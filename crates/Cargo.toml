@@ -4,3 +4,8 @@ members = [
   "ottto-connector-sdk",
   "ottto-connector-testkit",
 ]
+
+# Optimise dependencies (not workspace crates) in test builds; debug
+# assertions and overflow checks stay on.
+[profile.test.package."*"]
+opt-level = 2

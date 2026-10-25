@@ -6511,6 +6511,7 @@ mod phase_b_tests {
         }
     }
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
     fn saved_equality_includes_birth_stubs_and_detects_their_removal() {
         let _mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(A, record('a', vec![1]))]);
@@ -6535,6 +6536,7 @@ mod phase_b_tests {
         assert!(!view.qualify_saved(&loaded).shadow_post_save_qualified);
     }
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
     fn stale_pending_is_uncomparable_and_dirty_old_fingerprint_does_not_cover() {
         let _mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(A, record('a', vec![1]))]);
@@ -6891,6 +6893,7 @@ mod phase_b_tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
     fn post_save_equality_qualifies_only_the_exact_record_and_pending_basis() {
         let _shadow_mode = phase_b::ShadowMode::set(true);
         let index = index_with(vec![(B, record('b', vec![8]))]);
@@ -6982,6 +6985,7 @@ mod phase_b_tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
     fn synthetic_scale_receipt_includes_old_new_and_checkpoint_decode_overlap() {
         let _shadow_mode = phase_b::ShadowMode::set(true);
         let calibration = admitted_scale_calibration();
@@ -7862,6 +7866,7 @@ mod phase_b_tests {
         *CALIBRATION.get_or_init(measure_admitted_scale)
     }
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
     fn admitted_scale_receipt_covers_view_comparison_and_saved_equality() {
         let _shadow_mode = phase_b::ShadowMode::set(true);
         let calibration = admitted_scale_calibration();

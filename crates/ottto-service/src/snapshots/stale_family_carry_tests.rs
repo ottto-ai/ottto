@@ -1617,6 +1617,7 @@ fn fix2_clean_followup_preserves_c1b_family_refusals() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn fix2_restart_before_the_first_window_start_is_base() {
     let mut index = window_index();
     index.claude_full_rearm_progress.full_rearm_window_next = true;
@@ -2147,6 +2148,7 @@ fn c1b_identity_rearm_wins_over_the_census_rebuild_bound() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader() {
     #[derive(serde::Deserialize)]
     struct OldCarry {

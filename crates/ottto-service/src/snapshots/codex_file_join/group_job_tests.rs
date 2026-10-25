@@ -211,6 +211,19 @@ fn sampled_in(
     collected_at: &str,
     scope: &str,
 ) -> (ScanIndex, SourceScanResult) {
+    sampled_hinted(root, index, limit, cache, collected_at, scope, &[])
+}
+
+/// `sampled_in` with watcher `hints`.
+fn sampled_hinted(
+    root: &Path,
+    index: ScanIndex,
+    limit: usize,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    scope: &str,
+    hints: &[PathBuf],
+) -> (ScanIndex, SourceScanResult) {
     let mut owned = OwnedSourceScan::new(
         SnapshotSource::Codex,
         &[root.join("sessions")],
@@ -220,7 +233,7 @@ fn sampled_in(
         limit,
         false,
         None,
-        &[],
+        hints,
         false,
         false,
     )
@@ -317,6 +330,102 @@ fn fence_filters_watcher_hint_after_attempt() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// G1 (review of #751, P1): a processed group re-hinted through one member
+/// is a re-read group. On every page it would take the whole file allowance
+/// (two files) and evict the waiting census-member singleton `c`, so the
+/// census never closed. It now waits for a page without a waiting member,
+/// and a group fenced by its attempt this generation is decided at admission
+/// without taking allowance: `c` is read on the first hinted page and the
+/// census closes. Covered for an ordinary group, a fenced group and an
+/// own-page group (more members than the page's file limit).
+#[test]
+fn reread_group_never_starves_a_waiting_census_singleton() {
+    let ordinary = || fixture().0;
+    let own_page = || {
+        let (root, _) = fixture();
+        write_rows(
+            &root.join("sessions/d.jsonl"),
+            &member(OWNER, "r-d", 300, 600),
+        );
+        root
+    };
+    let cases: [(&str, &dyn Fn() -> PathBuf); 3] = [
+        ("ordinary", &ordinary),
+        ("fenced", &refused_fixture),
+        ("own-page", &own_page),
+    ];
+    for (case, make) in cases {
+        let root = make();
+        write_rows(
+            &root.join("sessions/c.jsonl"),
+            &member(OTHER, "healthy", 100, 100),
+        );
+        let cache = Arc::new(SharedCache::default());
+        let at = |page: u64| format!("2026-10-06T23:{page:02}:00Z");
+        // Page 0, two files: the group (a, b) is attempted; `c` waits.
+        let (mut index, first) = sampled_hinted(
+            &root,
+            ScanIndex::default(),
+            2,
+            &cache,
+            &at(0),
+            "group-fixture",
+            &[],
+        );
+        assert!(
+            first
+                .snapshots
+                .iter()
+                .all(|snapshot| snapshot.source_session_id != OTHER),
+            "{case}"
+        );
+        let traversal = index.traversal.as_ref().expect("the generation continues");
+        assert!(
+            traversal
+                .pending_candidates
+                .iter()
+                .any(|pending| pending.path.ends_with("c.jsonl") && pending.census_member),
+            "{case}: c waits as a census member"
+        );
+        let hinted = traversal.scan_roots[0].join("b.jsonl");
+        let mut published = 0;
+        let mut closed = None;
+        for page in 1..=3_u64 {
+            let (next, scan) = sampled_hinted(
+                &root,
+                index,
+                2,
+                &cache,
+                &at(page),
+                "group-fixture",
+                std::slice::from_ref(&hinted),
+            );
+            index = next;
+            published += scan
+                .snapshots
+                .iter()
+                .filter(|snapshot| snapshot.source_session_id == OTHER)
+                .count();
+            if scan.census_complete {
+                closed = Some(page);
+                break;
+            }
+        }
+        assert_eq!(
+            published,
+            1,
+            "{case}: c is read once: {:?}",
+            counters(&cache)
+        );
+        assert_eq!(closed, Some(1), "{case}: {:?}", counters(&cache));
+        if case == "fenced" {
+            // Decided at admission: fenced, and no allowance taken from `c`.
+            assert_eq!(counters(&cache).groups_fenced, 1, "{:?}", counters(&cache));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// `count` native/UI pairs continuing the counter from `start`.
 fn chain_rows(owner: &str, prefix: &str, created: &str, start: u64, count: u64) -> Vec<Value> {
     let mut rows = vec![meta(owner, created, json!({}))];
@@ -393,6 +502,7 @@ fn selection_skips_job_owned_entries() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn blocked_owner_released_when_all_members_vanish_on_clean_walk() {
     let root = refused_fixture();
     write_rows(
@@ -948,6 +1058,7 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
     let root = refused_fixture();
     let cache = Arc::new(SharedCache::default());
@@ -975,6 +1086,7 @@ fn refused_group_memo_hit_on_live_growth_rereads_nothing() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
     let root = temp_root("curable");
     let first = "11111111-aaaa-4aaa-8aaa-111111111111";
@@ -1026,6 +1138,7 @@ fn append_curable_live_refusal_memo_matches_only_the_exact_stamp() {
 /// before the file's end; bytes after it cannot cure it, so the exact-stamp
 /// entry is recorded and an unchanged group is not re-read.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn mid_stream_live_gap_is_memoized_and_skipped_while_unchanged() {
     let root = temp_root("midgap");
     write_rows(
@@ -2243,6 +2356,7 @@ fn refused_first_page(cache: &Arc<SharedCache>) -> (PathBuf, ScanIndex) {
 /// owner. A departed non-member key (never on disk, so never in the census)
 /// keeps its claim, and with it the owner's block.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn join_release_keeps_a_non_member_claim_on_the_same_owner() {
     let cache = Arc::new(SharedCache::default());
     let (root, mut index) = refused_first_page(&cache);
@@ -2412,6 +2526,7 @@ fn join_release_keeps_an_owner_a_header_still_names() {
 /// J-T5: releasing `OWNER` removes only its claims: `OTHER`'s claim on the
 /// same member key and its block survive; an emptied key is removed.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn join_release_of_one_owner_never_deletes_another() {
     let cache = Arc::new(SharedCache::default());
     let (root, mut index) = refused_first_page(&cache);

@@ -561,6 +561,7 @@ mod tests {
                     reasoning_effort: None,
                     timestamp,
                     event_clock_complete: true,
+                    desktop_request: false,
                     effective_input_context: if sequence % 11 == 0 {
                         0
                     } else {

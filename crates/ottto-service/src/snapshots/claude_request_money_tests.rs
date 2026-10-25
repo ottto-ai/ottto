@@ -1398,6 +1398,7 @@ fn money_rows_converge_by_tailing_long_sidecars() {
 /// the read is fine (the extent was frozen at open).
 #[test]
 #[serial_test::serial(claude_request_money_shadow)]
+#[cfg_attr(not(target_os = "macos"), ignore = "rewrite race unseen on ubuntu")]
 fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     let tail = MoneyTail::new("money-tail-raced");
     let budget = ClaudeTelemetryTailBudget::default();

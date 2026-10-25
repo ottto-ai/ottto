@@ -896,6 +896,34 @@ fn audit_file_cap_is_shared_by_the_agents() {
     env.cleanup();
 }
 
+/// A concurrent subprocess can inherit the flock descriptor until exec,
+/// briefly keeping the lease alive after take_run_health closes its copy.
+/// A lease held throughout this bounded probe must still fail the test.
+fn probe_health_worker_lease(dir: &Path) -> Option<File> {
+    let until = Instant::now() + Duration::from_millis(250);
+    loop {
+        if let Some(lease) = harvest::lock_state(dir).unwrap() {
+            return Some(lease);
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn health_lease_probe_rejects_a_continuously_held_lease() {
+    let dir = crate::test_scratch::ScratchDir::new("composition-health-held-lease");
+    let lease = harvest::lock_state(&dir).unwrap().unwrap();
+    assert!(
+        probe_health_worker_lease(&dir).is_none(),
+        "retry must not hide a lease retained during posting"
+    );
+    drop(lease);
+    assert!(probe_health_worker_lease(&dir).is_some());
+}
+
 #[test]
 fn health_mark_releases_the_worker_lease_before_posting() {
     let dir = scratch("composition-health-release-lease");
@@ -904,7 +932,7 @@ fn health_mark_releases_the_worker_lease_before_posting() {
     let mut log = HealthLog::begin(&dir, day, "device|machine|api");
     log.set(HealthEntry::started("claude-code", now));
     let record = harvest::take_run_health(&dir, day).unwrap();
-    let lease = harvest::lock_state(&dir).unwrap();
+    let lease = probe_health_worker_lease(&dir);
     assert!(
         lease.is_some(),
         "network work must not hold the worker lease"

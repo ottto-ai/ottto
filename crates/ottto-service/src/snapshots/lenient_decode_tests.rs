@@ -1948,6 +1948,12 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
 #[test]
 fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
     let mut seed = fixture();
+    // A moved Codex session's counting binding is nested entry state. The
+    // files codec must preserve it without adding a root-level sequence slot.
+    seed.files
+        .get_mut("/synthetic/0.jsonl")
+        .unwrap()
+        .codex_counting_owner = Some(codex_protected_owner("counting-session"));
     seed.insert_retry_pending_claude_authority_for_test("valid-family");
     seed.codex_parent_prefix_proofs.insert(
         "child".into(),
@@ -2117,6 +2123,10 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
     let decoded =
         lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
     assert!(decoded.decode_holds.is_empty());
+    assert_eq!(
+        decoded.files["/synthetic/0.jsonl"].codex_counting_owner,
+        index.files["/synthetic/0.jsonl"].codex_counting_owner
+    );
     assert_eq!(serde_json::to_vec_pretty(&decoded).unwrap(), bytes);
 }
 

@@ -8548,6 +8548,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_identity::desktop_census(index),
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
+        .with_native_originals(&originals)
     });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
@@ -11003,6 +11004,7 @@ mod tests {
                 codex_captured_tier_receipt_required: false,
                 codex_captured_uncommitted: false,
                 codex_counting_v2: false,
+                codex_counting_owner: None,
                 effective_upload_body_witness_revision: 0,
             },
         );
@@ -21611,6 +21613,9 @@ mod tests {
             );
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+    mod codex_counting_lifecycle_tests {
+        include!("snapshot_sync/codex_counting_lifecycle_tests.rs");
     }
     fn prepare_codex_union_fixture(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(

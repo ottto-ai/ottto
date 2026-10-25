@@ -3210,6 +3210,746 @@ fn rotation_serves_waiters_in_turn_and_fences_one_attempt_per_generation() {
     assert_eq!(rotation.attempted.len(), ROTATION_KEYS);
 }
 
+/// G1: a census member's large read takes the slot ahead of every re-read
+/// (growth after its path was processed in this generation), whatever their
+/// rank or wait; among census members the K7 order is unchanged.
+#[test]
+fn rotation_serves_census_members_ahead_of_rereads() {
+    let mut rotation = Rotation {
+        page: 10,
+        ..Rotation::default()
+    };
+    rotation.wait_as("reread", false);
+    rotation.page = 11;
+    rotation.wait_as("member", true);
+    rotation.page = 12;
+    assert!(rotation.turn_as("member", true));
+    assert!(
+        !rotation.turn_as("reread", false),
+        "an older re-read waits behind a census member"
+    );
+    assert!(
+        !rotation.turn_as("new", true),
+        "a newcomer member waits behind an older member"
+    );
+    assert!(
+        !rotation.turn_as("new-reread", false),
+        "a newcomer re-read waits behind every member"
+    );
+    rotation.complete("member", Some("g1"));
+    assert!(
+        rotation.turn_as("reread", false),
+        "no member waits any more"
+    );
+    // A waiter's membership follows its latest plan.
+    rotation.wait_as("reread", true);
+    rotation.page = 13;
+    rotation.wait_as("late", true);
+    assert!(rotation.turn_as("reread", true));
+    assert!(!rotation.turn_as("late", true));
+}
+
+/// G1: a read holds the census when one of its paths was selected as a
+/// census member, or none of them was selected (a cursor job's unselected
+/// path, a group's unselected members); one whose selected paths are all
+/// re-reads holds nothing.
+#[test]
+fn census_membership_follows_the_selected_paths_only() {
+    let member = PathBuf::from("/synthetic/sessions/member.jsonl");
+    let reread = PathBuf::from("/synthetic/sessions/reread.jsonl");
+    let unselected = PathBuf::from("/synthetic/sessions/unselected.jsonl");
+    let flags = BTreeMap::from([
+        (local_index_key(&member), (true, false)),
+        (local_index_key(&reread), (false, true)),
+    ]);
+    assert!(selected_census_member(&flags, &member));
+    assert!(!selected_census_member(&flags, &reread));
+    assert!(selected_census_member(&flags, &unselected));
+    assert!(census_member(&flags, [member.as_path(), reread.as_path()]));
+    assert!(!census_member(
+        &flags,
+        [reread.as_path(), unselected.as_path()]
+    ));
+    assert!(census_member(&flags, [unselected.as_path()]));
+    assert!(census_member(&flags, std::iter::empty::<&Path>()));
+}
+
+/// G1 (K7 for singletons and re-reads): a Codex watcher hint for a path this
+/// generation already processed (observed, no longer pending) re-enters as
+/// a non-member and is counted; a pending path is not duplicated; a path the
+/// walk has not observed, and every non-Codex hint, stays a census member.
+#[test]
+fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
+    const SESSION_C: &str = "019fa111-2222-7333-8444-777777777701";
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 2), (SESSION_B, 2)]);
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    let walked = index.traversal.as_mut().unwrap();
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        walked,
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    let processed = fixture.file(SESSION);
+    let pending = fixture.file(SESSION_B);
+    let unobserved = fixture.file(SESSION_C);
+    assert!(walked
+        .observed_index_keys
+        .contains(&local_index_key(&processed)));
+    // `processed` was selected and read on an earlier page.
+    walked
+        .pending_candidates
+        .retain(|candidate| candidate.path != processed);
+    assert!(walked
+        .pending_candidates
+        .iter()
+        .any(|candidate| candidate.path == pending && candidate.census_member));
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let mut traversal = walked.clone();
+        let before = traversal.pending_candidates.len();
+        let next_generation = enqueue_watcher_hints(
+            source,
+            &mut traversal,
+            &[processed.clone(), pending.clone(), unobserved.clone()],
+            false,
+        );
+        let flags = |path: &Path| {
+            let matches = traversal
+                .pending_candidates
+                .iter()
+                .filter(|candidate| candidate.path == path)
+                .map(|candidate| (candidate.census_member, candidate.watcher_hint))
+                .collect::<Vec<_>>();
+            assert!(matches.len() <= 1, "{source:?}: one entry per path");
+            matches.first().copied()
+        };
+        let codex = source == SnapshotSource::Codex;
+        assert_eq!(next_generation, u64::from(codex), "{source:?}");
+        assert_eq!(flags(&processed), Some((!codex, true)), "{source:?}");
+        assert_eq!(
+            flags(&pending),
+            Some((true, false)),
+            "{source:?}: the pending census member keeps its entry"
+        );
+        assert_eq!(flags(&unobserved), Some((true, true)), "{source:?}");
+        assert_eq!(traversal.pending_candidates.len(), before + 2);
+    }
+}
+
+/// One page with `hints` as the cycle's watcher paths (`page_selections`
+/// otherwise).
+fn hinted_page(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    hints: &[PathBuf],
+) -> (ScanIndex, SourceScanResult) {
+    hinted_page_limited(fixture, index, cache, collected_at, hints, 10)
+}
+
+/// `hinted_page` with a file limit of `limit` per page.
+fn hinted_page_limited(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    hints: &[PathBuf],
+    limit: usize,
+) -> (ScanIndex, SourceScanResult) {
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        index,
+        collected_at,
+        BACKFILL_WINDOW_DAYS,
+        limit,
+        false,
+        None,
+        hints,
+        false,
+        true,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    loop {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                let mut projected = scan.clone();
+                apply_upload_policy(
+                    SnapshotSource::Codex,
+                    &mut projected.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
+                let accepted = projected
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan);
+            }
+        }
+    }
+}
+
+/// G1/G2 at scan level. Three medium files grow on every page and are
+/// hinted, and their retained state is gone each page (as after a restart or
+/// a cache eviction), so each growth needs a full re-read; together they
+/// exceed the page's singleton budget. A fourth file larger than the budget
+/// is read by the cursor, one slice per page, while it also grows.
+///
+/// Before G1 the re-hinted files re-entered the census on every page and one
+/// was always deferred, so the generation never closed. Now the generation
+/// closes once the large job ends (within `ceil(L/B)` pages plus a small
+/// constant), each page completes a first read ahead of the hints, and the
+/// re-reads are counted as next-generation evidence. After growth stops, the
+/// follow-up generation re-reads every grown file (G2), and the published
+/// totals equal a fresh full read of the final files: no byte lost, none
+/// counted twice.
+#[test]
+fn growing_generation_with_large_file_closes_within_bounded_pages() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const MEDIUM: [&str; 3] = [
+        "019fa111-2222-7333-8444-777777777711",
+        "019fa111-2222-7333-8444-777777777712",
+        "019fa111-2222-7333-8444-777777777713",
+    ];
+    const LARGE: &str = "019fa111-2222-7333-8444-777777777714";
+    const B: u64 = 2048;
+    let fixture =
+        ScanRoot::with_sessions(&[(MEDIUM[0], 4), (MEDIUM[1], 4), (MEDIUM[2], 4), (LARGE, 60)]);
+    let sessions = [MEDIUM[0], MEDIUM[1], MEDIUM[2], LARGE];
+    let medium_len = fixture.len(MEDIUM[0]);
+    // Two medium full reads fit one page's singleton budget, three never do.
+    let singleton = medium_len * 2 + medium_len / 2;
+    assert!(fixture.len(LARGE) > singleton);
+    let bound = fixture.len(LARGE).div_ceil(B) + 4;
+    let cache = Arc::new(SharedCache::default());
+    let mut next_line = [5_u64, 5, 5, 61];
+    let mut latest = BTreeMap::<String, (u64, u64, u64, u64)>::new();
+    let mut record = |scan: &SourceScanResult| {
+        for item in &scan.snapshots {
+            latest.insert(
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            );
+        }
+    };
+    with_test_limits(B, singleton, 64, || {
+        let mut index = ScanIndex::default();
+        let mut page_number = 0_u64;
+        let mut closed = None;
+        let mut closing_token = None;
+        while page_number < bound {
+            closing_token = census_token(&index);
+            let hints = if page_number == 0 {
+                Vec::new()
+            } else {
+                sessions.map(|session| fixture.file(session)).to_vec()
+            };
+            let (next, scan) =
+                hinted_page(&fixture, index, &cache, &collected_at(page_number), &hints);
+            index = next;
+            record(&scan);
+            page_number += 1;
+            if scan.census_complete {
+                assert_eq!(
+                    scan.skipped_file_count_due_to_limit, 0,
+                    "census members only"
+                );
+                closed = Some(page_number);
+                break;
+            }
+            // Steady growth; every retained state is gone by the next page.
+            for (session, line) in sessions.iter().zip(next_line.iter_mut()) {
+                fixture.append(session, &token_line(*line));
+                *line += 1;
+            }
+            cache.clear();
+        }
+        let closed = closed.unwrap_or_else(|| {
+            panic!(
+                "the growing generation did not close within {bound} pages: {}",
+                counters(&cache)
+            )
+        });
+        // The closed generation retired. Re-reads still waiting then were
+        // carried into the next generation, each as a census member of it.
+        if let Some(traversal) = &index.traversal {
+            assert_ne!(census_token(&index), closing_token, "a new generation");
+            assert!(traversal
+                .pending_candidates
+                .iter()
+                .all(|candidate| candidate.census_member));
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified),
+            1
+        );
+        assert!(
+            counter(&cache, |c| c.deferred_next_generation) > 0,
+            "re-reads were counted as next-generation evidence: {}",
+            counters(&cache)
+        );
+        assert!(closed > 1, "the large file really paged");
+        // G2: growth stops; the follow-up generation re-reads every grown
+        // file, including the growth a closed generation left pending.
+        let mut converged = false;
+        for _ in 0..bound * 2 {
+            let (next, scan) =
+                hinted_page(&fixture, index, &cache, &collected_at(page_number), &[]);
+            index = next;
+            record(&scan);
+            page_number += 1;
+            let current = sessions.iter().all(|session| {
+                index
+                    .files
+                    .get(&local_index_key(&fixture.file(session)))
+                    .is_some_and(|entry| entry.size_bytes == fixture.len(session))
+            });
+            if scan.census_complete && current {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the follow-up generation re-read every grown file: {}",
+            counters(&cache)
+        );
+    });
+    // No byte lost, none counted twice: the last published totals per
+    // session equal a fresh full read of the final files.
+    let (_, fresh) = page(&fixture, ScanIndex::default(), None);
+    let expected = fresh
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(expected.len(), sessions.len());
+    assert_eq!(latest, expected);
+}
+
+/// G1 carry: a census that closes while a re-read is still waiting hands it
+/// to the next generation as a member instead of dropping it. Two small
+/// files, one full read per page. Page 0 reads one (X) and defers the other
+/// (Y). X then grows and is hinted with its retained state gone: a re-read,
+/// not a member. Page 1 reads the member Y first, the budget defers X, and the
+/// census closes with X waiting. The closed generation never takes X back;
+/// the next one holds it as a member and reads it exactly once, and the
+/// published totals equal a fresh full read (no byte lost, none twice).
+#[test]
+fn census_close_carries_a_waiting_reread_into_the_next_generation() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const SESSIONS: [&str; 2] = [
+        "019fa111-2222-7333-8444-777777777721",
+        "019fa111-2222-7333-8444-777777777722",
+    ];
+    let fixture = ScanRoot::with_sessions(&[(SESSIONS[0], 4), (SESSIONS[1], 4)]);
+    let small = fixture.len(SESSIONS[0]);
+    assert_eq!(fixture.len(SESSIONS[1]), small);
+    // One full read per page, and a grown file still fits alone.
+    let singleton = small + small / 2;
+    let cache = Arc::new(SharedCache::default());
+    let mut latest = BTreeMap::<String, (u64, u64, u64, u64)>::new();
+    let mut record = |scan: &SourceScanResult| {
+        for item in &scan.snapshots {
+            latest.insert(
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            );
+        }
+    };
+    let waiting = |index: &ScanIndex, path: &Path| {
+        index.traversal.as_ref().and_then(|traversal| {
+            traversal
+                .pending_candidates
+                .iter()
+                .find(|pending| pending.path == path)
+                .map(|pending| (pending.census_member, pending.watcher_hint))
+        })
+    };
+    with_test_limits(2048, singleton, 64, || {
+        let (index, scan) = hinted_page(
+            &fixture,
+            ScanIndex::default(),
+            &cache,
+            &collected_at(0),
+            &[],
+        );
+        record(&scan);
+        assert!(!scan.census_complete, "one file is deferred");
+        let [x, y] = if waiting(&index, &fixture.file(SESSIONS[0])).is_some() {
+            [SESSIONS[1], SESSIONS[0]]
+        } else {
+            [SESSIONS[0], SESSIONS[1]]
+        };
+        let (x_path, y_path) = (fixture.file(x), fixture.file(y));
+        assert_eq!(waiting(&index, &y_path), Some((true, false)));
+        assert_eq!(waiting(&index, &x_path), None, "X was read");
+        let first = census_token(&index).expect("first generation");
+
+        fixture.append(x, &token_line(5));
+        assert!(fixture.len(x) <= singleton);
+        cache.clear();
+        let (index, scan) = hinted_page(
+            &fixture,
+            index,
+            &cache,
+            &collected_at(1),
+            std::slice::from_ref(&x_path),
+        );
+        record(&scan);
+        assert!(
+            scan.census_complete,
+            "the member was read and the census closed: {}",
+            counters(&cache)
+        );
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != x));
+        assert!(counter(&cache, |c| c.deferred_next_generation) >= 1);
+        // Carried, not dropped: a member of a new generation, still a hint.
+        let second = census_token(&index).expect("the next generation started");
+        assert_ne!(second, first);
+        assert_eq!(waiting(&index, &x_path), Some((true, true)));
+        assert_eq!(waiting(&index, &y_path), None);
+
+        let mut index = index;
+        let mut x_reads = 0;
+        let mut closed = false;
+        for page_number in 2..6 {
+            assert_eq!(census_token(&index).as_deref(), Some(second.as_str()));
+            let (next, scan) =
+                hinted_page(&fixture, index, &cache, &collected_at(page_number), &[]);
+            index = next;
+            record(&scan);
+            x_reads += scan
+                .snapshots
+                .iter()
+                .filter(|item| item.source_session_id == x)
+                .count();
+            if scan.census_complete {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the next generation closed: {}", counters(&cache));
+        assert_eq!(x_reads, 1, "read exactly once in the next generation");
+        assert_eq!(
+            index.files[&local_index_key(&x_path)].size_bytes,
+            fixture.len(x)
+        );
+    });
+    let (_, fresh) = page(&fixture, ScanIndex::default(), None);
+    let expected = fresh
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(expected.len(), SESSIONS.len());
+    assert_eq!(latest, expected);
+}
+
+/// Per-session (input, output, cache read, requests) of a fresh, uncached
+/// full read of `fixture`.
+fn fresh_totals(fixture: &ScanRoot) -> BTreeMap<String, (u64, u64, u64, u64)> {
+    let (_, fresh) = page(fixture, ScanIndex::default(), None);
+    fresh
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The (census member, watcher hint) flags of `path` while it is pending.
+fn pending_flags(index: &ScanIndex, path: &Path) -> Option<(bool, bool)> {
+    index.traversal.as_ref().and_then(|traversal| {
+        traversal
+            .pending_candidates
+            .iter()
+            .find(|pending| pending.path == path)
+            .map(|pending| (pending.census_member, pending.watcher_hint))
+    })
+}
+
+/// G1 (review of #751): a re-read cursor job that is not a census member
+/// is paused on the page its census closes. `L` was read in the generation
+/// as a singleton, then grew past the singleton budget and was hinted with
+/// its retained state gone, so its re-read is a non-member cursor job (no
+/// K7 fence: no earlier cursor attempt). Page 1 reads the last member and
+/// the census closes while that job is paused. The next generation holds
+/// `L` as a member; the job resumes there without a restart and publishes
+/// exactly once, equal to a fresh full read.
+#[test]
+fn non_member_job_paused_at_census_close_resumes_in_the_next_generation() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const L: &str = "019fa111-2222-7333-8444-777777777731";
+    const M: [&str; 2] = [
+        "019fa111-2222-7333-8444-777777777732",
+        "019fa111-2222-7333-8444-777777777733",
+    ];
+    const B: u64 = 2048;
+    let fixture = ScanRoot::with_sessions(&[(L, 4), (M[0], 4), (M[1], 4)]);
+    let small = fixture.len(L);
+    // Two small reads fit one page; the grown `L` never does.
+    let singleton = small * 4;
+    let l_path = fixture.file(L);
+    let l_key = local_index_key(&l_path);
+    let cache = Arc::new(SharedCache::default());
+    let mut latest = BTreeMap::<String, (u64, u64, u64, u64)>::new();
+    let mut record = |scan: &SourceScanResult| {
+        let mut l_publications = 0;
+        for item in &scan.snapshots {
+            l_publications += usize::from(item.source_session_id == L);
+            latest.insert(
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            );
+        }
+        l_publications
+    };
+    with_test_limits(B, singleton, 64, || {
+        // Page 0, two files: `L` and `M0` are read; `M1` waits.
+        let (index, scan) = hinted_page_limited(
+            &fixture,
+            ScanIndex::default(),
+            &cache,
+            &collected_at(0),
+            &[],
+            2,
+        );
+        assert_eq!(record(&scan), 1, "L read as a singleton");
+        assert!(!scan.census_complete);
+        assert_eq!(
+            pending_flags(&index, &fixture.file(M[1])),
+            Some((true, false))
+        );
+        assert_eq!(pending_flags(&index, &l_path), None);
+        let first = census_token(&index).expect("first generation");
+
+        for line in 5..65 {
+            fixture.append(L, &token_line(line));
+        }
+        assert!(fixture.len(L) > singleton);
+        cache.clear();
+        let (index, scan) = hinted_page_limited(
+            &fixture,
+            index,
+            &cache,
+            &collected_at(1),
+            std::slice::from_ref(&l_path),
+            2,
+        );
+        let mut l_publications = record(&scan);
+        assert!(
+            scan.census_complete,
+            "the last member was read and the census closed: {}",
+            counters(&cache)
+        );
+        assert_eq!(l_publications, 0, "a paused job publishes nothing");
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+        assert_eq!(
+            cache.cursor_job_key().as_deref(),
+            Some(l_key.as_str()),
+            "the re-read job is paused: {}",
+            counters(&cache)
+        );
+        let second = census_token(&index).expect("the next generation started");
+        assert_ne!(second, first);
+        assert_eq!(pending_flags(&index, &l_path), Some((true, true)));
+
+        let bound = fixture.len(L).div_ceil(B) + 4;
+        let mut index = index;
+        let mut page_number = 2;
+        while counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified) == 0
+            && page_number < 2 + bound
+        {
+            let (next, scan) =
+                hinted_page_limited(&fixture, index, &cache, &collected_at(page_number), &[], 2);
+            index = next;
+            l_publications += record(&scan);
+            page_number += 1;
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified),
+            1,
+            "the job ended within {bound} pages: {}",
+            counters(&cache)
+        );
+        assert_eq!(
+            counter(&cache, |c| c.jobs_started),
+            1,
+            "resumed, never restarted: {}",
+            counters(&cache)
+        );
+        assert_eq!(l_publications, 1, "published exactly once");
+        assert_eq!(index.files[&l_key].size_bytes, fixture.len(L));
+    });
+    assert_eq!(latest, fresh_totals(&fixture));
+}
+
+/// G1 (review of #751): a census that closes with a re-read waiting while
+/// the sweep is partially settled keeps the old path. Nothing is carried and
+/// the unsettled marker stays for the clean follow-up; that walk re-reads the
+/// grown file exactly once, and the totals equal a fresh full read.
+#[test]
+fn unsettled_close_keeps_the_clean_follow_up_and_rereads_once() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const SESSIONS: [&str; 2] = [
+        "019fa111-2222-7333-8444-777777777741",
+        "019fa111-2222-7333-8444-777777777742",
+    ];
+    let fixture = ScanRoot::with_sessions(&[(SESSIONS[0], 4), (SESSIONS[1], 4)]);
+    let small = fixture.len(SESSIONS[0]);
+    let singleton = small + small / 2;
+    let cache = Arc::new(SharedCache::default());
+    let mut latest = BTreeMap::<String, (u64, u64, u64, u64)>::new();
+    let mut record = |scan: &SourceScanResult, session: &str| {
+        let mut publications = 0;
+        for item in &scan.snapshots {
+            publications += usize::from(item.source_session_id == session);
+            latest.insert(
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            );
+        }
+        publications
+    };
+    with_test_limits(2048, singleton, 64, || {
+        let (index, scan) = hinted_page(
+            &fixture,
+            ScanIndex::default(),
+            &cache,
+            &collected_at(0),
+            &[],
+        );
+        assert!(!scan.census_complete, "one file is deferred");
+        let [x, y] = if pending_flags(&index, &fixture.file(SESSIONS[0])).is_some() {
+            [SESSIONS[1], SESSIONS[0]]
+        } else {
+            [SESSIONS[0], SESSIONS[1]]
+        };
+        record(&scan, x);
+        let x_path = fixture.file(x);
+        assert_eq!(pending_flags(&index, &fixture.file(y)), Some((true, false)));
+
+        fixture.append(x, &token_line(5));
+        assert!(fixture.len(x) <= singleton);
+        cache.clear();
+        let mut index = index;
+        // An earlier page of this sweep settled only partially.
+        index.mark_bounded_sweep_unsettled();
+        let (index, scan) = hinted_page(
+            &fixture,
+            index,
+            &cache,
+            &collected_at(1),
+            std::slice::from_ref(&x_path),
+        );
+        let mut x_publications = record(&scan, x);
+        assert!(
+            !scan.census_complete,
+            "a partially settled sweep owes a clean follow-up"
+        );
+        assert_eq!(x_publications, 0, "X waited behind the member");
+        assert!(counter(&cache, |c| c.deferred_next_generation) >= 1);
+        assert!(index.traversal.is_none(), "nothing was carried");
+        assert!(index.bounded_sweep_had_unsettled_upload());
+
+        let mut index = index;
+        let mut closed = false;
+        for page_number in 2..8 {
+            let (next, scan) =
+                hinted_page(&fixture, index, &cache, &collected_at(page_number), &[]);
+            index = next;
+            x_publications += record(&scan, x);
+            if scan.census_complete {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the clean follow-up closed: {}", counters(&cache));
+        assert_eq!(x_publications, 1, "the follow-up re-read X once");
+        assert!(!index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            index.files[&local_index_key(&x_path)].size_bytes,
+            fixture.len(x)
+        );
+    });
+    assert_eq!(latest, fresh_totals(&fixture));
+}
+
 /// §r sizing at the measured event counts. Prints the figures for the PR;
 /// asserts only invariants. CI only (heavy; never run on the Mac).
 #[test]
@@ -3768,6 +4508,7 @@ fn created_usage(scan: &SourceScanResult) -> Vec<(u64, u64)> {
 /// the thread once, with its full usage. An unchanged generation after
 /// that publishes nothing new: no second admission, no resurrected hold.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn projection_ahead_created_thread_memo_misses_on_the_curing_append() {
     let home = CreatedThreadHome::new(3, false);
     let cache = Arc::new(SharedCache::default());
@@ -3859,6 +4600,7 @@ fn assert_admitted_once(
 /// memo miss: the file is re-read (still ahead, so held and memoized again)
 /// and the new entry hits while unchanged.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
     let home = CreatedThreadHome::new(3, false);
     let cache = Arc::new(SharedCache::default());
@@ -3896,6 +4638,7 @@ fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
 /// change alone cures it, and the thread is admitted once with its full
 /// usage.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
     let home = CreatedThreadHome::new(10, false);
     home.project(home.bytes(9), 9);
@@ -3930,6 +4673,7 @@ fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
 /// hits; growth re-reads it, and once the projection binds the grown file it
 /// stays held (no admission), memoized again and hit again while unchanged.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn created_thread_fork_stays_held_after_growth_and_still_memo_hits() {
     let home = CreatedThreadHome::new(2, true);
     home.project(home.bytes(3), 3);
@@ -4080,6 +4824,7 @@ fn assert_oracle(
 /// the file to its extent binds the parent and cures it: the memo must miss
 /// (exact stamp), and the thread is admitted once, exactly as a cold parse.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
     let home = CreatedThreadHome::with_lineage(3, false, "user", Some(SPAWN_PARENT));
     let cache = Arc::new(SharedCache::default());
@@ -4134,6 +4879,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
 /// miss), and the re-read binds the spawn parent: the usage-free thread is
 /// no longer ownership-incomplete, exactly as a cold parse.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
     let home = CreatedThreadHome::with_lineage(3, false, "user", Some(SPAWN_PARENT));
     let cache = Arc::new(SharedCache::default());
@@ -4188,6 +4934,7 @@ fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
 /// refs are insert-only until a reset, so the memo entry, not the index, is
 /// where the fresh ref is observable.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
@@ -4246,6 +4993,7 @@ const ORPHAN: &str = "01a0dead-49cf-7460-9fd7-f7dbfd2f05e4";
 /// Once the last created thread leaves the state census, the entry misses
 /// and the ordinary session is admitted, exactly as a cold parse.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
     // The created thread itself is complete and admitted; until the state
     // census drops it, it records no memo entry, so every memo counter
@@ -4400,6 +5148,7 @@ fn stored_memo_key(home: &CreatedThreadHome, cache: &SharedCache) -> String {
 /// - T18: growth with every other input unchanged is counted as an
 ///   exact-stamp miss with the grown extent, then re-read equal to cold.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::new(10, true);
@@ -4863,6 +5612,7 @@ fn append_parent_turn(path: &Path, n: u64) {
 /// fresh read of the same generation does (same index, no memo), field by
 /// field plus `scanned_session_count`, and what a cold settled scan does.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn kind_iii_fork_hold_hits_and_replays_a_fresh_read_exactly() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -4912,6 +5662,7 @@ fn kind_iii_fork_hold_hits_and_replays_a_fresh_read_exactly() {
 /// T14: after a restart (a new `SharedCache`, the index kept) the held fork
 /// is read once and recorded, then hits with the same disclosure.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let (index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
@@ -4943,6 +5694,7 @@ fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
 /// records no parent ref, before or after an index reset; its memo hit
 /// re-requests nothing. P-T32 covers an ordinary fork's re-request.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn memo_hit_after_an_index_reset_requests_no_parent_ref() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
@@ -4964,6 +5716,7 @@ fn memo_hit_after_an_index_reset_requests_no_parent_ref() {
 /// child's entry misses once, counted `memo_miss_other`, and the fork
 /// settles on the new parent object exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn replaced_parent_object_misses_the_child_and_settles_like_a_cold_scan() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -5016,6 +5769,7 @@ fn replaced_parent_object_misses_the_child_and_settles_like_a_cold_scan() {
 /// unchanged P identity, then recorded once, then quiet: nothing is parsed
 /// again, and the census equals the cold oracle.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
@@ -5152,6 +5906,7 @@ fn restarts_in_scope(scan: &SourceScanResult) -> Option<u64> {
 /// every generation) and its misses are `memo_miss_other`, never an
 /// exact-stamp miss; it is never admitted.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn child_of_a_growing_parent_never_hits() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -5193,6 +5948,7 @@ fn child_of_a_growing_parent_never_hits() {
 /// witness drops and the fork settles exactly as a cold scan (here held and
 /// memoized: kind (iii)).
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn absent_parent_fork_is_held_then_settles_when_its_parent_arrives() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let parent = home.fixture.file(PARENT);
@@ -5286,6 +6042,7 @@ fn mid_ledger_divergence_is_admitted_and_never_memoized() {
 /// refuses C (parent-pending: not recorded, nothing published). Later
 /// generations settle on the new P exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_rewritten_after_the_child_lookup_refuses_the_child() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -5342,6 +6099,7 @@ fn parent_rewritten_after_the_child_lookup_refuses_the_child() {
 /// finishes the fence re-opens P and refuses C. A fresh cache makes C read
 /// in full (no memo). Later generations settle exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_changed_between_the_child_step_calls_refuses_it_on_resume() {
     let home = ForkHome::new(&ForkHome::diverging_child(12));
     let (mut index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
@@ -5458,6 +6216,7 @@ fn bind_seed_short_of_the_read_extent_is_never_recorded() {
 /// is ahead of its projection) hits while unchanged; growth is an
 /// exact-stamp miss with the grown extent, re-read and held again as cold.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::with_lineage(10, false, "user", Some(SPAWN_PARENT));
@@ -5514,6 +6273,7 @@ fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
 /// `MAX_JSONL_LINE_BYTES`) is memoized and hits; every replayed count,
 /// `over_line_cap` and the terminal trio included, equals a cold read.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn terminal_over_line_cap_hold_hits_with_the_cold_counts() {
     let home = CreatedThreadHome::new(10, true);
     let mut row = format!(
@@ -5559,6 +6319,7 @@ fn terminal_over_line_cap_hold_hits_with_the_cold_counts() {
 /// the memo: its first record is not an owning header, so the header
 /// inventory holds the page, as on main.)
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let fixture = ScanRoot::with_sessions(&[]);
@@ -5630,6 +6391,7 @@ fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
 /// parent-pending): memoized, hit while unchanged; growth is an exact-stamp
 /// miss and the re-read settles exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn prefix_exhausted_fork_hold_hits_exactly_and_misses_on_growth() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::parent()[1..]);
@@ -5665,6 +6427,7 @@ fn prefix_exhausted_fork_hold_hits_exactly_and_misses_on_growth() {
 /// an exact-stamp miss (a tail could not replay it): it counts
 /// `memo_miss_other`, re-reads equal to cold, and the new entry hits.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn growth_with_a_sidecar_change_counts_an_other_miss() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::new(10, true);
@@ -5711,6 +6474,7 @@ fn growth_with_a_sidecar_change_counts_an_other_miss() {
 /// shrink each miss once, re-read equal to cold; a shrink is never counted
 /// as an exact-stamp (growth) miss.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn touched_replaced_or_shrunk_held_file_misses() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::new(10, true);
@@ -5817,6 +6581,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
                 codex_captured_tier_receipt_required: false,
                 codex_captured_uncommitted: false,
                 codex_counting_v2: false,
+                codex_counting_owner: None,
             },
         );
         index
@@ -5864,6 +6629,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
 /// T16: the memo has no clock input. The same unchanged hold collected a
 /// week later hits with the same disclosure.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn memo_hit_a_week_later_is_the_same_hit() {
     let home = CreatedThreadHome::new(10, true);
     let cache = Arc::new(SharedCache::default());
@@ -6046,6 +6812,7 @@ fn assert_warm_covers_cold(
 /// revert, two-page, historical-replay and strict/park generations
 /// (method-level `l_sb_*` tests in `snapshots.rs`).
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn warm_state_only_blocks_cover_cold_across_a_generation_sweep() {
     let home = CreatedThreadHome::new(10, true);
     home.set_tokens(CREATED, 50);
@@ -7428,6 +8195,7 @@ fn spent_budget_holds_a_new_fork_deferred_once_then_absent() {
 /// restart, and memo-hits from its second generation. Once refs leave the
 /// set it resolves as a cold scan does.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let cache = Arc::new(SharedCache::default());
@@ -7627,6 +8395,7 @@ fn a_deferred_ref_hold_built_before_its_proof_is_not_memoized() {
 /// page), and the namespace is marked matched for exactly that traversal,
 /// so a later page of it re-applies without matching.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn step_start_matches_once_per_traversal() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::rename(
@@ -7666,6 +8435,7 @@ fn step_start_matches_once_per_traversal() {
 /// append to the file drops A's witness and the file is read again.
 /// (Rev 5's admitted-B variant is dropped per the lease's N3.)
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn misnamed_parent_rollout_witnesses_no_ledger_and_absent() {
     const A: &str = "019fa111-2222-7333-8444-cccccccccccc";
     const B: &str = "019fa111-2222-7333-8444-dddddddddddd";
@@ -7776,6 +8546,7 @@ fn write_rollout(fixture: &ScanRoot, id: &str, parent: Option<&str>, records: &[
 /// after an index reset and re-requests its parent ref, exactly as its
 /// fresh parse did.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn witnessed_fork_memo_hit_after_an_index_reset_re_requests_its_parent_ref() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::rename(
@@ -7811,6 +8582,7 @@ fn witnessed_fork_memo_hit_after_an_index_reset_re_requests_its_parent_ref() {
 /// appears (sorted before P), G and P are read, P is admitted with its own
 /// usage, P's RAM witness is gone, and the chain settles as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn admitted_parent_loses_its_witness_and_its_child_resolves() {
     let fixture = chain_fixture(false);
     let away = fixture.root.parent().unwrap().join("grandparent-away");
@@ -7920,6 +8692,7 @@ fn out_of_window_parent_holds_its_fork_until_touched() {
 /// cycle and witnesses both `ForkCycle`. From then both are held `ForkCycle`
 /// and neither file is read again.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn fork_cycle_is_witnessed_and_then_quiet() {
     let fixture = ScanRoot::with_sessions(&[]);
     write_rollout(&fixture, PARENT, Some(CHILD), &ForkHome::diverging_child(2));
@@ -8012,6 +8785,7 @@ fn resolvable_chain_never_counts_parent_held() {
 /// pages of another namespace (past `NAMESPACE_STALE_PAGES`), the held
 /// chain's next generation parses nothing and its holds memo-hit.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_held_witness_survives_another_namespaces_pages() {
     let fixture = chain_fixture(false);
     let away = fixture.root.parent().unwrap().join("grandparent-away");
@@ -8121,6 +8895,7 @@ fn held_then_quiet_from(
 /// the fork is held under it, never `ParentLossy`, and nothing is read
 /// again.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn duplicated_parent_holds_its_fork_duplicated() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::copy(
@@ -8185,6 +8960,7 @@ fn append_oversized_line(path: &Path) {
 /// again: P is parsed exactly once, C is held `ParentLossy`, and from then on
 /// nothing is read.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     append_oversized_line(&home.fixture.file(PARENT));
@@ -8245,6 +9021,7 @@ fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
 /// copies are a join `CandidateCopy` refusal before any parse, so they
 /// never reach event (c).)
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn duplicated_lossy_parent_is_never_witnessed_parent_lossy() {
     const OTHER_HEADER: &str = "019fa111-2222-7333-8444-444444444444";
     let fixture = ScanRoot::with_sessions(&[]);
@@ -8321,6 +9098,7 @@ const ABSENT_GRANDPARENT: &str = "019fa111-2222-7333-8444-333333333333";
 /// ref already held from an earlier traversal) runs no restart; C before P
 /// runs at most one (C is pending before P's step-map entry exists).
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn deferred_intermediate_parent_is_not_reread_every_generation() {
     for c_first in [false, true] {
         let fixture = ScanRoot::with_sessions(&[]);
@@ -8554,6 +9332,7 @@ fn spent_budget_chain_never_counts_parent_debt_and_converges() {
 /// it again (the page-to-traversal fold, traversal-cumulative per page),
 /// P's witness survives every page, and restarts stay within budget.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn multi_page_traversal_folds_parent_causes_and_matches_once() {
     let fillers = (0..12)
         .map(|n| format!("019fa111-2222-7333-8444-9000000000{n:02}"))
@@ -8642,6 +9421,7 @@ fn multi_page_traversal_folds_parent_causes_and_matches_once() {
 /// generation, so C may count `ParentHeld` then, never later. Both settle as
 /// a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
     for c_first in [false, true] {
         let fixture = chain_fixture(c_first);
@@ -8725,6 +9505,7 @@ fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
 /// longer validates and does not hide P: C is held `Duplicated` (never
 /// `ParentLossy`) and then nothing, neither copy of P nor C, is read again.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn duplicate_after_an_admitted_ledger_holds_the_fork_duplicated() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let cache = Arc::new(SharedCache::default());

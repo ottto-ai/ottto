@@ -788,6 +788,7 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
         codex_captured_tier_receipt_required: false,
         codex_captured_uncommitted: false,
         codex_counting_v2: false,
+        codex_counting_owner: None,
         effective_upload_body_witness_revision: 0,
     }
 }

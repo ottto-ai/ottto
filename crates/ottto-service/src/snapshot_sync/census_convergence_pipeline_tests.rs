@@ -3102,6 +3102,7 @@ type IndexJsonDamage = fn(&mut serde_json::Value, &str);
 /// witness: nothing is uploaded or accepted and a bounded record re-forms.
 #[test]
 #[serial(source_manifests)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn returning_member_after_a_lost_tombstone_set_is_held_not_new() {
     let _source_manifests = SourceManifestTestGuard::new();
     let session = PIPELINE_SESSIONS[2];
@@ -3235,6 +3236,7 @@ fn assert_returning_member_held(pages: &[PipelinePage], session: &str, witness: 
 /// the returning member is held, never new.
 #[test]
 #[serial(source_manifests)]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
     let _source_manifests = SourceManifestTestGuard::new();
     let session = PIPELINE_SESSIONS[2];

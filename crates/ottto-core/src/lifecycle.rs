@@ -7,6 +7,10 @@ use crate::token_store::{
     classify_security_cli_delete_output, ControlTokenStore, KeychainSecretStore,
     SecurityCliDeleteOutcome,
 };
+use crate::token_store::{
+    OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT, OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT,
+    OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT, OTTTO_REVOCATION_RECEIPT_ACCOUNT,
+};
 use crate::{
     OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE, OTTTO_LEGACY_KEYCHAIN_SERVICE,
     OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
@@ -194,7 +198,38 @@ pub fn plan_local_uninstall(home: &Path) -> UninstallPlan {
             requires_confirmation: true,
             destructive: true,
         },
+        UninstallAction {
+            action: "remove_revocation_receipt".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_REVOCATION_RECEIPT_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
     ];
+    actions.extend(
+        [
+            (
+                "remove_local_release_marker",
+                OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT,
+            ),
+            (
+                "remove_local_release_proof",
+                OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT,
+            ),
+            (
+                "remove_history_browser_claim",
+                OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT,
+            ),
+        ]
+        .into_iter()
+        .map(|(action, account)| UninstallAction {
+            action: action.to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{account}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        }),
+    );
 
     actions.extend(
         TELEMETRY_KEYCHAIN_SERVICES
@@ -523,6 +558,17 @@ fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
 fn remove_keychain_tokens(report: &mut CleanupReport) {
     let mut failures = 0usize;
     for account in [
+        OTTTO_REVOCATION_RECEIPT_ACCOUNT,
+        OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT,
+        OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT,
+        OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT,
+    ] {
+        if let Err(error) = KeychainSecretStore::keychain_only(account).delete() {
+            failures += 1;
+            report.fail(format!("delete history recovery credential: {error}"));
+        }
+    }
+    for account in [
         OTTTO_KEYCHAIN_ACCOUNT,
         OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
         OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
@@ -741,6 +787,22 @@ identifier:                 net.ottto.Companion
                 (
                     "remove_pending_setup_run_credential",
                     "net.ottto.service/pending-setup-run-token"
+                ),
+                (
+                    "remove_revocation_receipt",
+                    "net.ottto.service/revocation-receipt"
+                ),
+                (
+                    "remove_local_release_marker",
+                    "net.ottto.service/local-release-marker"
+                ),
+                (
+                    "remove_local_release_proof",
+                    "net.ottto.service/local-release-device-proof"
+                ),
+                (
+                    "remove_history_browser_claim",
+                    "net.ottto.service/history-browser-claim"
                 ),
             ]
         );
