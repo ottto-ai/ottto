@@ -5519,7 +5519,14 @@ fn prepare_sync_source(
             machine_id,
             &account_witness,
         );
-        if !unknown_recovery::startup(support_dir, &binding, unknown_recovery::now(support_dir))? {
+        let now = unknown_recovery::now(support_dir);
+        if !unknown_recovery::startup(support_dir, &binding, now)? {
+            if unknown_recovery::networking_ready(support_dir, Some(&binding), now) {
+                // Routine custody maintenance parks Claude preparation only.
+                // It is neither a source failure nor permission to POST before
+                // the pending catalog transition has completed.
+                return Ok(None);
+            }
             return Err(crate::source_rotation::LocalRefusal(
                 "request money scheduling checkpoint pending",
             )
