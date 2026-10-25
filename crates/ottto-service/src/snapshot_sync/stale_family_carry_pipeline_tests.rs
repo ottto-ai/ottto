@@ -262,8 +262,7 @@ struct C1bRun {
 fn c1b_without_unrelated_upload_witnesses(fixture: &RearmFixture) {
     let index = ScanIndex::load(&fixture.index_path).unwrap();
     let family = RearmFixture::family_keys(&index)
-        .into_iter()
-        .map(|(_, key)| key)
+        .into_values()
         .collect::<BTreeSet<_>>();
     c1a_edit_index(fixture, |saved| {
         for (key, entry) in saved["files"].as_object_mut().unwrap() {
