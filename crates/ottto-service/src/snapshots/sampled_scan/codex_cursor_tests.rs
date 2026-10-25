@@ -3210,6 +3210,307 @@ fn rotation_serves_waiters_in_turn_and_fences_one_attempt_per_generation() {
     assert_eq!(rotation.attempted.len(), ROTATION_KEYS);
 }
 
+/// G1: a census member's large read takes the slot ahead of every re-read
+/// (growth after its path was processed in this generation), whatever their
+/// rank or wait; among census members the K7 order is unchanged.
+#[test]
+fn rotation_serves_census_members_ahead_of_rereads() {
+    let mut rotation = Rotation {
+        page: 10,
+        ..Rotation::default()
+    };
+    rotation.wait_as("reread", false);
+    rotation.page = 11;
+    rotation.wait_as("member", true);
+    rotation.page = 12;
+    assert!(rotation.turn_as("member", true));
+    assert!(
+        !rotation.turn_as("reread", false),
+        "an older re-read waits behind a census member"
+    );
+    assert!(
+        !rotation.turn_as("new", true),
+        "a newcomer member waits behind an older member"
+    );
+    assert!(
+        !rotation.turn_as("new-reread", false),
+        "a newcomer re-read waits behind every member"
+    );
+    rotation.complete("member", Some("g1"));
+    assert!(
+        rotation.turn_as("reread", false),
+        "no member waits any more"
+    );
+    // A waiter's membership follows its latest plan.
+    rotation.wait_as("reread", true);
+    rotation.page = 13;
+    rotation.wait_as("late", true);
+    assert!(rotation.turn_as("reread", true));
+    assert!(!rotation.turn_as("late", true));
+}
+
+/// G1 (K7 for singletons and re-reads): a Codex watcher hint for a path this
+/// generation already processed (observed, no longer pending) re-enters as
+/// a non-member and is counted; a pending path is not duplicated; a path the
+/// walk has not observed, and every non-Codex hint, stays a census member.
+#[test]
+fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
+    const SESSION_C: &str = "019fa111-2222-7333-8444-777777777701";
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 2), (SESSION_B, 2)]);
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    let walked = index.traversal.as_mut().unwrap();
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        walked,
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    let processed = fixture.file(SESSION);
+    let pending = fixture.file(SESSION_B);
+    let unobserved = fixture.file(SESSION_C);
+    assert!(walked
+        .observed_index_keys
+        .contains(&local_index_key(&processed)));
+    // `processed` was selected and read on an earlier page.
+    walked
+        .pending_candidates
+        .retain(|candidate| candidate.path != processed);
+    assert!(walked
+        .pending_candidates
+        .iter()
+        .any(|candidate| candidate.path == pending && candidate.census_member));
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let mut traversal = walked.clone();
+        let before = traversal.pending_candidates.len();
+        let next_generation = enqueue_watcher_hints(
+            source,
+            &mut traversal,
+            &[processed.clone(), pending.clone(), unobserved.clone()],
+            false,
+        );
+        let flags = |path: &Path| {
+            let matches = traversal
+                .pending_candidates
+                .iter()
+                .filter(|candidate| candidate.path == path)
+                .map(|candidate| (candidate.census_member, candidate.watcher_hint))
+                .collect::<Vec<_>>();
+            assert!(matches.len() <= 1, "{source:?}: one entry per path");
+            matches.first().copied()
+        };
+        let codex = source == SnapshotSource::Codex;
+        assert_eq!(next_generation, u64::from(codex), "{source:?}");
+        assert_eq!(flags(&processed), Some((!codex, true)), "{source:?}");
+        assert_eq!(
+            flags(&pending),
+            Some((true, false)),
+            "{source:?}: the pending census member keeps its entry"
+        );
+        assert_eq!(flags(&unobserved), Some((true, true)), "{source:?}");
+        assert_eq!(traversal.pending_candidates.len(), before + 2);
+    }
+}
+
+/// One page with `hints` as the cycle's watcher paths (`page_selections`
+/// otherwise).
+fn hinted_page(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    hints: &[PathBuf],
+) -> (ScanIndex, SourceScanResult) {
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        index,
+        collected_at,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        hints,
+        false,
+        true,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    loop {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                let mut projected = scan.clone();
+                apply_upload_policy(
+                    SnapshotSource::Codex,
+                    &mut projected.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
+                let accepted = projected
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan);
+            }
+        }
+    }
+}
+
+/// G1/G2 at scan level. Three medium files grow on every page and are
+/// hinted, and their retained state is gone each page (as after a restart or
+/// a cache eviction), so each growth needs a full re-read; together they
+/// exceed the page's singleton budget. A fourth file larger than the budget
+/// is read by the cursor, one slice per page, while it also grows.
+///
+/// Before G1 the re-hinted files re-entered the census on every page and one
+/// was always deferred, so the generation never closed. Now the generation
+/// closes once the large job ends (within `ceil(L/B)` pages plus a small
+/// constant), each page completes a first read ahead of the hints, and the
+/// re-reads are counted as next-generation evidence. After growth stops, the
+/// follow-up generation re-reads every grown file (G2), and the published
+/// totals equal a fresh full read of the final files: no byte lost, none
+/// counted twice.
+#[test]
+fn growing_generation_with_large_file_closes_within_bounded_pages() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const MEDIUM: [&str; 3] = [
+        "019fa111-2222-7333-8444-777777777711",
+        "019fa111-2222-7333-8444-777777777712",
+        "019fa111-2222-7333-8444-777777777713",
+    ];
+    const LARGE: &str = "019fa111-2222-7333-8444-777777777714";
+    const B: u64 = 2048;
+    let fixture =
+        ScanRoot::with_sessions(&[(MEDIUM[0], 4), (MEDIUM[1], 4), (MEDIUM[2], 4), (LARGE, 60)]);
+    let sessions = [MEDIUM[0], MEDIUM[1], MEDIUM[2], LARGE];
+    let medium_len = fixture.len(MEDIUM[0]);
+    // Two medium full reads fit one page's singleton budget, three never do.
+    let singleton = medium_len * 2 + medium_len / 2;
+    assert!(fixture.len(LARGE) > singleton);
+    let bound = fixture.len(LARGE).div_ceil(B) + 4;
+    let cache = Arc::new(SharedCache::default());
+    let mut next_line = [5_u64, 5, 5, 61];
+    let mut latest = BTreeMap::<String, (u64, u64, u64, u64)>::new();
+    let mut record = |scan: &SourceScanResult| {
+        for item in &scan.snapshots {
+            latest.insert(
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            );
+        }
+    };
+    with_test_limits(B, singleton, 64, || {
+        let mut index = ScanIndex::default();
+        let mut page_number = 0_u64;
+        let mut closed = None;
+        while page_number < bound {
+            let hints = if page_number == 0 {
+                Vec::new()
+            } else {
+                sessions.map(|session| fixture.file(session)).to_vec()
+            };
+            let (next, scan) =
+                hinted_page(&fixture, index, &cache, &collected_at(page_number), &hints);
+            index = next;
+            record(&scan);
+            page_number += 1;
+            if scan.census_complete {
+                assert_eq!(
+                    scan.skipped_file_count_due_to_limit, 0,
+                    "census members only"
+                );
+                closed = Some(page_number);
+                break;
+            }
+            // Steady growth; every retained state is gone by the next page.
+            for (session, line) in sessions.iter().zip(next_line.iter_mut()) {
+                fixture.append(session, &token_line(*line));
+                *line += 1;
+            }
+            cache.clear();
+        }
+        let closed = closed.unwrap_or_else(|| {
+            panic!(
+                "the growing generation did not close within {bound} pages: {}",
+                counters(&cache)
+            )
+        });
+        assert!(index.traversal.is_none(), "the closed generation retired");
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified),
+            1
+        );
+        assert!(
+            counter(&cache, |c| c.deferred_next_generation) > 0,
+            "re-reads were counted as next-generation evidence: {}",
+            counters(&cache)
+        );
+        assert!(closed > 1, "the large file really paged");
+        // G2: growth stops; the follow-up generation re-reads every grown
+        // file, including the growth a closed generation left pending.
+        let mut converged = false;
+        for _ in 0..bound * 2 {
+            let (next, scan) =
+                hinted_page(&fixture, index, &cache, &collected_at(page_number), &[]);
+            index = next;
+            record(&scan);
+            page_number += 1;
+            let current = sessions.iter().all(|session| {
+                index
+                    .files
+                    .get(&local_index_key(&fixture.file(session)))
+                    .is_some_and(|entry| entry.size_bytes == fixture.len(session))
+            });
+            if scan.census_complete && current {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the follow-up generation re-read every grown file: {}",
+            counters(&cache)
+        );
+    });
+    // No byte lost, none counted twice: the last published totals per
+    // session equal a fresh full read of the final files.
+    let (_, fresh) = page(&fixture, ScanIndex::default(), None);
+    let expected = fresh
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(expected.len(), sessions.len());
+    assert_eq!(latest, expected);
+}
+
 /// §r sizing at the measured event counts. Prints the figures for the PR;
 /// asserts only invariants. CI only (heavy; never run on the Mac).
 #[test]
