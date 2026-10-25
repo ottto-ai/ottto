@@ -3307,7 +3307,7 @@ fn tag_item(
 }
 
 crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
-crate::heap_layout_bound::fields!(OrgMarker; position, at, org, terminal_trusted);
+crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
 crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_seconds, process_id, inventory);
 
 #[cfg(test)]
