@@ -1366,7 +1366,7 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
     );
     assert_eq!(serde_json::to_vec(&scan.snapshots).unwrap(), body_before);
     let saved_bytes = fs::read(&fixture.index_path).unwrap();
-    assert_eq!(saved_bytes, serde_json::to_vec_pretty(&saved).unwrap());
+    assert_eq!(saved_bytes, serde_json::to_vec(&saved).unwrap());
     assert!(!String::from_utf8(saved_bytes.clone())
         .unwrap()
         .contains("disappearance_process_totals_v1"));
@@ -1387,7 +1387,7 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
         loaded
     });
     assert_eq!(reload_events, [[0; 4]; 3]);
-    assert_eq!(serde_json::to_vec_pretty(&reloaded).unwrap(), saved_bytes);
+    assert_eq!(serde_json::to_vec(&reloaded).unwrap(), saved_bytes);
     assert_eq!(fs::read(&fixture.index_path).unwrap(), saved_bytes);
     let retry = fixture.prepare(reloaded, 1);
     assert_eq!(retry.identified_candidates[0].path, fixture.paths[0]);
