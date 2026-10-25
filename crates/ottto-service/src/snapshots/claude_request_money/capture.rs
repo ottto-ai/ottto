@@ -1902,16 +1902,22 @@ mod bounded_tests {
         }
         let held = capture_reserved() - before;
         // Another native page's families: an interrupted build keeps the
-        // union (40,000 families) ...
+        // union (with half the room left under the ceiling) ...
         let other = set("other");
+        let room = CAPTURE_CEILING_BYTES - capture_reserved();
+        let interrupted = room / 2 / plan_key_bytes(&other[0]);
+        assert!(
+            interrupted >= 1_000,
+            "room for an interrupted build: {room}"
+        );
         assert_eq!(
-            page(&other, 0, 10_000),
+            page(&other, 0, interrupted + 1),
             PlanInstall::Fallback(PlanFailure::Deadline)
         );
         let union = capture_reserved() - before;
         assert!(union > held, "{union} {held}");
         // ... and a third page set, whose own 30,000 families fit but the
-        // 70,000-family union does not, still installs completely.
+        // union with them does not, still installs completely.
         let third = set("third");
         assert_eq!(page(&third, 0, usize::MAX), PlanInstall::Complete);
         assert!(capture_reserved() - before < 2 * one_plan);
@@ -1932,7 +1938,7 @@ mod bounded_tests {
         assert_eq!(capture_reserved(), before + plan_funds_for_test(&support));
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
-        println!("MONEY_P1B_PLAN_FUNDS keys=30000 one_plan_bytes={one_plan} held_bytes={held} interrupted_union_bytes={union} ceiling={CAPTURE_CEILING_BYTES} same_set_pages=3 changed_set_installed=1");
+        println!("MONEY_P1B_PLAN_FUNDS keys=30000 one_plan_bytes={one_plan} held_bytes={held} interrupted_entries={interrupted} interrupted_union_bytes={union} ceiling={CAPTURE_CEILING_BYTES} same_set_pages=3 changed_set_installed=1");
     }
 
     /// Admission inside a running money section charges its time already;

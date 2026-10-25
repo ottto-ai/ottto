@@ -467,9 +467,14 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
     // The page's batch is released by its writer.
     money::store::flush();
     // Every page item's capture was taken (freed); drop any parse of this
-    // scope no item carried, then the capture budget is back to baseline.
+    // scope no item carried, then the capture budget is back to baseline
+    // plus the scope's next-page plan (MONEY round 2: a page of at most 64
+    // families keeps funded scope-wide entries too). Turning the shadow off
+    // below forgets the plan and returns exactly to baseline.
     money::capture::purge_scope_for_test(&fixture.support);
-    assert_eq!(money::capture::capture_reserved(), baseline_reserved);
+    let plan_funds = money::capture::plan_funds_for_test(&fixture.support);
+    assert!(plan_funds > 0);
+    assert_eq!(money::capture::capture_reserved(), baseline_reserved + plan_funds);
     assert_eq!(money::reserved_for_test(), 0);
 
     // Sol R4-3: the kill switch stops capture too. The page that sees it
@@ -531,6 +536,9 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
     let _ = scan(&mut ScanIndex::default());
     assert!(money::capture::capture_reserved() > baseline_reserved);
     money::capture::purge_scope_for_test(&fixture.support);
+    assert_eq!(money::capture::capture_reserved(),
+        baseline_reserved + money::capture::plan_funds_for_test(&fixture.support));
+    money::disable_shadow_for_test(&fixture.support);
     assert_eq!(money::capture::capture_reserved(), baseline_reserved);
     assert_eq!(money::reserved_for_test(), 0);
     let _ = money::take_shadow_lines_for_test();
