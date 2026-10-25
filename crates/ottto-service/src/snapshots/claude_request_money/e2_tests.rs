@@ -854,12 +854,27 @@ fn org_hash(org: &str) -> String {
 fn tag_owned(mut items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
     let api = ClaudeLocalOtelLoadReport::default();
     let trace = ClaudeTraceOwnershipLoadReport::default();
-    let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let per_file_originals = claude_request_identity::capture_request_owned_originals(&items);
+    // Production's legacy map collapses twins; E2 activity must not use it.
+    let originals = items
+        .iter()
+        .filter_map(|item| {
+            item.session_account_evidence
+                .clone()
+                .map(|original| (item.source_session_id.clone(), original))
+        })
+        .collect();
+    let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+        .with_native_originals(&originals);
     claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
     let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     let ownership = claude_request_identity::TranscriptOwnership::after_census(index, &disposition);
-    let activity =
-        claude_request_identity::stage_request_owned_activity(&items, &evidence, &ownership);
+    let activity = claude_request_identity::stage_request_owned_activity(
+        &items,
+        &evidence,
+        &ownership,
+        &per_file_originals,
+    );
     let withheld = finish_page(&mut items, index, TelemetryRead::Loaded);
     assert!(
         withheld.is_empty(),
@@ -1789,7 +1804,7 @@ fn e2_identity_recent_desktop_activity_survives_discarded_twin_in_both_orders() 
             let cli = root_file("identity-activity-cli-twin");
             let desktop_path = root_file("identity-activity-desktop-twin");
             let index = ScanIndex::default();
-            let older = parse(
+            let mut older = parse(
                 &cli,
                 Some(t0()),
                 &index,
@@ -1823,6 +1838,17 @@ fn e2_identity_recent_desktop_activity_survives_discarded_twin_in_both_orders() 
                 evidence_source: "claude_desktop_original:v1",
                 identity_disposition: Some("complete"),
                 source_created_at: Some(clock),
+            });
+            older.source_file_fingerprint = Some("synthetic-cli-physical-source".into());
+            recent.source_file_fingerprint = Some("synthetic-desktop-physical-source".into());
+            older.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+                provider: "anthropic",
+                account_identifier_hash: None,
+                provider_workspace_hash: None,
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "claude_desktop_original:v1",
+                identity_disposition: Some("missing"),
+                source_created_at: None,
             });
             let mut items = if reverse {
                 vec![recent, older]

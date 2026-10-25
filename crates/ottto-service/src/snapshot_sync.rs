@@ -8448,6 +8448,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 .map(|original| (item.source_session_id.clone(), original))
         })
         .collect();
+    let request_owned_originals =
+        crate::snapshots::claude_request_identity::capture_request_owned_originals(
+            &scan_result.snapshots,
+        );
     let mut session_ids = claude_evidence_session_ids(&scan_result.snapshots)
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -8661,12 +8665,14 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
         let ownership =
             crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
-                index, &disposition,
+                index,
+                &disposition,
             );
         crate::snapshots::claude_request_identity::stage_request_owned_activity(
             &scan_result.snapshots,
             evidence,
             &ownership,
+            &request_owned_originals,
         )
     });
     // E2 bodies are final before any identity owner runs: contract 5, D1 and

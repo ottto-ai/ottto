@@ -2755,7 +2755,8 @@ pub(crate) fn apply_scan(
 ) -> ScanOutcome {
     static NONE: Duplicates = BTreeMap::new();
     let ownership = TranscriptOwnership { duplicates: &NONE };
-    let activity = stage_request_owned_activity(snapshots, evidence, &ownership);
+    let originals = capture_request_owned_originals(snapshots);
+    let activity = stage_request_owned_activity(snapshots, evidence, &ownership, &originals);
     let outcome = apply_scan_with_ownership(snapshots, evidence, reported, &ownership);
     publish_request_owned_activity(snapshots, activity);
     outcome
@@ -2784,6 +2785,43 @@ pub(crate) fn apply_scan_with_ownership(
     outcome
 }
 
+/// Each physical source's pre-enrichment native original, not a session-keyed
+/// projection where path twins can overwrite one another's creator evidence.
+#[derive(Default)]
+pub(crate) struct RequestOwnedOriginals(
+    BTreeMap<(String, Option<String>), Option<super::SessionAccountEvidence>>,
+);
+
+pub(crate) fn capture_request_owned_originals(items: &[SnapshotItem]) -> RequestOwnedOriginals {
+    let mut originals = RequestOwnedOriginals::default();
+    if !super::claude_request_money::e2::enabled() {
+        return originals;
+    }
+    for item in items {
+        if item.claude_money.is_none()
+            || !item
+                .claude_usage_occurrences
+                .values()
+                .any(|occurrence| occurrence.desktop_request)
+        {
+            continue;
+        }
+        originals
+            .0
+            .entry((
+                item.source_session_id.clone(),
+                item.source_file_fingerprint.clone(),
+            ))
+            .and_modify(|original| {
+                if original.as_ref() != item.session_account_evidence.as_ref() {
+                    *original = None;
+                }
+            })
+            .or_insert_with(|| item.session_account_evidence.clone());
+    }
+    originals
+}
+
 /// Bounded validated activity, kept only across final twin removal/tagging.
 #[derive(Default)]
 pub(crate) struct RequestOwnedActivity(
@@ -2794,6 +2832,7 @@ pub(crate) fn stage_request_owned_activity(
     items: &[SnapshotItem],
     evidence: &ScanEvidence<'_>,
     ownership: &TranscriptOwnership<'_>,
+    originals: &RequestOwnedOriginals,
 ) -> RequestOwnedActivity {
     let mut page = RequestOwnedActivity::default();
     if !super::claude_request_money::e2::enabled() {
@@ -2823,7 +2862,18 @@ pub(crate) fn stage_request_owned_activity(
         page.0
             .entry(item.source_session_id.clone())
             .or_default()
-            .push(collect_request_owned_activity(item, evidence, ownership));
+            .push(collect_request_owned_activity(
+                item,
+                evidence,
+                ownership,
+                originals
+                    .0
+                    .get(&(
+                        item.source_session_id.clone(),
+                        item.source_file_fingerprint.clone(),
+                    ))
+                    .and_then(Option::as_ref),
+            ));
     }
     page
 }
@@ -2856,16 +2906,13 @@ fn collect_request_owned_activity(
     item: &SnapshotItem,
     evidence: &ScanEvidence<'_>,
     ownership: &TranscriptOwnership<'_>,
+    original: Option<&super::SessionAccountEvidence>,
 ) -> crate::desktop_recent::RecentActivity {
     let Some(fold) = item.claude_money.as_deref() else {
         return Default::default();
     };
     let Some(root) = owner_root(item) else {
         return Default::default();
-    };
-    let original = match evidence.native_originals {
-        Some(originals) => originals.get(&item.source_session_id),
-        None => item.session_account_evidence.as_ref(),
     };
     let mut activity = crate::desktop_recent::RecentActivity::default();
     for (request_id, occurrence) in &item.claude_usage_occurrences {
