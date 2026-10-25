@@ -4152,7 +4152,8 @@ struct ClaudeAccountFamilyWitness {
     member_request_id_fingerprints: BTreeMap<String, String>,
 }
 
-// Only the account-family proof uses this version. Usage proofs retain v1.
+// Version the packed pending layout; retain canonical full-set fingerprints
+// so upgrading storage does not force transcript rereads or revoke valid proof.
 const CLAUDE_ACCOUNT_REQUEST_SET_VERSION: &str = "claude_account_request_set:v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4170,11 +4171,7 @@ impl Serialize for ClaudeAccountRequestSet {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        let digest = self
-            .fingerprint
-            .strip_prefix(CLAUDE_ACCOUNT_REQUEST_SET_VERSION)
-            .and_then(|value| value.strip_prefix(':'))
-            .ok_or_else(|| serde::ser::Error::custom("invalid account request-set version"))?;
+        let digest = &self.fingerprint;
         let revision = self
             .identity_revision
             .as_deref()
@@ -4217,7 +4214,7 @@ impl<'de> Deserialize<'de> for ClaudeAccountRequestSet {
         }
         Ok(Self {
             prefixes: prefixes.to_string(),
-            fingerprint: format!("{CLAUDE_ACCOUNT_REQUEST_SET_VERSION}:{digest}"),
+            fingerprint: digest.to_string(),
             identity_revision: identity_revision.map(str::to_string),
         })
     }
@@ -4246,7 +4243,7 @@ impl ClaudeAccountRequestSet {
         }
         Some(Self {
             prefixes: base64::engine::general_purpose::STANDARD_NO_PAD.encode(packed),
-            fingerprint: claude_account_request_id_set_fingerprint(hashes),
+            fingerprint: claude_request_id_set_fingerprint(hashes),
             identity_revision: None,
         })
     }
@@ -4261,9 +4258,7 @@ impl ClaudeAccountRequestSet {
                 .chunks_exact(8)
                 .zip(bytes.chunks_exact(8).skip(1))
                 .all(|(left, right)| left < right)
-            && self
-                .fingerprint
-                .starts_with(CLAUDE_ACCOUNT_REQUEST_SET_VERSION))
+            && is_snapshot_fingerprint(&self.fingerprint))
         .then_some(bytes)
     }
 }
@@ -7376,7 +7371,7 @@ pub fn apply_claude_effort_evidence_with_index(
             witness
                 .member_request_id_fingerprints
                 .values()
-                .any(|fp| !fp.starts_with(CLAUDE_ACCOUNT_REQUEST_SET_VERSION))
+                .any(|fp| !is_snapshot_fingerprint(fp))
         })
         .map(|(root, _)| root.clone())
         .collect::<BTreeSet<_>>();
@@ -7419,7 +7414,7 @@ pub fn apply_claude_effort_evidence_with_index(
                     || witness
                         .member_request_id_fingerprints
                         .values()
-                        .any(|fp| !fp.starts_with(CLAUDE_ACCOUNT_REQUEST_SET_VERSION)))
+                        .any(|fp| !is_snapshot_fingerprint(fp)))
                     && complete_family_members.contains_key(root_session_id))
                 .then_some(root_session_id.clone())
             })
@@ -7447,7 +7442,7 @@ pub fn apply_claude_effort_evidence_with_index(
                         witness
                             .member_request_id_fingerprints
                             .values()
-                            .all(|fp| fp.starts_with(CLAUDE_ACCOUNT_REQUEST_SET_VERSION))
+                            .all(|fp| is_snapshot_fingerprint(fp))
                             && members == &witness.members.keys().cloned().collect::<BTreeSet<_>>()
                             && members
                                 == &witness
@@ -12019,20 +12014,6 @@ fn claude_account_identity_revision(
     ]))
 }
 
-fn claude_account_request_id_set_fingerprint(hashes: &BTreeSet<String>) -> String {
-    let mut digest = Sha256::new();
-    digest.update(CLAUDE_ACCOUNT_REQUEST_SET_VERSION.as_bytes());
-    digest.update(b"\0");
-    for hash in hashes {
-        digest.update(hash.as_bytes());
-        digest.update(b"\0");
-    }
-    format!(
-        "{CLAUDE_ACCOUNT_REQUEST_SET_VERSION}:{:x}",
-        digest.finalize()
-    )
-}
-
 fn apply_claude_effort_evidence_with_families(
     snapshots: &mut [SnapshotItem],
     evidence_by_session: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
@@ -12162,7 +12143,7 @@ fn apply_claude_family_account_evidence(
                 claude_snapshot_request_id_hashes(item).map(|request_id_hashes| {
                     (
                         item.source_session_id.clone(),
-                        claude_account_request_id_set_fingerprint(&request_id_hashes),
+                        claude_request_id_set_fingerprint(&request_id_hashes),
                     )
                 })
             })
@@ -58989,7 +58970,7 @@ mod tests {
                             .expect("fixture has one request id per request");
                         (
                             item.source_session_id.clone(),
-                            claude_account_request_id_set_fingerprint(&request_id_hashes),
+                            claude_request_id_set_fingerprint(&request_id_hashes),
                         )
                     })
                     .collect(),
@@ -61880,6 +61861,40 @@ mod tests {
     }
 
     #[test]
+    fn claude_account_pending_storage_upgrade_keeps_canonical_witness_without_reread() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        let witness = index.claude_account_family_witnesses[&root].clone();
+        for item in &items {
+            assert_eq!(
+                witness.member_request_id_fingerprints[&item.source_session_id],
+                claude_request_id_set_fingerprint(
+                    &claude_snapshot_request_id_hashes(item).unwrap()
+                )
+            );
+        }
+        let files = serde_json::to_value(&index.files).unwrap();
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        assert_eq!(index.claude_account_family_witnesses[&root], witness);
+        assert_eq!(serde_json::to_value(&index.files).unwrap(), files);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn claude_account_pending_prefix_collision_holds_within_and_across_members() {
         let one = "0123456789abcdef".to_string() + &"1".repeat(48);
         let two = "0123456789abcdef".to_string() + &"2".repeat(48);
@@ -61923,7 +61938,7 @@ mod tests {
             .member_request_id_fingerprints
             .values_mut()
         {
-            *fingerprint = "b".repeat(64);
+            *fingerprint = format!("unsupported_account_set:v0:{}", "b".repeat(64));
         }
         let acks = old_version.accepted_snapshot_fingerprints.clone();
         let bindings = old_version.session_account_bindings.clone();
