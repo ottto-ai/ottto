@@ -411,6 +411,7 @@ pub(crate) fn disable_shadow_for_test(support_dir: &Path) {
 fn shadow_enabled(support_dir: &Path) -> bool {
     #[cfg(test)]
     {
+        sleep_for_test(&SHADOW_ENABLED_DELAY_FOR_TEST);
         SHADOW_ENABLED_FOR_TEST
             .lock()
             .expect("shadow control")
@@ -1202,6 +1203,8 @@ thread_local! {
 // slow filesystem, a blocked log sink), on the test's own thread.
 #[cfg(test)]
 thread_local! {
+    static SHADOW_ENABLED_DELAY_FOR_TEST: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
     static KILL_SWITCH_DELAY_FOR_TEST: std::cell::Cell<Duration> =
         const { std::cell::Cell::new(Duration::ZERO) };
     static LOG_WRITE_DELAY_FOR_TEST: std::cell::Cell<Duration> =
@@ -1214,6 +1217,11 @@ fn sleep_for_test(delay: &'static std::thread::LocalKey<std::cell::Cell<Duration
     if !delay.is_zero() {
         std::thread::sleep(delay);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn set_shadow_enabled_delay_for_test(delay: Duration) {
+    SHADOW_ENABLED_DELAY_FOR_TEST.with(|current| current.set(delay));
 }
 
 #[cfg(test)]

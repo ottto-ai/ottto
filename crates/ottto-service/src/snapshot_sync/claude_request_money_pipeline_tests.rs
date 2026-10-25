@@ -1936,6 +1936,7 @@ fn money_p1b_slow_native_scan_page_is_admitted_and_builds() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_steps_outside_the_body_are_charged_to_money_us() {
+    const ENABLE_CHECK: std::time::Duration = std::time::Duration::from_millis(20);
     const KILL_SWITCH: std::time::Duration = std::time::Duration::from_millis(60);
     const LOG_WRITE: std::time::Duration = std::time::Duration::from_millis(40);
     let (fixture, index, scan) = money_armed_scan("money-p1b-steps-outside-body");
@@ -1947,10 +1948,12 @@ fn money_p1b_steps_outside_the_body_are_charged_to_money_us() {
             &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), scan.census_complete,
             &money::coverage::InterimFamilyCoverage::default());
     };
+    money::set_shadow_enabled_delay_for_test(ENABLE_CHECK);
     money::set_money_step_delays_for_test(KILL_SWITCH, LOG_WRITE);
     let started = std::time::Instant::now();
     page();
     let first_wall = started.elapsed();
+    money::set_shadow_enabled_delay_for_test(std::time::Duration::ZERO);
     money::set_money_step_delays_for_test(std::time::Duration::ZERO, std::time::Duration::ZERO);
     money::store::flush();
     page();
@@ -1961,6 +1964,8 @@ fn money_p1b_steps_outside_the_body_are_charged_to_money_us() {
     let first_capture = first["capture_us"].as_u64().unwrap();
     let first_elapsed = first["elapsed_us"].as_u64().unwrap();
     assert!(first_elapsed >= KILL_SWITCH.as_micros() as u64, "the kill-switch lookup is inside the page clock: {first}");
+    assert!(first_elapsed >= (ENABLE_CHECK + KILL_SWITCH).as_micros() as u64,
+        "shadow_enabled and the kill-switch lookup are both inside the page clock: {first}");
     assert!(first.get("money_us").is_none(), "a line cannot carry its own write time: {first}");
     let previous = second["previous_page_money_us"].as_u64().unwrap();
     assert!(previous >= first_capture + first_elapsed + LOG_WRITE.as_micros() as u64,

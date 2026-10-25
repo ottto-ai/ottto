@@ -22,7 +22,7 @@ use super::super::{rfc3339_unix_seconds, ClaudeTranscriptUsageOccurrence, UsageT
 use super::ClaudeMoneyTokens;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,54 @@ const PAGE_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const PAGE_COMPARISONS: usize = 1_048_576;
 const PAGE_CAPTURE_US: u64 = 100_000;
 static WORK: Mutex<BTreeMap<PathBuf, Work>> = Mutex::new(BTreeMap::new());
+
+// Production has one capture scope, and SNAPSHOT_SYNC_LOCK serializes its
+// pages. Mirror the page latch so later files return before arming takes a
+// lock or clones a scope. Tests have independent scopes on parallel threads.
+static PAGE_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+
+// Normal tests isolate scopes; one regression opts its thread into the
+// actual production latch. Other test threads never read or mutate it.
+fn uses_process_latch() -> bool {
+    #[cfg(test)]
+    {
+        PROCESS_LATCH_FOR_TEST.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+pub(super) fn page_exhausted(scope: &Path) -> bool {
+    #[cfg(test)]
+    if !uses_process_latch() {
+        return WORK.lock().map_or(true, |pages| {
+            pages.get(scope).is_some_and(|work| work.exhausted)
+        });
+    }
+    let _ = scope;
+    PAGE_EXHAUSTED.load(Ordering::Acquire)
+}
+
+/// Check before arming (which locks and, in tests, clones the scope).
+/// Arming and plan eligibility stay independent of the current page's work:
+/// the next-page finalizer probe selects its inputs before resetting Work.
+fn page_exhausted_for_file(path: &Path) -> bool {
+    #[cfg(test)]
+    if !uses_process_latch() {
+        return super::SHADOW_ENABLED_FOR_TEST
+            .lock()
+            .map_or(true, |scopes| {
+                scopes
+                    .iter()
+                    .find(|dir| dir.parent().is_some_and(|base| path.starts_with(base)))
+                    .is_some_and(|scope| page_exhausted(scope))
+            });
+    }
+    let _ = path;
+    PAGE_EXHAUSTED.load(Ordering::Acquire)
+}
 
 /// After a cold page, focus the next Full parse on the oldest 64 family
 /// turns. Gating optional capture leaves native file/finalizer order alone.
@@ -485,6 +533,9 @@ pub(crate) fn set_plan_deadline_for_test(expired: bool) {
 }
 
 pub(crate) fn begin_page(scope: &Path) {
+    if uses_process_latch() {
+        PAGE_EXHAUSTED.store(false, Ordering::Release);
+    }
     if let Ok(mut work) = WORK.lock() {
         work.insert(scope.to_path_buf(), Work::default());
     }
@@ -519,6 +570,8 @@ struct MoneyTimer {
 }
 impl MoneyTimer {
     fn new(scope: &Path, started: Instant) -> Self {
+        #[cfg(test)]
+        TIMER_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         let owns_section = WORK.lock().is_ok_and(|mut pages| {
             let work = pages.entry(scope.to_path_buf()).or_default();
             start_page_clock(work, started);
@@ -605,6 +658,9 @@ fn spend_work(scope: &Path, bytes: usize, comparisons: usize) -> bool {
             || work.micros.saturating_add(running) >= PAGE_CAPTURE_US
         {
             work.exhausted = true;
+            if uses_process_latch() {
+                PAGE_EXHAUSTED.store(true, Ordering::Release);
+            }
             return false;
         }
         work.input = input;
@@ -742,6 +798,9 @@ impl ClaudeResponseCapture {
     /// A capture for the Claude file at `path`, or None when the shadow is
     /// not armed for it.
     pub(crate) fn begin(path: &Path) -> Option<Self> {
+        if page_exhausted_for_file(path) {
+            return None;
+        }
         let started = Instant::now();
         let mut scope = None;
         super::guarded(|| scope = super::capture_armed(path));
@@ -762,10 +821,14 @@ impl ClaudeResponseCapture {
     /// latch (the shadow is off for the process), the capture is refused
     /// and never deposited, and the live parse goes on unchanged.
     fn contained(&mut self, run: impl FnOnce(&mut Self)) {
-        let _timer = MoneyTimer::new(&self.scope, Instant::now());
         if self.refused {
             return;
         }
+        if page_exhausted(&self.scope) {
+            self.refuse();
+            return;
+        }
+        let _timer = MoneyTimer::new(&self.scope, Instant::now());
         if !spend_work(&self.scope, 0, 1) {
             self.refuse();
             return;
@@ -978,10 +1041,14 @@ impl ClaudeResponseCapture {
     /// hashes the id (the native parse keeps it unhashed), so this is money
     /// work: timed and admitted against the page's capture input first.
     pub(crate) fn request_hash(&mut self, request_id: &str) -> Option<u64> {
-        let _timer = MoneyTimer::new(&self.scope, Instant::now());
         if self.refused {
             return None;
         }
+        if page_exhausted(&self.scope) {
+            self.refuse();
+            return None;
+        }
+        let _timer = MoneyTimer::new(&self.scope, Instant::now());
         if !spend_work(&self.scope, request_id.len(), 0) {
             self.refuse();
             return None;
@@ -1090,6 +1157,9 @@ impl ClaudeResponseCapture {
     /// The store key and fingerprint are built here, inside the money timer:
     /// they are money-only work.
     pub(crate) fn deposit(self, path: &Path, fingerprint: &str) {
+        if self.refused || page_exhausted(&self.scope) {
+            return;
+        }
         let _timer = MoneyTimer::new(&self.scope, Instant::now());
         if super::SHADOW_PANICKED.load(Ordering::Acquire) || !spend_work(&self.scope, 0, 0) {
             return;
@@ -1244,8 +1314,8 @@ pub(crate) fn planned_families_for_test(
         })
 }
 
-/// Whether `begin` would capture `path` now (its scope armed and its plan
-/// allowing the family), without spending capture work.
+/// Whether the scope is armed and its plan allows `path` on the next native
+/// page, independent of the current page's spent capture work.
 #[cfg(test)]
 pub(crate) fn capture_eligible_for_test(path: &Path) -> bool {
     super::capture_armed(path).is_some_and(|scope| capture_eligible(&scope, path))
@@ -1298,6 +1368,12 @@ pub(crate) fn work_for_test(scope: &Path) -> (usize, usize, u64) {
     let pages = WORK.lock().unwrap();
     let work = pages.get(scope).expect("page capture budget installed");
     (work.input, work.comparisons, work.micros)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TIMER_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROCESS_LATCH_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -2009,6 +2085,80 @@ mod bounded_tests {
             WORK.lock().unwrap()[&scope].section.is_none(),
             "an ended section stops charging"
         );
+    }
+
+    /// Refusal is a constant-work fast path, even when a file still has
+    /// many finalizers and the native page still has many files to parse.
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn exhausted_capture_constructs_no_timers_and_allocates_nothing() {
+        assert_exhausted_capture_fast_path();
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn production_exhaustion_latch_constructs_no_timers_and_allocates_nothing() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PROCESS_LATCH_FOR_TEST.with(|enabled| enabled.set(false));
+            }
+        }
+        PROCESS_LATCH_FOR_TEST.with(|enabled| assert!(!enabled.replace(true)));
+        let _reset = Reset;
+        assert_exhausted_capture_fast_path();
+    }
+
+    fn assert_exhausted_capture_fast_path() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-exhausted-fast-path");
+        let scope = scratch.join("support");
+        let path = scratch.join("transcript.jsonl");
+        super::super::enable_shadow_for_test(&scope);
+        let mut capture = ClaudeResponseCapture::begin(&path).expect("armed capture");
+        let pending_deposit = ClaudeResponseCapture::begin(&path).expect("second capture");
+        let mut pending_finalizer = ClaudeResponseCapture::begin(&path).expect("third capture");
+        WORK.lock().unwrap().get_mut(&scope).unwrap().micros = PAGE_CAPTURE_US;
+        assert_eq!(capture.request_hash("exhaust"), None);
+        assert!(capture.is_refused());
+        assert!(page_exhausted(&scope));
+        assert!(
+            capture_eligible_for_test(&path),
+            "next-page plan eligibility ignores the current page's spent work"
+        );
+        let timers = TIMER_CONSTRUCTIONS.with(std::cell::Cell::get);
+        let work = work_for_test(&scope);
+        let (_, allocations) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            // Captures created before another capture exhausted the page
+            // also refuse before constructing a timer.
+            pending_finalizer.contained(|_| panic!("exhausted page ran a finalizer"));
+            pending_deposit.deposit(&path, "fingerprint");
+            for _ in 0..4096 {
+                capture.contained(|_| panic!("refused capture ran a finalizer"));
+                capture.note_messages(std::iter::once((0, "message")));
+                assert_eq!(capture.request_hash("request"), None);
+                assert!(ClaudeResponseCapture::begin(&path).is_none());
+            }
+            capture.deposit(&path, "fingerprint");
+        });
+        assert!(pending_finalizer.is_refused());
+        assert_eq!(TIMER_CONSTRUCTIONS.with(std::cell::Cell::get), timers);
+        assert_eq!(allocations.allocations, 0, "{allocations:?}");
+        assert_eq!(
+            work_for_test(&scope),
+            work,
+            "refused callbacks charge no work"
+        );
+        assert!(take_capture(
+            &scope,
+            &super::super::super::local_index_key(&path),
+            "fingerprint"
+        )
+        .is_none());
+        // Only an explicit new native page clears the refusal.
+        begin_page(&scope);
+        assert!(ClaudeResponseCapture::begin(&path).is_some());
+        super::super::disable_shadow_for_test(&scope);
+        println!("MONEY_P1B_EXHAUSTED callbacks=4096 timer_constructions_after_refusal=0 allocations_after_refusal=0 new_page_rearms=1");
     }
 
     /// Hashing a displaced response's request id is shadow-only work: it is
