@@ -18,6 +18,7 @@ fn waker() -> &'static Waker {
 type Finish = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 struct PendingFinish {
     future: Finish,
+    completed: bool,
     started_unix: u64,
     recovery_binding: String,
     support_dir: PathBuf,
@@ -35,7 +36,9 @@ impl Drop for PendingFinish {
         // A queued writer may have committed a send intent/counter after the
         // last poll. The next owner must reload it rather than reuse a stale
         // catalog and rearm a consumed physical slot.
-        super::unknown_recovery::invalidate(&self.support_dir);
+        if !self.completed {
+            super::unknown_recovery::invalidate(&self.support_dir);
+        }
     }
 }
 static PENDING: Mutex<Option<PendingFinish>> = Mutex::new(None);
@@ -300,6 +303,10 @@ impl Memory {
 fn poll(mut pending: PendingFinish) -> Result<()> {
     match immediate(pending.future.as_mut()) {
         Some(result) => {
+            // A completed future has consumed its writer results. Independent
+            // outcome tickets remain owned by the current catalog. Only an
+            // interrupted future can leave an unseen durable counter.
+            pending.completed = true;
             record_refusal(&pending.support_dir, &result);
             result
         }
@@ -547,6 +554,7 @@ fn start_admitted(
     };
     poll(PendingFinish {
         future: Box::pin(future),
+        completed: false,
         started_unix: super::unknown_recovery::now(support_dir),
         recovery_binding,
         support_dir: support_dir.to_owned(),

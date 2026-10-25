@@ -3284,6 +3284,31 @@ fn p2a_denied_original_literal_cannot_create_an_authorized_replay_intent() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_completed_finish_keeps_catalog_and_quiet_privacy_cycles_ready() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    control.cycle();
+    assert!(
+        unknown_recovery::initialized(&control.support),
+        "completed finish must retain its reconciled catalog; cancellation still invalidates"
+    );
+    let now = current_unix_seconds();
+    control.recovery_startup(now);
+    assert!(unknown_recovery::offline_startup(&control.support, now).unwrap());
+    assert!(unknown_recovery::offline_startup(&control.support, now).unwrap());
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_account_change_after_restart_retires_bytes_with_same_device_credentials() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
