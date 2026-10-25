@@ -2010,7 +2010,15 @@ fn request_owned_grouping(
             }),
             None => IdentityRef::Missing,
         };
-        grouping.add(bucket, &row_key_from_model_usage(&row), &usage, identity);
+        // E2 grains carry no per-request clock, so they never decide the
+        // local current account (#775); their totals still group exactly.
+        grouping.add_at(
+            bucket,
+            &row_key_from_model_usage(&row),
+            &usage,
+            identity,
+            None,
+        );
     })?;
     Some(grouping)
 }
