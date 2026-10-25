@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 843,
-  "content_sha256": "bb98666dbcdf2c5ee49bc57c9a5c1a425df1a4a086bde762a08a4e14068cec29",
+  "content_sha256": "a01bf861759bc3ed62a01a677a360d5a42bf1002ac4fb5c5654df490c4973a50",
   "files": [
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "9080500c9e38a50237988a0e56cc1f3565d6c684f15ef931085750971146c275",
-      "size_bytes": 993289
+      "sha256": "4669fdbcb09f3cc475c2db66111d056c58b8706989a8ea69bb2fd1d6a1f3a623",
+      "size_bytes": 998919
     },
     {
       "executable": false,
@@ -1539,8 +1539,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/money_resume.rs",
-      "sha256": "a0880a6d45a738886839aa2bcdb2dd863e420c709b2c389fd3b67ddfe65933e5",
-      "size_bytes": 25505
+      "sha256": "8a9f3159eca30f766021f9f1a84f2e441df592ecb004ff70176b7879420a45f1",
+      "size_bytes": 26038
     },
     {
       "executable": false,
@@ -1560,8 +1560,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/p2a_round3_tests.rs",
-      "sha256": "2ef4339870afea883772eeb00659bf2d870453b904a593598a1a86f4cbdcddfe",
-      "size_bytes": 194486
+      "sha256": "286086d5bb3d85bdb9a65cc27549debe34d080f7ab26d50472273d00e9eb9de1",
+      "size_bytes": 208602
     },
     {
       "executable": false,
@@ -1637,8 +1637,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/unknown_recovery.rs",
-      "sha256": "5cf7ecea1558202dcb5adf7e5b1a4c9d7319deb9a80e28c8ce3aebc7ce2a2b01",
-      "size_bytes": 95235
+      "sha256": "3de86459be49b6a3b2a25c76845adb0a64fd6a2e9a2938846e30e1c0f4f25b37",
+      "size_bytes": 102034
     },
     {
       "executable": false,
@@ -1651,8 +1651,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c3de73187044a31895fdf32f20ca4bc74df8b28929975757136f20616f9548b5",
-      "size_bytes": 3483771
+      "sha256": "eaed368bd7c60a606c03d872a2400a5994a41c978974ebb759b9dbfa513a7a2f",
+      "size_bytes": 3486221
     },
     {
       "executable": false,
@@ -5904,7 +5904,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-25T03:32:56+00:00",
+  "generated_at": "2026-10-25T04:45:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 844,
   "public_roots": [
@@ -5943,5 +5943,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "829c2faada9a62e72eabee7f5298ac6cf94018a1"
+  "source_commit": "ebfd5daaa434e80d0a84d97b3a5e64cc376d855e"
 }
