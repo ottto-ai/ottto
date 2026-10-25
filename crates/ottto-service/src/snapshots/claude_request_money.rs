@@ -114,6 +114,10 @@ const FIRST_FAMILY_CLOSE_RESERVE: Duration = Duration::from_millis(70);
 /// before the first scheduled family's floor: that family's own setup and
 /// body always have this window.
 const FIRST_FAMILY_SETUP_RESERVE: Duration = Duration::from_millis(60);
+/// Acknowledgements stop this far before the setup stop, so scheduling
+/// usually keys every root before family zero (past the stop it selects
+/// family zero from the roots keyed so far).
+const SCHEDULE_SETUP_RESERVE: Duration = Duration::from_millis(30);
 const TELEMETRY_MAX_ELAPSED: Duration = Duration::from_millis(20);
 /// A growing structure's admission step.
 const GROWTH_STEP_BYTES: usize = 256 * 1024;
@@ -568,6 +572,8 @@ pub(crate) enum PageFault {
     SetupOverrun,
     /// Common setup used everything up to its stop.
     SetupStall,
+    /// Scheduling used everything up to the setup stop after keying one root.
+    ScheduleStall,
     /// The batch's admission is refused.
     BatchRefused,
     WriteFailure,
@@ -826,6 +832,8 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) plan_install_failed: u64,
     /// A page with fresh captures built no family: no coverage progress.
     pub(crate) full_page_zero_built: u64,
+    /// Roots keyed after family zero: scheduling reached the setup stop.
+    pub(crate) families_keyed_after_first: u64,
     pub(crate) capture_reserved_bytes: u64,
     pub(crate) work_stopped: u64,
     pub(crate) telemetry_retired_pressure: u64,
@@ -1364,22 +1372,80 @@ struct PageClaims<'k> {
     first_event: BTreeMap<String, u64>,
 }
 
-/// The telemetry key of each page root with rows, from its admitted
-/// scheduling key.
+/// The telemetry key of each page root with rows: from its scheduling key
+/// when keyed, else hashed. None when the deadline passed.
 fn page_claim_keys<'r>(
     order: &[(&'r str, String, u64)],
+    unkeyed: impl Iterator<Item = &'r str>,
     api_report: &ClaudeLocalOtelLoadReport,
-) -> Vec<(&'r str, String)> {
-    order
-        .iter()
-        .filter(|(root, _, _)| api_report.evidence.contains_key(*root))
-        .map(|(root, key, _)| {
-            (
-                *root,
-                format!("{TELEMETRY_KEY_PREFIX}{}", &key[FAMILY_KEY_PREFIX.len()..]),
-            )
-        })
-        .collect()
+    deadline: Instant,
+) -> Option<Vec<(&'r str, String)>> {
+    let mut keys = Vec::new();
+    let keyed = order.iter().map(|(root, key, _)| (*root, Some(key)));
+    for (root, key) in keyed.chain(unkeyed.map(|root| (root, None))) {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if !api_report.evidence.contains_key(root) {
+            continue;
+        }
+        keys.push((
+            root,
+            key.map_or_else(
+                || telemetry_key(root),
+                |key| format!("{TELEMETRY_KEY_PREFIX}{}", &key[FAMILY_KEY_PREFIX.len()..]),
+            ),
+        ));
+    }
+    Some(keys)
+}
+
+/// A root's scheduling entry: its family key and turn.
+fn schedule_entry<'r>(
+    scope_key: &Path,
+    ledger: &ClaudeLedger,
+    root: &'r str,
+) -> (&'r str, String, u64) {
+    let key = family_key(root);
+    let published_turn = ledger.get(&key).map_or(0, |record| record.window());
+    let turn = capture::scheduling_turn(scope_key, &key, published_turn);
+    (root, key, turn)
+}
+
+/// The producer's total schedule order, which the capture plan also uses.
+/// Stable input ordering differs after a rotation and cannot break
+/// equal-turn ties safely.
+fn schedule_order(left: &(&str, String, u64), right: &(&str, String, u64)) -> std::cmp::Ordering {
+    left.2.cmp(&right.2).then_with(|| left.1.cmp(&right.1))
+}
+
+/// After family zero: key the roots scheduling did not reach and order the
+/// rest of the page (family zero keeps its place). Charged to money time
+/// like every deadline row it feeds.
+fn complete_schedule<'r>(
+    order: &mut Vec<(&'r str, String, u64)>,
+    unkeyed: &mut impl Iterator<Item = &'r str>,
+    scope_key: &Path,
+    ledger: &ClaudeLedger,
+    done: &mut bool,
+    counts: &mut ClaudeRequestMoneyShadowCounts,
+) {
+    if std::mem::replace(done, true) {
+        return;
+    }
+    let keyed = order.len();
+    order.extend(unkeyed.map(|root| schedule_entry(scope_key, ledger, root)));
+    counts.families_keyed_after_first = (order.len() - keyed) as u64;
+    if order.len() > 1 {
+        order[1..].sort_by(schedule_order);
+    }
+    #[cfg(test)]
+    PAGE_SCHEDULE.with(|schedule| {
+        *schedule.borrow_mut() = order
+            .iter()
+            .map(|(root, _, _)| (*root).to_owned())
+            .collect();
+    });
 }
 
 /// None when the deadline passed.
@@ -1417,7 +1483,9 @@ fn page_claims<'k>(
 /// each root's digest; it is indexed only when a classification asks.
 struct PageSessions<'o> {
     order: &'o [(&'o str, String, u64)],
-    by_digest: std::cell::OnceCell<BTreeMap<&'o str, &'o str>>,
+    /// The family's body deadline: indexing stops there (no session).
+    deadline: Instant,
+    by_digest: std::cell::OnceCell<Option<BTreeMap<&'o str, &'o str>>>,
 }
 
 impl claude_request_ledger::ClaudePageSessions for PageSessions<'_> {
@@ -1425,11 +1493,16 @@ impl claude_request_ledger::ClaudePageSessions for PageSessions<'_> {
         let digest = key.strip_prefix(TELEMETRY_KEY_PREFIX)?;
         self.by_digest
             .get_or_init(|| {
-                self.order
-                    .iter()
-                    .map(|(root, key, _)| (&key[FAMILY_KEY_PREFIX.len()..], *root))
-                    .collect()
+                let mut by_digest = BTreeMap::new();
+                for (root, key, _) in self.order {
+                    if Instant::now() >= self.deadline {
+                        return None;
+                    }
+                    by_digest.insert(&key[FAMILY_KEY_PREFIX.len()..], *root);
+                }
+                Some(by_digest)
             })
+            .as_ref()?
             .get(digest)
             .map(|root| (*root).to_owned())
     }
@@ -1657,10 +1730,15 @@ fn shadow_page_body(
         counts.refused_budget = 1;
         return refuse(&end, None, index, snapshots.len(), counts);
     };
-    let roots = snapshots
-        .iter()
-        .map(claude_snapshot_family_root_ref)
-        .collect::<BTreeSet<_>>();
+    // Each root's snapshots, grouped in the one admission pass over them.
+    let mut items_by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
+    for item in snapshots {
+        items_by_root
+            .entry(claude_snapshot_family_root_ref(item))
+            .or_default()
+            .push(item);
+    }
+    let roots = &items_by_root;
     // Pre-admit metadata, every failure row, memos and writer buffer. No
     // family-specific scratch is charged until that family's turn.
     let key_bytes = index.files.keys().map(String::len).sum::<usize>();
@@ -1670,7 +1748,7 @@ fn shadow_page_body(
         .map(|(key, _)| key.len())
         .sum::<usize>();
     let page_claim_rows = roots
-        .iter()
+        .keys()
         .filter_map(|root| api_report.evidence.get(*root))
         .map(Vec::len)
         .sum::<usize>();
@@ -1712,35 +1790,45 @@ fn shadow_page_body(
     // acknowledgements left resume after that family.
     let setup_deadline = first_family_deadline - FIRST_FAMILY_SETUP_RESERVE;
     let applying = Instant::now();
-    apply_results(support_dir, ledger, &mut counts, setup_deadline);
+    apply_results(
+        support_dir,
+        ledger,
+        &mut counts,
+        setup_deadline - SCHEDULE_SETUP_RESERVE,
+    );
     counts.result_apply_us = applying.elapsed().as_micros() as u64;
     let mut applied_rest = false;
     if std::mem::take(&mut ledger.load_damaged) {
         counts.ledger_load_damaged = 1;
         drop_certificate(ledger);
     }
-    let mut order = roots
+    // Scheduling keys each root (family key and turn) inside the setup slice.
+    // Only the oldest turns are selected before family zero; past the stop,
+    // they are the oldest of the roots keyed so far. The rest is keyed and
+    // sorted after family zero.
+    let mut unkeyed = roots.keys().copied();
+    let mut order = Vec::with_capacity(roots.len());
+    for root in unkeyed.by_ref() {
+        order.push(schedule_entry(&scope_key, ledger, root));
+        #[cfg(test)]
+        if faulted(PageFault::ScheduleStall) {
+            // Scheduling used everything up to the setup stop.
+            while Instant::now() < setup_deadline {
+                std::hint::spin_loop();
+            }
+        }
+        if Instant::now() >= setup_deadline {
+            break;
+        }
+    }
+    let head = order.len().min(capture::NEXT_PAGE_FAMILIES);
+    if order.len() > head {
+        order.select_nth_unstable_by(head - 1, schedule_order);
+    }
+    order[..head].sort_by(schedule_order);
+    let mut schedule_complete = false;
+    let capture_turns = order[..head]
         .iter()
-        .map(|root| {
-            let key = family_key(root);
-            let published_turn = ledger.get(&key).map_or(0, |record| record.window());
-            let turn = capture::scheduling_turn(&scope_key, &key, published_turn);
-            (*root, key, turn)
-        })
-        .collect::<Vec<_>>();
-    // The capture plan uses this same total order. Stable input ordering
-    // differs after a rotation and cannot break equal-turn ties safely.
-    order.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.1.cmp(&right.1)));
-    #[cfg(test)]
-    PAGE_SCHEDULE.with(|schedule| {
-        *schedule.borrow_mut() = order
-            .iter()
-            .map(|(root, _, _)| (*root).to_owned())
-            .collect();
-    });
-    let capture_turns = order
-        .iter()
-        .take(capture::NEXT_PAGE_FAMILIES)
         .map(|(root, _, _)| *root)
         .collect::<BTreeSet<_>>();
     // Only these oldest turns can have a captured body. Prioritize their
@@ -1751,9 +1839,8 @@ fn shadow_page_body(
         WORK_MAX_STATS,
         setup_deadline.min(Instant::now() + TELEMETRY_MAX_ELAPSED),
     );
-    let unloaded = order
+    let unloaded = order[..head]
         .iter()
-        .take(capture::NEXT_PAGE_FAMILIES)
         .map(|(root, _, _)| *root)
         .filter(|root| !api_report.evidence.contains_key(*root))
         .collect::<Vec<_>>();
@@ -1784,23 +1871,12 @@ fn shadow_page_body(
     // Only scheduled families can be reached. Their body inputs are gathered
     // when the schedule reaches them, in its order: a family the page never
     // reaches costs only its deadline row.
-    let mut by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
-    for item in snapshots {
-        let root = claude_snapshot_family_root_ref(item);
-        if capture_turns.contains(root) {
-            by_root.entry(root).or_default().push(item);
-        }
-    }
     // Captures deposited after this belong to the next parse.
     let purge_at = Instant::now();
     let located = std::cell::OnceCell::<Option<ClaudeScopeFiles<'_>>>::new();
     let claim_keys = std::cell::OnceCell::new();
     let claims = std::cell::OnceCell::<Option<PageClaims<'_>>>::new();
     let mut scope = ClaudeLedgerScope::default();
-    let sessions = PageSessions {
-        order: &order,
-        by_digest: Default::default(),
-    };
     let mut reached_turns = Vec::new();
     let holder_view = ClaudeHolderView::of(coverage_view);
     let mut families = Vec::with_capacity(roots.len());
@@ -1820,9 +1896,18 @@ fn shadow_page_body(
     } else if faulted(PageFault::SetupOverrun) {
         later_families = started;
     }
-    for position in 0..order.len() {
+    let mut position = 0;
+    while position < order.len() {
         if position > 0 {
             end.deadline = later_families;
+            complete_schedule(
+                &mut order,
+                &mut unkeyed,
+                &scope_key,
+                ledger,
+                &mut schedule_complete,
+                &mut counts,
+            );
             apply_rest(
                 support_dir,
                 ledger,
@@ -1834,6 +1919,14 @@ fn shadow_page_body(
         let body_deadline = end.deadline;
         let (root, key, turn) = order[position].clone();
         if !capture_turns.contains(root) || preflight_check(end.deadline).is_err() {
+            complete_schedule(
+                &mut order,
+                &mut unkeyed,
+                &scope_key,
+                ledger,
+                &mut schedule_complete,
+                &mut counts,
+            );
             apply_rest(
                 support_dir,
                 ledger,
@@ -1909,7 +2002,7 @@ fn shadow_page_body(
             incomplete += deferred;
             break;
         }
-        let items = &by_root[root];
+        let items = &roots[root];
         // The page's one index walk and its page roots' claims, when the
         // schedule first reaches a family.
         let files = located
@@ -1919,7 +2012,11 @@ fn shadow_page_body(
             claims
                 .get_or_init(|| {
                     page_claims(
-                        claim_keys.get_or_init(|| page_claim_keys(&order, api_report)),
+                        claim_keys
+                            .get_or_init(|| {
+                                page_claim_keys(&order, unkeyed.clone(), api_report, body_deadline)
+                            })
+                            .as_deref()?,
                         api_report,
                         body_deadline,
                     )
@@ -2002,6 +2099,11 @@ fn shadow_page_body(
                 let mut budget = ShadowBudget::new(reservation);
                 let family = family.as_ref().expect("admitted body requires its files");
                 let claims = claimed.expect("admitted body requires the page claims");
+                let sessions = PageSessions {
+                    order: &order,
+                    deadline: body_deadline,
+                    by_digest: Default::default(),
+                };
                 let result = build_slice(
                     root,
                     items,
@@ -2133,11 +2235,19 @@ fn shadow_page_body(
             }
             families.push(rows);
         }
+        position += 1;
     }
+    complete_schedule(
+        &mut order,
+        &mut unkeyed,
+        &scope_key,
+        ledger,
+        &mut schedule_complete,
+        &mut counts,
+    );
     // Captures of families the page did not reach.
     counts.captures_purged += capture::purge_before(&scope_key, purge_at);
     end.scope = scope.debt;
-    drop(sessions);
     for position in reached_turns {
         order[position].2 = now;
     }

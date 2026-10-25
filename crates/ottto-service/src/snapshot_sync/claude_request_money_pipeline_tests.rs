@@ -1711,17 +1711,31 @@ fn money_p1b_setup_overrun_still_attempts_first_scheduled_family() {
     money::disable_shadow_for_test(&fixture.support);
 }
 
-/// Common setup that runs all the way to its stop (an injected stall of the
-/// acknowledgement, telemetry and retirement steps) cannot starve the page:
-/// the first scheduled family still gets its own setup and body, and is
-/// built, within the real 250 ms money allowance (no injected page clock).
+/// Common setup that runs all the way to its stop (an injected busy stall of
+/// the acknowledgement, telemetry and retirement steps) cannot starve the
+/// page: the first scheduled family still gets its own setup and body, and
+/// is built, within the real 250 ms money allowance (no injected page clock).
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_setup_stall_still_builds_first_scheduled_family() {
-    let (fixture, index, scan) = money_armed_scan("money-p1b-setup-stall");
+    money_p1b_stall_still_builds_first_scheduled_family("money-p1b-setup-stall", money::PageFault::SetupStall);
+}
+
+/// MONEY round 4: scheduling (keying every root) that runs all the way to the
+/// setup stop cannot starve the page either: family zero is selected from the
+/// roots keyed so far, the rest is keyed after it, and family zero is built
+/// within the real 250 ms money allowance.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_schedule_stall_still_builds_first_scheduled_family() {
+    money_p1b_stall_still_builds_first_scheduled_family("money-p1b-schedule-stall", money::PageFault::ScheduleStall);
+}
+
+fn money_p1b_stall_still_builds_first_scheduled_family(name: &str, fault: money::PageFault) {
+    let (fixture, index, scan) = money_armed_scan(name);
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
     let _ = money::take_shadow_lines_for_test();
-    money::set_page_fault_for_test(money::PageFault::SetupStall);
+    money::set_page_fault_for_test(fault);
     let started = std::time::Instant::now();
     let counts = money::shadow_page_at(&fixture.support, &scan.snapshots, &index,
         &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
@@ -1729,17 +1743,24 @@ fn money_p1b_setup_stall_still_builds_first_scheduled_family() {
     let elapsed = started.elapsed();
     money::set_page_fault_for_test(money::PageFault::None);
     money::store::flush();
-    println!("MONEY_P1B_SETUP_STALL setup_stop_us={} capture_us={} setup_us={} money_us={} wall_us={} families={} unbuilt={} deferred_deadline={} captures_taken={}",
+    println!("MONEY_P1B_STALL fault={fault:?} setup_stop_us={} capture_us={} setup_us={} money_us={} wall_us={} families={} unbuilt={} deferred_deadline={} keyed_after_first={} captures_taken={}",
         money::setup_stop_for_test().as_micros(), counts.capture_us, counts.family_setup_us, counts.money_us, elapsed.as_micros(),
-        counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.captures_taken);
+        counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.families_keyed_after_first, counts.captures_taken);
     assert_eq!(counts.refused_deadline + counts.refused_budget, 0, "{counts:?}");
     assert!(u128::from(counts.capture_us + counts.family_setup_us) >= money::setup_stop_for_test().as_micros(),
-        "common setup ran to its stop: {counts:?}");
+        "the stalled phase ran to the setup stop: {counts:?}");
+    if fault == money::PageFault::ScheduleStall {
+        assert_eq!(counts.families_keyed_after_first, counts.families - 1,
+            "only family zero was keyed before the setup stop: {counts:?}");
+    } else {
+        assert_eq!(counts.families_keyed_after_first, 0, "{counts:?}");
+    }
     assert!(counts.captures_taken > 0, "{counts:?}");
     assert!(counts.families_unbuilt < counts.families, "{counts:?}");
     assert!(u128::from(counts.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{counts:?}");
     let schedule = money::last_page_schedule_for_test().iter()
         .map(|root| money::hashed_id_for_test(root.as_str())).collect::<Vec<_>>();
+    assert_eq!(schedule.len() as u64, counts.families, "{schedule:?}");
     let rows = money_jsonl_rows(&fixture.support);
     let first = rows.iter().find(|row| row["row"] == "family" && row["family"] == schedule[0].as_str())
         .unwrap_or_else(|| panic!("the first scheduled family is written: {schedule:?}"));
