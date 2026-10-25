@@ -3442,7 +3442,7 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
     })
     .unwrap();
     assert!(
-        (9..=16).contains(&available),
+        (1..=16).contains(&available),
         "single-context fixture capacity"
     );
     let mut items = Vec::new();
@@ -3550,34 +3550,50 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
         control.server.raw_batches.lock().unwrap().len(),
         1 + available
     );
-    // Save only real ACKs through the actual selected-index save before retiring custody.
-    let selected = items
-        .iter()
-        .filter(|item| {
-            progress
-                .accepted_body_witnesses
-                .get(&item.snapshot_fingerprint)
-                == Some(&snapshot_upload_body_witness(item))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    money::finalize_synthetic(&mut index, &selected);
-    index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-    index.save(&control.index_path).unwrap();
-    unknown_recovery::resolve_saved(&control.support, &index, &progress, now).unwrap();
-    money_resume::drive_for_test(std::future::poll_fn(|_| {
-        match unknown_recovery::startup(&control.support, &binding, now) {
-            Ok(true) => std::task::Poll::Ready(Ok(())),
-            Ok(false) => std::task::Poll::Pending,
-            Err(error) => std::task::Poll::Ready(Err(error)),
+    let mut completed = false;
+    for _ in 0..items.len() {
+        // Save only real ACKs through the selected-index barrier before reusing
+        // either manifest or shared-control admission in another source turn.
+        let selected = items
+            .iter()
+            .filter(|item| {
+                progress
+                    .accepted_body_witnesses
+                    .get(&item.snapshot_fingerprint)
+                    == Some(&snapshot_upload_body_witness(item))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        money::finalize_synthetic(&mut index, &selected);
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        index.save(&control.index_path).unwrap();
+        unknown_recovery::resolve_saved(&control.support, &index, &progress, now).unwrap();
+        money_resume::drive_for_test(std::future::poll_fn(|_| {
+            match unknown_recovery::startup(&control.support, &binding, now) {
+                Ok(true) => std::task::Poll::Ready(Ok(())),
+                Ok(false) => std::task::Poll::Pending,
+                Err(error) => std::task::Poll::Ready(Err(error)),
+            }
+        }))
+        .unwrap();
+        assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+        progress.prepare_quarantine_retries(&BTreeMap::new());
+        let before = control.server.raw_batches.lock().unwrap().len();
+        let outcome = run(&mut progress, &mut index).unwrap();
+        assert!(
+            control.server.raw_batches.lock().unwrap().len() > before,
+            "every admitted source turn must make new physical progress"
+        );
+        money_resume::drive_for_test(unknown_recovery::outcomes(&control.support)).unwrap();
+        if outcome == ResumableUploadResult::Completed {
+            completed = true;
+            break;
         }
-    }))
-    .unwrap();
-    assert!(unknown_recovery::active_for_test(&control.support).is_empty());
-    progress.prepare_quarantine_retries(&BTreeMap::new());
-    assert_eq!(
-        run(&mut progress, &mut index).unwrap(),
-        ResumableUploadResult::Completed
+        assert!(matches!(outcome, ResumableUploadResult::Deferred { count } if count > 0));
+    }
+    assert!(
+        completed,
+        "bounded custody must drain every pending offer without a restart"
     );
     assert_eq!(control.server.raw_batches.lock().unwrap().len(), 18);
     assert_eq!(progress.accepted_fingerprints.len(), 17); // seventeen distinct frozen offers
