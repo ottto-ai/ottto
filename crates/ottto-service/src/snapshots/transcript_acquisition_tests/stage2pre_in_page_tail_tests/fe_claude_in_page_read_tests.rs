@@ -1869,7 +1869,37 @@ fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
                     .unwrap()
                     .set_modified(SystemTime::now() - std::time::Duration::from_secs(7200))
                     .unwrap();
-                plain(&fixture, CLAUDE, ScanIndex::default(), &base.cache);
+                // Seed a real native reduction through ordinary cache
+                // admission, as cache_policy_tests seeds its fillers. A
+                // whole-page Full also reserves its finished output; that
+                // unrelated finalization bound can discard this large copy.
+                let (mut parser, _, scope) = native_parser(&fixture.file, CLAUDE);
+                let now = sampled_scan::now_seconds();
+                assert!(is_full(
+                    parser.prepare_acquisition(None, &scope, None, now).unwrap()
+                ));
+                while !parser.step().unwrap() {}
+                let completed = parser
+                    .retain_reduction(
+                        &scope,
+                        now,
+                        sampled_scan::RetainBudget::granted_unclassified(
+                            crate::transcript_cache::ENTRY_BYTES,
+                        ),
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert!(!completed.unsealed, "precondition: a complete victim");
+                let retained = Retained {
+                    checkpoint: completed.checkpoint,
+                    state: completed.reduction.expect("victim fits one cache entry"),
+                };
+                drop(parser);
+                assert!(base
+                    .cache
+                    .retained()
+                    .unwrap()
+                    .insert(local_index_key(&fixture.file.0), retained));
                 assert!(base
                     .cache
                     .retained_checkpoint(&local_index_key(&fixture.file.0))
