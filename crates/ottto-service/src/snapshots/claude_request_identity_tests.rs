@@ -4682,6 +4682,27 @@ fn equal_newest_times_with_different_triples_are_unknown() {
     assert_eq!(display.current.account_identifier_hash, owned(&hex('a')));
 }
 
+/// A newer request replaces the entire conflicting tie set, even when its
+/// storage reuses one of those ties. No old account/workspace/plan may survive.
+#[test]
+fn newer_request_replaces_conflicting_latest_ties() {
+    for (plan, identity) in [
+        (Some("max"), login_org('b', Some('e'), identity::TELEMETRY)),
+        (Some("pro"), login_org('c', None, identity::TELEMETRY_LOGIN)),
+        (None, RequestIdentity::Missing),
+    ] {
+        let latest = display_request(plan, HOUR_10, 4, identity, Some("2026-09-01T10:31:00Z"));
+        let expected = displayed(std::slice::from_ref(&latest)).1.current;
+        let (_, actual) = displayed(&[
+            display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:30:00Z")),
+            display_request(Some("max"), HOUR_10, 2, login_org('b', Some('e'), identity::TELEMETRY), Some("2026-09-01T10:30:00Z")),
+            latest,
+        ]);
+        assert_eq!(actual.current, expected);
+        assert_eq!(actual.history.iter().map(|entry| entry.request_count).sum::<u64>(), 3);
+    }
+}
+
 /// One login across two workspaces and two plans: every exact triple stays
 /// its own use, and the current one names the newest request's own workspace
 /// and plan, never the first observation's.

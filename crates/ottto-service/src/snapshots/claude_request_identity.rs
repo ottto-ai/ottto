@@ -457,11 +457,36 @@ impl LatestRequests {
             std::cmp::Ordering::Less => {
                 self.at = Some(at);
                 self.ties_overflowed = false;
-                // The common case, one key request after request: no copy.
-                if self.ties.len() == 1 && same(&self.ties[0]) {
+                // Reuse a retained tie, including its string buffers, when a
+                // newer request replaces the previous newest set. Alternating
+                // accounts must not allocate copies on every request.
+                if let Some(index) = self.ties.iter().position(same) {
+                    self.ties.swap(0, index);
+                    self.ties.truncate(1);
                     return;
                 }
-                self.ties.clear();
+                if let Some((bucket, row, known)) = self.ties.first_mut() {
+                    bucket_start.clone_into(bucket);
+                    if *row != *row_key {
+                        *row = row_key.clone();
+                    }
+                    match (known.as_mut(), key) {
+                        (Some(known), Some(key)) => {
+                            for (stored, incoming) in
+                                [(&mut known.login, key.login), (&mut known.org, key.org)]
+                            {
+                                match (stored.as_mut(), incoming) {
+                                    (Some(stored), Some(incoming)) => incoming.clone_into(stored),
+                                    (_, incoming) => *stored = incoming.map(str::to_string),
+                                }
+                            }
+                            known.basis = key.basis;
+                        }
+                        (_, key) => *known = key.map(KeyRef::to_key),
+                    }
+                    self.ties.truncate(1);
+                    return;
+                }
             }
             std::cmp::Ordering::Equal => {
                 if self.ties.iter().any(same) {
