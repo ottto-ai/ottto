@@ -7,26 +7,6 @@ pub(crate) const ABSENT_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 // Domain-separated SHA-256 prefixes are local lookup keys, never move proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LocationKey([u8; 16]);
-impl Serialize for LocationKey {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&URL_SAFE_NO_PAD.encode(self.0))
-    }
-}
-impl<'de> Deserialize<'de> for LocationKey {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        let mut bytes = [0; 16];
-        if s.len() != 22
-            || URL_SAFE_NO_PAD
-                .decode_slice(s, &mut bytes)
-                .map_err(serde::de::Error::custom)?
-                != 16
-        {
-            return Err(serde::de::Error::custom("invalid birth key"));
-        }
-        Ok(Self(bytes))
-    }
-}
 fn key(domain: &[u8], value: &str) -> LocationKey {
     let mut h = Sha256::new();
     h.update(domain);
@@ -40,7 +20,7 @@ fn session_key(session: &str) -> LocationKey {
     key(b"claude-money-session-v1\0", session)
 }
 // Tuple wire shape: [session, owner, cutoff, absent-since, physical observations].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct Session(
     LocationKey,
     LocationKey,
@@ -81,6 +61,9 @@ impl Serialize for BirthStore {
 impl<'de> Deserialize<'de> for BirthStore {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         fn decode(encoded: &str) -> Option<BirthStore> {
+            if encoded.len() > 4 * 1024 * 1024 {
+                return None;
+            }
             let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
             let mut input = bytes.as_slice();
             fn take<const N: usize>(input: &mut &[u8]) -> Option<[u8; N]> {

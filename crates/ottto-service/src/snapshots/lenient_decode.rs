@@ -750,7 +750,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
                 reader.consume(1);
                 name
             };
-            let optional = optional_census(name);
+            let optional = optional_census(name) || name == Some("claude_money_birth_store");
             // CensusRead streams positional-array separator whitespace before
             // capture; object-field evidence starts immediately after ':'.
             if array {
@@ -758,8 +758,10 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
             }
             let value = lexical_span(reader, optional, 1)?;
             if optional {
-                resources[usize::from(name == Some("claude_request_census_shadow"))] |=
-                    value.resource;
+                if optional_census(name) {
+                    resources[usize::from(name == Some("claude_request_census_shadow"))] |=
+                        value.resource;
+                }
                 if !value.resource {
                     checked_grammar(reader, value)?;
                 }
@@ -1398,7 +1400,8 @@ impl<R: BufRead + Seek> Decoder<R> {
                 self.eat(b':')?;
                 name
             };
-            let value = self.span_optional(optional_census(name))?;
+            let value = self
+                .span_optional(optional_census(name) || name == Some("claude_money_birth_store"))?;
             if let Some(name) = name {
                 if matches!(
                     name,
@@ -1750,14 +1753,15 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_money_birth_store" => {
                             // Optional money hints cannot rebuild or pause an otherwise valid index.
                             // Bound allocation before decoding; do not carry through identity repair.
-                            index.claude_money_birth_store = if value.len <= 4 * 1024 * 1024 {
-                                self.typed::<claude_money_birth_store::BirthStore>(value)
-                                    .ok()
-                                    .and_then(claude_money_birth_store::BirthStore::valid)
-                                    .unwrap_or_default()
-                            } else {
-                                Default::default()
-                            };
+                            index.claude_money_birth_store =
+                                if !value.resource && value.len <= 4 * 1024 * 1024 {
+                                    self.typed::<claude_money_birth_store::BirthStore>(value)
+                                        .ok()
+                                        .and_then(claude_money_birth_store::BirthStore::valid)
+                                        .unwrap_or_default()
+                                } else {
+                                    Default::default()
+                                };
                         }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
