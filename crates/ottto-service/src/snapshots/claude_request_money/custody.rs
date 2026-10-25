@@ -647,6 +647,17 @@ impl Custody {
                 "adoption"
             };
             if !self.primary_bindings {
+                let detached = file_address(key, field, key, None);
+                // Preserve the slow path's file-first precedence. A memo may
+                // predate telemetry; its later arrival cannot hide that basis
+                // or leave a stale duplicate which retention cannot remove.
+                if self
+                    .files
+                    .get::<str>(detached.carrier.as_str())
+                    .is_some_and(|file| file.slots().any(|slot| slot.key == key))
+                {
+                    return Some(detached);
+                }
                 if field == "memo" {
                     let root = key.strip_prefix("fam:")?;
                     if self
@@ -656,7 +667,7 @@ impl Custody {
                         return Some(telemetry_address(root, field, key));
                     }
                 }
-                return Some(file_address(key, field, key, None));
+                return Some(detached);
             }
             // Primary identity is assigned by bind_file / bind_entity. Reads
             // during a promotion overlap prefer the successor's binding.
@@ -3227,6 +3238,57 @@ impl Custody {
 #[cfg(test)]
 mod compact_layout_tests {
     use super::*;
+    #[test]
+    fn detached_memo_keeps_file_first_precedence_when_telemetry_arrives() {
+        let root = "04".repeat(32);
+        let key = format!("fam:{root}");
+        let record = Record::family_record(
+            [7; 32],
+            42,
+            super::super::super::claude_request_census::ClaudeFamilyMemo {
+                snapshot: 5,
+                ..Default::default()
+            },
+        );
+        let mut custody = Custody::default();
+        assert_eq!(custody.insert(key.clone(), record.clone()), Insert::Stored);
+        assert!(!custody.primary_bindings);
+        assert_eq!(
+            custody.insert(format!("otel:{root}"), Record::money_debt([1; 32], 0)),
+            Insert::Stored
+        );
+        let count = custody.record_count();
+        assert!(!custody.primary_bindings);
+        assert_eq!(custody.get(&key).unwrap().to_owned_record(), record);
+        let replacement = Record::family_record(
+            [8; 32],
+            43,
+            super::super::super::claude_request_census::ClaudeFamilyMemo {
+                snapshot: 6,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            custody.insert(key.clone(), replacement.clone()),
+            Insert::Stored
+        );
+        assert_eq!(
+            custody.record_count(),
+            count,
+            "updating cannot duplicate the memo carrier"
+        );
+        assert_eq!(custody.records_with_prefix("fam:").count(), 1);
+        assert_eq!(custody.get(&key).unwrap().to_owned_record(), replacement);
+        assert_eq!(custody.take(&key), Some(replacement));
+        assert!(custody.get(&key).is_none());
+        assert_eq!(
+            custody.records_with_prefix("fam:").count(),
+            0,
+            "retention cannot leave an unreachable stale basis"
+        );
+        assert_eq!(custody.record_count(), count - 1);
+    }
+
     #[test]
     fn loaded_primary_memo_routing_survives_control_first_and_missing_logical_hint() {
         let root = "a1111111-1111-4111-8111-111111111111";
