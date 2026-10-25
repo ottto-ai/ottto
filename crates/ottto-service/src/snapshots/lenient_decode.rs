@@ -212,7 +212,6 @@ impl Serialize for ScanIndex {
         }
         field!(schema_version);
         field!(generation);
-        field!(upload_ack_retirement_handoff, Option::is_none);
         field!(upload_context_fingerprint, Option::is_none);
         map.serialize_entry(
             "files",
@@ -315,6 +314,7 @@ impl Serialize for ScanIndex {
             codex_counting_evicted_legacy,
             codex_counting_version::EvictedLegacyOwners::is_empty
         );
+        field!(upload_ack_retirement_handoff, Option::is_none);
         map.end()
     }
 }
@@ -322,7 +322,6 @@ impl Serialize for ScanIndex {
 pub(super) const FIELDS: &[&str] = &[
     "schema_version",
     "generation",
-    "upload_ack_retirement_handoff",
     "upload_context_fingerprint",
     "files",
     "session_account_bindings",
@@ -404,6 +403,7 @@ pub(super) const FIELDS: &[&str] = &[
     "codex_counting_tombstones",
     "reread_guard",
     "codex_counting_evicted_legacy",
+    "upload_ack_retirement_handoff",
 ];
 
 #[derive(Debug, thiserror::Error)]

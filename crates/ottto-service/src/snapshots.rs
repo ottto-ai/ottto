@@ -3101,8 +3101,6 @@ pub struct ScanIndex {
     pub schema_version: u16,
     #[serde(default)]
     pub generation: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) upload_ack_retirement_handoff: Option<UploadAckRetirementHandoff>,
     /// The exact privacy/attribution context under which every settled entity
     /// fingerprint in this index was produced. A policy transition keeps the
     /// policy-neutral entity identity but must force one complete correction
@@ -3617,8 +3615,8 @@ pub struct ScanIndex {
     codex_counting_tombstones: BTreeMap<String, codex_counting_version::CountingTombstone>,
     #[serde(default)]
     reread_guard: reread_guard::State,
-    /// Diagnostic-only bounded FIFO of evicted Legacy tombstones. Last
-    /// serialized field; old indexes default empty, damaged values are dropped.
+    /// Diagnostic-only bounded FIFO of evicted Legacy tombstones. Appended
+    /// serialized slot; old indexes default empty, damaged values are dropped.
     #[serde(
         default,
         skip_serializing_if = "codex_counting_version::EvictedLegacyOwners::is_empty",
@@ -3628,6 +3626,9 @@ pub struct ScanIndex {
     /// Scan-local cap eviction events by safety class; drained into receipts.
     #[serde(skip)]
     codex_counting_evictions: [u64; 3],
+    /// Appended persisted field: preserve every older positional index slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) upload_ack_retirement_handoff: Option<UploadAckRetirementHandoff>,
     /// Runtime-only, Claude only: what owed history does this cycle where no
     /// list is intended, set with the cutoff before scanning.
     #[serde(skip)]

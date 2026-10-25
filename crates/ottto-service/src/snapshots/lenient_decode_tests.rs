@@ -1969,6 +1969,11 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             | "claude_usage_authority_quarantine"
             | "codex_parent_prefix_proofs"
             | "accepted_snapshot_fingerprint_ledger_version" => continue,
+            "upload_ack_retirement_handoff" => serde_json::json!({
+                "destination_namespace_hash":"c".repeat(64),
+                "committed_generation":1,
+                "bodies":{"d".repeat(64):"e".repeat(64)}
+            }),
             "session_account_bindings" => {
                 serde_json::json!({"session":{"account_identifier_hash":"account","workspace_identifier_hash":"workspace"}})
             }
