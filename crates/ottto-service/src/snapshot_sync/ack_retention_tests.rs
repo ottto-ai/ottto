@@ -140,16 +140,15 @@ fn exact_ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::Snapsho
     let mut response = accepted_batch(request.snapshots.len());
     response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
     for item in &request.snapshots {
+        let body_version = crate::snapshot_client::snapshot_ack_body_witness_version(item)?;
         response
             .accepted_entities
             .push(crate::snapshot_client::SnapshotEntityRef {
                 source_session_id: item.source_session_id.clone(),
                 snapshot_fingerprint: item.snapshot_fingerprint.clone(),
                 occurrence_count: 1,
-                body_witness_version: crate::snapshot_client::snapshot_ack_body_witness_version(
-                    item,
-                )?,
-                body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                body_witness_version: body_version,
+                body_witness_digest: body_version.map(|_| snapshot_upload_body_witness(item)),
                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                 head_challenge: None,
                 unchanged_basis: None,
@@ -255,7 +254,7 @@ fn ack_saved_before_index_crash_survives_real_empty_and_unrelated_deltas() {
         index.save(&f.index_path).unwrap(); // claim/reserved future cooldown
         progress.save(&f.progress_path).unwrap();
         assert!(!index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
-        f.upload(&mut progress, &[f.item.clone()], exact_ack)
+        f.upload(&mut progress, std::slice::from_ref(&f.item), exact_ack)
             .unwrap();
         f.assert_ack(&f.load().1);
         // Crash: only progress has the ACK, while the index still has old debt.
@@ -709,7 +708,7 @@ fn partial_index_replacement_retires_only_proven_state_only_ack() {
         &working,
         &previous,
         &progress,
-        &[f.item.clone()],
+        std::slice::from_ref(&f.item),
         None,
         &BTreeSet::new(),
         &f.index_path,
@@ -743,4 +742,69 @@ fn partial_index_replacement_retires_only_proven_state_only_ack() {
         "adopted sibling remains suppressed during retained retry"
     );
     assert_eq!(loaded.accepted_body_witnesses[&unknown], unknown);
+}
+
+#[test]
+fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_growth() {
+    let f = AckFixture::new(true);
+    for revision in 0..20 {
+        let (committed, mut progress) = f.load();
+        let name = format!("vanished-{revision}");
+        AckFixture::write_source(&f.sources, &name);
+        let mut indexed = committed.clone();
+        let scan = AckFixture::scan(&f.sources, &mut indexed);
+        assert!(scan.census_complete);
+        assert_eq!(scan.snapshots.len(), 1);
+        let fingerprint = scan.snapshots[0].snapshot_fingerprint.clone();
+        let body = snapshot_upload_body_witness(&scan.snapshots[0]);
+        f.upload(&mut progress, &scan.snapshots, exact_ack).unwrap();
+        settle_index_after_upload(&mut indexed, &committed, &progress);
+        indexed.save(&f.index_path).unwrap();
+        // Retain the real saved ACK across restart before cycle cleanup. The
+        // file subsequently vanishes while its containing scan root stays live.
+        drop(indexed);
+        drop(progress);
+        let (committed, mut progress) = f.load();
+        assert!(committed.accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert_eq!(progress.accepted_body_witnesses[&fingerprint], body);
+        assert!(progress.accepted_fingerprints.len() <= 2);
+        std::fs::remove_file(f.sources.join(format!("{name}.jsonl"))).unwrap();
+        let mut selected = committed.clone();
+        let empty = AckFixture::scan(&f.sources, &mut selected);
+        assert!(
+            empty.census_complete,
+            "one complete census is the retirement bound"
+        );
+        assert!(
+            empty.snapshots.is_empty(),
+            "live accepted sibling needs no new body"
+        );
+        assert!(!selected
+            .upload_progress_ack_incidence()
+            .any(|fp| fp == fingerprint));
+        let retired = progress.retired_ack_candidates(&committed, &selected);
+        assert!(retired.contains(&fingerprint));
+        // Neither omitted input nor the tentative index may erase durable ACKs.
+        f.upload(&mut progress, &empty.snapshots, |_| {
+            panic!("empty delta must not POST")
+        })
+        .unwrap();
+        assert_eq!(f.load().1.accepted_body_witnesses[&fingerprint], body);
+        settle_index_after_upload(&mut selected, &committed, &progress);
+        selected.save(&f.index_path).unwrap();
+        let selected = ScanIndex::load(&f.index_path).unwrap();
+        assert!(!selected.accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert!(selected.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+        progress.retire_acks_after_index_save(&selected, &retired, &BTreeSet::new());
+        progress.finish_cycle(&f.progress_path).unwrap();
+        let (saved, progress) = f.load();
+        f.assert_identity(&saved);
+        assert!(
+            progress.accepted_fingerprints.is_empty(),
+            "no retired revision accumulates"
+        );
+        assert!(!progress.accepted_body_witnesses.contains_key(&fingerprint));
+        assert_eq!(saved.current_snapshot_fingerprints().len(), 1);
+        assert!(saved.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+    }
 }
