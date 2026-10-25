@@ -11584,6 +11584,14 @@ fn accumulate_claude_family_pending(
             // Missing/conflicting identity cannot cancel prior pending proof.
             continue;
         };
+        // A terminal page may load thousands of untouched roots. Do not
+        // manufacture a new empty window (and archive) merely by loading OTLP.
+        if !snapshots
+            .iter()
+            .any(|item| claude_snapshot_belongs_to_family(item, root_session_id))
+        {
+            continue;
+        }
         let evidence_request_count = evidence
             .iter()
             .map(|row| u128::from(row.request_count))
