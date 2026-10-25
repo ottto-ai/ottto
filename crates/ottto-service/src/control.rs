@@ -22701,7 +22701,19 @@ for line in sys.stdin:
                 api_base_url: "https://api.ottto.net".to_string(),
             }));
         let authorization = RequestAuthorization::Token("token".to_string());
+        daemon
+            .begin_auth_with_claim(crate::PendingAuthClaim {
+                claim_code: "claim_reconnect".to_string(),
+                claim_token: "token_reconnect".to_string(),
+                nonce: "nonce_reconnect".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_reconnect".to_string(),
+                expires_at: "2100-01-01T00:00:00Z".to_string(),
+            })
+            .expect("begin claim");
 
+        // A bound user with a connection still reads as connected, so the
+        // connected-account gate is reached and refuses while Ottto has said
+        // nothing terminal.
         let error = auth_start(&daemon, &authorization)
             .expect_err("healthy connected Mac refuses a new claim");
         assert!(matches!(
@@ -22714,15 +22726,6 @@ for line in sys.stdin:
         daemon
             .record_local_health_upload_failed(crate::LocalHealthUploadFailureKind::AuthRejected)
             .expect("record upload failure");
-        daemon
-            .begin_auth_with_claim(crate::PendingAuthClaim {
-                claim_code: "claim_reconnect".to_string(),
-                claim_token: "token_reconnect".to_string(),
-                nonce: "nonce_reconnect".to_string(),
-                claim_url: "https://ottto.net/setup/claim?code=claim_reconnect".to_string(),
-                expires_at: "2100-01-01T00:00:00Z".to_string(),
-            })
-            .expect("begin claim");
         let response = auth_start(&daemon, &authorization).expect("reconnect claim is allowed");
         assert_eq!(response.claim_code, "claim_reconnect");
         assert_eq!(
