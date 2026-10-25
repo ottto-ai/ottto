@@ -2322,6 +2322,27 @@ fn fe_n1_option_b_saturated_non_draining_debts_do_not_starve_many_readable_holds
     index
         .claude_request_census_mut_for_test()
         .insert_for_test(&unavailable_key, record);
+    // A prior configured root disappeared while its slot was waiting.
+    // Reloaded scheduling state must rotate to the current roots.
+    let old_root_key = "/previous-option-b-root/held.jsonl";
+    index
+        .files
+        .insert(old_root_key.into(), index.files[&hold.key].clone());
+    let old_root_record = index
+        .claude_request_census_for_test()
+        .get(&hold.key)
+        .unwrap()
+        .clone();
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(old_root_key, old_root_record);
+    index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
+        key: old_root_key.into(),
+        due: start + INTERVAL,
+        attempted: false,
+    });
+    index.save(&hold.index_path).unwrap();
+    index = ScanIndex::load(&hold.index_path).unwrap();
     let mut completed = BTreeSet::new();
     let mut fulls = 0;
     for turn in 0..(readable.len() * 2 + 4) {
@@ -2367,6 +2388,119 @@ fn fe_n1_option_b_saturated_non_draining_debts_do_not_starve_many_readable_holds
             .count(),
         CACHE_ENTRIES - 1
     );
+}
+
+/// Failed native revalidation and disclosed terminal loss must retain the
+/// virtual recovery obligation across partial settlement/save/reload, and
+/// must never turn it into a sampled marker taking the reserved last slot.
+#[test]
+fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove() {
+    use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
+    use crate::transcript_cache::CACHE_ENTRIES;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = TestClock;
+    let due = sampled_scan::now_seconds();
+    for terminal_loss in [false, true] {
+        let hold = erased_hold(due - 4 * INTERVAL);
+        let key = hold.key.clone();
+        let mut index = hold.index;
+        for n in 0..CACHE_ENTRIES - 1 {
+            let mut pending = index.files[&key].clone();
+            pending.set_unverified_deadline(due);
+            index
+                .files
+                .insert(format!("/non-draining-retry/{n}"), pending);
+        }
+        let path = hold.fixture.file.0.clone();
+        let bytes = bytes_of(&path);
+        if terminal_loss {
+            hold.fixture.file.append(&json!({
+                "type":"ignored", "padding":"x".repeat(MAX_JSONL_LINE_BYTES + 1024)
+            }));
+        }
+        File::open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        sampled_scan::set_test_now(Some(due - 4 * INTERVAL));
+        let (mut index, _, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
+        assert_eq!(seen.modes, (0, 0, 0), "scheduling is zero reads");
+        index.save(&hold.index_path).unwrap();
+        let index = ScanIndex::load(&hold.index_path).unwrap();
+        sampled_scan::set_test_now(Some(due - 3 * INTERVAL));
+        let mut index = if terminal_loss {
+            let (index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
+            assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+            assert!(result.over_line_cap_count > 0);
+            index
+        } else {
+            let parked = path.with_extension("parked");
+            let (index, _, seen, read) = page_injecting(
+                &hold.fixture,
+                CLAUDE,
+                index,
+                &hold.cache,
+                |mode| mode == ReadMode::Full(FullReason::AuditDue),
+                |_| {
+                    fs::rename(&path, &parked).unwrap();
+                    std::os::unix::fs::symlink("missing-target", &path).unwrap();
+                },
+            );
+            assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+            assert!(seen.unreadable > 0, "completion re-open must fail");
+            fs::remove_file(&path).unwrap();
+            fs::rename(&parked, &path).unwrap();
+            index
+        };
+        assert!(sampled_audit::awaits_hold_deadline_restoration(
+            &index, &key
+        ));
+        assert_eq!(
+            index
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .count(),
+            CACHE_ENTRIES - 1
+        );
+        index.save(&hold.index_path).unwrap();
+        let index = ScanIndex::load(&hold.index_path).unwrap();
+        assert!(sampled_audit::awaits_hold_deadline_restoration(
+            &index, &key
+        ));
+        // Repair the source after the failed attempt; no audit slot is freed.
+        fs::write(&path, &bytes).unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        hold.cache.clear();
+        sampled_scan::set_test_now(Some(due - 2 * INTERVAL));
+        let (mut index, _, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
+        assert_eq!(seen.modes, (0, 0, 0), "retry waits a fresh interval");
+        index.save(&hold.index_path).unwrap();
+        let index = ScanIndex::load(&hold.index_path).unwrap();
+        sampled_scan::set_test_now(Some(due - INTERVAL));
+        let (mut index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
+        assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+        assert_eq!(seen.unreadable, 0);
+        assert!(!index
+            .claude_request_census_for_test()
+            .get(&key)
+            .unwrap()
+            .unverified_or_twin());
+        assert!(mints_v1(&mut index, &result, 0..6));
+        assert_eq!(
+            index
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .count(),
+            CACHE_ENTRIES - 1
+        );
+    }
 }
 
 /// Option B reads nothing extra: a plain-v2 entry without an N1 hold (a

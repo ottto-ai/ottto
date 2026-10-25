@@ -25964,6 +25964,12 @@ impl OwnedSourceScan {
                             .filter(|scope| *scope == &acquisition.scope)
                             .filter(|_| {
                                 acquisition.audit_due.is_some()
+                                    && sampled_audit::progress_debt(
+                                        index,
+                                        &acquisition.key,
+                                        sampled_scan::now_seconds(),
+                                    )
+                                    .is_none()
                                     && sampling.as_ref().is_some_and(|context| {
                                         context.audit_metadata_supported
                                             && (context.audit_slots > 0
@@ -26953,6 +26959,9 @@ impl OwnedSourceScan {
                     }
                 }
                 // N2: a withheld final record is owed, never verified.
+                let held_progress_audit =
+                    sampled_audit::progress_debt(index, &index_key, sampled_scan::now_seconds())
+                        .is_some();
                 let source_verified = cursor_fragment.is_none()
                     && completed_acquisition
                         .as_ref()
@@ -27018,7 +27027,9 @@ impl OwnedSourceScan {
                             index,
                             &candidate.path,
                         );
-                    } else {
+                    } else if !held_progress_audit || source_verified {
+                        // An unsuccessful virtual audit keeps its old hold:
+                        // it has no sampled marker carrying the obligation.
                         claude_request_census::record_claude_request_census(
                             index,
                             claude_request_census::ClaudeRequestCensusParse {
@@ -27210,6 +27221,10 @@ impl OwnedSourceScan {
                     // Its sampled publication still owes the prepared deadline;
                     // losing a completion certificate must never erase that debt.
                     let obligation = match completed_acquisition.as_ref() {
+                        // Recovery debt stays in its bounded scheduling slot
+                        // and census hold, including terminal loss. Never
+                        // consume the last sampled slot on failed credit.
+                        _ if held_progress_audit => None,
                         Some(completed) => completed.checkpoint.audit_debt(),
                         None => file_sampling
                             .as_ref()

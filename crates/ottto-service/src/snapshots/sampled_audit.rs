@@ -341,6 +341,12 @@ impl OwnedSourceScan {
                     .checked_add(AUDIT_INTERVAL_SECONDS)
                     .is_some_and(|latest| slot.due <= latest)
                 && awaits_hold_deadline_restoration(&self.index, &slot.key)
+                && self.index.traversal.as_ref().is_some_and(|traversal| {
+                    traversal
+                        .scan_roots
+                        .iter()
+                        .any(|root| Path::new(&slot.key).starts_with(root))
+                })
         });
         if !keep {
             let after = previous.map(|slot| slot.key.as_str());

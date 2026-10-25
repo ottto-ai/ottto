@@ -2537,10 +2537,19 @@ pub(crate) fn record_claude_request_census(
 /// target whose record allocation is not prepaid) leaves the key without
 /// one, never with an older revision's.
 pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Path) {
+    let key = super::local_index_key(path);
+    // A recovery Full has no sampled marker to retain its obligation. Its
+    // old unverified IdentityIncomplete record cannot bind a body or grant
+    // proof; keep that exclusion/retry obligation after failed validation.
+    // Successful Full verification and explicit vanished-file retirement
+    // still replace/remove it at their existing authority boundaries.
+    if super::sampled_audit::progress_debt(index, &key, super::sampled_scan::now_seconds())
+        .is_some()
+    {
+        return;
+    }
     if claude_index_path_family_member(path).is_some() {
-        index
-            .claude_request_census
-            .invalidate_keeping_birth(&super::local_index_key(path));
+        index.claude_request_census.invalidate_keeping_birth(&key);
     }
 }
 
