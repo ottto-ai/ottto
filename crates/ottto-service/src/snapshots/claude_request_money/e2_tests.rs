@@ -985,7 +985,9 @@ fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
     for (truncated, partial) in [(false, false), (false, true), (true, false), (true, true)] {
         let early = root_file("stale-early");
         let later = root_file("stale-later");
-        let history = [line("h", &at(-100), 10)];
+        let mut historical = line("h", &at(-100), 10);
+        historical["fixture_padding"] = json!("h".repeat(512));
+        let history = [historical];
         let original_bytes = serde_json::to_vec(&history[0]).unwrap();
         fs::write(&early, &original_bytes).unwrap();
         let old_handle = fs::File::open(&early).unwrap();
@@ -1001,7 +1003,11 @@ fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
         if !truncated {
             fs::remove_file(&early).unwrap();
         }
-        fs::write(&early, b"x").unwrap();
+        let mut replacement = line("u", &at(121), 20);
+        if !truncated {
+            replacement["fixture_padding"] = json!("u".repeat(1024));
+        }
+        fs::write(&early, serde_json::to_vec(&replacement).unwrap()).unwrap();
         let current = fs::metadata(&early).unwrap();
         #[cfg(unix)]
         {
@@ -1011,6 +1017,23 @@ fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
                 truncated
             );
         }
+        assert_eq!(
+            current.len() < original_bytes.len() as u64,
+            truncated,
+            "new-inode case grows, so identity alone must reject it; truncation case shrinks"
+        );
+        let mut later_lines = history.to_vec();
+        if partial {
+            later_lines.push(line("own", &at(61), 40));
+        }
+        fs::write(
+            &later,
+            later_lines
+                .iter()
+                .map(|line| serde_json::to_string(line).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
         let mut index = restart(&index); // generation/extent evidence survives restart
         stage_twins(
             &mut index,
@@ -1019,16 +1042,7 @@ fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
                 (&later, t0() + 60_000_000_000),
             ],
         );
-        let early_item = parse(
-            &early,
-            Some(t0() + 120_000_000_000),
-            &index,
-            &[line("u", &at(121), 20)],
-        );
-        let mut later_lines = history.to_vec();
-        if partial {
-            later_lines.push(line("own", &at(61), 40));
-        }
+        let early_item = parse(&early, Some(t0() + 120_000_000_000), &index, &[replacement]);
         let later_item = parse(&later, Some(t0() + 60_000_000_000), &index, &later_lines);
         assert_eq!(fold(&later_item).entity.removed_requests, 0);
         assert_eq!(fold(&later_item).entity.totals().1, 1 + u64::from(partial));
@@ -1043,7 +1057,8 @@ fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
             (got[0].request_count, got[0].input_tokens),
             (2 + u64::from(partial), if partial { 70 } else { 30 })
         );
-        assert_eq!(got[0].removed_request_count, None);
+        assert_eq!(got[0].removed_request_count, Some(0));
+        assert_eq!(got[0].removed_usage, Some(ClaudeRemovedUsage::default()));
         cleanup(&[&early, &later]);
     }
 }

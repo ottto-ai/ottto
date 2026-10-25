@@ -1200,7 +1200,10 @@ impl ClaudeFileBirth {
     /// A root file system that reports this creation time (Unix nanos),
     /// through the same floor as a real read.
     pub(crate) fn set_birth_for_test(&mut self, created_unix_nanos: i128) {
-        self.opened.birth = u64::try_from(created_unix_nanos).unwrap();
+        self.opened.birth = (created_unix_nanos > CLAUDE_BIRTH_FLOOR_UNIX_NANOS)
+            .then(|| u64::try_from(created_unix_nanos).ok())
+            .flatten()
+            .unwrap_or(0);
         if self.scope != ClaudeBirthScope::Subagent && self.scope != ClaudeBirthScope::NotObserved {
             self.scope = root_birth_scope(Some(created_unix_nanos));
         }
