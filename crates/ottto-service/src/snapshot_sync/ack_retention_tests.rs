@@ -63,16 +63,14 @@ impl AckFixture {
     }
 
     fn scan(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
-        let mut scan = crate::snapshots::scan_source_roots(
+        crate::snapshots::scan_source_roots(
             SnapshotSource::ClaudeCode,
             &[root.to_owned()],
             index,
             "2026-10-25T07:01:00Z",
             crate::snapshots::BACKFILL_WINDOW_DAYS,
         )
-        .unwrap();
-        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, index);
-        scan
+        .unwrap()
     }
 
     fn load(&self) -> (ScanIndex, SnapshotUploadProgress) {
@@ -542,4 +540,207 @@ fn semantic_index_acceptance_cannot_dispose_a_newer_exact_body_ack() {
     progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
     progress.finish_cycle(&f.progress_path).unwrap();
     assert!(f.load().1.accepted_fingerprints.is_empty());
+}
+
+fn one_body_set_witness(body: &str) -> String {
+    let mut digest = Sha256::new();
+    for bytes in [
+        b"snapshot_file_upload_body_set:v1".as_slice(),
+        body.as_bytes(),
+    ] {
+        digest.update((bytes.len() as u32).to_be_bytes());
+        digest.update(bytes);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+#[test]
+fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
+    let scratch = crate::test_scratch::ScratchDir::new("bootstrap-ack-capacity");
+    let index_path = scratch.join("index.json");
+    let progress_path = scratch.join("progress.json");
+    let mut baseline = ScanIndex::default();
+    baseline.save(&index_path).unwrap();
+    let mut progress = test_upload_progress();
+    progress.save(&progress_path).unwrap();
+    let (_, template) = pending_head_index_item();
+    let entry = pending_head_index_item()
+        .0
+        .files
+        .into_values()
+        .next()
+        .unwrap();
+    let all = (0..5)
+        .map(|slot| {
+            let mut item = template.clone();
+            item.source_session_id = format!("bootstrap-capacity-{slot}");
+            item.snapshot_fingerprint = format!("{:064x}", 100 + slot);
+            item.source_file_fingerprint = Some(format!("{:064x}", 200 + slot));
+            item
+        })
+        .collect::<Vec<_>>();
+    let mut main_posts = 0;
+    for cycle in 0..3 {
+        baseline = ScanIndex::load(&index_path).unwrap();
+        progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            test_quarantine_witness(),
+        )
+        .unwrap();
+        progress.ack_capacity = 2; // exact production capacity seam, small oracle
+        let mut items = all
+            .iter()
+            .filter(|item| {
+                !baseline.accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let limited = progress.admit_upload_input(&mut items);
+        assert_eq!(limited, cycle < 2);
+        assert_eq!(items.len(), if cycle < 2 { 2 } else { 1 });
+        let probes = items.iter().map(cache_head_probe).collect::<Vec<_>>();
+        bootstrap_cache_heads_with_budget(
+            &probes,
+            &unique_poison_scope(),
+            &mut progress,
+            true,
+            &mut InplaceRetryBudget::default(),
+            |batch, _| {
+                let mut response = exact_ack(batch)?;
+                for entity in &mut response.accepted_entities {
+                    entity.head_etag = Some("a".repeat(64));
+                }
+                Ok(response)
+            },
+            |state| state.save(&progress_path),
+        )
+        .unwrap();
+        apply_bootstrapped_cache_heads(&mut items, &progress).unwrap();
+        upload_resumable_batches_with_body_witness(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut 0,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |batch| {
+                main_posts += batch.len();
+                exact_ack(batch)
+            },
+            |state| state.save(&progress_path),
+        )
+        .unwrap();
+        // Production forces partial settlement when `limited`, rather than
+        // treating omitted work as a completed page or returning in bootstrap.
+        let mut working = baseline.clone();
+        for item in &items {
+            let key = format!("{}.jsonl", item.source_session_id);
+            let mut file = entry.clone();
+            file.source_file_fingerprint = item.source_file_fingerprint.clone().unwrap();
+            file.last_upload_body_witness =
+                Some(one_body_set_witness(&snapshot_upload_body_witness(item)));
+            working.files.insert(key.clone(), file);
+            working
+                .file_snapshot_fingerprints
+                .insert(key, BTreeSet::from([item.snapshot_fingerprint.clone()]));
+        }
+        let saved = checkpoint_partial_snapshot_index(
+            &working,
+            &baseline,
+            &progress,
+            &items,
+            None,
+            &BTreeSet::new(),
+            &index_path,
+            &progress_path,
+            || Ok(()),
+        )
+        .unwrap();
+        progress
+            .release_acks_after_partial_index_save(
+                &progress_path,
+                &baseline,
+                &saved,
+                &BTreeSet::new(),
+                false,
+            )
+            .unwrap();
+        let loaded = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            test_quarantine_witness(),
+        )
+        .unwrap();
+        assert!(
+            loaded.accepted_fingerprints.is_empty(),
+            "adopted capacity drains each cycle"
+        );
+    }
+    let index = ScanIndex::load(&index_path).unwrap();
+    assert!(all
+        .iter()
+        .all(|item| index.accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint)));
+    assert_eq!(
+        main_posts,
+        all.len(),
+        "all admitted bodies converge without losing remaining work"
+    );
+}
+
+#[test]
+fn partial_index_replacement_retires_only_proven_state_only_ack() {
+    let f = AckFixture::new(true);
+    let (index, mut progress) = f.load();
+    let old = "d".repeat(64);
+    let unknown = "e".repeat(64);
+    progress.record_body(&old, &old);
+    progress.record_body(&unknown, &unknown);
+    progress.save(&f.progress_path).unwrap();
+    let mut raw = serde_json::to_value(index).unwrap();
+    raw["codex_state_only_snapshot_fingerprints"] = serde_json::json!({"state-only":old});
+    let mut previous: ScanIndex = serde_json::from_value(raw).unwrap();
+    previous.save(&f.index_path).unwrap();
+    let mut working = serde_json::to_value(&previous).unwrap();
+    working["codex_state_only_snapshot_fingerprints"] =
+        serde_json::json!({"state-only":f.item.snapshot_fingerprint.clone()});
+    let working: ScanIndex = serde_json::from_value(working).unwrap();
+    let saved = checkpoint_partial_snapshot_index(
+        &working,
+        &previous,
+        &progress,
+        &[f.item.clone()],
+        None,
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+    )
+    .unwrap();
+    let reloaded = ScanIndex::load(&f.index_path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&saved).unwrap(),
+        serde_json::to_value(&reloaded).unwrap()
+    );
+    let saved = reloaded;
+    assert!(!saved.upload_progress_ack_incidence().any(|fp| fp == old));
+    progress
+        .release_acks_after_partial_index_save(
+            &f.progress_path,
+            &previous,
+            &saved,
+            &BTreeSet::new(),
+            true,
+        )
+        .unwrap();
+    let loaded = f.load().1;
+    assert!(!loaded.accepted_fingerprints.contains(&old));
+    assert!(
+        loaded.contains_body(
+            &f.item.snapshot_fingerprint,
+            &snapshot_upload_body_witness(&f.item)
+        ),
+        "adopted sibling remains suppressed during retained retry"
+    );
+    assert_eq!(loaded.accepted_body_witnesses[&unknown], unknown);
 }

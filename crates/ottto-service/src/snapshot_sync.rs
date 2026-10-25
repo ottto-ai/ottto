@@ -6973,6 +6973,9 @@ fn finish_sync_source(
     // a producer-owned predecessor token. Probe the unchanged semantic body
     // through the existing CAS contract, omitting the additive cache patch.
     // Exact settled ACKs enter the same atomic progress ledger as normal pages.
+    // Bootstrap and main upload must drain the same admitted subset. A larger
+    // page stops through partial settlement only after those bodies can finish.
+    let ack_admission_limited = upload_progress.admit_upload_input(&mut scan_result.snapshots);
     let probes = scan_result
         .snapshots
         .iter()
@@ -7134,6 +7137,20 @@ fn finish_sync_source(
             // delivery cursor after the machine has moved to destination B.
             ensure_authority()?;
         }
+        if ack_admission_limited
+            && matches!(
+                result,
+                ResumableUploadResult::Completed
+                    | ResumableUploadResult::Deferred { .. }
+                    | ResumableUploadResult::Rejected { .. }
+            )
+        {
+            // Never commit omitted files as a completed scan. Adopt the admitted
+            // exact ACKs through the existing partial-index save, then retry.
+            return Err(anyhow!(
+                "snapshot upload progress requires durable index settlement"
+            ));
+        }
         Ok(result)
     })
     .map(|result| {
@@ -7249,6 +7266,13 @@ fn finish_sync_source(
             ) {
                 Ok(committable) => {
                     note_codex_side_saved(daemon, &index_path, false, side_mark);
+                    upload_progress.release_acks_after_partial_index_save(
+                        &upload_progress_path,
+                        &committed_index,
+                        &committable,
+                        locally_held_fingerprints,
+                        true,
+                    )?;
                     committable
                 }
                 Err(error) => {
@@ -7370,12 +7394,13 @@ fn finish_sync_source(
                     Ok(committable) => {
                         index = committable;
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
-                        upload_progress.retire_acks_after_index_save(
+                        upload_progress.release_acks_after_partial_index_save(
+                            &upload_progress_path,
+                            &committed_index,
                             &index,
-                            &BTreeSet::new(),
                             locally_held_fingerprints,
-                        );
-                        upload_progress.save(&upload_progress_path)?;
+                            false,
+                        )?;
                     }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",

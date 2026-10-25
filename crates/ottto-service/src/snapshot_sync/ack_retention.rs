@@ -21,6 +21,57 @@ impl SnapshotUploadProgress {
             .saturating_add(MAX_UNSETTLED_ACKS);
     }
 
+    /// Freeze a capacity-bounded subset before bootstrap. Already accepted
+    /// entities may replace their body in the same slot. Omitted work remains
+    /// uncommitted and the caller must force the partial-index settlement path.
+    pub(super) fn admit_upload_input(&self, items: &mut Vec<SnapshotItem>) -> bool {
+        let mut remaining = self
+            .ack_capacity
+            .saturating_sub(self.accepted_fingerprints.len());
+        // At most the available unsettled slots are allocated as hash keys.
+        let mut admitted = BTreeSet::new();
+        let before = items.len();
+        items.retain(|item| {
+            let fp = &item.snapshot_fingerprint;
+            if self.accepted_fingerprints.contains(fp) || admitted.contains(fp) {
+                return true;
+            }
+            if remaining == 0 {
+                return false;
+            }
+            admitted.insert(fp.clone());
+            remaining -= 1;
+            true
+        });
+        before != items.len()
+    }
+
+    pub(super) fn release_acks_after_partial_index_save(
+        &mut self,
+        path: &Path,
+        previous: &ScanIndex,
+        saved: &ScanIndex,
+        locally_held: &BTreeSet<String>,
+        keep_adopted_for_retry: bool,
+    ) -> Result<()> {
+        let retired = self.retired_ack_candidates(previous, saved);
+        let before = self.accepted_fingerprints.len();
+        if keep_adopted_for_retry {
+            // The retained retry driver still reads this resume ledger. Keep
+            // its adopted siblings suppressed until that logical offer ends.
+            self.accepted_body_witnesses
+                .retain(|fp, _| !retired.contains(fp) || locally_held.contains(fp));
+            self.accepted_fingerprints
+                .retain(|fp| self.accepted_body_witnesses.contains_key(fp));
+        } else {
+            self.retire_acks_after_index_save(saved, &retired, locally_held);
+        }
+        if self.accepted_fingerprints.len() != before {
+            self.save(path)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn admit_ack_batch(&self, new_acks: usize) -> Result<()> {
         if new_acks > 0
             && self.accepted_fingerprints.len().saturating_add(new_acks) > self.ack_capacity

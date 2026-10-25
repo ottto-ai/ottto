@@ -13,8 +13,10 @@ progress until settlement adopts it. Final backfill/index ordering and cache
 head retention remain intact. Acquisition, body hashes, carry eligibility,
 conflict budgets and monetary calculations are unchanged.
 
-Admission reserves space before each POST, including retained retries. Capacity
-is loaded committed/carried incidence edges plus 4,096 unsettled entities; each
+Admission reserves space before each POST, including retained retries. Bootstrap and main upload drain the same admitted input subset before a
+capacity stop selects the partial-index save. Positive retirement is retained
+across partial saves; adopted siblings remain in progress during retained retry.
+Capacity is loaded committed/carried incidence edges plus 4,096 unsettled entities; each
 entity retains one accepted body witness. The extra ACK state is conservatively
 priced at 8 MiB, plus one scalar on progress. Retirement scratch contains only
 already admitted ACK keys, not a cloned index census. A capacity stop preserves
