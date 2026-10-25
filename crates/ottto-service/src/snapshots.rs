@@ -17617,7 +17617,7 @@ impl SnapshotAccumulator {
                     .map(|capture| (capture, response.sequence)),
             );
         }
-        money.finish_native(money_context.as_ref());
+        money.finish_native(money_context.as_ref(), self.claude_org_markers.as_deref());
         money.fold_us = money_started.elapsed().as_micros() as u64;
         self.claude_money = Some(Box::new(money));
     }

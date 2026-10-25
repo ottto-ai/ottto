@@ -247,6 +247,11 @@ pub fn run_snapshot_audit<W: Write>(
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     if options.source == SnapshotSource::ClaudeCode {
         if let Some(support_dir) = options.claude_support_dir.as_deref() {
+            crate::snapshots::claude_request_identity::retain_root_accounts(
+                &mut scan.snapshots,
+                &index,
+                &options.machine_id,
+            );
             let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
                 support_dir,
                 &mut scan,
