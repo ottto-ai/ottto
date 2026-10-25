@@ -2674,3 +2674,156 @@ fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
         }
     });
 }
+
+#[test]
+fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
+    with_enabled(|| {
+        for bound in [None, Some("c".repeat(64))] {
+            let path = root_file("identity-copy-boundary");
+            let index = ScanIndex::default();
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+            accumulator.claude_file_birth = ClaudeFileBirth::observe(&path, None);
+            accumulator
+                .claude_file_birth
+                .set_birth_for_test(t0() + 100_000_000_000);
+            accumulator.account_identifier_hash = bound;
+            for value in [
+                org_marker(ORG_A),
+                line("copy", &at(1), 10),
+                line("unmarked-own", &at(101), 20),
+                org_marker(ORG_B),
+                line("b", &at(102), 30),
+                line("b-inherited", &at(103), 40),
+            ] {
+                apply_claude_code_line(&value, &mut accumulator);
+            }
+            accumulator.finalize_claude_responses_e2(
+                None,
+                Some(ReadContext {
+                    index: &index,
+                    path: &path,
+                }),
+            );
+            let mut items =
+                accumulator.into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None);
+            let read = sidecar(&[
+                row("unmarked-own", 1, 20),
+                row("b", 2, 30),
+                row("b-inherited", 3, 40),
+            ]);
+            attach_page(&mut items, &read);
+            assert_eq!(
+                requests(&items[0], MATCHED),
+                3,
+                "rebuilt account keys must match native grain keys"
+            );
+            let item = tag_owned(items, &index).remove(0);
+            assert_eq!(
+                org_amounts(&item),
+                BTreeMap::from([(org_hash(ORG_B), (70, 2))])
+            );
+            assert_eq!(
+                (
+                    item.request_count,
+                    item.input_tokens,
+                    item.removed_request_count
+                ),
+                (3, 90, Some(1))
+            );
+            assert_eq!(
+                item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                Some("0.0003")
+            );
+            assert_evidence_referenced(&item);
+            cleanup(&[&path]);
+        }
+    });
+}
+
+#[test]
+fn e2_identity_conflicting_twin_bindings_clear_root_fallback_in_every_order() {
+    with_enabled(|| {
+        let a = root_file("identity-bound-conflict-a");
+        let b = root_file("identity-bound-conflict-b");
+        let c = root_file("identity-bound-conflict-c");
+        let agent = a
+            .parent()
+            .unwrap()
+            .join(ROOT)
+            .join("subagents/agent-abc.jsonl");
+        fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"fixture\n").unwrap();
+        let index = ScanIndex::default();
+        let parse_bound = |path: &Path, org: Option<&str>, login: &str| {
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+            accumulator.claude_file_birth = ClaudeFileBirth::observe(path, None);
+            accumulator.claude_file_birth.set_birth_for_test(t0());
+            accumulator.account_identifier_hash = Some(login.repeat(64));
+            if let Some(org) = org {
+                apply_claude_code_line(&org_marker(org), &mut accumulator);
+            }
+            apply_claude_code_line(&line(login, &at(1), 10), &mut accumulator);
+            accumulator.finalize_claude_responses_e2(
+                None,
+                Some(ReadContext {
+                    index: &index,
+                    path,
+                }),
+            );
+            accumulator
+                .into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None)
+                .remove(0)
+        };
+        let roots = [
+            parse_bound(&a, Some(ORG_A), "c"),
+            parse_bound(&b, Some(ORG_B), "c"),
+            parse_bound(&c, None, "d"),
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut sub = line("child", &at(2), 5);
+            sub["agentId"] = json!("abc");
+            sub["isSidechain"] = json!(true);
+            let mut items = order
+                .iter()
+                .map(|at| roots[*at].clone())
+                .collect::<Vec<_>>();
+            items.push(parse(&agent, Some(t0()), &index, &[sub]));
+            claude_request_identity::inherit_root_accounts(&mut items, false);
+            assert!(items.iter().take(3).all(|item| fold(item)
+                .accounts
+                .as_ref()
+                .unwrap()
+                .fallback
+                .is_none()));
+            assert!(fold(items.last().unwrap())
+                .accounts
+                .as_ref()
+                .unwrap()
+                .starting
+                .is_none());
+            let items = tag_owned(items, &index);
+            let child = items
+                .iter()
+                .find(|item| item.source_session_id.contains("_agent-"))
+                .unwrap();
+            assert!(child.request_evidence.is_empty());
+            let root = items
+                .iter()
+                .find(|item| item.source_session_id == ROOT)
+                .unwrap();
+            assert_eq!(
+                org_amounts(root),
+                BTreeMap::from([(org_hash(ORG_A), (10, 1)), (org_hash(ORG_B), (10, 1))])
+            );
+            assert_evidence_referenced(root);
+        }
+        cleanup(&[&a, &b, &c]);
+    });
+}

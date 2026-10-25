@@ -1427,12 +1427,15 @@ impl RequestAccounts {
     /// The governing native marker run; E2 uses its own skipped ranges to
     /// stage inherited usage until its copy decision is final.
     pub(crate) fn copied_marker_position(&self, sequence: u64) -> Option<u64> {
-        self.runs
-            .iter()
+        let end = self.runs.partition_point(|run| run.position <= sequence);
+        let runs = &self.runs[..end];
+        // Keep every marker boundary, even a provisionally rejected flip:
+        // removing its copied predecessor can make that marker authoritative.
+        runs.iter()
             .rev()
-            .find(|run| run.position <= sequence && run.account.is_some())
-            .filter(|run| run.copied == Some(true))
-            .map(|run| run.position)
+            .find(|run| run.account.is_some())
+            .filter(|run| run.copied == Some(true))?;
+        runs.last().map(|run| run.position)
     }
 
     /// Rebuild only after the money owner confirms exclusion. Restored files
@@ -1610,7 +1613,9 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         bound: AccountPartition,
         conflict: bool,
         known: bool,
+        // Kind of the original start evidence, retained through fallback.
         org_start: bool,
+        start_conflict: bool,
         bound_conflict: bool,
     }
     let mut roots = BTreeMap::<String, Root>::new();
@@ -1640,6 +1645,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
                 .starting
                 .as_ref()
                 .is_some_and(|key| key.org.is_some()),
+            start_conflict: false,
             bound_conflict: false,
         };
         match roots.entry(item.source_session_id.clone()) {
@@ -1663,23 +1669,23 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
                     } else if root.bound.is_none() {
                         root.bound = candidate.bound.clone();
                     }
-                    if root.starting.is_some()
-                        && candidate.starting.is_some()
-                        && root.starting != candidate.starting
-                    {
-                        let root_org = root.org_start;
-                        let candidate_org = candidate.org_start;
-                        if root_org != candidate_org {
-                            // Login and org are different evidence kinds, not
-                            // contradictory orgs. Prefer the request's own org.
-                            if candidate_org {
+                    if root.known && candidate.known && root.starting != candidate.starting {
+                        if root.org_start != candidate.org_start {
+                            // Different kinds do not contradict each other.
+                            if candidate.org_start {
                                 root.starting = candidate.starting.clone();
                                 root.org_start = true;
+                                root.start_conflict = false;
                             }
                         } else {
+                            root.start_conflict = true;
                             root.conflict = true;
-                            root.starting = root.bound.clone();
                         }
+                    }
+                    // A fallback is only as strong as the current binding.
+                    // A later contradictory binding invalidates it too.
+                    if root.start_conflict {
+                        root.starting = root.bound.clone();
                     }
                 }
                 root.conflict |= any_conflict;
