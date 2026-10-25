@@ -879,6 +879,7 @@ fn handle_command(
             status.update.install_owner = detect_install_owner();
             status.service_owner = service_owner_state(client_install_owner);
             crate::refresh_canonical_local_health(&mut status);
+            status.account = crate::effective_account_binding(&status);
             let mut value = to_value(status)?;
             inject_machine_icon(&mut value);
             Ok(value)
@@ -919,7 +920,11 @@ fn handle_command(
                 })?,
             )
         }
-        LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
+        LocalControlCommand::AuthStatus => {
+            let mut status = status_for(daemon, &authorization)?;
+            status.account = crate::effective_account_binding(&status);
+            to_value(status)
+        }
         LocalControlCommand::AgentStatusRefresh {
             source,
             quota_refresh,
@@ -1497,11 +1502,8 @@ fn account_for(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
 ) -> Result<LocalAccountBinding, LocalApiError> {
-    match authorization {
-        RequestAuthorization::Token(token) => Ok(daemon.status(token)?.account),
-        RequestAuthorization::TrustedCompanionApp => daemon.account_for_trusted_client(),
-        RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
-    }
+    // The `account` command answers with the effective account, like `status`.
+    status_for(daemon, authorization).map(|status| crate::effective_account_binding(&status))
 }
 
 fn load_claude_config_slot_settings(
@@ -20867,6 +20869,57 @@ for line in sys.stdin:
             response.payload.expect("payload").get("daemon"),
             Some(&serde_json::Value::String("running".to_string()))
         );
+    }
+
+    #[test]
+    fn status_and_account_commands_answer_with_effective_reconnect_after_auth_rejection() {
+        let daemon = daemon().with_account(connected_account());
+        let saved = daemon.account_for_trusted_client().expect("saved account");
+        daemon
+            .record_local_health_upload_failed(crate::LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        let request = |command| LocalControlRequest {
+            request_id: "req_test".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            token: Some("token".to_string()),
+            client_kind: Some(LocalClientKind::Cli),
+            client_install_owner: None,
+            command,
+        };
+
+        for command in [
+            LocalControlCommand::Status {
+                refresh_agent_status: false,
+            },
+            LocalControlCommand::AuthStatus,
+        ] {
+            let response = handle_request(&daemon, request(command));
+            assert!(response.ok, "{response:?}");
+            let payload = response.payload.expect("payload");
+            assert_eq!(payload["account"]["state"], "error");
+            assert_eq!(payload["account"]["message"]["code"], "reconnect_required");
+            assert_eq!(
+                payload["account"]["user"]["id"],
+                serde_json::json!(saved.user.as_ref().unwrap().id)
+            );
+            assert_eq!(
+                payload["canonical_health"]["account"]["state"],
+                "reconnect_required"
+            );
+        }
+
+        let response = handle_request(&daemon, request(LocalControlCommand::Account));
+        assert!(response.ok, "{response:?}");
+        let payload = response.payload.expect("payload");
+        assert_eq!(payload["state"], "error");
+        assert_eq!(payload["message"]["code"], "reconnect_required");
+        assert_eq!(
+            payload["user"]["id"],
+            serde_json::json!(saved.user.as_ref().unwrap().id)
+        );
+
+        // The saved binding is untouched.
+        assert_eq!(daemon.account_for_trusted_client().expect("account"), saved);
     }
 
     #[test]
