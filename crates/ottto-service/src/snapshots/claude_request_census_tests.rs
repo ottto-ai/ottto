@@ -4127,7 +4127,8 @@ fn census_rebuild_form_raw(original: &ScanIndex, key: &str, form: &str) -> Strin
 /// reads at (0, 60 s), (1 d, 1 d + 60 s), (7 d + 1 s, 7 d + 2 s): the first
 /// stamp still counts at the third load (one window plus the read span), so
 /// the third read is refused. The schedule continues with a long scan (a
-/// read 11 h after its load is admitted). Every read is covered by a saved
+/// read 11 h after its load is admitted) and the attempt window's inclusive
+/// boundary. Every read is covered by a saved
 /// stamp at most the span before it, and any rolling seven days hold at most
 /// two actual reads, in one process and with a restart before every cycle.
 /// Current and earlier-checkpoint forms; OFF and ON.
@@ -4151,7 +4152,10 @@ fn census_duplicate_rebuild_actual_reads_stay_bounded_with_independent_load_and_
         (8 * N3_DAY, 8 * N3_DAY + 11 * 3_600),
         (N3_DAY + N3_ATTEMPT_WINDOW + 1, 8 * N3_DAY + 23 * 3_600),
         (16 * N3_DAY, 16 * N3_DAY + 60),
-        (16 * N3_DAY + 3_600, 16 * N3_DAY + 3_660),
+        // The stamp of `N3_DAY + N3_ATTEMPT_WINDOW + 1` still counts at
+        // exactly one attempt window after it (refused), not a second later.
+        (16 * N3_DAY + 1, 16 * N3_DAY + 61),
+        (16 * N3_DAY + 2, 16 * N3_DAY + 62),
     ];
     let expected = [
         60,
@@ -4159,6 +4163,7 @@ fn census_duplicate_rebuild_actual_reads_stay_bounded_with_independent_load_and_
         N3_ATTEMPT_WINDOW + 2,
         8 * N3_DAY + 23 * 3_600,
         16 * N3_DAY + 60,
+        16 * N3_DAY + 62,
     ]
     .map(|offset| N3_T0 + offset);
     for enabled in [false, true] {
