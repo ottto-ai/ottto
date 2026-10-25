@@ -16,7 +16,9 @@ use super::{
     MAX_TRANSCRIPT_BYTES,
 };
 use crate::context_footprint::{sha256_hex, transcript_file_metadata};
-use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
+use crate::snapshot_client::{
+    load_snapshot_device_credentials, workspace_labels_allowed, SnapshotApiClient,
+};
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
 use ottto_core::{default_support_dir, LocalDeviceBinding};
@@ -196,10 +198,10 @@ pub(super) fn harvest_source(
                 return Ok(());
             }
             let _ = fs::remove_file(&marker);
-            hint.workspace_labels_enabled
+            workspace_labels_allowed(Some(&hint))
         }
         Err(_) if read_marker(&marker).as_deref() == Some(identity.as_str()) => return Ok(()),
-        Err(_) => true,
+        Err(_) => workspace_labels_allowed(None),
     };
 
     let deadline = Instant::now() + CONTEXT_COMPOSITION_CYCLE_BUDGET;
