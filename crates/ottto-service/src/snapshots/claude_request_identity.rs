@@ -1206,6 +1206,7 @@ pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestAccounts {
     pub(crate) starting: AccountPartition,
+    bound: AccountPartition,
     runs: Vec<(u64, AccountPartition)>,
     pub(crate) mixed: bool,
     pub(crate) conflict: bool,
@@ -1213,7 +1214,7 @@ pub(crate) struct RequestAccounts {
     pub(crate) inherited: u64,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, runs, mixed, conflict, subagent, inherited);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, bound, runs, mixed, conflict, subagent, inherited);
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A malformed, overflowing or contradictory stream falls back as a whole.
@@ -1232,7 +1233,8 @@ pub(crate) fn request_accounts(
         })
     });
     let mut accounts = RequestAccounts {
-        starting: bound,
+        starting: bound.clone(),
+        bound,
         subagent,
         ..Default::default()
     };
@@ -1246,12 +1248,28 @@ pub(crate) fn request_accounts(
         return accounts;
     };
     // The first request's own/preceding org, never the first org found later.
-    if let MarkerVerdict::Trusted(org) = markers.verdict(first, false) {
-        accounts.starting = Some(Arc::new(AuthorityKey {
-            login: None,
-            org: Some(org.to_owned()),
-            basis: TRANSCRIPT_ORG,
-        }));
+    if let Some(position) = markers
+        .entries
+        .iter()
+        .rev()
+        .find(|marker| marker.position <= first)
+        .map(|marker| marker.position)
+    {
+        // Keep the initial observation if two markers claim this same request;
+        // the contradictory stream below then falls back to this start.
+        if let Some(marker) = markers
+            .entries
+            .iter()
+            .find(|marker| marker.position == position)
+        {
+            if let Some(org) = marker.org.as_deref().filter(|_| marker.terminal_trusted) {
+                accounts.starting = Some(Arc::new(AuthorityKey {
+                    login: None,
+                    org: Some(org.to_owned()),
+                    basis: TRANSCRIPT_ORG,
+                }));
+            }
+        }
     }
     accounts.conflict = markers.overflowed;
     for marker in &markers.entries {
@@ -1284,6 +1302,16 @@ pub(crate) fn request_accounts(
             });
         accounts.runs.push((marker.position, Some(key)));
     }
+    if accounts
+        .runs
+        .iter()
+        .filter_map(|(_, key)| key.as_ref())
+        .collect::<BTreeSet<_>>()
+        .len()
+        > MAX_AUTHORITY_KEYS
+    {
+        accounts.conflict = true;
+    }
     accounts.mixed = accounts
         .runs
         .iter()
@@ -1309,8 +1337,7 @@ impl RequestAccounts {
     }
     pub(crate) fn observe(&mut self, sequence: u64) {
         if !self.subagent
-            && !self.runs.iter().any(|(position, _)| *position == sequence)
-            && self.runs.iter().any(|(position, _)| *position < sequence)
+            && matches!(self.runs.binary_search_by_key(&sequence, |(position, _)| *position), Err(at) if at > 0)
         {
             self.inherited = self.inherited.saturating_add(1);
         }
@@ -1321,10 +1348,7 @@ impl RequestAccounts {
 /// request. Such a session stays counted under its native starting account.
 pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
     for item in items {
-        let root = super::claude_snapshot_family_root_ref(item).map(str::to_owned);
-        let Some(root) = root else {
-            continue;
-        };
+        let root = super::claude_snapshot_family_root_ref(item).to_owned();
         let Some(fold) = item.claude_money.as_deref_mut() else {
             continue;
         };
@@ -1367,17 +1391,61 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
 /// Root placement is fixed before summing path twins. A missing/Unknown root
 /// stays Unknown; a subagent's own marker can never manufacture a root account.
 pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem]) {
-    let roots = items
-        .iter()
-        .filter_map(|item| {
-            let accounts = item.claude_money.as_deref()?.accounts.as_deref()?;
-            (!accounts.subagent)
-                .then(|| (item.source_session_id.clone(), accounts.starting.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut seen = BTreeSet::new();
+    // Select the root's earliest native start, independently of page/map order.
+    // Contradictory observations at the same start use the retained binding.
+    struct Root {
+        first: i128,
+        starting: AccountPartition,
+        bound: AccountPartition,
+        conflict: bool,
+    }
+    let mut roots = BTreeMap::<String, Root>::new();
+    for item in items.iter() {
+        let Some(accounts) = item
+            .claude_money
+            .as_deref()
+            .and_then(|fold| fold.accounts.as_deref())
+        else {
+            continue;
+        };
+        if accounts.subagent {
+            continue;
+        }
+        let first = item
+            .source_started_at
+            .as_deref()
+            .and_then(super::rfc3339_unix_nanos)
+            .unwrap_or(i128::MAX);
+        let candidate = Root {
+            first,
+            starting: accounts.starting.clone(),
+            bound: accounts.bound.clone(),
+            conflict: accounts.conflict,
+        };
+        match roots.entry(item.source_session_id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let root = entry.get_mut();
+                let any_conflict = root.conflict || candidate.conflict;
+                if first < root.first {
+                    *root = candidate;
+                } else if first == root.first {
+                    if root.starting != candidate.starting {
+                        root.conflict = true;
+                        if root.bound != candidate.bound {
+                            root.bound = None;
+                        }
+                        root.starting = root.bound.clone();
+                    }
+                }
+                root.conflict |= any_conflict;
+            }
+        }
+    }
     for item in items {
-        let root = super::claude_snapshot_family_root_ref(item).map(str::to_owned);
+        let root = super::claude_snapshot_family_root_ref(item).to_owned();
         let Some(fold) = item.claude_money.as_deref_mut() else {
             continue;
         };
@@ -1385,13 +1453,29 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem]) {
             continue;
         };
         if accounts.subagent {
-            accounts.starting = root
-                .as_deref()
-                .and_then(|root| roots.get(root).cloned())
-                .flatten();
+            accounts.starting = roots.get(&root).and_then(|root| root.starting.clone());
             fold.entity.repartition(accounts.starting.clone());
+        } else if let Some(root) = roots.get(&root) {
+            accounts.starting = root.starting.clone();
+            if root.conflict {
+                accounts.conflict = true;
+                fold.entity.repartition(accounts.starting.clone());
+            }
         }
-        if seen.insert(item.source_session_id.clone()) {
+    }
+}
+
+pub(crate) fn record_page_identity_counts(items: &[SnapshotItem]) {
+    let mut seen = BTreeSet::new();
+    for item in items {
+        let Some(accounts) = item
+            .claude_money
+            .as_deref()
+            .and_then(|fold| fold.accounts.as_deref())
+        else {
+            continue;
+        };
+        if seen.insert(&item.source_session_id) {
             for (counter, value) in IDENTITY_COUNTS.iter().zip([
                 u64::from(accounts.mixed),
                 accounts.inherited,
@@ -1441,7 +1525,7 @@ fn request_owned_grouping(item: &SnapshotItem) -> Option<Grouping> {
             usage.costs.reported = true;
             usage.costs.total = Some(u128::from(cost) * 1_000_000);
         }
-        let identity = match account {
+        let identity = match account.as_ref() {
             Some(key) => IdentityRef::Tagged(KeyRef {
                 login: key.login.as_deref(),
                 org: key.org.as_deref(),

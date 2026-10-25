@@ -859,6 +859,9 @@ pub(crate) fn side_calls_page(
     trace: &ClaudeTraceOwnershipLoadReport,
     index: &ScanIndex,
 ) {
+    if enabled() {
+        claude_request_identity::inherit_root_accounts(items);
+    }
     let owing = |item: &SnapshotItem| {
         item.claude_money
             .as_deref()
@@ -1065,6 +1068,7 @@ pub(crate) fn finish_page(
         .unwrap_or_default();
     if enabled() {
         claude_request_identity::inherit_root_accounts(items);
+        claude_request_identity::record_page_identity_counts(items);
     }
     let mut sessions = BTreeMap::<&str, Session>::new();
     for item in items.iter() {
