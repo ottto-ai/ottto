@@ -5227,10 +5227,11 @@ fn auth_start(
     // through a fresh claim: Verify and `ottto doctor` tell the user to sign
     // in, so refusing here would dead-end them. The claim keeps the bound
     // user, and completing it for that user replaces the dead binding.
-    let history_pending = registration_history_choice_account(&status.account)
+    let history_pending = local_history_recovery_expected()?
+        || registration_history_choice_account(&status.account)
         || history_load::<StoredHistoryBrowserClaim>(history_stores().browser.as_ref())
             .is_ok_and(|claim| claim.is_some_and(|claim| claim.registration_pending))
-        || FileAccountStore::default()
+        || history_account_store()
             .load()
             .is_ok_and(|account| registration_history_choice_account(&account));
     if status.account.state == LocalAccountState::Connected
@@ -5291,9 +5292,21 @@ fn begin_durable_browser_claim(
     daemon: &LocalDaemon,
     pending: PendingAuthClaim,
 ) -> Result<AuthStartResponse, LocalApiError> {
+    let expected = local_history_recovery_expected()?;
+    let registration = history_account_store()
+        .load()
+        .is_ok_and(|account| registration_history_choice_account(&account));
     let response = daemon.begin_auth_with_claim(pending)?;
-    FileAccountStore::default()
-        .save(&response.account)
+    let mut persisted = response.account.clone();
+    if expected {
+        persisted.message = Some(if registration {
+            registration_history_choice_message()
+        } else {
+            local_release_pending_message()
+        });
+    }
+    history_account_store()
+        .save(&persisted)
         .map_err(|_| LocalApiError::StatePoisoned)?;
     Ok(response)
 }
@@ -5335,6 +5348,54 @@ fn retire_refused_registration_after_browser_answer(claim_code: &str) -> Result<
     }
 }
 
+const LOCAL_HISTORY_RECOVERY_PENDING: &str = "local_history_recovery_pending";
+
+fn local_history_recovery_expected() -> Result<bool, LocalApiError> {
+    history_account_store()
+        .load()
+        .map(|account| {
+            account.message.as_ref().is_some_and(|m| {
+                matches!(
+                    m.code.as_str(),
+                    LOCAL_HISTORY_RECOVERY_PENDING | "history_choice_required"
+                )
+            })
+        })
+        .map_err(|_| LocalApiError::StatePoisoned)
+}
+
+fn local_release_pending_message() -> StableMessage {
+    StableMessage {
+        code: LOCAL_HISTORY_RECOVERY_PENDING.to_string(),
+        text: "Waiting for browser sign-in to finish.".to_string(),
+    }
+}
+
+fn persist_local_release_expected() -> Result<(), LocalApiError> {
+    let store = history_account_store();
+    let mut account = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
+    account.message = Some(local_release_pending_message());
+    store
+        .save(&account)
+        .map_err(|_| LocalApiError::StatePoisoned)
+}
+
+fn clear_local_release_expected() -> Result<(), LocalApiError> {
+    let store = history_account_store();
+    let mut account = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
+    if account
+        .message
+        .as_ref()
+        .is_some_and(|m| m.code == LOCAL_HISTORY_RECOVERY_PENDING)
+    {
+        account.message = None;
+        store
+            .save(&account)
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+    }
+    Ok(())
+}
+
 fn registration_history_choice_account(account: &LocalAccountBinding) -> bool {
     account
         .message
@@ -5356,7 +5417,7 @@ fn registration_history_choice_message() -> StableMessage {
 
 fn persist_registration_history_choice() -> Result<(), LocalApiError> {
     let _lock = lock_setup_run_binding();
-    let store = FileAccountStore::default();
+    let store = history_account_store();
     let mut account = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
     // Preserve the bound identity and all credential journals. This is a
     // durable user action, not an authority transition or a failed install.
@@ -7135,6 +7196,17 @@ fn released_without_setup_run_message(forget_installation: bool) -> StableMessag
 }
 
 fn forget_installation_state_locked() -> Result<(), LocalApiError> {
+    // This explicit identity-forget action closes the old local ceremony.
+    // Complete secure cleanup BEFORE replacing the installation identity.
+    {
+        let _history_lock = lock_history_recovery()?;
+        let stores = history_stores();
+        clear_local_release(&stores)?;
+        stores
+            .browser
+            .delete()
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+    }
     FileMachineStore::default()
         .reset()
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -7164,9 +7236,17 @@ fn reset_local_account_files_locked(
     require_cloud_session_cleanup_before_identity_change(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
     )?;
-    FileAccountStore::default()
-        .reset()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if local_history_recovery_expected()? {
+        let mut account = LocalAccountBinding::not_connected();
+        account.message = Some(local_release_pending_message());
+        FileAccountStore::default()
+            .save(&account)
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+    } else {
+        FileAccountStore::default()
+            .reset()
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+    }
     FileConnectionStore::default()
         .reset()
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -7330,6 +7410,23 @@ struct HistoryStores {
     browser: Box<dyn ControlTokenStore>,
 }
 
+fn history_support_dir() -> PathBuf {
+    #[cfg(test)]
+    if std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR").is_none() {
+        return ottto_core::token_store::isolated_test_secret_dir()
+            .expect("isolated history test store")
+            .join(format!("history-{:?}", std::thread::current().id()));
+    }
+    default_support_dir()
+}
+
+fn history_account_store() -> FileAccountStore {
+    FileAccountStore::new(history_support_dir().join("account.json"))
+}
+fn history_connection_store() -> FileConnectionStore {
+    FileConnectionStore::new(history_support_dir().join("connection.json"))
+}
+
 fn history_stores() -> HistoryStores {
     HistoryStores {
         receipt: history_secret_store(OTTTO_REVOCATION_RECEIPT_ACCOUNT),
@@ -7357,7 +7454,7 @@ fn history_secret_store(account: &'static str) -> Box<dyn ControlTokenStore> {
             .unwrap();
         Box::new(
             stores
-                .entry((default_support_dir(), account))
+                .entry((history_support_dir(), account))
                 .or_default()
                 .clone(),
         )
@@ -7377,6 +7474,8 @@ struct LocalReleaseMarker {
     released_at: i64,
     #[serde(default)]
     cleanup_required: bool,
+    #[serde(default)]
+    ceremony_closed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7435,7 +7534,8 @@ fn stage_local_release(
     // Preserve the original boundary across a refresh/retry of the release.
     let same_release = existing
         .as_ref()
-        .is_some_and(|m| m.device_id == release.device_id && m.api_base_url == api_base_url);
+        .is_some_and(|m| m.device_id == release.device_id && m.api_base_url == api_base_url
+            && !m.ceremony_closed && now.checked_sub(m.released_at).is_some_and(|age| (0..REVOCATION_RECEIPT_MAX_AGE_SECONDS).contains(&age)));
     if !same_release {
         stores
             .receipt
@@ -7463,8 +7563,10 @@ fn stage_local_release(
             api_base_url,
             released_at,
             cleanup_required: false,
+            ceremony_closed: false,
         },
-    )
+    )?;
+    persist_local_release_expected()
 }
 
 fn remember_revocation_receipt(
@@ -7492,6 +7594,7 @@ fn clear_local_release(stores: &HistoryStores) -> Result<(), LocalApiError> {
     // Marker is last: any partial cleanup remains a recoverable pending action.
     if let Some(mut marker) = history_load::<LocalReleaseMarker>(stores.marker.as_ref())? {
         marker.cleanup_required = true;
+        marker.ceremony_closed = true;
         history_save(stores.marker.as_ref(), &marker)?;
     }
     stores
@@ -7502,10 +7605,8 @@ fn clear_local_release(stores: &HistoryStores) -> Result<(), LocalApiError> {
         .proof
         .delete()
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    stores
-        .marker
-        .delete()
-        .map_err(|_| LocalApiError::StatePoisoned)
+    clear_local_release_expected()?;
+    stores.marker.delete().map_err(|_| LocalApiError::StatePoisoned)
 }
 
 #[derive(Debug, Deserialize)]
@@ -7638,12 +7739,12 @@ fn persist_history_browser_claim(
             installation_id: machine.installation_id.clone(),
             account_scope: machine.account_scope.clone(),
             api_base_url: base.to_string(),
-            setup_run_id: FileConnectionStore::default()
+            setup_run_id: history_connection_store()
                 .load()
                 .map_err(|_| LocalApiError::StatePoisoned)?
                 .filter(|c| c.api_base_url == base)
                 .map(|c| c.setup_run_id),
-            registration_pending: FileAccountStore::default()
+            registration_pending: history_account_store()
                 .load()
                 .is_ok_and(|account| registration_history_choice_account(&account)),
             nonce: SecretString::new(claim.client_nonce.as_deref().unwrap_or(nonce)),
@@ -7663,13 +7764,33 @@ fn create_setup_claim_with_history(
         url.strip_suffix("/api/v1/setup-claims")
             .ok_or(LocalApiError::StatePoisoned)?,
     ))?;
-    let mut marker: Option<LocalReleaseMarker> = history_load(stores.marker.as_ref())?;
+    let expected = local_history_recovery_expected()?;
+    let mut marker: Option<LocalReleaseMarker> = match history_load(stores.marker.as_ref()) {
+        Ok(marker) => marker,
+        Err(_) if !expected => None,
+        Err(error) => return Err(error),
+    };
     if marker.as_ref().is_some_and(|m| {
-        now.checked_sub(m.released_at)
-            .is_some_and(|age| age >= REVOCATION_RECEIPT_MAX_AGE_SECONDS)
+        m.ceremony_closed
+            || now
+                .checked_sub(m.released_at)
+                .is_some_and(|age| age >= REVOCATION_RECEIPT_MAX_AGE_SECONDS)
     }) {
         clear_local_release(stores)?;
         marker = None;
+    }
+    // Only a release or registration refusal needs durable recovery. Existing
+    // first-time and same-account sign-in still works with file-only stores.
+    if marker.is_none() && !local_history_recovery_expected()? {
+        return backend_post_json(url, &setup_claim_create_body(machine, nonce), &[]);
+    }
+    if marker.is_none()
+        && expected
+        && !history_account_store()
+            .load()
+            .is_ok_and(|a| registration_history_choice_account(&a))
+    {
+        return Err(LocalApiError::StatePoisoned);
     }
     let stored = history_load::<StoredRevocationReceipt>(stores.receipt.as_ref());
     let mut receipt = stored.ok().flatten().filter(|r| {
@@ -7747,7 +7868,8 @@ fn create_setup_claim_with_history(
             Ok(claim)
         }
         Err(error) => {
-            if matches!(&error, ureq::Error::Status(status, _) if (400..500).contains(status)) {
+            if matches!(&error, ureq::Error::Status(status, _) if definitive_claim_refusal(*status))
+            {
                 clear_local_release(stores)?;
             }
             Err(backend_error_from_ureq(url, error))
@@ -7755,14 +7877,31 @@ fn create_setup_claim_with_history(
     }
 }
 
+fn definitive_claim_refusal(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
+}
+
 fn resume_history_browser_claim(
     machine: &MachineIdentity,
     base: &str,
 ) -> Result<Option<PendingAuthClaim>, LocalApiError> {
     let _lock = lock_history_recovery()?;
-    let stores = history_stores();
-    let Some(stored) = history_load::<StoredHistoryBrowserClaim>(stores.browser.as_ref())? else {
-        return Ok(None);
+    resume_history_browser_claim_with_stores(machine, base, &history_stores())
+}
+
+fn resume_history_browser_claim_with_stores(
+    machine: &MachineIdentity,
+    base: &str,
+    stores: &HistoryStores,
+) -> Result<Option<PendingAuthClaim>, LocalApiError> {
+    let stored = match history_load::<StoredHistoryBrowserClaim>(stores.browser.as_ref()) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Ok(None),
+        Err(_) if !local_history_recovery_expected()? => return Ok(None),
+        Err(_) if history_load::<LocalReleaseMarker>(stores.marker.as_ref())?.is_some() => {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
     };
     if stored.installation_id != machine.installation_id
         || stored.account_scope != machine.account_scope
@@ -9375,8 +9514,11 @@ fn setup_result_from_detail(
         })
         .collect::<Vec<_>>();
 
-    let local_claim: Option<StoredHistoryBrowserClaim> =
-        history_load(history_stores().browser.as_ref())?;
+    let local_claim: Option<StoredHistoryBrowserClaim> = match history_load(history_stores().browser.as_ref()) {
+        Ok(claim) => claim,
+        Err(_) if !local_history_recovery_expected()? => None,
+        Err(error) => return Err(error),
+    };
     let local_claim_url = local_claim
         .filter(|claim| {
             claim.setup_run_id.as_deref() == Some(connection.setup_run_id.as_str())
@@ -24651,7 +24793,12 @@ for line in sys.stdin:
         let server = thread::spawn(move || {
             let mut seen = BTreeSet::new();
             let mut requests = Vec::new();
-            for (status, body) in [(503, "{}"), (200, "{"), (200, RECEIPT_CLAIM_SUCCESS)] {
+            for (status, body) in [
+                (429, "{}"),
+                (503, "{}"),
+                (200, "{"),
+                (200, RECEIPT_CLAIM_SUCCESS),
+            ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_complete_http_request(&mut stream);
                 let body_receipt = history_choice_request_body(&request)["revocation_receipt"]
@@ -24670,12 +24817,12 @@ for line in sys.stdin:
         history_choice_stage_test_release(&stores, &base, 100);
         history_choice_store_test_receipt(&stores, 100);
         let encoded = stores.receipt.load().unwrap();
-        for now in [101, 102] {
+        for now in [101, 102, 103] {
             assert!(history_choice_create(&base, &stores, now).is_err());
             assert_eq!(stores.receipt.load().unwrap(), encoded);
             assert!(stores.marker.load().is_ok());
         }
-        let claim = history_choice_create(&base, &stores, 103).unwrap();
+        let claim = history_choice_create(&base, &stores, 104).unwrap();
         assert_eq!(claim.claim_code, "claim");
         assert_eq!(
             ceremonies.load(Ordering::SeqCst),
@@ -24692,7 +24839,7 @@ for line in sys.stdin:
         assert!(stores.proof.load().is_ok());
         assert!(!format!("{claim:?}").contains("token"));
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         for request in requests {
             assert_eq!(
                 history_choice_request_body(&request)["revocation_receipt"],
@@ -24753,6 +24900,131 @@ for line in sys.stdin:
         }
     }
 
+    struct HistoryChoiceUnavailableStore;
+    impl ControlTokenStore for HistoryChoiceUnavailableStore {
+        fn load(&self) -> Result<String, TokenStoreError> {
+            Err(TokenStoreError::Store("synthetic unavailable store".into()))
+        }
+        fn save(&self, _: &str) -> Result<(), TokenStoreError> {
+            Err(TokenStoreError::Store("synthetic unavailable store".into()))
+        }
+        fn delete(&self) -> Result<(), TokenStoreError> {
+            Err(TokenStoreError::Store("synthetic unavailable store".into()))
+        }
+    }
+    fn history_choice_unavailable_stores() -> HistoryStores {
+        HistoryStores {
+            receipt: Box::new(HistoryChoiceUnavailableStore),
+            marker: Box::new(HistoryChoiceUnavailableStore),
+            proof: Box::new(HistoryChoiceUnavailableStore),
+            browser: Box::new(HistoryChoiceUnavailableStore),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_ordinary_sign_in_works_without_optional_keychain() {
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        let (base, server) = scripted_json_backend(vec![(200, RECEIPT_CLAIM_SUCCESS)]);
+        let stores = history_choice_unavailable_stores();
+        assert!(
+            resume_history_browser_claim_with_stores(&test_machine(), &base, &stores)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            history_choice_create(&base, &stores, 101)
+                .unwrap()
+                .claim_code,
+            "claim"
+        );
+        assert!(history_choice_request_body(&server.join().unwrap()[0])
+            .get("revocation_receipt")
+            .is_none());
+        persist_local_release_expected().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let blocked_base = format!("http://{}", listener.local_addr().unwrap());
+        assert!(
+            history_choice_create(&blocked_base, &stores, 102).is_err(),
+            "known release must not silently downgrade when Keychain is locked"
+        );
+        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_forget_installation_invalidates_old_browser_credentials() {
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        let base = DEFAULT_API_BASE_URL;
+        let stores = history_stores();
+        history_choice_stage_test_release(&stores, base, history_now());
+        let claim: SetupClaimCreateResponse = serde_json::from_str(RECEIPT_CLAIM_SUCCESS).unwrap();
+        persist_history_browser_claim(
+            &claim,
+            "synthetic-original-nonce",
+            &test_machine(),
+            base,
+            &stores,
+        )
+        .unwrap();
+        {
+            let _identity_lock = lock_setup_run_binding();
+            forget_installation_state_locked().unwrap();
+        }
+        let mut machine = test_machine();
+        machine.installation_id = "new-installation-after-forget".into();
+        assert!(resume_history_browser_claim(&machine, base)
+            .unwrap()
+            .is_none());
+        assert!(!local_history_recovery_expected().unwrap());
+        for store in [
+            &stores.receipt,
+            &stores.marker,
+            &stores.proof,
+            &stores.browser,
+        ] {
+            assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_interrupted_closed_cleanup_needs_no_deleted_proof() {
+        use ottto_core::token_store::MemoryTokenStore;
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        let (base, server) = scripted_json_backend(vec![(200, RECEIPT_CLAIM_SUCCESS)]);
+        let mut stores = history_choice_test_stores();
+        history_choice_stage_test_release(&stores, &base, 100);
+        history_choice_store_test_receipt(&stores, 100);
+        let marker = MemoryTokenStore::new();
+        marker.save(&stores.marker.load().unwrap()).unwrap();
+        stores.marker = Box::new(HistoryChoiceFaultStore {
+            inner: marker,
+            fail_load: false.into(),
+            fail_delete: true.into(),
+        });
+        assert!(clear_local_release(&stores).is_err());
+        assert!(matches!(stores.proof.load(), Err(TokenStoreError::Missing)));
+        assert!(
+            history_load::<LocalReleaseMarker>(stores.marker.as_ref())
+                .unwrap()
+                .unwrap()
+                .ceremony_closed
+        );
+        assert!(history_choice_create(&base, &stores, 101).is_ok());
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /api/v1/setup-claims "));
+        assert!(matches!(
+            stores.marker.load(),
+            Err(TokenStoreError::Missing)
+        ));
+    }
+
     #[test]
     #[serial]
     fn history_choice_receipt_missing_read_or_parse_failure_reissues_before_claim() {
@@ -24773,6 +25045,12 @@ for line in sys.stdin:
             }
             let mut stores = history_choice_test_stores();
             history_choice_stage_test_release(&stores, &base, 100);
+            stores.browser.save("{").unwrap();
+            assert!(
+                resume_history_browser_claim_with_stores(&test_machine(), &base, &stores)
+                    .unwrap()
+                    .is_none()
+            );
             stores.receipt = Box::new(HistoryChoiceFaultStore {
                 inner,
                 fail_load: (fault == "read").into(),
@@ -24937,7 +25215,7 @@ for line in sys.stdin:
     fn history_choice_receipt_definitive_4xx_closes_local_marker() {
         let _lock = lock_backend_test_env();
         let _env = history_choice_test_env();
-        for status in [400, 401, 404, 422, 429] {
+        for status in [400, 401, 404, 422] {
             let (base, server) = scripted_json_backend(vec![(status, "{}")]);
             let stores = history_choice_test_stores();
             history_choice_stage_test_release(&stores, &base, 100);
