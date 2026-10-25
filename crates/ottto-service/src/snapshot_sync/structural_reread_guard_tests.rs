@@ -49,7 +49,8 @@ fn run_observe_events(observe: bool) -> (Vec<serde_json::Value>, u64, BTreeMap<S
     .unix_timestamp() as u64;
     let clock = TestClock::at(start);
     let mut fixture = c1a_fixture("structural-reread-seven-days");
-    fixture.native_file_limit = 64;
+    // Keep the real cached frame within the existing per-page layout budget.
+    fixture.native_file_limit = 2;
     fixture.owned_base_preparation = true;
     fixture.reread_guard_cache = Some(std::sync::Arc::new(Default::default()));
     for session in HEALTHY {

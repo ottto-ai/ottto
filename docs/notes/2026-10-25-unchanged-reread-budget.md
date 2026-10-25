@@ -27,14 +27,20 @@ each further selection is counted as one would-refuse event. Plan counting is
 currently conservative for stale families; composition with scoped retry must
 count the actual funded re-arm set before any future enforcement.
 
-Each of the three sparse diagnostic maps is capped at 10,000 keys and pruned on
+Each of the three sparse diagnostic maps is capped at 256 keys and pruned on
 load: 16-byte key digest plus two 32-bit hour stamps, physical metadata witnesses,
-and growth-read diagnostics. Their combined inline key/value payload is at most
-1,280,000 bytes on the validated layout, plus BTree allocation overhead. The
-stamp map alone is 240,000 bytes of key/value payload, approximately 510,001
-bytes of compact JSON with six-digit hours. Capacity loss increments a local
-counter and never affects selection. Empty default state remains omitted; an
-untouched index is not initialized by load/save.
+and growth-read diagnostics. Combined inline key/value payload is at most 32,768
+bytes on the validated layout. The existing requested-layout walker charges all
+three full BTree maps 633,248 bytes per index (two index owners: 1,266,496 bytes),
+plus their enclosing state. Inline-only stamp/witness accounting preserves that
+node charge without visiting each scalar. Aggregate observations and tripwire
+counts continue past capacity; per-key observation then becomes incomplete.
+Separate `reread_tracking_dropped{attempts|physical|growth}` local counts disclose
+omitted live insertions and load-time truncations. Capacity never affects selection.
+Empty default state remains omitted; unused guard state is not initialized by
+load/save. These are live-state/layout bounds, not peak decode-memory bounds:
+the decoder buffers and materializes diagnostic input before pruning. Bounded
+decoding and dormant grant/string limits remain a follow-up.
 
 Observation keeps the most recent two hour stamps. It conservatively retains
 stamps through 181 hours to cover hour rounding and the enforcement calculator's
@@ -45,7 +51,7 @@ its durable debt, grant and protected-read contracts are not shipped as policy.
 
 New synthetic tests check exact would-refuse counts, restart/pruning, map caps,
 clock rules and unconditional Admit. A seven-day multi-event fixture compares
-actual reads and delivery decisions with observation disabled/enabled and checks
+page outputs and delivery decisions with observation disabled/enabled and checks
 a whole-history alarm without a plan hold. Legacy correction tests need no
 budget allowances. Test builds retain the current-selection Admit-ticket
 invariant, with direct reader drivers explicitly obtaining their tickets.

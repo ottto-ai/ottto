@@ -2294,8 +2294,6 @@ struct ClaudeFullRearmWindow {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct ScanTraversalCounts {
-    unchanged_reread_admitted: u64,
-    reread_budget_refused: u64,
     discovered_file_count: usize,
     directory_entry_cap_exceeded_count: usize,
     symlink_rejected_count: usize,
@@ -2337,6 +2335,9 @@ struct ScanTraversalCounts {
     terminal_ownership_incomplete_file_count: usize,
     #[serde(default)]
     terminal_zero_snapshot_usage_evidence_count: usize,
+    // Persisted positional slots: diagnostic additions must remain last.
+    unchanged_reread_admitted: u64,
+    reread_budget_refused: u64,
 }
 
 /// Residue a generation disclosed as terminal after settling. Counts exclude
@@ -28601,6 +28602,10 @@ impl OwnedSourceScan {
                     *count = count.saturating_add(1);
                 }
             }
+            index.note_reason_reoffer_cooldown_candidate(
+                &candidate,
+                decision == CandidateDecision::Skip && parse_reason.is_none(),
+            );
             // U1a-2a (row 9): P's side read, when main skips an unchanged P
             // that owes no PR-P reparse and its side request is due. Every
             // main write on its path is gated (G2–G17); it ends at the side
@@ -28738,10 +28743,6 @@ impl OwnedSourceScan {
             } else {
                 None
             };
-            index.note_reason_reoffer_cooldown_candidate(
-                &candidate,
-                decision == CandidateDecision::Skip && parse_reason.is_none(),
-            );
             // A parse of a carried family's member cancels that family's
             // carry, so the family is co-observed in this window as BASE's
             // re-arm would observe it. A re-armed member is no new change.

@@ -7,7 +7,9 @@ use serde::{Deserializer, Serializer};
 /// with durable debt, protected-read and replay-drip contracts completed.
 pub(crate) const REREAD_GUARD_ENFORCE: bool = false;
 /// Cap each sparse diagnostic map independently; capacity never blocks reads.
-const MAX_TRACKED_KEYS: usize = 10_000;
+// Two index owners can coexist in the 8 MiB SourcePreparation frame. The
+// existing walker charges these three maps 633,248 bytes per populated owner.
+const MAX_TRACKED_KEYS: usize = 256;
 
 const WEEK_HOURS: u32 = 7 * 24;
 const GRANT_LIFETIME: u64 = 12 * 3600;
@@ -62,6 +64,30 @@ impl crate::heap_layout_bound::HeapLayoutBound for KeyHash {
     }
 }
 
+/// Stamp values and digest keys contain no owned allocations. Charge their
+/// BTree nodes once, without spending one walker visit per scalar hour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct StampMap(BTreeMap<KeyHash, [u32; 2]>);
+impl std::ops::Deref for StampMap {
+    type Target = BTreeMap<KeyHash, [u32; 2]>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for StampMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for StampMap {
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self(map): &Self = self;
+        crate::heap_layout_bound::tree_nodes::<KeyHash, [u32; 2]>(map.len(), c)
+    }
+}
+
 /// Counters belong to one traversal and survive page boundaries and restarts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -95,10 +121,12 @@ pub(super) struct State {
     over_budget: [u64; CAUSES],
     observed_reads: u64,
     tracking_dropped: u64,
-    growth_full: BTreeMap<KeyHash, [u32; 2]>,
+    physical_tracking_dropped: u64,
+    growth_tracking_dropped: u64,
+    growth_full: StampMap,
     source_revision: String,
     // Sparse: no entry until a selected unchanged file spends an attempt.
-    attempts: BTreeMap<KeyHash, [u32; 2]>,
+    attempts: StampMap,
     wall_high_water: u64,
     replayed: BTreeMap<String, BTreeSet<KeyHash>>,
     tripwire: Tripwire,
@@ -110,7 +138,7 @@ pub(super) struct State {
     #[serde(skip)]
     require_save: bool,
 }
-crate::heap_layout_bound::fields!(State; replay_witnesses, over_budget, observed_reads, tracking_dropped, growth_full, source_revision, attempts, wall_high_water, replayed, tripwire, last_budget_alarm, closed, reservations, require_save);
+crate::heap_layout_bound::fields!(State; replay_witnesses, over_budget, observed_reads, tracking_dropped, physical_tracking_dropped, growth_tracking_dropped, growth_full, source_revision, attempts, wall_high_water, replayed, tripwire, last_budget_alarm, closed, reservations, require_save);
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Ticket {
@@ -239,12 +267,15 @@ impl State {
         }
         while self.attempts.len() > MAX_TRACKED_KEYS {
             self.attempts.pop_last();
+            self.tracking_dropped = self.tracking_dropped.saturating_add(1);
         }
         while self.replay_witnesses.len() > MAX_TRACKED_KEYS {
             self.replay_witnesses.pop_last();
+            self.physical_tracking_dropped = self.physical_tracking_dropped.saturating_add(1);
         }
         while self.growth_full.len() > MAX_TRACKED_KEYS {
             self.growth_full.pop_last();
+            self.growth_tracking_dropped = self.growth_tracking_dropped.saturating_add(1);
         }
         self.reservations.clear(); // Restart never reuses an unconsumed ticket.
     }
@@ -490,8 +521,8 @@ impl State {
             .collect::<Vec<_>>()
             .join(" ");
         format!(
-            "{counts} reread_mode=observe reread_observed={} reread_tracking_dropped={} reread_planned={} reread_indexed={} reread_tripwire_would_fire={} growth_full={}",
-            self.observed_reads, self.tracking_dropped, self.tripwire.planned, self.tripwire.indexed,
+            "{counts} reread_mode=observe reread_observed={} reread_tracking_dropped{{attempts}}={} reread_tracking_dropped{{physical}}={} reread_tracking_dropped{{growth}}={} reread_planned={} reread_indexed={} reread_tripwire_would_fire={} growth_full={}",
+            self.observed_reads, self.tracking_dropped, self.physical_tracking_dropped, self.growth_tracking_dropped, self.tripwire.planned, self.tripwire.indexed,
             self.tripwire.plan_held || self.tripwire.full_reads > threshold(self.tripwire.indexed),
             self.growth_full.values().map(|v| u64::from(v[1])).sum::<u64>()
         )
@@ -514,6 +545,7 @@ impl State {
         if !self.growth_full.contains_key(&KeyHash::of(key))
             && self.growth_full.len() >= MAX_TRACKED_KEYS
         {
+            self.growth_tracking_dropped = self.growth_tracking_dropped.saturating_add(1);
             return;
         }
         let record = self
@@ -758,9 +790,11 @@ impl<'de> Deserialize<'de> for State {
             over_budget: [u64; CAUSES],
             observed_reads: u64,
             tracking_dropped: u64,
-            growth_full: BTreeMap<KeyHash, [u32; 2]>,
+            physical_tracking_dropped: u64,
+            growth_tracking_dropped: u64,
+            growth_full: StampMap,
             source_revision: String,
-            attempts: BTreeMap<KeyHash, [u32; 2]>,
+            attempts: StampMap,
             wall_high_water: u64,
             replayed: BTreeMap<String, BTreeSet<KeyHash>>,
             tripwire: Tripwire,
@@ -782,6 +816,8 @@ impl<'de> Deserialize<'de> for State {
             over_budget: stored.over_budget,
             observed_reads: stored.observed_reads,
             tracking_dropped: stored.tracking_dropped,
+            physical_tracking_dropped: stored.physical_tracking_dropped,
+            growth_tracking_dropped: stored.growth_tracking_dropped,
             growth_full: stored.growth_full,
             source_revision: stored.source_revision,
             attempts: stored.attempts,
@@ -904,13 +940,32 @@ struct PhysicalWitness {
     mtime_seconds: u64,
     object: Option<[u64; 2]>,
 }
-crate::heap_layout_bound::fields!(PhysicalWitness; removed_hour, size, mtime_ns, mtime_seconds, object);
+impl crate::heap_layout_bound::HeapLayoutBound for PhysicalWitness {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, _: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        // Exhaustive, typed destructuring makes any future owned field require
+        // an explicit accounting change. All storage is in the charged node.
+        let Self {
+            removed_hour,
+            size,
+            mtime_ns,
+            mtime_seconds,
+            object,
+        } = self;
+        let _: (&u32, &u64, &Option<u64>, &u64, &Option<[u64; 2]>) =
+            (removed_hour, size, mtime_ns, mtime_seconds, object);
+        Some(())
+    }
+}
 impl State {
     pub(super) fn is_empty(&self) -> bool {
         self.replay_witnesses.is_empty()
             && self.attempts.is_empty()
             && self.observed_reads == 0
             && self.tracking_dropped == 0
+            && self.physical_tracking_dropped == 0
+            && self.growth_tracking_dropped == 0
             && self.growth_full.is_empty()
             && self.source_revision.is_empty()
             && self.replayed.is_empty()
@@ -952,8 +1007,17 @@ impl ScanIndex {
             if entry.retain_history_evidence() {
                 continue;
             }
-            if self.reread_guard.replay_witnesses.len() >= MAX_TRACKED_KEYS {
-                break;
+            if !self
+                .reread_guard
+                .replay_witnesses
+                .contains_key(&KeyHash::of(key))
+                && self.reread_guard.replay_witnesses.len() >= MAX_TRACKED_KEYS
+            {
+                self.reread_guard.physical_tracking_dropped = self
+                    .reread_guard
+                    .physical_tracking_dropped
+                    .saturating_add(1);
+                continue;
             }
             self.reread_guard.replay_witnesses.insert(
                 KeyHash::of(key),
@@ -976,6 +1040,10 @@ impl ScanIndex {
         if !self.reread_guard.replay_witnesses.contains_key(&id)
             && self.reread_guard.replay_witnesses.len() >= MAX_TRACKED_KEYS
         {
+            self.reread_guard.physical_tracking_dropped = self
+                .reread_guard
+                .physical_tracking_dropped
+                .saturating_add(1);
             return;
         }
         self.reread_guard.replay_witnesses.insert(
@@ -1006,6 +1074,7 @@ impl State {
         if !self.replay_witnesses.contains_key(&KeyHash::of(key))
             && self.replay_witnesses.len() >= MAX_TRACKED_KEYS
         {
+            self.physical_tracking_dropped = self.physical_tracking_dropped.saturating_add(1);
             return;
         }
         self.replay_witnesses.insert(

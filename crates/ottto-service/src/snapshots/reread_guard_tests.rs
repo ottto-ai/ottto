@@ -536,6 +536,22 @@ fn observe_sparse_maps_are_capped_and_pruned_without_changing_admission() {
             Admission::Admit(_)
         ));
         state.note_growth_full(&key);
+        state.remember_entry(&key, &super::super::tests::manifest_index_entry(None));
+    }
+    assert_eq!(state.replay_witnesses.len(), MAX_TRACKED_KEYS);
+    assert_eq!(state.tracking_dropped, 1);
+    assert_eq!(state.physical_tracking_dropped, 1);
+    assert_eq!(state.growth_tracking_dropped, 1);
+    for map in ["attempts", "physical", "growth"] {
+        assert!(state
+            .disclosure()
+            .contains(&format!("reread_tracking_dropped{{{map}}}=1")));
+    }
+    if crate::heap_layout_bound::layout_supported() {
+        // Real node charge and visit ceiling, not just inline map payload.
+        let charge = crate::heap_layout_bound::bound(&state, 1024 * 1024)
+            .expect("all three full diagnostic maps fit one MiB including walker visits");
+        assert!(charge >= 633_248);
     }
     assert_eq!(state.attempts.len(), MAX_TRACKED_KEYS);
     assert_eq!(state.growth_full.len(), MAX_TRACKED_KEYS);

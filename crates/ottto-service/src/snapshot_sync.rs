@@ -338,6 +338,38 @@ fn with_retained_refusal_conflicts(
     with_bootstrap_deferred(result, retained.len())
 }
 
+/// Exercise the real retained-conflict settlement boundary from Codex scan
+/// fixtures, without replacing its cooldown decision with a test predicate.
+#[cfg(test)]
+pub(crate) fn retained_refusal_settles_for_test(
+    index: &ScanIndex,
+    fingerprint: &str,
+    record: SnapshotQuarantineRecord,
+    body: &str,
+    now: u64,
+    deadline: u64,
+) -> bool {
+    let mut progress =
+        SnapshotUploadProgress::new("synthetic-codex-cooldown".into(), record.witness.clone());
+    progress
+        .quarantined_fingerprints
+        .insert(fingerprint.into(), record);
+    progress.permanent_rejections.insert(
+        fingerprint.into(),
+        PermanentSnapshotRejection {
+            body_witness: body.into(),
+            reason: crate::upload_receipts::RejectedUsageReason::Other,
+            reoffer: Some(reason_reoffer::RefusalReoffer::OriginalPair {
+                retry_after_unix_seconds: deadline,
+            }),
+        },
+    );
+    matches!(
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, index, &progress, now),
+        ResumableUploadResult::Completed
+    )
+}
+
 // Local index projection producer revision; independent of semantic/wire identity.
 // Each indexed file whose stored revision differs is re-read once; the stamp is
 // written only when its upload settles, so an interrupted pass resumes. Claude
