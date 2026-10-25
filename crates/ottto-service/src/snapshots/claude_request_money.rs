@@ -740,6 +740,21 @@ pub(crate) fn set_next_page_budget_for_test(budget: Duration) {
     PAGE_BUDGET.with(|current| current.set(Some(budget)));
 }
 
+// The schedule position whose family consumes its captures just before the
+// money budget runs out, as on a CPU-starved runner.
+#[cfg(test)]
+thread_local! {
+    static BUDGET_EXPIRES_AFTER_CAPTURE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The page budget expires right after the family at schedule `position`
+/// took its captures, before its body: that family and every later one are
+/// out of time. Cleared by `None`.
+#[cfg(test)]
+pub(crate) fn set_budget_expires_after_capture_for_test(position: Option<usize>) {
+    BUDGET_EXPIRES_AFTER_CAPTURE.with(|current| current.set(position));
+}
+
 #[cfg(test)]
 pub(crate) fn set_page_fault_for_test(fault: PageFault) {
     PAGE_FAULT.with(|current| current.set(fault));
@@ -2653,6 +2668,14 @@ async fn build_page_with_coverage(
                 }
             }
         }
+        #[cfg(test)]
+        let body_deadline =
+            if BUDGET_EXPIRES_AFTER_CAPTURE.with(std::cell::Cell::get) == Some(position) {
+                (end.deadline, later_families) = (started, started);
+                started
+            } else {
+                body_deadline
+            };
         let prepared = match (files, &family) {
             (Some(files), Some(family)) => add_family_scope(
                 &mut scope,

@@ -561,6 +561,7 @@ fn the_exit_rows_write_the_record_or_the_tombstone_in_both_stores() {
 /// (`begin_codex_continuation_side_pass`) never charges a side read: no
 /// ledger entry, no request write. An ordinary pass charges the same one.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn the_continuation_pass_charges_no_g7() {
     let fixture = Root::new(1, b"");
     let at = fixture.at();
@@ -582,6 +583,9 @@ fn the_continuation_pass_charges_no_g7() {
     assert_eq!(cache.side_ledger().len(), 0, "nothing charged");
     assert_eq!(
         index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &pass(true)),
+        // Side-ledger admission requires the validated native heap layout.
+        // The continuation assertions above apply on every platform; Linux
+        // must also keep the ordinary read uncharged when layout is unsupported.
         crate::heap_layout_bound::layout_supported().then_some(1),
         "the ordinary control follows native heap-layout support"
     );

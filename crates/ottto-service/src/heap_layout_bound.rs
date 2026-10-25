@@ -395,7 +395,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentDiagnost
     }
 }
 
-crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusPlanObservation; observed_at, evidence_method, source_session_id, provider, billing_provider, model_provider, billing_channel, auth_mode, gateway_provider, subscription_product, plan_type, account_label, account_id, organization_label, organization_id, account_identifier_hash, organization_identifier_hash, superseded_account_identifier_hash, superseded_organization_identifier_hash, credential_fingerprint_hash, billing_identity_evidence, billing_identity_confidence, confidence, is_current);
+crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusPlanObservation; desktop_recent_at, observed_at, evidence_method, source_session_id, provider, billing_provider, model_provider, billing_channel, auth_mode, gateway_provider, subscription_product, plan_type, account_label, account_id, organization_label, organization_id, account_identifier_hash, organization_identifier_hash, superseded_account_identifier_hash, superseded_organization_identifier_hash, credential_fingerprint_hash, billing_identity_evidence, billing_identity_confidence, confidence, is_current);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentStatusConfidence {
     const STABLE_HEAP: bool = true;

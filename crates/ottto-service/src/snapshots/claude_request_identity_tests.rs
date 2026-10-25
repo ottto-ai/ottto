@@ -4349,3 +4349,227 @@ fn p2a_si_all_55_trace_named_subagents_keep_per_item_contract5_accounts() {
     assert_eq!(named, 55);
     let _ = fs::remove_dir_all(dir);
 }
+
+// Recent activity is independent of session-first origin and billing identity.
+#[test]
+fn desktop_recent_follows_each_request_entrypoint_and_governing_org() {
+    let dir = temp_dir("desktop-recent-transitions");
+    let mut lines = vec![marker(ORG_1)];
+    for (n, entrypoint) in ["claude-desktop", "cli", "claude-desktop", "cli"].iter().enumerate() {
+        if n == 2 { lines.push(marker(ORG_2)); }
+        lines.push(json!({"type": "assistant", "sessionId": ROOT,
+            "timestamp": format!("2026-08-02T07:00:{:02}Z", 10 + n),
+            "entrypoint": entrypoint, "requestId": format!("req_{n}"),
+            "message": {"id": format!("msg_{n}"), "model": "claude-haiku-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 1}}
+        }));
+    }
+    let mut item = parse_session(&dir, &lines).remove(0);
+    assert_eq!(item.origin.as_ref().unwrap().entrypoint.as_deref(), Some("claude-desktop"));
+    item.session_account_evidence = Some(SessionAccountEvidence {
+        provider: "anthropic", account_identifier_hash: Some(LOGIN_A.into()),
+        provider_workspace_hash: Some(org_hash(ORG_1)),
+        identity_hash_scheme: "provider-sha256:v1", evidence_source: "claude_desktop_original:v1",
+        identity_disposition: Some("complete"), source_created_at: Some("2026-08-02T07:00:00Z".into()),
+    });
+    let (api, trace) = reports(Vec::new(), Vec::new());
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let collect = |item: &SnapshotItem| {
+        let mut sink = identity::RequestSink::for_item(&evidence, item, usize::MAX).unwrap();
+        for (request_id, occurrence) in &item.claude_usage_occurrences {
+            let (row_key, _, _) = build_row_identity(
+                occurrence.model.as_deref().unwrap(), &occurrence.selector,
+                occurrence.reasoning_effort.as_deref());
+            sink.add(item, identity::Request {
+                request_id, occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
+                timestamp: occurrence.timestamp.as_deref().unwrap(),
+                bucket_start: "2026-08-02T07:00:00Z", row_key: &row_key, usage: &occurrence.usage,
+            });
+        }
+        sink.finish()
+    };
+    let at = |seconds| OffsetDateTime::parse(&format!("2026-08-02T07:00:{seconds:02}Z"), &Rfc3339).ok();
+    let grouping = collect(&item);
+    assert_eq!(grouping.desktop_recent().at(LOGIN_A, &org_hash(ORG_1)), at(10));
+    assert_eq!(grouping.desktop_recent().at(LOGIN_A, &org_hash(ORG_2)), at(12));
+    // No native account, ambiguous/imported ownership, or old/future clocks cannot qualify.
+    for disposition in ["missing", "conflict"] {
+        let mut refused = item.clone();
+        refused.session_account_evidence.as_mut().unwrap().identity_disposition = Some(disposition);
+        assert_eq!(collect(&refused).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    }
+    let mut no_owner = item.clone();
+    no_owner.session_account_evidence = None;
+    assert_eq!(collect(&no_owner).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    let mut expired = item.clone();
+    expired.collected_at = "2026-08-02T07:16:00Z".into();
+    assert_eq!(collect(&expired).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    let mut future = item.clone();
+    future.collected_at = "2026-08-02T07:00:00Z".into();
+    assert_eq!(collect(&future).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    // The account binding is copied exactly, never inferred from the org.
+    let mut other = item.clone();
+    other.session_account_evidence.as_mut().unwrap().account_identifier_hash = Some(D64.into());
+    assert_eq!(collect(&other).desktop_recent().at(LOGIN_A, &org_hash(ORG_1)), None);
+    assert_eq!(collect(&other).desktop_recent().at(D64, &org_hash(ORG_1)), at(10));
+    // Local bookkeeping cannot change serialized telemetry or diagnostics.
+    let wire = serde_json::to_string(&item).unwrap();
+    assert!(!wire.contains("desktop_request") && !wire.contains("desktop_recent"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    accumulator.claude_request_identity_capture = true;
+    apply_claude_code_line(&marker(ORG_1), &mut accumulator);
+    for (n, entrypoint) in [Some("cli"), Some("claude-desktop"), None].iter().enumerate() {
+        if n == 1 { apply_claude_code_line(&marker(ORG_2), &mut accumulator); }
+        let mut line = json!({"type": "assistant", "sessionId": ROOT,
+            "timestamp": format!("2026-08-02T07:00:{n:02}Z"),
+            "requestId": format!("req_{n}"), "message": {"id": format!("msg_{n}"),
+            "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 1}}});
+        if let Some(entrypoint) = entrypoint { line["entrypoint"] = json!(entrypoint); }
+        apply_claude_code_line(&line, &mut accumulator);
+    }
+    accumulator.finalize_claude_responses();
+    assert!(!accumulator.claude_usage_occurrences["req_0"].desktop_request);
+    assert!(accumulator.claude_usage_occurrences["req_1"].desktop_request);
+    assert!(!accumulator.claude_usage_occurrences["req_2"].desktop_request);
+    assert_eq!(accumulator.origin.entrypoint.as_deref(), Some("cli"));
+    let mut item = accumulator.into_items(
+        Path::new("/synthetic/session.jsonl"), "2026-08-02T07:01:00Z", "fp".into(), None).remove(0);
+    item.session_account_evidence = Some(SessionAccountEvidence {
+        provider: "anthropic", account_identifier_hash: Some(LOGIN_A.into()),
+        provider_workspace_hash: Some(org_hash(ORG_1)), identity_hash_scheme: "provider-sha256:v1",
+        evidence_source: "claude_desktop_original:v1", identity_disposition: Some("complete"),
+        source_created_at: Some("2026-08-02T06:59:00Z".into()),
+    });
+    let (api, trace) = reports(Vec::new(), Vec::new());
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let mut sink = identity::RequestSink::for_item(&evidence, &item, usize::MAX).unwrap();
+    for (request_id, occurrence) in &item.claude_usage_occurrences {
+        let (key, _, _) = build_row_identity(occurrence.model.as_deref().unwrap(), &occurrence.selector, None);
+        sink.add(&item, identity::Request { request_id,
+            occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
+            timestamp: occurrence.timestamp.as_deref().unwrap(), bucket_start: "2026-08-02T07:00:00Z",
+            row_key: &key, usage: &occurrence.usage });
+    }
+    assert_eq!(sink.finish().desktop_recent().at(LOGIN_A, &org_hash(ORG_2)),
+        OffsetDateTime::parse("2026-08-02T07:00:01Z", &Rfc3339).ok());
+}
+
+/// Same order as the daemon: save native originals, apply request enrichment
+/// (including its billing veto), rebuild/place requests, then publish the fold.
+#[test]
+fn desktop_recent_survives_same_account_org_switch_through_enrichment_and_both_folds() {
+    let dir = temp_dir("desktop-recent-enrichment");
+    let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+    let first = now - time::Duration::seconds(60);
+    let second = now - time::Duration::seconds(30);
+    let stamp = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
+    let account = "f2".repeat(32);
+    let org1 = org_hash(ORG_1);
+    let org2 = org_hash(ORG_2);
+    let mut lines = vec![marker(ORG_1)];
+    for (n, at) in [(1, first), (2, second)] {
+        if n == 2 { lines.push(marker(ORG_2)); }
+        lines.push(json!({"type":"assistant", "sessionId":ROOT,
+            "entrypoint":"claude-desktop", "timestamp":stamp(at),
+            "requestId":format!("req_{n}"), "message":{"id":format!("msg_{n}"),
+            "model":"claude-haiku-4-5", "usage":{"input_tokens":10,"output_tokens":1}}}));
+    }
+    let path = dir.join(format!("{ROOT}.jsonl"));
+    fs::write(&path, lines.iter().map(|v| v.to_string()+"\n").collect::<String>()).unwrap();
+    let mut item = parse_claude_code_jsonl_file(&path, &stamp(now), "fp".into()).unwrap().remove(0);
+    item.session_account_evidence = Some(SessionAccountEvidence {
+        provider: "anthropic", account_identifier_hash: Some(account.clone()),
+        provider_workspace_hash: Some(org1.clone()), identity_hash_scheme: "provider-sha256:v1",
+        evidence_source: "claude_desktop_original:v1", identity_disposition: Some("complete"),
+        source_created_at: Some(stamp(first - time::Duration::seconds(1))),
+    });
+    let originals = BTreeMap::from([(ROOT.to_string(), item.session_account_evidence.clone().unwrap())]);
+    let api_rows = [("req_1", &org1), ("req_2", &org2)].into_iter().enumerate().map(|(i,(request,org))| {
+        let mut row = complete_api_row(ROOT, request, i as u64+1, 10, 1, 0);
+        row.account_identifier_hash = Some(account.clone());
+        let mut identity = org_identity(org);
+        identity.account.log_record_hash = Some(account.clone());
+        row.request_identity = Some(identity);
+        signed(row)
+    }).collect::<Vec<_>>();
+    let (api, trace) = reports(api_rows, vec![complete_trace_row(ROOT,"req_1",""),complete_trace_row(ROOT,"req_2","")]);
+    let mut index = ScanIndex::default();
+    let mut enriched = vec![item];
+    apply_claude_effort_evidence_with_index(&mut enriched, &api.evidence, &mut index, false, &stamp(now));
+    assert_eq!(enriched[0].session_account_evidence.as_ref().unwrap().identity_disposition, Some("conflict"), "existing billing veto remains");
+    let evidence = ScanEvidence::new(&api,&trace,BTreeSet::new(),None).with_native_originals(&originals);
+    for reported in [false, true] {
+        let mut items = enriched.clone();
+        let mut groupings = BTreeMap::new();
+        if reported {
+            let item = &mut items[0];
+            let mut sink = identity::RequestSink::for_item(&evidence,item,usize::MAX).unwrap();
+            assert!(rebuild_claude_reported_usage(item, &api.evidence[ROOT], &BTreeSet::new(), Some(&mut sink)));
+            item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".into());
+            groupings.insert(ROOT.to_string(),sink.finish());
+        }
+        let result = identity::apply_scan(&mut items,&evidence,groupings);
+        assert_eq!(result.sent,1,"reported={reported}: {result:?}");
+        assert_eq!(items[0].session_account_evidence.as_ref().unwrap().identity_disposition,Some("conflict"));
+        let activity = crate::desktop_recent::saved();
+        assert_eq!(activity.at(&account,&org1),Some(first));
+        assert_eq!(activity.at(&account,&org2),Some(second));
+    }
+    // Config selection is the existing health observation, independent of
+    // which snapshot upload carries the two exact rows.
+    let mut health: ottto_protocol::AgentStatusSnapshot = serde_json::from_str(include_str!("../../../../fixtures/agent-status/display-carrier.json")).unwrap();
+    health.plan_observations = vec![serde_json::from_value(json!({
+        "confidence":"high", "auth_mode":"claude_desktop", "evidence_method":"claude_desktop_session_bucket",
+        "account_identifier_hash":account, "is_current":true})).unwrap()];
+    let mut response = vec![health.clone()];
+    response[0].plan_observations = [&org1,&org2].into_iter().map(|org| serde_json::from_value(json!({
+        "confidence":"high", "account_identifier_hash":account,"organization_identifier_hash":org})).unwrap()).collect();
+    crate::desktop_recent::overlay(&mut response,&health,now);
+    assert!(response[0].plan_observations.iter().all(|o|o.desktop_recent_at.is_some()));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without_duplicate_index() {
+    let dir = temp_dir("desktop-recent-foreign");
+    let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+    let at = now - time::Duration::seconds(30);
+    let stamp = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
+    let lines = [marker(ORG_1),json!({"type":"assistant","sessionId":ROOT,
+        "entrypoint":"claude-desktop","timestamp":stamp(at),"requestId":"req_foreign",
+        "message":{"id":"msg_foreign","model":"claude-haiku-4-5","usage":{"input_tokens":10,"output_tokens":1}}})];
+    let path = dir.join(format!("{ROOT}.jsonl"));
+    fs::write(&path,lines.iter().map(|v|v.to_string()+"\n").collect::<String>()).unwrap();
+    let base = parse_claude_code_jsonl_file(&path,&stamp(now),"fp".into()).unwrap().remove(0);
+    for (case,account) in [("foreign","f3".repeat(32)),("conflict","f4".repeat(32)),("account","f5".repeat(32))] {
+        let mut item = base.clone();
+        item.session_account_evidence = Some(SessionAccountEvidence {
+            provider:"anthropic",account_identifier_hash:Some(account.clone()),provider_workspace_hash:Some(org_hash(ORG_1)),
+            identity_hash_scheme:"provider-sha256:v1",evidence_source:"claude_desktop_original:v1",
+            identity_disposition:Some("complete"),source_created_at:Some(stamp(at-time::Duration::seconds(1))),
+        });
+        let mut api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        if case=="foreign" {
+            trace.evidence.insert(OTHER_ROOT.into(),vec![complete_trace_row(OTHER_ROOT,"req_foreign","")]);
+        } else {
+            let mut row = complete_api_row(ROOT,"req_foreign",1,10,1,0);
+            row.account_identifier_hash = Some(if case=="account" {D64.into()} else {account.clone()});
+            api.evidence.insert(ROOT.into(),vec![signed(row)]);
+            let owner = complete_trace_row(ROOT,"req_foreign","");
+            trace.evidence.insert(ROOT.into(),if case=="conflict" {vec![owner.clone(),owner]} else {vec![owner]});
+        }
+        let evidence = ScanEvidence::new(&api,&trace,BTreeSet::new(),None);
+        let mut items = vec![item];
+        let result = identity::apply_scan(&mut items,&evidence,BTreeMap::new());
+        assert_eq!(result.sent,1,"{case}: {result:?}");
+        assert_eq!(crate::desktop_recent::saved().at(&account,&org_hash(ORG_1)),None,"{case}");
+        if case!="account" { assert!(items[0].request_identity_refusals>0,"{case}"); }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

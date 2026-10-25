@@ -27,6 +27,7 @@ pub mod context_footprint;
 pub mod context_posture;
 pub mod control;
 pub mod control_plane_health;
+mod desktop_recent;
 pub mod detected_uses;
 mod external_scheduler_attribution;
 #[cfg(unix)]
@@ -1303,7 +1304,15 @@ impl LocalDaemon {
             .collect::<Result<Vec<_>, _>>()?;
         let snapshots = collections
             .iter()
-            .flat_map(|collection| collection.snapshots.iter().cloned())
+            .flat_map(|collection| {
+                let mut snapshots = collection.snapshots.clone();
+                desktop_recent::overlay(
+                    &mut snapshots,
+                    &collection.source_health_snapshot,
+                    time::OffsetDateTime::now_utc(),
+                );
+                snapshots
+            })
             .collect::<Vec<_>>();
         let mut state = self.state()?;
         for collection in collections {
@@ -6547,7 +6556,7 @@ mod tests {
     fn snapshot_sync_stall_never_masks_a_blocking_failure() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         daemon
-            .record_snapshot_sync_stalled(45, Some("otlp_relay"))
+            .record_snapshot_sync_stalled(45, Some("agent_status"))
             .expect("record sync stall");
         daemon
             .record_local_health_upload_failed(LocalHealthUploadFailureKind::BackendUnreachable)
@@ -9279,6 +9288,7 @@ mod tests {
             },
         ];
         snapshot.plan_observations = vec![ottto_protocol::AgentStatusPlanObservation {
+            desktop_recent_at: None,
             observed_at: Some("2026-05-05T10:20:00Z".to_string()),
             evidence_method: Some("local_status".to_string()),
             source_session_id: None,

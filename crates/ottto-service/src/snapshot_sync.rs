@@ -9725,6 +9725,7 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
             crate::snapshots::claude_request_identity::desktop_census(index),
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
+        .with_native_originals(&originals)
     });
     // A first duplicate-census fence closure re-arms every family file so the
     // NEXT window re-reads it. This page's completed parses (captures and

@@ -288,6 +288,23 @@ impl ClaudeTraceOwnershipLoadReport {
     }
 }
 
+/// Context attached when a Claude OTLP body cannot be decoded, so the relay
+/// can tell a malformed request apart from a local storage failure.
+#[derive(Debug, Clone, Copy)]
+struct UndecodableClaudeOtlpBody;
+
+impl std::fmt::Display for UndecodableClaudeOtlpBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Claude OTLP body could not be decoded")
+    }
+}
+
+/// True when a capture error came from decoding the request body rather than
+/// from storing the reduced evidence.
+pub fn is_undecodable_body(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<UndecodableClaudeOtlpBody>().is_some()
+}
+
 pub fn capture_claude_api_request_logs(
     support_dir: &Path,
     body: &[u8],
@@ -295,9 +312,9 @@ pub fn capture_claude_api_request_logs(
 ) -> Result<usize> {
     let content_type = content_type.to_ascii_lowercase();
     let evidence = if content_type.contains("json") {
-        api_evidence_from_json(body)?
+        api_evidence_from_json(body).context(UndecodableClaudeOtlpBody)?
     } else if content_type.contains("protobuf") || content_type.contains("octet-stream") {
-        api_evidence_from_protobuf(body)?
+        api_evidence_from_protobuf(body).context(UndecodableClaudeOtlpBody)?
     } else {
         return Ok(0);
     };
@@ -408,8 +425,8 @@ fn persist_api_evidence(
 }
 
 /// Reduce Claude Code's enhanced `claude_code.llm_request` spans to a bounded,
-/// content-free request owner record. The caller continues forwarding `body`
-/// unchanged; this function only decodes a borrowed byte slice.
+/// content-free request owner record. This function only decodes a borrowed
+/// byte slice; the raw body is never stored or sent anywhere.
 pub fn capture_claude_llm_request_traces(
     support_dir: &Path,
     body: &[u8],
@@ -417,9 +434,9 @@ pub fn capture_claude_llm_request_traces(
 ) -> Result<usize> {
     let content_type = content_type.to_ascii_lowercase();
     let evidence = if content_type.contains("json") {
-        trace_evidence_from_json(body)?
+        trace_evidence_from_json(body).context(UndecodableClaudeOtlpBody)?
     } else if content_type.contains("protobuf") || content_type.contains("octet-stream") {
-        trace_evidence_from_protobuf(body)?
+        trace_evidence_from_protobuf(body).context(UndecodableClaudeOtlpBody)?
     } else {
         return Ok(0);
     };
@@ -1672,7 +1689,7 @@ fn append_trace_ownership_evidence(
 }
 
 /// Local capture success means the whole row was appended below the strict
-/// reader's usable boundary. It is independent of raw OTLP forwarding success.
+/// reader's usable boundary.
 ///
 /// Preserve the existing final-row append when it reaches/crosses the boundary:
 /// the resulting file size is the existing durable incomplete-evidence signal.
@@ -1859,7 +1876,7 @@ mod tests {
             assert_eq!(output.as_slice(), if writes { row.as_slice() } else { &[] });
             if writes && !succeeds {
                 // Retry at the persisted boundary must refuse without another
-                // duplicate append; the receiver still forwards independently.
+                // duplicate append.
                 let size = output.len();
                 assert!(
                     append_evidence_bytes(&mut output, before + row.len() as u64, row).is_err()

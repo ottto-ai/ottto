@@ -10070,6 +10070,7 @@ fn claude_desktop_builder_plan_observation(
         .and_then(|seconds| u64::try_from(seconds).ok())
         .and_then(rfc3339_from_unix_seconds);
     Some(AgentStatusPlanObservation {
+        desktop_recent_at: None,
         observed_at: activity_observed_at,
         evidence_method: Some("claude_desktop_session_bucket".to_string()),
         source_session_id: builder.latest_session_id,
@@ -10230,6 +10231,7 @@ fn claude_desktop_pair_observation(
     Some(ClaudeDesktopPairObservation {
         binding,
         observation: AgentStatusPlanObservation {
+            desktop_recent_at: None,
             observed_at: u64::try_from(activity)
                 .ok()
                 .and_then(rfc3339_from_unix_seconds),
@@ -14963,6 +14965,7 @@ fn plan_observation_from_snapshot_account(
         return None;
     }
     Some(AgentStatusPlanObservation {
+        desktop_recent_at: None,
         observed_at: Some(snapshot.captured_at.clone()),
         evidence_method: Some(collection_method_key(&snapshot.collection_method).to_string()),
         source_session_id: None,
@@ -15093,6 +15096,7 @@ fn append_pi_route_plan_observations(snapshot: &mut AgentStatusSnapshot) {
             continue;
         }
         snapshot.plan_observations.push(AgentStatusPlanObservation {
+            desktop_recent_at: None,
             observed_at: Some(observed_at.clone()),
             evidence_method: Some("pi_route_metadata".to_string()),
             source_session_id: None,
@@ -36236,6 +36240,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         );
         let observation =
             |hash: Option<&str>, confidence: AgentStatusConfidence| AgentStatusPlanObservation {
+                desktop_recent_at: None,
                 observed_at: Some("2026-08-04T10:00:00Z".to_string()),
                 evidence_method: Some("claude_desktop_session_bucket".to_string()),
                 source_session_id: None,
@@ -36352,6 +36357,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let pair = |account: &str, organization: &str| ClaudeDesktopPairObservation {
             binding: ClaudeStrongBinding::new(account, organization).expect("binding"),
             observation: AgentStatusPlanObservation {
+                desktop_recent_at: None,
                 account_identifier_hash: Some(account.to_string()),
                 organization_identifier_hash: Some(organization.to_string()),
                 ..observation(Some(account), AgentStatusConfidence::High)

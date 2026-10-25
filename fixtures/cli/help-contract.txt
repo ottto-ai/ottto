@@ -128,6 +128,7 @@ Options:
       --token <TOKEN>    Override the local-control token for CLI and agent requests
       --json             Print one final JSON object and no human summary text
       --no-autostart     Do not kickstart the standard per-user ottto-service
+      --cached           Read daemon memory only; never refresh or start the daemon
       --watch            Emit NDJSON progress events and a final event; requires --json
   -h, --help             Print help
 ### ottto context --help

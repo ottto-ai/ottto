@@ -409,9 +409,15 @@ pub(crate) struct Grouping {
     /// An admitted request was excluded, or its transcript membership
     /// disagrees with its occurrence: such a grouping is never tagged.
     unowned_request: bool,
+    desktop_recent: crate::desktop_recent::RecentActivity,
 }
 
 impl Grouping {
+    #[cfg(test)]
+    pub(super) fn desktop_recent(&self) -> &crate::desktop_recent::RecentActivity {
+        &self.desktop_recent
+    }
+
     pub(crate) fn new(max_groups: usize) -> Self {
         Self {
             groups: BTreeMap::new(),
@@ -424,6 +430,7 @@ impl Grouping {
             telemetry_only_requests: 0,
             excluded_requests: Some(0),
             unowned_request: false,
+            desktop_recent: crate::desktop_recent::RecentActivity::default(),
         }
     }
 
@@ -1229,6 +1236,10 @@ pub(crate) struct ScanEvidence<'a> {
     status_coverage: Option<crate::claude_status_coverage::Ledger>,
     /// Key of the shared default folder, where the email basis never applies.
     default_home: Option<crate::claude_status_coverage::HomeKey>,
+    /// Pre-enrichment native evidence already saved by this scan. Request
+    /// telemetry may veto its original org for billing without changing the
+    /// unambiguous native account used by local Desktop activity.
+    native_originals: Option<&'a BTreeMap<String, super::SessionAccountEvidence>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1290,6 +1301,14 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    pub(crate) fn with_native_originals(
+        mut self,
+        originals: &'a BTreeMap<String, super::SessionAccountEvidence>,
+    ) -> Self {
+        self.native_originals = Some(originals);
+        self
     }
 
     /// The root whose rows name `request_id` (`Some(None)`: several roots).
@@ -1969,12 +1988,81 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             duplicated_elsewhere,
         };
         let identity = classify_ref(self.evidence, &facts);
+        // Activity never overrides stronger request identity. A later Desktop
+        // line can, however, qualify a marker flip the session-first CLI origin
+        // would refuse solely as UntrustedFlip.
+        if !self.grouping.unowned_request && !duplicated_elsewhere {
+            let original = match self.evidence.native_originals {
+                Some(originals) => originals.get(&item.source_session_id),
+                None => item.session_account_evidence.as_ref(),
+            };
+            Self::note_desktop_activity(
+                &mut self.grouping.desktop_recent,
+                item,
+                original,
+                &request,
+                identity,
+            );
+        }
         self.grouping.add(
             request.bucket_start,
             request.row_key,
             request.usage,
             identity,
         );
+    }
+
+    fn note_desktop_activity(
+        activity: &mut crate::desktop_recent::RecentActivity,
+        item: &SnapshotItem,
+        original: Option<&super::SessionAccountEvidence>,
+        request: &Request<'_>,
+        identity: IdentityRef<'_>,
+    ) {
+        let Some(occurrence) = item.claude_usage_occurrences.get(request.request_id) else {
+            return;
+        };
+        if !occurrence.desktop_request || !occurrence.event_clock_complete {
+            return;
+        }
+        let Some(owner) = original else {
+            return;
+        };
+        if owner.evidence_source != "claude_desktop_original:v1"
+            || owner.identity_disposition != Some("complete")
+        {
+            return;
+        }
+        let Some(account) = owner.account_identifier_hash.as_deref() else {
+            return;
+        };
+        let Some((sequence, _)) = request.occurrence else {
+            return;
+        };
+        let Some(markers) = item.claude_org_markers.as_deref() else {
+            return;
+        };
+        let MarkerVerdict::Trusted(org) = markers.verdict(sequence, true) else {
+            return;
+        };
+        match identity {
+            IdentityRef::Refused(Refusal::UntrustedFlip) | IdentityRef::Missing => {}
+            IdentityRef::Refused(_) => return,
+            IdentityRef::Tagged(key) => {
+                if key.login.is_some_and(|login| login != account)
+                    || key.org.is_some_and(|actual| actual != org)
+                {
+                    return;
+                }
+            }
+        }
+        let (Ok(at), Ok(now)) = (
+            OffsetDateTime::parse(request.timestamp, &Rfc3339),
+            OffsetDateTime::parse(&item.collected_at, &Rfc3339),
+        ) else {
+            return;
+        };
+        activity.note(account, org, at, now);
     }
 
     pub(crate) fn finish(self) -> Grouping {
@@ -2370,7 +2458,12 @@ fn tag_item(
         item.source_last_activity_at.clone(),
     );
     normalize_activity(item);
+    let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
+    let owned = !grouping.unowned_request;
     let tagged = apply_grouped(item, grouping);
+    if tagged.is_ok() && owned {
+        crate::desktop_recent::publish(desktop_recent);
+    }
     if tagged.is_err() {
         (
             item.source_started_at,

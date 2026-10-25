@@ -1566,6 +1566,11 @@ pub struct AgentAccountStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStatusPlanObservation {
+    /// Local-only recent Desktop request activity for this exact account + org.
+    /// Expires 15 minutes after event time, evaluated when serving the response.
+    /// Never uploaded or exported in diagnostics; does not imply current login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_recent_at: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4028,6 +4033,12 @@ pub enum LocalControlCommand {
         #[serde(default, skip_serializing_if = "is_false")]
         quota_refresh: bool,
     },
+    /// Read only the status owner's process memory. Never refresh, load a disk
+    /// cache, or hydrate general status. An empty array means no saved reading.
+    /// A distinct verb makes older daemons reject rather than refresh.
+    AgentStatusCached {
+        source: Option<SourceKind>,
+    },
     PersonalMeterLocalSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<SourceKind>,
@@ -4987,6 +4998,7 @@ fn is_format_char(ch: char) -> bool {
 fn redact_plan_observation_for_backend(
     mut observation: AgentStatusPlanObservation,
 ) -> AgentStatusPlanObservation {
+    observation.desktop_recent_at = None;
     observation.evidence_method = safe_optional_text(observation.evidence_method.take());
     observation.source_session_id = safe_optional_text(observation.source_session_id.take());
     observation.provider = safe_optional_text(observation.provider.take());
@@ -5057,6 +5069,43 @@ mod tests {
         assert_eq!(CliErrorCode::NeedsUserAction.exit_code(), 60);
         assert_eq!(CliErrorCode::TimedOut.exit_code(), 61);
         assert_eq!(CliErrorCode::Internal.exit_code(), 70);
+    }
+
+    #[test]
+    fn desktop_recent_is_optional_and_redacted_for_backend() {
+        let mut snapshot: AgentStatusSnapshot = serde_json::from_str(include_str!(
+            "../../../fixtures/agent-status/display-carrier.json"
+        ))
+        .unwrap();
+        assert!(snapshot
+            .plan_observations
+            .iter()
+            .all(|r| r.desktop_recent_at.is_none()));
+        assert!(!serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("desktop_recent_at"));
+        snapshot.plan_observations[0].desktop_recent_at = Some("2026-10-25T10:00:00Z".into());
+        let local = serde_json::to_string(&snapshot).unwrap();
+        assert!(local.contains("desktop_recent_at"));
+        assert!(!serde_json::to_string(&snapshot.redacted_for_backend())
+            .unwrap()
+            .contains("desktop_recent_at"));
+    }
+
+    #[test]
+    fn agent_status_cached_is_a_distinct_wire_command() {
+        let command = LocalControlCommand::AgentStatusCached {
+            source: Some(SourceKind::ClaudeCode),
+        };
+        let wire = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"command": "agent_status_cached", "source": "claude_code"})
+        );
+        assert_eq!(
+            serde_json::from_value::<LocalControlCommand>(wire).unwrap(),
+            command
+        );
     }
 
     #[test]
@@ -7014,6 +7063,7 @@ mod tests {
             context: None,
             capabilities: Vec::new(),
             plan_observations: vec![AgentStatusPlanObservation {
+                desktop_recent_at: None,
                 observed_at: Some("2026-05-07T00:00:00Z".to_string()),
                 evidence_method: Some("cli_text".to_string()),
                 source_session_id: Some("session-safe".to_string()),

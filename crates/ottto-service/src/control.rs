@@ -933,6 +933,18 @@ fn handle_command(
             }
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
+        LocalControlCommand::AgentStatusCached { source } => {
+            // The usual authorization helper builds general status (disk IO).
+            // This command authenticates directly against the in-memory token.
+            match &authorization {
+                RequestAuthorization::Token(token) => daemon.control_token.authorize(token)?,
+                RequestAuthorization::TrustedCompanionApp => {}
+                RequestAuthorization::Untrusted => {
+                    return Err(LocalApiError::LocalClientNotTrusted)
+                }
+            }
+            to_value(crate::agent_status_refresh::cached(source.as_ref()))
+        }
         LocalControlCommand::PersonalMeterLocalSnapshot { source } => {
             let status = status_for(daemon, &authorization)?;
             to_value(crate::personal_meter_local_snapshot_from_status(
@@ -10942,68 +10954,6 @@ fn run_install_source_action(
                 device_id: Some(&device_id),
             },
         )?;
-        match emit_setup_run_verification_marker(
-            api_base_url,
-            &source_kind,
-            &credentials.connection,
-            machine,
-        ) {
-            Ok(marker_id) => {
-                record_install_session_event(
-                    api_base_url,
-                    &install_session.install_session_id,
-                    &install_session.install_session_token,
-                    InstallSessionEvent {
-                        event_type: "verification.succeeded",
-                        status: "succeeded",
-                        message: "Recorded setup verification signal",
-                        metadata: Some(json!({
-                            "source": source,
-                            "marker_id": marker_id,
-                        })),
-                        device_id: Some(&device_id),
-                    },
-                )?;
-            }
-            Err(error) => {
-                let error_message = error.to_string();
-                record_install_session_event(
-                    api_base_url,
-                    &install_session.install_session_id,
-                    &install_session.install_session_token,
-                    InstallSessionEvent {
-                        event_type: "verification.failed",
-                        status: "failed",
-                        message: "Setup verification signal failed",
-                        metadata: Some(json!({
-                            "source": source,
-                            "error_code": "verification_marker_failed",
-                            "error_message": error_message,
-                        })),
-                        device_id: Some(&device_id),
-                    },
-                )?;
-                return Ok((
-                    "failed".to_string(),
-                    format!(
-                        "{} setup was installed, but verification did not finish",
-                        source_display_name(&source_kind)
-                    ),
-                    json!({
-                        "install_session_id": install_session.install_session_id,
-                        "device_id": device_id,
-                        "source": source,
-                        "local_changes": "installed",
-                        "config_patched": true,
-                        "relay_running": true,
-                        "relay_port": relay_port,
-                        "relay_source": source,
-                        "error_code": "verification_marker_failed",
-                        "error_message": "Setup verification signal failed",
-                    }),
-                ));
-            }
-        }
     }
 
     let status = if relay_running { "succeeded" } else { "failed" }.to_string();
@@ -13963,43 +13913,6 @@ fn pi_session_import_unsupported_io_error() -> std::io::Error {
     )
 }
 
-#[derive(Debug, Deserialize)]
-struct RelayTokenApiResponse {
-    token: String,
-}
-
-fn issue_source_relay_token(
-    api_base_url: &str,
-    source: &SourceKind,
-) -> Result<String, LocalApiError> {
-    let (device, device_secret) = crate::snapshot_client::load_snapshot_device_credentials()
-        .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
-    request_source_relay_token(api_base_url, &device, &device_secret, source)
-}
-
-fn request_source_relay_token(
-    api_base_url: &str,
-    device: &LocalDeviceBinding,
-    device_secret: &str,
-    source: &SourceKind,
-) -> Result<String, LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!("/api/v1/telemetry/devices/{}/relay-token", device.device_id),
-    );
-    let response = crate::retry_tls::credential_agent()
-        .post(&url)
-        .set("Accept", "application/json")
-        .set("X-Ottto-Device-Secret", device_secret)
-        .timeout(BACKEND_REQUEST_TIMEOUT)
-        .send_json(relay_token_request_payload(device, source_slug(source)))
-        .map_err(|error| backend_error_from_ureq(&url, error))?;
-    let response: RelayTokenApiResponse = backend_success(&url, response)?
-        .into_json()
-        .map_err(|error| backend_response_unexpected(&url, error.to_string()))?;
-    Ok(response.token)
-}
-
 fn emit_api_key_verification_marker(
     otlp_endpoint: &str,
     ingest_key: &str,
@@ -14022,35 +13935,6 @@ fn emit_api_key_verification_marker(
         &body,
         &[
             ("X-API-Key", ingest_key),
-            (VERIFICATION_MARKER_HEADER, "true"),
-        ],
-    )?;
-    Ok(marker_id)
-}
-
-fn emit_setup_run_verification_marker(
-    api_base_url: &str,
-    source: &SourceKind,
-    connection: &LocalConnectionBinding,
-    machine: &MachineIdentity,
-) -> Result<String, LocalApiError> {
-    let relay_token = issue_source_relay_token(api_base_url, source)?;
-    let url = api_url_with_base(api_base_url, "/v1/metrics");
-    let marker_id = format!("m3-{}-{}", source_slug(source), current_millis());
-    let authorization = format!("Bearer {relay_token}");
-    let body = verification_marker_body(
-        source,
-        Some(connection.setup_run_id.as_str()),
-        Some(machine),
-        &marker_id,
-        None,
-        None,
-    );
-    let _: serde_json::Value = backend_post_json(
-        &url,
-        &body,
-        &[
-            ("Authorization", authorization.as_str()),
             (VERIFICATION_MARKER_HEADER, "true"),
         ],
     )?;
@@ -20076,14 +19960,16 @@ for line in sys.stdin:
                 .expect("old authority remains admissible before confirmation"),
             (old_device.clone(), old_secret)
         );
-        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+        assert!(crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_ok());
 
         let pending = mark_pending_device_credential_guards_passed(&pending, &pending_store)
             .expect("persist pre-confirm crash boundary");
         // Once the confirm request can be sent, a lost response is ambiguous:
         // the server may already have revoked the prior generation.
         assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
-        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+        assert!(
+            crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
+        );
 
         let confirmed = mark_pending_device_credential_confirmed(
             &pending,
@@ -20116,7 +20002,9 @@ for line in sys.stdin:
         // local files still exist, neither snapshots nor cached OTLP admission
         // may use it across this crash cut.
         assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
-        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+        assert!(
+            crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
+        );
 
         assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
         assert!(pending_store.load().expect("pending cleared").is_none());
@@ -20125,7 +20013,7 @@ for line in sys.stdin:
                 .expect("promoted authority admitted"),
             (confirmed.device, candidate)
         );
-        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+        assert!(crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_ok());
     }
 
     #[test]
@@ -20179,7 +20067,9 @@ for line in sys.stdin:
             Some(pending.clone())
         );
         assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
-        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+        assert!(
+            crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
+        );
         assert!(matches!(
             setup_run_token_for_connection(DEFAULT_API_BASE_URL, &connection),
             Err(LocalApiError::IdentityMutationInProgress)
@@ -20218,7 +20108,7 @@ for line in sys.stdin:
         // inert orphan, but without the journal it is neither discoverable nor
         // authority and the next exact journal-bound stage replaces it.
         assert!(crate::snapshot_client::load_snapshot_device_credentials().is_ok());
-        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+        assert!(crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_ok());
     }
 
     #[test]
@@ -24558,25 +24448,6 @@ for line in sys.stdin:
             let request = backend.finish();
             assert!(request.starts_with("GET /api/v1/setup-runs/run/agent/costs "));
             assert!(request.contains(&format!("X-Ottto-Setup-Run-Token: {secret}")));
-            assert_never_logged(&secret);
-
-            // Device secret on the relay-token request.
-            let secret = format!("synthetic-device-secret-relay-{code}");
-            let backend = RedirectingBackend::start(status);
-            let device = LocalDeviceBinding {
-                device_id: "device-synthetic".to_string(),
-                machine_id: None,
-                sources: vec!["codex".to_string()],
-            };
-            assert!(matches!(
-                request_source_relay_token(&backend.base_url, &device, &secret, &SourceKind::Codex),
-                Err(LocalApiError::Backend(BackendErrorDetails {
-                    kind: BackendErrorKind::ResponseUnexpected,
-                    ..
-                }))
-            ));
-            let request = backend.finish();
-            assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
             assert_never_logged(&secret);
 
             // Device secret on the ended-run release.
