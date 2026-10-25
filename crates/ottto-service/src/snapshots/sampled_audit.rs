@@ -1,6 +1,7 @@
 //! Audit status lives in the existing per-file index, never in a new ledger.
 use super::*;
 use crate::transcript_acquisition::{AuditDebt, AUDIT_INTERVAL_SECONDS};
+use crate::transcript_cache::CACHE_ENTRIES;
 
 // v1 did not distinguish an ordinary Tail from a published FE prefix.
 pub(super) const UNVERIFIED_IDENTITY: &str = "semantic_sync:v2+sampled_unverified:v1";
@@ -234,6 +235,56 @@ pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
     }
 }
 
+/// Restorations per sampled scan: under a steady scan cadence, at most one
+/// restored audit falls due per page.
+const HOLD_DEADLINE_RESTORES_PER_SCAN: usize = 1;
+
+/// Option B (SOURCE rule 3: a hold may delay a re-offer, never cancel it). A
+/// marker-erasing daemon (0.1.189's parse-free migrate) rewrote held entries
+/// to plain v2, dropping their audit deadline; an unchanged file then skips
+/// forever and an aged one leaves discovery. Re-derive the marker from the
+/// persisted census hold: one interval out, as a Tail stages it, and tagged
+/// `p` because plain v2 cannot prove the lost tag was `c`. Each restored
+/// entry owes one Full; the deadline only delays it. Restorations take free
+/// audit slots and always leave one, so sampling stays supported.
+pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> usize {
+    let pending = index
+        .files
+        .values()
+        .filter(|entry| entry.has_unverified_source())
+        .take(CACHE_ENTRIES)
+        .count();
+    let budget = CACHE_ENTRIES
+        .saturating_sub(pending.saturating_add(1))
+        .min(HOLD_DEADLINE_RESTORES_PER_SCAN);
+    let Some(due) = now.checked_add(AUDIT_INTERVAL_SECONDS) else {
+        return 0;
+    };
+    let files = &mut index.files;
+    let mut restored = 0;
+    for (key, _) in index
+        .claude_request_census
+        .records()
+        .filter(|(_, record)| record.identity_incomplete_hold())
+    {
+        if restored == budget {
+            break;
+        }
+        if let Some(entry) = files.get_mut(key.as_str()).filter(|entry| {
+            entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+        }) {
+            entry.scan_identity_version = Some(provenance_marker(due, true));
+            restored += 1;
+        }
+    }
+    if restored > 0 {
+        super::claude_request_census::note_identity_incomplete_hold_deadlines_restored(
+            restored as u64,
+        );
+    }
+    restored
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +503,120 @@ mod tests {
             150
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Option B: only a plain-v2 entry whose census record is an N1 hold gets
+    /// a deadline back; one per scan, one interval out, prefix-tagged, and
+    /// never into the last free audit slot.
+    #[test]
+    fn option_b_restores_only_erased_hold_deadlines_paced_by_audit_slots() {
+        use crate::snapshots::claude_request_census::{
+            identity_incomplete_hold_deadlines_restored_total as restored_total,
+            ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+            CLAUDE_REQUEST_CENSUS_DERIVATION,
+        };
+        let held = || {
+            Record::synthetic_for_test(&"a".repeat(64), 1, Shape::IdentityIncomplete, vec![1])
+                .with_unverified_for_test(true)
+        };
+        let mut retired = held();
+        retired.retire();
+        let mut index = ScanIndex::default();
+        for (key, record) in [
+            ("held-a", held()),
+            ("held-b", held()),
+            ("held-legacy-entry", held()),
+            ("not-held-retired", retired),
+            (
+                "not-held-stale-derivation",
+                held().with_derivation_for_test(CLAUDE_REQUEST_CENSUS_DERIVATION + 1),
+            ),
+            ("not-held-verified", held().with_unverified_for_test(false)),
+            (
+                "not-held-exact",
+                Record::synthetic_for_test(&"a".repeat(64), 1, Shape::Exact, vec![1])
+                    .with_unverified_for_test(true),
+            ),
+        ] {
+            index.files.insert(key.into(), entry());
+            index
+                .claude_request_census_mut_for_test()
+                .insert_for_test(key, record);
+        }
+        index
+            .files
+            .get_mut("held-legacy-entry")
+            .unwrap()
+            .scan_identity_version = Some("semantic_sync:v1".into());
+        let plain = |index: &ScanIndex| {
+            index
+                .files
+                .iter()
+                .filter(|(_, entry)| !entry.has_unverified_source())
+                .map(|(key, _)| key.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        let before = plain(&index);
+        let total = restored_total();
+
+        assert_eq!(restore_held_audit_deadlines(&mut index, 100), 1);
+        assert_eq!(restored_total(), total + 1);
+        let restored = &index.files["held-a"];
+        assert_eq!(
+            restored.unverified_deadline(),
+            Some(100 + AUDIT_INTERVAL_SECONDS)
+        );
+        assert!(
+            restored.has_prefix_provenance(),
+            "plain v2 cannot prove `c`"
+        );
+        assert!(!restored.audit_requires_full(100), "no read at restoration");
+        assert!(restored.audit_requires_full(100 + AUDIT_INTERVAL_SECONDS));
+        assert!(
+            !index.files["held-b"].has_unverified_source(),
+            "one per scan"
+        );
+
+        // The next scan restores the next hold; a restored entry is not
+        // restored again, and nothing else ever is.
+        assert_eq!(restore_held_audit_deadlines(&mut index, 200), 1);
+        assert_eq!(
+            index.files["held-a"].unverified_deadline(),
+            Some(100 + AUDIT_INTERVAL_SECONDS)
+        );
+        assert_eq!(
+            index.files["held-b"].unverified_deadline(),
+            Some(200 + AUDIT_INTERVAL_SECONDS)
+        );
+        assert_eq!(restore_held_audit_deadlines(&mut index, 300), 0);
+        assert_eq!(restored_total(), total + 2);
+        let mut unchanged = before;
+        unchanged.remove("held-a");
+        unchanged.remove("held-b");
+        assert_eq!(plain(&index), unchanged);
+        assert_eq!(
+            index.files["held-legacy-entry"]
+                .scan_identity_version
+                .as_deref(),
+            Some("semantic_sync:v1")
+        );
+
+        // Restoration leaves the last audit slot free, so a full pending
+        // set keeps sampling supported and restores nothing.
+        let mut full = ScanIndex::default();
+        full.files.insert("held".into(), entry());
+        full.claude_request_census_mut_for_test()
+            .insert_for_test("held", held());
+        for slot in 0..CACHE_ENTRIES - 1 {
+            let mut pending = entry();
+            pending.set_unverified_deadline(1);
+            full.files.insert(format!("pending-{slot}"), pending);
+        }
+        assert_eq!(restore_held_audit_deadlines(&mut full, 100), 0);
+        assert!(!full.files["held"].has_unverified_source());
+        full.files.remove("pending-0");
+        assert_eq!(restore_held_audit_deadlines(&mut full, 100), 1);
+        assert_eq!(restored_total(), total + 3);
     }
 }
 
