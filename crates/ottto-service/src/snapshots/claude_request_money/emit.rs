@@ -26,6 +26,53 @@ fn removed(tokens: ClaudeMoneyTokens) -> ClaudeRemovedUsage {
     }
 }
 
+pub(super) fn grain_row(
+    key: &super::body::ClaudeLiveKey,
+    origin: Option<ClaudeRequestUsageOrigin>,
+    grain: &super::body::ClaudeGrainSide,
+    account: Option<String>,
+) -> SnapshotModelUsage {
+    let mut selector_context = key.2.clone();
+    let mut selector_sources = BTreeMap::new();
+    if let Some(origin) = origin {
+        let name = match origin {
+            ClaudeRequestUsageOrigin::TelemetryMatched => "telemetry_matched",
+            ClaudeRequestUsageOrigin::TelemetryReported => "telemetry_reported",
+            ClaudeRequestUsageOrigin::TelemetryUnpriced => "telemetry_unpriced",
+        };
+        selector_context.insert("request_usage_origin".into(), name.into());
+        selector_sources.insert("request_usage_origin".into(), "claude_api_request".into());
+    }
+    SnapshotModelUsage {
+        model: key.1.clone(),
+        input_tokens: grain.tokens.input,
+        output_tokens: grain.tokens.output,
+        cache_read_tokens: grain.tokens.cache_read,
+        cache_creation_5m_tokens: grain.tokens.cache_5m,
+        cache_creation_1h_tokens: grain.tokens.cache_1h,
+        reasoning_output_tokens: grain.tokens.reasoning,
+        unattributed_total_tokens: grain.tokens.unattributed,
+        request_count: grain.requests,
+        reasoning_effort: selector_context.remove("reasoning_effort"),
+        auth_mode: selector_context.remove("auth_mode"),
+        billing_channel: selector_context.remove("billing_channel"),
+        billing_provider: selector_context.remove("billing_provider"),
+        gateway_provider: selector_context.remove("gateway_provider"),
+        model_provider: selector_context.remove("model_provider"),
+        subscription_product: selector_context.remove("subscription_product"),
+        selector_context,
+        selector_sources,
+        account_identifier_hash: account,
+        evidence_ref: None,
+        identity_parts: None,
+        cost_usd: grain.cost().map(dollars),
+        input_cost_usd: None,
+        output_cost_usd: None,
+        cache_read_cost_usd: None,
+        cache_creation_cost_usd: None,
+    }
+}
+
 pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool {
     if entity.held || !entity.certificate_ok {
         return false;
@@ -49,20 +96,12 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
     let mut tokens = ClaudeMoneyTokens::default();
     let mut requests = 0_u64;
     let mut cost = None::<u64>;
+    // Keep the native key order for single-account bytes. A partition may
+    // split an internal grain, but never creates a duplicate wire selector.
     let mut buckets = BTreeMap::<String, Vec<SnapshotModelUsage>>::new();
+    let mut positions = BTreeMap::<(String, super::super::RowKey), (usize, Option<u64>)>::new();
     let mut row_costs = BTreeMap::new();
-    for ((key, origin), grain) in &entity.grains {
-        let mut selector_context = key.2.clone();
-        let mut selector_sources = BTreeMap::new();
-        if let Some(origin) = origin {
-            let name = match origin {
-                ClaudeRequestUsageOrigin::TelemetryMatched => "telemetry_matched",
-                ClaudeRequestUsageOrigin::TelemetryReported => "telemetry_reported",
-                ClaudeRequestUsageOrigin::TelemetryUnpriced => "telemetry_unpriced",
-            };
-            selector_context.insert("request_usage_origin".into(), name.into());
-            selector_sources.insert("request_usage_origin".into(), "claude_api_request".into());
-        }
+    for ((key, origin, _partition), grain) in &entity.grains {
         tokens.add(&grain.tokens);
         requests = match requests.checked_add(grain.requests) {
             Some(n) => n,
@@ -74,34 +113,7 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
                 None => return false,
             });
         }
-        let row = SnapshotModelUsage {
-            model: key.1.clone(),
-            input_tokens: grain.tokens.input,
-            output_tokens: grain.tokens.output,
-            cache_read_tokens: grain.tokens.cache_read,
-            cache_creation_5m_tokens: grain.tokens.cache_5m,
-            cache_creation_1h_tokens: grain.tokens.cache_1h,
-            reasoning_output_tokens: grain.tokens.reasoning,
-            unattributed_total_tokens: grain.tokens.unattributed,
-            request_count: grain.requests,
-            reasoning_effort: selector_context.remove("reasoning_effort"),
-            auth_mode: selector_context.remove("auth_mode"),
-            billing_channel: selector_context.remove("billing_channel"),
-            billing_provider: selector_context.remove("billing_provider"),
-            gateway_provider: selector_context.remove("gateway_provider"),
-            model_provider: selector_context.remove("model_provider"),
-            subscription_product: selector_context.remove("subscription_product"),
-            selector_context,
-            selector_sources,
-            account_identifier_hash: account.clone(),
-            evidence_ref: None,
-            identity_parts: None,
-            cost_usd: grain.cost().map(dollars),
-            input_cost_usd: None,
-            output_cost_usd: None,
-            cache_read_cost_usd: None,
-            cache_creation_cost_usd: None,
-        };
+        let row = grain_row(key, *origin, grain, account.clone());
         let row_key = super::super::row_key_from_model_usage(&row);
         let cost = grain.cost();
         match row_costs.entry(row_key) {
@@ -119,7 +131,35 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
                 entry.insert(next);
             }
         }
-        buckets.entry(key.0.clone()).or_default().push(row);
+        let rows = buckets.entry(key.0.clone()).or_default();
+        let identity = (key.0.clone(), super::super::row_key_from_model_usage(&row));
+        if let Some(&(position, prior)) = positions.get(&identity) {
+            let existing = &mut rows[position];
+            let mut usage = super::super::usage_totals_from_model_usage(existing);
+            if !usage.add(&super::super::usage_totals_from_model_usage(&row)) {
+                return false;
+            }
+            let mut combined = super::super::BucketRowAccumulator {
+                selector_context: existing.selector_context.clone(),
+                selector_sources: existing.selector_sources.clone(),
+                reasoning_effort: existing.reasoning_effort.clone(),
+                usage,
+            };
+            let cost = match (prior, grain.cost()) {
+                (Some(a), Some(b)) => match a.checked_add(b) {
+                    Some(n) => Some(n),
+                    None => return false,
+                },
+                _ => None,
+            };
+            positions.insert(identity.clone(), (position, cost));
+            combined.usage.costs.total = cost.map(|micros| u128::from(micros) * 1_000_000);
+            *existing = super::super::model_usage_from_row(&identity.1, &combined);
+            existing.account_identifier_hash = account.clone();
+        } else {
+            positions.insert(identity, (rows.len(), grain.cost()));
+            rows.push(row);
+        }
     }
     let r = removed(entity.removed);
     if [
@@ -266,6 +306,7 @@ mod tests {
                 (
                     ("2026-08-02T09:00:00Z".into(), model.into(), BTreeMap::new()),
                     origin,
+                    None,
                 ),
                 ClaudeGrainSide {
                     tokens: ClaudeMoneyTokens {
@@ -326,6 +367,7 @@ mod tests {
         entity.grains.insert(
             (
                 ("2026-08-02T09:00:00Z".into(), "m".into(), BTreeMap::new()),
+                None,
                 None,
             ),
             ClaudeGrainSide {

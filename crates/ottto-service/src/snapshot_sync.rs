@@ -8650,6 +8650,14 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if let Some(comparison) = comparison {
         comparison.retire_native_fold_owner();
     }
+    if crate::snapshots::claude_request_money::e2::enabled() {
+        if let Some(evidence) = &identity_evidence {
+            crate::snapshots::claude_request_identity::reconcile_request_accounts(
+                &mut scan_result.snapshots,
+                evidence,
+            );
+        }
+    }
     // E2 bodies are final before any identity owner runs: contract 5, D1 and
     // the account hash then tag the rows that upload (donor #699 order).
     // Gate off this only counts, so the page is unchanged.

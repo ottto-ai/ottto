@@ -5,6 +5,7 @@
 //! identity, parser scope or body witness.
 use super::super::claude_context_file_birth::ClaudeFileBirth;
 use super::super::claude_money_birth_store::{location_key, LocationKey};
+use super::super::claude_request_identity::{self, AccountPartition, RequestAccounts};
 use super::super::{
     claude_api_cache_creation, claude_api_matches_transcript_occurrence,
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,
@@ -128,7 +129,14 @@ pub(in crate::snapshots) fn remember_birth(index: &mut ScanIndex, path: &Path, f
 /// custody, maturity or alternate response classifier participates here.
 #[derive(Debug, Clone)]
 pub(crate) struct ClaudeEntityBody {
-    pub(crate) grains: BTreeMap<(ClaudeLiveKey, Option<ClaudeRequestUsageOrigin>), ClaudeGrainSide>,
+    pub(crate) grains: BTreeMap<
+        (
+            ClaudeLiveKey,
+            Option<ClaudeRequestUsageOrigin>,
+            AccountPartition,
+        ),
+        ClaudeGrainSide,
+    >,
     pub(crate) bucket_activity: BTreeMap<String, (i128, i128)>,
     pub(crate) removed: ClaudeMoneyTokens,
     pub(crate) removed_requests: u64,
@@ -166,12 +174,13 @@ impl ClaudeEntityBody {
         cost: Option<u64>,
         origin: Option<ClaudeRequestUsageOrigin>,
         at: Option<i128>,
+        account: AccountPartition,
     ) {
         if let Some(at) = at {
             self.note_activity(&key.0, at, at);
         }
         self.grains
-            .entry((key, origin))
+            .entry((key, origin, account))
             .or_default()
             .add(tokens, requests, cost);
     }
@@ -188,15 +197,31 @@ impl ClaudeEntityBody {
         }
         self.activity_nanos = self.activity_nanos.max(last);
     }
+    /// Identity can collapse an undecidable session without changing money.
+    pub(crate) fn repartition(&mut self, account: AccountPartition) {
+        let grains = std::mem::take(&mut self.grains);
+        for ((key, origin, _), grain) in grains {
+            Self::merge_grain(
+                self.grains
+                    .entry((key, origin, account.clone()))
+                    .or_default(),
+                &grain,
+            );
+        }
+    }
+    fn merge_grain(into: &mut ClaudeGrainSide, grain: &ClaudeGrainSide) {
+        into.tokens.add(&grain.tokens);
+        into.requests = into.requests.saturating_add(grain.requests);
+        into.cost_micros = into.cost_micros.saturating_add(grain.cost_micros);
+        into.unpriced = into.unpriced.saturating_add(grain.unpriced);
+        into.contributions = into.contributions.saturating_add(grain.contributions);
+    }
+
     /// Grains and their activity only (a held copy moving back to counted).
     fn absorb_grains(&mut self, other: &Self) {
         for (key, grain) in &other.grains {
             let into = self.grains.entry(key.clone()).or_default();
-            into.tokens.add(&grain.tokens);
-            into.requests = into.requests.saturating_add(grain.requests);
-            into.cost_micros = into.cost_micros.saturating_add(grain.cost_micros);
-            into.unpriced = into.unpriced.saturating_add(grain.unpriced);
-            into.contributions = into.contributions.saturating_add(grain.contributions);
+            Self::merge_grain(into, grain);
         }
         for (bucket, (first, last)) in &other.bucket_activity {
             self.note_activity(bucket, *first, *last);
@@ -228,7 +253,7 @@ impl ClaudeEntityBody {
     fn estimated_requests(&self) -> u64 {
         self.grains
             .iter()
-            .filter(|((_, origin), _)| origin.is_none())
+            .filter(|((_, origin, _), _)| origin.is_none())
             .map(|(_, grain)| grain.requests)
             .sum()
     }
@@ -289,8 +314,9 @@ pub(crate) struct FileFold {
     side: ClaudeMoneyTokens,
     side_requests: u64,
     telemetry: FoldTelemetry,
+    pub(crate) accounts: Option<Box<RequestAccounts>>,
 }
-crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, copied, first_own, ambiguous, disclosed, fold_us, responses, root_fallbacks, side, side_requests, telemetry);
+crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, copied, first_own, ambiguous, disclosed, fold_us, responses, root_fallbacks, side, side_requests, telemetry, accounts);
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,
@@ -348,7 +374,32 @@ impl FileFold {
             side: Default::default(),
             side_requests: 0,
             telemetry: Default::default(),
+            accounts: None,
         }
+    }
+
+    /// Native-finalizer input seam: identity policy stays with its owner.
+    pub(in crate::snapshots) fn set_identity(
+        &mut self,
+        markers: Option<&claude_request_identity::OrgMarkers>,
+        bound: Option<&str>,
+        session: Option<&str>,
+        context: Option<&ReadContext<'_>>,
+        first_sequence: Option<u64>,
+    ) {
+        if !enabled() {
+            return;
+        }
+        let subagent = context
+            .and_then(|c| claude_index_path_member_ref(c.path))
+            .is_some_and(|member| member.subagent_stem.is_some())
+            || session.is_some_and(|session| session.contains("_agent-"));
+        self.accounts = Some(Box::new(claude_request_identity::request_accounts(
+            markers,
+            bound,
+            first_sequence,
+            subagent,
+        )));
     }
 
     /// The effective cutoff (copy rule), for diagnostics and tests.
@@ -422,6 +473,10 @@ impl FileFold {
             self.disclosed += 1;
             return;
         };
+        let account = self.accounts.as_mut().and_then(|accounts| {
+            accounts.observe(response.sequence);
+            accounts.account(response.sequence)
+        });
         let tokens = ClaudeMoneyTokens::from_usage(&response.usage);
         let requests = response.usage.request_count;
         if copied == Some(true) {
@@ -434,13 +489,15 @@ impl FileFold {
                     .skipped
                     .push((response.sequence, response.sequence + 1)),
             }
-            self.copy.add(key, &tokens, requests, None, None, at);
+            self.copy
+                .add(key, &tokens, requests, None, None, at, account);
             return;
         }
         if copied.is_none() && self.money_birth.birth_nanos().is_some() {
             self.disclosed += 1; // untimed root record: counted, birth unproven
         }
-        self.entity.add(key, &tokens, requests, None, None, at);
+        self.entity
+            .add(key, &tokens, requests, None, None, at, account);
     }
 
     /// Confirm or undo the held pre-birth skip. A partial copy is skipped only
@@ -502,7 +559,7 @@ impl FileFold {
         self.entity
             .grains
             .iter()
-            .filter(|((key, origin), _)| {
+            .filter(|((key, origin, _), _)| {
                 origin.is_none() && key.0.as_str() >= start && key.0.as_str() < hour_ago_bucket
             })
             .map(|(_, grain)| grain.requests)
@@ -671,7 +728,11 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
     };
     let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
     let requests = occurrence.usage.request_count;
-    let slot = (estimated, None);
+    let account = fold
+        .accounts
+        .as_ref()
+        .and_then(|a| a.account(occurrence.sequence));
+    let slot = (estimated, None, account.clone());
     let Some(grain) = fold.entity.grains.get_mut(&slot) else {
         return false;
     };
@@ -704,6 +765,7 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
         row.cost_usd_micros,
         Some(origin),
         at,
+        account,
     );
     true
 }
@@ -915,6 +977,7 @@ pub(crate) fn side_calls_page(
                 row.cost_usd_micros,
                 Some(origin),
                 rfc3339_unix_nanos(&row.observed_at),
+                fold.accounts.as_ref().and_then(|a| a.starting.clone()),
             );
             fold.side.add(&tokens);
             fold.side_requests += 1;
@@ -1000,6 +1063,9 @@ pub(crate) fn finish_page(
         .and_then(|clock| super::super::activity_bucket_from_timestamp(&clock))
         .map(|(bucket, _)| bucket)
         .unwrap_or_default();
+    if enabled() {
+        claude_request_identity::inherit_root_accounts(items);
+    }
     let mut sessions = BTreeMap::<&str, Session>::new();
     for item in items.iter() {
         let Some(fold) = item.claude_money.as_deref() else {
@@ -1099,10 +1165,30 @@ pub(crate) fn finish_page(
         // apply refuses before mutating, so a withheld item is unchanged.
         if !super::emit::apply(item, &entity) {
             withheld.insert(item.source_session_id.clone());
+        } else if let Some(fold) = item.claude_money.as_deref_mut() {
+            // Keep the final summed placement for contract 5, not the first twin.
+            fold.entity = entity;
         }
         true
     });
     withheld
+}
+
+/// Visit the exact final placement; account classification belongs to identity.
+pub(crate) fn visit_identity_rows(
+    item: &SnapshotItem,
+    mut visit: impl FnMut(&str, super::super::SnapshotModelUsage, AccountPartition, Option<u64>),
+) -> Option<()> {
+    let fold = item.claude_money.as_deref()?;
+    for ((key, origin, account), grain) in &fold.entity.grains {
+        visit(
+            &key.0,
+            super::emit::grain_row(key, *origin, grain, None),
+            account.clone(),
+            grain.cost(),
+        );
+    }
+    Some(())
 }
 
 /// Sessions with a live indexed root path that is not on this page: never
