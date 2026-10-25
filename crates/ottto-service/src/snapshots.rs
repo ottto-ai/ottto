@@ -24578,7 +24578,17 @@ impl OwnedSourceScan {
                         .into_values()
                         .map(|group| (own_page(&group), group))
                         .collect::<Vec<_>>();
-                    groups.sort_by_key(|(own, _)| !*own);
+                    // G1: after own-page groups, census members' groups go
+                    // ahead of groups whose selected members are re-reads.
+                    groups.sort_by_key(|(own, group)| {
+                        (
+                            !*own,
+                            !sampled_scan::codex_cursor::census_member(
+                                &codex_selected_flags,
+                                group.members.iter().map(|member| member.path.as_path()),
+                            ),
+                        )
+                    });
                     for (own, group) in groups {
                         if group
                             .members
@@ -24695,7 +24705,12 @@ impl OwnedSourceScan {
                                         traversal.pending_candidates.push_back(ScanTraversalPath {
                                             scan_root: member.scan_root.clone(),
                                             path: member.path.clone(),
-                                            census_member: true,
+                                            // G1: a re-read is not re-enrolled.
+                                            census_member:
+                                                sampled_scan::codex_cursor::selected_census_member(
+                                                    &codex_selected_flags,
+                                                    &member.path,
+                                                ),
                                             watcher_hint: false,
                                         });
                                     }
@@ -24777,10 +24792,16 @@ impl OwnedSourceScan {
                     {
                         if let Some(candidate) = identified_candidates.pop_back() {
                             if let Some(traversal) = index.traversal.as_mut() {
+                                // G1: a re-read is not re-enrolled.
+                                let census_member =
+                                    sampled_scan::codex_cursor::selected_census_member(
+                                        &codex_selected_flags,
+                                        &candidate.path,
+                                    );
                                 traversal.pending_candidates.push_front(ScanTraversalPath {
                                     scan_root: candidate.scan_root,
                                     path: candidate.path,
-                                    census_member: true,
+                                    census_member,
                                     watcher_hint: false,
                                 });
                             }
@@ -25195,7 +25216,25 @@ impl OwnedSourceScan {
                     }
                 }
             }
-            if active_file.is_none() {
+            // G1 (fix 2): a group whose selected members are all re-reads
+            // waits until this page's census singletons are read, so its
+            // replay cannot spend the singleton budget a first read needs.
+            // Evaluated between files only, and the candidate scan only when
+            // the next group is a re-read.
+            let rereads_wait = || {
+                codex_join_groups.front().is_some_and(|group| {
+                    !sampled_scan::codex_cursor::census_member(
+                        &codex_selected_flags,
+                        group.members.iter().map(|member| member.path.as_path()),
+                    )
+                }) && identified_candidates.iter().any(|candidate| {
+                    sampled_scan::codex_cursor::selected_census_member(
+                        &codex_selected_flags,
+                        &candidate.path,
+                    )
+                })
+            };
+            if active_file.is_none() && !rereads_wait() {
                 if let Some(group) = codex_join_groups.pop_front() {
                     if group
                         .members
@@ -27719,8 +27758,12 @@ impl OwnedSourceScan {
                     scanned_session_count += state_only_scanned;
                     semantic_noop_count += state_only_noops;
                 }
+                // G1: pending re-reads do not hold the restart either.
                 let parent_resolution_restart = traversal_discovery_done
-                    && traversal_snapshot.pending_candidates.is_empty()
+                    && !traversal_snapshot
+                        .pending_candidates
+                        .iter()
+                        .any(|candidate| candidate.census_member)
                     && traversal_snapshot.codex_parent_resolution_retry_required;
                 if parent_resolution_restart {
                     if let Some(context) = sampling.as_ref() {
@@ -37195,8 +37238,13 @@ fn ensure_bounded_traversal(
         .as_ref()
         .filter(|traversal| traversal.context_fingerprint == context_fingerprint)
     {
+        // G1: discovery's census-member rule; pending re-reads do not hold
+        // the bounded retry.
         let terminal_unhealthy = traversal.pending_directories.is_empty()
-            && traversal.pending_candidates.is_empty()
+            && !traversal
+                .pending_candidates
+                .iter()
+                .any(|candidate| candidate.census_member)
             && index.claude_stale_family_carry.replay.is_empty()
             && traversal.counts.has_errors();
         // What clears the latch: a generation that completes drops the

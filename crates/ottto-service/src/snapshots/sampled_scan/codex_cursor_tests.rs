@@ -3249,6 +3249,31 @@ fn rotation_serves_census_members_ahead_of_rereads() {
     assert!(!rotation.turn_as("late", true));
 }
 
+/// G1: a read holds the census when one of its paths was selected as a
+/// census member, or none of them was selected (a cursor job's unselected
+/// path, a group's unselected members); one whose selected paths are all
+/// re-reads holds nothing.
+#[test]
+fn census_membership_follows_the_selected_paths_only() {
+    let member = PathBuf::from("/synthetic/sessions/member.jsonl");
+    let reread = PathBuf::from("/synthetic/sessions/reread.jsonl");
+    let unselected = PathBuf::from("/synthetic/sessions/unselected.jsonl");
+    let flags = BTreeMap::from([
+        (local_index_key(&member), (true, false)),
+        (local_index_key(&reread), (false, true)),
+    ]);
+    assert!(selected_census_member(&flags, &member));
+    assert!(!selected_census_member(&flags, &reread));
+    assert!(selected_census_member(&flags, &unselected));
+    assert!(census_member(&flags, [member.as_path(), reread.as_path()]));
+    assert!(!census_member(
+        &flags,
+        [reread.as_path(), unselected.as_path()]
+    ));
+    assert!(census_member(&flags, [unselected.as_path()]));
+    assert!(census_member(&flags, std::iter::empty::<&Path>()));
+}
+
 /// G1 (K7 for singletons and re-reads): a Codex watcher hint for a path this
 /// generation already processed (observed, no longer pending) re-enters as
 /// a non-member and is counted; a pending path is not duplicated; a path the

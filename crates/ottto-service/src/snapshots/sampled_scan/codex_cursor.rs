@@ -5125,17 +5125,33 @@ impl SharedCache {
     }
 }
 
-/// Whether a read of `paths` holds this generation's census (G1): any path
-/// selected as a census member, or not selected on this page at all.
+/// Whether a read of `paths` holds this generation's census (G1): one of
+/// them was selected on this page as a census member, or none was selected
+/// at all. Only selected paths are pending, so a read whose selected paths
+/// are all re-reads holds nothing.
 pub(in crate::snapshots) fn census_member<'a>(
     flags: &BTreeMap<String, (bool, bool)>,
     paths: impl IntoIterator<Item = &'a Path>,
 ) -> bool {
-    paths.into_iter().any(|path| {
-        flags
-            .get(&local_index_key(path))
-            .map_or(true, |(member, _)| *member)
-    })
+    let mut selected = false;
+    for path in paths {
+        if let Some((member, _)) = flags.get(&local_index_key(path)) {
+            if *member {
+                return true;
+            }
+            selected = true;
+        }
+    }
+    !selected
+}
+
+/// The census flag `path` was selected with on this page (a member when it
+/// was not selected), for a path returned to the queue (G1).
+pub(in crate::snapshots) fn selected_census_member(
+    flags: &BTreeMap<String, (bool, bool)>,
+    path: &Path,
+) -> bool {
+    census_member(flags, [path])
 }
 
 /// Return a page-selected Codex file to `pending_candidates` with the
