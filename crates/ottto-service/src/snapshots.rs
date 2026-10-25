@@ -39812,6 +39812,7 @@ impl ScanIndex {
                 member_request_id_hashes: members,
                 member_occurrences: BTreeMap::new(),
                 invalid: false,
+                diagnostic_invalid_causes: 0,
             },
         );
     }

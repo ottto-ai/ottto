@@ -604,6 +604,7 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
             )]),
             member_occurrences: BTreeMap::new(),
             invalid: false,
+            diagnostic_invalid_causes: 0,
         },
     );
     let witness = held.claude_usage_family_witnesses[&root].clone();
