@@ -145,16 +145,34 @@ pub(crate) fn encode_json<T: serde::Serialize>(value: &T, cap: usize) -> Result<
     }
     impl std::io::Write for CappedVec {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self
+            let required = self
                 .bytes
                 .len()
                 .checked_add(bytes.len())
-                .map_or(true, |n| n > self.cap)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "optional snapshot request cap",
-                ));
+                .filter(|required| *required <= self.cap)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "optional snapshot request cap",
+                    )
+                })?;
+            if required > self.bytes.capacity() {
+                // Vec's implicit doubling can exceed cap after a bulk write
+                // even when the final JSON fits. Keep amortized growth bounded.
+                let target = self
+                    .bytes
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(required)
+                    .min(self.cap);
+                self.bytes
+                    .try_reserve_exact(target - self.bytes.len())
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::OutOfMemory,
+                            "optional snapshot request allocation",
+                        )
+                    })?;
             }
             self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
@@ -287,6 +305,24 @@ pub(crate) fn read_state(path: &std::path::Path, cap: usize) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn encoded_bulk_value_and_tail_keep_capacity_inside_the_wire_cap() {
+        #[derive(serde::Serialize)]
+        struct Bulk<'a> {
+            payload: &'a str,
+            tail: u8,
+        }
+        let payload = "x".repeat(10_000);
+        let value = Bulk {
+            payload: &payload,
+            tail: 1,
+        };
+        let encoded = encode_json(&value, 12_000).unwrap();
+        assert!(encoded.capacity() <= 12_000);
+        assert_eq!(encoded, serde_json::to_vec(&value).unwrap());
+        assert!(encode_json(&value, encoded.len() - 1).is_err());
+    }
+
     #[test]
     fn bounded_retry_budget_preserves_lifetime_posts_and_ordinary_deadline() {
         let now = Instant::now();

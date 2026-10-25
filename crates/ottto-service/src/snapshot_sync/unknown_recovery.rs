@@ -113,6 +113,22 @@ struct CheckedManifest {
     checksum: String,
     manifest: Manifest,
 }
+#[derive(Serialize)]
+struct CheckedManifestView<'a> {
+    checksum: &'a str,
+    manifest: &'a Manifest,
+}
+fn manifest_fits(m: &Manifest) -> bool {
+    // A SHA-256 checksum always serializes as the same 64 unescaped bytes.
+    const CHECKSUM: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    crate::snapshot_retry::json_fits(
+        &CheckedManifestView {
+            checksum: CHECKSUM,
+            manifest: m,
+        },
+        MANIFEST_MAX,
+    )
+}
 
 #[derive(Debug)]
 pub(super) struct Deferred {
@@ -329,9 +345,10 @@ fn atomic(root: &Path, target: &Path, bytes: &[u8]) -> Result<()> {
 }
 fn write_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
     let value = serde_json::to_vec(manifest)?;
-    let envelope = CheckedManifest {
-        checksum: digest(&value),
-        manifest: manifest.clone(),
+    let checksum = digest(&value);
+    let envelope = CheckedManifestView {
+        checksum: &checksum,
+        manifest,
     };
     let bytes = serde_json::to_vec(&envelope)?;
     if bytes.len() > MANIFEST_MAX {
@@ -1527,6 +1544,11 @@ pub(super) fn initial_post(
     state: &mut SendState,
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     if matches!(state, SendState::Empty) {
+        // Pay before copying private metadata from the already packed request.
+        // Reject an oversized manifest before allocating the serialized body.
+        let funds = money::ShadowReservation::admit(BODY_FUNDS).ok_or_else(fault)?;
+        let metadata_scratch =
+            money::ShadowReservation::admit(8 * MANIFEST_MAX).ok_or_else(fault)?;
         let m = manifest(
             support,
             index,
@@ -1535,6 +1557,10 @@ pub(super) fn initial_post(
             head_cas,
             policy,
         )?;
+        if !manifest_fits(&m) {
+            return Err(fault());
+        }
+        drop(metadata_scratch);
         if CATALOGS
             .lock()
             .map_err(|_| fault())?
@@ -1589,11 +1615,9 @@ pub(super) fn initial_post(
 
             // A terminal lineage can make normal offers, but never acquire a
             // fresh UNKNOWN allowance through reserialization or restart.
-            let _body_funds = money::ShadowReservation::admit(BODY_FUNDS).ok_or_else(fault)?;
             let body = encode(request, m.head_cas)?;
             return client.upload_recovery_bytes(token, request, head_cas, &body);
         }
-        let funds = money::ShadowReservation::admit(BODY_FUNDS).ok_or_else(fault)?;
         let body = encode(request, m.head_cas)?;
         *state = SendState::Reserving(m, body, funds);
         return Err(Pending.into());
