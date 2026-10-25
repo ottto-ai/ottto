@@ -3920,6 +3920,12 @@ fn census_duplicate_rebuild_earlier_empty_without_prior_is_held() {
 /// covered by a counted stamp saved before it. Cases: a current-form grant,
 /// an earlier checkpoint's marked empty with and without its prior, and with
 /// its priors field refused on every load (no read at all).
+///
+/// MONEY 724g P2: a `delayed` schedule also leaves a saved, unspent grant
+/// unread in one process for most of a window, or past it, before the same
+/// process reloads and reads. The bound holds for the actual read times too:
+/// at most two reads in any rolling seven days, not only two authorizing
+/// stamps.
 #[test]
 fn census_duplicate_rebuild_total_re_reads_stay_within_the_bound_across_windows() {
     use crate::snapshots::claude_request_census::{
@@ -3929,12 +3935,15 @@ fn census_duplicate_rebuild_total_re_reads_stay_within_the_bound_across_windows(
     const WINDOW: u64 = 7 * N3_DAY;
     for enabled in [false, true] {
         let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
-        for case in [
+        for (case, schedule) in [
             "current",
             "earlier_with_prior",
             "earlier_without_prior",
             "earlier_priors_refused",
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|case| [(case, "regular"), (case, "delayed")])
+        {
             bound::restart();
             let scratch =
                 crate::test_scratch::ScratchDir::new("census-duplicate-rebuild-multi-window");
@@ -3965,12 +3974,23 @@ fn census_duplicate_rebuild_total_re_reads_stay_within_the_bound_across_windows(
             // that authorized each read.
             let mut reads = vec![N3_T0];
             let mut authorized = vec![N3_T0];
+            let mut delay = 0;
+            let mut at = N3_T0;
             for step in 0..42_u64 {
-                let at = N3_T0 + 3_600 + step * N3_DAY / 2;
+                at = N3_T0 + 3_600 + step * N3_DAY / 2 + delay;
                 // 0: restart, read, unsaved. 1: same process, discarded before
                 // the read. 2: same process, read, saved. 3: restart,
                 // discarded before the read, saved.
                 let kind = step % 4;
+                if schedule == "delayed" && kind == 1 {
+                    // This process's saved grant stays unread until the next
+                    // step's reload: most of a window, then past one.
+                    delay += if step % 8 == 1 {
+                        6 * N3_DAY
+                    } else {
+                        7 * N3_DAY
+                    };
+                }
                 if kind == 0 || kind == 3 {
                     bound::restart();
                 }
@@ -4004,16 +4024,25 @@ fn census_duplicate_rebuild_total_re_reads_stay_within_the_bound_across_windows(
                         .count();
                     assert!(
                         in_window <= MAX_N3_REARMS_PER_WINDOW,
-                        "{case} at {at}: {in_window} reads in one window"
+                        "{case} {schedule} at {at}: {in_window} authorizations in one window"
                     );
                     reads.push(at);
+                    // MONEY 724g P2: the actual reads, in any rolling window.
+                    let read_in_window = reads
+                        .iter()
+                        .filter(|earlier| at - **earlier <= WINDOW)
+                        .count();
+                    assert!(
+                        read_in_window <= MAX_N3_REARMS_PER_WINDOW,
+                        "{case} {schedule} at {at}: {read_in_window} reads in seven days: {reads:?}"
+                    );
                     note_duplicate_rebuild_started(&mut index, Path::new(&key));
                 }
                 if kind >= 2 {
                     index.save(&path).unwrap();
                 }
             }
-            let span = 3_600 + 41 * N3_DAY / 2;
+            let span = at - N3_T0;
             let windows = span.div_ceil(WINDOW) as usize + 1;
             assert!(
                 reads.len() <= MAX_N3_REARMS_PER_WINDOW * windows,
@@ -4026,6 +4055,58 @@ fn census_duplicate_rebuild_total_re_reads_stay_within_the_bound_across_windows(
                 // Not vacuous: each later window still allows a counted read.
                 assert!(reads.len() >= 4, "{case}: {reads:?}");
             }
+        }
+    }
+}
+
+/// MONEY 724g P2 with SI's ruling: closing this process's stale, unspent
+/// grant never holds an identity-armed empty fingerprint. The grant's key is
+/// current-form; identity work then clears its fingerprint (saved). The same
+/// process reloads within the grant's window and past it: the identity path
+/// wins either way (re-offered, never held, no N3 attempt charged or saved).
+/// OFF and ON.
+#[test]
+fn census_duplicate_rebuild_stale_grant_never_holds_an_identity_rearm() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for delay in [6 * N3_DAY, 8 * N3_DAY] {
+            let case = format!("shadow={enabled} delay={delay}");
+            bound::restart();
+            let scratch =
+                crate::test_scratch::ScratchDir::new("census-rebuild-stale-grant-identity");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            // This process's saved grant at N3_T0, never started.
+            let mut saved = census_rebuild_saved_grant(&path, &original, &key);
+            // Identity work's saved re-arm of the current-form key.
+            saved["files"][&key]["source_file_fingerprint"] = serde_json::json!("");
+            std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+
+            let _clock = bound::set_now(N3_T0 + delay);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert!(bound::current_form(&index, &key), "{case}");
+            assert!(!bound::held(&index, &key), "{case}: never held");
+            assert!(!bound::exhausted(&index, &key), "{case}");
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                rearmed,
+                "{case}: identity re-offers it"
+            );
+            let before = std::fs::read(&path).unwrap();
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{case}: no N3 attempt charged"
+            );
         }
     }
 }
@@ -4540,7 +4621,8 @@ fn census_identity_clear(
 #[test]
 fn census_duplicate_rebuild_identity_revoke_is_one_shot_per_arming() {
     use crate::snapshots::claude_request_census::{
-        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started, SourceRearm,
+        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started,
+        persist_duplicate_rebuild_revokes, SourceRearm,
     };
     let rearmed = (
         CandidateDecision::Parse,
@@ -4583,6 +4665,7 @@ fn census_duplicate_rebuild_identity_revoke_is_one_shot_per_arming() {
         bound::restart();
         let clock = bound::set_now(N3_T0 + 60);
         let mut index = ScanIndex::load(&path).unwrap();
+        let mut committed = index.clone();
         assert!(bound::held(&index, &key), "shadow={enabled}: held");
         assert_eq!(
             census_rebuild_decision(&index, &key, &fingerprint),
@@ -4603,6 +4686,15 @@ fn census_duplicate_rebuild_identity_revoke_is_one_shot_per_arming() {
             &key,
             SourceRearm::Identity("identity_contract:test-5"),
         );
+        // MONEY 724g P1: never selected before the revoke is saved.
+        assert!(bound::revoke_unsaved(&index, &key));
+        assert!(bound::held(&index, &key), "shadow={enabled}: until saved");
+        assert_eq!(
+            census_rebuild_decision(&index, &key, &fingerprint),
+            (CandidateDecision::Skip, None)
+        );
+        persist_duplicate_rebuild_revokes(&mut index, &mut committed, &path).unwrap();
+        assert!(!bound::revoke_unsaved(&index, &key));
         assert!(!bound::held(&index, &key));
         assert!(bound::revoked(&index, &key));
         assert!(!bound::pending(&index, &key), "out of the bound's control");
@@ -4659,6 +4751,7 @@ fn census_duplicate_rebuild_identity_revoke_is_one_shot_per_arming() {
         bound::restart();
         let _clock = bound::set_now(N3_T0 + 600);
         let mut index = ScanIndex::load(&path).unwrap();
+        let mut committed = index.clone();
         assert!(bound::held(&index, &key), "shadow={enabled}: re-entered");
         census_identity_clear(
             &mut index,
@@ -4672,9 +4765,175 @@ fn census_duplicate_rebuild_identity_revoke_is_one_shot_per_arming() {
             &key,
             SourceRearm::Identity("identity_contract:test-6"),
         );
+        assert!(bound::held(&index, &key), "shadow={enabled}: until saved");
+        persist_duplicate_rebuild_revokes(&mut index, &mut committed, &path).unwrap();
         assert!(!bound::held(&index, &key), "shadow={enabled}: a new arming");
         assert_eq!(bound::identity_revoked(&index), 2);
         assert_eq!(census_rebuild_decision(&index, &key, &fingerprint), rearmed);
+    }
+}
+
+/// MONEY 724g P1 with SI's rulings: identity work revoking an earlier
+/// checkpoint's N3 hold while the scan is built is durable before the key is
+/// selected (`persist_duplicate_rebuild_revokes`, the daemon's save on the
+/// cycle's committed state, right after the scan is built). Unsaved, the key
+/// stays held and is never selected; a revoke lost to a crash before its save
+/// only repeats as a revoke, which re-offers the key once saved. A crash or a
+/// discarded working index after that save, before the cycle's post-scan
+/// save, never revokes the same arming again: the token stays consumed, the
+/// counter counts one revoke in total, and the key is re-offered once per
+/// selection until its read is saved, then never again. Restarts and
+/// same-process reloads; OFF and ON.
+#[test]
+fn census_duplicate_rebuild_identity_revoke_is_saved_before_selection() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started,
+        persist_duplicate_rebuild_revokes, SourceRearm,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    let skipped = (CandidateDecision::Skip, None);
+    let arming = SourceRearm::Identity("identity_contract:test-5");
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for reload in ["restart", "same_process"] {
+            let case = format!("shadow={enabled} reload={reload}");
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new(
+                "census-rebuild-revoke-saved-before-selection",
+            );
+            let (root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            let id = bound::key_id(&key);
+            let mut saved = census_rebuild_saved_grant(&path, &original, &key);
+            bound::hold_earlier_form(&mut saved, &key, [N3_T0, N3_T0 + 30]);
+            std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+            let load = || {
+                if reload == "restart" {
+                    bound::restart();
+                }
+                ScanIndex::load(&path).unwrap()
+            };
+            let on_disk = || -> serde_json::Value {
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+            };
+
+            // The revoke lost before any save: never selected, nothing read.
+            let clock = bound::set_now(N3_T0 + 60);
+            let mut index = load();
+            let held_bytes = std::fs::read(&path).unwrap();
+            assert!(bound::held(&index, &key), "{case}: held");
+            census_identity_clear(&mut index, &key, arming);
+            assert!(bound::revoked(&index, &key), "{case}");
+            assert!(bound::revoke_unsaved(&index, &key), "{case}");
+            assert!(bound::held(&index, &key), "{case}: held until saved");
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                skipped,
+                "{case}: never selected before the save"
+            );
+            drop(index);
+            assert_eq!(std::fs::read(&path).unwrap(), held_bytes, "{case}");
+            drop(clock);
+
+            // The daemon's order: load, the arming while the scan is built,
+            // the revoke saved, then selection.
+            let clock = bound::set_now(N3_T0 + 120);
+            let mut index = load();
+            let mut committed = index.clone();
+            assert!(
+                bound::held(&index, &key),
+                "{case}: the lost revoke left it held"
+            );
+            assert_eq!(bound::identity_revoked(&index), 0, "{case}");
+            census_identity_clear(&mut index, &key, arming);
+            assert!(bound::held(&index, &key), "{case}: held until saved");
+            assert_eq!(bound::identity_revoked(&index), 1, "{case}");
+            persist_duplicate_rebuild_revokes(&mut index, &mut committed, &path).unwrap();
+            assert!(!bound::revoke_unsaved(&index, &key), "{case}");
+            assert!(!bound::held(&index, &key), "{case}: saved, then released");
+            assert_eq!(
+                index.generation, committed.generation,
+                "{case}: one CAS line"
+            );
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                rearmed,
+                "{case}: re-offered"
+            );
+            let saved = on_disk();
+            let guard = &saved["claude_request_census_shadow"]["n"];
+            assert!(
+                guard["k"].get(&id).is_none(),
+                "{case}: out of the bound's control"
+            );
+            assert!(guard["r"][&id].is_string(), "{case}: token saved");
+            assert_eq!(guard["i"], serde_json::json!(1), "{case}: counted once");
+            assert_eq!(
+                saved["files"][&key]["source_file_fingerprint"],
+                serde_json::json!(""),
+                "{case}: the clear is saved"
+            );
+            // The read starts; the working index is then lost (a crash, or a
+            // failed scan discarding it) before the post-scan save.
+            note_duplicate_rebuild_started(&mut index, Path::new(&key));
+            drop(index);
+            drop(committed);
+            drop(clock);
+
+            for cycle in 1..=3_u64 {
+                let case = format!("{case} cycle={cycle}");
+                let _clock = bound::set_now(N3_T0 + 120 + 60 * cycle);
+                let mut index = load();
+                let mut committed = index.clone();
+                assert!(!bound::held(&index, &key), "{case}: never held again");
+                assert!(bound::revoked(&index, &key), "{case}: durable");
+                assert_eq!(bound::identity_revoked(&index), 1, "{case}");
+                // The same arming re-derived: no second revoke.
+                let before = std::fs::read(&path).unwrap();
+                census_identity_clear(&mut index, &key, arming);
+                assert!(
+                    !bound::revoke_unsaved(&index, &key),
+                    "{case}: token consumed"
+                );
+                assert_eq!(bound::identity_revoked(&index), 1, "{case}: no second");
+                assert_eq!(
+                    census_rebuild_identity_revoked_line(&mut index),
+                    1,
+                    "{case}"
+                );
+                persist_duplicate_rebuild_revokes(&mut index, &mut committed, &path).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), before, "{case}: nothing new");
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    rearmed,
+                    "{case}: re-offered, still unread"
+                );
+                if cycle == 2 {
+                    note_duplicate_rebuild_started(&mut index, Path::new(&key));
+                }
+            }
+
+            // The read completes and is saved: never re-offered again.
+            let _clock = bound::set_now(N3_T0 + 600);
+            let mut index = load();
+            census_scan(&root, &mut index, SECOND_WINDOW);
+            assert_eq!(
+                index.files[&key].source_file_fingerprint, fingerprint,
+                "{case}: read once"
+            );
+            index.save(&path).unwrap();
+            let index = load();
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                skipped,
+                "{case}: exactly one re-offer"
+            );
+            assert_eq!(bound::identity_revoked(&index), 1, "{case}: one in total");
+        }
     }
 }
 

@@ -17,7 +17,11 @@
 //!   `revoke_for_identity`): the key leaves the guard, its token stays in `r`
 //!   for one window, and `census_duplicate_rebuild_identity_revoked` counts
 //!   it. Repairs of damaged state, recovery re-reads and re-parse debt a
-//!   committable subset carries revoke nothing.
+//!   committable subset carries revoke nothing. The revoke is durable before
+//!   the key is selected (MONEY 724g P1): until the daemon saves it
+//!   (`persist_revokes`, before its scan steps, or the cycle's own save) the
+//!   key stays held, so a crash or a discarded working index can only repeat
+//!   an unsaved revoke, which again re-offers the key once saved.
 //! - Nothing a rearm needs is saved in an entry, so whatever erases the guard
 //!   (a downgrade, an older binary's save, corruption) erases only the rearm:
 //!   the entry keeps its real fingerprint and is not re-read (MONEY P1a).
@@ -27,7 +31,12 @@
 //!   rollback, and it still expires one window after it is first seen).
 //! - A persisted rearm is counted again on the first load of each process, or
 //!   when this process already started its parse. A bounded sweep that has not
-//!   reached the key yet does not spend an attempt.
+//!   reached the key yet does not spend an attempt. Its saved, unspent grant
+//!   authorizes a read only while its own stamp is still one of the key's
+//!   counted attempts in the window (MONEY 724g P2); a later load moves that
+//!   stamp forward to itself and saves it before its scan, like a new grant,
+//!   so the window bounds actual reads, not only authorizations. An expired
+//!   grant needs a fresh counted attempt.
 //! - Past the bound the key is not rearmed: its record stays absent, its
 //!   duplicate stays counted in `decode_duplicate_keys_dropped`, and the
 //!   census line counts it in `census_duplicate_rebuild_exhausted` with a
@@ -150,8 +159,28 @@ pub(crate) struct DuplicateRebuildGuard {
     identity_revoked: u64,
     #[serde(default, rename = "ia", skip_serializing_if = "is_zero")]
     identity_revoked_at: u64,
+    /// Never persisted: index keys this working index revoked that no save has
+    /// made durable yet (MONEY 724g P1). Held until saved.
+    #[serde(skip)]
+    unsaved: UnsavedRevokes,
 }
-crate::heap_layout_bound::fields!(DuplicateRebuildGuard; keys, untracked_refused, untracked_refused_at, orphaned, orphaned_at, priors_refused, priors_refused_at, closed_at, revoked, identity_revoked, identity_revoked_at);
+crate::heap_layout_bound::fields!(DuplicateRebuildGuard; keys, untracked_refused, untracked_refused_at, orphaned, orphaned_at, priors_refused, priors_refused_at, closed_at, revoked, identity_revoked, identity_revoked_at, unsaved);
+
+/// The working index's revokes not yet saved (MONEY 724g P1). Transient:
+/// never serialized and never part of the guard's value, so a guard equals
+/// its saved and decoded form.
+#[derive(Debug, Clone, Default)]
+struct UnsavedRevokes {
+    keys: BTreeSet<String>,
+}
+crate::heap_layout_bound::fields!(UnsavedRevokes; keys);
+
+impl PartialEq for UnsavedRevokes {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for UnsavedRevokes {}
 
 /// One key's identity revokes in the window, `"<token>,<token>:<stamp>"`:
 /// each arming's token (16 hex digits of its evidence's SHA-256), at most
@@ -479,12 +508,12 @@ impl DuplicateRebuildGuard {
     }
 }
 
-/// Never persisted: grants this load made, the index keys whose unchanged
-/// transcript candidate selection re-reads, and refusals of keys the guard
-/// could not track (for the terminal alarm).
+/// Never persisted: grants this load made (key id and stamp), the index keys
+/// whose unchanged transcript candidate selection re-reads, and refusals of
+/// keys the guard could not track (for the terminal alarm).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Transient {
-    grants: Vec<String>,
+    grants: Vec<(String, u64)>,
     rearmed: BTreeSet<String>,
     refusals: Vec<(String, &'static str)>,
 }
@@ -499,16 +528,17 @@ pub(crate) fn key_id(key: &str) -> String {
 #[cfg(test)]
 thread_local! {
     static TEST_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    static PERSISTED: std::cell::RefCell<BTreeSet<String>> =
-        const { std::cell::RefCell::new(BTreeSet::new()) };
+    static PERSISTED: std::cell::RefCell<BTreeMap<String, u64>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
     static ALARMED: std::cell::RefCell<BTreeSet<(String, &'static str)>> =
         const { std::cell::RefCell::new(BTreeSet::new()) };
     static ALARM_LINES: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
-/// Keys whose current rearm this process already saved before its scan.
+/// Keys whose current rearm this process already saved before its scan, with
+/// the saved grant's stamp.
 #[cfg(not(test))]
-static PERSISTED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+static PERSISTED: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
 /// One alarm per key and cause per process.
 #[cfg(not(test))]
 static ALARMED: std::sync::Mutex<BTreeSet<(String, &'static str)>> =
@@ -531,11 +561,11 @@ fn now_unix() -> u64 {
 }
 
 #[cfg(test)]
-fn with_persisted<T>(f: impl FnOnce(&mut BTreeSet<String>) -> T) -> T {
+fn with_persisted<T>(f: impl FnOnce(&mut BTreeMap<String, u64>) -> T) -> T {
     PERSISTED.with(|set| f(&mut set.borrow_mut()))
 }
 #[cfg(not(test))]
-fn with_persisted<T>(f: impl FnOnce(&mut BTreeSet<String>) -> T) -> T {
+fn with_persisted<T>(f: impl FnOnce(&mut BTreeMap<String, u64>) -> T) -> T {
     f(&mut PERSISTED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner))
@@ -760,12 +790,33 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             tracked.flags &= !HELD;
             continue;
         }
-        let attempt_due = tracked.has(EXHAUSTED)
-            || tracked.has(STARTED)
-            || !with_persisted(|set| set.contains(id));
-        if !attempt_due && open {
+        // MONEY 724g P2: this process's saved grant authorizes a read only
+        // while its own stamp is still one of the key's counted attempts in
+        // the window. Expired (or clamped by a clock rollback) it is spent:
+        // the read needs a fresh counted attempt below.
+        let unspent = if tracked.has(EXHAUSTED) || tracked.has(STARTED) {
+            None
+        } else {
+            with_persisted(|grants| grants.get(id).copied())
+                .filter(|stamp| tracked.attempts.contains(stamp))
+        };
+        if let Some(stamp) = unspent.filter(|_| open) {
             // This process saved the grant and has not started its read. A
-            // closed guard refuses it below instead.
+            // closed guard refuses it below instead. Moved forward to this
+            // load and saved before its scan (`persist_grants`): still one
+            // attempt, now counted from the cycle that may read it, so the
+            // window bounds actual reads.
+            if stamp < now {
+                if let Some(attempt) = tracked
+                    .attempts
+                    .iter_mut()
+                    .rfind(|attempt| **attempt == stamp)
+                {
+                    *attempt = now;
+                }
+                tracked.attempts.sort_unstable();
+                transient.grants.push((id.clone(), now));
+            }
             if !empty {
                 transient.rearmed.insert(key.clone());
             }
@@ -774,7 +825,7 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         if open && tracked.attempts.len() < MAX_ATTEMPTS_PER_WINDOW {
             tracked.attempts.push(now);
             tracked.flags = PENDING | (tracked.flags & CURRENT);
-            transient.grants.push(id.clone());
+            transient.grants.push((id.clone(), now));
             // A marked entry is already empty and reads as Rearmed: this
             // counted attempt is its only authorization, saved before the
             // daemon's scan (`persist_grants`).
@@ -825,12 +876,16 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
 ///   `CURRENT`: its empty fingerprint is the bound's own) is revoked. Others
 ///   are not held, so nothing is revoked or counted.
 /// - Once per key per arming: the token is recorded in the guard (`r`) for
-///   one window, in the same index mutation as the arming's own clear, so
-///   both are saved by the same commit before any later selection reads the
-///   key. A crash or discarded working index loses both (the arming is
-///   re-derived and revokes once); a failed or discarded scan after the save
-///   finds the key already out of control. The key's attempts and prior are
-///   dropped, never restored: from here on it is the identity path's.
+///   one window, in the same index mutation as the arming's own clear. The
+///   key stays held until a save makes both durable (MONEY 724g P1): the
+///   daemon saves revokes made while its scan is built before the scan
+///   selects anything (`persist_revokes`); later ones wait for the cycle's
+///   own save. A crash or discarded working index before that loses both and
+///   nothing was read: the re-derived arming revokes again, and the key is
+///   re-offered once that revoke is saved. After the save a failed or
+///   discarded scan finds the key already out of control and the token
+///   consumed. The key's attempts and prior are dropped, never restored: from
+///   here on it is the identity path's.
 /// - Corruption cannot manufacture a revoke: missing or oversized evidence,
 ///   or an absent or ambiguous guard (decoded closed, so holding nothing),
 ///   revokes nothing and the key stays held. A guard
@@ -875,24 +930,113 @@ pub(crate) fn revoke_for_identity(
     revoked.at = now;
     guard.identity_revoked = guard.identity_revoked.saturating_add(1);
     guard.identity_revoked_at = now;
+    guard.unsaved.keys.insert(key.to_owned());
     shadow.rebuild_witness = guard.latest_stamp();
     with_persisted(|set| set.remove(&id));
 }
 
+/// MONEY 724g P1, daemon: before the scan selects anything, make the revokes
+/// building it made durable. `committed` is the cycle's committed state (the
+/// base of its partial commits); each unsaved revoke is applied to it exactly
+/// as the working guard holds it (the key out of `k`, its tokens in `r`, the
+/// counter), it is saved, and the working index takes its generation, as a
+/// staged recovery capture does. The revoked key's entry must already be empty
+/// in `committed` (an earlier checkpoint's held rearm is); otherwise, or with
+/// no committed guard, the revoke stays unsaved and the key held until the
+/// cycle's own save. A failed save fails the cycle before any read.
+pub(crate) fn persist_revokes(
+    working: &mut ScanIndex,
+    committed: &mut ScanIndex,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let Some(guard) = working
+        .claude_request_census_shadow
+        .rebuild_bound
+        .as_deref()
+    else {
+        return Ok(());
+    };
+    if guard.unsaved.keys.is_empty() {
+        return Ok(());
+    }
+    let Some(saved) = committed
+        .claude_request_census_shadow
+        .rebuild_bound
+        .as_deref_mut()
+    else {
+        return Ok(());
+    };
+    let mut made_durable = Vec::new();
+    for key in &guard.unsaved.keys {
+        let id = key_id(key);
+        let Some(revoked) = guard.revoked.get(&id) else {
+            continue;
+        };
+        if !committed
+            .files
+            .get(key)
+            .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+        {
+            continue;
+        }
+        let new_tokens = revoked
+            .tokens
+            .iter()
+            .filter(|token| {
+                !saved
+                    .revoked
+                    .get(&id)
+                    .is_some_and(|earlier| earlier.tokens.contains(token))
+            })
+            .count() as u64;
+        saved.keys.remove(&id);
+        saved.revoked.insert(id, revoked.clone());
+        saved.identity_revoked = saved.identity_revoked.saturating_add(new_tokens);
+        saved.identity_revoked_at = saved.identity_revoked_at.max(guard.identity_revoked_at);
+        made_durable.push(key.clone());
+    }
+    if made_durable.is_empty() {
+        return Ok(());
+    }
+    committed.claude_request_census_shadow.rebuild_witness = saved.latest_stamp();
+    if matches!(
+        committed.claude_census_rebuild_initialized,
+        0 | MARKER_REFUSED
+    ) {
+        committed.claude_census_rebuild_initialized = now_unix().max(1);
+    }
+    committed.save(path)?;
+    working.generation = committed.generation;
+    if let Some(guard) = working
+        .claude_request_census_shadow
+        .rebuild_bound
+        .as_deref_mut()
+    {
+        for key in made_durable {
+            guard.unsaved.keys.remove(&key);
+        }
+    }
+    Ok(())
+}
+
 /// Candidate selection (MONEY P1a, legacy): `key`'s empty fingerprint is an
 /// earlier checkpoint's rearm this bound refuses for now. It is skipped,
-/// never read, until a counted attempt is allowed.
+/// never read, until a counted attempt is allowed, or until identity work's
+/// revoke of it is saved (MONEY 724g P1).
 pub(crate) fn held(index: &ScanIndex, key: &str) -> bool {
     index
         .claude_request_census_shadow
         .rebuild_bound
         .as_deref()
-        .filter(|guard| guard.keys.values().any(|tracked| tracked.has(HELD)))
+        .filter(|guard| {
+            !guard.unsaved.keys.is_empty() || guard.keys.values().any(|tracked| tracked.has(HELD))
+        })
         .is_some_and(|guard| {
-            guard
-                .keys
-                .get(&key_id(key))
-                .is_some_and(|tracked| tracked.has(HELD))
+            guard.unsaved.keys.contains(key)
+                || guard
+                    .keys
+                    .get(&key_id(key))
+                    .is_some_and(|tracked| tracked.has(HELD))
         })
 }
 
@@ -942,12 +1086,12 @@ pub(crate) fn persist_grants(index: &mut ScanIndex, path: &Path) -> anyhow::Resu
     index.save(path)?;
     let grants = std::mem::take(&mut index.claude_request_census.rebuild_transient.grants);
     with_persisted(|set| {
-        for id in grants {
-            if set.len() >= MAX_TRACKED_KEYS && !set.contains(&id) {
+        for (id, stamp) in grants {
+            if set.len() >= MAX_TRACKED_KEYS && !set.contains_key(&id) {
                 // Unrecorded: the next load counts it again (fail closed).
                 break;
             }
-            set.insert(id);
+            set.insert(id, stamp);
         }
     });
     Ok(())
@@ -1124,6 +1268,14 @@ pub(crate) mod test_support {
             .as_ref()
             .map_or(0, |guard| guard.identity_revoked)
     }
+    /// MONEY 724g P1: `key`'s revoke is not saved yet (it stays held).
+    pub(crate) fn revoke_unsaved(index: &ScanIndex, key: &str) -> bool {
+        index
+            .claude_request_census_shadow
+            .rebuild_bound
+            .as_ref()
+            .is_some_and(|guard| guard.unsaved.keys.contains(key))
+    }
     pub(crate) fn revoked(index: &ScanIndex, key: &str) -> bool {
         index
             .claude_request_census_shadow
@@ -1193,6 +1345,7 @@ mod tests {
             revoked: BTreeMap::new(),
             identity_revoked: u64::MAX,
             identity_revoked_at: u64::MAX,
+            unsaved: UnsavedRevokes::default(),
         };
         let priors: BTreeMap<String, String> =
             ids.map(|id| (id, "f".repeat(PRIOR_BYTES))).collect();

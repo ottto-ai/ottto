@@ -3760,6 +3760,16 @@ pub(crate) fn persist_duplicate_rebuild_grants(
     rebuild_bound::persist_grants(index, path)
 }
 
+/// MONEY 724g P1: save the revokes identity work made while the scan was
+/// built, before the scan selects anything.
+pub(crate) fn persist_duplicate_rebuild_revokes(
+    working: &mut ScanIndex,
+    committed: &mut ScanIndex,
+    path: &Path,
+) -> anyhow::Result<()> {
+    rebuild_bound::persist_revokes(working, committed, path)
+}
+
 pub(crate) use rebuild_bound::deserialize_priors as deserialize_duplicate_rebuild_priors;
 
 /// Why an index entry's source fingerprint is cleared (its unchanged

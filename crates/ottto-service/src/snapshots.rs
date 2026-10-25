@@ -22917,6 +22917,16 @@ impl OwnedSourceScan {
             codex_side_pass: None,
         }
     }
+    /// MONEY 724g P1: the N3 revokes identity work made while this scan was
+    /// built are saved (on `committed`, the cycle's committed state) before
+    /// the scan selects anything; until then the revoked keys stay held.
+    pub(crate) fn persist_duplicate_rebuild_revokes(
+        &mut self,
+        committed: &mut ScanIndex,
+        path: &Path,
+    ) -> Result<()> {
+        claude_request_census::persist_duplicate_rebuild_revokes(&mut self.index, committed, path)
+    }
     /// U1a-2a: the pass's C14 namespace and gate (`None` for other sources).
     pub(crate) fn with_codex_side_pass(mut self, pass: Option<CodexSidePass>) -> Self {
         self.codex_side_pass = pass;
@@ -58316,7 +58326,9 @@ mod tests {
     /// nothing more. OFF and ON.
     #[test]
     fn claude_family_correction_revokes_an_earlier_checkpoint_n3_hold_once() {
-        use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+        use crate::snapshots::claude_request_census::{
+            duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_revokes,
+        };
         const NOW: u64 = 1_790_000_000;
         let rearmed = (
             CandidateDecision::Parse,
@@ -58371,6 +58383,10 @@ mod tests {
                 (CandidateDecision::Skip, None),
                 "shadow={enabled}: held before the correction"
             );
+            // The cycle's committed checkpoint, as saved.
+            let path = root.join("n3-family-correction-index.json");
+            std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+            let mut committed = index.clone();
 
             // The terminal page proves the family and arms the correction.
             apply_claude_effort_evidence_with_index(
@@ -58384,6 +58400,18 @@ mod tests {
             assert!(index.files[&parent_index_key]
                 .source_file_fingerprint
                 .is_empty());
+            // MONEY 724g P1: held, never selected, until the revoke is saved.
+            assert!(bound::held(&index, &child_index_key), "shadow={enabled}");
+            assert_eq!(
+                index.source_fingerprint_decision(
+                    &child_index_key,
+                    &index.files[&child_index_key],
+                    &source
+                ),
+                (CandidateDecision::Skip, None),
+                "shadow={enabled}: not selected before the save"
+            );
+            persist_duplicate_rebuild_revokes(&mut index, &mut committed, &path).unwrap();
             assert!(!bound::held(&index, &child_index_key), "shadow={enabled}");
             assert!(bound::revoked(&index, &child_index_key));
             assert_eq!(bound::identity_revoked(&index), 1);
@@ -58397,7 +58425,6 @@ mod tests {
                 "shadow={enabled}: re-offered on the next selection"
             );
 
-            let path = root.join("n3-family-correction-index.json");
             index.save(&path).unwrap();
             for cycle in 0..3 {
                 let case = format!("shadow={enabled} cycle={cycle}");

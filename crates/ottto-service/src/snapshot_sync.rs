@@ -5778,7 +5778,7 @@ fn prepare_sync_source(
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
     }
-    let committed_index = index.clone();
+    let mut committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
     // A replay re-reads everything and neither re-offers nor defers.
@@ -5851,6 +5851,9 @@ fn prepare_sync_source(
         )),
     )
     .with_codex_side_pass(codex_side_pass);
+    // MONEY 724g P1: a revoke of an earlier checkpoint's N3 hold made while
+    // the scan was built is durable before the scan selects the key.
+    scan.persist_duplicate_rebuild_revokes(&mut committed_index, &index_path)?;
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
     }

@@ -46,7 +46,11 @@ absent, its duplicate stays counted, and `census_duplicate_rebuild_exhausted`
 plus a rate-limited `key_hash8`/`cause` alarm make it visible. It clears when
 the key's record next decodes clean; the window passing allows only a new
 counted attempt. A read that starts spends its grant even if the failed pass is
-never saved. At most 512 keys are tracked, one compact line each in the saved
+never saved. A saved grant this process has not started yet authorizes a read
+only while its own stamp is still one of the key's attempts in the window
+(MONEY 724g P2): a later load moves that stamp forward to itself and saves it
+before its scan like a new grant, so the window bounds actual reads, not only
+authorizations; an expired grant needs a fresh counted attempt. At most 512 keys are tracked, one compact line each in the saved
 index; past that new keys are refused for one window. Only well-formed
 fingerprints (64 lowercase hex) are rearmed.
 
@@ -66,10 +70,17 @@ re-arm, family correction, legacy witness, owned start, stale-family uncarry,
 cancel, rewind or stale-pending re-arm) takes a held earlier-form key out of
 the bound: the key leaves `n`, and a 16-hex token of the arming's evidence
 stays in `n.r` for one window. Every consumed token is kept (at most three
-per key; past that a re-entered hold stays held, failing closed). The revoke happens once per key per arming, is
-saved by the same commit as the arming's clear, and is counted in
-`census_duplicate_rebuild_identity_revoked`. The key is then re-offered on the
-next selection and never held, restored or revoked again for that arming.
+per key; past that a re-entered hold stays held, failing closed). The revoke happens once per key per arming and is
+counted in `census_duplicate_rebuild_identity_revoked`. It is durable before
+the key is selected (MONEY 724g P1): the daemon applies the revokes made while
+its scan is built to the cycle's committed state and saves it before the scan
+selects anything (the working index takes the saved generation); a revoke made
+later in the cycle is saved by the cycle's own save. Until saved, the key stays
+held. A crash before that save loses the revoke and nothing was read, so the
+re-derived arming only revokes again and re-offers the key once saved; after
+it, a crash or discarded working index finds the token consumed. The key is
+then re-offered on the next selection and never held, restored or revoked
+again for that arming.
 Missing or oversized evidence, or an absent or closed-ambiguous guard, revokes
 nothing. Repairs of damaged state, recovery re-reads and carried re-parse debt
 never revoke.

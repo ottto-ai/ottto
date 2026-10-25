@@ -1295,7 +1295,9 @@ fn pipeline_new_auxiliary_bad_clock_keeps_the_due_rearm_enabled() {
 /// ON.
 #[test]
 fn contract_rearm_revokes_an_earlier_checkpoint_n3_hold_once() {
-    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_revokes,
+    };
     const NOW: u64 = 1_790_000_000;
     let rearmed = (
         CandidateDecision::Parse,
@@ -1323,6 +1325,11 @@ fn contract_rearm_revokes_an_earlier_checkpoint_n3_hold_once() {
             (CandidateDecision::Skip, None),
             "shadow={enabled}: the hold skips it before identity work"
         );
+        // The cycle's committed checkpoint, as saved.
+        let scratch = crate::test_scratch::ScratchDir::new("contract-rearm-revokes-n3-hold");
+        let path = scratch.join("index.json");
+        std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+        let mut committed = index.clone();
 
         // The real terminal contract-5 re-arm.
         index.claude_request_identity_contract_changed = true;
@@ -1337,6 +1344,15 @@ fn contract_rearm_revokes_an_earlier_checkpoint_n3_hold_once() {
         for member in rearm.sources.keys() {
             assert!(index.files[member].source_file_fingerprint.is_empty());
         }
+        // MONEY 724g P1: held, never selected, until the revoke is saved.
+        assert!(bound::revoke_unsaved(&index, &key), "shadow={enabled}");
+        assert!(bound::held(&index, &key), "shadow={enabled}: until saved");
+        assert_eq!(
+            index.source_fingerprint_decision(&key, &index.files[&key], &source),
+            (CandidateDecision::Skip, None),
+            "shadow={enabled}: not selected before the save"
+        );
+        persist_duplicate_rebuild_revokes(&mut index, &mut committed, &path).unwrap();
         assert!(!bound::held(&index, &key), "shadow={enabled}: revoked");
         assert!(bound::revoked(&index, &key));
         assert!(!bound::pending(&index, &key), "out of the bound's control");
@@ -1347,8 +1363,6 @@ fn contract_rearm_revokes_an_earlier_checkpoint_n3_hold_once() {
             "shadow={enabled}: re-offered on the next selection"
         );
 
-        let scratch = crate::test_scratch::ScratchDir::new("contract-rearm-revokes-n3-hold");
-        let path = scratch.join("index.json");
         index.save(&path).unwrap();
         for cycle in 0..4 {
             let case = format!("shadow={enabled} cycle={cycle}");
