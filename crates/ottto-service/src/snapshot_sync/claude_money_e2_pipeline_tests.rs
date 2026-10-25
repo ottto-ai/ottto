@@ -1,6 +1,6 @@
-//! E2 acceptance from synthetic files through the production scan, fresh
-//! sidecar read, native finalize, emission, policy, batch and ACK settlement.
-//! No supplied accumulators, literal bodies or money totals stand in for reads.
+// E2 acceptance from synthetic files through the production scan, fresh
+// sidecar read, native finalize, emission, policy, batch and ACK settlement.
+// No supplied accumulators, literal bodies or money totals stand in for reads.
 use super::*;
 use crate::snapshots::claude_request_money::e2;
 use crate::snapshots::e2_pipeline_scan_fixture::{
@@ -219,6 +219,17 @@ fn trace(request: &str, agent: &str) -> crate::claude_local_otel::ClaudeTraceOwn
     );
     row
 }
+fn request(items: &[SnapshotItem]) -> SnapshotBatchRequest {
+    SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: SnapshotSource::ClaudeCode.api_slug().into(),
+        machine_id: "a".repeat(64),
+        collector_version: Some("0.1.synthetic".into()),
+        snapshots: items.to_vec(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    }
+}
 fn upload(
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
@@ -243,10 +254,15 @@ fn upload(
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {
-            sent.push(canonical(&batch));
+            let wire = request(&batch);
+            validate_snapshot_batch_request(&wire)
+                .expect("scan-generated fixture passes real wire preflight");
+            sent.push(canonical(&wire));
             order.push(batch.iter().map(|s| s.source_session_id.clone()).collect());
             let owned = batch.iter().map(|s| (*s).clone()).collect::<Vec<_>>();
-            respond(&owned)
+            let response = respond(&owned)?;
+            response.validate_entity_ack(&wire)?;
+            Ok(response)
         },
         |_| Ok(()),
     );
@@ -258,6 +274,14 @@ fn ack(batch: &[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchRe
     for item in batch {
         let mut reference = entity_ack_ref(&item.snapshot_fingerprint);
         reference.source_session_id = item.source_session_id.clone();
+        reference.body_witness_version =
+            crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
+        reference.body_witness_digest = reference
+            .body_witness_version
+            .map(|_| snapshot_upload_body_witness(item));
+        if item.cache_observations.is_some() {
+            reference.head_etag = Some("e".repeat(64));
+        }
         response.accepted_entities.push(reference);
         response.accepted += 1;
     }
@@ -275,7 +299,7 @@ fn literal(page: &Page) {
         .scan
         .snapshots
         .iter()
-        .all(crate::snapshots::claude_history_upgrade::is_request_owned_literal));
+        .all(crate::snapshots::claude_request_money::is_request_owned_literal));
 }
 fn assert_mode(actual: (usize, usize, usize), expected: (usize, usize, usize)) {
     let expected = if crate::heap_layout_bound::layout_supported() {
@@ -299,12 +323,23 @@ fn ready(
 ) -> Page {
     let mut p = corpus.raw(scanner, index, limit, sampled, &[]);
     p.enrich(corpus);
+    let mut send = Page {
+        index: p.index.clone(),
+        scan: p.scan.clone(),
+        modes: p.modes,
+    };
+    send.finish();
+    let (result, _, _) = upload(&send.scan.snapshots, &mut test_upload_progress(), ack);
+    assert_eq!(
+        result.unwrap(),
+        ResumableUploadResult::Completed,
+        "real finalized bodies pass batching and entity ACK"
+    );
     p
 }
 
 #[test]
 fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
-    let _manifests = SourceManifestTestGuard::new();
     let mut c = Corpus::new("e2-pipeline-dark");
     c.root(
         ROOT,
@@ -351,7 +386,6 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
 
 #[test]
 fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-modes");
         let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
@@ -408,7 +442,6 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
 }
 
 fn mutation_case(kind: &str) {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-{kind}"));
         let contents = line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20);
@@ -469,7 +502,6 @@ fn e2_pipeline_inode_replacement_matches_full() {
 
 #[test]
 fn e2_pipeline_page_boundary_matches_single_page_bodies() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-pages");
         for (n, session) in [ROOT, COPY, PIPELINE_SESSIONS[0]].iter().enumerate() {
@@ -510,7 +542,6 @@ fn e2_pipeline_page_boundary_matches_single_page_bodies() {
 
 #[test]
 fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-move-copy");
         let original = c.root(ROOT, &line(ROOT, "r1", AT, 10));
@@ -554,7 +585,6 @@ fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
 }
 
 fn twins(reverse: bool) {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new(if reverse {
             "e2-pipeline-twins-reverse"
@@ -607,7 +637,6 @@ fn e2_pipeline_twins_copy_discovered_first() {
 
 #[test]
 fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-twin-hold");
         let original = c.write_at(
@@ -676,7 +705,6 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
 
 #[test]
 fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-twin-delete");
         let original = c.write_at(
@@ -707,7 +735,6 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
 
 #[test]
 fn e2_pipeline_one_branch_removes_copied_prefix_only() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-branch");
         c.root(ROOT, &line(ROOT, "r1", AT, 10));
@@ -761,7 +788,6 @@ fn e2_pipeline_one_branch_removes_copied_prefix_only() {
 
 #[test]
 fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-side-calls");
         c.root(ROOT, &line(ROOT, "root", AT, 10));
@@ -804,7 +830,6 @@ fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
 
 #[test]
 fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-quiet-otel");
         let path = c.root(ROOT, &line(ROOT, "root", AT, 10));
@@ -842,7 +867,6 @@ fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
 
 #[test]
 fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-side-other-page");
         let root = c.root(ROOT, &line(ROOT, "root", AT, 10));
@@ -895,7 +919,6 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
 
 #[test]
 fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-retry");
         let prefix = line(ROOT, "copied", "2026-08-02T06:58:00Z", 11);
@@ -972,6 +995,8 @@ fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
             let mut response = ack(batch)?;
             let refused = response.accepted_entities.pop().unwrap();
             response.accepted -= 1;
+            let mut refused = refused;
+            refused.head_etag = None;
             response.conflict_entities.push(refused);
             Ok(response)
         });
@@ -1015,7 +1040,6 @@ fn family_corpus(c: &mut Corpus, count: usize, model_padding: usize) {
     }
 }
 fn family_count_case(count: usize) {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-family-{count}"));
         family_corpus(&mut c, count, 0);
@@ -1063,23 +1087,23 @@ fn e2_pipeline_real_family_51() {
 
 #[test]
 fn e2_pipeline_real_family_crosses_two_mib_root_first() {
-    let _manifests = SourceManifestTestGuard::new();
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-family-bytes");
         // Search input model length, never mutate an emitted body to pad it.
-        // Each arm opens and parses actual root+agent JSONL, joins, emits and
+        // Each arm opens and parses actual root+three-agent JSONL, joins, emits and
         // serializes with the same accounting the production packer uses.
         let measure = |c: &mut Corpus, padding| {
-            family_corpus(c, 2, padding);
-            let mut p = ready(
-                c,
+            family_corpus(c, 4, padding);
+            let mut p = c.raw(
                 &E2ScanFixture::default(),
                 ScanIndex::default(),
                 100,
                 false,
+                &[],
             );
+            p.enrich(c);
             literal(&p);
-            assert_eq!(p.scan.snapshots.len(), 2);
+            assert_eq!(p.scan.snapshots.len(), 4);
             p.finish();
             let bytes = 2 + p
                 .scan
@@ -1090,7 +1114,7 @@ fn e2_pipeline_real_family_crosses_two_mib_root_first() {
             (p, bytes)
         };
         let mut low = 0;
-        let mut high = 600_000;
+        let mut high = 300_000;
         assert!(measure(&mut c, high).1 > SNAPSHOT_BATCH_MAX_BYTES);
         while low + 1 < high {
             let mid = (low + high) / 2;
@@ -1112,7 +1136,7 @@ fn e2_pipeline_real_family_crosses_two_mib_root_first() {
         assert_eq!(b.len(), 1);
         let (r, _, b) = upload(&above.scan.snapshots, &mut test_upload_progress(), ack);
         assert_eq!(r.unwrap(), ResumableUploadResult::Completed);
-        assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 1]);
+        assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
         assert_eq!(b[0][0], ROOT);
         println!("E2_PIPELINE_BYTE_BOUNDARY below={bytes_below} above={bytes_above} limit={SNAPSHOT_BATCH_MAX_BYTES}");
     });
