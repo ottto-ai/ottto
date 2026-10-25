@@ -1347,8 +1347,13 @@ impl SnapshotUploadProgress {
                     contract_retry_changed |= self.quarantined_fingerprints[fingerprint]
                         .reconstruction_contract
                         < record.reconstruction_contract;
+                    let mut replacement = record.clone();
+                    crate::snapshots::terminal_contract_retry::merge_claims(
+                        &mut replacement,
+                        &self.quarantined_fingerprints[fingerprint],
+                    );
                     self.quarantined_fingerprints
-                        .insert(fingerprint.clone(), record.clone());
+                        .insert(fingerprint.clone(), replacement);
                 }
                 self.quarantined_fingerprints
                     .entry(fingerprint.clone())
@@ -1357,6 +1362,13 @@ impl SnapshotUploadProgress {
                         record.clone()
                     });
             }
+        }
+        contract_retry_changed |= crate::snapshots::terminal_contract_retry::merge_maps(
+            &mut self.quarantined_fingerprints,
+            index_quarantine,
+        );
+        for record in self.quarantined_fingerprints.values_mut() {
+            contract_retry_changed |= crate::snapshots::terminal_contract_retry::exhaust(record);
         }
         // The server-permanent exact-body fact dominates an older index timer.
         // Keep the index-facing disposition truthful as well as suppressing I/O.
@@ -1396,7 +1408,8 @@ impl SnapshotUploadProgress {
                             == Some(permanent.body_witness.as_str())
                     })
                     && record.disposition == SnapshotQuarantineDisposition::RetryPending
-                    && (&record.witness != active || record.retry_after_unix_seconds <= now)
+                    && ((record.contract_retry_claims.is_none() && &record.witness != active)
+                        || record.retry_after_unix_seconds <= now)
             })
             .map(|(fingerprint, record)| {
                 (
@@ -1466,20 +1479,11 @@ impl SnapshotUploadProgress {
         for fingerprint in &retry {
             let record = self
                 .quarantined_fingerprints
-                .get(fingerprint)
-                .expect("selected quarantine retry exists")
-                .clone();
-            self.quarantined_fingerprints.insert(
-                fingerprint.clone(),
-                SnapshotQuarantineRecord {
-                    reconstruction_contract: record.reconstruction_contract,
-                    witness: active.clone(),
-                    retry_after_unix_seconds: quarantine_retry_after(fingerprint),
-                    upload_body_witness: record.upload_body_witness,
-                    failed_reconstruction_count: record.failed_reconstruction_count,
-                    disposition: record.disposition,
-                },
-            );
+                .get_mut(fingerprint)
+                .expect("selected quarantine retry exists");
+            crate::snapshots::terminal_contract_retry::claim(record);
+            record.witness = active.clone();
+            record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
         }
         self.active_quarantine_retries = retry;
         !self.active_quarantine_retries.is_empty() || reoffer_changed || contract_retry_changed
@@ -1853,6 +1857,11 @@ impl SnapshotUploadProgress {
                 record.witness == witness
                     && record.upload_body_witness.as_deref() == Some(body_witness)
             });
+        let contract_retry_claims = self
+            .quarantined_fingerprints
+            .get(fingerprint)
+            .filter(|record| record.upload_body_witness.as_deref() == Some(body_witness))
+            .and_then(|record| record.contract_retry_claims);
         let reconstruction_contract = existing.map_or(
             crate::snapshots::terminal_contract_retry::current_contract(),
             |record| {
@@ -1873,6 +1882,7 @@ impl SnapshotUploadProgress {
         self.quarantined_fingerprints.insert(
             fingerprint.to_string(),
             SnapshotQuarantineRecord {
+                contract_retry_claims,
                 reconstruction_contract,
                 witness,
                 retry_after_unix_seconds: if disposition
@@ -1989,9 +1999,14 @@ impl SnapshotUploadProgress {
             .quarantined_fingerprints
             .get_mut(fingerprint)
             .expect("quarantine just recorded");
-        record.failed_reconstruction_count = 1;
+        record.failed_reconstruction_count = if record.contract_retry_claims.is_some() {
+            MAX_SNAPSHOT_RECONSTRUCTION_FAILURES - 1
+        } else {
+            1
+        };
         record.disposition = SnapshotQuarantineDisposition::RetryPending;
         record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+        crate::snapshots::terminal_contract_retry::exhaust(record);
     }
 
     fn retain_current_quarantines_with_diagnostics(
@@ -2055,6 +2070,10 @@ impl SnapshotUploadProgress {
             {
                 return Err(anyhow!("snapshot upload progress changed concurrently"));
             }
+            crate::snapshots::terminal_contract_retry::merge_maps(
+                &mut self.quarantined_fingerprints,
+                &current.quarantined_fingerprints,
+            );
         } else if self.generation != 0 {
             return Err(anyhow!("snapshot upload progress disappeared concurrently"));
         }
@@ -3330,7 +3349,7 @@ impl SyncCounts {
             "snapshot terminal_census source={source} census_complete={} scanned_files={} \
              uploaded={} unproven_terminal={} superseded_terminal={} \
              ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
-             dropped_usage_records={} cooldown_conflict_deferred={} terminal_contract_retry={}",
+             dropped_usage_records={} cooldown_conflict_deferred={} terminal_contract_retry={} terminal_contract_retry_exhausted={}",
             self.census_complete,
             self.scanned_file_count,
             self.uploaded_count,
@@ -3341,6 +3360,7 @@ impl SyncCounts {
             self.dropped_usage_record_count,
             self.cooldown_conflict_deferred,
             crate::snapshots::terminal_contract_retry::local_count(),
+            crate::snapshots::terminal_contract_retry::exhausted_count(),
         )
     }
 
@@ -5880,6 +5900,7 @@ fn prepare_sync_source(
         // identical entities and gives overlapping writers a CAS boundary.
         upload_progress.save(&upload_progress_path)?;
     }
+    save_terminal_contract_claims_for_scan(&mut index, &upload_progress, &index_path)?;
     let active_legacy_reconciliation = upload_progress
         .active_quarantine_retries
         .intersection(&legacy_reconciliation_pending)
@@ -7825,6 +7846,32 @@ fn finish_sync_source(
                 ),
         );
     }
+    Ok(())
+}
+
+/// The progress claim was saved by the caller. Mirror its maximum into the
+/// durable index before granting the source selector a runtime lease.
+fn save_terminal_contract_claims_for_scan(
+    index: &mut ScanIndex,
+    progress: &SnapshotUploadProgress,
+    index_path: &Path,
+) -> Result<()> {
+    if index.merge_terminal_contract_claims(&progress.quarantined_fingerprints) {
+        index.save(index_path)?;
+    }
+    index.activate_terminal_contract_retries(
+        progress
+            .active_quarantine_retries
+            .iter()
+            .filter(|fp| {
+                progress
+                    .quarantined_fingerprints
+                    .get(*fp)
+                    .is_some_and(|record| record.contract_retry_claims.is_some())
+            })
+            .cloned()
+            .collect(),
+    );
     Ok(())
 }
 
@@ -16529,6 +16576,7 @@ mod tests {
         corrupt.quarantined_fingerprints.insert(
             fingerprint,
             SnapshotQuarantineRecord {
+                contract_retry_claims: None,
                 reconstruction_contract:
                     crate::snapshots::terminal_contract_retry::current_contract(),
                 witness: test_quarantine_witness(),
@@ -17186,6 +17234,7 @@ mod tests {
             progress.quarantined_fingerprints.insert(
                 format!("{value:064x}"),
                 SnapshotQuarantineRecord {
+                    contract_retry_claims: None,
                     reconstruction_contract:
                         crate::snapshots::terminal_contract_retry::current_contract(),
                     witness: witness.clone(),

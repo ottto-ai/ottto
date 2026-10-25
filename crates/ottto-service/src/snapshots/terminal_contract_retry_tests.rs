@@ -189,6 +189,14 @@ fn terminal_contract_retry_reads_only_the_owning_file() {
             .get_mut(&fingerprint)
             .unwrap()
             .retry_after_unix_seconds = 0;
+        terminal_contract_retry::claim(
+            loaded
+                .quarantined_snapshot_fingerprints
+                .get_mut(&fingerprint)
+                .unwrap(),
+        );
+        loaded.save(&path).unwrap();
+        loaded.activate_terminal_contract_retries(BTreeSet::from([fingerprint.clone()]));
         let due = scan(&mut loaded);
         assert_eq!(due.scanned_file_count, 1);
         assert_eq!(due.snapshots.len(), 1);

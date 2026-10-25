@@ -54,3 +54,29 @@ negative/overflow integers and other JSON shapes, both ordinary decode and the
 index's scalar-repair path, and checkpoint save/reload. Separate bumped-contract
 success and selected-lease restart cases exercise exact ACK settlement, stale
 index suppression and an interrupted attempt returning only after pacing.
+
+
+## Durable acquisition bound
+
+Contract-origin retries carry `contract_retry_claims: Some(n)` alongside their
+version. Ordinary retries omit this member. Migration starts at zero; selection
+increments and saves the claim in upload progress and merges its maximum into
+the scan index before granting a runtime source lease. One claim selects one
+indexed owning file. A restart restores no runtime lease. It retains the saved
+claim and paced deadline, allowing at most one further claimed acquisition.
+After two claims, an unsettled retry becomes terminal again; a conflict cannot
+reset this budget. Ordinary conflicts retain their existing failure-count
+behavior. Actual reconstruction failure can still return terminal sooner.
+
+Same-version, exact-body merges and both checkpoint CAS paths retain the maximum
+claim count. A newer claim also retains its cooldown; older index copies cannot
+reopen it. A malformed-present counter is conservatively exhausted, preserving
+the enclosing record and checkpoint. A new reconstruction version starts a new
+bounded obligation. The local terminal-census line additionally discloses
+`terminal_contract_retry_exhausted`; no upload field changes.
+
+Synthetic scanner regressions count actual parser-read acquisitions for the
+owning file and unrelated files over seven due cycles. They cover restarts
+before outcomes, repeated server conflicts, actual post-read checkpoint-write
+failures, stale index merges, same-generation CAS restoration and malformed
+claim metadata, while preserving the retained identity and ACK fixture.
