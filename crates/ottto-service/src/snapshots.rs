@@ -4230,6 +4230,8 @@ struct ClaudeUsageAuthorityQuarantineRecord {
 
 include!("snapshots/authority_proof_correction.rs");
 include!("snapshots/load_containment.rs");
+#[cfg(test)]
+mod compact_index_tests;
 mod lenient_decode;
 #[cfg(test)]
 mod lenient_decode_tests;
@@ -42338,7 +42340,7 @@ impl ScanIndex {
         let result = (|| -> Result<()> {
             {
                 let mut writer = BufWriter::new(&mut file);
-                serde_json::to_writer_pretty(&mut writer, &self)
+                lenient_decode::write_index(&mut writer, self)
                     .with_context(|| format!("write scan index temp {}", temp_path.display()))?;
                 writer
                     .flush()
@@ -47994,7 +47996,7 @@ mod tests {
         index.save(&path).expect("save large generation");
         assert_eq!(
             fs::read(&path).expect("read durable index"),
-            serde_json::to_vec_pretty(&index).expect("encode exact index bytes")
+            serde_json::to_vec(&index).expect("encode exact compact index bytes")
         );
         let mut stale = ScanIndex::load(&path).expect("load stale generation");
         let mut winner = ScanIndex::load(&path).expect("load winning generation");
@@ -48005,7 +48007,7 @@ mod tests {
             .expect_err("stale generation stays fenced");
         assert_eq!(
             fs::read(&path).expect("read winning bytes"),
-            serde_json::to_vec_pretty(&winner).expect("encode winning bytes")
+            serde_json::to_vec(&winner).expect("encode winning compact bytes")
         );
         let observed = ScanIndex::load(&path).expect("reload winning generation");
         assert_eq!(observed.generation, 2);
