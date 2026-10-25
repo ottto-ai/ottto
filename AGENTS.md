@@ -28,6 +28,20 @@
 - Locally, check and test only the crates you changed (`cargo check|test -p <crate>`).
   Full-workspace `cargo build`/`cargo test` runs only in GitHub CI: push a PR and
   read its result. Coordinate heavy local builds.
+- CI runs on pull requests. Push to the PR branch; do not also start Public CI by
+  hand on a branch whose PR is open and mergeable. GitHub starts no pull-request
+  run while a PR has merge conflicts (`gh pr view <n> --json mergeable`): rebase
+  onto `main` and push. Start Public CI by hand (`workflow_dispatch`) only for a
+  `main` commit with no push run, a branch with no PR (for example a red-test
+  proof), or a dispatch-only job the branch adds; one run per head, and never
+  restart a run because it is queued. Do not put `[skip ci]` in PR commits. Merge
+  only after a green pull-request run on the final head.
+- Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
+  ready, waits until the four `ci.yml` checks of the pull-request run on the PR's
+  head commit pass (macOS `Rust contracts`; Linux `Public surface checks`, `Rust
+  advisory audit`, `Dependency review`), and squash-merges exactly that head.
+  `main`'s ruleset also requires `Rust contracts`. `gh pr checks` exit 0 is not
+  evidence, and no Linux job stands in for the macOS `Rust contracts` job.
 - Use macOS for native behavior. Use synthetic fixtures rather than live
   credentials or provider accounts.
 - No additional skill, dependency, coverage quota, report, or validation gate is
