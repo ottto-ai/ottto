@@ -796,7 +796,10 @@ fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
                 InterruptedOutcome::Restart => {} // Lose all volatile state before any outcome.
                 InterruptedOutcome::Conflict | InterruptedOutcome::SaveFailure => {
                     let mut accepted = 0;
-                    let items = vec![fixture.fingerprint.clone()];
+                    // The uploader's frozen input owns ACK-ledger pruning.
+                    // Keep the retained ACK in that input so this fixture tests
+                    // conflict/outcome persistence, rather than orphan pruning.
+                    let items = vec![fixture.fingerprint.clone(), retained_ack()];
                     let temp = fixture
                         .retained
                         .progress_path
@@ -810,8 +813,21 @@ fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
                         &mut progress,
                         &mut accepted,
                         String::as_str,
-                        |_| fixture.body.clone(),
-                        |batch| Ok(entity_ack_batch(&[], &[], &batch)),
+                        |fp| {
+                            if fp == &fixture.fingerprint {
+                                fixture.body.clone()
+                            } else {
+                                retained_body(fp)
+                            }
+                        },
+                        |batch| {
+                            assert_eq!(
+                                batch,
+                                vec![fixture.fingerprint.clone()],
+                                "the retained exact ACK must never be offered again"
+                            );
+                            Ok(entity_ack_batch(&[], &[], &batch))
+                        },
                         |state| state.save(&fixture.retained.progress_path),
                     );
                     if matches!(outcome, InterruptedOutcome::SaveFailure) {
