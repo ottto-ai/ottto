@@ -6986,7 +6986,8 @@ fn finish_sync_source(
     // Exact settled ACKs enter the same atomic progress ledger as normal pages.
     // Bootstrap and main upload must drain the same admitted subset. A larger
     // page stops through partial settlement only after those bodies can finish.
-    let ack_admission_limited = upload_progress.admit_upload_input(&mut scan_result.snapshots);
+    let ack_admission_limited =
+        upload_progress.admit_upload_input(&mut scan_result.snapshots, &committed_index);
     let probes = scan_result
         .snapshots
         .iter()

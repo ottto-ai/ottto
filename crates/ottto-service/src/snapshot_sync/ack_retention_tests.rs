@@ -598,7 +598,7 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let limited = progress.admit_upload_input(&mut items);
+        let limited = progress.admit_upload_input_with_unsettled_limit(&mut items, &baseline, 2);
         assert_eq!(limited.is_some(), cycle < 2);
         assert_eq!(items.len(), if cycle < 2 { 2 } else { 1 });
         let probes = items.iter().map(cache_head_probe).collect::<Vec<_>>();
@@ -1056,7 +1056,7 @@ fn capacity_outcome_reports_deferred_entities_without_counting_network_loss() {
     reset_for_test();
     for has_http_attempt in [true, false] {
         let f = AckFixture::new(false);
-        let (_, mut progress) = f.load();
+        let (index, mut progress) = f.load();
         progress.ack_capacity = usize::from(has_http_attempt);
         let mut items = [1, 2, 2, 3]
             .into_iter()
@@ -1067,7 +1067,13 @@ fn capacity_outcome_reports_deferred_entities_without_counting_network_loss() {
                 item
             })
             .collect::<Vec<_>>();
-        let admission = progress.admit_upload_input(&mut items).unwrap();
+        let admission = progress
+            .admit_upload_input_with_unsettled_limit(
+                &mut items,
+                &index,
+                usize::from(has_http_attempt),
+            )
+            .unwrap();
         let mut attempts = 0;
         let result = f
             .upload(&mut progress, &items, |batch| {
@@ -1108,4 +1114,42 @@ fn capacity_outcome_reports_deferred_entities_without_counting_network_loss() {
     ack_retention::record_upload_failure_loss(&anyhow!("synthetic transport failure"));
     assert_eq!(observe().quantity(ClientReportReason::NetworkError), 1);
     reset_for_test();
+}
+
+#[test]
+fn full_unindexed_debt_still_allows_a_live_entity_without_lending_slots_to_unrelated_input() {
+    let f = AckFixture::new(false);
+    let (index, mut progress) = f.load();
+    for entity in 0..4096 {
+        let fp = format!("{entity:064x}");
+        progress.record_body(&fp, &fp);
+    }
+    progress.save(&f.progress_path).unwrap();
+    let mut unrelated = f.item.clone();
+    unrelated.snapshot_fingerprint = "e".repeat(64);
+    unrelated.source_session_id = "unrelated".into();
+    let input = vec![f.item.clone(), unrelated];
+    for _ in 0..2 {
+        // Repeated admission must not accumulate reservations or debt credit.
+        let mut page = input.clone();
+        let limited = progress.admit_upload_input(&mut page, &index).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].snapshot_fingerprint, f.item.snapshot_fingerprint);
+        assert_eq!(limited.deferred_entity_count, 1);
+        assert_eq!(progress.ack_capacity, 4097);
+    }
+    let mut page = input;
+    progress.admit_upload_input(&mut page, &index).unwrap();
+    let mut attempts = 0;
+    f.upload(&mut progress, &page, |batch| {
+        attempts += 1;
+        exact_ack(batch)
+    })
+    .unwrap();
+    assert_eq!(attempts, 1);
+    let (index, progress) = f.load();
+    f.assert_ack(&progress);
+    assert_eq!(progress.accepted_fingerprints.len(), 4097);
+    assert_eq!(progress.ack_capacity, 4097);
+    assert_eq!(index.upload_progress_ack_incidence().count(), 1);
 }

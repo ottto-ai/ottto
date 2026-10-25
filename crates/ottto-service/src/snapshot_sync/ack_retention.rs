@@ -90,22 +90,53 @@ impl SnapshotUploadProgress {
     /// entities may replace their body in the same slot. Omitted work remains
     /// uncommitted and the caller must force the partial-index settlement path.
     pub(super) fn admit_upload_input(
-        &self,
+        &mut self,
         items: &mut Vec<SnapshotItem>,
+        committed: &ScanIndex,
     ) -> Option<AckSettlementRequired> {
-        let mut remaining = self
-            .ack_capacity
-            .saturating_sub(self.accepted_fingerprints.len());
-        // At most the available unsettled slots are allocated as hash keys.
-        let mut admitted = BTreeSet::new();
-        let before = items
+        self.admit_upload_input_with_unsettled_limit(items, committed, MAX_UNSETTLED_ACKS)
+    }
+
+    // The explicit limit permits small persistence oracles. Production always
+    // uses MAX_UNSETTLED_ACKS above. Recompute reservations on every call.
+    pub(super) fn admit_upload_input_with_unsettled_limit(
+        &mut self,
+        items: &mut Vec<SnapshotItem>,
+        committed: &ScanIndex,
+        unsettled_limit: usize,
+    ) -> Option<AckSettlementRequired> {
+        let input = items
             .iter()
             .map(|item| item.snapshot_fingerprint.as_str())
-            .collect::<BTreeSet<_>>()
-            .len();
+            .collect::<BTreeSet<_>>();
+        let before = input.len();
+        let mut unsettled = self.accepted_fingerprints.clone();
+        let mut live_input = BTreeSet::new();
+        for fp in committed.upload_progress_ack_incidence() {
+            unsettled.remove(fp);
+            if input.contains(fp) && !self.accepted_fingerprints.contains(fp) {
+                live_input.insert(fp.to_owned());
+            }
+        }
+        drop(input);
+        // New input already in durable incidence uses live slots, even when
+        // unsettled debt is full. Only unrelated entities consume debt slots.
+        // Input/live scratch is bounded by this page, not the index census.
+        let held_live = self
+            .accepted_fingerprints
+            .len()
+            .saturating_sub(unsettled.len());
+        self.ack_capacity = held_live
+            .saturating_add(live_input.len())
+            .saturating_add(unsettled_limit);
+        let mut remaining = unsettled_limit.saturating_sub(unsettled.len());
+        let mut admitted = BTreeSet::new();
         items.retain(|item| {
             let fp = &item.snapshot_fingerprint;
-            if self.accepted_fingerprints.contains(fp) || admitted.contains(fp) {
+            if self.accepted_fingerprints.contains(fp)
+                || live_input.contains(fp)
+                || admitted.contains(fp)
+            {
                 return true;
             }
             if remaining == 0 {

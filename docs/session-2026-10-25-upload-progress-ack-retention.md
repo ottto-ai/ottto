@@ -16,8 +16,9 @@ conflict budgets and monetary calculations are unchanged.
 Admission reserves space before each POST, including retained retries. Bootstrap and main upload drain the same admitted input subset before a
 capacity stop selects the partial-index save. Positive retirement is retained
 across partial saves; adopted siblings remain in progress during retained retry.
-Only ACKs already held for current committed/carried incidence grant extra
-slots; all other admitted entities share 4,096 unsettled slots. The ledger is
+Only ACKs held for current committed/carried incidence and current input
+entities proved live by that committed incidence grant live slots; all other
+admitted entities share 4,096 unsettled slots. The ledger is
 bounded by current live incidence plus 4,096, with one exact body per entity.
 Unused index incidence never grants additional unindexed debt. At supported
 native layouts the 4,096-entry hash ledger is asserted below 8 MiB, and its
@@ -56,3 +57,8 @@ cleanup failures, preserve unindexed debt, and prove a new unrelated upload
 succeeds after restart. Destination/generation/body mismatches and protected
 incidence cannot authorize replay cleanup. Capacity diagnostics are checked with
 successful HTTP-boundary attempts and with no attempt.
+
+A full unsettled allowance still permits a newly ACKed body for a committed
+live entity. Reservations are recomputed from held ACKs and the frozen input
+page, so repeated admission cannot accumulate credit, and unrelated omitted
+entities never borrow unused live-incidence slots.
