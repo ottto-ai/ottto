@@ -1859,7 +1859,10 @@ fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
         let older = (0..2)
             .map(|_| {
                 let fixture = ScanFixture::new(CLAUDE);
-                append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..512));
+                // One victim must cover the real X_out + decode peak as
+                // well as the copy. Two 512-row residents can leave that
+                // proof infeasible or exceed its copy-only victim count.
+                append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..4096));
                 OpenOptions::new()
                     .write(true)
                     .open(&fixture.file.0)
@@ -1883,6 +1886,10 @@ fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
             .filter(|(key, _, _)| key != &base.key)
             .collect::<Vec<_>>();
         assert_eq!(before.len(), older.len(), "precondition: older residents");
+        assert!(
+            base.cache.retained_checkpoint(&base.key).is_some(),
+            "precondition: the complete baseline survived resident setup"
+        );
         let job = Box::new(ProofJob {
             namespace: "fe-second-lander-proof".to_owned(),
             index_path: PathBuf::from("/fe-second-lander/index.json"),
@@ -1962,6 +1969,24 @@ fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
                 "zero victims and no copy: {counts:?}"
             );
         } else {
+            let (victims, copy_only) = probe
+                .prefixes
+                .expect("precondition: residents fund the real X_out release proof");
+            assert!(victims > 0, "precondition: nonempty release; {probe:?}");
+            assert_eq!(
+                victims, copy_only,
+                "precondition: X_out stays within the copy-only victim cap; {probe:?}"
+            );
+            let need = probe
+                .need_prime
+                .expect("precondition: measured release need");
+            assert!(
+                before[0].2 >= need + 256 * 1024,
+                "precondition: one victim funds X_out and peak with margin; {probe:?}"
+            );
+            eprintln!(
+                "FE second-lander grow={grow} probe={probe:?} counts={counts:?} side={side_counts:?}"
+            );
             assert!(!index.files[&base.key].has_prefix_provenance());
             assert!(base.cache.retained_checkpoint(&base.key).is_some());
             assert!(matches!(
