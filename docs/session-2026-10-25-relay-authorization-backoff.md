@@ -5,7 +5,7 @@ bounded retry and credential-recovery requests. The binding includes the device,
 credential generation, a digest of its secret, API destination, source and setup-run
 binding. New credentials or a reattach admit an immediate attempt. HTTP 401/403
 starts an equal-jitter exponential wait: initially 2.5–5 minutes, eventually
-3–6 hours. One probe runs per rejected binding at a time. Successful exchanges
+30–60 minutes, capped at one hour. One probe runs per rejected binding at a time. Successful exchanges
 clear rejection state; no tokens are cached beyond their existing lifetime.
 
 The local-health path keeps its existing terminal setup-run refresh hold. Each
@@ -32,7 +32,7 @@ checks remain CI's responsibility.
 
 Round 2 corrects refresh handover ownership: a new setup-run key starts with no
 in-flight probe marker, while an existing destination key keeps its own marker.
-An authorized connect, doctor or non-dry-run repair clears auth retry state,
+An authorized sign-in that starts a claim, doctor or non-dry-run repair clears auth retry state,
 including the terminal setup-refresh hold, even for unchanged credentials.
 Doctor sends the additive optional status flag `retry_relay_authorization: true`;
 ordinary status omits its default false value and never resets backoff. Existing
@@ -61,3 +61,8 @@ Tests confined to the removed OTLP token cache, token acquisition and forwarding
 grant checks are retired with that code. Credential-promotion fence tests call
 the surviving snapshot credential fence directly. Source isolation, recovery
 handover, explicit reset and the unit-test egress guard remain covered.
+
+Round 4 caps relay rejection waits at one hour to bound recovery after a backend
+incident. The pre-cap growth and equal jitter are unchanged. Sign-in resets the
+hold after a new or resumed claim starts successfully; an already-connected
+refusal, a failed claim request, or reusing an existing pending claim retains it.

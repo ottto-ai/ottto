@@ -5245,7 +5245,6 @@ fn auth_start(
     authorization: &RequestAuthorization,
 ) -> Result<AuthStartResponse, LocalApiError> {
     let status = status_for(daemon, authorization)?;
-    crate::snapshot_sync::reset_relay_authorization_backoff();
     // A connected Mac whose setup run Ottto no longer accepts can only recover
     // through a fresh claim: Verify and `ottto doctor` tell the user to sign
     // in, so refusing here would dead-end them. The claim keeps the bound
@@ -5290,7 +5289,9 @@ fn auth_start(
     if let Some(pending) =
         resume_history_browser_claim(&status.machine, &validated_api_base_url(None)?)?
     {
-        return begin_durable_browser_claim(daemon, pending);
+        let response = begin_durable_browser_claim(daemon, pending)?;
+        crate::snapshot_sync::reset_relay_authorization_backoff();
+        return Ok(response);
     }
     if !history_pending {
         discard_abandoned_unconfirmed_claim_credential()?;
@@ -5299,7 +5300,7 @@ fn auth_start(
     let claim = create_setup_claim(&status.machine, &nonce)?;
     let nonce = claim.client_nonce.unwrap_or(nonce);
     let claim_url = append_nonce_to_claim_url(&claim.claim_url, &nonce);
-    begin_durable_browser_claim(
+    let response = begin_durable_browser_claim(
         daemon,
         PendingAuthClaim {
             claim_code: claim.claim_code,
@@ -5308,7 +5309,9 @@ fn auth_start(
             claim_url,
             expires_at: claim.expires_at,
         },
-    )
+    )?;
+    crate::snapshot_sync::reset_relay_authorization_backoff();
+    Ok(response)
 }
 
 fn begin_durable_browser_claim(
@@ -22601,6 +22604,41 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
+    fn auth_start_clears_backoff_after_starting_a_claim_but_not_after_backend_failure() {
+        let env = history_choice_test_env();
+        let secret_root = env.root.join("secrets");
+        fs::create_dir_all(&secret_root).unwrap();
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let (base, server) = scripted_json_backend(vec![(503, "{}"), (200, RECEIPT_CLAIM_SUCCESS)]);
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &base);
+        let daemon = daemon();
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let device = LocalDeviceBinding {
+            device_id: "started-claim-retry-fixture".into(),
+            machine_id: None,
+            sources: vec!["codex".into()],
+        };
+        let mut rejected =
+            crate::relay_auth::Probe::begin(&base, &device, "same", "codex").unwrap();
+        rejected.reject(401);
+
+        assert!(matches!(
+            auth_start(&daemon, &authorization),
+            Err(LocalApiError::Backend(details)) if details.status == Some(503)
+        ));
+        assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
+        assert!(crate::relay_auth::Probe::begin(&base, &device, "same", "codex").is_err());
+
+        let response = auth_start(&daemon, &authorization).expect("start a new claim");
+        assert_eq!(response.account.state, LocalAccountState::ClaimPending);
+        assert_eq!(response.claim_code, "claim");
+        assert!(daemon.pending_auth_claim_snapshot().unwrap().is_some());
+        assert!(crate::relay_auth::Probe::begin(&base, &device, "same", "codex").is_ok());
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[serial]
     fn repeated_auth_start_reuses_unexpired_pending_claim() {
         // Daemon with an in-flight, far-future claim: auth_start must return
         // the SAME claim (idempotent re-trigger) without minting a new one —
@@ -22616,6 +22654,14 @@ for line in sys.stdin:
             })
             .expect("begin claim");
 
+        let device = LocalDeviceBinding {
+            device_id: "pending-claim-retry-fixture".into(),
+            machine_id: None,
+            sources: vec!["codex".into()],
+        };
+        let base = "http://127.0.0.1:1/pending-claim-retry-fixture";
+        let mut rejected = crate::relay_auth::Probe::begin(base, &device, "same", "codex").unwrap();
+        rejected.reject(401);
         let response = auth_start(&daemon, &RequestAuthorization::Token("token".to_string()))
             .expect("auth start reuses pending claim");
         assert_eq!(response.claim_code, "claim_reuse");
@@ -22624,6 +22670,13 @@ for line in sys.stdin:
             response.account.state,
             ottto_protocol::LocalAccountState::ClaimPending
         );
+        assert!(
+            crate::relay_auth::Probe::begin(base, &device, "same", "codex").is_err(),
+            "reusing an in-flight claim does not start another sign-in or reset backoff"
+        );
+        crate::relay_auth::clear(crate::relay_auth::binding_key(
+            base, &device, "same", "codex",
+        ));
     }
 
     #[test]
@@ -22667,9 +22720,12 @@ for line in sys.stdin:
         ));
         assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
         assert!(
-            crate::relay_auth::Probe::begin(base, &device, "same", "codex").is_ok(),
-            "explicit connect retries unchanged device credentials"
+            crate::relay_auth::Probe::begin(base, &device, "same", "codex").is_err(),
+            "an already-connected refusal must retain relay authorization backoff"
         );
+        crate::relay_auth::clear(crate::relay_auth::binding_key(
+            base, &device, "same", "codex",
+        ));
     }
 
     #[test]

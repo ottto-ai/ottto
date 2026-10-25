@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const BASE: Duration = Duration::from_secs(5 * 60);
-const CAP: Duration = Duration::from_secs(6 * 60 * 60);
+const CAP: Duration = Duration::from_secs(60 * 60);
 const MAX_BINDINGS: usize = 128;
 type Key = [u8; 32];
 
@@ -92,8 +92,8 @@ fn key(
     digest.finalize().into()
 }
 
-// Equal jitter keeps a nonzero minimum wait. The ceiling doubles to six hours;
-// the eventual probe interval is three to six hours, even with unlucky entropy.
+// Equal jitter keeps a nonzero minimum wait. The ceiling doubles to one hour;
+// the eventual probe interval is thirty to sixty minutes.
 fn wait(failures: u32, random: u64) -> Duration {
     let ceiling = BASE
         .saturating_mul(1 << failures.saturating_sub(1).min(16))
@@ -472,7 +472,14 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn waits_grow_to_three_to_six_hours() {
+    fn waits_grow_to_thirty_to_sixty_minutes() {
+        assert_eq!(CAP, Duration::from_secs(60 * 60));
+        for (index, minutes) in [5, 10, 20, 40, 60, 60].into_iter().enumerate() {
+            let ceiling = Duration::from_secs(minutes * 60);
+            let half = ceiling / 2;
+            assert_eq!(wait(index as u32 + 1, 0), half);
+            assert_eq!(wait(index as u32 + 1, half.as_nanos() as u64), ceiling);
+        }
         let mut previous = Duration::ZERO;
         for failures in 1..30 {
             let low = wait(failures, 0);
