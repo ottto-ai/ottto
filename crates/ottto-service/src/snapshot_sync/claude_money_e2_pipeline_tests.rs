@@ -993,7 +993,10 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
         let mut c = Corpus::new("e2-pipeline-side-other-page");
         let root = c.root(ROOT, &line(ROOT, "root", AT, 10));
         c.agent(0, &line(ROOT, "agent", AT, 20));
-        c.evidence(&[api("root", 10, 100), api("agent", 20, 200)], &[]);
+        c.evidence(
+            &[api("root", 10, 100), api("agent", 20, 200)],
+            &[trace("root", ""), trace("agent", "000")],
+        );
         let scanner = E2ScanFixture::default();
         let mut baseline = ready(&c, &scanner, ScanIndex::default(), 100, false);
         baseline.finish();
@@ -1001,6 +1004,11 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
         upload(&baseline.scan.snapshots, &mut baseline_progress, ack)
             .0
             .unwrap();
+        assert_eq!(
+            baseline_progress.accepted_fingerprints.len(),
+            2,
+            "baseline root and agent really received ACKs"
+        );
         baseline
             .index
             .record_accepted_snapshot_fingerprints(&baseline_progress.accepted_fingerprints);
@@ -1011,7 +1019,11 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
                 api("agent", 20, 200),
                 api("side", 5, 50),
             ],
-            &[trace("side", "000")],
+            &[
+                trace("root", ""),
+                trace("agent", "000"),
+                trace("side", "000"),
+            ],
         );
         std::fs::OpenOptions::new()
             .append(true)
@@ -1021,16 +1033,20 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
             .unwrap();
         let mut p = c.raw(&scanner, prior, 1, false, std::slice::from_ref(&root));
         p.enrich(&c);
-        let root_body = p
+        if let Some(root_body) = p
             .scan
             .snapshots
             .iter()
             .find(|s| s.source_session_id == ROOT)
-            .expect("hinted root must be published on its page");
-        assert_eq!(
-            root_body.input_tokens, 11,
-            "trace-named side call must never fall back to root"
-        );
+        {
+            assert_eq!(
+                root_body.input_tokens, 11,
+                "trace-named side call must never fall back to root"
+            );
+        } else {
+            assert!(crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(&p.disposition, ROOT),
+                "absent root must have an explicit hold; a partial family cannot silently cancel it");
+        }
         // An absent agent must stay due or be co-scheduled. Observe the next
         // real bounded pages; a named side call must eventually reach it.
         let mut items = p.scan.snapshots.clone();
@@ -1067,7 +1083,8 @@ fn retry_case(conflict: bool) {
         );
         c.agent(0, &line(ROOT, "agent", AT, 5));
         let scanner = E2ScanFixture::default();
-        let mut p = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        let committed = ScanIndex::default();
+        let mut p = ready(&c, &scanner, committed.clone(), 100, false);
         literal(&p);
         let root = p
             .scan
@@ -1104,7 +1121,16 @@ fn retry_case(conflict: bool) {
         assert_eq!(order.len(), 1);
         assert_eq!(order[0].len(), 2);
         assert_eq!(order[0][0], ROOT);
-        let prior = c.reload(&mut p.index);
+        let holds = LocalHoldSettlement::classify(
+            SnapshotSource::ClaudeCode,
+            &mut p.index,
+            &mut p.scan,
+            &p.disposition,
+        );
+        let mut failed_settlement =
+            settle_checkpointed_upload(p.index, &committed, &progress, &holds, false);
+        settle_index_after_upload(&mut failed_settlement.index, &committed, &progress);
+        let prior = c.reload(&mut failed_settlement.index);
         let progress_path = c.base.join("progress.json");
         progress.save(&progress_path).unwrap();
         let mut progress = SnapshotUploadProgress::load(
@@ -1477,6 +1503,12 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         let mut prior = c.reload(&mut first.index);
         let before = prior.current_snapshot_fingerprints();
+        assert_eq!(
+            before.len(),
+            1,
+            "hold starts from one complete accepted family body"
+        );
+        assert_eq!(progress.accepted_fingerprints.len(), 1);
         prior.activate_effective_upload_body_witness_revision(3);
         for key in prior.files.keys().cloned().collect::<Vec<_>>() {
             assert!(
@@ -1510,7 +1542,7 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
         );
         assert!(
             scanner.paths().is_empty(),
-            "strict byte budget refuses the complete twin group before either file is read"
+            "strict byte budget refuses the complete twin group before either file is read; opened={}", scanner.paths().len()
         );
     });
 }

@@ -97,3 +97,10 @@ pub(crate) fn birth_store_bytes(index: &ScanIndex) -> Vec<u8> {
 pub(crate) fn with_history_byte_limit<T>(limit: u64, f: impl FnOnce() -> T) -> T {
     with_body_witness_adoption_byte_budget(limit, f)
 }
+
+pub(crate) fn explicitly_held(
+    disposition: &ClaudeUsageAuthorityDisposition,
+    session: &str,
+) -> bool {
+    disposition.quarantined_source_session_ids.contains(session)
+}
