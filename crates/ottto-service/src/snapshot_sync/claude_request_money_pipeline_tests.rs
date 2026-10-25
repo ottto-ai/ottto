@@ -1288,7 +1288,12 @@ fn money_shadow_deleted_debt_marker_survives_restart() {
         !fixture.support.join(".claude-request-money-run.json").exists(),
         "no batch ran: only the marker keeps the debt across a restart"
     );
+    // Make the external deletion happen between writer turns. The idle
+    // healer may otherwise recreate an entry during remove_dir_all itself.
+    let stalled = money::store::stall_writer_for_test();
     std::fs::remove_dir_all(fixture.support.join("diagnostics")).unwrap();
+    assert!(!fixture.support.join("diagnostics").exists());
+    drop(stalled);
     money::store::flush();
     assert_eq!(money_owed_markers(&fixture.support), 1, "the next pass heals it");
     money::store::restart_for_test(&fixture.support);

@@ -5563,16 +5563,29 @@ fn schedule_evidence(
                 .map(|(key, _)| key.clone()),
         )
         .collect::<Vec<_>>();
-    // Resolve family roots once; never walk the index once per dependent.
+    // Resolve logical membership and query digests once. Evidence may have
+    // many copied physical holders; repeating the same classification/hash
+    // for every changed record can spend the first family's entire window.
+    let candidate_charge = index.files.keys().fold(0_usize, |bytes, key| {
+        bytes
+            .saturating_add(key.len().saturating_mul(8))
+            .saturating_add(1024)
+    });
+    if !budget.charge(candidate_charge) {
+        return false;
+    }
     let mut roots = BTreeMap::<String, &str>::new();
+    let mut candidates = Vec::with_capacity(index.files.len());
     for key in index.files.keys() {
         if Instant::now() >= deadline {
             return false;
         }
         if let Some((root, member)) = logical_family_member(index, key) {
             if root == member {
-                roots.insert(root, key);
+                roots.insert(root.clone(), key);
             }
+            let telemetry = telemetry_key(&root);
+            candidates.push((key, (root, member), message_key(key), telemetry));
         }
     }
     if !budget.charge(keys.len().saturating_mul(256)) {
@@ -5584,8 +5597,9 @@ fn schedule_evidence(
         .collect::<BTreeSet<_>>();
     let missing_charge = ledger
         .census()
-        .records_with_prefix("watch:")
-        .filter(|(key, _)| !key.starts_with("watch:trace:") && !present.contains(key))
+        .records_with_prefix("watch:r:")
+        .chain(ledger.census().records_with_prefix("watch:m:"))
+        .filter(|(key, _)| !present.contains(key))
         .fold(0_usize, |bytes, (key, _)| {
             bytes.saturating_add(key.len()).saturating_add(128)
         });
@@ -5594,8 +5608,9 @@ fn schedule_evidence(
     }
     let missing = ledger
         .census()
-        .records_with_prefix("watch:")
-        .filter(|(key, _)| !key.starts_with("watch:trace:") && !present.contains(key))
+        .records_with_prefix("watch:r:")
+        .chain(ledger.census().records_with_prefix("watch:m:"))
+        .filter(|(key, _)| !present.contains(key))
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     for watch in missing {
@@ -5611,16 +5626,13 @@ fn schedule_evidence(
         let revision: [u8; 32] = revision.finalize().into();
         let mut affected = BTreeSet::new();
         let mut direct_holders = 0_usize;
-        for candidate in index.files.keys() {
+        for (candidate, (root, _), message, telemetry) in &candidates {
             if Instant::now() >= deadline {
                 return false;
             }
-            let Some((root, _)) = logical_family_member(index, candidate) else {
-                continue;
-            };
-            let mut affected_holder = evidence_watch_key(&telemetry_key(&root)) == watch;
+            let mut affected_holder = evidence_watch_key(telemetry) == watch;
             let holder = if watch.starts_with("watch:m:") {
-                ledger.get(&message_key(candidate))
+                ledger.get(message)
             } else {
                 index
                     .claude_request_census
@@ -5646,7 +5658,7 @@ fn schedule_evidence(
                     affected.insert(candidate.as_str());
                     direct_holders += 1;
                 }
-                if let Some(root_key) = roots.get(&root) {
+                if let Some(root_key) = roots.get(root) {
                     affected.insert(*root_key);
                 }
             }
@@ -5688,20 +5700,19 @@ fn schedule_evidence(
         let watch = record.money_watch(revision);
         let mut affected = BTreeSet::new();
         let mut holders = 0_usize;
-        for candidate in index.files.keys() {
+        let logical = logical_family_member(index, &key);
+        for (candidate, family, message, telemetry) in &candidates {
             if Instant::now() >= deadline {
                 return false;
             }
-            let Some((root, _)) = logical_family_member(index, candidate) else {
-                continue;
-            };
-            let direct = *candidate == key
-                || message_key(candidate) == key
-                || telemetry_key(&root) == key
-                || logical_family_member(index, candidate) == logical_family_member(index, &key);
+            let root = &family.0;
+            let direct = **candidate == key
+                || *message == key
+                || *telemetry == key
+                || logical.as_ref() == Some(family);
             let mut intersects = false;
             let holder = if key.starts_with(MESSAGE_KEY_PREFIX) {
-                ledger.get(&message_key(candidate))
+                ledger.get(message)
             } else {
                 index
                     .claude_request_census
@@ -5729,7 +5740,7 @@ fn schedule_evidence(
                     affected.insert(candidate.as_str());
                     holders += 1;
                 }
-                if let Some(root_key) = roots.get(&root) {
+                if let Some(root_key) = roots.get(root) {
                     affected.insert(*root_key);
                 }
             }
@@ -6934,12 +6945,10 @@ fn schedule_trace(
             watches.push(("", format!("watch:trace:otel:{root_hash}")));
         }
         let old_root = format!("watch:trace:v2:{root_hash}");
+        // Missing/current per-file watches are the routing barrier. Once
+        // their revision is durable, redundant legacy requests cannot re-owe
+        // an acknowledged family merely because bounded cleanup remains.
         let changed = ledger.get(&old_root).is_some()
-            || ledger
-                .census()
-                .records_with_prefix(&legacy)
-                .next()
-                .is_some()
             || watches.iter().any(|(_, watch)| {
                 ledger
                     .get(watch)
@@ -6954,7 +6963,10 @@ fn schedule_trace(
                 return false;
             }
         }
-        for (key, _) in ledger.census().records_with_prefix(&legacy) {
+        // Keep cleanup below the family scratch ceiling at the actual record
+        // cap. The metadata reclaimer owns the remaining legacy entries; its
+        // missing-aggregate barrier and the debt checkpoint below both remain.
+        for (key, _) in ledger.census().records_with_prefix(&legacy).take(1024) {
             if !stage_money_watch(updates, key.clone(), None, budget) {
                 return false;
             }
@@ -7875,6 +7887,91 @@ mod scheduling_reconciliation_tests {
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
+    fn trace_legacy_cleanup_is_bounded_and_current_watch_does_not_reowe() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-bounded-legacy-trace");
+        let mut index = ScanIndex::default();
+        let key = "/fixture/.claude/projects/group/a.jsonl".to_owned();
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":1, "modified_unix_seconds":1,
+                "source_file_fingerprint":"01".repeat(32), "last_snapshot_fingerprint":null
+            }))
+            .unwrap(),
+        );
+        let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        item.source_session_id = "a".into();
+        item.attribution_facts.clear();
+        record_logical_member(&mut index, &key, &"01".repeat(32), &item);
+        let mut ledger = ClaudeLedger::new_for_test();
+        let legacy = format!("watch:trace:{:x}:", Sha256::digest(b"a"));
+        for request in 0..2048 {
+            assert!(ledger.put_money(
+                format!("{legacy}{request:016x}"),
+                ClaudeRequestCensusRecord::money_debt([2; 32], 0)
+            ));
+        }
+        let traces = BTreeMap::from([("a".to_owned(), BTreeMap::from([(1, "a".to_owned())]))]);
+        let mut budget = ShadowBudget::new(ShadowReservation::admit(1024 * 1024).unwrap());
+        let mut updates = Vec::new();
+        assert!(schedule_trace(
+            &mut ledger,
+            &index,
+            &traces,
+            10,
+            Instant::now() + PAGE_MAX_ELAPSED,
+            &mut budget,
+            &mut updates
+        ));
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|(_, record)| record.is_none())
+                .count(),
+            1024
+        );
+        assert_eq!(
+            updates.len(),
+            1025,
+            "one watch plus bounded obsolete metadata"
+        );
+        let dirty = store::money_key("dirty:", &key);
+        assert!(ledger.get(&dirty).is_some());
+        assert_eq!(
+            ledger.census().records_with_prefix(&legacy).count(),
+            2048,
+            "staging cannot retire evidence before dependent debt is durable"
+        );
+        assert!(checkpoint_money_watches(&scratch, &mut ledger, updates));
+        assert_eq!(ledger.census().records_with_prefix(&legacy).count(), 1024);
+        // Model an ACK only after the watch/debt publication is checkpointed.
+        assert!(store::checkpoint_for_test(&scratch, &mut ledger));
+        ledger.remove(&dirty);
+        assert!(store::checkpoint_for_test(&scratch, &mut ledger));
+        let mut loaded = store::load_for_test(&scratch);
+        let mut updates = Vec::new();
+        assert!(schedule_trace(
+            &mut loaded,
+            &index,
+            &traces,
+            11,
+            Instant::now() + PAGE_MAX_ELAPSED,
+            &mut budget,
+            &mut updates
+        ));
+        assert!(
+            updates.is_empty(),
+            "surviving legacy cleanup cannot invalidate a current watch"
+        );
+        assert!(
+            loaded.get(&dirty).is_none(),
+            "settled family stays settled after restart"
+        );
+        assert_eq!(loaded.census().records_with_prefix(&legacy).count(), 1024);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
     fn message_transfer_dirties_unchanged_former_holder_in_its_own_namespace() {
         let mut index = ScanIndex::default();
         let a = "/fixture/.claude/projects/group/a.jsonl".to_owned();
@@ -8282,7 +8379,10 @@ mod seal_tests {
         store::flush();
         store::flush();
         assert_eq!(stamp(), synced, "a present synced marker is not rewritten");
+        let stalled = store::stall_writer_for_test();
         std::fs::remove_dir_all(&diagnostics).unwrap();
+        assert!(!diagnostics.exists());
+        drop(stalled);
         store::wake_writer();
         store::flush();
         assert_eq!(

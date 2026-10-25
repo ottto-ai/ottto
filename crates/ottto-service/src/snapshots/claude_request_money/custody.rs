@@ -647,7 +647,14 @@ impl Custody {
                 if self
                     .files
                     .get::<str>(detached.carrier.as_str())
-                    .is_some_and(|file| file.slots().any(|slot| slot.key == key))
+                    .is_some_and(|file| {
+                        (if field == "memo" {
+                            file.memo.as_deref()
+                        } else {
+                            file.adoption.as_deref()
+                        })
+                        .is_some_and(|slot| slot.key == key)
+                    })
                 {
                     return Some(detached);
                 }
@@ -662,12 +669,22 @@ impl Custody {
                 }
                 return Some(detached);
             }
+            // Query prefixes name one typed field. At the record cap, scanning
+            // every unrelated slot of every carrier for a memo can consume a
+            // checkpoint's whole slice before serialization even starts.
             // Primary identity is assigned by bind_file / bind_entity. Reads
             // during a promotion overlap prefer the successor's binding.
             let found = self
                 .files
                 .iter()
-                .filter(|(_, file)| file.slots().any(|slot| slot.key == key))
+                .filter(|(_, file)| {
+                    (if field == "memo" {
+                        file.memo.as_deref()
+                    } else {
+                        file.adoption.as_deref()
+                    })
+                    .is_some_and(|slot| slot.key == key)
+                })
                 .min_by_key(|(_, file)| {
                     (
                         !file.indexed,
@@ -678,11 +695,14 @@ impl Custody {
             if let Some((carrier, _)) = found {
                 return Some(file_address(&carrier[5..], field, key, None));
             }
-            if let Some((carrier, _)) = self
-                .telemetry
-                .iter()
-                .find(|(_, file)| file.slots().any(|slot| slot.key == key))
-            {
+            if let Some((carrier, _)) = self.telemetry.iter().find(|(_, file)| {
+                (if field == "memo" {
+                    file.memo.as_deref()
+                } else {
+                    file.adoption.as_deref()
+                })
+                .is_some_and(|slot| slot.key == key)
+            }) {
                 return Some(telemetry_address(&carrier[10..], field, key));
             }
             // New publication/adoption uses an already bound logical primary.
@@ -854,13 +874,36 @@ impl Custody {
         // Filter compact field tags before constructing query spellings. P1
         // telemetry sweeps must not allocate every transcript path (or any
         // absent live delivery query) just to discard it at this boundary.
+        let typed = matches!(
+            prefix,
+            "mh:"
+                | "otel:"
+                | "watch:r:"
+                | "watch:m:"
+                | "watch:trace:"
+                | "union:"
+                | "due:"
+                | "dirty:"
+                | "hold:"
+                | "unbuilt:"
+        );
         self.entries().flat_map(move |(key, carrier)| {
             let path = match carrier {
                 Carrier::File(file) => file.path.as_deref(),
                 _ => None,
             };
-            carrier
-                .slots()
+            // Exact standard prefixes name one slot. Do not walk every
+            // delivery/binding field on each unrelated legacy carrier.
+            typed
+                .then(|| carrier.standard_slot(prefix))
+                .flatten()
+                .into_iter()
+                .chain(
+                    (!typed)
+                        .then_some(carrier)
+                        .into_iter()
+                        .flat_map(|carrier| carrier.slots()),
+                )
                 .filter(move |slot| {
                     let fixed = match slot.key.name() {
                         QueryName::Standard(code) => QueryKey::PREFIXES[*code as usize],
@@ -1481,6 +1524,32 @@ pub(super) enum Carrier<'a> {
     Ever(&'a [[u8; 32]]),
 }
 impl<'a> Carrier<'a> {
+    fn standard_slot(&self, prefix: &str) -> Option<&'a Slot> {
+        let delivery = match self {
+            Self::File(file) => match prefix {
+                "mh:" => return file.current_m.as_deref(),
+                "watch:r:" => return file.seen_r.as_deref(),
+                "watch:m:" => return file.seen_m.as_deref(),
+                "watch:trace:" => return file.trace.as_deref(),
+                "union:" => return file.union.as_deref(),
+                _ => &file.delivery,
+            },
+            Self::Telemetry(file) => match prefix {
+                "otel:" => return file.current.as_deref(),
+                "watch:r:" => return file.seen_r.as_deref(),
+                "watch:trace:" => return file.trace.as_deref(),
+                _ => &file.delivery,
+            },
+            Self::Control(_) | Self::Ever(_) => return None,
+        };
+        match prefix {
+            "due:" => delivery.due.as_deref(),
+            "dirty:" => delivery.dirty.as_deref(),
+            "hold:" => delivery.hold.as_deref(),
+            "unbuilt:" => delivery.unbuilt.as_deref(),
+            _ => None,
+        }
+    }
     fn slots(&self) -> impl Iterator<Item = &'a Slot> {
         let file = match self {
             Self::File(file) => Some(*file),
@@ -3563,5 +3632,69 @@ mod compact_layout_tests {
             .telemetry
             .values()
             .all(|carrier| carrier.live.is_some()));
+    }
+    #[test]
+    fn exact_standard_prefix_reads_match_full_custody_queries() {
+        let mut custody = Custody::default();
+        let path = "/fixture/.claude/projects/group/a.jsonl";
+        let id = digest(path);
+        let keys = vec![
+            format!("mh:{path}"),
+            "otel:root".into(),
+            format!("watch:r:{id}"),
+            "watch:r:otel:root".into(),
+            format!("watch:m:{id}"),
+            format!("watch:trace:file:{id}"),
+            "watch:trace:otel:root".into(),
+            "watch:trace:legacy:0001".into(),
+            format!("union:{id}"),
+            format!("due:{id}"),
+            "due:otel:root".into(),
+            format!("dirty:{id}"),
+            "dirty:otel:root".into(),
+            format!("hold:{id}"),
+            "hold:otel:root".into(),
+            format!("unbuilt:{id}"),
+            "unbuilt:otel:root".into(),
+            format!("fam:{}", "04".repeat(32)),
+            "adopt:entity:rates".into(),
+        ];
+        for (n, key) in keys.into_iter().enumerate() {
+            assert_eq!(
+                custody.insert(key, Record::money_debt([n as u8; 32], n as u64)),
+                Insert::Stored
+            );
+        }
+        for prefix in [
+            "mh:",
+            "otel:",
+            "watch:r:",
+            "watch:m:",
+            "watch:trace:",
+            "union:",
+            "due:",
+            "dirty:",
+            "hold:",
+            "unbuilt:",
+            "watch:",
+            "watch:trace:legacy:",
+            "fam:",
+            "adopt:",
+        ] {
+            let expected = custody
+                .records()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .map(|(key, record)| (key, record.to_owned_record()))
+                .collect::<BTreeMap<_, _>>();
+            let actual = custody
+                .records_with_prefix(prefix)
+                .map(|(key, record)| (key, record.to_owned_record()))
+                .collect::<BTreeMap<_, _>>();
+            assert!(!expected.is_empty(), "fixture must exercise {prefix}");
+            assert_eq!(
+                actual, expected,
+                "typed prefix must preserve every query and value: {prefix}"
+            );
+        }
     }
 }
