@@ -40608,6 +40608,27 @@ impl ScanIndex {
         }
     }
 
+    /// E2: a permissive load can succeed while one root's API or trace read
+    /// failed. Hold every permitted owed file of that root (including path
+    /// twins and agents) without changing unrelated history or live uploads.
+    pub(crate) fn hold_claude_history_for_unhealthy_telemetry_roots(
+        &mut self,
+        roots: &BTreeSet<String>,
+    ) {
+        if roots.is_empty() {
+            return;
+        }
+        for gated in self.claude_history_emission.files.values_mut() {
+            if gated.held.is_none()
+                && !gated.literal_denied
+                && claude_index_path_member_ref(Path::new(&gated.index_key))
+                    .is_some_and(|member| roots.contains(member.root))
+            {
+                gated.held = Some(HistoryHold::TelemetryUnread);
+            }
+        }
+    }
+
     /// The hold on this source file's history this cycle, if any.
     pub(crate) fn claude_history_emission_held(
         &self,
