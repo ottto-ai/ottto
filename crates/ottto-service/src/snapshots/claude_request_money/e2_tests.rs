@@ -1829,7 +1829,12 @@ fn e2_identity_recent_desktop_activity_survives_discarded_twin_in_both_orders() 
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap();
             recent.collected_at = collected.clone();
-            let account = "e".repeat(64);
+            let account = if reverse { "17" } else { "18" }.repeat(32);
+            assert_eq!(
+                crate::desktop_recent::saved().at(&account, &org_hash(ORG_A)),
+                None,
+                "each ordering must publish its own activity, not reuse process-global state"
+            );
             recent.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
                 provider: "anthropic",
                 account_identifier_hash: Some(account.clone()),
