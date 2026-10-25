@@ -22,7 +22,7 @@ on:
       money_e2_bench_rounds:
         description: E2 benchmark counterbalanced rounds (each runs all three arms)
         type: string
-        default: "2"
+        default: "3"
       money_e2_bench_reference:
         description: Pre-E2 reference commit (default merge-base of the branch and origin/main)
         type: string
@@ -194,9 +194,9 @@ jobs:
     # Manual dispatch only (workflow_dispatch with money_e2_bench=true), never
     # on a pull request or push. Public repository, standard runner, no cache
     # save. Fails closed: green only with the live E2 hook, the full M4 shape
-    # and every target met. Expected 1.5-2.5 h at full shape.
+    # and every target met. Expected ~2-2.5 h at full shape.
     if: github.event_name == 'workflow_dispatch' && inputs.money_e2_bench
-    timeout-minutes: 240
+    timeout-minutes: 300
     runs-on: macos-15
     env:
       RUSTUP_TOOLCHAIN: "1.95.0"
@@ -349,7 +349,10 @@ jobs:
           peak = per_arm(lambda r: r["phys_footprint_peak_bytes"])
           index = per_arm(lambda r: r["index_bytes"] or 0)
           rss_ref = [r["max_rss_bytes"] for r in arms["reference"]]
-          rss_tolerance = max(2 * MIB, max(rss_ref) - min(rss_ref)) if rss_ref else None
+          # Peak RSS of identical code moved ~6% between processes in the
+          # stub proof run, so "not worse" allows max(2 MiB, twice the
+          # reference spread, 5% of the reference median).
+          rss_tolerance = max(2 * MIB, 2 * (max(rss_ref) - min(rss_ref)), 0.05 * statistics.median(rss_ref)) if rss_ref else None
           fold = [r["traversal"]["e2"].get("fold_us", 0) / r["traversal"]["e2"]["responses"]
                   for r in candidate if r["traversal"]["e2"].get("responses")]
           finalize_ms = [f["e2"].get("fold_us", 0) / 1000 for r in candidate for f in r["finishes"] if f["e2"].get("responses")]

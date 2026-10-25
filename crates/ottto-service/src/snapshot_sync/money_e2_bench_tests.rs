@@ -864,6 +864,8 @@ fn footprint() -> (u64, u64) {
         min_address: u64,
         max_address: u64,
         ledger_phys_footprint_peak: i64,
+        // The rest of rev3: the kernel fills the peak only for a full rev3 count.
+        _ledger_rest: [i64; 20],
     }
     extern "C" {
         static mach_task_self_: u32;
