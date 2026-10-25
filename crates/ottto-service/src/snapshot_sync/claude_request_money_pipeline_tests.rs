@@ -2151,6 +2151,9 @@ fn money_p1b_plan_install_failure_is_counted() {
     money::capture::purge_scope_for_test(&fixture.support);
     let _ = money::take_shadow_lines_for_test();
     let held = money::capture::hold_capture_ceiling_for_test();
+    // Injected page clocks: a page past its plan slice would fail on the
+    // deadline before funds, and a complete plan must not depend on it.
+    money::set_next_page_budget_for_test(Duration::from_secs(3600));
     let refused = page(now);
     drop(held);
     assert_eq!(refused.refused_deadline + refused.refused_budget, 0, "{refused:?}");
@@ -2164,6 +2167,7 @@ fn money_p1b_plan_install_failure_is_counted() {
     assert_eq!((refused.plan_install_failed_funds, refused.fallback_plan_installed), (1, 0), "{refused:?}");
     assert_eq!(money::capture::planned_families_for_test(&fixture.support), Some(BTreeSet::new()));
     assert_eq!(money::capture::plan_allows_capture_for_test(&fixture.support), Some(false));
+    money::set_next_page_budget_for_test(Duration::from_secs(3600));
     let installed = page(now + 1);
     assert_eq!(installed.plan_install_failed, 0, "{installed:?}");
     assert_eq!(money::capture::planned_families_for_test(&fixture.support).map(|plan| plan.len()),
@@ -2263,8 +2267,13 @@ fn money_p1b_dense_deferred_day_suppresses_unchanged_rows_and_closes() {
 }
 
 /// Natural Full/Skip pages must not repeatedly publish the same deferred
-/// suffix. No BodyDeadline fault: the 64 body turns and all shared/closing
-/// work consume the real first-finalizer deadline on every admitted probe.
+/// suffix. No BodyDeadline fault: every admitted probe runs its 64 body
+/// turns and all shared/closing work on an injected page clock, so what is
+/// built, planned and saved does not depend on CI CPU contention (a loaded
+/// runner can spend the real budget on bodies and push the plan and save
+/// past their slices). Wall bounds and the real closing slices are asserted
+/// on real-clock pages: `money_p1b_full_page_thousands_of_reads_preserves_live_body`
+/// and `money_p1b_dense_deferred_day_suppresses_unchanged_rows_and_closes`.
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
@@ -2287,7 +2296,6 @@ fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
     let mut suppressed = 0;
     let mut deferred_emitted = 0;
-    let mut max_wall_us = 0;
     let mut max_emitted_after_first = 0;
     for page in 0..32 {
         let is_full = page % 2 == 0;
@@ -2309,14 +2317,12 @@ fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
         money::capture::purge_scope_for_test(&fixture.support);
         money::capture::begin_page(&fixture.support);
         if let Some(replay) = replay { replay(); }
-        let started = std::time::Instant::now();
+        money::set_next_page_budget_for_test(Duration::from_secs(3600));
         let counts = money::shadow_page_ready_for_test(&fixture.support, &full.snapshots, &index,
             &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
             &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), full.census_complete, now + page);
-        let total_us = started.elapsed().as_micros() + u128::from(counts.capture_us);
-        assert!(total_us <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{counts:?}");
-        max_wall_us = max_wall_us.max(total_us);
         assert_eq!(counts.refused_deadline, 0, "{counts:?}");
+        assert_eq!(counts.plan_install_failed, 0, "{counts:?}");
         assert_eq!(counts.families, 2051, "{counts:?}");
         assert_eq!(counts.ledger_save_late, 0, "closing slices are reserved: {counts:?}");
         assert_eq!(counts.jsonl_sealed, 0, "{counts:?}");
@@ -2343,14 +2349,17 @@ fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
     }
     let bytes = std::fs::metadata(fixture.support.join("diagnostics/claude-request-money-shadow-20260802.jsonl")).unwrap().len();
     assert!(bytes < 8 * 1024 * 1024);
-    println!("MONEY_P1B_NATURAL_DAY admitted_finalizer_probe=true retained_item_skip_probe=true pages=32 full=16 skip=16 families=2051 body_deadline_fault=0 suppressed={suppressed} emitted_deferred={deferred_emitted} max_emitted_after_first={max_emitted_after_first} bytes={bytes} day_cap=8388608 sealed=0 max_money_us={max_wall_us} deadline_us=250000 ci_tolerance_us=25000");
+    println!("MONEY_P1B_NATURAL_DAY admitted_finalizer_probe=true retained_item_skip_probe=true pages=32 full=16 skip=16 families=2051 body_deadline_fault=0 suppressed={suppressed} emitted_deferred={deferred_emitted} max_emitted_after_first={max_emitted_after_first} bytes={bytes} day_cap=8388608 sealed=0 page_clock=injected");
     money::disable_shadow_for_test(&fixture.support);
 }
 
 /// Reaching an uncaptured family must not spend its capture turn. Native
 /// Full byte parity is checked separately; real finalizers on prepared
 /// current input isolate turn fairness from native I/O consuming the wall
-/// window. Continue beyond initial coverage to expose equal-turn ties.
+/// window. Each page runs on an injected page clock, so every captured
+/// family is built on any runner speed: the exact built count checks turn
+/// fairness, not CPU contention. Continue beyond initial coverage to expose
+/// equal-turn ties.
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
@@ -2382,7 +2391,6 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
         let pages = family_count.div_ceil(money::capture::NEXT_PAGE_FAMILIES);
         let mut built = BTreeSet::new();
         let mut constructed = BTreeSet::new();
-        let mut max_wall_us = 0;
         for page in 0..pages + 2 {
             money::capture::begin_page(&fixture.support);
             let mut index = ScanIndex::default(); // every page is genuinely Full
@@ -2403,14 +2411,11 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             let captured_roots = current_captures.iter().take(money::capture::NEXT_PAGE_FAMILIES)
                 .map(|(key, _)| money::hashed_id_for_test(std::path::Path::new(key).file_stem().unwrap().to_str().unwrap()))
                 .collect::<BTreeSet<_>>();
-            let started = std::time::Instant::now();
+            money::set_next_page_budget_for_test(Duration::from_secs(3600));
             let counts = money::shadow_page_ready_for_test(&fixture.support, &full.snapshots, &index,
                 &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
                 &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), full.census_complete,
                 census_pipeline_window("2026-08-02T08:00:00Z") + page as u64);
-            let elapsed = started.elapsed();
-            assert!(elapsed <= money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE, "{counts:?}");
-            max_wall_us = max_wall_us.max(elapsed.as_micros());
             assert_eq!(counts.refused_deadline, 0, "{counts:?}");
             assert_eq!(counts.families, family_count as u64);
             // No-capture families cannot build; this equality proves every
@@ -2439,7 +2444,7 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             // captured roots alone cannot substitute for emitted bodies.
             assert_eq!(built, expected, "all {family_count} families must publish built bodies within {pages} Full pages");
         }
-        println!("MONEY_P1B_ROTATION admitted_finalizer_probe=true ack_mode={ack_mode} families={family_count} full_pages={} initial_coverage_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", pages + 2, if ack_mode == "sealed" { constructed.len() } else { built.len() });
+        println!("MONEY_P1B_ROTATION admitted_finalizer_probe=true ack_mode={ack_mode} families={family_count} full_pages={} initial_coverage_pages={pages} distinct_built={} page_clock=injected", pages + 2, if ack_mode == "sealed" { constructed.len() } else { built.len() });
         money::disable_shadow_for_test(&fixture.support);
     }
 }
@@ -2773,9 +2778,14 @@ fn money_p1b_write_sync_save_and_ack_faults_never_create_false_progress() {
     for (at, fault) in [money::PageFault::WriteFailure, money::PageFault::SyncFailure,
         money::PageFault::SaveFailure, money::PageFault::LostAck].into_iter().enumerate() {
         let (fixture, index, scan) = money_armed_scan(&format!("money-p1b-fault-{at}"));
-        let page = |now| money::shadow_page_at(&fixture.support, &scan.snapshots, &index,
-            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), scan.census_complete, now);
+        // Injected page clock: a save past its closing slice is skipped
+        // (`ledger_save_late`), which is not the fault under test.
+        let page = |now| {
+            money::set_next_page_budget_for_test(Duration::from_secs(3600));
+            money::shadow_page_at(&fixture.support, &scan.snapshots, &index,
+                &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+                &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), scan.census_complete, now)
+        };
         money::set_page_fault_for_test(fault);
         let first = page(response + 3600);
         money::set_page_fault_for_test(money::PageFault::None);
