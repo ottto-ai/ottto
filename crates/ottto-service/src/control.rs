@@ -884,6 +884,7 @@ fn handle_command(
             status.update.install_owner = detect_install_owner();
             status.service_owner = service_owner_state(client_install_owner);
             crate::refresh_canonical_local_health(&mut status);
+            status.account = crate::effective_account_binding(&status);
             let mut value = to_value(status)?;
             inject_machine_icon(&mut value);
             Ok(value)
@@ -924,7 +925,11 @@ fn handle_command(
                 })?,
             )
         }
-        LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
+        LocalControlCommand::AuthStatus => {
+            let mut status = status_for(daemon, &authorization)?;
+            status.account = crate::effective_account_binding(&status);
+            to_value(status)
+        }
         LocalControlCommand::AgentStatusRefresh {
             source,
             quota_refresh,
@@ -1502,11 +1507,8 @@ fn account_for(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
 ) -> Result<LocalAccountBinding, LocalApiError> {
-    match authorization {
-        RequestAuthorization::Token(token) => Ok(daemon.status(token)?.account),
-        RequestAuthorization::TrustedCompanionApp => daemon.account_for_trusted_client(),
-        RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
-    }
+    // The `account` command answers with the effective account, like `status`.
+    status_for(daemon, authorization).map(|status| crate::effective_account_binding(&status))
 }
 
 fn load_claude_config_slot_settings(
@@ -20992,6 +20994,57 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn status_and_account_commands_answer_with_effective_reconnect_after_auth_rejection() {
+        let daemon = daemon().with_account(connected_account());
+        let saved = daemon.account_for_trusted_client().expect("saved account");
+        daemon
+            .record_local_health_upload_failed(crate::LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        let request = |command| LocalControlRequest {
+            request_id: "req_test".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            token: Some("token".to_string()),
+            client_kind: Some(LocalClientKind::Cli),
+            client_install_owner: None,
+            command,
+        };
+
+        for command in [
+            LocalControlCommand::Status {
+                refresh_agent_status: false,
+            },
+            LocalControlCommand::AuthStatus,
+        ] {
+            let response = handle_request(&daemon, request(command));
+            assert!(response.ok, "{response:?}");
+            let payload = response.payload.expect("payload");
+            assert_eq!(payload["account"]["state"], "error");
+            assert_eq!(payload["account"]["message"]["code"], "reconnect_required");
+            assert_eq!(
+                payload["account"]["user"]["id"],
+                serde_json::json!(saved.user.as_ref().unwrap().id)
+            );
+            assert_eq!(
+                payload["canonical_health"]["account"]["state"],
+                "reconnect_required"
+            );
+        }
+
+        let response = handle_request(&daemon, request(LocalControlCommand::Account));
+        assert!(response.ok, "{response:?}");
+        let payload = response.payload.expect("payload");
+        assert_eq!(payload["state"], "error");
+        assert_eq!(payload["message"]["code"], "reconnect_required");
+        assert_eq!(
+            payload["user"]["id"],
+            serde_json::json!(saved.user.as_ref().unwrap().id)
+        );
+
+        // The saved binding is untouched.
+        assert_eq!(daemon.account_for_trusted_client().expect("account"), saved);
+    }
+
+    #[test]
     #[serial]
     fn handles_authenticated_receipts_request_from_private_ring() {
         let support_root = telemetry_key_store_root("receipts-control");
@@ -22820,6 +22873,62 @@ for line in sys.stdin:
                 .map(|user| user.id.as_str()),
             "the reconnect claim keeps the bound user"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_rejected_upload_lets_sign_in_reconnect_the_connected_mac() {
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("auth-rejected-sign-in");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(LocalConnectionBinding {
+                setup_run_id: "setup_current".to_string(),
+                setup_run_token_expires_at: "2100-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                claim_code: None,
+                api_base_url: "https://api.ottto.net".to_string(),
+            }));
+        let authorization = RequestAuthorization::Token("token".to_string());
+        daemon
+            .begin_auth_with_claim(crate::PendingAuthClaim {
+                claim_code: "claim_reconnect".to_string(),
+                claim_token: "token_reconnect".to_string(),
+                nonce: "nonce_reconnect".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_reconnect".to_string(),
+                expires_at: "2100-01-01T00:00:00Z".to_string(),
+            })
+            .expect("begin claim");
+
+        // A bound user with a connection still reads as connected, so the
+        // connected-account gate is reached and refuses while Ottto has said
+        // nothing terminal.
+        let error = auth_start(&daemon, &authorization)
+            .expect_err("healthy connected Mac refuses a new claim");
+        assert!(matches!(
+            error,
+            LocalApiError::InvalidRequest(message) if message.contains("already connected")
+        ));
+
+        // Ottto rejects the relay credentials: the answer says reconnect, and
+        // the sign-in it points to is admitted over the bound account.
+        daemon
+            .record_local_health_upload_failed(crate::LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        let response = auth_start(&daemon, &authorization).expect("reconnect claim is allowed");
+        assert_eq!(response.claim_code, "claim_reconnect");
+        assert_eq!(
+            response.account.user.as_ref().map(|user| user.id.as_str()),
+            connected_account()
+                .user
+                .as_ref()
+                .map(|user| user.id.as_str()),
+            "the reconnect claim keeps the bound user"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     /// A connected Mac with a device credential and a setup run bound to

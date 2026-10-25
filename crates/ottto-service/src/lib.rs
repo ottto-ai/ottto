@@ -1556,16 +1556,24 @@ impl LocalDaemon {
     }
 
     /// True when this Mac is bound to an account but has no usable setup run:
-    /// no setup-run binding is left, or Ottto's latest authoritative answer
+    /// no setup-run binding is left, Ottto's latest authoritative answer
     /// for the binding was terminal (an ended run or a refused device
-    /// credential). Sign-in may then start a fresh claim over the bound
-    /// account; completing it for the same user replaces the binding.
+    /// credential), or Ottto rejected this Mac's credentials on the latest
+    /// local-health upload (the status then answers `reconnect_required`).
+    /// Sign-in may then start a fresh claim over the bound account;
+    /// completing it for the same user replaces the binding.
     pub(crate) fn connected_setup_run_needs_reconnect(&self) -> Result<bool, LocalApiError> {
         if self.connection_for_authorized_client()?.is_none() {
             return Ok(true);
         }
         let state = self.state()?;
-        Ok(latest_setup_run_read_rejection(&state.local_health_events).is_some())
+        Ok(
+            latest_setup_run_read_rejection(&state.local_health_events).is_some()
+                || matches!(
+                    latest_local_health_upload_in(&state.local_health_events),
+                    Some(LatestLocalHealthUpload::AuthRejected { .. })
+                ),
+        )
     }
 
     /// Clear a recorded setup-run read rejection after a successful read
@@ -2175,6 +2183,32 @@ fn status_from_state(state: &DaemonState) -> DaemonStatus {
     status
 }
 
+pub(crate) const ACCOUNT_RECONNECT_REQUIRED_MESSAGE_CODE: &str = "reconnect_required";
+
+/// The account answer a client should show for `status`: a copy of the saved
+/// binding that stops claiming `connected` while canonical health says Ottto
+/// rejected this Mac's credentials. Identity stays. The saved binding is never
+/// changed and nothing here is persisted, so internal account gates keep
+/// reading the saved state and a status without the rejection shows the saved
+/// answer again. Other binding states (a pending claim, reattach, reset) are
+/// already not connected and are returned unchanged.
+pub fn effective_account_binding(status: &DaemonStatus) -> LocalAccountBinding {
+    let mut account = status.account.clone();
+    let canonical_reconnect = status
+        .canonical_health
+        .as_ref()
+        .is_some_and(|health| health.account.state == LocalHealthAccountState::ReconnectRequired);
+    if account.state == LocalAccountState::Connected && canonical_reconnect {
+        account.state = LocalAccountState::Error;
+        account.message = Some(StableMessage {
+            code: ACCOUNT_RECONNECT_REQUIRED_MESSAGE_CODE.to_string(),
+            text: "Ottto no longer accepts this Mac's sign-in. Sign in to Ottto again to reconnect it."
+                .to_string(),
+        });
+    }
+    account
+}
+
 fn push_local_health_upload_event(
     state: &mut DaemonState,
     event_type: &str,
@@ -2468,8 +2502,11 @@ enum LatestLocalHealthUpload {
 }
 
 fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealthUpload> {
-    status
-        .local_health_events
+    latest_local_health_upload_in(&status.local_health_events)
+}
+
+fn latest_local_health_upload_in(events: &[LocalHealthEventV1]) -> Option<LatestLocalHealthUpload> {
+    events
         .iter()
         .filter(|event| {
             event.event_type == "LocalHealthUploadFailed"
@@ -6147,6 +6184,61 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.code == "auth_missing"));
+    }
+
+    #[test]
+    fn auth_rejected_status_shows_effective_reconnect_without_changing_saved_binding() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let saved = daemon.status(TOKEN).expect("status").account;
+        assert_eq!(saved.state, LocalAccountState::Connected);
+        assert_eq!(
+            effective_account_binding(&daemon.status(TOKEN).expect("status")),
+            saved
+        );
+
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        let status = daemon.status(TOKEN).expect("status");
+        // Internal account gates still read the saved binding.
+        assert_eq!(status.account, saved);
+
+        let effective = effective_account_binding(&status);
+        assert_eq!(effective.state, LocalAccountState::Error);
+        let message = effective.message.as_ref().expect("reconnect message");
+        assert_eq!(message.code, ACCOUNT_RECONNECT_REQUIRED_MESSAGE_CODE);
+        assert!(message.text.contains("Sign in to Ottto again"));
+        assert_eq!(effective.user, saved.user);
+        assert_eq!(effective.organization, saved.organization);
+        assert_eq!(effective.connected_at, saved.connected_at);
+        assert_eq!(effective.can_reconnect, saved.can_reconnect);
+        // Nothing was written back to the saved binding.
+        assert_eq!(daemon.account_for_trusted_client().expect("account"), saved);
+
+        // A later accepted upload clears it; the old rejection does not latch.
+        daemon
+            .record_local_health_upload_succeeded()
+            .expect("record upload success");
+        assert_eq!(
+            effective_account_binding(&daemon.status(TOKEN).expect("status")),
+            saved
+        );
+    }
+
+    #[test]
+    fn fresh_claim_is_not_rewritten_by_an_older_auth_rejection() {
+        let daemon = daemon();
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+
+        let status = daemon.status(TOKEN).expect("status");
+        let effective = effective_account_binding(&status);
+        assert_eq!(effective.state, LocalAccountState::ClaimPending);
+        assert_eq!(effective, status.account);
     }
 
     #[test]
