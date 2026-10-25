@@ -302,6 +302,7 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
         field!(claude_census_rebuild_priors, BTreeMap::is_empty);
         field!(claude_census_rebuild_initialized, is_zero_u64);
+        field!(claude_census_rebuild_wall_high_water, is_zero_u64);
         map.end()
     }
 }
@@ -389,6 +390,7 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_last_alarm_unix_seconds",
     "claude_census_rebuild_priors",
     "claude_census_rebuild_initialized",
+    "claude_census_rebuild_wall_high_water",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1796,6 +1798,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_census_rebuild_initialized" => {
                             index.claude_census_rebuild_initialized = self.rebuild_marker(value)?;
+                        }
+                        "claude_census_rebuild_wall_high_water" => {
+                            index.claude_census_rebuild_wall_high_water = self.typed(value)?;
                         }
                         _ => return Err(Error::Refused("unhandled index field")),
                     }

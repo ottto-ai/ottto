@@ -41,6 +41,13 @@
 //!   an orphan) starts no earlier than the saved witness (of any copy), and
 //!   an identity revoke keeps the removed key's latest stamp. An alarm's
 //!   retry is never before the clock passes the latest stamp.
+//! - MONEY 724i P2: `claude_census_rebuild_wall_high_water` retains the
+//!   maximum wall time observed on every N3 load and save, including cycles
+//!   with no new grant. Time below that maximum spends an unread grant as
+//!   `grant_clock_regressed`, even above every attempt stamp. In-process
+//!   elapsed time also bounds grant age, so rollback hidden between wall
+//!   observations cannot prolong the read span. Reloads and saves retain
+//!   the original monotonic birth; a restart requires a new counted grant.
 //! - A persisted rearm is counted again on the first load of each process, or
 //!   when this process already started its parse. A bounded sweep that has not
 //!   reached the key yet does not spend an attempt. A grant authorizes a read
@@ -476,11 +483,13 @@ fn close(closed_at: &mut Option<u64>, now: u64) {
 /// latest persisted stamp (which bounds the grant's own), the wall clock went
 /// backward: no new authority. Past `N3_GRANT_MAX_LOAD_TO_READ` the span is
 /// over.
-fn grant_spent(tracked: &TrackedKey, now: u64, high_water: u64) -> Option<&'static str> {
+fn grant_spent(tracked: &TrackedKey, now: u64, high_water: u64, born: u64) -> Option<&'static str> {
     let stamp = unread_grant(tracked)?;
     if now < high_water.max(stamp) {
         Some("grant_clock_regressed")
-    } else if now > stamp.saturating_add(N3_GRANT_MAX_LOAD_TO_READ) {
+    } else if now > stamp.saturating_add(N3_GRANT_MAX_LOAD_TO_READ)
+        || monotonic_millis().saturating_sub(born) > N3_GRANT_MAX_LOAD_TO_READ * 1000
+    {
         Some("grant_read_span_expired")
     } else {
         None
@@ -499,9 +508,18 @@ fn unread_grant(tracked: &TrackedKey) -> Option<u64> {
 /// `grant_spent`, sticky in this process: a grant `admission_refused` found
 /// spent stays spent while its stamp is the key's latest, even in the same
 /// working index once the wall clock is back inside its span.
-fn spent_cause(id: &str, tracked: &TrackedKey, now: u64, high_water: u64) -> Option<&'static str> {
+fn spent_cause(
+    id: &str,
+    tracked: &TrackedKey,
+    now: u64,
+    high_water: u64,
+    loaded_at: u64,
+) -> Option<&'static str> {
     let stamp = unread_grant(tracked)?;
-    grant_spent(tracked, now, high_water).or_else(|| {
+    let born = with_persisted(|grants| grants.get(id).copied())
+        .filter(|grant| grant.stamp == stamp)
+        .map_or(loaded_at, |grant| grant.born);
+    grant_spent(tracked, now, high_water, born).or_else(|| {
         let (cause, overflow) = with_spent(|spent| {
             let cause = spent
                 .grants
@@ -514,8 +532,9 @@ fn spent_cause(id: &str, tracked: &TrackedKey, now: u64, high_water: u64) -> Opt
             // Once the cache fills, an unrecorded spend is possible. Only
             // proof of a newly saved counted attempt supplies authority.
             // Drop the spent lock before taking the persisted lock.
-            (overflow && !with_persisted(|grants| grants.get(id).copied() == Some(stamp)))
-                .then_some("grant_clock_regressed")
+            (overflow
+                && !with_persisted(|grants| grants.get(id).map(|grant| grant.stamp) == Some(stamp)))
+            .then_some("grant_clock_regressed")
         })
     })
 }
@@ -540,7 +559,7 @@ fn record_spent(id: &str, stamp: u64, cause: &'static str) {
 fn spend(id: &str, tracked: &TrackedKey) {
     let stamp = tracked.attempts.last().copied();
     with_persisted(|grants| {
-        if grants.get(id).copied() == stamp {
+        if grants.get(id).map(|grant| grant.stamp) == stamp {
             grants.remove(id);
         }
     });
@@ -666,13 +685,22 @@ pub(crate) struct Transient {
     /// SI-724-F2: the guard itself was lost or refused this load (for the
     /// count-only guard alarm, raised even with no key pending).
     guard_loss: Option<&'static str>,
+    /// Monotonic birth of grants made by this load. Reused grants retain
+    /// their earlier birth in PERSISTED; neither saving nor reloading renews it.
+    loaded_at: u64,
 }
-crate::heap_layout_bound::fields!(Transient; grants, rearmed, refusals, guard_loss);
+crate::heap_layout_bound::fields!(Transient; grants, rearmed, refusals, guard_loss, loaded_at);
 
 pub(crate) fn key_id(key: &str) -> String {
     let mut id = safety_key_id(key);
     id.truncate(16);
     id
+}
+
+#[derive(Clone, Copy)]
+struct ProcessGrant {
+    stamp: u64,
+    born: u64,
 }
 
 #[derive(Default)]
@@ -683,8 +711,9 @@ struct SpentGrants {
 
 #[cfg(test)]
 thread_local! {
+    static TEST_ELAPSED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TEST_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    static PERSISTED: std::cell::RefCell<BTreeMap<String, u64>> =
+    static PERSISTED: std::cell::RefCell<BTreeMap<String, ProcessGrant>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
     static SPENT: std::cell::RefCell<SpentGrants> =
         const { std::cell::RefCell::new(SpentGrants {
@@ -698,7 +727,8 @@ thread_local! {
 /// Keys whose current rearm this process already saved before its scan, with
 /// the saved grant's stamp.
 #[cfg(not(test))]
-static PERSISTED: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
+static PERSISTED: std::sync::Mutex<BTreeMap<String, ProcessGrant>> =
+    std::sync::Mutex::new(BTreeMap::new());
 /// Grants this process found spent as it admitted a read (key id, the
 /// grant's stamp and why): refused for as long as that stamp is the key's
 /// latest, in every working index of the process.
@@ -711,6 +741,28 @@ static SPENT: std::sync::Mutex<SpentGrants> = std::sync::Mutex::new(SpentGrants 
 #[cfg(not(test))]
 static ALARMED: std::sync::Mutex<BTreeSet<(String, &'static str)>> =
     std::sync::Mutex::new(BTreeSet::new());
+
+/// Elapsed process time, independent of wall-clock corrections. Milliseconds
+/// preserve the inclusive span boundary without truncating a late read to it.
+fn monotonic_millis() -> u64 {
+    #[cfg(test)]
+    if let Some(elapsed) = TEST_ELAPSED.with(std::cell::Cell::get) {
+        return elapsed;
+    }
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+/// Each N3 load and checkpoint observes wall time, even without a new grant.
+/// The maximum is independent of guard retirement, and never reset by it.
+pub(super) fn observe_clock(index: &mut ScanIndex) {
+    if index.claude_census_rebuild_wall_high_water != 0
+        || index.claude_request_census_shadow.rebuild_bound.is_some()
+    {
+        raise(&mut index.claude_census_rebuild_wall_high_water, now_unix());
+    }
+}
 
 fn system_now() -> u64 {
     std::time::SystemTime::now()
@@ -729,11 +781,11 @@ fn now_unix() -> u64 {
 }
 
 #[cfg(test)]
-fn with_persisted<T>(f: impl FnOnce(&mut BTreeMap<String, u64>) -> T) -> T {
+fn with_persisted<T>(f: impl FnOnce(&mut BTreeMap<String, ProcessGrant>) -> T) -> T {
     PERSISTED.with(|set| f(&mut set.borrow_mut()))
 }
 #[cfg(not(test))]
-fn with_persisted<T>(f: impl FnOnce(&mut BTreeMap<String, u64>) -> T) -> T {
+fn with_persisted<T>(f: impl FnOnce(&mut BTreeMap<String, ProcessGrant>) -> T) -> T {
     f(&mut PERSISTED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner))
@@ -784,6 +836,7 @@ fn emit_alarm(line: String) {
 /// `priors_seen`: the field was present at all. Never writes an index entry:
 /// a grant is recorded in the guard and the load's transient set only.
 pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bool) {
+    observe_clock(index);
     let witness = index.claude_request_census_shadow.rebuild_witness;
     let marker = index.claude_census_rebuild_initialized;
     if !priors_refused
@@ -847,7 +900,10 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
     // MONEY 724h condition 3: behind the guard's latest persisted stamp the
     // wall clock went backward. That time is no new authority: no grant is
     // made or reused, and no new key is admitted, until the clock passes it.
-    let high_water = guard.latest_stamp();
+    let high_water = guard
+        .latest_stamp()
+        .max(index.claude_census_rebuild_wall_high_water);
+    raise(&mut index.claude_census_rebuild_wall_high_water, now);
     let regressed = now < high_water;
     guard.settle_clock(now);
     let mut priors = std::mem::take(&mut index.claude_census_rebuild_priors);
@@ -878,6 +934,7 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         }
     }
     let mut transient = Transient {
+        loaded_at: monotonic_millis(),
         // SI-724-F2: alarmed (count-only) whether or not any key is pending.
         guard_loss: if marker_refused && !priors_refused {
             Some("marker_refused")
@@ -1021,17 +1078,16 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         let unspent = if tracked.has(EXHAUSTED) || tracked.has(STARTED) {
             None
         } else {
-            with_persisted(|grants| grants.get(id).copied()).filter(|stamp| {
-                tracked.attempts.contains(stamp)
-                    && !regressed
-                    && now <= stamp.saturating_add(N3_GRANT_MAX_LOAD_TO_READ)
+            with_persisted(|grants| grants.get(id).copied()).filter(|grant| {
+                tracked.attempts.contains(&grant.stamp)
+                    && grant_spent(tracked, now, high_water, grant.born).is_none()
             })
         };
         if unspent.is_none() {
             // A save's throwaway CAS decode may be the first observer of a
             // spent grant. Remember it for the original working index too,
             // whose flags survive that discarded decode.
-            if let Some(cause) = grant_spent(tracked, now, high_water) {
+            if let Some(cause) = spent_cause(id, tracked, now, high_water, transient.loaded_at) {
                 mark_spent(id, tracked, cause);
             } else {
                 // Spent (or never this process's): never reused later.
@@ -1269,15 +1325,29 @@ pub(crate) fn held(index: &ScanIndex, key: &str) -> bool {
     }
     let id = key_id(key);
     guard.keys.get(&id).is_some_and(|tracked| {
-        tracked.has(HELD) || (!tracked.has(CURRENT) && admission_refused(guard, &id, tracked))
+        tracked.has(HELD)
+            || (!tracked.has(CURRENT) && admission_refused(index, guard, &id, tracked))
     })
 }
 
 /// MONEY 724h P2 and condition 3, as candidate selection admits a read:
 /// `tracked`'s grant is spent (its span over, or the wall clock behind the
 /// guard's latest persisted stamp). A spent grant stays spent (`spend`).
-fn admission_refused(guard: &DuplicateRebuildGuard, id: &str, tracked: &TrackedKey) -> bool {
-    let Some(cause) = spent_cause(id, tracked, now_unix(), guard.latest_stamp()) else {
+fn admission_refused(
+    index: &ScanIndex,
+    guard: &DuplicateRebuildGuard,
+    id: &str,
+    tracked: &TrackedKey,
+) -> bool {
+    let Some(cause) = spent_cause(
+        id,
+        tracked,
+        now_unix(),
+        guard
+            .latest_stamp()
+            .max(index.claude_census_rebuild_wall_high_water),
+        index.claude_request_census.rebuild_transient.loaded_at,
+    ) else {
         return false;
     };
     mark_spent(id, tracked, cause);
@@ -1312,7 +1382,7 @@ pub(crate) fn rearmed(index: &ScanIndex, key: &str) -> bool {
                 guard
                     .keys
                     .get(&id)
-                    .is_some_and(|tracked| !admission_refused(guard, &id, tracked))
+                    .is_some_and(|tracked| !admission_refused(index, guard, &id, tracked))
             })
 }
 
@@ -1349,6 +1419,7 @@ pub(crate) fn persist_grants(index: &mut ScanIndex, path: &Path) -> anyhow::Resu
         return Ok(());
     }
     index.save(path)?;
+    let born = index.claude_request_census.rebuild_transient.loaded_at;
     let grants = std::mem::take(&mut index.claude_request_census.rebuild_transient.grants);
     with_persisted(|set| {
         for (id, stamp) in grants {
@@ -1360,7 +1431,7 @@ pub(crate) fn persist_grants(index: &mut ScanIndex, path: &Path) -> anyhow::Resu
             // as a spent one: only the spent grant stays refused. Never
             // before its save (a save's throwaway decode makes grants too).
             with_spent(|spent| spent.grants.remove(&id));
-            set.insert(id, stamp);
+            set.insert(id, ProcessGrant { stamp, born });
         }
     });
     Ok(())
@@ -1392,7 +1463,9 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
     // grant still re-reads its intact fingerprint: an identity-armed empty
     // fingerprint is the identity path's read, never this bound's.
     let now = now_unix();
-    let high_water = guard.latest_stamp();
+    let high_water = guard
+        .latest_stamp()
+        .max(index.claude_census_rebuild_wall_high_water);
     let transient = &index.claude_request_census.rebuild_transient;
     let rearmed_ids: BTreeMap<String, &String> = transient
         .rearmed
@@ -1402,7 +1475,13 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
     let spent: BTreeMap<&str, &'static str> = guard
         .keys
         .iter()
-        .filter_map(|(id, key)| Some((id, key, spent_cause(id, key, now, high_water)?)))
+        .filter_map(|(id, key)| {
+            Some((
+                id,
+                key,
+                spent_cause(id, key, now, high_water, transient.loaded_at)?,
+            ))
+        })
         .filter(|(id, key, _)| {
             !key.has(CURRENT)
                 || rearmed_ids
@@ -1527,6 +1606,16 @@ pub(crate) mod test_support {
     pub(crate) fn set_now(now: u64) -> Clock {
         TEST_NOW.with(|cell| cell.set(Some(now)));
         Clock
+    }
+    pub(crate) struct ElapsedClock;
+    impl Drop for ElapsedClock {
+        fn drop(&mut self) {
+            TEST_ELAPSED.with(|cell| cell.set(None));
+        }
+    }
+    pub(crate) fn set_elapsed(seconds: u64) -> ElapsedClock {
+        TEST_ELAPSED.with(|cell| cell.set(Some(seconds * 1000)));
+        ElapsedClock
     }
     /// A new daemon process: no grant saved yet, no alarm emitted yet.
     pub(crate) fn restart() {

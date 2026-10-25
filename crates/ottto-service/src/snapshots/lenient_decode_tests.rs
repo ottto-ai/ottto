@@ -2038,6 +2038,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                 serde_json::json!({ (n3_id.clone()): "f".repeat(64) })
             }
             "claude_census_rebuild_initialized" => serde_json::json!(N3_NOW - 60),
+            "claude_census_rebuild_wall_high_water" => serde_json::json!(N3_NOW),
             "claude_retired_family_tombstones" => {
                 serde_json::json!({"a".repeat(64): 1})
             }

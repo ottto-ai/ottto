@@ -8158,3 +8158,8 @@ mod memo_accounting_tests {
         assert_eq!(census.hash_total, 0);
     }
 }
+
+/// Observe the N3 wall clock at the checkpoint boundary, as well as load.
+pub(super) fn observe_duplicate_rebuild_clock(index: &mut ScanIndex) {
+    rebuild_bound::observe_clock(index);
+}

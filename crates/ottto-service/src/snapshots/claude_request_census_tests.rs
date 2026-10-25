@@ -6782,3 +6782,211 @@ fn every_source_fingerprint_clear_uses_the_identity_path() {
         "classify the new non-identity clear site"
     );
 }
+
+/// MONEY 724i's exact counterexample: a grant at real/wall zero, then a
+/// ten-hour rollback while waiting, reaches admission at real 20h / wall 10h.
+/// Wall time alone admits it and permits three reads in 6d16h. Monotonic age
+/// spends that grant; restart variants must count a new attempt, never reuse
+/// the old process's elapsed authority.
+#[test]
+fn census_duplicate_rebuild_above_stamp_rollback_keeps_real_reads_bounded() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started,
+        persist_duplicate_rebuild_grants,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for form in ["current", "earlier"] {
+            for wait in ["unchanged", "reload", "restart"] {
+                let restart_wait = wait == "restart";
+                for restart_cycles in [false, true] {
+                    bound::restart();
+                    let case = format!(
+                        "shadow={enabled} {form} wait={wait} restart_cycles={restart_cycles}"
+                    );
+                    let scratch =
+                        crate::test_scratch::ScratchDir::new("census-rebuild-above-stamp");
+                    let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+                    let fingerprint = original.files[&key].source_file_fingerprint.clone();
+                    let path = scratch.join("index.json");
+                    std::fs::write(&path, census_rebuild_form_raw(&original, &key, form)).unwrap();
+                    let mut index = {
+                        let _wall = bound::set_now(N3_T0);
+                        let _elapsed = bound::set_elapsed(0);
+                        let mut index = ScanIndex::load(&path).unwrap();
+                        persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                        assert_eq!(bound::saved_stamps(&path, &key), vec![N3_T0]);
+                        index
+                    };
+                    if wait == "reload" {
+                        // Reload after rollback, still within both spans. The
+                        // reused grant must retain its birth at real zero,
+                        // rather than gaining another twelve hours here.
+                        let _wall = bound::set_now(N3_T0 + 3600);
+                        let _elapsed = bound::set_elapsed(11 * 3600);
+                        index = ScanIndex::load(&path).unwrap();
+                        persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                        assert_eq!(bound::saved_stamps(&path, &key), vec![N3_T0]);
+                    }
+                    if restart_wait {
+                        // A restart during the rolled-back wait cannot reuse
+                        // stamp zero. It spends a second counted, saved attempt.
+                        bound::restart();
+                        let _wall = bound::set_now(N3_T0 + 8 * 3600);
+                        let _elapsed = bound::set_elapsed(18 * 3600);
+                        index = ScanIndex::load(&path).unwrap();
+                        persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                        assert_eq!(
+                            bound::saved_stamps(&path, &key),
+                            vec![N3_T0, N3_T0 + 8 * 3600]
+                        );
+                    }
+                    let mut reads = Vec::new();
+                    {
+                        let _wall = bound::set_now(N3_T0 + 10 * 3600);
+                        let _elapsed = bound::set_elapsed(20 * 3600);
+                        let decision = census_rebuild_decision(&index, &key, &fingerprint);
+                        if restart_wait {
+                            assert_eq!(decision, rearmed, "{case}: second counted grant");
+                            reads.push(20 * 3600);
+                            note_duplicate_rebuild_started(&mut index, Path::new(&key));
+                        } else {
+                            assert_eq!(
+                                decision,
+                                (CandidateDecision::Skip, None),
+                                "{case}: real age exceeds 12h"
+                            );
+                            assert_eq!(census_rebuild_counters(&mut index), (1, 0), "{case}");
+                            assert_eq!(
+                                census_rebuild_alarms(&key, "grant_read_span_expired"),
+                                1,
+                                "{case}"
+                            );
+                            assert_eq!(
+                                bound::saved_stamps(&path, &key),
+                                vec![N3_T0],
+                                "{case}: spent stamp still counts"
+                            );
+                        }
+                    }
+                    // Correct the clock; failed/discarded scans, with optional
+                    // restarts, leave all counted authority on disk.
+                    for real in [N3_DAY, N3_ATTEMPT_WINDOW + 1] {
+                        if restart_cycles {
+                            bound::restart();
+                        }
+                        let _wall = bound::set_now(N3_T0 + real);
+                        let _elapsed = bound::set_elapsed(real);
+                        index = ScanIndex::load(&path).unwrap();
+                        persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                        if census_rebuild_decision(&index, &key, &fingerprint) == rearmed {
+                            assert!(
+                                bound::saved_stamps(&path, &key).contains(&(N3_T0 + real)),
+                                "{case}: new saved counted attempt"
+                            );
+                            reads.push(real);
+                            note_duplicate_rebuild_started(&mut index, Path::new(&key));
+                        }
+                    }
+                    let expected = if restart_wait {
+                        vec![20 * 3600, N3_ATTEMPT_WINDOW + 1]
+                    } else {
+                        vec![N3_DAY, N3_ATTEMPT_WINDOW + 1]
+                    };
+                    assert_eq!(reads, expected, "{case}");
+                    for real in &reads {
+                        assert!(
+                            reads
+                                .iter()
+                                .filter(
+                                    |earlier| **earlier <= *real && *real - **earlier <= 7 * N3_DAY
+                                )
+                                .count()
+                                <= MAX_N3_REARMS_PER_WINDOW,
+                            "{case}: more than two reads in seven real days: {reads:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A cycle observing later wall time without minting an attempt must save
+/// that maximum. Rollback above every attempt is then refused and counted,
+/// including after restart and through both readers. Legacy absence is safe.
+#[test]
+fn census_duplicate_rebuild_wall_high_water_survives_unread_cycles_and_restart() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for form in ["current", "earlier"] {
+            for restart in [false, true] {
+                bound::restart();
+                let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-wall-mark");
+                let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+                let fingerprint = original.files[&key].source_file_fingerprint.clone();
+                let path = scratch.join("index.json");
+                // Old indexes omit the field.
+                assert!(original.claude_census_rebuild_wall_high_water == 0);
+                std::fs::write(&path, census_rebuild_form_raw(&original, &key, form)).unwrap();
+                let mut index = {
+                    let _wall = bound::set_now(N3_T0);
+                    let _elapsed = bound::set_elapsed(0);
+                    let mut index = ScanIndex::load(&path).unwrap();
+                    persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                    index
+                };
+                {
+                    let _wall = bound::set_now(N3_T0 + 11 * 3600);
+                    let _elapsed = bound::set_elapsed(11 * 3600);
+                    // No grant minted and no read started. Checkpoint still observes time.
+                    index.save(&path).unwrap();
+                    assert_eq!(bound::saved_stamps(&path, &key), vec![N3_T0]);
+                    let saved: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    assert_eq!(
+                        saved["claude_census_rebuild_wall_high_water"],
+                        serde_json::json!(N3_T0 + 11 * 3600)
+                    );
+                }
+                if restart {
+                    bound::restart();
+                }
+                let _wall = bound::set_now(N3_T0 + 10 * 3600);
+                // Within the monotonic span: only the saved wall maximum detects this.
+                let _elapsed = bound::set_elapsed(11 * 3600 + 1);
+                for bounded in [false, true] {
+                    let mut index = if bounded {
+                        crate::snapshots::claude_request_census::decode_bounded_index(
+                            &std::fs::read(&path).unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        ScanIndex::load(&path).unwrap()
+                    };
+                    assert_eq!(
+                        census_rebuild_decision(&index, &key, &fingerprint),
+                        (CandidateDecision::Skip, None)
+                    );
+                    assert_eq!(bound::attempts(&index, &key), vec![N3_T0]);
+                    assert_eq!(census_rebuild_counters(&mut index), (1, 0));
+                    assert_eq!(census_rebuild_alarms(&key, "grant_clock_regressed"), 1);
+                    index.save(&path).unwrap();
+                    let saved: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    assert_eq!(
+                        saved["claude_census_rebuild_wall_high_water"],
+                        serde_json::json!(N3_T0 + 11 * 3600)
+                    );
+                }
+            }
+        }
+    }
+}
