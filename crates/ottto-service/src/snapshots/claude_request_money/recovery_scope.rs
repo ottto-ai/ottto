@@ -66,6 +66,24 @@ fn overlaps(hashes: &[u64], scope: &BTreeSet<u64>) -> bool {
     scope.iter().any(|h| hashes.binary_search(h).is_ok())
 }
 
+fn admit_root<'a>(
+    scope: &'a mut Scope,
+    root: &str,
+    key_bytes: &mut usize,
+) -> Option<&'a mut Vec<String>> {
+    if !scope.roots.contains_key(root) {
+        if root.len() > 1024
+            || scope.roots.len() >= ROOT_MAX
+            || key_bytes.saturating_add(root.len()) > KEY_BYTES_MAX
+        {
+            return None;
+        }
+        *key_bytes += root.len();
+        scope.roots.insert(root.to_owned(), Vec::new());
+    }
+    scope.roots.get_mut(root)
+}
+
 pub(crate) struct Closed {
     pub scope: Scope,
     _funds: ShadowReservation,
@@ -118,6 +136,15 @@ pub(crate) fn close_with_reason(
         if !scope.valid() {
             return None;
         }
+        // Enforce the same bounds incrementally. Revalidating every path in
+        // the entire growing graph after each file made this bounded walk
+        // quadratic and exhausted its unchanged two-millisecond deadline.
+        let mut file_count = scope.roots.values().map(Vec::len).sum::<usize>();
+        let mut key_bytes = scope
+            .roots
+            .iter()
+            .map(|(root, files)| root.len() + files.iter().map(String::len).sum::<usize>())
+            .sum::<usize>();
         loop {
             let before = (
                 scope.roots.len(),
@@ -153,10 +180,7 @@ pub(crate) fn close_with_reason(
                     return None;
                 }
                 refusal.set(Refusal::Bounds);
-                if !scope.roots.contains_key(&root) && scope.roots.len() >= ROOT_MAX {
-                    return None;
-                }
-                scope.roots.entry(root).or_default();
+                admit_root(&mut scope, &root, &mut key_bytes)?;
                 merge(
                     &mut scope.requests,
                     &scope.messages,
@@ -195,18 +219,20 @@ pub(crate) fn close_with_reason(
                 if !connected && !overlaps(messages, &scope.messages) {
                     continue;
                 }
-                if !scope.roots.contains_key(root) && scope.roots.len() >= ROOT_MAX {
-                    return None;
-                }
-                let files = scope.roots.entry(root.to_owned()).or_default();
+                let files = admit_root(&mut scope, root, &mut key_bytes)?;
                 if !files.contains(key) {
+                    if key.len() > 4096
+                        || file_count >= FILE_MAX
+                        || key_bytes.saturating_add(key.len()) > KEY_BYTES_MAX
+                    {
+                        return None;
+                    }
+                    file_count += 1;
+                    key_bytes += key.len();
                     files.push(key.clone());
                 }
                 merge(&mut scope.requests, &scope.messages, requests)?;
                 merge(&mut scope.messages, &scope.requests, messages)?;
-                if !scope.valid() {
-                    return None;
-                }
             }
             if before
                 == (
