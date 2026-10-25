@@ -28,6 +28,50 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
+// N1 diagnostics only: process totals on the existing local census line.
+// Reloading a held record does not enter it again; a lost/over-budget record
+// is not a successful clearance. No persisted or uploaded bookkeeping.
+#[cfg(not(test))]
+static IDENTITY_INCOMPLETE_HOLDS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+#[cfg(test)]
+thread_local! {
+    static IDENTITY_INCOMPLETE_HOLDS: [std::cell::Cell<u64>; 2] = const {
+        [std::cell::Cell::new(0), std::cell::Cell::new(0)]
+    };
+}
+
+fn note_identity_incomplete_hold(entered: bool, cleared: bool) {
+    for (slot, changed) in [entered, cleared].into_iter().enumerate() {
+        if changed {
+            #[cfg(not(test))]
+            let _ = IDENTITY_INCOMPLETE_HOLDS[slot].fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| Some(count.saturating_add(1)),
+            );
+            #[cfg(test)]
+            IDENTITY_INCOMPLETE_HOLDS.with(|counts| {
+                counts[slot].set(counts[slot].get().saturating_add(1));
+            });
+        }
+    }
+}
+
+/// Independent relaxed process totals (entered, cleared), test-thread local
+/// in unit tests as the existing history-upgrade local counts are.
+pub(super) fn identity_incomplete_hold_totals() -> (u64, u64) {
+    #[cfg(not(test))]
+    {
+        (
+            IDENTITY_INCOMPLETE_HOLDS[0].load(std::sync::atomic::Ordering::Relaxed),
+            IDENTITY_INCOMPLETE_HOLDS[1].load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+    #[cfg(test)]
+    IDENTITY_INCOMPLETE_HOLDS.with(|counts| (counts[0].get(), counts[1].get()))
+}
+
 /// Bumped only when request-id or occurrence extraction, or the shape rule,
 /// changes. A bump makes every stored record inert until its file is parsed
 /// again. `CLAUDE_REQUEST_CENSUS_CANARY` pins what the fixed fixture corpus
@@ -403,6 +447,29 @@ impl ClaudeRequestCensusRecord {
     /// twin: never complete evidence for a negative claim.
     pub(crate) fn unverified_or_twin(&self) -> bool {
         self.unverified || self.twin
+    }
+
+    /// A current native body can supersede an unverified D1 record only if
+    /// the record describes a complete, loss-free parse of that revision.
+    /// Terminal oversized-line settlement is NOT complete proof evidence.
+    /// Identity-incomplete records wait for a Full audit: saved-witness
+    /// reconstruction does not itself refuse their bodies.
+    pub(crate) fn can_bind_recomposed_body(&self) -> bool {
+        self.current_derivation()
+            && !self.twin
+            && self.retired.is_none()
+            && matches!(
+                self.shape,
+                ClaudeRequestCensusShape::Exact | ClaudeRequestCensusShape::Empty
+            )
+    }
+
+    fn identity_incomplete_hold(&self) -> bool {
+        self.current_derivation()
+            && self.unverified
+            && !self.twin
+            && self.retired.is_none()
+            && self.shape == ClaudeRequestCensusShape::IdentityIncomplete
     }
 
     /// Both records were produced at the same file fingerprint (a ledger
@@ -2363,6 +2430,10 @@ pub(crate) fn record_claude_request_census(
     if records_disabled_for_test(parse.path) {
         return;
     }
+    let was_held = index
+        .claude_request_census
+        .get(parse.index_key)
+        .is_some_and(ClaudeRequestCensusRecord::identity_incomplete_hold);
     let window = rfc3339_unix_seconds(parse.census_window_end).unwrap_or_default();
     let Some(record) = claude_request_census_record(
         &path_owner,
@@ -2423,6 +2494,22 @@ pub(crate) fn record_claude_request_census(
     let _ = index
         .claude_request_census
         .insert(parse.index_key.to_owned(), record);
+    if let Some(stored) = index.claude_request_census.get(parse.index_key) {
+        note_identity_incomplete_hold(
+            !was_held && stored.identity_incomplete_hold(),
+            was_held
+                && stored.current_derivation()
+                && !stored.twin
+                && stored.retired.is_none()
+                && matches!(
+                    stored.shape,
+                    ClaudeRequestCensusShape::Exact
+                        | ClaudeRequestCensusShape::Empty
+                        | ClaudeRequestCensusShape::IdentityIncomplete
+                )
+                && (!stored.unverified || stored.can_bind_recomposed_body()),
+        );
+    }
 }
 
 /// A parse that reaches no record (a failed finish, or a native comparison

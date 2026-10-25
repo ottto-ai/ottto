@@ -565,7 +565,7 @@ mod http_tests {
 
     #[test]
     #[serial_test::serial]
-    fn relay_401_is_shared_across_clients_bounded_otlp_and_control_for_one_source() {
+    fn relay_401_is_shared_across_snapshot_clients_bounded_and_composition_health_for_one_source() {
         let backend = Backend::start(vec![401, 401]);
         let client =
             SnapshotApiClient::new(&backend.base).with_bounded_retry_loopback_http_for_test();
@@ -591,20 +591,30 @@ mod http_tests {
                     .suppressed
             );
             assert!(
-                crate::otlp_relay::request_relay_token(
-                    &backend.base,
-                    &device,
-                    secret,
-                    SnapshotSource::Codex
-                )
-                .unwrap_err()
-                .downcast_ref::<RelayTokenAuthorizationRejected>()
-                .unwrap()
-                .suppressed
+                client
+                    .issue_relay_token_with_timeout(
+                        &device,
+                        secret,
+                        SnapshotSource::Codex,
+                        Duration::from_secs(5),
+                    )
+                    .unwrap_err()
+                    .downcast_ref::<RelayTokenAuthorizationRejected>()
+                    .unwrap()
+                    .suppressed
             );
             assert!(
-                matches!(crate::control::request_source_relay_token(&backend.base, &device, secret,
-                &ottto_protocol::SourceKind::Codex), Err(crate::LocalApiError::Backend(details)) if details.status == Some(401))
+                client
+                    .issue_composition_health_relay_token(
+                        &device,
+                        secret,
+                        SnapshotSource::Codex,
+                        Duration::from_secs(5),
+                    )
+                    .unwrap_err()
+                    .downcast_ref::<RelayTokenAuthorizationRejected>()
+                    .unwrap()
+                    .suppressed
             );
         }
         let mut budget =
@@ -733,31 +743,6 @@ mod http_tests {
             .unwrap();
         assert_eq!(backend.calls(), 3);
         clear(client.relay_auth_binding(&device, "same", SnapshotSource::ClaudeCode));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn otlp_refuses_ungranted_source_without_http_or_an_auth_latch() {
-        let backend = Backend::start(vec![200]);
-        let device = device();
-        assert!(crate::otlp_relay::request_relay_token(
-            &backend.base,
-            &device,
-            "same",
-            SnapshotSource::ClaudeCode
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("not registered"));
-        assert_eq!(backend.calls(), 0);
-        crate::otlp_relay::request_relay_token(
-            &backend.base,
-            &device,
-            "same",
-            SnapshotSource::Codex,
-        )
-        .unwrap();
-        assert_eq!(backend.calls(), 1);
     }
 
     #[test]

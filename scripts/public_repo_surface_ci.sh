@@ -8,12 +8,15 @@ DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$DEFAULT_REPO_ROOT"
 STAGED_OUTPUT_DIR=""
 KEEP_TEMP=0
+SCOPE="all"
 TMP_DIR=""
 script_completed=0
+steps_run=0
 
 usage() {
   cat <<'USAGE'
 Usage: public_repo_surface_ci.sh [--root <dir>] [--staged-output <dir>] [--keep-temp]
+                                [--scope all|portable|macos]
 
 Runs the public repository surface checks that GitHub Actions runs before a
 public commit: schema/registry JSON validation, shellcheck, export gate tests,
@@ -23,6 +26,14 @@ a self-exported staged bundle verification.
 Use --staged-output to copy a generated root-shaped bundle into a temporary git
 checkout before running the same checks. This is the local substitute for public
 GitHub CI while the separate ottto repository is not reachable.
+
+--scope picks which steps run. Each step is portable (P), needed on both Linux
+and macOS (B: the scripts under test run on Macs under /bin/bash 3.2 and BSD
+tools), or macOS-only (M: real plutil, codesign, packaging tools, LaunchServices).
+  all       every step once (default; macOS only)
+  portable  P and B steps (runs on Linux; GitHub CI "Public surface checks")
+  macos     M and B steps plus a /bin/bash 3.2 parse of scripts/*.sh
+            (GitHub CI "Rust contracts" job)
 USAGE
 }
 
@@ -69,6 +80,11 @@ while [[ "$#" -gt 0 ]]; do
       KEEP_TEMP=1
       shift
       ;;
+    --scope)
+      [[ "$#" -ge 2 ]] || fail "--scope requires a value"
+      SCOPE="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       script_completed=1
@@ -80,9 +96,14 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
+case "$SCOPE" in
+  all|portable|macos) ;;
+  *) fail "unknown scope: $SCOPE (use all, portable, or macos)" ;;
+esac
+echo "public-surface-ci: scope=$SCOPE bash=$BASH_VERSION"
+
 require_command git
 require_command jq
-require_command shellcheck
 require_command python3
 require_command cargo
 
@@ -160,11 +181,30 @@ for path in "${required_public_files[@]}"; do
   fi
 done
 
+# Checked only after staged-output preparation and root checks, so their
+# failures (exit 2 with their own message) stay the same on every OS and on a
+# Mac without shellcheck (the macOS scope does not need it).
+if [[ "$SCOPE" != portable && "$(uname -s)" != Darwin ]]; then
+  fail "scope $SCOPE needs macOS; use --scope portable"
+fi
+if [[ "$SCOPE" != macos ]]; then
+  require_command shellcheck
+fi
+
+# run_step <P|B|M> <label> <command...>: see --help for the step classes.
 run_step() {
-  local label="$1"
-  shift
+  local class="$1"
+  local label="$2"
+  shift 2
+  case "$class" in
+    P) [[ "$SCOPE" != macos ]] || return 0 ;;
+    B) ;;
+    M) [[ "$SCOPE" != portable ]] || return 0 ;;
+    *) fail "unknown step class '$class' for: $label" ;;
+  esac
   echo "public-surface-ci: $label"
   (cd "$REPO_ROOT" && "$@")
+  steps_run=$((steps_run + 1))
 }
 
 # PUBLIC_EXPORT_MANIFEST.json is derived from the commit tree
@@ -191,50 +231,57 @@ check_self_export_matches_tree() {
   bash scripts/public_repo_manifest.sh --compare dist/public-export/ottto/PUBLIC_EXPORT_MANIFEST.json
 }
 
-run_step "validate public schemas and generated registry" \
+run_step P "validate public schemas and generated registry" \
   bash -c 'jq empty connectors/registry.generated.json schemas/*.schema.json'
-run_step "shellcheck public scripts" bash -c 'shellcheck scripts/*.sh'
-run_step "test local autoreview helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_autoreview.py
+run_step P "shellcheck public scripts" bash -c 'shellcheck scripts/*.sh'
+run_step P "test local autoreview helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_autoreview.py
+run_step P "test PR merge guard" bash scripts/test_pr_merge_when_mac_green.sh
 
-run_step "test public export check" bash scripts/test_public_repo_export_check.sh
-run_step "run public export check" bash scripts/public_repo_export_check.sh
-run_step "test public export bundle" bash scripts/test_public_repo_export_bundle.sh
-run_step "test public bootstrap plan" bash scripts/test_public_repo_bootstrap_plan.sh
-run_step "test public cutover closeout" bash scripts/test_public_repo_cutover_closeout.sh
-run_step "test public manifest check" bash scripts/test_public_repo_manifest_check.sh
-run_step "test public manifest derivation" bash scripts/test_public_repo_manifest.sh
-run_step "check root manifest is derived from the commit tree" check_root_manifest
-run_step "test public skeleton check" bash scripts/test_public_repo_skeleton_check.sh
-run_step "test public secret scan" bash scripts/test_public_repo_secret_scan.sh
-run_step "test public temp cleanup" bash scripts/test_public_repo_temp_cleanup.sh
-run_step "test public contract check" bash scripts/test_public_repo_contract_check.sh
-run_step "test macOS release gate" bash scripts/test_macos_release_gate.sh
-run_step "test macOS installer channel policy" bash scripts/test_macos_installer_channel_policy.sh
-run_step "test macOS package URL scheme policy" bash scripts/test_macos_package_url_scheme_policy.sh
-run_step "test macOS package root resolution" bash scripts/test_macos_package_root_resolution.sh
-run_step "test macOS Sparkle bundle version and launch policy" bash scripts/test_macos_sparkle_bundle_version.sh
-run_step "test macOS launch smoke" bash scripts/test_macos_launch_smoke.sh
-run_step "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh
-run_step "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh
-run_step "test macOS manifest signature helper" bash scripts/test_macos_manifest_signature.sh
-run_step "test stable-candidate RC gate" bash scripts/test_macos_public_rc_gate.sh
-run_step "test stable preflight gate" bash scripts/test_macos_stable_preflight.sh
-run_step "test stable closeout gate" bash scripts/test_macos_stable_closeout_gate.sh
-run_step "test stable QA evidence template" bash scripts/test_macos_stable_qa_evidence_template.sh
-run_step "test Homebrew formula generator" bash scripts/test_homebrew_formula.sh
-run_step "test hosted native installer generator" bash scripts/test_hosted_native_installer.sh
-run_step "test CycloneDX SBOM generator" bash scripts/test_cyclonedx_sbom.sh
+run_step P "test public export check" bash scripts/test_public_repo_export_check.sh
+run_step P "run public export check" bash scripts/public_repo_export_check.sh
+run_step P "test public export bundle" bash scripts/test_public_repo_export_bundle.sh
+run_step P "test public bootstrap plan" bash scripts/test_public_repo_bootstrap_plan.sh
+run_step P "test public cutover closeout" bash scripts/test_public_repo_cutover_closeout.sh
+run_step P "test public manifest check" bash scripts/test_public_repo_manifest_check.sh
+run_step P "test public manifest derivation" bash scripts/test_public_repo_manifest.sh
+run_step P "check root manifest is derived from the commit tree" check_root_manifest
+run_step P "test public skeleton check" bash scripts/test_public_repo_skeleton_check.sh
+run_step P "test public secret scan" bash scripts/test_public_repo_secret_scan.sh
+run_step B "test public temp cleanup" bash scripts/test_public_repo_temp_cleanup.sh
+run_step P "test public contract check" bash scripts/test_public_repo_contract_check.sh
+run_step B "test macOS release gate" bash scripts/test_macos_release_gate.sh
+run_step P "test macOS installer channel policy" bash scripts/test_macos_installer_channel_policy.sh
+run_step B "test macOS package URL scheme policy" bash scripts/test_macos_package_url_scheme_policy.sh
+run_step M "test macOS package root resolution" bash scripts/test_macos_package_root_resolution.sh
+run_step M "test macOS Sparkle bundle version and launch policy" bash scripts/test_macos_sparkle_bundle_version.sh
+run_step M "test macOS launch smoke" bash scripts/test_macos_launch_smoke.sh
+run_step P "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh
+run_step B "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh
+run_step B "test macOS manifest signature helper" bash scripts/test_macos_manifest_signature.sh
+run_step B "test stable-candidate RC gate" bash scripts/test_macos_public_rc_gate.sh
+run_step B "test stable preflight gate" bash scripts/test_macos_stable_preflight.sh
+run_step B "test stable closeout gate" bash scripts/test_macos_stable_closeout_gate.sh
+run_step B "test stable QA evidence template" bash scripts/test_macos_stable_qa_evidence_template.sh
+run_step B "test Homebrew formula generator" bash scripts/test_homebrew_formula.sh
+run_step B "test hosted native installer generator" bash scripts/test_hosted_native_installer.sh
+run_step B "test CycloneDX SBOM generator" bash scripts/test_cyclonedx_sbom.sh
 
-run_step "generate self-exported public bundle" bash scripts/public_repo_export_bundle.sh --force
-run_step "verify self-exported manifest" \
+# Free macOS /bin/bash 3.2 parse check for the scripts only Linux runs.
+# shellcheck disable=SC2016
+run_step M "parse public scripts with macOS /bin/bash" \
+  /bin/bash -c 'for f in scripts/*.sh; do /bin/bash -n "$f" || exit 1; done'
+
+run_step P "generate self-exported public bundle" bash scripts/public_repo_export_bundle.sh --force
+run_step P "verify self-exported manifest" \
   bash scripts/public_repo_manifest_check.sh --staged-output dist/public-export/ottto
-run_step "verify self-exported manifest matches commit tree" check_self_export_matches_tree
-run_step "verify public skeleton" \
+run_step P "verify self-exported manifest matches commit tree" check_self_export_matches_tree
+run_step P "verify public skeleton" \
   bash -c 'PUBLIC_SKELETON_REPO_ROOT=dist/public-export/ottto scripts/public_repo_skeleton_check.sh'
-run_step "scan self-exported public bundle" \
+run_step P "scan self-exported public bundle" \
   bash scripts/public_repo_secret_scan.sh --staged-output dist/public-export/ottto
-run_step "verify self-exported public contracts" \
+run_step P "verify self-exported public contracts" \
   bash scripts/public_repo_contract_check.sh --staged-output dist/public-export/ottto
 
+echo "public-surface-ci: ran $steps_run steps (scope=$SCOPE)"
 echo "public-surface-ci: completed public surface checks at $REPO_ROOT"
 script_completed=1

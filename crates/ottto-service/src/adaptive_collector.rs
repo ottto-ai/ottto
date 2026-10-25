@@ -201,10 +201,16 @@ impl SourceCadence {
         self.last_full_sweep_at = Some(now);
     }
 
+    /// The Hot tier's floor: the shortest gap the ordinary cadence ever takes.
+    pub fn hot_min_interval(&self) -> Duration {
+        self.config.hot_min_interval
+    }
+
     /// The gap the ordinary cadence wants between scans right now: the tier
     /// floor, or the failure backoff while failing, lengthened by any server
-    /// directive. This policy interval alone does not establish coverage for
-    /// same-revision admission: ordinary cycle and lock delays are unbounded.
+    /// directive. It is a per-page lower bound of ordinary accrual, not
+    /// coverage: ordinary cycle and lock delays are unbounded, and coverage
+    /// for same-revision admission is the guard's.
     pub fn ordinary_interval(&self) -> Duration {
         if self.disabled {
             return self.config.cold_interval;

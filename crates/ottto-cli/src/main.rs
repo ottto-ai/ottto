@@ -65,7 +65,7 @@ enum Command {
     #[command(about = "List apps or refresh app setup status")]
     Apps(AppsArgs),
     #[command(about = "Refresh one source status using the lower-level source noun")]
-    AgentStatus(SourceArgs),
+    AgentStatus(AgentStatusArgs),
     #[command(about = "Print cloud context for AI agents")]
     Context(ContextArgs),
     #[command(about = "Print cloud cost breakdown for AI agents")]
@@ -766,6 +766,17 @@ struct SourceArgs {
     app: Option<SourceArg>,
     #[arg(long, help = "Print one final JSON object and no human summary text")]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct AgentStatusArgs {
+    #[command(flatten)]
+    source: SourceArgs,
+    #[arg(
+        long,
+        help = "Read daemon memory only; never refresh or start the daemon"
+    )]
+    cached: bool,
 }
 
 impl SourceArgs {
@@ -2113,6 +2124,7 @@ fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
     let token = cli.token.unwrap_or_else(default_cli_control_token);
     let socket = cli.socket.unwrap_or_else(default_socket_path);
     let command = local_command(cli.command);
+    let cached = matches!(command, LocalControlCommand::AgentStatusCached { .. });
     let protocol_version = expected_local_control_protocol_version(&command);
     Invocation {
         socket,
@@ -2129,7 +2141,8 @@ fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
             command,
         },
         output_mode,
-        auto_start: should_auto_start(socket_overridden, cli.no_autostart, env_socket_present),
+        auto_start: !cached
+            && should_auto_start(socket_overridden, cli.no_autostart, env_socket_present),
     }
 }
 
@@ -2175,10 +2188,17 @@ fn local_command(command: Command) -> LocalControlCommand {
                 quota_refresh: false,
             },
         },
-        Command::AgentStatus(args) => LocalControlCommand::AgentStatusRefresh {
-            source: Some(args.selected_source()),
-            quota_refresh: false,
-        },
+        Command::AgentStatus(args) => {
+            let source = Some(args.source.selected_source());
+            if args.cached {
+                LocalControlCommand::AgentStatusCached { source }
+            } else {
+                LocalControlCommand::AgentStatusRefresh {
+                    source,
+                    quota_refresh: false,
+                }
+            }
+        }
         Command::Context(args) => LocalControlCommand::AgentContext {
             query: args.query(),
         },
@@ -2292,7 +2312,8 @@ fn command_json(command: &Command) -> bool {
         Command::Sessions(args) => args.json,
         Command::Recommendations(args) => args.json,
         Command::ProviderImpact(args) => args.json,
-        Command::AgentStatus(args) | Command::Fix(args) => args.json,
+        Command::AgentStatus(args) => args.source.json,
+        Command::Fix(args) => args.json,
         Command::Verify(args) => args.json,
         Command::Diagnostics {
             command: DiagnosticsCommand::Collect(args),
@@ -2386,6 +2407,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::Receipts { .. } => "receipts",
         LocalControlCommand::AuthStatus => "auth_status",
         LocalControlCommand::AgentStatusRefresh { .. } => "agent_status_refresh",
+        LocalControlCommand::AgentStatusCached { .. } => "agent_status_cached",
         LocalControlCommand::PersonalMeterLocalSnapshot { .. } => "personal_meter_local_snapshot",
         LocalControlCommand::AgentContext { .. } => "agent_context",
         LocalControlCommand::AgentCosts { .. } => "agent_costs",
@@ -4214,6 +4236,33 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_cached_uses_distinct_fast_verb_without_autostart() {
+        let cli = Cli::parse_from([
+            "ottto",
+            "--token",
+            "test-token",
+            "agent-status",
+            "--app",
+            "claude-code",
+            "--cached",
+            "--json",
+        ]);
+        let mut invocation = invocation_from_cli(cli);
+        assert!(!invocation.auto_start);
+        assert!(!is_long_running_command(&invocation.request.command));
+        assert_eq!(
+            local_command_name(&invocation.request.command),
+            "agent_status_cached"
+        );
+        invocation.request.request_id = "req_cli_agent_status_cached_fixture".into();
+        invocation.request.client_install_owner = None;
+        assert_request_matches_fixture(
+            &invocation,
+            include_str!("../../../fixtures/cli/agent-status-cached-request.json"),
+        );
+    }
+
+    #[test]
     fn agent_status_builds_refresh_request() {
         let invocation = build_invocation(
             Cli {
@@ -4221,10 +4270,13 @@ mod tests {
                 token: Some("token".to_string()),
                 no_autostart: false,
                 watch: false,
-                command: Command::AgentStatus(SourceArgs {
-                    source: Some(SourceArg::Codex),
-                    app: None,
-                    json: true,
+                command: Command::AgentStatus(AgentStatusArgs {
+                    source: SourceArgs {
+                        source: Some(SourceArg::Codex),
+                        app: None,
+                        json: true,
+                    },
+                    cached: false,
                 }),
             },
             OutputMode::Json,

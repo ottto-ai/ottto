@@ -60,7 +60,7 @@ pub(crate) use codex_saved_quota::scheduled_round_now as codex_scheduled_round_n
 pub use codex_saved_quota::start_codex_quota_scheduler;
 pub(crate) use codex_saved_quota::{
     refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
-    with_codex_home_read_lock,
+    wake_codex_quota_scheduler, with_codex_home_read_lock,
 };
 #[cfg(test)]
 pub(crate) use codex_setup_gate::SetupGateTestClock;
@@ -2259,6 +2259,13 @@ fn collect_codex_slot_candidates(
 
 /// The default Codex home and every accepted managed slot home.
 fn codex_home_slots(status: &CodexAccountsStatusV1) -> Vec<CodexHomeSlot> {
+    codex_home_slots_checked(status).0
+}
+
+/// [`codex_home_slots`], and whether every settings read it made succeeded:
+/// `false` when the registered bindings or an accepted slot's home could not
+/// be read, so a slot may be missing for a reason that can pass.
+fn codex_home_slots_checked(status: &CodexAccountsStatusV1) -> (Vec<CodexHomeSlot>, bool) {
     let store = FileCodexAccountSlotSettingsStore::default();
     let mut slots = vec![CodexHomeSlot {
         slot_id: "default".to_string(),
@@ -2266,8 +2273,9 @@ fn codex_home_slots(status: &CodexAccountsStatusV1) -> Vec<CodexHomeSlot> {
         home: default_codex_home(),
         registered_binding: None,
     }];
-    let registered = store
-        .registered_bindings()
+    let registered = store.registered_bindings();
+    let mut complete = registered.is_ok();
+    let registered = registered
         .unwrap_or_default()
         .into_iter()
         .filter(|binding| binding.accepted)
@@ -2276,6 +2284,7 @@ fn codex_home_slots(status: &CodexAccountsStatusV1) -> Vec<CodexHomeSlot> {
     for descriptor in &status.managed_slots {
         if let Some(binding) = registered.get(&descriptor.slot_id) {
             let Ok(home) = store.slot_home(&descriptor.slot_id) else {
+                complete = false;
                 continue;
             };
             slots.push(CodexHomeSlot {
@@ -2289,7 +2298,7 @@ fn codex_home_slots(status: &CodexAccountsStatusV1) -> Vec<CodexHomeSlot> {
             });
         }
     }
-    slots
+    (slots, complete)
 }
 
 fn collect_codex_home_candidate(
@@ -10061,6 +10070,7 @@ fn claude_desktop_builder_plan_observation(
         .and_then(|seconds| u64::try_from(seconds).ok())
         .and_then(rfc3339_from_unix_seconds);
     Some(AgentStatusPlanObservation {
+        desktop_recent_at: None,
         observed_at: activity_observed_at,
         evidence_method: Some("claude_desktop_session_bucket".to_string()),
         source_session_id: builder.latest_session_id,
@@ -10221,6 +10231,7 @@ fn claude_desktop_pair_observation(
     Some(ClaudeDesktopPairObservation {
         binding,
         observation: AgentStatusPlanObservation {
+            desktop_recent_at: None,
             observed_at: u64::try_from(activity)
                 .ok()
                 .and_then(rfc3339_from_unix_seconds),
@@ -14954,6 +14965,7 @@ fn plan_observation_from_snapshot_account(
         return None;
     }
     Some(AgentStatusPlanObservation {
+        desktop_recent_at: None,
         observed_at: Some(snapshot.captured_at.clone()),
         evidence_method: Some(collection_method_key(&snapshot.collection_method).to_string()),
         source_session_id: None,
@@ -15084,6 +15096,7 @@ fn append_pi_route_plan_observations(snapshot: &mut AgentStatusSnapshot) {
             continue;
         }
         snapshot.plan_observations.push(AgentStatusPlanObservation {
+            desktop_recent_at: None,
             observed_at: Some(observed_at.clone()),
             evidence_method: Some("pi_route_metadata".to_string()),
             source_session_id: None,
@@ -15478,6 +15491,28 @@ fn codex_credential_claimed_ids(credentials: &CodexAuthCredentials) -> Option<(S
         }
     }
     Some((account_id, raw_workspace_id))
+}
+
+/// When the binding a credential claims ([`codex_credential_claimed_binding`])
+/// lapses: the earliest expiry of the tokens it is checked against. `None`
+/// when a token's expiry cannot be read.
+fn codex_credential_claim_lapses_at(credentials: &CodexAuthCredentials) -> Option<u64> {
+    [
+        credentials.access_token.as_deref(),
+        credentials.id_token.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|token| {
+        structurally_valid_live_codex_jwt_claims(token)?
+            .get("exp")?
+            .as_i64()
+            .and_then(|expires_at| u64::try_from(expires_at).ok())
+    })
+    .try_fold(u64::MAX, |earliest, expires_at| {
+        Some(earliest.min(expires_at?))
+    })
+    .filter(|earliest| *earliest != u64::MAX)
 }
 
 /// The account identifier hash the credential claims (not validated), for
@@ -16010,6 +16045,64 @@ struct CodexAppServerRun {
 /// rate-limits read.
 const CODEX_APP_SERVER_MIN_REQUESTS: u32 = 2;
 
+/// Bound on one `codex app-server` quota session: [`CODEX_APP_SERVER_TIMEOUT`],
+/// or a test's scaled bound.
+fn codex_app_server_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeouts) = codex_app_server_test_timeouts() {
+        return timeouts.session;
+    }
+    CODEX_APP_SERVER_TIMEOUT
+}
+
+/// Scaled app-server bounds for tests only; production constants are never
+/// changed.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct CodexAppServerTestTimeouts {
+    session: Duration,
+    detail_min: Duration,
+    detail_max: Duration,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CODEX_APP_SERVER_TEST_TIMEOUTS: std::cell::Cell<Option<CodexAppServerTestTimeouts>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn codex_app_server_test_timeouts() -> Option<CodexAppServerTestTimeouts> {
+    CODEX_APP_SERVER_TEST_TIMEOUTS.with(std::cell::Cell::get)
+}
+
+/// Runs `run` with the session bound and the detailed read's budget bounds
+/// scaled down. The session runs on the calling thread, so the override
+/// reaches it and no other test.
+#[cfg(test)]
+fn with_codex_app_server_test_timeouts<T>(
+    session: Duration,
+    detail_min: Duration,
+    detail_max: Duration,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CODEX_APP_SERVER_TEST_TIMEOUTS.with(|timeouts| timeouts.set(None));
+        }
+    }
+    CODEX_APP_SERVER_TEST_TIMEOUTS.with(|timeouts| {
+        timeouts.set(Some(CodexAppServerTestTimeouts {
+            session,
+            detail_min,
+            detail_max,
+        }))
+    });
+    let _reset = Reset;
+    run()
+}
+
 /// One `codex app-server` quota session for `codex_home`, logged as one
 /// provider-call line when the CLI started.
 fn call_codex_app_server_rate_limits_for_home(
@@ -16144,7 +16237,7 @@ fn run_codex_app_server_rate_limits_for_home(
     }
 
     let start = Instant::now();
-    let mut deadline = start + CODEX_APP_SERVER_TIMEOUT;
+    let mut deadline = start + codex_app_server_timeout();
     let mut initialize_error = None;
     let mut initialize_completed = false;
     let mut disconnected = false;
@@ -24335,12 +24428,29 @@ for line in sys.stdin:
     #[test]
     #[serial]
     fn codex_probe_deadline_is_a_timeout_with_its_phase_not_an_eof() {
+        let session = Duration::from_secs(6);
         let started = Instant::now();
-        let message = run_codex_probe_failure_fake("account_timeout")
-            .err()
-            .expect("deadline");
+        let message = with_codex_app_server_test_timeouts(
+            session,
+            Duration::from_secs(3),
+            Duration::from_secs(6),
+            || {
+                assert_eq!(codex_app_server_timeout(), session);
+                run_codex_probe_failure_fake("account_timeout")
+            },
+        )
+        .err()
+        .expect("deadline");
         assert_eq!(message, "Codex app-server account read timed out.");
-        assert!(started.elapsed() >= CODEX_APP_SERVER_TIMEOUT);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= session);
+        // The scaled bound, not the production one, ended the session.
+        assert!(elapsed < CODEX_APP_SERVER_TIMEOUT, "{elapsed:?}");
+    }
+
+    #[test]
+    fn codex_app_server_timeout_is_twenty_seconds_without_a_test_override() {
+        assert_eq!(codex_app_server_timeout(), Duration::from_secs(20));
     }
 
     #[cfg(unix)]
@@ -36130,6 +36240,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         );
         let observation =
             |hash: Option<&str>, confidence: AgentStatusConfidence| AgentStatusPlanObservation {
+                desktop_recent_at: None,
                 observed_at: Some("2026-08-04T10:00:00Z".to_string()),
                 evidence_method: Some("claude_desktop_session_bucket".to_string()),
                 source_session_id: None,
@@ -36246,6 +36357,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let pair = |account: &str, organization: &str| ClaudeDesktopPairObservation {
             binding: ClaudeStrongBinding::new(account, organization).expect("binding"),
             observation: AgentStatusPlanObservation {
+                desktop_recent_at: None,
                 account_identifier_hash: Some(account.to_string()),
                 organization_identifier_hash: Some(organization.to_string()),
                 ..observation(Some(account), AgentStatusConfidence::High)
