@@ -44353,13 +44353,6 @@ impl ScanIndex {
         }) {
             return false;
         }
-        if self.files.contains_key(key) {
-            if let Some((root, member)) = claude_index_path_family_member(Path::new(key)) {
-                if let Some(pending) = self.claude_account_family_pending.get_mut(&root) {
-                    pending.confirmed_absent_members.insert(member);
-                }
-            }
-        }
         self.files.remove(key);
         self.terminal_jsonl_dispositions.remove(key);
         self.confirmed_empty_files.remove(key);
@@ -44382,6 +44375,13 @@ impl ScanIndex {
             self.codex_parent_ownership_ledgers.remove(&session_id);
         }
         self.remember_removed_read_witness(key);
+        if self.files.contains_key(key) {
+            if let Some((root, member)) = claude_index_path_family_member(Path::new(key)) {
+                if let Some(pending) = self.claude_account_family_pending.get_mut(&root) {
+                    pending.confirmed_absent_members.insert(member);
+                }
+            }
+        }
         self.files.remove(key);
         self.terminal_jsonl_dispositions.remove(key);
         self.confirmed_empty_files.remove(key);
