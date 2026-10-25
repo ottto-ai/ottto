@@ -34708,15 +34708,7 @@ impl CodexTitleMetadata {
 
     #[cfg(test)]
     fn session_sidecar_fingerprint(&self, source_session_id: &str) -> String {
-        self.session_sidecar_fingerprint_for(source_session_id, false)
-    }
-
-    fn session_sidecar_fingerprint_for(
-        &self,
-        source_session_id: &str,
-        reduction_only: bool,
-    ) -> String {
-        self.session_sidecar_fingerprint_in(source_session_id, reduction_only, None)
+        self.session_sidecar_fingerprint_in(source_session_id, false, None)
     }
 
     fn thread_extent_for_path(

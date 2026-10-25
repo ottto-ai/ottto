@@ -163,6 +163,12 @@ fn five_roots_46_copied_threads_recover_census_and_count_each_once() {
         .iter()
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
+    let unacknowledged =
+        index.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
+    assert!(
+        unacknowledged.files.is_empty(),
+        "lost upload ACK cannot checkpoint any alias"
+    );
     let settled = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
     let (_, again) = fixture.scan(settled);
     assert!(again.census_complete, "{again:?}");
@@ -246,4 +252,44 @@ fn synthetic_reduction_and_alias_failures_are_retryable_not_hidden_by_copy_recov
     // Only a genuinely clean subsequent traversal may complete the census.
     let (_, clean) = fixture.scan(ScanIndex::default());
     assert!(clean.census_complete, "{clean:?}");
+}
+
+#[test]
+fn stale_metadata_in_four_homes_with_one_physical_rollout_completes() {
+    let fixture = Fixture::new(1);
+    for root in &fixture.roots[2..] {
+        let row =
+            &fixture.metadata().root_sidecars[root.parent().unwrap()].threads[&fixture.ids[0]];
+        fs::remove_file(row.rollout_path.as_ref().unwrap()).unwrap();
+    }
+    let metadata = fixture.metadata();
+    assert!(metadata.identity_conflicts.is_empty());
+    assert_eq!(metadata.state_threads[&fixture.ids[0]].tokens_used, 400);
+    let (_, scan) = fixture.scan(ScanIndex::default());
+    assert!(scan.census_complete, "{scan:?}");
+    assert_eq!(scan.snapshots.len(), 1);
+    assert_eq!(scan.snapshots[0].input_tokens, 400);
+}
+
+#[test]
+fn identical_headers_do_not_authorize_divergent_copied_body_records() {
+    let fixture = Fixture::new(1);
+    let metadata = fixture.metadata();
+    let row = &metadata.root_sidecars[fixture.roots[2].parent().unwrap()].threads[&fixture.ids[0]];
+    let path = row.rollout_path.as_ref().unwrap();
+    let body = fs::read_to_string(path).unwrap();
+    fs::write(path, body.replace("r-1", "q-1")).unwrap();
+    let (index, scan) = fixture.scan(ScanIndex::default());
+    assert!(!scan.census_complete);
+    assert!(scan.snapshots.is_empty());
+    assert!(index.files.is_empty());
+    assert_eq!(scan.ownership_incomplete_file_count, 4);
+    let diagnostic = scan.local_codex_diagnostics.unwrap();
+    let causes = serde_json::to_value(
+        diagnostic
+            .unreadable_causes
+            .projection(scan.unreadable_path_count as u64),
+    )
+    .unwrap();
+    assert_eq!(causes["counts"][5], 1);
 }
