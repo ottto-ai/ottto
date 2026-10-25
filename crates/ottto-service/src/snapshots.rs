@@ -3855,6 +3855,9 @@ const fn legacy_snapshot_item_wire_byte_limit() -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotQuarantineRecord {
+    /// Reconstruction semantics last assessed; legacy records were assessed under v1.
+    #[serde(default = "terminal_contract_retry::legacy_contract")]
+    pub reconstruction_contract: u16,
     pub witness: SnapshotQuarantineWitness,
     pub retry_after_unix_seconds: u64,
     /// Optional exact hash-neutral body rejected under this contract. A body
@@ -3898,6 +3901,7 @@ pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineR
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     SnapshotQuarantineRecord {
+        reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
         witness: snapshot_quarantine_witness(source),
         retry_after_unix_seconds: now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS),
         upload_body_witness: None,
@@ -4218,6 +4222,9 @@ include!("snapshots/load_containment.rs");
 mod lenient_decode;
 #[cfg(test)]
 mod lenient_decode_tests;
+pub(crate) mod terminal_contract_retry;
+#[cfg(test)]
+mod terminal_contract_retry_tests;
 
 #[cfg(test)]
 pub(crate) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST: u8 =
@@ -41681,6 +41688,8 @@ impl ScanIndex {
             self.quarantined_snapshot_fingerprints.insert(
                 fingerprint.clone(),
                 SnapshotQuarantineRecord {
+                    reconstruction_contract:
+                        crate::snapshots::terminal_contract_retry::current_contract(),
                     witness: witness.clone(),
                     retry_after_unix_seconds: 0,
                     upload_body_witness: None,
@@ -42216,6 +42225,11 @@ impl ScanIndex {
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
                 }
+                let active_witness = source.map(snapshot_quarantine_witness);
+                terminal_contract_retry::rearm(
+                    &mut index.quarantined_snapshot_fingerprints,
+                    active_witness.as_ref(),
+                );
                 index.codex_parent_proof_parents_live =
                     codex_parent_proof_parents_live(&index.codex_parent_prefix_proofs);
                 Ok((index, LoadOrigin::Loaded(opened)))
@@ -47279,6 +47293,7 @@ mod tests {
     fn quarantine_deadline_never_becomes_authoritative_after_clock_rollback() {
         let original_now = 1_000_000;
         let record = SnapshotQuarantineRecord {
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: snapshot_quarantine_witness(SnapshotSource::Codex),
             retry_after_unix_seconds: original_now
                 + SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2),
@@ -48539,6 +48554,8 @@ mod tests {
             quarantined_snapshot_fingerprints: BTreeMap::from([(
                 fingerprint,
                 SnapshotQuarantineRecord {
+                    reconstruction_contract:
+                        crate::snapshots::terminal_contract_retry::current_contract(),
                     witness: stale_witness,
                     retry_after_unix_seconds: u64::MAX,
                     upload_body_witness: None,
@@ -49315,6 +49332,8 @@ mod tests {
         index.quarantined_snapshot_fingerprints.insert(
             fingerprint.clone(),
             SnapshotQuarantineRecord {
+                reconstruction_contract:
+                    crate::snapshots::terminal_contract_retry::current_contract(),
                 witness: snapshot_quarantine_witness(SnapshotSource::Pi),
                 retry_after_unix_seconds: 0,
                 upload_body_witness: None,
@@ -81067,6 +81086,8 @@ mod tests {
         index.quarantined_snapshot_fingerprints.insert(
             "old-entity".into(),
             SnapshotQuarantineRecord {
+                reconstruction_contract:
+                    crate::snapshots::terminal_contract_retry::current_contract(),
                 witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
                 retry_after_unix_seconds: 0,
                 upload_body_witness: Some("old-body".into()),
@@ -81144,6 +81165,7 @@ mod tests {
             .insert("refused-entity".into(), Some("2026-10-14T10:00:00Z".into()));
         // The newer conflict on the exact refused body, its timer due.
         let conflict = SnapshotQuarantineRecord {
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
             retry_after_unix_seconds: 0,
             upload_body_witness: Some("refused-body".into()),
@@ -82689,7 +82711,7 @@ crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash,
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);
 crate::heap_layout_bound::fields!(SnapshotOrigin; thread_source, source, source_subagent, originator, agent_role, entrypoint, is_sidechain, session_kind, used_workflow_orchestration, parent_session_ref);
 crate::heap_layout_bound::fields!(SnapshotProvenance; collector, source_file_count, input_token_scope, state_total_tokens, state_archived);
-crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition);
+crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contract, witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition);
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
 crate::heap_layout_bound::fields!(SnapshotToolUsage; name, count);
 crate::heap_layout_bound::fields!(SnapshotUsageBucket; bucket_start, model_usage, first_activity_at, last_activity_at);

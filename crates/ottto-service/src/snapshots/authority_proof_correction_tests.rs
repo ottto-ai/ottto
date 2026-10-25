@@ -1615,6 +1615,7 @@ fn terminal_refusal_requires_current_proof_revision_body_and_nonpartial_outcome(
     base.quarantined_snapshot_fingerprints.insert(
         fp.clone(),
         SnapshotQuarantineRecord {
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
             retry_after_unix_seconds: 0,
             upload_body_witness: Some(body.clone()),

@@ -51,6 +51,7 @@ fn lc_fixture() -> ScanIndex {
     index.quarantined_snapshot_fingerprints.insert(
         lc_hex('f'),
         SnapshotQuarantineRecord {
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
             retry_after_unix_seconds: 0,
             upload_body_witness: None,

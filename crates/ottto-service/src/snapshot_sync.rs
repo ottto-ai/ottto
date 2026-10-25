@@ -1126,6 +1126,8 @@ struct SnapshotUploadProgress {
     attempted_reason_reoffers: BTreeSet<String>,
     #[serde(skip)]
     reason_reoffer_counts: reason_reoffer::ReofferCounts,
+    #[serde(skip)]
+    terminal_contract_retry_pending_save: bool,
 }
 
 impl SnapshotUploadProgress {
@@ -1164,6 +1166,7 @@ impl SnapshotUploadProgress {
             active_reason_reoffers: BTreeMap::new(),
             attempted_reason_reoffers: BTreeSet::new(),
             reason_reoffer_counts: reason_reoffer::ReofferCounts::default(),
+            terminal_contract_retry_pending_save: false,
         }
     }
 
@@ -1263,6 +1266,20 @@ impl SnapshotUploadProgress {
                 ));
             }
         };
+        let permanent = &progress.permanent_rejections;
+        progress.terminal_contract_retry_pending_save =
+            crate::snapshots::terminal_contract_retry::rearm(
+                progress
+                    .quarantined_fingerprints
+                    .iter_mut()
+                    .filter(|(fingerprint, record)| {
+                        !permanent.get(*fingerprint).is_some_and(|refusal| {
+                            record.upload_body_witness.as_deref()
+                                == Some(refusal.body_witness.as_str())
+                        })
+                    }),
+                Some(&active_quarantine_witness),
+            ) > 0;
         progress.active_quarantine_witness = Some(active_quarantine_witness);
         progress.active_quarantine_retries.clear();
         progress.active_reason_reoffers.clear();
@@ -1289,6 +1306,8 @@ impl SnapshotUploadProgress {
         self.active_reason_reoffers.clear();
         self.attempted_reason_reoffers.clear();
         self.reason_reoffer_counts = reason_reoffer::ReofferCounts::default();
+        let mut contract_retry_changed =
+            std::mem::take(&mut self.terminal_contract_retry_pending_save);
         // The upload ledger is saved immediately after an exact ACK, before
         // the index can retire its older quarantine. On crash/restart that ACK
         // is the stronger fact and must not be overwritten by restoring the
@@ -1319,15 +1338,24 @@ impl SnapshotUploadProgress {
                     .quarantined_fingerprints
                     .get(fingerprint)
                     .is_some_and(|old| {
-                        old.witness.item_wire_byte_limit < record.witness.item_wire_byte_limit
+                        old.reconstruction_contract < record.reconstruction_contract
+                            || (old.reconstruction_contract == record.reconstruction_contract
+                                && old.witness.item_wire_byte_limit
+                                    < record.witness.item_wire_byte_limit)
                     })
                 {
+                    contract_retry_changed |= self.quarantined_fingerprints[fingerprint]
+                        .reconstruction_contract
+                        < record.reconstruction_contract;
                     self.quarantined_fingerprints
                         .insert(fingerprint.clone(), record.clone());
                 }
                 self.quarantined_fingerprints
                     .entry(fingerprint.clone())
-                    .or_insert_with(|| record.clone());
+                    .or_insert_with(|| {
+                        contract_retry_changed |= record.reconstruction_contract > 1;
+                        record.clone()
+                    });
             }
         }
         // The server-permanent exact-body fact dominates an older index timer.
@@ -1444,6 +1472,7 @@ impl SnapshotUploadProgress {
             self.quarantined_fingerprints.insert(
                 fingerprint.clone(),
                 SnapshotQuarantineRecord {
+                    reconstruction_contract: record.reconstruction_contract,
                     witness: active.clone(),
                     retry_after_unix_seconds: quarantine_retry_after(fingerprint),
                     upload_body_witness: record.upload_body_witness,
@@ -1453,7 +1482,7 @@ impl SnapshotUploadProgress {
             );
         }
         self.active_quarantine_retries = retry;
-        !self.active_quarantine_retries.is_empty() || reoffer_changed
+        !self.active_quarantine_retries.is_empty() || reoffer_changed || contract_retry_changed
     }
 
     /// Due, exactly bound refusal re-offers: fingerprint -> (deadline, body).
@@ -1817,13 +1846,22 @@ impl SnapshotUploadProgress {
             .active_quarantine_witness
             .clone()
             .expect("upload progress always has an active quarantine witness");
-        let failed_reconstruction_count = self
+        let existing = self
             .quarantined_fingerprints
             .get(fingerprint)
             .filter(|record| {
                 record.witness == witness
                     && record.upload_body_witness.as_deref() == Some(body_witness)
-            })
+            });
+        let reconstruction_contract = existing.map_or(
+            crate::snapshots::terminal_contract_retry::current_contract(),
+            |record| {
+                record
+                    .reconstruction_contract
+                    .max(crate::snapshots::terminal_contract_retry::current_contract())
+            },
+        );
+        let failed_reconstruction_count = existing
             .map(|record| record.failed_reconstruction_count.saturating_add(1))
             .unwrap_or(1)
             .min(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES);
@@ -1835,6 +1873,7 @@ impl SnapshotUploadProgress {
         self.quarantined_fingerprints.insert(
             fingerprint.to_string(),
             SnapshotQuarantineRecord {
+                reconstruction_contract,
                 witness,
                 retry_after_unix_seconds: if disposition
                     == SnapshotQuarantineDisposition::UnprovenTerminal
@@ -2423,7 +2462,7 @@ fn current_unix_seconds() -> u64 {
         .unwrap_or_default()
 }
 
-fn quarantine_retry_after(fingerprint: &str) -> u64 {
+pub(crate) fn quarantine_retry_after(fingerprint: &str) -> u64 {
     let digest = Sha256::digest(fingerprint.as_bytes());
     let jitter = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"))
         % SNAPSHOT_QUARANTINE_RETRY_SECONDS;
@@ -3291,7 +3330,7 @@ impl SyncCounts {
             "snapshot terminal_census source={source} census_complete={} scanned_files={} \
              uploaded={} unproven_terminal={} superseded_terminal={} \
              ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
-             dropped_usage_records={} cooldown_conflict_deferred={}",
+             dropped_usage_records={} cooldown_conflict_deferred={} terminal_contract_retry={}",
             self.census_complete,
             self.scanned_file_count,
             self.uploaded_count,
@@ -3301,6 +3340,7 @@ impl SyncCounts {
             self.zero_snapshot_usage_evidence_count,
             self.dropped_usage_record_count,
             self.cooldown_conflict_deferred,
+            crate::snapshots::terminal_contract_retry::local_count(),
         )
     }
 
@@ -10805,6 +10845,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod terminal_contract_retry_tests {
+        include!("snapshot_sync/terminal_contract_retry_tests.rs");
+    }
     use crate::snapshots::finalize_scan_after_policy;
     #[test]
     fn retry_copy_keeps_compaction_events_and_never_local_context_points() {
@@ -16486,6 +16529,8 @@ mod tests {
         corrupt.quarantined_fingerprints.insert(
             fingerprint,
             SnapshotQuarantineRecord {
+                reconstruction_contract:
+                    crate::snapshots::terminal_contract_retry::current_contract(),
                 witness: test_quarantine_witness(),
                 retry_after_unix_seconds: u64::MAX,
                 upload_body_witness: None,
@@ -17141,6 +17186,8 @@ mod tests {
             progress.quarantined_fingerprints.insert(
                 format!("{value:064x}"),
                 SnapshotQuarantineRecord {
+                    reconstruction_contract:
+                        crate::snapshots::terminal_contract_retry::current_contract(),
                     witness: witness.clone(),
                     retry_after_unix_seconds: value as u64,
                     upload_body_witness: None,
@@ -22813,7 +22860,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
