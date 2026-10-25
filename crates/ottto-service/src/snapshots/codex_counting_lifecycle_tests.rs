@@ -1006,18 +1006,37 @@ fn cap_eviction_receipts_correlate_a_later_v2_selection_after_selected_reload() 
 }
 
 #[test]
-fn cap_eviction_with_a_live_legacy_carrier_does_not_record_a_flip_candidate() {
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+fn cap_eviction_with_a_live_legacy_carrier_does_not_report_a_flip() {
     for bound in [true, false] {
-        let mut index = ScanIndex::default();
+        let acked = acked_original(false, bound);
+        let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
         let owner = codex_protected_owner(SESSION);
-        let key = format!("/synthetic/sessions/rollout-{SESSION}.jsonl");
-        index
-            .files
-            .insert(key, acked_entry(false, bound.then_some(owner.clone())));
+        let mut index = acked.previous.clone();
         evict_counting_owner(&mut index, &owner, None);
         assert_eq!(index.codex_counting_evictions, [0, 0, 1]);
-        assert!(index.codex_counting_evicted_legacy.is_empty());
+        assert!(
+            !index.codex_counting_evicted_legacy.is_empty(),
+            "record loss without an index walk per eviction"
+        );
+        write(&acked.original, &rows(200));
+        let result = scan_at(&acked.root, &mut index, "2026-10-07T23:00:00Z");
+        let receipts = result.codex_counting_v2.as_deref().unwrap();
+        assert_eq!(
+            receipts.tombstone_evictions_not_provably_pre_cutover_legacy,
+            1
+        );
+        assert_eq!(receipts.legacy_to_v2_after_tombstone_eviction, 0);
+        assert_eq!(
+            receipts.v2_sessions, 0,
+            "the remaining carrier keeps Legacy"
+        );
+        if bound {
+            assert!(
+                index.codex_counting_evicted_legacy.is_empty(),
+                "committed binding absorbs the record"
+            );
+        }
+        fs::remove_dir_all(acked.root).unwrap();
     }
 }
 

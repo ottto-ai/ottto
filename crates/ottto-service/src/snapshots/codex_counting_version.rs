@@ -121,8 +121,8 @@ impl AckEvidence {
 /// if no safer slot exists, refuse retirement until a later generation.
 pub(super) const MAX_COUNTING_TOMBSTONES: usize = 1024;
 
-/// Diagnostic correlation only: newest 256 owners whose last known Legacy
-/// carrier was removed by a not-provably-pre-cutover cap eviction. Persisted
+/// Diagnostic correlation only: newest 256 owners whose Legacy tombstone
+/// was removed by a not-provably-pre-cutover cap eviction. Persisted
 /// because a moved owner can be parsed on a later scan or after restart. FIFO
 /// displacement ages records; a committed live ACK absorbs them. Never read
 /// by version selection, reuse, ACK, settlement or dedup logic.
@@ -159,23 +159,6 @@ impl<'de> Deserialize<'de> for EvictedLegacyOwners {
         }
         Ok(recent)
     }
-}
-
-/// Match the same proven binding / conservative filename hint as retirement.
-/// No inventory, filesystem read or allocation proportional to the index.
-fn live_legacy_carrier(files: &BTreeMap<String, ScanIndexEntry>, owner: &str) -> bool {
-    files.iter().any(|(key, entry)| {
-        let evidence = AckEvidence::of_view(Some(entry));
-        match proven_owner(entry) {
-            Some(binding) => binding == owner && evidence == AckEvidence::LegacyAcked,
-            None if evidence != AckEvidence::None => {
-                codex_session_id_candidates_from_path(Path::new(key))
-                    .iter()
-                    .any(|id| codex_protected_owner(id) == owner)
-            }
-            None => false,
-        }
-    })
 }
 
 /// A diagnostic observation of an actual V2 decision, correlated with a lost
@@ -336,7 +319,12 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
             counts[class] += 1;
             index.codex_counting_evictions[class] =
                 index.codex_counting_evictions[class].saturating_add(1);
-            if class == 2 && !live_legacy_carrier(&index.files, &owner) {
+            if class == 2 {
+                // Record the loss without walking/hashing the file index per
+                // eviction. Surviving ACKs are absorbed in the single existing
+                // inventory pass below; any remaining Legacy carrier also
+                // forces Legacy through ordinary evidence selection, so only
+                // loss of the last carrier can produce a V2 flip receipt.
                 index.codex_counting_evicted_legacy.remember(owner);
             }
         }

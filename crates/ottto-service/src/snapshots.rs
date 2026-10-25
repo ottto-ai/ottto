@@ -3593,7 +3593,7 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_map"
     )]
     codex_counting_tombstones: BTreeMap<String, codex_counting_version::CountingTombstone>,
-    /// Diagnostic-only bounded FIFO of evicted last Legacy carriers. Last
+    /// Diagnostic-only bounded FIFO of evicted Legacy tombstones. Last
     /// serialized field; old indexes default empty, damaged values are dropped.
     #[serde(
         default,
