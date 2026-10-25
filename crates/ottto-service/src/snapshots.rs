@@ -4270,6 +4270,7 @@ struct ClaudeAccountFamilyPendingWindow {
     census_window_end: String,
     account_identifier_hash: String,
     evidence_request_count: u128,
+    census_complete: bool,
     members: BTreeMap<String, u64>,
     member_requests: BTreeMap<String, ClaudeAccountRequestSet>,
     invalid: bool,
@@ -4283,22 +4284,17 @@ impl Serialize for ClaudeAccountFamilyPendingWindow {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("v", &self.version)?;
-        map.serialize_entry("w", &self.census_window_end)?;
-        map.serialize_entry("a", &self.account_identifier_hash)?;
-        map.serialize_entry("e", &self.evidence_request_count)?;
-        // Normal members' exact counts are already encoded in the packed
-        // lengths. Preserve explicit counts for malformed/incomplete holds.
-        let implicit_members = self.members.len() == self.member_requests.len()
-            && self.members.iter().all(|(member, count)| {
-                self.member_requests.get(member).is_some_and(|set| {
-                    (set.prefixes.len() as u128 * 3 / 4 / 8) == u128::from(*count)
-                })
-            });
-        if !implicit_members {
-            map.serialize_entry("members", &self.members)?;
+        map.serialize_entry("census_window_end", &self.census_window_end)?;
+        map.serialize_entry("account_identifier_hash", &self.account_identifier_hash)?;
+        map.serialize_entry("evidence_request_count", &self.evidence_request_count)?;
+        // Older readers require these fields. They ignore v/r/archives and
+        // decode empty full-hash evidence without quarantining the index.
+        map.serialize_entry("members", &self.members)?;
+        if self.census_complete {
+            map.serialize_entry("complete", &true)?;
         }
         map.serialize_entry("r", &self.member_requests)?;
-        map.serialize_entry("i", &self.invalid)?;
+        map.serialize_entry("invalid", &self.invalid)?;
         map.end()
     }
 }
@@ -4318,6 +4314,8 @@ struct ClaudeAccountFamilyPendingWire {
     account_identifier_hash: String,
     #[serde(rename = "e", alias = "evidence_request_count")]
     evidence_request_count: u128,
+    #[serde(default, rename = "complete")]
+    census_complete: bool,
     #[serde(default)]
     members: BTreeMap<String, u64>,
     #[serde(default)]
@@ -4377,6 +4375,7 @@ impl From<ClaudeAccountFamilyPendingWire> for ClaudeAccountFamilyPendingWindow {
             census_window_end: wire.census_window_end,
             account_identifier_hash: wire.account_identifier_hash,
             evidence_request_count: wire.evidence_request_count,
+            census_complete: wire.census_complete,
             members,
             member_requests,
             invalid,
@@ -7519,6 +7518,11 @@ pub fn apply_claude_effort_evidence_with_index(
         &proven_families,
     );
     if census_complete {
+        for pending in index.claude_account_family_pending.values_mut() {
+            if pending.census_window_end == census_window_end {
+                pending.census_complete = true;
+            }
+        }
         let current_source_session_ids = snapshots
             .iter()
             .map(|snapshot| snapshot.source_session_id.as_str())
@@ -11751,6 +11755,7 @@ fn accumulate_claude_family_pending(
             census_window_end: census_window_end.to_string(),
             account_identifier_hash: account_hash.to_string(),
             evidence_request_count,
+            census_complete: false,
             members: BTreeMap::new(),
             member_requests: BTreeMap::new(),
             invalid: false,
@@ -42776,41 +42781,85 @@ impl ScanIndex {
         if !claude_accepted_ledger_is_current(self) {
             return;
         }
-        let candidates = self
-            .claude_account_family_pending
-            .iter()
-            .filter_map(|(root, pending)| {
-                if pending.previous_windows.is_empty() {
-                    return None;
-                }
-                let window = rfc3339_unix_seconds(&pending.census_window_end)?;
-                // Each member's finalized account-bearing revision is stronger
-                // than a family-only witness and also covers healthy singletons.
-                if pending.invalid
-                    || pending.member_requests.len() != pending.members.len()
-                    || pending
-                        .member_requests
-                        .values()
-                        .any(|requests| requests.identity_revision.is_none())
-                    || self.claude_usage_authority_quarantine.contains_key(root)
-                    || self.decode_holds_family(root)
+        let mut candidates = BTreeMap::new();
+        for (root, pending) in &self.claude_account_family_pending {
+            if pending.invalid
+                || !pending.census_complete
+                || self.decode_holds_family(root)
+                || self.claude_usage_authority_quarantine.contains_key(root)
+            {
+                continue;
+            }
+            let Some(current_window) = rfc3339_unix_seconds(&pending.census_window_end) else {
+                continue;
+            };
+            let mut latest: BTreeMap<
+                String,
+                (
+                    u64,
+                    &ClaudeAccountFamilyPendingWindow,
+                    Option<&ClaudeAccountRequestSet>,
+                ),
+            > = BTreeMap::new();
+            let mut valid = true;
+            for window in pending
+                .previous_windows
+                .iter()
+                .chain(std::iter::once(&pending.current))
+            {
+                let Some(time) = rfc3339_unix_seconds(&window.census_window_end) else {
+                    valid = false;
+                    break;
+                };
+                if time > current_window
+                    || (time == current_window && !std::ptr::eq(window, &pending.current))
                 {
-                    return None;
+                    valid = false;
+                    break;
                 }
-                Some((root.clone(), window))
-            })
-            .collect::<BTreeMap<_, _>>();
+                for member in window.members.keys() {
+                    if latest
+                        .get(member)
+                        .is_none_or(|(previous, _, _)| time > *previous)
+                    {
+                        latest.insert(
+                            member.clone(),
+                            (time, window, window.member_requests.get(member)),
+                        );
+                    }
+                }
+            }
+            let mut revisions = BTreeMap::new();
+            for (member, (_, window, requests)) in latest {
+                let revision = requests.and_then(|requests| requests.identity_revision.as_ref());
+                if window.invalid
+                    || window.account_identifier_hash != pending.account_identifier_hash
+                    || revision.is_none()
+                {
+                    valid = false;
+                    break;
+                }
+                revisions.insert(member, revision.expect("checked revision").clone());
+            }
+            if valid && !revisions.is_empty() {
+                candidates.insert(root.clone(), revisions);
+            }
+        }
         if candidates.is_empty() {
             return;
         }
-        // One file traversal, never one corpus traversal per pending family.
-        let mut settled_members: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        // One traversal. Unchanged members use their newest retained window,
+        // never a fictional observation in this window or an older ACK.
+        let mut settled: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut held = BTreeSet::new();
         for (key, entry) in &self.files {
             let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
                 continue;
             };
-            if !candidates.contains_key(&root) {
+            let Some(revisions) = candidates.get(&root) else {
+                continue;
+            };
+            if self.confirmed_empty_files.contains(key) {
                 continue;
             }
             let fingerprints = self.file_snapshot_fingerprints.get(key);
@@ -42825,16 +42874,6 @@ impl ScanIndex {
                             || owned.verified_source_file_fingerprint
                                 != owned.emitted_source_file_fingerprint
                     })
-                || self.claude_account_family_pending[&root]
-                    .member_requests
-                    .get(&member)
-                    .and_then(|requests| requests.identity_revision.as_ref())
-                    != claude_account_identity_revision(
-                        &entry.source_file_fingerprint,
-                        entry.last_snapshot_fingerprint.as_deref(),
-                        entry.last_upload_body_witness.as_deref(),
-                    )
-                    .as_ref()
                 || !fingerprints.is_some_and(|fps| {
                     !fps.is_empty()
                         && fps.iter().all(|fp| {
@@ -42845,23 +42884,38 @@ impl ScanIndex {
                 })
             {
                 held.insert(root);
-            } else {
-                settled_members.entry(root).or_default().insert(member);
-            }
-        }
-        for (root, window) in candidates {
-            if held.contains(&root) {
                 continue;
             }
-            let Some(pending) = self.claude_account_family_pending.get_mut(&root) else {
+            let Some(expected) = revisions.get(&member) else {
+                // No pending evidence for this file is being discarded. It
+                // may be unchanged or explicitly outside the account family.
                 continue;
             };
-            if settled_members.get(&root) != Some(&pending.members.keys().cloned().collect()) {
+            if claude_account_identity_revision(
+                &entry.source_file_fingerprint,
+                entry.last_snapshot_fingerprint.as_deref(),
+                entry.last_upload_body_witness.as_deref(),
+            )
+            .as_ref()
+                != Some(expected)
+            {
+                held.insert(root);
                 continue;
             }
-            pending.previous_windows.retain(|old| {
-                rfc3339_unix_seconds(&old.census_window_end).map_or(true, |old| old >= window)
-            });
+            settled.entry(root).or_default().insert(member);
+        }
+        let completed = candidates
+            .into_iter()
+            .filter_map(|(root, revisions)| {
+                (!held.contains(&root)
+                    && settled.get(&root) == Some(&revisions.into_keys().collect()))
+                .then_some(root)
+            })
+            .collect::<Vec<_>>();
+        for root in completed {
+            // Every retained member's newest account identity is now committed;
+            // keep neither superseded windows nor a lifetime copy of this one.
+            self.claude_account_family_pending.remove(&root);
         }
     }
 
@@ -61710,9 +61764,25 @@ mod tests {
             let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
                 continue;
             };
-            entry.source_file_fingerprint = "new-source".into();
-            entry.last_snapshot_fingerprint = Some("new-entity-set".into());
-            entry.last_upload_body_witness = Some("new-account-body-set".into());
+            if !index
+                .claude_account_family_pending
+                .get(&root)
+                .is_some_and(|pending| pending.member_requests.contains_key(&member))
+            {
+                continue;
+            }
+            entry.source_file_fingerprint = format!(
+                "{:x}",
+                Sha256::digest(format!("{key}:new-source").as_bytes())
+            );
+            entry.last_snapshot_fingerprint = Some(format!(
+                "{:x}",
+                Sha256::digest(format!("{key}:new-entity-set").as_bytes())
+            ));
+            entry.last_upload_body_witness = Some(format!(
+                "{:x}",
+                Sha256::digest(format!("{key}:new-account-body-set").as_bytes())
+            ));
             let entity = format!(
                 "{:x}",
                 Sha256::digest(format!("{key}:new-account").as_bytes())
@@ -62088,7 +62158,7 @@ mod tests {
                 "authority_retry" => {
                     held.insert_claude_authority_for_test(
                         &root,
-                        "fixture",
+                        &"f".repeat(64),
                         ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
                     );
                 }
@@ -62139,9 +62209,7 @@ mod tests {
             reloaded.claude_account_family_pending["identity-incomplete-other-family"],
             retained_other
         );
-        assert!(reloaded.claude_account_family_pending[&root]
-            .previous_windows
-            .is_empty());
+        assert!(!reloaded.claude_account_family_pending.contains_key(&root));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -62193,9 +62261,7 @@ mod tests {
         }
         let mut accepted = working.committable_subset(&previous, &newer_entities, &BTreeMap::new());
         accepted.save(&dir.join("all-accepted.json")).unwrap();
-        assert!(accepted.claude_account_family_pending[&root]
-            .previous_windows
-            .is_empty());
+        assert!(!accepted.claude_account_family_pending.contains_key(&root));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -62234,10 +62300,7 @@ mod tests {
                 .unwrap();
             assert!(!index.claude_account_family_witnesses.contains_key(&root));
             assert!(!claude_pending_family_session_ids(&index).contains(&root));
-            assert_eq!(index.claude_account_family_pending.len(), 1);
-            assert!(index.claude_account_family_pending[&root]
-                .previous_windows
-                .is_empty());
+            assert!(index.claude_account_family_pending.is_empty());
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -62287,6 +62350,121 @@ mod tests {
     }
 
     #[test]
+    fn claude_account_pending_root_only_windows_and_cross_window_members_settle() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        let path = dir.join("multi-window.json");
+        index.save(&path).unwrap();
+        assert!(index.claude_account_family_pending.is_empty());
+        for window in 1..5 {
+            apply_claude_effort_evidence_with_index(
+                &mut vec![items[0].clone()],
+                &evidence,
+                &mut index,
+                true,
+                &format!("2026-08-02T07:1{window}:00Z"),
+            );
+            d2_finalize_identity_revisions(&mut index);
+            index.save(&path).unwrap();
+            index = lenient_decode::read_file(File::open(&path).unwrap(), "test", "claude_code")
+                .unwrap();
+            assert!(index.claude_account_family_pending.is_empty());
+            assert!(!claude_pending_family_session_ids(&index).contains(&root));
+        }
+        // Retain genuinely incomplete old evidence until the missing member
+        // itself finalizes; the two latest proofs need not share a window.
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:20:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        index
+            .claude_account_family_pending
+            .get_mut(&root)
+            .unwrap()
+            .member_requests
+            .get_mut(&items[1].source_session_id)
+            .unwrap()
+            .identity_revision = None;
+        index.save(&path).unwrap();
+        assert!(index.claude_account_family_pending.contains_key(&root));
+        apply_claude_effort_evidence_with_index(
+            &mut vec![items[0].clone()],
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:21:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        index.save(&path).unwrap();
+        assert_eq!(
+            index.claude_account_family_pending[&root]
+                .previous_windows
+                .len(),
+            1
+        );
+        apply_claude_effort_evidence_with_index(
+            &mut vec![items[1].clone()],
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:22:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        index.save(&path).unwrap();
+        assert!(index.claude_account_family_pending.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_account_pending_v2_keeps_legacy_reader_required_shape() {
+        #[derive(Deserialize)]
+        struct LegacyPending {
+            census_window_end: String,
+            account_identifier_hash: String,
+            evidence_request_count: u128,
+            members: BTreeMap<String, u64>,
+            #[serde(default)]
+            member_request_id_hashes: BTreeMap<String, BTreeSet<String>>,
+            invalid: bool,
+        }
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        let bytes = serde_json::to_vec(&index.claude_account_family_pending[&root]).unwrap();
+        let old: LegacyPending = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old.census_window_end, "2026-08-02T07:10:00Z");
+        assert_eq!(old.account_identifier_hash, "a".repeat(64));
+        assert_eq!(old.evidence_request_count, 5);
+        assert_eq!(
+            old.members,
+            index.claude_account_family_pending[&root].members
+        );
+        assert!(!old.invalid);
+        assert!(old.member_request_id_hashes.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn claude_account_pending_m4_synthetic_serialized_size() {
         let families = 6_398usize;
         let requests = 347_187usize;
@@ -62303,15 +62481,29 @@ mod tests {
         }
         let legacy = json!({"claude_account_family_pending": legacy});
         let old_bytes = serde_json::to_vec_pretty(&legacy).unwrap().len();
-        let converted: BTreeMap<String, ClaudeAccountFamilyPending> =
+        let mut converted: BTreeMap<String, ClaudeAccountFamilyPending> =
             serde_json::from_value(legacy["claude_account_family_pending"].clone()).unwrap();
         let new_bytes =
-            serde_json::to_vec_pretty(&json!({"claude_account_family_pending":converted}))
+            serde_json::to_vec_pretty(&json!({"claude_account_family_pending":&converted}))
                 .unwrap()
                 .len();
         println!("D2_SIZE families={families} requests={requests} old_bytes={old_bytes} new_bytes={new_bytes}");
         assert!(new_bytes < old_bytes / 4);
         assert!(new_bytes < 8_000_000);
+        for pending in converted.values_mut() {
+            pending.census_complete = true;
+            for requests in pending.member_requests.values_mut() {
+                requests.identity_revision = Some("f".repeat(64));
+            }
+        }
+        let populated_bytes =
+            serde_json::to_vec_pretty(&json!({"claude_account_family_pending":&converted}))
+                .unwrap()
+                .len();
+        println!(
+            "D2_SIZE_POPULATED families={families} requests={requests} bytes={populated_bytes}"
+        );
+        assert!(populated_bytes < old_bytes / 3);
     }
 
     #[test]
@@ -83897,7 +84089,7 @@ pub(crate) mod cache_adapter_tests {
 crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, selector_sources, usage, reasoning_effort);
 crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; current, previous_windows);
-crate::heap_layout_bound::fields!(ClaudeAccountFamilyPendingWindow; version, census_window_end, account_identifier_hash, evidence_request_count, members, member_requests, invalid);
+crate::heap_layout_bound::fields!(ClaudeAccountFamilyPendingWindow; version, census_window_end, account_identifier_hash, evidence_request_count, census_complete, members, member_requests, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountRequestSet; prefixes, fingerprint, identity_revision);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyWitness; account_identifier_hash, evidence_request_count, members, member_request_id_fingerprints);
 crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key, has_parent_link, trigger, id_less_before, id_less_after);
