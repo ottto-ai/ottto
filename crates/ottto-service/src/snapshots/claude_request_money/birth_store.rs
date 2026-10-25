@@ -1,6 +1,6 @@
 //! Claude-only physical births and move cutoffs, independent of upload settlement.
 //! Sorted boxed slices avoid path strings and per-node/spare capacity overhead.
-use super::super::claude_context_file_birth::ClaudeOpenedBirth;
+use crate::snapshots::claude_context_file_birth::ClaudeOpenedBirth;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -8,6 +8,13 @@ pub(crate) const ABSENT_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 // Domain-separated SHA-256 prefixes are local lookup keys, never move proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LocationKey([u8; 16]);
+impl crate::heap_layout_bound::HeapLayoutBound for LocationKey {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
 fn key(domain: &[u8], value: &str) -> LocationKey {
     let mut h = Sha256::new();
     h.update(domain);
@@ -548,6 +555,60 @@ mod tests {
         std::fs::create_dir_all(&p).unwrap();
         p
     }
+    #[test]
+    fn generation_witness_is_append_only_persisted_and_page_probes_are_transient() {
+        let mut store = BirthStore::default();
+        let opened = ClaudeOpenedBirth {
+            birth: 100,
+            device: 1,
+            inode: 2,
+            size: 10,
+        };
+        store.record_opened("s", "A", 100, opened);
+        store.stage_opened("s", "A", Some(opened), 10);
+        assert!(store.witnessed(location_key("A")));
+        let mut restored: BirthStore =
+            serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+        assert!(
+            !restored.witnessed(location_key("A")),
+            "no cached probes survive restart"
+        );
+        restored.stage_opened("s", "A", Some(ClaudeOpenedBirth { size: 20, ..opened }), 10);
+        assert!(
+            restored.witnessed(location_key("A")),
+            "append preserves the witness"
+        );
+        restored.preserve_missing_from(&store);
+        restored.begin_page();
+        restored.stage_opened("s", "A", Some(ClaudeOpenedBirth { size: 19, ..opened }), 10);
+        assert!(
+            !restored.witnessed(location_key("A")),
+            "remember the highest observed extent"
+        );
+        restored.begin_page();
+        restored.stage_opened(
+            "s",
+            "A",
+            Some(ClaudeOpenedBirth {
+                birth: 200,
+                inode: 3,
+                size: 30,
+                ..opened
+            }),
+            10,
+        );
+        assert!(
+            !restored.witnessed(location_key("A")),
+            "old minimum never rebinds to a replacement"
+        );
+        assert_eq!(restored.observed_birth("s", "A"), Some(100));
+        assert_eq!(std::mem::size_of::<BirthIdentity>(), 16);
+        assert_eq!(std::mem::size_of::<(LocationKey, u8)>(), 24);
+        println!("F1C_COUNT_SIZE birth_identity_bytes={} transient_probe_bytes={} opened_metadata_bytes={} claude_file_birth_bytes={}",
+            std::mem::size_of::<BirthIdentity>(), std::mem::size_of::<(LocationKey, u8)>(),
+            std::mem::size_of::<ClaudeOpenedBirth>(), std::mem::size_of::<crate::snapshots::claude_context_file_birth::ClaudeFileBirth>());
+    }
+
     #[test]
     fn physical_min_move_copy_and_equal_move() {
         let mut b = BirthStore::default();

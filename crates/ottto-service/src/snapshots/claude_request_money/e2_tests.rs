@@ -978,7 +978,7 @@ fn e2_subagent_twins_identical_and_overlapping_count_once_in_both_orders() {
 
 #[test]
 fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
-    for truncated in [false, true] {
+    for (truncated, partial) in [(false, false), (false, true), (true, false), (true, true)] {
         let early = root_file("stale-early");
         let later = root_file("stale-later");
         let history = [line("h", &at(-100), 10)];
@@ -1021,9 +1021,13 @@ fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
             &index,
             &[line("u", &at(121), 20)],
         );
-        let later_item = parse(&later, Some(t0() + 60_000_000_000), &index, &history);
+        let mut later_lines = history.to_vec();
+        if partial {
+            later_lines.push(line("own", &at(61), 40));
+        }
+        let later_item = parse(&later, Some(t0() + 60_000_000_000), &index, &later_lines);
         assert_eq!(fold(&later_item).entity.removed_requests, 0);
-        assert_eq!(fold(&later_item).entity.totals().1, 1);
+        assert_eq!(fold(&later_item).entity.totals().1, 1 + u64::from(partial));
         assert!(fold(&later_item).disclosed > 0);
         let got = publish(
             vec![early_item, later_item],
@@ -1031,7 +1035,10 @@ fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
             TelemetryRead::Loaded,
             &index,
         );
-        assert_eq!((got[0].request_count, got[0].input_tokens), (2, 30));
+        assert_eq!(
+            (got[0].request_count, got[0].input_tokens),
+            (2 + u64::from(partial), if partial { 70 } else { 30 })
+        );
         assert_eq!(got[0].removed_request_count, None);
         cleanup(&[&early, &later]);
     }

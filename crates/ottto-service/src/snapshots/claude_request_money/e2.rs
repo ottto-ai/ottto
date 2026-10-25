@@ -67,26 +67,39 @@ impl ReadContext<'_> {
     /// No filesystem lookup here: T4's twin walk already paid for it.
     fn live(&self, member: &str, location: LocationKey) -> bool {
         self.index.claude_money_birth_store.witnessed(location)
-            && self.index.files.keys().any(|key| {
-                session_member(Path::new(key)).as_deref() == Some(member)
-                    && location_key(key) == location
-            })
+            && self
+                .index
+                .files
+                .keys()
+                .any(|key| member_matches(Path::new(key), member) && location_key(key) == location)
     }
     fn indexed(&self, member: &str, location: LocationKey) -> bool {
-        self.index.files.keys().any(|key| {
-            session_member(Path::new(key)).as_deref() == Some(member)
-                && location_key(key) == location
-        })
+        self.index
+            .files
+            .keys()
+            .any(|key| member_matches(Path::new(key), member) && location_key(key) == location)
     }
     fn has_twins(&self, member: &str) -> bool {
         self.index
             .files
             .keys()
-            .filter(|key| session_member(Path::new(key)).as_deref() == Some(member))
+            .filter(|key| member_matches(Path::new(key), member))
             .take(2)
             .count()
             > 1
     }
+}
+
+fn member_matches(path: &Path, session: &str) -> bool {
+    claude_index_path_member_ref(path).is_some_and(|member| match member.subagent_stem {
+        None => member.root == session,
+        Some(stem) => {
+            session
+                .strip_prefix(member.root)
+                .and_then(|s| s.strip_prefix('_'))
+                == Some(stem)
+        }
+    })
 }
 
 /// Same member spelling as T4's twin index, including subagent stems.
@@ -343,21 +356,22 @@ impl FileFold {
             }
         }
         // A lone subagent keeps the context birth exemption. A later same-member
-        // path twin uses the normal money cutoff, only with a valid earlier object.
+        // path twin uses the normal money cutoff; finish_native still requires
+        // the earlier object's current identity/extent to validate the skip.
         let subagent_twin = context.is_some_and(|context| {
             claude_index_path_member_ref(context.path).is_some_and(|m| m.subagent_stem.is_some())
                 && physical.is_some_and(|physical| {
                     let member = session_member(context.path).unwrap();
+                    let here = location_key(&local_index_key(context.path));
                     context
                         .index
                         .claude_money_birth_store
-                        .original_witness_at(
-                            &member,
-                            &local_index_key(context.path),
-                            physical,
-                            |location| context.live(&member, location),
-                        )
-                        .is_some()
+                        .observations(&member)
+                        .any(|(location, observed)| {
+                            location != here
+                                && observed < physical
+                                && context.indexed(&member, location)
+                        })
                 })
         });
         let money_birth = if subagent_twin {
