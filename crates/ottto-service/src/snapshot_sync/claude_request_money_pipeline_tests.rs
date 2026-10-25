@@ -788,6 +788,134 @@ fn money_armed_scan(name: &str) -> (PipelineFixture, ScanIndex, crate::snapshots
     (fixture, index, scan)
 }
 
+
+/// A page larger than the test ceiling in family rows alone still builds
+/// its scheduled prefix. Its deferred suffix keeps its turns and is first
+/// on the following Full page, after the writer releases page funds.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_lazy_family_admission_defers_suffix_and_resumes_in_order() {
+    let family_count = 512;
+    let fixture = PipelineFixture::new("money-page-lazy-admission");
+    for session in PIPELINE_SESSIONS {
+        std::fs::remove_file(fixture.root.join(format!("{session}.jsonl"))).unwrap();
+    }
+    for at in 0..family_count {
+        let session = format!("{at:08x}-1234-4567-890a-123456789abc");
+        std::fs::write(fixture.root.join(format!("{session}.jsonl")),
+            pipeline_transcript_line(&session, &format!("lazy-{at}"), 7)).unwrap();
+    }
+    money::enable_shadow_for_test(&fixture.support);
+    money::store::prime_credit_for_test(&fixture.support, 0);
+    let mut index = ScanIndex::default();
+    let scan = crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), &mut index,
+        "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
+    assert_eq!(scan.snapshots.len(), family_count);
+    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+    let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    // Measure the same minimum in an isolated ledger without consuming the
+    // real page's captures or scheduling turns. No body runs in this probe.
+    let probe_support = fixture.base.join("admission-probe");
+    money::enable_shadow_for_test(&probe_support);
+    money::set_page_fault_for_test(money::PageFault::BodyDeadline);
+    let probe = money::shadow_page_at(&probe_support, &scan.snapshots, &index, &api, &trace, true, now);
+    money::set_page_fault_for_test(money::PageFault::None);
+    money::store::flush();
+    money::disable_shadow_for_test(&probe_support);
+    let ceiling = probe.admission_bytes as usize + 384 * 1024;
+    assert!(family_count * 8192 > ceiling, "full family storage alone exceeds ceiling={ceiling}");
+    // Functional scheduling probe: isolate memory admission from CI CPU
+    // contention, using the existing test-only money clock injection.
+    money::set_next_page_budget_for_test(Duration::from_secs(5));
+    let first = money::with_shadow_ceiling_for_test(ceiling, ||
+        money::shadow_page_at(&fixture.support, &scan.snapshots, &index, &api, &trace, true, now));
+    let first_schedule = money::last_page_schedule_for_test().iter()
+        .map(|root| money::hashed_id_for_test(root)).collect::<Vec<_>>();
+    assert_eq!((first.refused_budget, first.refused_deadline), (0, 0), "{first:?}");
+    assert_eq!(first.families, family_count as u64);
+    assert!(first.families_budget_deferred > 0, "{first:?}");
+    assert_eq!(first.families_deadline_deferred, 0, "budget ends this page: {first:?}");
+    assert!(first.admitted_peak_bytes <= ceiling as u64, "{first:?}");
+    assert!(money::reserved_for_test() <= ceiling);
+    assert_eq!(first.admission_bytes, first.admission_snapshot_bytes + first.admission_scope_bytes
+        + first.admission_key_bytes + first.admission_claim_bytes + first.admission_fixed_bytes);
+    money::store::flush();
+    assert_eq!(money::reserved_for_test(), 0, "writer released page funds");
+    let rows = money_jsonl_rows(&fixture.support);
+    let first_rows = rows.iter().filter(|row| row["row"] == "family" && row["observed_unix"] == now).collect::<Vec<_>>();
+    assert_eq!(first_rows.iter().map(|row| row["family"].as_str().unwrap().to_owned()).collect::<Vec<_>>(), first_schedule);
+    let reached = family_count - first.families_budget_deferred as usize;
+    let built = first_rows.iter().take_while(|row| row["category"] != "unbuilt"
+        && row["members_built"].as_u64().is_some_and(|count| count > 0)).count();
+    assert!(built > 0 && built <= reached, "a scheduled prefix builds: {first:?}");
+    assert!(first_rows[built..].iter().all(|row| row["category"] == "unbuilt"), "built families form a prefix");
+    assert!(first_rows[reached..].iter().all(|row| row["p1_reasons"] == serde_json::json!(["memory"])
+        && row["old_available"] == false && row["grains"] == 0 && row["coverage_complete"] == false));
+    let first_page = rows.iter().find(|row| row["row"] == "page" && row["observed_unix"] == now).unwrap();
+    assert_eq!(first_page["refused"], false);
+    assert_eq!(first_page["coverage_complete"], false);
+    assert_eq!(first_page["page_families"].as_u64().unwrap(), first_page["written"].as_u64().unwrap()
+        + first_page["failed"].as_u64().unwrap() + first_page["unchanged"].as_u64().unwrap());
+    assert!(money::capture::keys_for_test(&fixture.support).is_empty());
+    let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &index);
+    money::capture::begin_page(&fixture.support);
+    replay();
+    let captured = money::captured_roots_for_test(&fixture.support).iter()
+        .map(|root| money::hashed_id_for_test(root)).collect::<BTreeSet<_>>();
+    let deferred = first_schedule[reached..].iter().cloned().collect::<BTreeSet<_>>();
+    assert!(!captured.is_empty() && captured.is_subset(&deferred), "prior incomplete families first");
+    money::set_next_page_budget_for_test(Duration::from_secs(5));
+    let following = money::shadow_page_at(&fixture.support, &scan.snapshots, &index, &api, &trace, true, now + 1);
+    assert_eq!(money::last_page_schedule_for_test().first().map(|root| money::hashed_id_for_test(root)),
+        Some(first_schedule[reached].clone()), "oldest deferred turn is first");
+    money::store::flush();
+    let following_built = money_jsonl_rows(&fixture.support).iter().filter(|row|
+        row["row"] == "family" && row["observed_unix"] == now + 1 && row["category"] != "unbuilt"
+        && row["members_built"].as_u64().is_some_and(|count| count > 0))
+        .map(|row| row["family"].as_str().unwrap().to_owned()).collect::<BTreeSet<_>>();
+    assert_eq!(following_built, captured, "released funds build deferred captures");
+    assert_eq!(following.families_budget_deferred, 0, "{following:?}");
+    assert!(following.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
+    assert_eq!(money::reserved_for_test(), 0);
+    println!("MONEY_PAGE_ADMISSION families={family_count} ceiling={ceiling} upfront={} snapshot={} scope={} keys={} claims={} fixed={} built={built} reached={reached} budget_deferred={} peak={} following_built={}",
+        first.admission_bytes, first.admission_snapshot_bytes, first.admission_scope_bytes, first.admission_key_bytes,
+        first.admission_claim_bytes, first.admission_fixed_bytes, first.families_budget_deferred, first.admitted_peak_bytes, following_built.len());
+    money::disable_shadow_for_test(&fixture.support);
+}
+
+/// Both the root-index minimum and the remaining up-front minimum can
+/// genuinely refuse a page. Either path purges its captures and fails closed.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_upfront_minimum_refusal_purges_captures() {
+    for ceiling in [0, 1024] {
+        let (fixture, index, scan) = money_armed_scan("money-page-minimum-refusal");
+        let captured = money::capture::keys_for_test(&fixture.support).len();
+        assert!(captured > 0);
+        money::store::prime_credit_for_test(&fixture.support, 0);
+        let now = census_pipeline_window("2026-08-02T08:00:00Z");
+        let counts = money::with_shadow_ceiling_for_test(ceiling, || money::shadow_page_at(
+            &fixture.support, &scan.snapshots, &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), true, now));
+        money::store::flush();
+        assert_eq!((counts.refused_budget, counts.families_budget_deferred), (1, 0), "{counts:?}");
+        assert!(counts.admission_bytes > ceiling as u64, "{counts:?}");
+        assert_eq!(counts.captures_purged, captured as u64, "{counts:?}");
+        assert!(money::capture::keys_for_test(&fixture.support).is_empty());
+        let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &index);
+        money::capture::begin_page(&fixture.support);
+        replay();
+        assert!(money::capture::keys_for_test(&fixture.support).is_empty(), "refusal remains paged and closed");
+        assert!(money_jsonl_rows(&fixture.support).iter().all(|row| row["row"] == "page" && row["refused"] == true));
+        assert_eq!(money::reserved_for_test(), 0);
+        println!("MONEY_PAGE_MINIMUM_REFUSAL ceiling={ceiling} upfront={} refused={} purged={captured}", counts.admission_bytes, counts.refused_budget);
+        money::disable_shadow_for_test(&fixture.support);
+    }
+}
+
 /// Immature units (younger than the maturity window) are neither counted nor
 /// removed and their live slices leave the new body as `immature`; at a
 /// later clock the interim holder seam holds them: maturity cannot establish
