@@ -192,6 +192,7 @@ pub(in crate::snapshots) enum Boot {
 
 /// Pre-job group state; one unit of work per scan step.
 pub(in crate::snapshots) struct GroupBoot {
+    reread_members_admitted: BTreeSet<String>,
     pub(in crate::snapshots) group: Group,
     pub(in crate::snapshots) key: String,
     identified: usize,
@@ -218,7 +219,7 @@ pub(in crate::snapshots) struct GroupBoot {
     legacy_expected: BTreeMap<String, String>,
     evidence: codex_counting_version::AckEvidence,
 }
-crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, headers, plan,
+crate::heap_layout_bound::fields!(GroupBoot; reread_members_admitted, group, key, identified, stamps, headers, plan,
     probes, probed, ordered, admitted, probe_bound, probe_limit_bound, own_page, probe_allowance,
     charge, previous_receipts, receipt_scope, legacy_expected, evidence);
 
@@ -247,6 +248,7 @@ impl GroupBoot {
         }
         let evidence = codex_counting_version::members_evidence(&group.members, index);
         Self {
+            reread_members_admitted: BTreeSet::new(),
             key: job_key(&group),
             group,
             identified: 0,
@@ -597,6 +599,7 @@ impl GroupBoot {
             evidence,
         )
         .map_err(|_| GroupEnd::Strict)?;
+        parser.bind_reread(inputs.index, &first);
         let v2 = group_counting_is_v2(&parser.accumulator);
         let mut join = Box::new(StreamProof::new(group.owner.clone(), v2, plan.plans));
         join.begin_member(0);
@@ -830,6 +833,7 @@ pub(in crate::snapshots) enum GroupStep {
 
 /// Scan facts one group step needs.
 pub(in crate::snapshots) struct StepInputs<'a> {
+    pub(in crate::snapshots) index: &'a ScanIndex,
     pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
     pub(in crate::snapshots) attribution:
         Option<&'a crate::session_attribution::SessionAttributionContext>,
@@ -1159,6 +1163,7 @@ fn open_member(
         .saturating_add(active.parser.reader.consumed_bytes());
     let parser = &mut active.parser;
     parser.reader = BoundedJsonlReader::new(OpenedInput::plain(file), jsonl_line_cap(), true);
+    parser.bind_reread(inputs.index, &member);
     // Context inferred in one physical file must not price an unrelated
     // record at the beginning of another file.
     parser.accumulator.current_selector = SelectorCapture::default();
@@ -1340,3 +1345,45 @@ pub(in crate::snapshots) fn end_group(
 #[cfg(test)]
 #[path = "group_job_tests.rs"]
 mod tests;
+
+impl GroupBoot {
+    pub(in crate::snapshots) fn admit_rereads(
+        &mut self,
+        index: &mut ScanIndex,
+    ) -> reread_guard::GroupAdmission {
+        let mut awaiting_save = false;
+        for member in &self.group.members {
+            let key = local_index_key(&member.path);
+            if self.reread_members_admitted.contains(&key) {
+                continue;
+            }
+            if index
+                .files
+                .get(&key)
+                .is_some_and(|entry| reread_guard::byte_unchanged(entry, member))
+            {
+                let reason = index.candidate_decision_with_reason(member).1;
+                match index.admit_unchanged_reread(&key, reason, reread_guard::now()) {
+                    reread_guard::Admission::Refuse => return reread_guard::GroupAdmission::Refuse,
+                    reread_guard::Admission::Admit(ticket) if !ticket.durable => {
+                        awaiting_save = true;
+                        continue;
+                    }
+                    reread_guard::Admission::Admit(_) => {}
+                }
+            } else if index
+                .files
+                .get(&key)
+                .is_some_and(|entry| member.size_bytes > entry.size_bytes)
+            {
+                index.reread_guard.note_growth_full(&key);
+            }
+            self.reread_members_admitted.insert(key);
+        }
+        if awaiting_save {
+            reread_guard::GroupAdmission::AwaitSave
+        } else {
+            reread_guard::GroupAdmission::Ready
+        }
+    }
+}

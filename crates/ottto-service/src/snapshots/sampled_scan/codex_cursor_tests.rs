@@ -637,6 +637,7 @@ fn strict(reason: DebtReason) -> Disclosure {
 #[test]
 fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
     let candidate = CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/sessions"),
         path: PathBuf::from(format!(
             "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
@@ -2653,6 +2654,7 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
     let path = fixture.file(SESSION);
     let entry = &index.files[&local_index_key(&path)];
     CandidateFile {
+        physical_identity: None,
         scan_root: fixture.root.clone(),
         path,
         size_bytes: entry.size_bytes,
@@ -4240,6 +4242,7 @@ fn memo_wakes_on_the_conflicted_identity_set() {
     let temp = Temp::new("memo-conflict-digest", b"{\"n\":1}\n");
     let file = File::open(&temp.0).unwrap();
     let candidate = CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/sessions"),
         path: path.clone(),
         size_bytes: 0,
@@ -4273,6 +4276,7 @@ fn memo_wakes_on_the_conflicted_identity_set() {
     let mut created = CodexTitleMetadata::default();
     created.state_created_threads.insert(SESSION.into());
     let orphan_candidate = CandidateFile {
+        physical_identity: None,
         path: orphan.clone(),
         ..candidate.clone()
     };
@@ -5250,6 +5254,7 @@ fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
 #[test]
 fn one_writer_attributes_and_replays_held_totals() {
     let candidate = CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/sessions"),
         path: PathBuf::from(format!(
             "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
@@ -6541,6 +6546,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
     let temp = Temp::new("memo-fence-digest", b"{\"n\":1}\n");
     let file = File::open(&temp.0).unwrap();
     let candidate = CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/sessions"),
         path: PathBuf::from(format!(
             "/synthetic/sessions/rollout-2026-10-07T10-00-00-{SESSION}.jsonl"
@@ -6564,6 +6570,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         index.files.insert(
             local_index_key(&candidate.path),
             ScanIndexEntry {
+                physical_identity: None,
                 size_bytes: 8,
                 modified_unix_seconds: 0,
                 modified_unix_nanos: None,
@@ -6935,6 +6942,7 @@ const JOIN_OTHER: &str = "ffffffff-1111-4111-8111-ffffffffffff";
 
 fn join_member(path: PathBuf) -> CandidateFile {
     CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/sessions"),
         path,
         size_bytes: 0,

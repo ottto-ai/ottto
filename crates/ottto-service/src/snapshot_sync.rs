@@ -5257,7 +5257,17 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
+                if next
+                    .persist_reread_reservations(&mut self.committed_index, &self.index_path)
+                    .is_err()
+                {
+                    self.scan = Some(next);
+                    return SourcePreparationStep::Refused(
+                        self,
+                        crate::source_rotation::LocalRefusal("reread reservation save refused"),
+                    );
+                }
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -5929,6 +5939,7 @@ fn prepare_sync_source(
         context_curve_enabled,
         request_identity_capture,
     )
+    .with_reread_persistence()
     .with_sampled_acquisition(
         daemon.transcript_cache.clone(),
         cycle_sampled_scope(
@@ -6300,6 +6311,7 @@ fn prepare_continuation_source(
         ordinary_equivalent,
     )
     .with_continuation_deadline(deadline)
+    .with_reread_persistence()
     .with_sampled_acquisition(
         std::sync::Arc::clone(cache),
         // K5: the ordinary Codex page's scope; Codex never captures.
@@ -10997,6 +11009,7 @@ mod tests {
         index.files.insert(
             "synthetic/deferred.jsonl".into(),
             crate::snapshots::ScanIndexEntry {
+                physical_identity: None,
                 size_bytes: 1,
                 modified_unix_seconds: 1,
                 modified_unix_nanos: Some(1),
@@ -21377,6 +21390,9 @@ mod tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
             mod stale_family_carry_pipeline_tests {
                 include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
+                mod structural_reread_guard_tests {
+                    include!("snapshot_sync/structural_reread_guard_tests.rs");
+                }
             }
         }
     }

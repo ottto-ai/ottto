@@ -204,6 +204,7 @@ impl Serialize for ScanIndex {
         }
         field!(schema_version);
         field!(generation);
+        field!(reread_guard);
         field!(upload_context_fingerprint, Option::is_none);
         map.serialize_entry(
             "files",
@@ -307,6 +308,7 @@ impl Serialize for ScanIndex {
 pub(super) const FIELDS: &[&str] = &[
     "schema_version",
     "generation",
+    "reread_guard",
     "upload_context_fingerprint",
     "files",
     "session_account_bindings",
@@ -1425,6 +1427,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
+                        "reread_guard" => index.reread_guard = self.typed(value)?,
                         "upload_context_fingerprint" => {
                             index.upload_context_fingerprint = self.typed(value)?
                         }

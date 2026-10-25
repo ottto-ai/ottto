@@ -1,0 +1,426 @@
+//! Synthetic read-selection contracts; never opens provider state.
+use super::*;
+use crate::transcript_acquisition::{ReadMode, Scope};
+use std::sync::atomic::{AtomicU64, Ordering};
+const WALL: u64 = 1_790_000_017;
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+struct Fixture {
+    root: PathBuf,
+    path: PathBuf,
+    index_path: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-reread-guard-{}-{}-{}",
+            std::process::id(),
+            now(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixture.jsonl");
+        fs::write(&path, b"{\"type\":\"user\",\"sessionId\":\"reread-fixture\",\"timestamp\":\"2026-10-07T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Synthetic\"}}\n").unwrap();
+        Self {
+            index_path: root.join("index.json"),
+            root,
+            path,
+        }
+    }
+    fn candidate(&self) -> CandidateFile {
+        let candidate = CandidateFile {
+            physical_identity: None,
+            scan_root: self.root.clone(),
+            path: self.path.clone(),
+            size_bytes: 0,
+            modified_unix_seconds: 0,
+            modified_unix_nanos: 0,
+            source_file_fingerprint: String::new(),
+            legacy_source_file_fingerprint: String::new(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: String::new(),
+        };
+        let (opened, _) = open_and_identify_scan_candidate(
+            SnapshotSource::ClaudeCode,
+            candidate,
+            &mut ScanCensus::default(),
+            None,
+            0,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        opened
+    }
+    fn indexed(&self) -> (ScanIndex, CandidateFile) {
+        let candidate = self.candidate();
+        let mut index = ScanIndex::default();
+        index.record(
+            candidate.clone(),
+            Some("accepted-fixture".into()),
+            ScanParseOutcome::Snapshot,
+        );
+        (index, candidate)
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+fn admit(state: &mut State, key: &str, wall: u64) -> bool {
+    matches!(
+        state.admit(key, Some(CandidateParseReason::Rearmed), wall, 1000, None),
+        Admission::Admit(_)
+    )
+}
+fn restart(state: State, wall: u64) -> State {
+    let mut state: State = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    state.prune_on_load(wall);
+    state
+}
+
+#[test]
+fn two_attempts_survive_restart_and_roll_back_without_clamping() {
+    let mut state = State::default();
+    assert!(admit(&mut state, "one", WALL));
+    let first = state.attempts[&KeyHash::of("one")];
+    state = restart(state, WALL + 3600);
+    assert!(!admit(&mut state, "one", WALL + 100)); // persisted wall high-water
+    assert_eq!(state.attempts[&KeyHash::of("one")], first);
+    assert!(admit(&mut state, "one", WALL + 3600));
+    assert!(!admit(&mut state, "one", WALL + 3601));
+    let second = state.attempts[&KeyHash::of("one")];
+    state = restart(state, WALL - 86400);
+    assert_eq!(state.attempts[&KeyHash::of("one")], second);
+    assert!(!admit(&mut state, "one", WALL - 1));
+    assert!(!admit(&mut state, "one", WALL + 7 * 86400));
+    // Expiry also covers a delayed read and hour-rounding slack.
+    assert!(admit(&mut state, "one", WALL + 183 * 3600));
+}
+
+#[test]
+fn reservation_is_saved_once_consumed_once_and_never_reused_after_restart() {
+    let mut state = State {
+        require_save: true,
+        ..State::default()
+    };
+    let attempt = state.admit("key", None, WALL, 1000, None);
+    assert!(matches!(
+        attempt,
+        Admission::Admit(Ticket { durable: false, .. })
+    ));
+    let slots = state.attempts[&KeyHash::of("key")];
+    assert!(state.needs_save());
+    state.saved();
+    assert!(matches!(
+        state.admit("key", None, WALL + 1, 1001, None),
+        Admission::Admit(Ticket { durable: true, .. })
+    ));
+    assert_eq!(state.attempts[&KeyHash::of("key")], slots);
+    state = restart(state, WALL + 2);
+    assert!(admit(&mut state, "key", WALL + 2));
+    assert!(!admit(&mut state, "key", WALL + 3));
+}
+
+#[test]
+fn clock_failure_or_suspend_spends_the_reserved_grant() {
+    for (wall, elapsed) in [
+        (WALL, u64::MAX),
+        (WALL - 1, 1000),
+        (WALL, GRANT_LIFETIME * 1000 + 1001),
+        (WALL + GRANT_LIFETIME + 1, 1001),
+        (WALL, 999),
+    ] {
+        let mut state = State {
+            require_save: true,
+            ..State::default()
+        };
+        assert!(matches!(
+            state.admit("key", None, WALL, 1000, None),
+            Admission::Admit(_)
+        ));
+        state.saved();
+        assert!(
+            matches!(
+                state.admit("key", None, wall, elapsed, None),
+                Admission::Refuse
+            ),
+            "wall={wall} elapsed={elapsed}"
+        );
+        assert_eq!(
+            state.attempts[&KeyHash::of("key")]
+                .iter()
+                .filter(|h| **h != 0)
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn rolling_read_window_includes_rounding_and_delayed_consumption() {
+    // The first ticket is stamped just before the next hour and consumed at
+    // its latest allowed instant. A replacement slot still waits >7d.
+    let h = WALL / 3600 * 3600;
+    let stamp = h + 3599;
+    let oldest_actual_read = stamp + GRANT_LIFETIME;
+    let mut state = State::default();
+    assert!(admit(&mut state, "key", stamp));
+    assert!(admit(&mut state, "key", stamp + 1));
+    for offset in 0..=RETAIN_HOURS {
+        assert!(!admit(&mut state, "key", stamp + u64::from(offset) * 3600));
+    }
+    let next_stamp = stamp + u64::from(RETAIN_HOURS + 1) * 3600;
+    assert!(admit(&mut state, "key", next_stamp));
+    assert!(next_stamp - oldest_actual_read > u64::from(WEEK_HOURS) * 3600);
+}
+
+#[test]
+fn approved_revision_is_exactly_one_persisted_extra_read() {
+    let mut state = State::default();
+    assert!(admit(&mut state, "key", WALL));
+    assert!(admit(&mut state, "key", WALL + 1));
+    assert!(!admit(&mut state, "key", WALL + 2));
+    let grants = [ReplayGrant {
+        revision: "approved-fixture-v1",
+    }];
+    assert!(matches!(
+        state.admit_with_grants(
+            "key",
+            None,
+            WALL + 3,
+            1003,
+            Some("approved-fixture-v1"),
+            &grants
+        ),
+        Admission::Admit(_)
+    ));
+    let mut state: State = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    assert!(matches!(
+        state.admit_with_grants(
+            "key",
+            None,
+            WALL + 4,
+            1004,
+            Some("approved-fixture-v1"),
+            &grants
+        ),
+        Admission::Refuse
+    ));
+    assert!(matches!(
+        state.admit_with_grants("key", None, WALL + 5, 1005, Some("unapproved-v2"), &grants),
+        Admission::Refuse
+    ));
+    assert!(
+        REPLAY_GRANTS.is_empty(),
+        "production has no implicit money replay approval"
+    );
+}
+
+#[test]
+fn whole_history_plan_preserves_entries_and_census_debt() {
+    let f = Fixture::new();
+    let (mut index, candidate) = f.indexed();
+    let entry = index.files.values().next().unwrap().clone();
+    for i in 0..301 {
+        index.files.insert(format!("synthetic-{i}"), entry.clone());
+    }
+    index.activate_upload_context("changed-policy".into());
+    let entries = serde_json::to_value(&index.files).unwrap();
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[],
+        &mut index,
+        "2026-10-07T12:00:00Z",
+        90,
+    );
+    assert!(index.reread_guard.tripwire.plan_held);
+    assert!(index.reread_guard.tripwire.last_alarm > 0);
+    assert_eq!(serde_json::to_value(&index.files).unwrap(), entries);
+    assert!(index.traversal.as_ref().unwrap().counts.has_errors());
+    assert!(matches!(
+        index.admit_unchanged_reread(
+            &local_index_key(&candidate.path),
+            Some(CandidateParseReason::UploadContext),
+            now()
+        ),
+        Admission::Refuse
+    ));
+    assert!(index
+        .reread_guard
+        .disclosure()
+        .contains("withheld: reread budget"));
+}
+
+#[test]
+fn runtime_tripwire_catches_an_unplanned_future_override() {
+    let mut state = State::default();
+    state.tripwire.indexed = 500;
+    for i in 0..=300 {
+        assert!(admit(&mut state, &format!("healthy-{i}"), WALL));
+    }
+    assert_eq!(state.tripwire.full_reads, 301);
+    assert!(state.tripwire.last_alarm > 0);
+    assert!(!admit(&mut state, "healthy-301", WALL));
+    let last_alarm = state.tripwire.last_alarm;
+    assert!(!admit(&mut state, "healthy-302", WALL + 1));
+    assert_eq!(
+        state.tripwire.last_alarm, last_alarm,
+        "alarm is rate limited"
+    );
+    let state = restart(state, WALL + 2);
+    assert_eq!(
+        state.tripwire.full_reads, 301,
+        "restart keeps traversal tripwire"
+    );
+    assert_eq!(threshold(10_000), 500);
+    assert_eq!(threshold(6_019), 300);
+    assert_eq!(threshold(6_020), 301);
+}
+
+#[test]
+fn refusal_never_restores_a_fingerprint_or_changes_acceptance_or_binding() {
+    let f = Fixture::new();
+    let (mut index, candidate) = f.indexed();
+    let _clock = TestClock::at(WALL);
+    let key = local_index_key(&candidate.path);
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    index.bounded_sweep_had_unsettled_upload = true;
+    let before_entry = serde_json::to_value(&index.files[&key]).unwrap();
+    let accepted = index.accepted_snapshot_fingerprints.clone();
+    let bindings = serde_json::to_value(&index.session_account_bindings).unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            index.admit_unchanged_reread(&key, None, WALL),
+            Admission::Admit(_)
+        ));
+    }
+    assert!(matches!(
+        index.admit_unchanged_reread(&key, None, WALL),
+        Admission::Refuse
+    ));
+    assert_eq!(
+        serde_json::to_value(&index.files[&key]).unwrap(),
+        before_entry
+    );
+    assert_eq!(index.accepted_snapshot_fingerprints, accepted);
+    assert_eq!(
+        serde_json::to_value(&index.session_account_bindings).unwrap(),
+        bindings
+    );
+    assert!(index.bounded_sweep_had_unsettled_upload);
+    assert_eq!(index.reread_guard.refused[CAUSES - 1], 1);
+}
+
+#[test]
+fn physical_change_is_size_nanoseconds_or_opened_device_inode() {
+    let f = Fixture::new();
+    let (index, candidate) = f.indexed();
+    let entry = index.files.values().next().unwrap();
+    assert!(byte_unchanged(entry, &candidate));
+    let mut changed = candidate.clone();
+    changed.size_bytes += 1;
+    assert!(!byte_unchanged(entry, &changed));
+    changed = candidate.clone();
+    changed.modified_unix_nanos += 1;
+    assert!(!byte_unchanged(entry, &changed));
+    changed = candidate.clone();
+    changed.physical_identity = Some([u64::MAX, u64::MAX]);
+    assert!(!byte_unchanged(entry, &changed));
+}
+
+#[test]
+fn budget_state_is_registered_sparse_and_pruned_without_identity_carry() {
+    assert_eq!(std::mem::size_of::<KeyHash>(), 16);
+    assert_eq!(std::mem::size_of::<[u32; 2]>(), 8);
+    assert!(lenient_decode::FIELDS.contains(&"reread_guard"));
+    assert!(!lenient_decode::IDENTITY_CARRY_FIELDS.contains(&"reread_guard"));
+    let mut state = State::default();
+    assert!(admit(&mut state, "key", WALL));
+    state = restart(state, WALL + u64::from(RETAIN_HOURS + 1) * 3600);
+    assert!(state.attempts.is_empty());
+    let malformed: State = serde_json::from_str(r#"{"attempts":{"bad":[1,2]}}"#).unwrap();
+    assert!(malformed.closed);
+}
+
+#[test]
+fn save_failure_keeps_reservation_unsaved_and_no_read_ticket_is_usable() {
+    let f = Fixture::new();
+    let (mut index, candidate) = f.indexed();
+    let _clock = TestClock::at(WALL);
+    index.save(&f.index_path).unwrap();
+    let mut committed = index.clone();
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::ClaudeCode,
+        &[],
+        index,
+        "2026-10-07T12:00:00Z",
+        90,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        false,
+    )
+    .with_reread_persistence();
+    let key = local_index_key(&candidate.path);
+    assert!(matches!(
+        scan.index.admit_unchanged_reread(&key, None, WALL),
+        Admission::Admit(Ticket { durable: false, .. })
+    ));
+    let bytes = fs::read(&f.index_path).unwrap();
+    let impossible = f.path.join("not-a-directory");
+    assert!(scan
+        .persist_reread_reservations(&mut committed, &impossible)
+        .is_err());
+    assert!(scan.index.reread_guard.needs_save());
+    assert!(scan.index.reread_guard.ticket(&key).is_none());
+    assert_eq!(fs::read(&f.index_path).unwrap(), bytes);
+    scan.persist_reread_reservations(&mut committed, &f.index_path)
+        .unwrap();
+    let saved = ScanIndex::load(&f.index_path).unwrap();
+    assert_eq!(
+        saved.reread_guard.attempts[&KeyHash::of(&key)]
+            .iter()
+            .filter(|h| **h != 0)
+            .count(),
+        1
+    );
+    assert!(matches!(
+        scan.index.admit_unchanged_reread(&key, None, WALL),
+        Admission::Admit(Ticket { durable: true, .. })
+    ));
+    assert_eq!(scan.index.generation, committed.generation);
+}
+
+#[test]
+#[should_panic(expected = "byte-unchanged indexed Full read requires an Admit ticket")]
+fn indexed_full_read_without_an_admit_ticket_panics() {
+    let f = Fixture::new();
+    let (index, candidate) = f.indexed();
+    let file = File::open(&f.path).unwrap();
+    let mut parser = sampled_scan::new_source_parser(
+        file,
+        &candidate,
+        SnapshotSource::ClaudeCode,
+        &CodexTitleMetadata::default(),
+        None,
+        None,
+        false,
+        false,
+        false,
+        &index,
+    )
+    .unwrap();
+    let scope = Scope("synthetic-reread-invariant".into());
+    let mode = parser
+        .prepare_acquisition(None, &scope, None, now())
+        .unwrap();
+    assert!(matches!(mode, ReadMode::Full(_)));
+}

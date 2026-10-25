@@ -2187,6 +2187,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
             // Pins the NewFile decision independently of the scan's earlier
             // candidate guard, including when the held native entry is absent.
             let candidate = CandidateFile {
+                physical_identity: None,
                 scan_root: root.clone(),
                 path: transcript_paths[0].clone(),
                 size_bytes: fs::metadata(&transcript_paths[0]).unwrap().len(),

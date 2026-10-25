@@ -1013,6 +1013,7 @@ fn codex_counting_ack_bool_survives_twin_alias_and_rekeyed_entries() {
     // their acknowledged fingerprint.
     let path = PathBuf::from("/synthetic/sessions/rollout.jsonl");
     let candidate = || CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/sessions"),
         path: path.clone(),
         size_bytes: 2,
