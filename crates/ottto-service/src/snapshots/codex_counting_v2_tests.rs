@@ -176,6 +176,7 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
     let mut file = File::open(&path).unwrap();
     let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
     let candidate = CandidateFile {
+        physical_identity: None,
         scan_root: root.clone(),
         path: path.clone(),
         size_bytes: text.len() as u64,
