@@ -205,3 +205,16 @@ fn terminal_contract_retry_reads_only_the_owning_file() {
         assert_eq!(unrelated_full_reads, 0);
     });
 }
+
+#[test]
+fn terminal_contract_valid_values_are_not_coerced_by_tolerant_decode() {
+    for version in [0, 1, 2, u16::MAX] {
+        let mut wire = serde_json::to_value(terminal(SnapshotSource::ClaudeCode)).unwrap();
+        wire["reconstruction_contract"] = json!(version);
+        let decoded: SnapshotQuarantineRecord = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.reconstruction_contract, version);
+        let restarted: SnapshotQuarantineRecord =
+            serde_json::from_slice(&serde_json::to_vec(&decoded).unwrap()).unwrap();
+        assert_eq!(restarted, decoded);
+    }
+}

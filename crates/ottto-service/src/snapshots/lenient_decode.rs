@@ -2227,7 +2227,10 @@ fn present_raw<'de, D: serde::Deserializer<'de>>(
 }
 #[derive(Deserialize)]
 struct QuarantineRepair<'a> {
-    #[serde(default = "terminal_contract_retry::legacy_contract")]
+    #[serde(
+        default = "terminal_contract_retry::legacy_contract",
+        deserialize_with = "terminal_contract_retry::decode_contract"
+    )]
     reconstruction_contract: u16,
     witness: SnapshotQuarantineWitness,
     #[serde(borrow)]

@@ -37,3 +37,20 @@ returning terminal, stale-ledger reconciliation, retained account/workspace
 bindings, unchanged history-gate state, and a two-file Claude scan where the
 retry selects only its owning file. Tests run in Public CI; local validation is
 explicit-file rustfmt and bounded `cargo check -p ottto-service --tests`.
+
+## Malformed bookkeeping and interrupted retries
+
+A malformed-present reconstruction version decodes as unknown (`0`) in both
+checkpoint representations, preserving every other field. The decoder consumes
+invalid scalar or container values without retaining their contents. Absent
+fields still mean v1; valid u16 values remain intact. Unknown pending or unproven
+terminal records receive exactly one paced attempt at the current version, then
+persist that stamp. Superseded and server-permanent gates remain in force.
+
+Regression fixtures keep account/workspace bindings, prior ACK fingerprints and
+body witnesses, cache states/heads, refusals, the identity-contract token, its
+latch and history markers beside the damaged record. They cover null, strings,
+negative/overflow integers and other JSON shapes, both ordinary decode and the
+index's scalar-repair path, and checkpoint save/reload. Separate bumped-contract
+success and selected-lease restart cases exercise exact ACK settlement, stale
+index suppression and an interrupted attempt returning only after pacing.

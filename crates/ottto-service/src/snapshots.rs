@@ -3856,7 +3856,10 @@ const fn legacy_snapshot_item_wire_byte_limit() -> usize {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotQuarantineRecord {
     /// Reconstruction semantics last assessed; legacy records were assessed under v1.
-    #[serde(default = "terminal_contract_retry::legacy_contract")]
+    #[serde(
+        default = "terminal_contract_retry::legacy_contract",
+        deserialize_with = "terminal_contract_retry::decode_contract"
+    )]
     pub reconstruction_contract: u16,
     pub witness: SnapshotQuarantineWitness,
     pub retry_after_unix_seconds: u64,
