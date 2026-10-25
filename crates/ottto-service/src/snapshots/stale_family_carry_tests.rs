@@ -2930,7 +2930,11 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
     }
     for case in [
         "idless",
+        "message_only",
         "second_cause",
+        "member_changed",
+        "occurrence_mismatch",
+        "lossy",
         "changed",
         "version",
         "parser",
@@ -2941,6 +2945,16 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
         let candidate = &mut fixture.candidates[0];
         let key = local_index_key(&candidate.path);
         std::fs::write(&candidate.path, format!("{{\"timestamp\":\"2026-08-02T07:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{root}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")).unwrap();
+        if case == "message_only" {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&candidate.path).unwrap()).unwrap();
+            value["message"]["id"] = serde_json::json!("msg-without-request-id");
+            std::fs::write(
+                &candidate.path,
+                serde_json::to_string(&value).unwrap() + "\n",
+            )
+            .unwrap();
+        }
         let items = parse_claude_code_jsonl_file(
             &candidate.path,
             CARRY_FAILED,
@@ -2975,6 +2989,30 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
                 let mut retained = 0;
                 invalidate_claude_usage_family_pending(pending, &mut retained);
             }
+            "member_changed" | "occurrence_mismatch" => {
+                let mut second = items[0].clone();
+                if case == "member_changed" {
+                    second.source_session_id += "_agent-secondary";
+                } else {
+                    second.claude_usage_request_ids.insert("other".into());
+                }
+                accumulate_claude_usage_family_pending_with_limit(
+                    &[second],
+                    &mut fixture.index.claude_usage_family_pending,
+                    CARRY_FAILED,
+                    100,
+                );
+            }
+            "lossy" => {
+                let mut value =
+                    serde_json::to_value(fixture.index.claude_request_census.get(&key).unwrap())
+                        .unwrap();
+                value["s"] = serde_json::json!("lossy");
+                fixture
+                    .index
+                    .claude_request_census
+                    .insert(key.clone(), scoped_retry_record(&key, value));
+            }
             "changed" => candidate.source_file_fingerprint = "e".repeat(64),
             "version" => {
                 fixture
@@ -2997,7 +3035,7 @@ fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() 
         }
         let before = serde_json::to_value(&fixture.index).unwrap();
         let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
-        if case == "idless" {
+        if matches!(case, "idless" | "message_only") {
             assert_eq!(row["carried_pending_families"], 1);
             assert_eq!(
                 scoped_retry_full_reads(&fixture.index, &fixture.candidates),
