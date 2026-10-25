@@ -5,7 +5,10 @@
 //! A record is local-only and content-free: the sorted 8-byte SHA-256 prefixes
 //! of the provider request ids one parse saw. It is never proof, usage or
 //! upload input. D1 only produces, persists, prunes and measures records; no
-//! fence, coverage, rearm, posture or upload decision reads them.
+//! fence, coverage, posture or upload decision reads them. The narrowed
+//! unhealthy-retry carry conservatively refuses its per-family exception
+//! unless a complete current record matches the committed scan identity;
+//! it never promotes that record to new-window proof or coverage.
 //!
 //! Census state follows the working index (`self`), never `previous`: a held
 //! or partially committed key keeps the record of the revision this window

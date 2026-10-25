@@ -1147,3 +1147,105 @@ fn fix2_late_api_row_rereads_the_family_like_base() {
     assert_eq!(fix.heads_after, base.heads_after);
     assert_eq!(fix.witness_after, base.witness_after);
 }
+
+/// Exercise Condition X through the widened carry, using actual sidecars,
+/// bounded scanner, proof fold, uploads, ACKs and save/reload between pages.
+#[test]
+#[serial(source_manifests)]
+fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
+    use sha2::{Digest, Sha256};
+    if !c1a_layout_supported("scoped_retry_late_identity") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = c1a_fixture("scoped-retry-late-identity");
+    let closing = c1b_generation(&fixture, "scoped", (8, 0));
+    assert!(closing.census_complete && closing.proven && closing.full_rearm);
+    RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+    RearmFixture::append(
+        &c1b_terminal_path(&fixture),
+        &rearm_transcript_line(REARM_TERMINAL, None, "req_terminal_2", 1),
+    );
+    let red = c1b_generation(&fixture, "scoped", (8, 10));
+    assert!(red.red && red.proven);
+    let unsettled = || {
+        c1b_without_full_rearm_window(&fixture);
+        let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+        index.save(&fixture.index_path).unwrap();
+    };
+    unsettled();
+    let retry = c1b_generation(&fixture, "scoped", (8, 20));
+    assert_eq!(
+        retry.start.as_ref().unwrap().carried_pending_families,
+        Some(1)
+    );
+    assert_eq!(
+        retry.family_reads, 0,
+        "the independently accepted family is carried"
+    );
+    assert!(retry.red && retry.census_invalid && retry.fence_after);
+    unsettled();
+
+    let login = "a".repeat(64);
+    let org = "d".repeat(64);
+    let path = fixture.sidecar_path("claude-code-effort");
+    let rows = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+                serde_json::from_str(line).unwrap();
+            row.account_identity_checked = true;
+            row.account_identifier_hash = Some(login.clone());
+            row.request_identity = Some(serde_json::from_value(serde_json::json!({
+            "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
+            "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":login},
+            "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":org},
+        })).unwrap());
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            serde_json::to_string(&row).unwrap() + "\n"
+        })
+        .collect::<String>();
+    std::fs::write(&path, rows).unwrap();
+
+    let mut parsed = BTreeSet::new();
+    let mut tagged_root = false;
+    for number in 0..C1B_MAX_PAGES {
+        let page = fixture.page(
+            &format!("2026-08-02T08:{:02}:00Z", 30 + number),
+            RearmUpload::Accept,
+        );
+        parsed.extend(page.parsed.iter().cloned());
+        if let Some(item) = page
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == REARM_ROOT)
+        {
+            assert!(page.offered.contains(&item.snapshot_fingerprint));
+            assert!(page.uploaded.contains(&item.snapshot_fingerprint));
+            assert!(!item.request_evidence.is_empty());
+            assert!(item.request_evidence.iter().all(|evidence| {
+                evidence.identity_basis == crate::snapshots::claude_request_identity::TELEMETRY
+                    && evidence.provider_workspace_hash.as_deref() == Some(org.as_str())
+            }));
+            tagged_root = true;
+        }
+        if c1b_traversal_ended(&page.index).0 {
+            break;
+        }
+    }
+    assert_eq!(
+        parsed.intersection(&rearm_family_sessions()).count(),
+        rearm_family_sessions().len()
+    );
+    assert!(
+        tagged_root,
+        "late identity evidence emits and ACKs the tagged root in this retry"
+    );
+}

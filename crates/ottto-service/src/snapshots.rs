@@ -4761,14 +4761,67 @@ fn claude_stale_carry_start_admitted(index: &ScanIndex) -> bool {
         && index.upload_context_fingerprint == index.active_upload_context_fingerprint
 }
 
+/// Additional per-file proof for the narrowed unhealthy-retry carry. The
+/// accepted current entity set, its committed head and the complete request
+/// record must all describe the retained scan identity. This credits no new
+/// census evidence and writes no ACK, authority, account or identity state.
+/// Candidate selection still compares the newly observed scan fingerprint;
+/// a changed member cancels the funded carry through the ordinary path.
+fn claude_stale_member_independently_accepted(
+    index: &ScanIndex,
+    key: &str,
+    entry: &ScanIndexEntry,
+) -> bool {
+    let Some(record) = index.claude_request_census.get(key) else {
+        return false;
+    };
+    record.current_for(&entry.source_file_fingerprint)
+        && entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+        && claude_index_file_body_accepted(index, key, entry)
+        && entry
+            .last_snapshot_fingerprint
+            .as_ref()
+            .is_some_and(|head| {
+                index
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|set| {
+                        // The committed head is the canonical FILE entity-set
+                        // digest used by finalization, not an entity fingerprint.
+                        let mut digest = Sha256::new();
+                        update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
+                        for fingerprint in set {
+                            update_length_prefixed(&mut digest, fingerprint.as_bytes());
+                        }
+                        let hex = b"0123456789abcdef";
+                        let bytes = head.as_bytes();
+                        bytes.len() == 64
+                            && digest.finalize().iter().enumerate().all(|(i, byte)| {
+                                bytes[2 * i] == hex[usize::from(byte >> 4)]
+                                    && bytes[2 * i + 1] == hex[usize::from(byte & 15)]
+                            })
+                    })
+            })
+        && !index.claude_family_listed(key)
+        && !index.claude_reemission_exclusions.pauses_adoption()
+        && !index
+            .claude_reemission_exclusions
+            .holds_without_list_before(
+                record.birth().map(|birth| birth.unix_seconds),
+                claude_reemission_exclusions::NO_LIST_HOLD_BEFORE_UNIX_SECONDS,
+            )
+}
+
 /// Stale Claude families whose committed revisions a red retry keeps instead
 /// of re-arming them whole. Nothing is carried unless the start retries the
-/// prior traversal's context after its red terminal, no page of that
-/// traversal settled partially, the duplicate fence is already closed, the
-/// contract-5 identity latch is clear, the accepted ledger is current and the
-/// upload context is active, and a whole re-arm could not plausibly reopen
-/// the fence (some indexed member would stay unread, or some stale family is
-/// invalid). A family is carried only with complete membership (its root and
+/// prior traversal's context after its red terminal, the duplicate fence is
+/// already closed, the contract-5 identity latch is clear, the accepted ledger
+/// is current and the upload context is active. A partially settled traversal or a plausibly
+/// fence-opening retry ordinarily keeps BASE. A same-context unhealthy retry
+/// outside a scheduled full replay can instead carry individually accepted
+/// families with current, complete saved request evidence and no protected
+/// member. Missing evidence or acceptance keeps that family's re-arm.
+/// A family is carried only with complete membership (its root and
 /// one path per member), no authority quarantine record (correction debt
 /// included), a legacy-free witness whose member sets equal that membership,
 /// no legacy, owned-start or duplicate-request link, valid pending that
@@ -4783,13 +4836,16 @@ fn claude_fence_closed_retry_carry(
     stale: &BTreeSet<String>,
     same_context_retry: bool,
     prior_unsettled_upload: bool,
+    scoped_retry_allowed: bool,
 ) -> ClaudeStaleFamilyCarry {
     #[cfg(test)]
     if KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get) {
         return ClaudeStaleFamilyCarry::default();
     }
+    let needs_independent_acceptance =
+        prior_unsettled_upload || claude_stale_rearm_can_reopen_fence(index, stale);
     if !same_context_retry
-        || prior_unsettled_upload
+        || (needs_independent_acceptance && !scoped_retry_allowed)
         || stale.is_empty()
         || !claude_stale_carry_start_admitted(index)
     {
@@ -4811,9 +4867,6 @@ fn claude_fence_closed_retry_carry(
         );
         return ClaudeStaleFamilyCarry::default();
     }
-    if claude_stale_rearm_can_reopen_fence(index, stale) {
-        return ClaudeStaleFamilyCarry::default();
-    }
     let mut blocked = BTreeSet::new();
     for (index_key, entry) in &index.files {
         let Some(member_ref) = claude_index_path_member_ref(Path::new(index_key)) else {
@@ -4829,6 +4882,8 @@ fn claude_fence_closed_retry_carry(
                 .claude_account_deferred_holds
                 .contains_key(index_key.as_str())
             || (!confirmed_empty && !claude_index_file_body_accepted(index, index_key, entry))
+            || (needs_independent_acceptance
+                && !claude_stale_member_independently_accepted(index, index_key, entry))
         {
             blocked.insert(root_session_id);
         }
@@ -37355,6 +37410,21 @@ fn ensure_bounded_traversal(
             index.claude_full_rearm_progress.full_rearm_window_next = false;
         }
         let retry_can_reopen = claude_stale_rearm_can_reopen_fence(index, &stale_pending_roots);
+        // Only ordinary same-context unhealthy retries gain the per-family
+        // exception. A due/invalid replay deadline or an active/new full-rearm
+        // window keeps its existing first-proof and identity opportunity.
+        let scoped_retry_allowed = prior_traversal_context_matches
+            && index.claude_full_rearm_progress.full_rearm_window.is_none()
+            && !index.claude_full_rearm_progress.full_rearm_window_next
+            && rfc3339_unix_seconds(collected_at).is_some_and(|now| {
+                index
+                    .claude_duplicate_fence_next_full_rearm_unix_seconds
+                    .is_some_and(|deadline| {
+                        now < deadline
+                            && deadline
+                                <= now.saturating_add(CLAUDE_DUPLICATE_FENCE_REARM_MAX_SECONDS)
+                    })
+            });
         let full_rearm_window_roots =
             claude_full_rearm_window_at_start(index, &context_fingerprint, collected_at)
                 .map(|window_ends| {
@@ -37372,7 +37442,7 @@ fn ensure_bounded_traversal(
                         .collect::<BTreeSet<_>>()
                 })
                 .unwrap_or_default();
-        let carry = if !window_scratch_admitted || retry_can_reopen {
+        let carry = if !window_scratch_admitted {
             ClaudeStaleFamilyCarry::default()
         } else if full_rearm_window_roots.is_empty() {
             claude_fence_closed_retry_carry(
@@ -37380,9 +37450,12 @@ fn ensure_bounded_traversal(
                 &stale_pending_roots,
                 prior_traversal_context_matches,
                 prior_unsettled_upload,
+                scoped_retry_allowed,
             )
+        } else if retry_can_reopen {
+            ClaudeStaleFamilyCarry::default()
         } else {
-            claude_fence_closed_retry_carry(index, &full_rearm_window_roots, true, false)
+            claude_fence_closed_retry_carry(index, &full_rearm_window_roots, true, false, false)
         };
         let mut carried_roots = carry.roots.clone();
         drop(carry); // Release its first funded buffer before cap/digest scratch.
@@ -37456,12 +37529,15 @@ fn ensure_bounded_traversal(
             full_rearm_window_roots.difference(&retained_roots).count();
         transition.stale_rearm_capped_families = capped_roots.len();
         transition.stale_rearm_capped_files = capped_file_count;
-        if rearmed_file_count > 0 {
+        if rearmed_file_count > 0 || !carried_roots.is_empty() {
             eprintln!(
                 "local snapshot census re-armed stale Claude request evidence: {} pending \
-                 family/families, {} indexed file(s); bounded scan counters include this work",
+                 family/families, {} indexed file(s); carried_families={} rearmed_families={}; \
+                 bounded scan counters include this work",
                 stale_pending_roots.len(),
-                rearmed_file_count
+                rearmed_file_count,
+                carried_roots.len(),
+                stale_pending_roots.difference(&retained_roots).count(),
             );
         }
         if !carried_roots.is_empty() {
