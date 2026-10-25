@@ -3410,11 +3410,15 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
     let _live = money::LiveForTest::new(&control.support);
-    let sample = control
-        .cycle()
-        .1
-        .pop()
-        .expect("actual prepared Claude body");
+    control.cycle();
+    // cycle().1 is the pre-finalization scan. Clone the actual finalized wire
+    // entity so these telemetry-only carriers have the literal synthetic
+    // selected-body proof that their retirement requires.
+    let sample: SnapshotItem = serde_json::from_value(control.offers().pop().unwrap()).unwrap();
+    assert_eq!(
+        sample.usage_accounting_contract.as_deref(),
+        Some(money::REQUEST_OWNED_CONTRACT)
+    );
     let now = current_unix_seconds();
     control.recovery_startup(now);
     let mut index = control.saved();
@@ -3450,6 +3454,11 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
         let mut item = sample.clone();
         item.source_session_id =
             format!("{:08x}-7777-4777-8777-777777777777", 0x60000000u32 + number);
+        for fact in &mut item.attribution_facts {
+            if fact.field == "root_session_ref" {
+                fact.value = item.source_session_id.clone();
+            }
+        }
         // Synthetic telemetry-only entities have no physical selected file.
         item.source_file_fingerprint = None;
         item.provenance.collector = "claude_api_synthetic".into();
