@@ -34757,7 +34757,7 @@ impl CodexTitleMetadata {
         let decoration = (!reduction_only).then_some(thread).flatten();
         let extent = (!reduction_only).then_some(extent).flatten();
         let family = self.family_position(source_session_id.as_str());
-        sha256_hex(&[
+        let fingerprint = sha256_hex(&[
             "codex_session_sidecar:v4",
             source_session_id.as_str(),
             if self
@@ -34830,7 +34830,15 @@ impl CodexTitleMetadata {
                 .map(|(_, _, depth)| *depth)
                 .unwrap_or_default()
                 .to_string(),
-        ])
+        ]);
+        // A per-home row can stay byte-identical while another home's row
+        // creates a collision. Invalidate paused ownership decisions as well
+        // as fresh parsing; census flags alone are not cursor dependencies.
+        if self.identity_conflicts.contains(source_session_id.as_str()) {
+            sha256_hex(&["codex_identity_conflict:v1", &fingerprint])
+        } else {
+            fingerprint
+        }
     }
 
     fn load_from_roots(roots: &[PathBuf]) -> Self {

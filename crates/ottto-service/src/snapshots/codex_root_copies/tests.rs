@@ -300,3 +300,65 @@ fn multiple_physical_homes_remain_strict_without_independent_alias_proof() {
         "unchanged guard refuses each cross-home file group"
     );
 }
+
+#[test]
+fn another_homes_collision_invalidates_unchanged_local_reduction_dependencies() {
+    let fixture = Fixture::new(1);
+    let before = fixture.metadata();
+    let root = fixture.roots[1].parent().unwrap();
+    let local = &before.root_sidecars[root].threads[&fixture.ids[0]];
+    let path = Path::new(local.rollout_path.as_deref().unwrap());
+    let fingerprint = before.path_reduction_fingerprint(path);
+    fixture.update(2, "UPDATE threads SET model='conflicting-model'");
+    let after = fixture.metadata();
+    assert!(after.identity_conflicts.contains(&fixture.ids[0]));
+    assert_eq!(&after.root_sidecars[root].threads[&fixture.ids[0]], local);
+    assert_ne!(
+        after.path_reduction_fingerprint(path),
+        fingerprint,
+        "paused parser must not reuse ownership after another home conflicts"
+    );
+    fixture.update(2, "UPDATE threads SET model='gpt-5.2'");
+    assert_eq!(
+        fixture.metadata().path_reduction_fingerprint(path),
+        fingerprint
+    );
+}
+
+#[test]
+fn dominant_projection_does_not_hide_incompatible_older_copies_in_any_order() {
+    let projections = [(1000, 100), (500, 80), (600, 70)];
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let mut metadata = CodexTitleMetadata::default();
+        for (n, i) in order.into_iter().enumerate() {
+            let (next_byte_offset, next_ordinal) = projections[i];
+            let extents = BTreeMap::from([(
+                "thread".to_string(),
+                CodexRolloutExtent {
+                    next_byte_offset,
+                    next_ordinal,
+                },
+            )]);
+            merge_extents(&mut metadata, &extents);
+            metadata.root_sidecars.insert(
+                PathBuf::from(format!("home-{n}")),
+                RootSidecar {
+                    threads: BTreeMap::new(),
+                    extents,
+                },
+            );
+        }
+        assert!(
+            metadata.identity_conflicts.contains("thread"),
+            "order={order:?}"
+        );
+        assert!(!metadata.rollout_extents.contains_key("thread"));
+    }
+}

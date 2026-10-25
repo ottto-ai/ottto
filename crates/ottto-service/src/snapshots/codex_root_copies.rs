@@ -125,6 +125,22 @@ pub(super) fn merge_extents(
             metadata.rollout_extents.remove(id);
             continue;
         }
+        // A dominating maximum does not prove all older copies agree:
+        // (1000,100) dominates both (500,80) and (600,70), but those two
+        // disagree on progress order. Home sort order must never hide it.
+        let incompatible = metadata.root_sidecars.values().any(|sidecar| {
+            sidecar.extents.get(id).is_some_and(|prior| {
+                !((extent.next_byte_offset >= prior.next_byte_offset
+                    && extent.next_ordinal >= prior.next_ordinal)
+                    || (extent.next_byte_offset <= prior.next_byte_offset
+                        && extent.next_ordinal <= prior.next_ordinal))
+            })
+        });
+        if incompatible {
+            metadata.rollout_extents.remove(id);
+            metadata.identity_conflicts.insert(id.clone());
+            continue;
+        }
         let Some(prior) = metadata.rollout_extents.get(id).copied() else {
             metadata.rollout_extents.insert(id.clone(), *extent);
             continue;
