@@ -1050,14 +1050,21 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
     });
 }
 
-#[test]
-fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
+fn retry_case(conflict: bool) {
     with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-retry");
+        let mut c = Corpus::new(if conflict {
+            "e2-pipeline-retry-conflict"
+        } else {
+            "e2-pipeline-retry-clean"
+        });
         let prefix = line(ROOT, "copied", "2026-08-02T06:58:00Z", 11);
         let a = line(ROOT, "conflict", AT, 2);
         let b = a.replace("claude-haiku-4-5", "claude-sonnet-4-5");
-        c.root(ROOT, &(prefix + &a + &b + &line(ROOT, "own", AT, 20)));
+        let conflict_lines = if conflict { a + &b } else { String::new() };
+        c.root(
+            ROOT,
+            &(prefix + &conflict_lines + &line(ROOT, "own", AT, 20)),
+        );
         c.agent(0, &line(ROOT, "agent", AT, 5));
         let scanner = E2ScanFixture::default();
         let mut p = ready(&c, &scanner, ScanIndex::default(), 100, false);
@@ -1069,7 +1076,10 @@ fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
             .find(|s| s.source_session_id == ROOT)
             .expect("resolver-conflict root must reach literal emission with its disclosure");
         assert_eq!(root.removed_request_count, Some(1));
-        assert_eq!(root.resolver_conflict_count, Some(1));
+        assert_eq!(
+            root.resolver_conflict_count,
+            if conflict { Some(1) } else { None }
+        );
         assert_eq!(root.telemetry_owned_complete, Some(false));
         let r = root.removed_usage.as_ref().unwrap();
         assert_eq!(
@@ -1170,6 +1180,15 @@ fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
                 .snapshot_fingerprint
         ));
     });
+}
+
+#[test]
+fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
+    retry_case(true);
+}
+#[test]
+fn e2_pipeline_transport_restart_and_partial_ack_without_resolver_conflict() {
+    retry_case(false);
 }
 
 fn family_corpus(c: &mut Corpus, count: usize, model_padding: usize) {
