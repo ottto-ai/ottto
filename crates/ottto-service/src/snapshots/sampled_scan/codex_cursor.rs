@@ -817,11 +817,7 @@ pub(in crate::snapshots) fn group_counting_view<'a>(
     members: impl IntoIterator<Item = &'a CandidateFile>,
     index: &ScanIndex,
 ) -> String {
-    crate::snapshots::codex_counting_version::group_view(
-        members
-            .into_iter()
-            .filter_map(|member| index.files.get(&local_index_key(&member.path))),
-    )
+    crate::snapshots::codex_counting_version::group_view(members, index)
 }
 
 /// The counting view a job is decided under: a group's over all members.
