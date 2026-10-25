@@ -23268,6 +23268,9 @@ pub(crate) struct OwnedSourceScan {
     resource_probe: crate::local_resource_diagnostics::Probe,
     sampling: Option<sampled_scan::Context>,
     source: SnapshotSource,
+    /// Configured scan roots, for a Codex census close that starts the next
+    /// generation in the same page (G1 carry).
+    roots: Vec<PathBuf>,
     index: ScanIndex,
     collected_at: String,
     backfill_window_days: u64,
@@ -23887,10 +23890,12 @@ impl OwnedSourceScan {
             index.observe_claude_request_identity_contract(claude_request_identity_capture);
         }
         ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+        let next_generation_hints;
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
             refresh_retained_codex_roster(source, traversal, backfill_window_days, &index.files);
-            enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
+            next_generation_hints =
+                enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
             if continuation.is_none() {
                 advance_bounded_directory_traversal(
                     source,
@@ -24001,6 +24006,7 @@ impl OwnedSourceScan {
                 pending_paths.push(candidate);
             }
         }
+        let audited = pending_paths.len();
         for _ in pending_paths.len()..hinted_budget {
             let Some(position) = traversal
                 .pending_candidates
@@ -24050,6 +24056,20 @@ impl OwnedSourceScan {
                 });
             traversal.pending_candidates = kept.into();
             pending_paths.extend(selected);
+        }
+        if source == SnapshotSource::Codex {
+            // G1 (fix 2): the same selection, read census members first. The
+            // reserved census member and every other first read are charged
+            // to the page's singleton budget before any re-read (a watcher
+            // hint for a path this generation already processed), so each
+            // page completes a first read and re-reads cannot starve one.
+            // Audits keep their place; the order is otherwise unchanged.
+            let (members, rereads): (Vec<_>, Vec<_>) = pending_paths
+                .split_off(audited)
+                .into_iter()
+                .partition(|candidate| candidate.census_member);
+            pending_paths.extend(members);
+            pending_paths.extend(rereads);
         }
         index.resume_census_window_end = Some(census_window_end.clone());
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
@@ -24271,6 +24291,7 @@ impl OwnedSourceScan {
             resource_probe,
             sampling: None,
             source,
+            roots: roots.to_vec(),
             index: owned_index,
             collected_at: collected_at.to_owned(),
             backfill_window_days,
@@ -24311,7 +24332,9 @@ impl OwnedSourceScan {
             codex_join_active: None,
             codex_join_completed: Vec::new(),
             codex_legacy_join_baselines: Vec::new(),
-            codex_page: Default::default(),
+            codex_page: sampled_scan::codex_cursor::PageBudget::with_next_generation_hints(
+                next_generation_hints,
+            ),
             codex_selected_flags,
             codex_side_pass: None,
             continuation_ticket: None,
@@ -24431,6 +24454,7 @@ impl OwnedSourceScan {
             mut sampling,
             index: mut index_storage,
             source,
+            roots,
             collected_at,
             backfill_window_days,
             file_limit,
@@ -24606,7 +24630,17 @@ impl OwnedSourceScan {
                         .into_values()
                         .map(|group| (own_page(&group), group))
                         .collect::<Vec<_>>();
-                    groups.sort_by_key(|(own, _)| !*own);
+                    // G1: after own-page groups, census members' groups go
+                    // ahead of groups whose selected members are re-reads.
+                    groups.sort_by_key(|(own, group)| {
+                        (
+                            !*own,
+                            !sampled_scan::codex_cursor::census_member(
+                                &codex_selected_flags,
+                                group.members.iter().map(|member| member.path.as_path()),
+                            ),
+                        )
+                    });
                     for (own, group) in groups {
                         if group
                             .members
@@ -24714,7 +24748,47 @@ impl OwnedSourceScan {
                             codex_state_only_blocked_session_ids.insert(group.owner.clone());
                             continue;
                         }
-                        if used > 0 && (own || used + group.members.len() > file_limit) {
+                        // G1: a group whose attempt already ended in this
+                        // generation is fenced at its pop (M-5 b) and reads
+                        // nothing. Decide it here, so it takes no file
+                        // allowance a waiting census member needs.
+                        let fenced = sampling.as_ref().is_some_and(|context| {
+                            context.cache.group_fenced(
+                                &context.namespace,
+                                &codex_file_join::job_key(&group),
+                                fence.as_deref(),
+                            )
+                        });
+                        // G1: a group whose selected members are all re-reads
+                        // never takes file allowance a waiting census-member
+                        // singleton needs (own page or not). It waits for a
+                        // page without one; its members stay pending as
+                        // re-reads.
+                        let rereads_crowd_members = !fenced
+                            && !sampled_scan::codex_cursor::census_member(
+                                &codex_selected_flags,
+                                group.members.iter().map(|member| member.path.as_path()),
+                            )
+                            && {
+                                let waiting = identified_candidates
+                                    .iter()
+                                    .filter(|candidate| {
+                                        let key = local_index_key(&candidate.path);
+                                        !grouped_paths.contains(&key)
+                                            && sampled_scan::codex_cursor::selected_census_member(
+                                                &codex_selected_flags,
+                                                &candidate.path,
+                                            )
+                                    })
+                                    .count();
+                                waiting > 0
+                                    && (own || used + group.members.len() + waiting > file_limit)
+                            };
+                        if rereads_crowd_members
+                            || (!fenced
+                                && used > 0
+                                && (own || used + group.members.len() > file_limit))
+                        {
                             // Keep the existing traversal as the only queue. A whole
                             // group is selected on a subsequent ordinary page.
                             if let Some(traversal) = index.traversal.as_mut() {
@@ -24723,7 +24797,12 @@ impl OwnedSourceScan {
                                         traversal.pending_candidates.push_back(ScanTraversalPath {
                                             scan_root: member.scan_root.clone(),
                                             path: member.path.clone(),
-                                            census_member: true,
+                                            // G1: a re-read is not re-enrolled.
+                                            census_member:
+                                                sampled_scan::codex_cursor::selected_census_member(
+                                                    &codex_selected_flags,
+                                                    &member.path,
+                                                ),
                                             watcher_hint: false,
                                         });
                                     }
@@ -24731,10 +24810,12 @@ impl OwnedSourceScan {
                             }
                             continue;
                         }
-                        used += group.members.len();
-                        if own {
-                            // Nothing else joins its page.
-                            used = used.max(file_limit);
+                        if !fenced {
+                            used += group.members.len();
+                            if own {
+                                // Nothing else joins its page.
+                                used = used.max(file_limit);
+                            }
                         }
                         if let Some(traversal) = index.traversal.as_mut() {
                             // R2-L3: one set per group, not a member scan per
@@ -24764,7 +24845,9 @@ impl OwnedSourceScan {
                                 .cache
                                 .record_join_owner(&group.owner, &group.members);
                         }
-                        codex_join_groups.push_back(group);
+                        if !fenced {
+                            codex_join_groups.push_back(group);
+                        }
                     }
                     // F8: the paused group job's owner, in every scan object.
                     if let Some(owner) = sampling
@@ -24803,12 +24886,28 @@ impl OwnedSourceScan {
                     while !identified_candidates.is_empty()
                         && used + identified_candidates.len() > file_limit
                     {
-                        if let Some(candidate) = identified_candidates.pop_back() {
+                        // G1: re-reads leave before any census member.
+                        let evict = identified_candidates
+                            .iter()
+                            .rposition(|candidate| {
+                                !sampled_scan::codex_cursor::selected_census_member(
+                                    &codex_selected_flags,
+                                    &candidate.path,
+                                )
+                            })
+                            .unwrap_or(identified_candidates.len() - 1);
+                        if let Some(candidate) = identified_candidates.remove(evict) {
                             if let Some(traversal) = index.traversal.as_mut() {
+                                // G1: a re-read is not re-enrolled.
+                                let census_member =
+                                    sampled_scan::codex_cursor::selected_census_member(
+                                        &codex_selected_flags,
+                                        &candidate.path,
+                                    );
                                 traversal.pending_candidates.push_front(ScanTraversalPath {
                                     scan_root: candidate.scan_root,
                                     path: candidate.path,
-                                    census_member: true,
+                                    census_member,
                                     watcher_hint: false,
                                 });
                             }
@@ -24841,6 +24940,13 @@ impl OwnedSourceScan {
                         &context.namespace,
                         &boot.key,
                         sampled_scan::codex_cursor::census_token(index).as_deref(),
+                        sampled_scan::codex_cursor::census_member(
+                            &codex_selected_flags,
+                            boot.group
+                                .members
+                                .iter()
+                                .map(|member| member.path.as_path()),
+                        ),
                     ) {
                         sampled_scan::codex_cursor::StartPlan::Defer => {
                             context.cache.cursor_note_deferred();
@@ -25023,6 +25129,13 @@ impl OwnedSourceScan {
                         &context.namespace,
                         &boot.key,
                         sampled_scan::codex_cursor::census_token(index).as_deref(),
+                        sampled_scan::codex_cursor::census_member(
+                            &codex_selected_flags,
+                            boot.group
+                                .members
+                                .iter()
+                                .map(|member| member.path.as_path()),
+                        ),
                     ) {
                         sampled_scan::codex_cursor::StartPlan::Singleton => {}
                         sampled_scan::codex_cursor::StartPlan::Cursor => paged = true,
@@ -25209,7 +25322,25 @@ impl OwnedSourceScan {
                     }
                 }
             }
-            if active_file.is_none() {
+            // G1 (fix 2): a group whose selected members are all re-reads
+            // waits until this page's census singletons are read, so its
+            // replay cannot spend the singleton budget a first read needs.
+            // Evaluated between files only, and the candidate scan only when
+            // the next group is a re-read.
+            let rereads_wait = || {
+                codex_join_groups.front().is_some_and(|group| {
+                    !sampled_scan::codex_cursor::census_member(
+                        &codex_selected_flags,
+                        group.members.iter().map(|member| member.path.as_path()),
+                    )
+                }) && identified_candidates.iter().any(|candidate| {
+                    sampled_scan::codex_cursor::selected_census_member(
+                        &codex_selected_flags,
+                        &candidate.path,
+                    )
+                })
+            };
+            if active_file.is_none() && !rereads_wait() {
                 if let Some(group) = codex_join_groups.pop_front() {
                     if group
                         .members
@@ -25691,6 +25822,12 @@ impl OwnedSourceScan {
                             .cursor
                             .as_ref()
                             .is_some_and(sampled_scan::codex_cursor::JobMeta::census_trusted);
+                    // G1: growth past a job's frozen extent is next-generation
+                    // evidence when the job started in this census generation.
+                    let job_in_generation = active
+                        .cursor
+                        .as_ref()
+                        .is_some_and(|meta| meta.in_generation(index));
                     // The certificate re-reads two samples from the held FD (M3).
                     codex_page.charge(true, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                     match sampled_scan::codex_cursor::finish_job(
@@ -25710,11 +25847,16 @@ impl OwnedSourceScan {
                         } => {
                             // N2: a withheld record keeps the path pending, so
                             // the next page tails it from `s`.
+                            let next_generation = grown && fragment.is_none() && job_in_generation;
                             sampled_scan::codex_cursor::release_path(
                                 index,
                                 &active.candidate,
                                 grown || fragment.is_some(),
+                                next_generation,
                             );
+                            context
+                                .cache
+                                .cursor_note_next_generation(u64::from(next_generation));
                             // N1: a cursor-only job (census incomplete at start
                             // or now) publishes like main's unsampled read: the
                             // certificate fenced the object, but no checkpoint,
@@ -25742,11 +25884,16 @@ impl OwnedSourceScan {
                         } => {
                             // N2: a withheld record keeps the path pending, so
                             // the next page tails it from `s`.
+                            let next_generation = grown && fragment.is_none() && job_in_generation;
                             sampled_scan::codex_cursor::release_path(
                                 index,
                                 &active.candidate,
                                 grown || fragment.is_some(),
+                                next_generation,
                             );
+                            context
+                                .cache
+                                .cursor_note_next_generation(u64::from(next_generation));
                             cursor_certificate = Some(None);
                             cursor_publication = Some(publication);
                             cursor_fragment = fragment;
@@ -27593,10 +27740,17 @@ impl OwnedSourceScan {
                         }
                     }
                 }
+                // G1: only census members hold discovery. A pending re-read
+                // (growth after this generation processed its path) is
+                // next-generation evidence; retiring drops it and the next
+                // walk re-reads the file if it is stale.
                 let traversal_discovery_done =
                     index.traversal.as_ref().is_some_and(|traversal| {
                         traversal.pending_directories.is_empty()
-                            && traversal.pending_candidates.is_empty()
+                            && !traversal
+                                .pending_candidates
+                                .iter()
+                                .any(|candidate| candidate.census_member)
                     }) && index.claude_stale_family_carry.replay.is_empty();
                 if traversal_discovery_done {
                     if source == SnapshotSource::Codex {
@@ -27714,8 +27868,12 @@ impl OwnedSourceScan {
                     scanned_session_count += state_only_scanned;
                     semantic_noop_count += state_only_noops;
                 }
+                // G1: pending re-reads do not hold the restart either.
                 let parent_resolution_restart = traversal_discovery_done
-                    && traversal_snapshot.pending_candidates.is_empty()
+                    && !traversal_snapshot
+                        .pending_candidates
+                        .iter()
+                        .any(|candidate| candidate.census_member)
                     && traversal_snapshot.codex_parent_resolution_retry_required;
                 if parent_resolution_restart {
                     if let Some(context) = sampling.as_ref() {
@@ -27815,7 +27973,13 @@ impl OwnedSourceScan {
                 let skipped_file_count_due_to_limit = index
                     .traversal
                     .as_ref()
-                    .map(|traversal| traversal.pending_candidates.len())
+                    .map(|traversal| {
+                        traversal
+                            .pending_candidates
+                            .iter()
+                            .filter(|candidate| candidate.census_member)
+                            .count()
+                    })
                     .unwrap_or_default()
                     .saturating_add(index.claude_stale_family_carry.replay.len());
                 let restart_after_hints =
@@ -27862,6 +28026,7 @@ impl OwnedSourceScan {
                     );
                 }
                 let mut terminal_native_traversal = None;
+                let mut carried_next_generation = Vec::new();
                 if (raw_census_complete
                     && codex_legacy_join_baselines.is_empty()
                     && !pending_finalization.iter().any(|pending| {
@@ -27904,6 +28069,23 @@ impl OwnedSourceScan {
                         raw_census_complete,
                         &census_window_end,
                     );
+                    // G1 carry: the closing generation's waiting re-reads
+                    // (watcher hints, budget-deferred re-reads, growth past
+                    // its window end) are next-generation evidence. Hand them
+                    // to the next generation as members rather than dropping
+                    // them; they never re-enter the generation closing here.
+                    carried_next_generation = index
+                        .traversal
+                        .as_ref()
+                        .filter(|_| source == SnapshotSource::Codex)
+                        .map_or_else(Vec::new, |traversal| {
+                            traversal
+                                .pending_candidates
+                                .iter()
+                                .filter(|candidate| !candidate.census_member)
+                                .map(|candidate| candidate.path.clone())
+                                .collect::<Vec<_>>()
+                        });
                     index.traversal = None;
                     index.resume_after_path = None;
                     index.resume_upper_bound_path = None;
@@ -27959,6 +28141,23 @@ impl OwnedSourceScan {
                 }
                 if !index.decode_holds.is_empty() {
                     index.mark_bounded_sweep_unsettled();
+                }
+                // Only a settled close starts the next generation in this
+                // page. A partially settled sweep (including a decode hold
+                // just marked) keeps its marker for the clean follow-up the
+                // next page starts, and that walk re-reads the stale files.
+                if !carried_next_generation.is_empty() && !index.bounded_sweep_had_unsettled_upload
+                {
+                    ensure_bounded_traversal(
+                        source,
+                        &roots,
+                        index,
+                        &collected_at,
+                        backfill_window_days,
+                    );
+                    if let Some(next) = index.traversal.as_mut() {
+                        enqueue_watcher_hints(source, next, &carried_next_generation, false);
+                    }
                 }
                 if source == SnapshotSource::ClaudeCode {
                     seal_claude_complete_rebuild_read(
@@ -28717,6 +28916,10 @@ impl OwnedSourceScan {
                     &context.namespace,
                     &key,
                     sampled_scan::codex_cursor::census_token(index).as_deref(),
+                    sampled_scan::codex_cursor::census_member(
+                        &codex_selected_flags,
+                        [candidate.path.as_path()],
+                    ),
                     // Stage 1 guard (§6): a side read is never paced.
                     side_plan
                         .is_none()
@@ -29233,6 +29436,7 @@ impl OwnedSourceScan {
                             &context.namespace,
                             &local_index_key(&active.candidate.path),
                             sampled_scan::codex_cursor::census_token(index).as_deref(),
+                            true,
                         )
                     });
                     if plan != Some(sampled_scan::codex_cursor::StartPlan::Singleton) {
@@ -29253,6 +29457,10 @@ impl OwnedSourceScan {
                     &context.namespace,
                     &local_index_key(&active.candidate.path),
                     sampled_scan::codex_cursor::census_token(index).as_deref(),
+                    sampled_scan::codex_cursor::census_member(
+                        &codex_selected_flags,
+                        [active.candidate.path.as_path()],
+                    ),
                     Some(sampled_scan::codex_cursor::PaceProbe {
                         file: active.parser.reader.reader.get_ref(),
                         index,
@@ -29347,6 +29555,7 @@ impl OwnedSourceScan {
             resource_probe,
             sampling,
             source,
+            roots,
             index: index_storage,
             collected_at,
             backfill_window_days,
@@ -37246,8 +37455,13 @@ fn ensure_bounded_traversal(
         .as_ref()
         .filter(|traversal| traversal.context_fingerprint == context_fingerprint)
     {
+        // G1: discovery's census-member rule; pending re-reads do not hold
+        // the bounded retry.
         let terminal_unhealthy = traversal.pending_directories.is_empty()
-            && traversal.pending_candidates.is_empty()
+            && !traversal
+                .pending_candidates
+                .iter()
+                .any(|candidate| candidate.census_member)
             && index.claude_stale_family_carry.replay.is_empty()
             && traversal.counts.has_errors();
         // What clears the latch: a generation that completes drops the
@@ -37637,18 +37851,20 @@ fn ensure_bounded_traversal(
     });
 }
 
+/// Returns how many Codex hints re-entered as next-generation evidence.
 fn enqueue_watcher_hints(
     source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
     hinted_paths: &[PathBuf],
     watcher_overflowed: bool,
-) {
+) -> u64 {
     // Ordinary, bounded watcher paths are exact path hints. They join the
     // durable traversal census and are revalidated by the same no-follow open
     // and post-read identity checks as directory-discovered candidates. Only
     // overflow/backend loss makes the watcher evidence incomplete and forces a
     // following clean generation.
     traversal.watcher_hint_seen |= watcher_overflowed;
+    let mut next_generation = 0_u64;
     let mut pending = traversal
         .pending_candidates
         .iter()
@@ -37670,15 +37886,26 @@ fn enqueue_watcher_hints(
         else {
             continue;
         };
+        // K7 for singletons and re-reads (G1): a Codex path this generation
+        // already processed (observed and no longer pending) was read after
+        // `census_window_end`, so its growth is next-generation evidence. It
+        // is still read when the page budget allows, but it no longer holds
+        // the census; the next generation's walk re-reads it if it is stale.
+        let census_member = source != SnapshotSource::Codex
+            || !traversal
+                .observed_index_keys
+                .contains(&local_index_key(path));
+        next_generation += u64::from(!census_member);
         // FIFO keeps an actively rewritten path from repeatedly jumping ahead
         // of an older remove/rename hint in a small bounded page.
         traversal.pending_candidates.push_back(ScanTraversalPath {
             scan_root,
             path: path.clone(),
-            census_member: true,
+            census_member,
             watcher_hint: true,
         });
     }
+    next_generation
 }
 
 /// Keep a retained Codex generation's roster current without a re-walk.
@@ -82373,7 +82600,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);

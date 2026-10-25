@@ -225,10 +225,13 @@ pub(in crate::snapshots) struct PageBudget {
     /// but no ticket is minted (`continuation_ticket` still requires the
     /// exhausted budget). Never set on an ordinary page.
     deadline: Option<InlineInstant>,
+    /// G1: watcher hints this page's start enqueued as next-generation
+    /// evidence, counted in `deferred_next_generation` at the page tick.
+    next_generation_hints: u64,
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
     disabled_disclosed, page_noted, resume_claimed, proof_claimed, window_start, continuation,
-    ordinary_equivalent, committed, deadline);
+    ordinary_equivalent, committed, deadline, next_generation_hints);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -270,6 +273,15 @@ pub(in crate::snapshots) enum StartRefusal {
 }
 
 impl PageBudget {
+    /// A page whose start enqueued `hints` watcher hints as next-generation
+    /// evidence (G1).
+    pub(in crate::snapshots) fn with_next_generation_hints(hints: u64) -> Self {
+        Self {
+            next_generation_hints: hints,
+            ..Self::default()
+        }
+    }
+
     pub(in crate::snapshots) fn charge(&mut self, cursor: bool, bytes: u64) {
         let counter = if cursor {
             &mut self.cursor_decoded
@@ -399,7 +411,14 @@ impl PageBudget {
     pub(in crate::snapshots) fn note_page(&mut self, cache: &SharedCache, namespace: &Scope) {
         if self.continuation {
             if !std::mem::replace(&mut self.page_noted, true) {
-                self.window_start = cache.with_cursor(|cursor| Box::new(cursor.counters));
+                self.window_start = cache.with_cursor(|cursor| {
+                    let start = Box::new(cursor.counters);
+                    cursor.counters.deferred_next_generation = cursor
+                        .counters
+                        .deferred_next_generation
+                        .saturating_add(self.next_generation_hints);
+                    start
+                });
             }
             return;
         }
@@ -417,7 +436,12 @@ impl PageBudget {
                 }
                 cursor.rotation.page = cursor.rotation.page.saturating_add(1);
                 cursor.proof_rotation.page = cursor.rotation.page;
-                Box::new(cursor.counters)
+                let start = Box::new(cursor.counters);
+                cursor.counters.deferred_next_generation = cursor
+                    .counters
+                    .deferred_next_generation
+                    .saturating_add(self.next_generation_hints);
+                start
             });
             if skipped {
                 record_proof_drop();
@@ -518,6 +542,12 @@ crate::heap_layout_bound::fields!(SealedPrefix; dev, ino, extent);
 impl JobMeta {
     pub(in crate::snapshots) fn census_trusted(&self) -> bool {
         self.census_trusted
+    }
+
+    /// The job started in `index`'s current census generation (K7), so it
+    /// froze its extent after that generation's `census_window_end`.
+    pub(in crate::snapshots) fn in_generation(&self, index: &ScanIndex) -> bool {
+        self.fence.is_some() && self.fence == census_token(index)
     }
 
     /// The live job's copy-budget charge without a walk (E3): the last
@@ -1346,8 +1376,10 @@ struct Rotation {
     /// Sequence of each file's last completed attempt: lower goes first,
     /// never-served files (absent, rank zero) first of all.
     served: BTreeMap<String, u64>,
-    /// Large files waiting for the slot: (first page waited, last page seen).
-    waiting: BTreeMap<String, (u64, u64)>,
+    /// Large files waiting for the slot: (first page waited, last page seen,
+    /// not a census member). A census member's read holds the strict census,
+    /// so it takes the slot ahead of every re-read (G1).
+    waiting: BTreeMap<String, (u64, u64, bool)>,
     /// Census generation of each file's last completed attempt.
     attempted: BTreeMap<String, (String, u64)>,
     /// Groups whose probes outran the page's remaining singleton budget
@@ -1361,40 +1393,56 @@ impl Rotation {
         self.served.get(key).copied().unwrap_or(0)
     }
 
-    /// True when no active waiter is ahead of `key`. Order: rank (last
-    /// completed attempt, zero if never served), then first page waited
-    /// (this page if `key` is not waiting).
+    /// True when no active waiter is ahead of a census member `key`.
+    #[cfg(test)]
     fn turn(&self, key: &str) -> bool {
+        self.turn_as(key, true)
+    }
+
+    /// True when no active waiter is ahead of `key`. Order: census members
+    /// before re-reads (G1), then rank (last completed attempt, zero if never
+    /// served), then first page waited (this page if `key` is not waiting).
+    fn turn_as(&self, key: &str, census_member: bool) -> bool {
         let mine = (
+            !census_member,
             self.rank(key),
-            self.waiting.get(key).map_or(self.page, |(first, _)| *first),
+            self.waiting
+                .get(key)
+                .map_or(self.page, |(first, _, _)| *first),
         );
-        !self.waiting.iter().any(|(other, (first, seen))| {
+        !self.waiting.iter().any(|(other, (first, seen, reread))| {
             other != key
                 && self.page.saturating_sub(*seen) < WAITER_ACTIVE_PAGES
-                && (self.rank(other), *first) < mine
+                && (*reread, self.rank(other), *first) < mine
         })
     }
 
+    #[cfg(test)]
     fn wait(&mut self, key: &str) {
+        self.wait_as(key, true);
+    }
+
+    fn wait_as(&mut self, key: &str, census_member: bool) {
         let page = self.page;
         self.waiting
-            .retain(|_, (_, seen)| page.saturating_sub(*seen) < WAITER_FORGET_PAGES);
-        if let Some((_, seen)) = self.waiting.get_mut(key) {
+            .retain(|_, (_, seen, _)| page.saturating_sub(*seen) < WAITER_FORGET_PAGES);
+        if let Some((_, seen, reread)) = self.waiting.get_mut(key) {
             *seen = page;
+            *reread = !census_member;
             return;
         }
         if self.waiting.len() >= ROTATION_KEYS {
             if let Some(victim) = self
                 .waiting
                 .iter()
-                .min_by_key(|(_, (_, seen))| *seen)
+                .min_by_key(|(_, (_, seen, _))| *seen)
                 .map(|(key, _)| key.clone())
             {
                 self.waiting.remove(&victim);
             }
         }
-        self.waiting.insert(key.to_owned(), (page, page));
+        self.waiting
+            .insert(key.to_owned(), (page, page, !census_member));
     }
 
     fn fenced(&self, key: &str, fence: Option<&str>) -> bool {
@@ -4604,6 +4652,15 @@ impl SharedCache {
         self.with_cursor(|cursor| cursor.counters.deferred += 1);
     }
 
+    /// Growth read after its path was processed in this census generation
+    /// re-enters the queue as next-generation evidence, not a census
+    /// member (K7 for singletons and re-reads, G1).
+    pub(in crate::snapshots) fn cursor_note_next_generation(&self, count: u64) {
+        if count > 0 {
+            self.with_cursor(|cursor| cursor.counters.deferred_next_generation += count);
+        }
+    }
+
     /// A cursor job reached the page budget without its lease (unreachable
     /// while the frame holds one): the job is dropped, never continued
     /// in-page, and its pending path restarts it (L2).
@@ -4615,7 +4672,8 @@ impl SharedCache {
     /// file larger than the singleton budget on a cursor build is affected:
     /// a file whose attempt completed in this generation is `Fenced`; a
     /// file another waiter is ahead of is deferred; every deferred large
-    /// file is recorded as waiting.
+    /// file is recorded as waiting. `census_member`: the read holds this
+    /// generation's census, so it waits ahead of every re-read (G1).
     #[allow(clippy::too_many_arguments)]
     pub(in crate::snapshots) fn cursor_plan(
         &self,
@@ -4627,6 +4685,7 @@ impl SharedCache {
         namespace: &Scope,
         key: &str,
         fence: Option<&str>,
+        census_member: bool,
     ) -> StartPlan {
         self.cursor_plan_paced(
             page,
@@ -4637,6 +4696,7 @@ impl SharedCache {
             namespace,
             key,
             fence,
+            census_member,
             None,
         )
     }
@@ -4662,6 +4722,7 @@ impl SharedCache {
         namespace: &Scope,
         key: &str,
         fence: Option<&str>,
+        census_member: bool,
         pace: Option<PaceProbe<'_>>,
     ) -> StartPlan {
         let plan = page.plan(limits, expected, slot_free, cursor_enabled);
@@ -4682,13 +4743,13 @@ impl SharedCache {
                 cursor.counters.deferred_next_generation += 1;
                 return StartPlan::Fenced;
             }
-            if plan == StartPlan::Cursor && !cursor.rotation.turn(&key) {
+            if plan == StartPlan::Cursor && !cursor.rotation.turn_as(&key, census_member) {
                 cursor.counters.deferred_rotation += 1;
-                cursor.rotation.wait(&key);
+                cursor.rotation.wait_as(&key, census_member);
                 return StartPlan::Defer;
             }
             if plan == StartPlan::Defer {
-                cursor.rotation.wait(&key);
+                cursor.rotation.wait_as(&key, census_member);
             }
             if let Some((pace_key, rev)) = paced.as_ref() {
                 if cursor.pace.verdict(*pace_key, rev, pace_now()) == PaceVerdict::Defer {
@@ -5064,6 +5125,35 @@ impl SharedCache {
     }
 }
 
+/// Whether a read of `paths` holds this generation's census (G1): one of
+/// them was selected on this page as a census member, or none was selected
+/// at all. Only selected paths are pending, so a read whose selected paths
+/// are all re-reads holds nothing.
+pub(in crate::snapshots) fn census_member<'a>(
+    flags: &BTreeMap<String, (bool, bool)>,
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> bool {
+    let mut selected = false;
+    for path in paths {
+        if let Some((member, _)) = flags.get(&local_index_key(path)) {
+            if *member {
+                return true;
+            }
+            selected = true;
+        }
+    }
+    !selected
+}
+
+/// The census flag `path` was selected with on this page (a member when it
+/// was not selected), for a path returned to the queue (G1).
+pub(in crate::snapshots) fn selected_census_member(
+    flags: &BTreeMap<String, (bool, bool)>,
+    path: &Path,
+) -> bool {
+    census_member(flags, [path])
+}
+
 /// Return a page-selected Codex file to `pending_candidates` with the
 /// selection flags it had, unless it is already pending.
 pub(in crate::snapshots) fn requeue(
@@ -5166,16 +5256,21 @@ pub(in crate::snapshots) fn dequeue_members<'a>(
 /// if the file grew past the frozen extent, keep the path as a watcher hint
 /// instead, and the next page tails the appended bytes from `s`. A large
 /// re-read of it in this generation is `Fenced` (K7), so the census waits
-/// for at most that one small tail.
+/// for at most that one small tail. `next_generation`: the job froze its
+/// extent in this generation, after `census_window_end`, so the appended
+/// bytes are next-generation evidence and the hint is not a census member
+/// (G1); a withheld fragment or a job from an older generation keeps it one.
 pub(in crate::snapshots) fn release_path(
     index: &mut ScanIndex,
     candidate: &CandidateFile,
     grown: bool,
+    next_generation: bool,
 ) {
     if !grown {
         dequeue(index, candidate);
         return;
     }
+    let census_member = !next_generation;
     let Some(traversal) = index.traversal.as_mut() else {
         return;
     };
@@ -5186,7 +5281,7 @@ pub(in crate::snapshots) fn release_path(
         }
         let keep = !std::mem::replace(&mut kept, true);
         if keep {
-            pending.census_member = true;
+            pending.census_member = census_member;
             pending.watcher_hint = true;
         }
         keep
@@ -5195,7 +5290,7 @@ pub(in crate::snapshots) fn release_path(
         traversal.pending_candidates.push_back(ScanTraversalPath {
             scan_root: candidate.scan_root.clone(),
             path: candidate.path.clone(),
-            census_member: true,
+            census_member,
             watcher_hint: true,
         });
     }
