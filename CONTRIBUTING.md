@@ -51,6 +51,8 @@ evidence, no Linux job stands in for the macOS `Rust contracts` job, and a
 manually started (`workflow_dispatch`) run tests the branch head, not the merge
 with `main`.
 
+The guard also works when `main` has a merge queue: it enqueues the PR and waits for the merge.
+
 Authors with write access merge their own pull request once its review is
 complete, the four checks passed on the final head and it is mergeable. No
 separate merge window, merge slot or extra approval is required. Wait only for a
