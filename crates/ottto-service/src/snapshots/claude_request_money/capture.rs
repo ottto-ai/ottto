@@ -22,9 +22,7 @@ use super::super::{rfc3339_unix_seconds, ClaudeTranscriptUsageOccurrence, UsageT
 use super::ClaudeMoneyTokens;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-#[cfg(not(test))]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -70,43 +68,49 @@ static WORK: Mutex<BTreeMap<PathBuf, Work>> = Mutex::new(BTreeMap::new());
 // Production has one capture scope, and SNAPSHOT_SYNC_LOCK serializes its
 // pages. Mirror the page latch so later files return before arming takes a
 // lock or clones a scope. Tests have independent scopes on parallel threads.
-#[cfg(not(test))]
 static PAGE_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 
-pub(super) fn page_exhausted(scope: &Path) -> bool {
-    #[cfg(not(test))]
-    {
-        let _ = scope;
-        PAGE_EXHAUSTED.load(Ordering::Acquire)
-    }
+// Normal tests isolate scopes; one regression opts its thread into the
+// actual production latch. Other test threads never read or mutate it.
+fn uses_process_latch() -> bool {
     #[cfg(test)]
     {
-        WORK.lock().map_or(true, |pages| {
-            pages.get(scope).is_some_and(|work| work.exhausted)
-        })
+        PROCESS_LATCH_FOR_TEST.with(std::cell::Cell::get)
     }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+pub(super) fn page_exhausted(scope: &Path) -> bool {
+    #[cfg(test)]
+    if !uses_process_latch() {
+        return WORK.lock().map_or(true, |pages| {
+            pages.get(scope).is_some_and(|work| work.exhausted)
+        });
+    }
+    let _ = scope;
+    PAGE_EXHAUSTED.load(Ordering::Acquire)
 }
 
 /// Check before arming (which locks and, in tests, clones the scope).
 /// Arming and plan eligibility stay independent of the current page's work:
 /// the next-page finalizer probe selects its inputs before resetting Work.
 fn page_exhausted_for_file(path: &Path) -> bool {
-    #[cfg(not(test))]
-    {
-        let _ = path;
-        PAGE_EXHAUSTED.load(Ordering::Acquire)
-    }
     #[cfg(test)]
-    {
-        super::SHADOW_ENABLED_FOR_TEST
+    if !uses_process_latch() {
+        return super::SHADOW_ENABLED_FOR_TEST
             .lock()
             .map_or(true, |scopes| {
                 scopes
                     .iter()
                     .find(|dir| dir.parent().is_some_and(|base| path.starts_with(base)))
                     .is_some_and(|scope| page_exhausted(scope))
-            })
+            });
     }
+    let _ = path;
+    PAGE_EXHAUSTED.load(Ordering::Acquire)
 }
 
 /// After a cold page, focus the next Full parse on the oldest 64 family
@@ -529,8 +533,9 @@ pub(crate) fn set_plan_deadline_for_test(expired: bool) {
 }
 
 pub(crate) fn begin_page(scope: &Path) {
-    #[cfg(not(test))]
-    PAGE_EXHAUSTED.store(false, Ordering::Release);
+    if uses_process_latch() {
+        PAGE_EXHAUSTED.store(false, Ordering::Release);
+    }
     if let Ok(mut work) = WORK.lock() {
         work.insert(scope.to_path_buf(), Work::default());
     }
@@ -653,8 +658,9 @@ fn spend_work(scope: &Path, bytes: usize, comparisons: usize) -> bool {
             || work.micros.saturating_add(running) >= PAGE_CAPTURE_US
         {
             work.exhausted = true;
-            #[cfg(not(test))]
-            PAGE_EXHAUSTED.store(true, Ordering::Release);
+            if uses_process_latch() {
+                PAGE_EXHAUSTED.store(true, Ordering::Release);
+            }
             return false;
         }
         work.input = input;
@@ -1367,6 +1373,7 @@ pub(crate) fn work_for_test(scope: &Path) -> (usize, usize, u64) {
 #[cfg(test)]
 thread_local! {
     static TIMER_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROCESS_LATCH_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -2085,6 +2092,24 @@ mod bounded_tests {
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn exhausted_capture_constructs_no_timers_and_allocates_nothing() {
+        assert_exhausted_capture_fast_path();
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn production_exhaustion_latch_constructs_no_timers_and_allocates_nothing() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PROCESS_LATCH_FOR_TEST.with(|enabled| enabled.set(false));
+            }
+        }
+        PROCESS_LATCH_FOR_TEST.with(|enabled| assert!(!enabled.replace(true)));
+        let _reset = Reset;
+        assert_exhausted_capture_fast_path();
+    }
+
+    fn assert_exhausted_capture_fast_path() {
         let scratch = crate::test_scratch::ScratchDir::new("money-exhausted-fast-path");
         let scope = scratch.join("support");
         let path = scratch.join("transcript.jsonl");
