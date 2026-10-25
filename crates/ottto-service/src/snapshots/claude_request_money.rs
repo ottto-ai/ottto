@@ -1481,14 +1481,18 @@ fn page_claims<'k>(
 
 /// Page roots' session ids by telemetry key. The schedule already holds
 /// each root's digest; it is indexed only when a classification asks.
-struct PageSessions<'o> {
-    order: &'o [(&'o str, String, u64)],
+struct PageSessions<'o, 'r, U> {
+    order: &'o [(&'r str, String, u64)],
+    /// Page roots scheduling has not keyed yet (family zero only).
+    unkeyed: U,
     /// The family's body deadline: indexing stops there (no session).
     deadline: Instant,
-    by_digest: std::cell::OnceCell<Option<BTreeMap<&'o str, &'o str>>>,
+    by_digest: std::cell::OnceCell<Option<BTreeMap<std::borrow::Cow<'o, str>, &'r str>>>,
 }
 
-impl claude_request_ledger::ClaudePageSessions for PageSessions<'_> {
+impl<'o, 'r, U: Iterator<Item = &'r str> + Clone> claude_request_ledger::ClaudePageSessions
+    for PageSessions<'o, 'r, U>
+{
     fn page_session(&self, key: &str) -> Option<String> {
         let digest = key.strip_prefix(TELEMETRY_KEY_PREFIX)?;
         self.by_digest
@@ -1498,7 +1502,20 @@ impl claude_request_ledger::ClaudePageSessions for PageSessions<'_> {
                     if Instant::now() >= self.deadline {
                         return None;
                     }
-                    by_digest.insert(&key[FAMILY_KEY_PREFIX.len()..], *root);
+                    by_digest.insert(
+                        std::borrow::Cow::Borrowed(&key[FAMILY_KEY_PREFIX.len()..]),
+                        *root,
+                    );
+                }
+                for root in self.unkeyed.clone() {
+                    if Instant::now() >= self.deadline {
+                        return None;
+                    }
+                    let key = telemetry_key(root);
+                    by_digest.insert(
+                        std::borrow::Cow::Owned(key[TELEMETRY_KEY_PREFIX.len()..].to_owned()),
+                        root,
+                    );
                 }
                 Some(by_digest)
             })
@@ -1900,14 +1917,6 @@ fn shadow_page_body(
     while position < order.len() {
         if position > 0 {
             end.deadline = later_families;
-            complete_schedule(
-                &mut order,
-                &mut unkeyed,
-                &scope_key,
-                ledger,
-                &mut schedule_complete,
-                &mut counts,
-            );
             apply_rest(
                 support_dir,
                 ledger,
@@ -2101,6 +2110,7 @@ fn shadow_page_body(
                 let claims = claimed.expect("admitted body requires the page claims");
                 let sessions = PageSessions {
                     order: &order,
+                    unkeyed: unkeyed.clone(),
                     deadline: body_deadline,
                     by_digest: Default::default(),
                 };
@@ -2235,6 +2245,16 @@ fn shadow_page_body(
             }
             families.push(rows);
         }
+        // The rest of the schedule, right after family zero and before the
+        // loop decides whether another family remains.
+        complete_schedule(
+            &mut order,
+            &mut unkeyed,
+            &scope_key,
+            ledger,
+            &mut schedule_complete,
+            &mut counts,
+        );
         position += 1;
     }
     complete_schedule(
