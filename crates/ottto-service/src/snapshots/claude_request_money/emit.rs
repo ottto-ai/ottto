@@ -1,7 +1,8 @@
 //! Literal emitter. Callers stage a complete body before changing the item.
+use super::super::claude_history_upgrade::REQUEST_OWNED_USAGE_CONTRACT;
 use super::super::{
-    exact_session_account_hash, ClaudeRemovedUsage, SnapshotCost, SnapshotItem,
-    SnapshotModelUsage, SnapshotSource, SnapshotUsageBucket, REQUEST_OWNED_USAGE_CONTRACT,
+    exact_session_account_hash, ClaudeRemovedUsage, SnapshotCost, SnapshotItem, SnapshotModelUsage,
+    SnapshotSource, SnapshotUsageBucket,
 };
 use super::body::ClaudeRequestUsageOrigin;
 use super::e2::ClaudeEntityBody;
@@ -318,6 +319,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn one_grain(conflicts: u64) -> ClaudeEntityBody {
+        let mut entity = ClaudeEntityBody::default();
+        entity.grains.insert(
+            (
+                ("2026-08-02T09:00:00Z".into(), "m".into(), BTreeMap::new()),
+                None,
+            ),
+            ClaudeGrainSide {
+                tokens: ClaudeMoneyTokens {
+                    input: 3,
+                    ..Default::default()
+                },
+                requests: 1,
+                cost_micros: 0,
+                unpriced: 1,
+                contributions: 1,
+            },
+        );
+        entity.resolver_conflicts = conflicts;
+        entity
+    }
+
+    #[test]
+    fn emission_keeps_uniform_account_and_refuses_tagged_identity() {
+        let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        assert!(apply(&mut item, &one_grain(0)));
+        super::super::super::set_session_account_hash(&mut item, Some("h"));
+        assert!(apply(&mut item, &one_grain(0)));
+        assert!(!item.model_usage.is_empty());
+        assert_eq!(exact_session_account_hash(&item).as_deref(), Some("h"));
+        // Rows already tagged with evidence cannot be regrouped: refuse,
+        // never wipe the tags.
+        item.model_usage[0].evidence_ref = Some(0);
+        let before = serde_json::to_vec(&item).unwrap();
+        assert!(!apply(&mut item, &one_grain(0)));
+        assert_eq!(serde_json::to_vec(&item).unwrap(), before);
+    }
+
+    #[test]
+    fn resolver_conflicts_emit_nonzero_only_and_change_the_fingerprint() {
+        let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        assert!(apply(&mut item, &one_grain(0)));
+        assert_eq!(item.resolver_conflict_count, None);
+        assert!(serde_json::to_value(&item)
+            .unwrap()
+            .get("resolver_conflict_count")
+            .is_none());
+        let clean = item.snapshot_fingerprint.clone();
+        assert!(apply(&mut item, &one_grain(2)));
+        assert_eq!(item.resolver_conflict_count, Some(2));
+        assert_eq!(
+            serde_json::to_value(&item).unwrap()["resolver_conflict_count"],
+            serde_json::json!(2)
+        );
+        assert_ne!(item.snapshot_fingerprint, clean);
     }
 
     #[test]

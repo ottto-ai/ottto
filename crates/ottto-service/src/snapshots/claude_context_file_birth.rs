@@ -168,10 +168,6 @@ impl ClaudeFileBirth {
         Some(at? < birth.checked_sub(slack)?)
     }
 
-    pub(in crate::snapshots) fn matches_path(&self, path: &Path) -> bool {
-        self.path_key_hash == stable_hash(&local_index_key(path))
-    }
-
     pub(in crate::snapshots) fn birth_nanos(&self) -> Option<i128> {
         match self.scope {
             ClaudeBirthScope::Root(birth) => Some(birth),
@@ -200,7 +196,11 @@ impl ClaudeFileBirth {
 
     /// One line's `version`, before its response (if any) is observed. A
     /// line without a version is no writer evidence. Borrowed; no allocation.
-    pub(in crate::snapshots) fn observe_writer(&mut self, version: Option<&str>, responses_before: u64) {
+    pub(in crate::snapshots) fn observe_writer(
+        &mut self,
+        version: Option<&str>,
+        responses_before: u64,
+    ) {
         let Some(version) = version else {
             return;
         };

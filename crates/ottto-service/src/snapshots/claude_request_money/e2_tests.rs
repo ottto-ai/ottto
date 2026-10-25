@@ -1,22 +1,38 @@
 use super::*;
-use crate::snapshots::{apply_claude_code_line, SnapshotAccumulator, SnapshotSource};
-use serde_json::json;
+use crate::claude_local_otel::{ClaudeApiEvidenceRead, ClaudeTraceOwnershipLoadReport};
+use crate::snapshots::tests::{complete_api_row, complete_trace_row};
+use crate::snapshots::{
+    apply_claude_code_line, ClaudeRemovedUsage, ScanIndexEntry, SnapshotAccumulator, SnapshotSource,
+};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
 const ROOT: &str = "a0000000-0000-4000-8000-00000000000a";
-const BIRTH: &str = "2026-10-25T12:00:00Z";
-fn line(id: Option<&str>, message: Option<&str>, at: &str, input: u64) -> serde_json::Value {
-    let mut v = json!({"type":"assistant","version":"2.1.309","sessionId":ROOT,"timestamp":at,"message":{"model":"claude-haiku-4-5","usage":{"input_tokens":input,"output_tokens":1}}});
-    if let Some(id) = id {
-        v["requestId"] = json!(id);
-    }
-    if let Some(message) = message {
-        v["message"]["id"] = json!(message);
-    }
-    v
+/// Birth of the first file; `complete_api_row` reports this hour.
+const T0: &str = "2026-08-02T07:00:00Z";
+const HOUR: &str = "2026-08-02T07:00:00Z";
+
+fn t0() -> i128 {
+    rfc3339_unix_nanos(T0).unwrap()
 }
-fn path(name: &str) -> PathBuf {
+fn at(seconds: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp_nanos(t0() + i128::from(seconds) * 1_000_000_000)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+fn line(id: &str, clock: &str, input: u64) -> Value {
+    json!({"type":"assistant","version":"2.1.309","sessionId":ROOT,"timestamp":clock,
+        "requestId":id,"message":{"id":format!("msg-{id}"),"model":"claude-haiku-4-5",
+        "usage":{"input_tokens":input,"output_tokens":1}}})
+}
+fn versioned(mut value: Value, version: &str) -> Value {
+    value["version"] = json!(version);
+    value
+}
+fn scratch(name: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "ottto-e2-{name}-{}-{}",
@@ -24,419 +40,754 @@ fn path(name: &str) -> PathBuf {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&dir).unwrap();
-    dir.join(format!("{ROOT}.jsonl"))
+    dir
 }
-fn entry() -> super::super::super::ScanIndexEntry {
+/// A root transcript path in its own scratch directory, written to disk.
+fn root_file(name: &str) -> PathBuf {
+    let path = scratch(name).join(format!("{ROOT}.jsonl"));
+    fs::write(&path, b"fixture\n").unwrap();
+    path
+}
+fn entry() -> ScanIndexEntry {
     serde_json::from_value(
-        json!({"size_bytes":0,"modified_unix_seconds":0,"source_file_fingerprint":"fixture"}),
+        json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fixture"}),
     )
     .unwrap()
 }
-fn item(
-    path: &Path,
-    birth: Option<i128>,
-    index: &ScanIndex,
-    lines: &[serde_json::Value],
-) -> SnapshotItem {
+fn parse(path: &Path, birth: Option<i128>, index: &ScanIndex, lines: &[Value]) -> SnapshotItem {
     let mut a = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
     a.claude_file_birth = ClaudeFileBirth::observe(path, None);
     if let Some(birth) = birth {
         a.claude_file_birth.set_birth_for_test(birth);
     }
-    for v in lines {
-        apply_claude_code_line(v, &mut a);
+    for value in lines {
+        apply_claude_code_line(value, &mut a);
     }
     a.finalize_claude_responses_e2(None, Some(ReadContext { index, path }));
-    a.into_items(path, "2026-10-25T13:00:00Z", "fixture".into(), None)
+    a.into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None)
         .remove(0)
 }
-fn published(
+/// Parse, then record the read like the scan does (birth + indexed path).
+fn parse_and_remember(
+    path: &Path,
+    birth: i128,
+    index: &mut ScanIndex,
+    lines: &[Value],
+) -> SnapshotItem {
+    let item = parse(path, Some(birth), index, lines);
+    remember_birth(index, path, item.claude_money.as_deref().unwrap());
+    index.files.insert(local_index_key(path), entry());
+    item
+}
+fn restart(index: &ScanIndex) -> ScanIndex {
+    serde_json::from_slice(&serde_json::to_vec(index).unwrap()).unwrap()
+}
+fn fold(item: &SnapshotItem) -> &FileFold {
+    item.claude_money.as_deref().unwrap()
+}
+fn requests(item: &SnapshotItem, origin: Option<ClaudeRequestUsageOrigin>) -> u64 {
+    fold(item)
+        .entity
+        .grains
+        .iter()
+        .filter(|((_, o), _)| *o == origin)
+        .map(|(_, grain)| grain.requests)
+        .sum()
+}
+const MATCHED: Option<ClaudeRequestUsageOrigin> = Some(ClaudeRequestUsageOrigin::TelemetryMatched);
+const UNPRICED: Option<ClaudeRequestUsageOrigin> =
+    Some(ClaudeRequestUsageOrigin::TelemetryUnpriced);
+const REPORTED: Option<ClaudeRequestUsageOrigin> =
+    Some(ClaudeRequestUsageOrigin::TelemetryReported);
+
+fn row(id: &str, sequence: u64, input: u64) -> ClaudeLocalOtelEvidence {
+    complete_api_row(ROOT, id, sequence, input, 1, 0)
+}
+fn refingerprint(mut row: ClaudeLocalOtelEvidence) -> ClaudeLocalOtelEvidence {
+    row.fingerprint.clear();
+    row.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&row).unwrap())
+    );
+    row
+}
+/// The live sidecar reader over exactly these rows for ROOT.
+fn sidecar(rows: &[ClaudeLocalOtelEvidence]) -> ClaudeApiEvidenceRead {
+    let support = scratch("support");
+    let dir = support.join(crate::claude_local_otel::STORE_DIR);
+    fs::create_dir_all(&dir).unwrap();
+    let body = rows
+        .iter()
+        .map(|row| serde_json::to_string(row).unwrap() + "\n")
+        .collect::<String>();
+    fs::write(
+        dir.join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes()))),
+        body,
+    )
+    .unwrap();
+    let read = ClaudeApiEvidenceRead::load(&support, [ROOT.to_owned()]).unwrap();
+    fs::remove_dir_all(support).unwrap();
+    read
+}
+fn api_report(read: &ClaudeApiEvidenceRead) -> ClaudeLocalOtelLoadReport {
+    ClaudeLocalOtelLoadReport {
+        evidence: read.evidence.clone(),
+        health: Default::default(),
+    }
+}
+/// The page path with the gate on: attach, side calls, finish.
+fn publish(
     mut items: Vec<SnapshotItem>,
-    api: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
+    read: Option<&ClaudeApiEvidenceRead>,
+    telemetry: TelemetryRead,
     index: &ScanIndex,
 ) -> Vec<SnapshotItem> {
-    attach_page(&mut items, api, index);
-    with_enabled(|| finish_page(&mut items, index));
+    if let Some(read) = read {
+        attach_page(&mut items, read);
+        side_calls_page(
+            &mut items,
+            &api_report(read),
+            &ClaudeTraceOwnershipLoadReport::default(),
+            index,
+        );
+    }
+    with_enabled(|| finish_page(&mut items, index, telemetry));
     items
 }
-fn birth() -> i128 {
-    rfc3339_unix_nanos(BIRTH).unwrap()
+fn rows_of(item: &SnapshotItem) -> impl Iterator<Item = &crate::snapshots::SnapshotModelUsage> {
+    item.model_usage.iter().chain(
+        item.usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage),
+    )
 }
-fn rows(
-    id: &str,
-    input: u64,
-) -> BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>> {
-    BTreeMap::from([(
-        ROOT.into(),
-        vec![crate::snapshots::tests::complete_api_row(
-            ROOT, id, 1, input, 1, 0,
-        )],
-    )])
+fn cleanup(paths: &[&Path]) {
+    for path in paths {
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
 }
 
 #[test]
-fn e2_two_second_boundary_and_context_sixty_seconds_unchanged() {
-    let p = path("boundary");
+fn e2_thinking_300_matches_an_otel_zero_and_rejects_a_different_count() {
+    let p = root_file("thinking");
     let index = ScanIndex::default();
-    let got = item(
-        &p,
-        Some(birth()),
+    let mut thinking = line("r", &at(1), 10);
+    thinking["message"]["usage"]["output_tokens"] = json!(301);
+    thinking["message"]["usage"]["output_tokens_details"] = json!({"thinking_tokens":300});
+    let item = parse(&p, Some(t0()), &index, std::slice::from_ref(&thinking));
+    let mut otel = complete_api_row(ROOT, "r", 1, 10, 301, 0);
+    assert_eq!(otel.reasoning_output_tokens, 0);
+    let got = publish(
+        vec![item],
+        Some(&sidecar(&[otel.clone()])),
+        TelemetryRead::Loaded,
         &index,
-        &[
-            line(
-                Some("copy"),
-                Some("a"),
-                "2026-10-25T11:59:57.999999999Z",
-                10,
-            ),
-            line(Some("boundary"), Some("b"), "2026-10-25T11:59:58Z", 20),
-            line(Some("own"), Some("c"), BIRTH, 30),
-        ],
     );
-    let fold = got.claude_money.as_ref().unwrap();
-    assert_eq!(fold.entity.totals().1, 2);
-    assert_eq!(fold.entity.removed_requests, 1);
+    assert_eq!(got[0].reasoning_output_tokens, 300, "transcript tokens win");
+    assert_eq!(got[0].telemetry_owned_complete, Some(true));
     assert_eq!(
-        got.request_count, 3,
-        "DARK leaves native counters unchanged"
+        got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+        Some("0.0001")
     );
-    let context = got.claude_file_birth;
-    assert_eq!(
-        context.copied_with_slack(Some(birth() - 2_000_000_001), 60_000_000_000),
-        Some(false)
-    );
-    let got = published(vec![got], &BTreeMap::new(), &index);
-    assert_eq!((got[0].request_count, got[0].input_tokens), (2, 50));
-    assert_eq!(got[0].removed_usage.unwrap().input_tokens, 10);
-    fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    otel.reasoning_output_tokens = 299;
+    let mut items = vec![parse(&p, Some(t0()), &index, &[thinking])];
+    attach_page(&mut items, &sidecar(&[refingerprint(otel)]));
+    assert_eq!(requests(&items[0], MATCHED), 0);
+    assert_eq!(requests(&items[0], None), 1);
+    assert_eq!(fold(&items[0]).disclosed, 1, "incompatible row disclosed");
+    cleanup(&[&p]);
 }
+
 #[test]
-fn e2_unknown_birth_version_and_invalid_clocks_count_and_disclose() {
-    let p = path("unknown");
+fn e2_model_less_record_attaches_through_its_native_fallback_key() {
+    let p = root_file("model-none");
     let index = ScanIndex::default();
-    for (physical, version) in [(None, "2.1.309"), (Some(birth()), "99.0.0")] {
-        let mut old = line(Some("old"), Some("a"), "2026-10-24T12:00:00Z", 11);
-        old["version"] = json!(version);
-        let mut own = line(Some("own"), Some("b"), BIRTH, 22);
-        own["version"] = json!(version);
-        let got = item(&p, physical, &index, &[old, own]);
-        let f = got.claude_money.as_ref().unwrap();
-        assert_eq!(f.entity.totals().1, 2);
-        assert_eq!(f.entity.removed_requests, 0);
-        assert_eq!(f.disclosed, 2);
-    }
-    let mut invalid = line(Some("bad"), Some("a"), "invalid", 5);
-    invalid["timestamp"] = json!("invalid");
-    let got = item(
+    let mut bare = line("b", &at(2), 20);
+    bare["message"].as_object_mut().unwrap().remove("model");
+    let mut items = vec![parse(
         &p,
-        Some(birth()),
+        Some(t0()),
         &index,
-        &[invalid, line(Some("own"), Some("b"), BIRTH, 7)],
+        &[line("a", &at(1), 10), bare],
+    )];
+    assert_eq!(fold(&items[0]).model_fallbacks.len(), 1);
+    attach_page(&mut items, &sidecar(&[row("b", 2, 20)]));
+    let f = fold(&items[0]);
+    assert_eq!(
+        (requests(&items[0], MATCHED), requests(&items[0], None)),
+        (1, 1)
     );
-    assert!(got.claude_money.as_ref().unwrap().disclosed > 0);
-    fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    assert_eq!(f.disclosed, 0);
+    assert_eq!(f.entity.totals().0.input, 30);
+    cleanup(&[&p]);
 }
+
+#[test]
+fn e2_untimed_record_attaches_from_the_bucket_fallback() {
+    let p = root_file("untimed");
+    let index = ScanIndex::default();
+    let mut untimed = line("b", &at(2), 20);
+    untimed.as_object_mut().unwrap().remove("timestamp");
+    let mut items = vec![parse(
+        &p,
+        Some(t0()),
+        &index,
+        &[line("a", &at(1), 10), untimed],
+    )];
+    assert_eq!(
+        fold(&items[0]).disclosed,
+        1,
+        "untimed root record disclosed"
+    );
+    assert_eq!(fold(&items[0]).entity.totals().1, 2);
+    attach_page(&mut items, &sidecar(&[row("b", 2, 20)]));
+    assert_eq!(
+        (requests(&items[0], MATCHED), requests(&items[0], None)),
+        (1, 1)
+    );
+    assert_eq!(fold(&items[0]).disclosed, 1, "the attach discloses nothing");
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_hour_boundary_keeps_the_transcript_hour() {
+    let p = root_file("hour");
+    let index = ScanIndex::default();
+    let mut items = vec![parse(
+        &p,
+        Some(t0()),
+        &index,
+        &[line("r", "2026-08-02T07:59:59.900Z", 10)],
+    )];
+    let mut late = row("r", 1, 10);
+    late.observed_at = "2026-08-02T08:00:01Z".into();
+    attach_page(&mut items, &sidecar(&[refingerprint(late)]));
+    let buckets = fold(&items[0])
+        .entity
+        .grains
+        .keys()
+        .map(|(key, origin)| (key.0.as_str(), *origin))
+        .collect::<Vec<_>>();
+    assert_eq!(buckets, vec![(HOUR, MATCHED)]);
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_otel_only_fast_speed_and_effort_join_the_reported_key() {
+    let p = root_file("speed");
+    let index = ScanIndex::default();
+    let items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
+    let estimated = fold(&items[0])
+        .entity
+        .grains
+        .keys()
+        .next()
+        .unwrap()
+        .0
+        .clone();
+    assert!(!estimated.2.contains_key("speed_mode"));
+    let mut items = items;
+    attach_page(&mut items, &sidecar(&[row("r", 1, 10)]));
+    let ((key, origin), _) = fold(&items[0]).entity.grains.iter().next().unwrap();
+    assert_eq!(*origin, MATCHED);
+    assert!(key.2.contains_key("speed_mode"), "OTEL speed joins the key");
+    assert_eq!(
+        key.2.get("reasoning_effort").map(String::as_str),
+        Some("high")
+    );
+    let got = publish(items, None, TelemetryRead::Loaded, &index);
+    assert!(rows_of(&got[0]).all(|row| row.reasoning_effort.as_deref() == Some("high")));
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_failed_or_missing_telemetry_read_is_never_complete() {
+    let p = root_file("failed");
+    let index = ScanIndex::default();
+    let lines = [line("r", &at(1), 10)];
+    let read = sidecar(&[row("r", 1, 10)]);
+    let ok = publish(
+        vec![parse(&p, Some(t0()), &index, &lines)],
+        Some(&read),
+        TelemetryRead::Loaded,
+        &index,
+    );
+    assert_eq!(ok[0].telemetry_owned_complete, Some(true));
+    let failed = publish(
+        vec![parse(&p, Some(t0()), &index, &lines)],
+        Some(&read),
+        TelemetryRead::Failed,
+        &index,
+    );
+    assert_eq!(failed[0].telemetry_owned_complete, Some(false));
+    let unread = publish(
+        vec![parse(&p, Some(t0()), &index, &lines)],
+        None,
+        TelemetryRead::Loaded,
+        &index,
+    );
+    assert_eq!(unread[0].telemetry_owned_complete, Some(false));
+    assert!(unread[0].cost.is_none());
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_oversized_sidecar_is_incomplete_and_attaches_nothing() {
+    let p = root_file("oversized");
+    let index = ScanIndex::default();
+    let support = scratch("oversized-support");
+    let dir = support.join(crate::claude_local_otel::STORE_DIR);
+    fs::create_dir_all(&dir).unwrap();
+    fs::File::create(dir.join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes()))))
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let read = ClaudeApiEvidenceRead::load(&support, [ROOT.to_owned()]).unwrap();
+    let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
+    attach_page(&mut items, &read);
+    assert!(fold(&items[0]).telemetry.read);
+    assert!(!fold(&items[0]).telemetry.complete);
+    let got = publish(items, None, TelemetryRead::Loaded, &index);
+    assert_eq!(got[0].telemetry_owned_complete, Some(false));
+    assert!(got[0].cost.is_none());
+    assert_eq!(got[0].request_count, 1);
+    fs::remove_dir_all(support).unwrap();
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_path_twins_attach_the_row_once() {
+    let first = root_file("twin-a");
+    let copy = root_file("twin-b");
+    let mut index = ScanIndex::default();
+    let own = parse_and_remember(&first, t0(), &mut index, &[line("r", &at(1), 10)]);
+    let twin = parse(
+        &copy,
+        Some(t0() + 60_000_000_000),
+        &index,
+        &[line("r", &at(1), 10), line("o", &at(61), 20)],
+    );
+    assert_eq!(fold(&twin).entity.removed_requests, 1, "the copy is held");
+    for order in [vec![own.clone(), twin.clone()], vec![twin, own]] {
+        let read = sidecar(&[row("r", 1, 10)]);
+        let mut items = order;
+        attach_page(&mut items, &read);
+        attach_page(&mut items, &read); // a second call moves nothing
+        assert_eq!(items.iter().map(|i| requests(i, MATCHED)).sum::<u64>(), 1);
+        let got = publish(items, None, TelemetryRead::Loaded, &index);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].request_count, got[0].input_tokens), (2, 30));
+        assert_eq!(got[0].removed_request_count, Some(1));
+        assert_eq!(
+            got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+    }
+    cleanup(&[&first, &copy]);
+}
+
+#[test]
+fn e2_unpriced_row_is_telemetry_unpriced() {
+    let p = root_file("unpriced");
+    let index = ScanIndex::default();
+    let mut unpriced = row("r", 1, 10);
+    unpriced.cost_usd_micros = None;
+    let got = publish(
+        vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])],
+        Some(&sidecar(&[refingerprint(unpriced)])),
+        TelemetryRead::Loaded,
+        &index,
+    );
+    assert!(got[0].cost.is_none());
+    assert_eq!(got[0].telemetry_owned_complete, Some(true));
+    assert!(rows_of(&got[0]).all(|row| {
+        row.cost_usd.is_none()
+            && row
+                .selector_context
+                .get("request_usage_origin")
+                .map(String::as_str)
+                == Some("telemetry_unpriced")
+    }));
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_priced_and_unpriced_rows_in_one_hour_stay_separate() {
+    let p = root_file("mixed");
+    let index = ScanIndex::default();
+    let mut unpriced = row("u", 2, 20);
+    unpriced.cost_usd_micros = None;
+    let mut items = vec![parse(
+        &p,
+        Some(t0()),
+        &index,
+        &[line("p", &at(1), 10), line("u", &at(2), 20)],
+    )];
+    attach_page(
+        &mut items,
+        &sidecar(&[row("p", 1, 10), refingerprint(unpriced)]),
+    );
+    assert_eq!(
+        (requests(&items[0], MATCHED), requests(&items[0], UNPRICED)),
+        (1, 1)
+    );
+    let got = publish(items, None, TelemetryRead::Loaded, &index);
+    assert_eq!(got[0].request_count, 2);
+    assert_eq!(
+        got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+        Some("0.0001")
+    );
+    let origins = got[0].usage_buckets[0]
+        .model_usage
+        .iter()
+        .map(|row| row.selector_context["request_usage_origin"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        origins,
+        BTreeSet::from(["telemetry_matched", "telemetry_unpriced"])
+    );
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_move_then_copy_across_restart_counts_each_request_once() {
+    let a = root_file("move-a");
+    let b = root_file("move-b");
+    let c = root_file("move-c");
+    let history = [line("h1", &at(1), 1), line("h2", &at(2), 2)];
+    let mut index = ScanIndex::default();
+    parse_and_remember(&a, t0(), &mut index, &history);
+    let mut index = restart(&index);
+    // Move: A is gone, B is a new inode born later with A's history.
+    fs::remove_file(&a).unwrap();
+    index.files.remove(&local_index_key(&a));
+    let moved = [
+        history[0].clone(),
+        history[1].clone(),
+        line("h3", &at(70), 4),
+    ];
+    let b_moved = parse_and_remember(&b, t0() + 60_000_000_000, &mut index, &moved);
+    assert_eq!(
+        fold(&b_moved).entity.totals().1,
+        3,
+        "a move inherits the cutoff"
+    );
+    assert_eq!(fold(&b_moved).birth(), Some(t0()));
+    let mut index = restart(&index);
+    // Copy of the live B: its history is held, its own line counts.
+    let copied = [
+        moved[0].clone(),
+        moved[1].clone(),
+        moved[2].clone(),
+        line("h4", &at(130), 8),
+    ];
+    for _pass in 0..2 {
+        let b_item = parse(&b, Some(t0() + 60_000_000_000), &index, &moved);
+        let c_item = parse_and_remember(&c, t0() + 120_000_000_000, &mut index, &copied);
+        assert_eq!(fold(&c_item).entity.removed_requests, 3);
+        let got = publish(vec![b_item, c_item], None, TelemetryRead::Loaded, &index);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].request_count, got[0].input_tokens), (4, 15));
+        assert_eq!(got[0].removed_request_count, Some(3));
+        index = restart(&index);
+    }
+    cleanup(&[&a, &b, &c]);
+}
+
+#[test]
+fn e2_restored_twins_both_prebirth_skip_exactly_one_never_both() {
+    let history = [line("h1", &at(-100), 1), line("h2", &at(-90), 2)];
+    for (x_birth, y_birth) in [(0, 5), (5, 0), (0, 0)] {
+        let x = root_file("restored-x");
+        let y = root_file("restored-y");
+        let (x_birth, y_birth) = (
+            t0() + x_birth * 1_000_000_000,
+            t0() + y_birth * 1_000_000_000,
+        );
+        let mut index = ScanIndex::default();
+        parse_and_remember(&x, x_birth, &mut index, &history);
+        parse_and_remember(&y, y_birth, &mut index, &history);
+        let index = restart(&index);
+        let xs = parse(&x, Some(x_birth), &index, &history);
+        let ys = parse(&y, Some(y_birth), &index, &history);
+        let skipped = [&xs, &ys]
+            .iter()
+            .filter(|item| fold(item).entity.removed_requests == 2)
+            .count();
+        assert_eq!(skipped, 1, "births {x_birth} {y_birth}");
+        let got = publish(
+            vec![xs.clone(), ys.clone()],
+            None,
+            TelemetryRead::Loaded,
+            &index,
+        );
+        assert_eq!(
+            (got[0].request_count, got[0].removed_request_count),
+            (2, Some(2))
+        );
+        // The surviving original is deleted: the held copy counts again.
+        let (kept, held) = if fold(&xs).entity.removed_requests == 0 {
+            (&x, (&y, y_birth))
+        } else {
+            (&y, (&x, x_birth))
+        };
+        fs::remove_file(kept).unwrap();
+        let alone = parse(held.0, Some(held.1), &index, &history);
+        assert_eq!(fold(&alone).entity.removed_requests, 0);
+        assert_eq!(fold(&alone).entity.totals().1, 2);
+        cleanup(&[&x, &y]);
+    }
+}
+
+#[test]
+fn e2_writer_certificate_refuses_mixed_versions_in_either_order() {
+    let p = root_file("writers");
+    let index = ScanIndex::default();
+    let copy = |version| versioned(line("c", &at(-100), 10), version);
+    for (copy_version, first, second, certified) in [
+        ("2.1.309", "2.1.309", "2.1.309", true),
+        ("2.0.0", "2.1.310", "2.1.310", true),
+        ("2.1.309", "2.1.309", "99.0.0", false),
+        ("2.1.309", "99.0.0", "2.1.309", false),
+        ("2.1.309", "2.1.309", "2.1.310", false),
+        ("2.1.309", "2.1.310", "2.1.309", false),
+    ] {
+        let lines = [
+            copy(copy_version),
+            versioned(line("o1", &at(1), 20), first),
+            versioned(line("o2", &at(2), 30), second),
+        ];
+        let got = parse(&p, Some(t0()), &index, &lines);
+        let f = fold(&got);
+        let case = format!("{copy_version} {first} {second}");
+        assert_eq!(f.entity.removed_requests, u64::from(certified), "{case}");
+        assert_eq!(f.entity.totals().1, 3 - u64::from(certified), "{case}");
+        assert_eq!(f.disclosed, u64::from(!certified), "{case}");
+    }
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_exact_removal_totals() {
+    let p = root_file("removal");
+    let index = ScanIndex::default();
+    let mut copy = line("c", &at(-100), 10);
+    copy["message"]["usage"]["output_tokens"] = json!(4);
+    copy["message"]["usage"]["cache_read_input_tokens"] = json!(7);
+    let got = publish(
+        vec![parse(
+            &p,
+            Some(t0()),
+            &index,
+            &[copy, line("o1", &at(1), 20), line("o2", &at(2), 30)],
+        )],
+        None,
+        TelemetryRead::Loaded,
+        &index,
+    );
+    assert_eq!((got[0].request_count, got[0].input_tokens), (2, 50));
+    assert_eq!((got[0].output_tokens, got[0].cache_read_tokens), (2, 0));
+    assert_eq!(got[0].removed_request_count, Some(1));
+    assert_eq!(
+        got[0].removed_usage,
+        Some(ClaudeRemovedUsage {
+            input_tokens: 10,
+            output_tokens: 4,
+            cache_read_tokens: 7,
+            ..Default::default()
+        })
+    );
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
+    let p = root_file("side");
+    let agent = p
+        .parent()
+        .unwrap()
+        .join(ROOT)
+        .join("subagents/agent-abc.jsonl");
+    fs::create_dir_all(agent.parent().unwrap()).unwrap();
+    fs::write(&agent, b"fixture\n").unwrap();
+    let index = ScanIndex::default();
+    let mut sub = line("s", &at(3), 30);
+    sub["agentId"] = json!("abc");
+    sub["isSidechain"] = json!(true);
+    let mut items = vec![
+        parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)]),
+        parse(&agent, Some(t0()), &index, &[sub]),
+    ];
+    let subagent = items[1].source_session_id.clone();
+    assert_eq!(subagent, format!("{ROOT}_agent-abc"));
+    let read = sidecar(&[
+        row("r", 1, 10),
+        row("s", 3, 30),
+        row("named", 4, 40),
+        row("orphan", 5, 50),
+    ]);
+    attach_page(&mut items, &read);
+    assert!(items
+        .iter()
+        .all(|item| !fold(item).telemetry.side_calls_done));
+    let trace = ClaudeTraceOwnershipLoadReport {
+        evidence: BTreeMap::from([(
+            ROOT.to_owned(),
+            vec![complete_trace_row(ROOT, "named", "abc")],
+        )]),
+        ..Default::default()
+    };
+    side_calls_page(&mut items, &api_report(&read), &trace, &index);
+    let (root, sub) = (fold(&items[0]), fold(&items[1]));
+    assert_eq!((requests(&items[1], REPORTED), sub.root_fallbacks), (1, 0));
+    assert_eq!((requests(&items[0], REPORTED), root.root_fallbacks), (1, 1));
+    assert_eq!((root.side_requests, sub.side_requests), (1, 1));
+    assert_eq!(root.side.input, 50);
+    assert_eq!(sub.side.input, 40);
+    let got = publish(items, None, TelemetryRead::Loaded, &index);
+    let by_session = got
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.as_str(),
+                (item.request_count, item.input_tokens),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(by_session[ROOT], (2, 60));
+    assert_eq!(by_session[subagent.as_str()], (2, 70));
+    assert!(got
+        .iter()
+        .all(|item| item.telemetry_owned_complete == Some(true)));
+    let _ = fs::remove_dir_all(p.parent().unwrap());
+}
+
+#[test]
+fn e2_resolver_conflict_is_counted_and_emitted() {
+    let p = root_file("conflict");
+    let index = ScanIndex::default();
+    let a = line("x", &at(1), 10);
+    let mut b = a.clone();
+    b["message"]["model"] = json!("other-model");
+    let item = parse(&p, Some(t0()), &index, &[a, b, line("own", &at(2), 1)]);
+    assert_eq!(fold(&item).entity.resolver_conflicts, 1);
+    assert_eq!(fold(&item).entity.totals().1, item.request_count);
+    let got = publish(vec![item], None, TelemetryRead::Loaded, &index);
+    assert_eq!(got[0].resolver_conflict_count, Some(1));
+    let clean = publish(
+        vec![parse(&p, Some(t0()), &index, &[line("own", &at(2), 1)])],
+        None,
+        TelemetryRead::Loaded,
+        &index,
+    );
+    assert_eq!(clean[0].resolver_conflict_count, None);
+    assert!(serde_json::to_value(&clean[0])
+        .unwrap()
+        .get("resolver_conflict_count")
+        .is_none());
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_gate_off_keeps_canonical_bytes_and_fingerprint() {
+    let p = root_file("dark");
+    let index = ScanIndex::default();
+    let mut items = vec![parse(
+        &p,
+        Some(t0()),
+        &index,
+        &[line("c", &at(-100), 5), line("r", &at(1), 10)],
+    )];
+    let before = items
+        .iter()
+        .map(|item| {
+            crate::canonical_json::canonicalize(&serde_json::to_value(item).unwrap()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let fingerprint = items[0].snapshot_fingerprint.clone();
+    let read = sidecar(&[row("r", 1, 10), row("side", 2, 7)]);
+    attach_page(&mut items, &read);
+    side_calls_page(
+        &mut items,
+        &api_report(&read),
+        &ClaudeTraceOwnershipLoadReport::default(),
+        &index,
+    );
+    finish_page(&mut items, &index, TelemetryRead::Loaded);
+    let after = items
+        .iter()
+        .map(|item| {
+            crate::canonical_json::canonicalize(&serde_json::to_value(item).unwrap()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(before, after);
+    assert_eq!(items[0].snapshot_fingerprint, fingerprint);
+    assert!(items[0].removed_usage.is_none());
+    assert!(items[0].resolver_conflict_count.is_none());
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_unknown_birth_counts_and_discloses_every_response() {
+    let p = root_file("unknown");
+    let index = ScanIndex::default();
+    let got = parse(
+        &p,
+        None,
+        &index,
+        &[line("old", &at(-86_400), 11), line("own", &at(1), 22)],
+    );
+    let f = fold(&got);
+    assert_eq!(f.entity.totals().1, 2);
+    assert_eq!(f.entity.removed_requests, 0);
+    assert_eq!(f.disclosed, 2);
+    cleanup(&[&p]);
+}
+
 #[test]
 fn e2_subagents_are_exempt_even_when_written_in_a_burst() {
-    let p = path("subagent");
+    let p = root_file("subagent");
     let agent = p
         .parent()
         .unwrap()
         .join(ROOT)
         .join("subagents/agent-abc123.jsonl");
-    let mut v = line(Some("old"), Some("a"), "2026-10-24T12:00:00Z", 10);
-    v["agentId"] = json!("abc123");
-    v["isSidechain"] = json!(true);
-    let got = item(&agent, Some(birth()), &ScanIndex::default(), &[v]);
-    let f = got.claude_money.as_ref().unwrap();
+    let mut value = line("old", &at(-86_400), 10);
+    value["agentId"] = json!("abc123");
+    value["isSidechain"] = json!(true);
+    let got = parse(&agent, Some(t0()), &ScanIndex::default(), &[value]);
+    let f = fold(&got);
     assert_eq!(f.entity.totals().1, 1);
     assert_eq!(f.entity.removed_requests, 0);
     assert_eq!(f.disclosed, 0);
-    fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    cleanup(&[&p]);
 }
+
 #[test]
-fn e2_all_prebirth_requires_an_indexed_live_twin_to_remove() {
-    let p = path("orphan");
-    let twin = path("twin");
-    fs::write(&twin, b"fixture").unwrap();
-    let old = line(Some("old"), Some("a"), "2026-10-24T12:00:00Z", 10);
-    let mut index = ScanIndex::default();
-    let counted = item(&p, Some(birth()), &index, std::slice::from_ref(&old));
-    assert_eq!(counted.claude_money.as_ref().unwrap().entity.totals().1, 1);
-    assert_eq!(counted.claude_money.as_ref().unwrap().disclosed, 1);
-    index.files.insert(local_index_key(&twin), entry());
-    let removed = item(&p, Some(birth()), &index, std::slice::from_ref(&old));
-    assert_eq!(
-        removed
-            .claude_money
-            .as_ref()
-            .unwrap()
-            .entity
-            .removed_requests,
-        1
-    );
-    fs::remove_file(&twin).unwrap();
-    let restored = item(&p, Some(birth()), &index, &[old]);
-    assert_eq!(
-        restored
-            .claude_money
-            .as_ref()
-            .unwrap()
-            .entity
-            .removed_requests,
-        0,
-        "stale index is no live twin"
-    );
-    fs::remove_dir_all(p.parent().unwrap()).unwrap();
-    fs::remove_dir_all(twin.parent().unwrap()).unwrap();
-}
-#[test]
-fn e2_minimum_nanosecond_birth_survives_restart_replacement_move_and_append() {
-    let p = path("persist");
-    fs::write(&p, b"original").unwrap();
-    let mut index = ScanIndex::default();
-    index.files.insert(local_index_key(&p), entry());
-    let original_birth = birth() - 9_000_000_123;
-    remember_birth(&mut index, &p, Some(original_birth));
-    let mut index: ScanIndex =
-        serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-    fs::remove_file(&p).unwrap();
-    fs::write(&p, b"restored history and append").unwrap();
-    let lines = [
-        line(Some("history"), Some("a"), "2026-10-25T11:59:52Z", 10),
-        line(Some("append"), Some("b"), BIRTH, 20),
-    ];
-    let got = item(&p, Some(birth()), &index, &lines);
-    assert_eq!(
-        got.claude_money.as_ref().unwrap().birth,
-        Some(original_birth)
-    );
-    assert_eq!(got.claude_money.as_ref().unwrap().entity.totals().1, 2);
-    remember_birth(&mut index, &p, Some(birth() + 1));
-    assert_eq!(
-        index.files[&local_index_key(&p)].claude_money_min_birth_nanos,
-        Some(original_birth)
-    );
-    let moved = path("move");
-    fs::remove_file(&p).unwrap();
-    index.files.remove(&local_index_key(&p));
-    let got = item(&moved, Some(birth() + 60_000_000_000), &index, &lines);
-    assert_eq!(
-        got.claude_money.as_ref().unwrap().birth,
-        Some(original_birth)
-    );
-    assert_eq!(got.claude_money.as_ref().unwrap().entity.totals().1, 2);
-    fs::remove_dir_all(p.parent().unwrap()).unwrap();
-    fs::remove_dir_all(moved.parent().unwrap()).unwrap();
-}
-#[test]
-fn e2_native_resolver_owns_progressive_idless_and_conflict_decisions() {
-    let p = path("resolver");
+fn e2_native_resolver_owns_progressive_and_idless_decisions() {
+    let p = root_file("resolver");
     let index = ScanIndex::default();
-    let got = item(
+    let progressive = line("progress", &at(1), 10);
+    let mut final_record = progressive.clone();
+    final_record["message"]["usage"]["input_tokens"] = json!(20);
+    let mut message_only = line("unused", &at(1), 30);
+    message_only.as_object_mut().unwrap().remove("requestId");
+    let got = parse(
         &p,
-        Some(birth()),
+        Some(t0()),
         &index,
-        &[
-            line(Some("progress"), Some("m"), BIRTH, 10),
-            line(Some("progress"), Some("m"), BIRTH, 20),
-            line(None, Some("message-only"), BIRTH, 30),
-            line(None, None, BIRTH, 40),
-            line(None, None, BIRTH, 50),
-        ],
+        &[progressive, final_record, message_only],
     );
-    assert_eq!(got.request_count, 4);
-    assert_eq!(got.claude_money.as_ref().unwrap().entity.totals().1, 4);
-    assert_eq!(
-        got.claude_money.as_ref().unwrap().entity.totals().0.input,
-        140
-    );
-    let a = line(Some("conflict"), Some("m"), BIRTH, 10);
-    let mut b = a.clone();
-    b["message"]["model"] = json!("other-model");
-    let got = item(
-        &p,
-        Some(birth()),
-        &index,
-        &[a, b, line(Some("own"), Some("own"), BIRTH, 1)],
-    );
-    assert_eq!(got.claude_money.as_ref().unwrap().disclosed, 1);
-    assert_eq!(
-        got.claude_money.as_ref().unwrap().entity.totals().1,
-        got.request_count
-    );
-    fs::remove_dir_all(p.parent().unwrap()).unwrap();
+    assert_eq!(fold(&got).entity.totals().1, got.request_count);
+    assert_eq!(fold(&got).entity.totals().0.input, got.input_tokens);
+    cleanup(&[&p]);
 }
-#[test]
-fn e2_dark_preserves_every_upload_byte_and_fingerprint() {
-    let p = path("dark");
-    let index = ScanIndex::default();
-    let got = item(
-        &p,
-        Some(birth()),
-        &index,
-        &[line(Some("r"), Some("m"), BIRTH, 10)],
-    );
-    let before = serde_json::to_value(&got).unwrap();
-    let fingerprint = got.snapshot_fingerprint.clone();
-    let mut items = vec![got];
-    attach_page(&mut items, &rows("r", 10), &index);
-    finish_page(&mut items, &index);
-    assert_eq!(
-        crate::canonical_json::canonicalize(&before).unwrap(),
-        crate::canonical_json::canonicalize(&serde_json::to_value(&items[0]).unwrap()).unwrap()
-    );
-    assert_eq!(items[0].snapshot_fingerprint, fingerprint);
-    assert!(items[0].removed_usage.is_none());
-    fs::remove_dir_all(p.parent().unwrap()).unwrap();
-}
-#[test]
-fn e2_otel_joins_once_checks_model_and_tokens_and_late_read_replaces_estimates() {
-    let p = path("otel");
-    let index = ScanIndex::default();
-    let lines = [line(Some("r"), Some("m"), BIRTH, 10)];
-    let estimated = published(
-        vec![item(&p, Some(birth()), &index, &lines)],
-        &BTreeMap::new(),
-        &index,
-    );
-    assert_eq!(estimated[0].telemetry_owned_complete, Some(false));
-    assert!(estimated[0].cost.is_none());
-    let reported = published(
-        vec![item(&p, Some(birth()), &index, &lines)],
-        &rows("r", 10),
-        &index,
-    );
-    assert_eq!(reported[0].request_count, estimated[0].request_count);
-    assert_eq!(reported[0].telemetry_owned_complete, Some(true));
-    assert_eq!(
-        reported[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
-        Some("0.0001")
-    );
-    let mismatch = published(
-        vec![item(&p, Some(birth()), &index, &lines)],
-        &rows("r", 11),
-        &index,
-    );
-    assert!(mismatch[0].cost.is_none());
-    assert_eq!(mismatch[0].input_tokens, 10);
-    let duplicate = [
-        line(Some("r"), Some("first"), BIRTH, 10),
-        line(Some("r"), Some("second"), BIRTH, 10),
-    ];
-    let got = published(
-        vec![item(&p, Some(birth()), &index, &duplicate)],
-        &rows("r", 10),
-        &index,
-    );
-    assert_eq!(got[0].request_count, 2);
-    assert!(
-        got[0].cost.is_none(),
-        "ambiguous joins never duplicate OTEL cost"
-    );
-    fs::remove_dir_all(p.parent().unwrap()).unwrap();
-}
-#[test]
-fn e2_twins_sum_into_one_entity_without_inheriting_a_live_twins_cutoff() {
-    let original = path("twin-original");
-    let twin = path("twin-new");
-    fs::write(&original, b"live").unwrap();
-    let mut index = ScanIndex::default();
-    index.files.insert(local_index_key(&original), entry());
-    remember_birth(&mut index, &original, Some(birth() - 100_000_000_000));
-    let old = item(
-        &original,
-        Some(birth() - 100_000_000_000),
-        &index,
-        &[line(Some("old"), Some("m1"), "2026-10-25T11:59:00Z", 10)],
-    );
-    let new = item(
-        &twin,
-        Some(birth()),
-        &index,
-        &[
-            line(Some("old"), Some("m1"), "2026-10-25T11:59:00Z", 10),
-            line(Some("new"), Some("m2"), BIRTH, 20),
-        ],
-    );
-    let got = published(vec![old, new], &BTreeMap::new(), &index);
-    assert_eq!(got.len(), 1);
-    assert_eq!((got[0].request_count, got[0].input_tokens), (2, 30));
-    assert_eq!(got[0].removed_request_count, Some(1));
-    fs::remove_dir_all(original.parent().unwrap()).unwrap();
-    fs::remove_dir_all(twin.parent().unwrap()).unwrap();
-}
-#[test]
-fn e2_side_call_is_subtracted_when_transcript_membership_changes() {
-    let p = path("side");
-    let index = ScanIndex::default();
-    let api = rows("side", 5);
-    let first = published(
-        vec![item(
-            &p,
-            Some(birth()),
-            &index,
-            &[line(Some("r"), Some("m"), BIRTH, 10)],
-        )],
-        &api,
-        &index,
-    );
-    assert_eq!(first[0].request_count, 2);
-    let next = published(
-        vec![item(
-            &p,
-            Some(birth()),
-            &index,
-            &[
-                line(Some("r"), Some("m"), BIRTH, 10),
-                line(Some("side"), Some("s"), BIRTH, 5),
-            ],
-        )],
-        &api,
-        &index,
-    );
-    assert_eq!(next[0].request_count, 2);
-    assert_eq!(next[0].input_tokens, 15);
-    fs::remove_dir_all(p.parent().unwrap()).unwrap();
-}
-#[test]
-fn e2_removal_fields_participate_in_serialization_and_semantic_hashes() {
-    let p = path("hash");
-    let index = ScanIndex::default();
-    let mut item = published(
-        vec![item(
-            &p,
-            Some(birth()),
-            &index,
-            &[line(Some("r"), Some("m"), BIRTH, 10)],
-        )],
-        &BTreeMap::new(),
-        &index,
-    )
-    .remove(0);
-    let before = super::super::super::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
-    item.removed_request_count = Some(1);
-    assert_ne!(
-        super::super::super::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item),
-        before
-    );
-    let before = super::super::super::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
-    item.removed_usage.as_mut().unwrap().input_tokens = 1;
-    assert_ne!(
-        super::super::super::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item),
-        before
-    );
-    assert!(serde_json::to_value(&item)
-        .unwrap()
-        .get("removed_usage")
-        .is_some());
-    fs::remove_dir_all(p.parent().unwrap()).unwrap();
-}
+
 #[test]
 fn e2_diagnostic_fields_are_nonzero_only() {
     assert_eq!(serde_json::to_value(Counts::default()).unwrap(), json!({}));
     assert_eq!(
-        serde_json::to_value(Counts([1, 2, 0, 0, 0, 1])).unwrap(),
-        json!({"fold_us":1,"responses":2,"dark_unexplained":1})
+        serde_json::to_value(Counts([1, 2, 0, 0, 0, 3, 0, 1])).unwrap(),
+        json!({"fold_us":1,"responses":2,"side_call_root_fallback":3,"dark_unexplained":1})
     );
 }

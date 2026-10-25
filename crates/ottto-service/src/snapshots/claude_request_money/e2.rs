@@ -27,7 +27,6 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const GATE: bool = false;
-pub(crate) const MONEY_RULE_VERSION: u16 = 1;
 /// A record this much older than its file's effective birth was copied in.
 /// Copies written within it are counted (known residual, disclosed nowhere).
 const SLACK: i128 = 2_000_000_000;
@@ -96,6 +95,15 @@ enum Role {
     Moved(LocationKey),
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Role {
+    const INLINE_ONLY: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+/// This root file's own location key (inline digest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Located(LocationKey);
+impl crate::heap_layout_bound::HeapLayoutBound for Located {
     const INLINE_ONLY: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)
@@ -174,7 +182,8 @@ impl ClaudeEntityBody {
                 bounds.1 = bounds.1.max(last);
             }
             None => {
-                self.bucket_activity.insert(bucket.to_owned(), (first, last));
+                self.bucket_activity
+                    .insert(bucket.to_owned(), (first, last));
             }
         }
         self.activity_nanos = self.activity_nanos.max(last);
@@ -259,7 +268,7 @@ pub(crate) struct FileFold {
     /// The opened file's own physical birth; the only birth ever recorded.
     physical: Option<i128>,
     role: Role,
-    location: Option<LocationKey>,
+    location: Option<Located>,
     base_selector: SelectorCapture,
     bucket_fallback: Option<String>,
     /// Model-less responses: the running native model fallback at their turn,
@@ -297,7 +306,7 @@ impl FileFold {
             if let Some(member) = root_member(context.path) {
                 let key = local_index_key(context.path);
                 let here = location_key(&key);
-                location = Some(here);
+                location = Some(Located(here));
                 let store = &context.index.claude_money_birth_store;
                 let observed = store.observed_birth(member, &key);
                 cutoff = match store.live_location(member) {
@@ -355,14 +364,18 @@ impl FileFold {
     /// Two responses claim `request_id`: its telemetry can never attach.
     pub(in crate::snapshots) fn note_ambiguous(&mut self, request_id: &str) {
         self.ambiguous
-            .insert(super::super::claude_request_census::claude_request_hash(request_id));
+            .insert(super::super::claude_request_census::claude_request_hash(
+                request_id,
+            ));
     }
 
     fn is_ambiguous(&self, request_id: &str) -> bool {
         !self.ambiguous.is_empty()
             && self
                 .ambiguous
-                .contains(&super::super::claude_request_census::claude_request_hash(request_id))
+                .contains(&super::super::claude_request_census::claude_request_hash(
+                    request_id,
+                ))
     }
 
     fn is_skipped(&self, sequence: u64) -> bool {
@@ -442,8 +455,11 @@ impl FileFold {
         if self.copied == 0 {
             return;
         }
+        // The witness order is total over (effective birth, location), so of
+        // two live all-pre-birth paths exactly one is skipped, whatever role
+        // (an equal-birth owner can lose to its twin).
         let keep = if self.first_own.is_none() {
-            self.role == Role::Twin && self.original_witness(context)
+            self.original_witness(context)
         } else {
             self.money_birth.writer_certified(self.first_own)
         };
@@ -634,7 +650,11 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
     let model = occurrence
         .model
         .as_deref()
-        .or_else(|| fold.model_fallbacks.get(&occurrence.sequence).map(String::as_str))
+        .or_else(|| {
+            fold.model_fallbacks
+                .get(&occurrence.sequence)
+                .map(String::as_str)
+        })
         .unwrap_or("unknown");
     let Some(estimated) = grain_key(
         model,
@@ -677,8 +697,14 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
     } else {
         ClaudeRequestUsageOrigin::TelemetryUnpriced
     };
-    fold.entity
-        .add(reported, &tokens, requests, row.cost_usd_micros, Some(origin), at);
+    fold.entity.add(
+        reported,
+        &tokens,
+        requests,
+        row.cost_usd_micros,
+        Some(origin),
+        at,
+    );
     true
 }
 
@@ -792,10 +818,11 @@ pub(crate) fn side_calls_page(
         };
         let mut family = Vec::new();
         for row in rows {
-            if members
-                .iter()
-                .any(|index| items[*index].claude_usage_request_ids.contains(&row.request_id))
-            {
+            if members.iter().any(|index| {
+                items[*index]
+                    .claude_usage_request_ids
+                    .contains(&row.request_id)
+            }) {
                 continue;
             }
             if !validate_claude_api_row(row, root) {
@@ -827,8 +854,10 @@ pub(crate) fn side_calls_page(
         else {
             // Unhealthy pair or deadline: counted and disclosed, never dropped
             // silently; the family stays telemetry-incomplete.
-            if let Some(fold) = first.and_then(|index| items[index].claude_money.as_deref_mut()) {
-                fold.disclosed += fold.telemetry.side_candidates;
+            if let Some(index) = first {
+                if let Some(fold) = items[index].claude_money.as_deref_mut() {
+                    fold.disclosed += fold.telemetry.side_candidates;
+                }
             }
             continue;
         };
@@ -914,8 +943,9 @@ fn trace_owners(
 ) -> Vec<Option<String>> {
     let mut owners = vec![None; rows.len()];
     for row in trace.into_iter().flatten() {
-        let Ok(at) = rows.binary_search_by(|candidate| candidate.request_id.as_str().cmp(&row.request_id))
-        else {
+        let Ok(at) = rows.binary_search_by(|candidate| {
+            candidate.request_id.as_str().cmp(row.request_id.as_str())
+        }) else {
             continue;
         };
         if row.capture_revision == "claude_llm_request_ownership:v1"
@@ -939,7 +969,11 @@ pub(crate) enum TelemetryRead {
 /// explicit gate permits mutation; one summed entity is emitted per session
 /// (path twins sum). A failed telemetry read never yields a "complete"
 /// body; T4 keeps that page's owed history files owed.
-pub(crate) fn finish_page(items: &mut Vec<SnapshotItem>, index: &ScanIndex, telemetry: TelemetryRead) {
+pub(crate) fn finish_page(
+    items: &mut Vec<SnapshotItem>,
+    index: &ScanIndex,
+    telemetry: TelemetryRead,
+) {
     struct Session {
         entity: ClaudeEntityBody,
         complete: bool,
@@ -989,8 +1023,13 @@ pub(crate) fn finish_page(items: &mut Vec<SnapshotItem>, index: &ScanIndex, tele
         session.complete &= fold.telemetry_complete();
         session.side.0.add(&fold.side);
         session.side.1 += fold.side_requests;
-        session.locations.extend(fold.location);
-        match (&mut session.native, item.usage_accounting_contract.is_none()) {
+        session
+            .locations
+            .extend(fold.location.map(|located| located.0));
+        match (
+            &mut session.native,
+            item.usage_accounting_contract.is_none(),
+        ) {
             (Some((tokens, requests)), true) => {
                 tokens.add(&ClaudeMoneyTokens {
                     input: item.input_tokens,
