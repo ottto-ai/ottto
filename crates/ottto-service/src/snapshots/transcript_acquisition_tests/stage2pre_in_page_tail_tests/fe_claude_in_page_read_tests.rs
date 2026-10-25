@@ -1870,6 +1870,8 @@ struct ErasedHold {
     fixture: ScanFixture,
     key: String,
     cache: Arc<sampled_scan::SharedCache>,
+    /// The saved index file `index` was loaded from (save is CAS-bound to it).
+    index_path: PathBuf,
     index: ScanIndex,
     witness: ClaudeUsageFamilyWitness,
 }
@@ -1922,6 +1924,7 @@ fn erased_hold(due: u64) -> ErasedHold {
         fixture,
         key,
         cache,
+        index_path: path,
         index,
         witness,
     }
@@ -1986,10 +1989,9 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
     assert_eq!(restore_dated(&mut restored_index, due), 1);
     assert_eq!(restored(), restored_before + 2);
     assert_eq!(restored_index.files[&key].unverified_deadline(), Some(due));
-    let path = hold.fixture.dir.join("restored-index.json");
-    restored_index.save(&path).unwrap();
+    restored_index.save(&hold.index_path).unwrap();
     drop(restored_index);
-    let mut loaded = ScanIndex::load(&path).unwrap();
+    let mut loaded = ScanIndex::load(&hold.index_path).unwrap();
     assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
     assert_eq!(restore_dated(&mut loaded, due), 0);
     assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
@@ -2109,10 +2111,9 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     assert_eq!(restore_dated(&mut restored_index, due), 1);
     assert_eq!(restored(), restored_before + 2);
     assert_eq!(restored_index.files[&key].unverified_deadline(), Some(due));
-    let path = hold.fixture.dir.join("aged-index.json");
-    restored_index.save(&path).unwrap();
+    restored_index.save(&hold.index_path).unwrap();
     drop(restored_index);
-    let loaded = ScanIndex::load(&path).unwrap();
+    let loaded = ScanIndex::load(&hold.index_path).unwrap();
 
     sampled_scan::set_test_now(Some(due));
     let (audited, result, seen, read) = page_injecting(
