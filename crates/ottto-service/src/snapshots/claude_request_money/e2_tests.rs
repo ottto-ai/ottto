@@ -2562,8 +2562,47 @@ fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
                 lines.push(own);
             }
             lines.push(line("branch-own", &at(101), 20));
-            let item = parse(&copy, Some(t0() + 100_000_000_000), &index, &lines);
+            // Give the copy its own login. An unbound same-session path twin
+            // legitimately inherits A from the original at page settlement;
+            // that cannot distinguish session fallback from prefix leakage.
+            let login = "c".repeat(64);
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+            accumulator.claude_file_birth = ClaudeFileBirth::observe(&copy, None);
+            accumulator
+                .claude_file_birth
+                .set_birth_for_test(t0() + 100_000_000_000);
+            accumulator.account_identifier_hash = Some(login.clone());
+            for value in &lines {
+                apply_claude_code_line(value, &mut accumulator);
+            }
+            accumulator.finalize_claude_responses_e2(
+                None,
+                Some(ReadContext {
+                    index: &index,
+                    path: &copy,
+                }),
+            );
+            let item = accumulator
+                .into_items(&copy, "2026-08-02T09:00:00Z", "fixture".into(), None)
+                .remove(0);
             assert_eq!(fold(&item).entity.removed_requests, 1);
+            assert_eq!(
+                org_amounts(
+                    &tag_owned(vec![item.clone(), original_item.clone()], &index).remove(0)
+                )
+                .get(&org_hash(ORG_A)),
+                Some(&(10, 1))
+            );
+            if !fresh {
+                assert!(fold(&item)
+                    .entity
+                    .grains
+                    .keys()
+                    .all(
+                        |(_, _, account)| account.as_ref().and_then(|key| key.login.as_deref())
+                            == Some(login.as_str())
+                    ));
+            }
             let item = tag_owned(vec![original_item.clone(), item], &index).remove(0);
             assert_eq!((item.request_count, item.input_tokens), (2, 30));
             assert_eq!(
