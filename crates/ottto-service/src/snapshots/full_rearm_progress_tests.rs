@@ -1480,7 +1480,7 @@ fn scanner_seals_only_actual_complete_rebuild_reads() {
     for entry in index.files.values_mut() {
         entry.source_file_fingerprint.clear();
     }
-    let scan = scan_source_roots_with_test_limit(
+    let mut scan = scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,
         std::slice::from_ref(&rearm.root),
         &mut index,
@@ -1491,11 +1491,29 @@ fn scanner_seals_only_actual_complete_rebuild_reads() {
     )
     .unwrap();
     assert!(scan.census_complete, "{scan:?}");
+    assert_eq!(scan.scanned_file_count, rearm.sources.len());
     assert!(index
         .claude_full_rearm_progress
         .complete_rebuild_read
         .is_some());
     assert!(take_claude_complete_rebuild_read(&mut index, WINDOW));
+    // This raw scan entry leaves policy finalization to its caller. Without
+    // it, missing activity/incidence metadata legitimately selects unchanged
+    // files for LegacyActivity reparsing and seals another complete read.
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    assert_eq!(index.file_snapshot_fingerprints.len(), rearm.sources.len());
+    assert!(index
+        .file_snapshot_fingerprints
+        .values()
+        .all(|fingerprints| {
+            !fingerprints.is_empty()
+                && fingerprints.iter().all(|fingerprint| {
+                    index
+                        .snapshot_activity_at
+                        .get(fingerprint)
+                        .is_some_and(valid_snapshot_activity)
+                })
+        }));
     let scan = scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,
         std::slice::from_ref(&rearm.root),
@@ -1507,6 +1525,11 @@ fn scanner_seals_only_actual_complete_rebuild_reads() {
     )
     .unwrap();
     assert!(scan.census_complete);
+    assert_eq!(
+        scan.scanned_file_count, 0,
+        "unchanged files must be skipped"
+    );
+    assert!(scan.pending_finalization.is_empty());
     assert!(
         index
             .claude_full_rearm_progress
