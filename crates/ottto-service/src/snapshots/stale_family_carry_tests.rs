@@ -2286,10 +2286,14 @@ struct ScopedRetryFixture {
 
 fn scoped_retry_fixture(held: usize, healthy: usize, unrelated: bool) -> ScopedRetryFixture {
     let scratch = crate::test_scratch::ScratchDir::new("scoped-unhealthy-retry");
+    let support = scratch.join("support");
+    let list = ReemissionExclusions::path(&support);
+    std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+    std::fs::write(list, b"").unwrap();
     let mut index = ScanIndex {
         claude_request_identity_contract: Some(claude_request_identity::COLLECTOR.to_string()),
         claude_duplicate_request_witness_overflowed: true,
-        claude_reemission_exclusions: ReemissionExclusions::parse(b""),
+        claude_reemission_exclusions: ReemissionExclusions::load(&support),
         claude_duplicate_fence_next_full_rearm_unix_seconds: rfc3339_unix_seconds(CARRY_FAILED)
             .map(|now| now + 86_400),
         ..ScanIndex::default()
@@ -2507,6 +2511,12 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
         .unhealthy_retry_not_before_unix_seconds =
         rfc3339_unix_seconds(CARRY_RETRY).map(|now| now + UNHEALTHY_SCAN_RETRY_MAX_SECONDS);
     fixture.index = carry_reload(fixture.index);
+    // The production cycle reloads this runtime-only protection policy
+    // before scanning (snapshot_sync::sync_source). Keep that same installed
+    // synthetic list across index reload; no acceptance is reconstructed.
+    fixture
+        .index
+        .load_claude_reemission_exclusions(&fixture._scratch.join("support"));
     let waiting = serde_json::to_value(&fixture.index).unwrap();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         ensure_bounded_traversal(
@@ -2567,6 +2577,7 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
         "missing_ack",
         "invalid_pending",
         "daily_replay",
+        "list_missing",
     ] {
         let mut fixture = scoped_retry_fixture(9, 32, false);
         let first = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
@@ -2580,6 +2591,17 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
             .index
             .mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
         fixture.index = carry_reload(fixture.index);
+        assert!(fixture
+            .index
+            .claude_reemission_exclusions
+            .holds_without_list(None));
+        fixture
+            .index
+            .load_claude_reemission_exclusions(&fixture._scratch.join("support"));
+        assert!(!fixture
+            .index
+            .claude_reemission_exclusions
+            .holds_without_list(None));
         fixture
             .index
             .claude_stale_family_carry
@@ -2598,6 +2620,9 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
                     &fixture.candidates[0].path,
                 ))),
             "missing_ack" => fixture.index.accepted_snapshot_fingerprints.clear(),
+            "list_missing" => {
+                fixture.index.claude_reemission_exclusions = ReemissionExclusions::default()
+            }
             "invalid_pending" => {
                 for root in fixture.roots.iter().skip(9) {
                     fixture
