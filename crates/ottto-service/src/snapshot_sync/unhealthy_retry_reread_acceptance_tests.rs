@@ -16,6 +16,8 @@
 // - 08:20, 08:30, 08:40 and 08:50 are terminal-unhealthy retries of that
 //   context. A healthy session gains a request before 08:30, and the held
 //   family gains one before 08:40.
+// - 09:10 and 09:50 are later retries, past the closed fence's 09:00 replay
+//   deadline, with the census still open.
 //
 // Accepted behaviour:
 // - Healthy unchanged files are never read again at a retry.
@@ -183,20 +185,24 @@ fn unhealthy_retries_reread_only_unsettled_files() {
     let held = seeded.held.clone().expect("the terminal family is held");
     assert!(!held.terminal, "RetryPending after the seeded window");
 
-    let retry = |minute: usize| at_window(&fixture, (8, minute));
-    let at_20 = retry(20);
+    let at_20 = at_window(&fixture, (8, 20));
     RearmFixture::append(
         &at_path(&fixture, AT_CHANGED),
         &rearm_transcript_line(AT_CHANGED, None, "req_changed_2", 1),
     );
-    let at_30 = retry(30);
+    let at_30 = at_window(&fixture, (8, 30));
     RearmFixture::append(
         &c1b_terminal_path(&fixture),
         &rearm_transcript_line(REARM_TERMINAL, None, "req_terminal_3", 2),
     );
-    let at_40 = retry(40);
-    let at_50 = retry(50);
-    let retries = [&at_20, &at_30, &at_40, &at_50];
+    let at_40 = at_window(&fixture, (8, 40));
+    let at_50 = at_window(&fixture, (8, 50));
+    // Past the closed fence's 09:00 replay deadline, with the census still
+    // open: the steady state of a Mac whose census has not completed for
+    // longer than its replay delay. Retry delays here are 16 and 32 minutes.
+    let at_110 = at_window(&fixture, (9, 10));
+    let at_150 = at_window(&fixture, (9, 50));
+    let retries = [&at_20, &at_30, &at_40, &at_50, &at_110, &at_150];
 
     // Preconditions: each is a real terminal-unhealthy retry that ends red
     // with the census still open.
@@ -213,19 +219,30 @@ fn unhealthy_retries_reread_only_unsettled_files() {
         );
     }
 
+    // Every violation is collected, so one run names each remaining path.
+    let mut violations = Vec::new();
+    let family = rearm_family_sessions();
     // 1. Healthy unchanged files: zero reads at every unhealthy retry.
     for window in retries {
-        let rereads = window
-            .reads
-            .iter()
-            .filter(|(session, _)| healthy.contains(*session))
-            .collect::<BTreeMap<_, _>>();
-        assert!(
-            rereads.is_empty(),
-            "{}: an unhealthy retry re-read healthy unchanged files {rereads:?} (start {:?})",
-            window.at,
-            window.start
-        );
+        let reread = |keep: &dyn Fn(&str) -> bool| {
+            window
+                .reads
+                .keys()
+                .filter(|session| healthy.contains(*session) && keep(session.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let witnessed = reread(&|session| family.contains(session));
+        let invalid = reread(&|session| session == C1A_INVALID);
+        let unwitnessed = reread(&|session| AT_HEALTHY.iter().any(|name| *name == session));
+        if !(witnessed.is_empty() && invalid.is_empty() && unwitnessed.is_empty()) {
+            violations.push(format!(
+                "{}: an unhealthy retry re-read healthy unchanged files: witnessed family \
+                 {witnessed:?}, unwitnessed {unwitnessed:?}, invalid pending {invalid:?} \
+                 (start {:?})",
+                window.at, window.start
+            ));
+        }
     }
     // 2. Only unsettled files are read, each at most once a window: the red
     // producer, the held family, and the changed file after its change.
@@ -235,57 +252,72 @@ fn unhealthy_retries_reread_only_unsettled_files() {
             allowed.insert(AT_CHANGED.to_owned());
         }
         for (session, count) in &window.reads {
-            assert!(
-                allowed.contains(session),
-                "{}: {session} read at an unhealthy retry",
-                window.at
-            );
-            assert_eq!(*count, 1, "{}: {session} read once at most", window.at);
+            if !allowed.contains(session) && !healthy.contains(session) {
+                violations.push(format!("{}: {session} read at a retry", window.at));
+            }
+            if *count > 1 {
+                violations.push(format!("{}: {session} read {count} times", window.at));
+            }
         }
     }
     // 3. The file that really changed is read once, after its change.
-    assert_eq!(
-        retries.map(|window| window.reads_of(AT_CHANGED)),
-        [0, 1, 0, 0],
-        "the changed file is read once, in the window after its change"
-    );
+    let changed = retries.map(|window| window.reads_of(AT_CHANGED));
+    if changed != [0, 1, 0, 0, 0, 0] {
+        violations.push(format!(
+            "the changed file is read once, in the window after its change: {changed:?}"
+        ));
+    }
     // 4. The held family is retried, at most once a window, and stays held
     // and disclosed: quarantined, never accepted, census open. Its binding
     // does not move while its bytes do not.
-    assert!(
-        retries
-            .iter()
-            .any(|window| window.reads_of(REARM_TERMINAL) > 0),
-        "the held family is retried"
-    );
+    if !retries
+        .iter()
+        .any(|window| window.reads_of(REARM_TERMINAL) > 0)
+    {
+        violations.push("the held family is never retried".to_owned());
+    }
     for window in retries {
-        let record = window
-            .held
-            .as_ref()
-            .unwrap_or_else(|| panic!("{}: the hold is still disclosed", window.at));
-        assert_eq!(window.held_head, held_head, "{}: never accepted", window.at);
-        if window.at == at_20.at || window.at == at_30.at {
-            assert_eq!(
-                record.member_source_file_fingerprints, held.member_source_file_fingerprints,
-                "{}: the unchanged held family keeps its binding",
+        let Some(record) = window.held.as_ref() else {
+            violations.push(format!("{}: the hold is no longer disclosed", window.at));
+            continue;
+        };
+        if window.held_head != held_head {
+            violations.push(format!("{}: the held family was accepted", window.at));
+        }
+        if (window.at == at_20.at || window.at == at_30.at)
+            && record.member_source_file_fingerprints != held.member_source_file_fingerprints
+        {
+            violations.push(format!(
+                "{}: the unchanged held family lost its binding",
                 window.at
-            );
+            ));
         }
     }
     // 5. N3: at most two reads per file over the run (well inside 7 days),
     // not counting the one read its own change justifies.
-    let all = [&closing, &seeded, &at_20, &at_30, &at_40, &at_50];
+    let all = [
+        &closing, &seeded, &at_20, &at_30, &at_40, &at_50, &at_110, &at_150,
+    ];
     let total = |session: &str| {
         all.iter()
             .map(|window| window.reads_of(session))
             .sum::<usize>()
     };
     for session in &healthy {
-        assert!(total(session) <= 2, "{session}: {} reads", total(session));
+        if total(session.as_str()) > 2 {
+            violations.push(format!(
+                "N3: {session} read {} times",
+                total(session.as_str())
+            ));
+        }
+    }
+    if total(AT_CHANGED) - at_30.reads_of(AT_CHANGED) > 2 {
+        violations.push(format!("N3: {AT_CHANGED} read {} times", total(AT_CHANGED)));
     }
     assert!(
-        total(AT_CHANGED) - at_30.reads_of(AT_CHANGED) <= 2,
-        "{AT_CHANGED}: {} reads",
-        total(AT_CHANGED)
+        violations.is_empty(),
+        "{} violation(s):\n{}",
+        violations.len(),
+        violations.join("\n")
     );
 }
