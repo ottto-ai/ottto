@@ -63,24 +63,39 @@ pub(in crate::snapshots) struct ReadContext<'a> {
     pub(in crate::snapshots) path: &'a Path,
 }
 impl ReadContext<'_> {
-    /// An indexed root path of `member` with this location still exists.
-    /// Store keys are digests, so this walks the index once; only the rare
-    /// twin, move and all-pre-birth decisions call it.
+    /// Current index membership plus this page's metadata generation probe.
+    /// No filesystem lookup here: T4's twin walk already paid for it.
     fn live(&self, member: &str, location: LocationKey) -> bool {
+        self.index.claude_money_birth_store.witnessed(location)
+            && self.index.files.keys().any(|key| {
+                session_member(Path::new(key)).as_deref() == Some(member)
+                    && location_key(key) == location
+            })
+    }
+    fn indexed(&self, member: &str, location: LocationKey) -> bool {
         self.index.files.keys().any(|key| {
-            claude_index_path_member_ref(Path::new(key))
-                .is_some_and(|m| m.subagent_stem.is_none() && m.root == member)
+            session_member(Path::new(key)).as_deref() == Some(member)
                 && location_key(key) == location
-                && Path::new(key).is_file()
         })
+    }
+    fn has_twins(&self, member: &str) -> bool {
+        self.index
+            .files
+            .keys()
+            .filter(|key| session_member(Path::new(key)).as_deref() == Some(member))
+            .take(2)
+            .count()
+            > 1
     }
 }
 
-/// A root transcript's session id; subagents are exempt from the birth rule.
-fn root_member(path: &Path) -> Option<&str> {
-    claude_index_path_member_ref(path)
-        .filter(|member| member.subagent_stem.is_none())
-        .map(|member| member.root)
+/// Same member spelling as T4's twin index, including subagent stems.
+fn session_member(path: &Path) -> Option<std::borrow::Cow<'_, str>> {
+    let member = claude_index_path_member_ref(path)?;
+    Some(match member.subagent_stem {
+        Some(stem) => std::borrow::Cow::Owned(format!("{}_{stem}", member.root)),
+        None => std::borrow::Cow::Borrowed(member.root),
+    })
 }
 
 /// How this path stands in its session's birth table at parse time.
@@ -113,14 +128,14 @@ impl crate::heap_layout_bound::HeapLayoutBound for Located {
 /// After parse: record the opened physical birth (never the inherited
 /// cutoff) and, on a proven move, transfer the session's live location.
 pub(in crate::snapshots) fn remember_birth(index: &mut ScanIndex, path: &Path, fold: &FileFold) {
-    let (Some(physical), Some(member)) = (fold.physical, root_member(path)) else {
+    let (Some(physical), Some(member)) = (fold.physical, session_member(path)) else {
         return;
     };
     let key = local_index_key(path);
     let store = &mut index.claude_money_birth_store;
-    store.record_observation(member, &key, physical);
+    store.record_opened(&member, &key, physical, fold.money_birth.opened());
     if let Role::Moved(from) = fold.role {
-        store.record_proven_move(member, from, &key);
+        store.record_proven_move(&member, from, &key);
     }
 }
 
@@ -298,27 +313,27 @@ impl FileFold {
         base_selector: SelectorCapture,
         bucket_fallback: Option<String>,
     ) -> Self {
-        let physical = birth.birth_nanos();
+        let physical = birth.physical_birth_nanos();
         let mut role = Role::Owner;
         let mut cutoff = None;
         let mut location = None;
         if let (Some(context), Some(_)) = (context, physical) {
-            if let Some(member) = root_member(context.path) {
+            if let Some(member) = session_member(context.path) {
                 let key = local_index_key(context.path);
                 let here = location_key(&key);
                 location = Some(Located(here));
                 let store = &context.index.claude_money_birth_store;
-                let observed = store.observed_birth(member, &key);
-                cutoff = match store.live_location(member) {
+                let observed = store.observed_birth(&member, &key);
+                cutoff = match store.live_location(&member) {
                     None => observed,
-                    Some(live) if live == here => store.effective_cutoff(member, &key),
-                    Some(live) if context.live(member, live) => {
+                    Some(live) if live == here => store.effective_cutoff(&member, &key),
+                    Some(live) if context.indexed(&member, live) => {
                         role = Role::Twin;
                         observed
                     }
                     Some(live) => {
                         role = Role::Moved(live);
-                        let session = store.session_effective_cutoff(member);
+                        let session = store.session_effective_cutoff(&member);
                         match (session, observed) {
                             (Some(a), Some(b)) => Some(a.min(b)),
                             (a, b) => a.or(b),
@@ -327,9 +342,32 @@ impl FileFold {
                 };
             }
         }
+        // A lone subagent keeps the context birth exemption. A later same-member
+        // path twin uses the normal money cutoff, only with a valid earlier object.
+        let subagent_twin = context.is_some_and(|context| {
+            claude_index_path_member_ref(context.path).is_some_and(|m| m.subagent_stem.is_some())
+                && physical.is_some_and(|physical| {
+                    let member = session_member(context.path).unwrap();
+                    context
+                        .index
+                        .claude_money_birth_store
+                        .original_witness_at(
+                            &member,
+                            &local_index_key(context.path),
+                            physical,
+                            |location| context.live(&member, location),
+                        )
+                        .is_some()
+                })
+        });
+        let money_birth = if subagent_twin {
+            birth.with_money_birth(physical)
+        } else {
+            birth
+        };
         Self {
             entity: Default::default(),
-            money_birth: birth.with_minimum(cutoff),
+            money_birth: money_birth.with_minimum(cutoff),
             physical,
             role,
             location,
@@ -458,11 +496,12 @@ impl FileFold {
         // The witness order is total over (effective birth, location), so of
         // two live all-pre-birth paths exactly one is skipped, whatever role
         // (an equal-birth owner can lose to its twin).
-        let keep = if self.first_own.is_none() {
-            self.original_witness(context)
-        } else {
-            self.money_birth.writer_certified(self.first_own)
-        };
+        let needs_original = self.first_own.is_none()
+            || context.is_some_and(|context| {
+                session_member(context.path).is_some_and(|member| context.has_twins(&member))
+            });
+        let keep = self.money_birth.writer_certified(self.first_own)
+            && (!needs_original || self.original_witness(context));
         if keep {
             self.copy = Default::default();
             return;
@@ -480,15 +519,15 @@ impl FileFold {
         let (Some(context), Some(physical)) = (context, self.physical) else {
             return false;
         };
-        let Some(member) = root_member(context.path) else {
+        let Some(member) = session_member(context.path) else {
             return false;
         };
         let key = local_index_key(context.path);
         context
             .index
             .claude_money_birth_store
-            .original_witness_at(member, &key, physical, |location| {
-                context.live(member, location)
+            .original_witness_at(&member, &key, physical, |location| {
+                context.live(&member, location)
             })
             .is_some()
     }

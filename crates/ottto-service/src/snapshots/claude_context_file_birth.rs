@@ -46,16 +46,67 @@ const MAX_CONTEXT_BASIS_VERSION_KEY_BYTES: usize = 24;
 /// or mixed writer counts and discloses them.
 pub(in crate::snapshots) const KNOWN_COPY_WRITERS: &[&str] = &["2.1.309", "2.1.310"];
 
-/// The writer version run in force: (writer id, the response sequence that
-/// started it). Id 0 is any version outside [`KNOWN_COPY_WRITERS`]; id i is
-/// its (i-1)th entry. Inline: a copy is written once, so one run suffices to
-/// tell "one known writer since the first own response" from anything else.
+/// Sticky response writer certificate. Zero = no responses, 255 = invalid.
+/// A missing/unknown version or two different known writers invalidates it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ClaudeWriterRun(Option<(u8, u64)>);
-
+struct ClaudeWriterRun(u8);
+impl ClaudeWriterRun {
+    fn observe(&mut self, version: Option<&str>) {
+        let id = version
+            .and_then(|v| KNOWN_COPY_WRITERS.iter().position(|k| *k == v))
+            .map_or(255, |i| i as u8 + 1);
+        self.0 = if self.0 == 0 || self.0 == id { id } else { 255 };
+    }
+    fn certified(self) -> bool {
+        self.0 != 0 && self.0 != 255
+    }
+}
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeWriterRun {
     const INLINE_ONLY: bool = true;
-    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// Open-descriptor metadata, also used by the page's one metadata probe per twin.
+/// A zero inode means unavailable; no timestamp or file identity is invented.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::snapshots) struct ClaudeOpenedBirth {
+    pub(in crate::snapshots) birth: u64,
+    pub(in crate::snapshots) device: u64,
+    pub(in crate::snapshots) inode: u64,
+    pub(in crate::snapshots) size: u64,
+}
+impl ClaudeOpenedBirth {
+    pub(in crate::snapshots) fn from_metadata(metadata: &fs::Metadata) -> Self {
+        let birth = metadata
+            .created()
+            .ok()
+            .and_then(system_time_unix_nanos_i128)
+            .filter(|b| *b > CLAUDE_BIRTH_FLOOR_UNIX_NANOS)
+            .and_then(|b| u64::try_from(b).ok())
+            .unwrap_or(0);
+        #[cfg(unix)]
+        {
+            Self {
+                birth,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: metadata.len(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                birth,
+                size: metadata.len(),
+                ..Self::default()
+            }
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeOpenedBirth {
+    const INLINE_ONLY: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)
     }
@@ -108,10 +159,12 @@ pub(crate) struct ClaudeFileBirth {
     tagged_before_first_own: bool,
     /// Money only: the writer version of the file's own lines.
     writer: ClaudeWriterRun,
+    all_response_writers: ClaudeWriterRun,
+    opened: ClaudeOpenedBirth,
 }
 crate::heap_layout_bound::fields!(ClaudeFileBirth; scope, path_key_hash, tagged_in_opening,
     tagged_responses, own_responses, untimed_records, first_own_sequence, own_first_context,
-    own_peak_context, own_last_context, tagged_before_first_own, writer);
+    own_peak_context, own_last_context, tagged_before_first_own, writer, all_response_writers, opened);
 
 /// A reported birth at or before the floor is no evidence (F5).
 fn root_birth_scope(created_unix_nanos: Option<i128>) -> ClaudeBirthScope {
@@ -142,6 +195,9 @@ impl ClaudeFileBirth {
         };
         Self {
             scope,
+            opened: metadata
+                .map(ClaudeOpenedBirth::from_metadata)
+                .unwrap_or_default(),
             path_key_hash: stable_hash(&local_index_key(path)),
             ..Self::default()
         }
@@ -190,36 +246,49 @@ impl ClaudeFileBirth {
         self
     }
 
+    /// E2-only cutoff for a subagent with a proven earlier path twin.
+    /// Context scalars keep their independent subagent exemption.
+    pub(in crate::snapshots) fn with_money_birth(mut self, birth: Option<i128>) -> Self {
+        self.scope = root_birth_scope(birth);
+        self
+    }
+
     pub(in crate::snapshots) fn uncertain_root(&self) -> bool {
         self.scope == ClaudeBirthScope::RootUnknownBirth
     }
 
-    /// One line's `version`, before its response (if any) is observed. A
-    /// line without a version is no writer evidence. Borrowed; no allocation.
-    pub(in crate::snapshots) fn observe_writer(
+    pub(in crate::snapshots) fn opened(&self) -> ClaudeOpenedBirth {
+        self.opened
+    }
+
+    pub(in crate::snapshots) fn physical_birth_nanos(&self) -> Option<i128> {
+        (self.opened.birth != 0)
+            .then_some(i128::from(self.opened.birth))
+            .or_else(|| self.birth_nanos())
+    }
+
+    /// Called only for usage-bearing response records, never headers/tool lines.
+    /// Copied prefix versions cannot certify a later response missing its own version.
+    pub(in crate::snapshots) fn observe_response_writer(
         &mut self,
         version: Option<&str>,
-        responses_before: u64,
+        timestamp: Option<&str>,
     ) {
-        let Some(version) = version else {
-            return;
-        };
-        let id = KNOWN_COPY_WRITERS
-            .iter()
-            .position(|known| *known == version)
-            .map_or(0, |index| index as u8 + 1);
-        if self.writer.0.map(|(current, _)| current) != Some(id) {
-            self.writer = ClaudeWriterRun(Some((id, responses_before)));
+        self.all_response_writers.observe(version);
+        let own = self
+            .physical_birth_nanos()
+            .zip(timestamp.and_then(rfc3339_unix_nanos))
+            .is_some_and(|(birth, at)| at >= birth - 2_000_000_000);
+        if own {
+            self.writer.observe(version);
         }
     }
 
-    /// The writer certificate: every versioned line from the file's first own
-    /// (post-birth) response on was written by ONE known copy writer. Unknown,
-    /// absent or mixed writer evidence (either order) refuses.
     pub(in crate::snapshots) fn writer_certified(&self, first_own_sequence: Option<u64>) -> bool {
-        match (self.writer.0, first_own_sequence) {
-            (Some((id, started)), Some(first_own)) => id != 0 && first_own >= started,
-            _ => false,
+        if first_own_sequence.is_some() {
+            self.writer.certified()
+        } else {
+            self.all_response_writers.certified()
         }
     }
 
@@ -1125,6 +1194,7 @@ impl ClaudeFileBirth {
     /// A root file system that reports this creation time (Unix nanos),
     /// through the same floor as a real read.
     pub(crate) fn set_birth_for_test(&mut self, created_unix_nanos: i128) {
+        self.opened.birth = u64::try_from(created_unix_nanos).unwrap();
         if self.scope != ClaudeBirthScope::Subagent && self.scope != ClaudeBirthScope::NotObserved {
             self.scope = root_birth_scope(Some(created_unix_nanos));
         }

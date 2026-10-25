@@ -17324,6 +17324,10 @@ impl SnapshotAccumulator {
         reasoning_effort: Option<String>,
         computed_effective_input_context: Option<u64>,
     ) {
+        self.claude_file_birth.observe_response_writer(
+            value.get("version").and_then(Value::as_str),
+            timestamp.as_deref(),
+        );
         let tool_uses = claude_response_tool_uses(value);
         let cache_slot = claude_cache_request_slot(
             value,
@@ -34294,11 +34298,6 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     accumulator
         .claude_file_birth
         .observe_line(timestamp.as_deref(), accumulator.claude_response_sequence);
-    // E2 writer certificate: the version of each line, borrowed.
-    accumulator.claude_file_birth.observe_writer(
-        value.get("version").and_then(Value::as_str),
-        accumulator.claude_response_sequence,
-    );
     note_claude_capability_calls(value, timestamp.as_deref(), accumulator);
     // Current Claude transcripts write both of these shapes for one compaction.
     // Keep the raw observations here; `claude_compaction_summary` pairs a
@@ -40371,8 +40370,7 @@ impl ScanIndex {
             self.claude_history_cutoff_unix_seconds,
             birth_unix_seconds,
         );
-        if kind == claude_history_upgrade::HistoryKind::Owed && claude_request_money::e2::enabled()
-        {
+        if claude_request_money::e2::enabled() {
             self.stage_claude_history_twins(&key, page);
         }
         let decision = claude_history_upgrade::decide(

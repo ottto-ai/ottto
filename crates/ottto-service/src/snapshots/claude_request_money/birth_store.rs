@@ -1,5 +1,6 @@
 //! Claude-only physical births and move cutoffs, independent of upload settlement.
 //! Sorted boxed slices avoid path strings and per-node/spare capacity overhead.
+use super::super::claude_context_file_birth::ClaudeOpenedBirth;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -19,6 +20,31 @@ pub(crate) fn location_key(path: &str) -> LocationKey {
 fn session_key(session: &str) -> LocationKey {
     key(b"claude-money-session-v1\0", session)
 }
+// File caps fit u32. An unrepresentable device/extent is unknown proof.
+#[derive(Debug, Clone, Copy, Default)]
+struct BirthIdentity {
+    device: u32,
+    size: u32,
+    inode: u64,
+}
+impl BirthIdentity {
+    fn from_opened(opened: ClaudeOpenedBirth) -> Self {
+        match (u32::try_from(opened.device), u32::try_from(opened.size)) {
+            (Ok(device), Ok(size)) => Self {
+                device,
+                size,
+                inode: opened.inode,
+            },
+            _ => Self::default(),
+        }
+    }
+    fn covers(self, current: ClaudeOpenedBirth) -> bool {
+        self.inode != 0
+            && self.inode == current.inode
+            && u64::from(self.device) == current.device
+            && current.size >= u64::from(self.size)
+    }
+}
 // Per-path generation retires a moved-away object without reviving it on partial save.
 // Observation = (path key, physical birth or zero when retired, generation).
 #[derive(Debug, Clone)]
@@ -27,10 +53,10 @@ struct Session(
     LocationKey,
     u64,
     u64,
-    Box<[(LocationKey, u64, u64)]>,
+    Box<[(LocationKey, u64, u64, BirthIdentity)]>,
 );
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BirthStore(Box<[Session]>);
+pub(crate) struct BirthStore(Box<[Session]>, Vec<(LocationKey, u8)>);
 // One versioned binary string keeps the handwritten pretty index writer within
 // the disk budget too. Integer fields are little endian; no wall time is invented.
 impl Serialize for BirthStore {
@@ -39,11 +65,18 @@ impl Serialize for BirthStore {
             .0
             .iter()
             .try_fold(8usize, |n, s| {
-                n.checked_add(52)?.checked_add(s.4.len().checked_mul(32)?)
+                n.checked_add(52)?
+                    .checked_add(s.4.len().checked_mul(32)?)?
+                    .checked_add(
+                        s.4.iter()
+                            .filter(|o| o.3.inode != 0)
+                            .count()
+                            .checked_mul(16)?,
+                    )
             })
             .ok_or_else(|| serde::ser::Error::custom("birth table size overflow"))?;
         let mut bytes = Vec::with_capacity(byte_len);
-        bytes.extend_from_slice(b"CMB2");
+        bytes.extend_from_slice(b"CMB3");
         bytes.extend_from_slice(&(self.0.len() as u32).to_le_bytes());
         for Session(session, owner, cutoff, absent, paths) in &self.0 {
             bytes.extend_from_slice(&session.0);
@@ -51,10 +84,19 @@ impl Serialize for BirthStore {
             bytes.extend_from_slice(&cutoff.to_le_bytes());
             bytes.extend_from_slice(&absent.to_le_bytes());
             bytes.extend_from_slice(&(paths.len() as u32).to_le_bytes());
-            for (path, birth, generation) in paths {
+            for (path, birth, generation, opened) in paths {
                 bytes.extend_from_slice(&path.0);
                 bytes.extend_from_slice(&birth.to_le_bytes());
-                bytes.extend_from_slice(&generation.to_le_bytes());
+                let tagged_generation = generation
+                    .checked_mul(2)
+                    .and_then(|g| g.checked_add(u64::from(opened.inode != 0)))
+                    .ok_or_else(|| serde::ser::Error::custom("birth generation overflow"))?;
+                bytes.extend_from_slice(&tagged_generation.to_le_bytes());
+                if opened.inode != 0 {
+                    bytes.extend_from_slice(&opened.device.to_le_bytes());
+                    bytes.extend_from_slice(&opened.size.to_le_bytes());
+                    bytes.extend_from_slice(&opened.inode.to_le_bytes());
+                }
             }
         }
         // serde_json streams Display into the quoted string: no second base64 buffer.
@@ -82,6 +124,7 @@ impl<'de> Deserialize<'de> for BirthStore {
             let record_bytes = match &version {
                 b"CMB1" => 24,
                 b"CMB2" => 32,
+                b"CMB3" => 32,
                 _ => return None,
             };
 
@@ -103,12 +146,27 @@ impl<'de> Deserialize<'de> for BirthStore {
                 for _ in 0..count {
                     let path = LocationKey(take(&mut input)?);
                     let birth = u64::from_le_bytes(take(&mut input)?);
-                    let generation = if record_bytes == 32 {
+                    let generation = if record_bytes >= 32 {
                         u64::from_le_bytes(take(&mut input)?)
                     } else {
                         0
                     };
-                    paths.push((path, birth, generation));
+                    let has_identity = &version == b"CMB3" && generation & 1 != 0;
+                    let generation = if &version == b"CMB3" {
+                        generation >> 1
+                    } else {
+                        generation
+                    };
+                    let opened = if has_identity {
+                        BirthIdentity {
+                            device: u32::from_le_bytes(take(&mut input)?),
+                            size: u32::from_le_bytes(take(&mut input)?),
+                            inode: u64::from_le_bytes(take(&mut input)?),
+                        }
+                    } else {
+                        BirthIdentity::default()
+                    };
+                    paths.push((path, birth, generation, opened));
                 }
                 sessions.push(Session(
                     session,
@@ -121,7 +179,7 @@ impl<'de> Deserialize<'de> for BirthStore {
             if !input.is_empty() {
                 return None;
             }
-            BirthStore(sessions.into_boxed_slice()).valid()
+            BirthStore(sessions.into_boxed_slice(), Vec::new()).valid()
         }
         let encoded = String::deserialize(deserializer)?;
         decode(encoded).ok_or_else(|| serde::de::Error::custom("invalid birth table"))
@@ -182,7 +240,7 @@ impl BirthStore {
                     }
                     Err(j) => {
                         let mut paths = std::mem::take(&mut s.4).into_vec();
-                        paths.insert(j, (pk, birth, 0));
+                        paths.insert(j, (pk, birth, 0, BirthIdentity::default()));
                         s.4 = paths.into_boxed_slice();
                     }
                 }
@@ -197,12 +255,83 @@ impl BirthStore {
                 let mut sessions = std::mem::take(&mut self.0).into_vec();
                 sessions.insert(
                     i,
-                    Session(sk, pk, birth, 0, vec![(pk, birth, 0)].into_boxed_slice()),
+                    Session(
+                        sk,
+                        pk,
+                        birth,
+                        0,
+                        vec![(pk, birth, 0, BirthIdentity::default())].into_boxed_slice(),
+                    ),
                 );
                 self.0 = sessions.into_boxed_slice();
             }
         }
     }
+    /// Page-local probes are cleared with T4's page twin index. No per-response state.
+    pub(in crate::snapshots) fn begin_page(&mut self) {
+        self.1.clear();
+    }
+    pub(in crate::snapshots) fn staged(&self, path: &str) -> bool {
+        self.1
+            .binary_search_by_key(&location_key(path), |o| o.0)
+            .is_ok()
+    }
+    pub(in crate::snapshots) fn witnessed(&self, path: LocationKey) -> bool {
+        self.1
+            .binary_search_by_key(&path, |o| o.0)
+            .ok()
+            .is_some_and(|i| self.1[i].1 == 3)
+    }
+    pub(in crate::snapshots) fn stage_opened(
+        &mut self,
+        session: &str,
+        path: &str,
+        opened: Option<ClaudeOpenedBirth>,
+        indexed_size: u64,
+    ) {
+        let pk = location_key(path);
+        if let Some(opened) = opened.filter(|o| o.birth != 0) {
+            self.record_opened(session, path, i128::from(opened.birth), opened);
+        }
+        let valid = opened.is_some_and(|current| {
+            current.size >= indexed_size
+                && self
+                    .get(session)
+                    .and_then(|s| s.4.iter().find(|o| o.0 == pk))
+                    .is_some_and(|o| o.3.covers(current))
+        });
+        let status = u8::from(opened.is_some()) | (u8::from(valid) << 1);
+        match self.1.binary_search_by_key(&pk, |o| o.0) {
+            Ok(i) => self.1[i].1 = status,
+            Err(i) => self.1.insert(i, (pk, status)),
+        }
+    }
+    /// Remember the identity at birth, never rebind an old minimum to a replacement.
+    pub(in crate::snapshots) fn record_opened(
+        &mut self,
+        session: &str,
+        path: &str,
+        birth: i128,
+        opened: ClaudeOpenedBirth,
+    ) {
+        self.record_observation(session, path, birth);
+        let sk = session_key(session);
+        let pk = location_key(path);
+        let Ok(i) = self.0.binary_search_by_key(&sk, |s| s.0) else {
+            return;
+        };
+        let s = &mut self.0[i];
+        let Ok(j) = s.4.binary_search_by_key(&pk, |o| o.0) else {
+            return;
+        };
+        let o = &mut s.4[j];
+        if o.3.inode == 0 && i128::from(o.1) == birth {
+            o.3 = BirthIdentity::from_opened(opened);
+        } else if o.3.covers(opened) {
+            o.3.size = u32::try_from(opened.size).unwrap_or(u32::MAX);
+        }
+    }
+
     /// Caller proves a move of the current owner at the existing read boundary.
     /// Equal minima transfer ownership too; other live twins keep their cutoff.
     pub(crate) fn record_proven_move(
@@ -236,6 +365,7 @@ impl BirthStore {
             return false;
         };
         s.4[source].1 = 0;
+        s.4[source].3 = BirthIdentity::default();
         s.4[source].2 = generation;
         s.1 = to;
         s.3 = 0;
@@ -257,7 +387,7 @@ impl BirthStore {
     ) -> impl Iterator<Item = (LocationKey, i128)> + '_ {
         self.get(session).into_iter().flat_map(|s| {
             s.4.iter()
-                .filter_map(|&(p, b, _)| (b != 0).then_some((p, i128::from(b))))
+                .filter_map(|&(p, b, _, _)| (b != 0).then_some((p, i128::from(b))))
         })
     }
     pub(crate) fn original_witness_at(
@@ -274,7 +404,7 @@ impl BirthStore {
             .map_or(opened_birth, |b| b.min(opened_birth));
         let current = (own, pk);
         s.4.iter()
-            .filter_map(|&(p, b, _)| {
+            .filter_map(|&(p, b, _, _)| {
                 if b == 0 {
                     return None;
                 }
@@ -295,19 +425,24 @@ impl BirthStore {
                 }
                 Ok(i) => {
                     let s = &mut self.0[i];
-                    for &(path, birth, generation) in &old.4 {
+                    for &(path, birth, generation, opened) in &old.4 {
                         match s.4.binary_search_by_key(&path, |o| o.0) {
                             Ok(j) => {
                                 let current = &mut s.4[j];
                                 if generation > current.2 {
-                                    *current = (path, birth, generation);
+                                    *current = (path, birth, generation, opened);
                                 } else if generation == current.2 && birth != 0 && current.1 != 0 {
                                     current.1 = current.1.min(birth);
+                                    if current.3.inode == opened.inode
+                                        && current.3.device == opened.device
+                                    {
+                                        current.3.size = current.3.size.max(opened.size);
+                                    }
                                 }
                             }
                             Err(j) => {
                                 let mut paths = std::mem::take(&mut s.4).into_vec();
-                                paths.insert(j, (path, birth, generation));
+                                paths.insert(j, (path, birth, generation, opened));
                                 s.4 = paths.into_boxed_slice();
                             }
                         }
@@ -366,6 +501,7 @@ impl BirthStore {
     fn memory_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + std::mem::size_of_val(&*self.0)
+            + self.1.capacity() * std::mem::size_of::<(LocationKey, u8)>()
             + self
                 .0
                 .iter()
@@ -381,9 +517,10 @@ impl crate::heap_layout_bound::HeapLayoutBound for BirthStore {
         for s in &self.0 {
             bytes = bytes
                 .checked_add(std::mem::size_of_val(&*s.4))?
-                .checked_add(std::mem::align_of::<(LocationKey, u64, u64)>())?;
+                .checked_add(std::mem::align_of::<(LocationKey, u64, u64, BirthIdentity)>())?;
         }
-        c.add(bytes)
+        c.add(bytes)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.1, c)
     }
 }
 
