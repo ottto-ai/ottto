@@ -42799,7 +42799,7 @@ impl ScanIndex {
             && self
                 .file_snapshot_fingerprints
                 .get(key)
-                .is_none_or(BTreeSet::is_empty)
+                .map_or(true, BTreeSet::is_empty)
     }
 
     fn claude_account_retained_pending_resources(
@@ -42939,7 +42939,7 @@ impl ScanIndex {
                     }
                     if latest
                         .get(member)
-                        .is_none_or(|(previous, _, _)| time > *previous)
+                        .map_or(true, |(previous, _, _)| time > *previous)
                     {
                         latest.insert(
                             member.clone(),

@@ -158,6 +158,7 @@ impl Probe {
             process_sample(),
         )
     }
+    #[cfg(test)]
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
         self.collection_with_account_pending(source, counts, None);
     }
