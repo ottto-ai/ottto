@@ -90,6 +90,7 @@ pub(crate) type ClaudeLiveKey = (String, String, BTreeMap<String, String>);
 fn live_key_of_row(bucket_start: &str, row: &SnapshotModelUsage) -> ClaudeLiveKey {
     let mut selector = row.selector_context.clone();
     for (name, value) in [
+        ("reasoning_effort", &row.reasoning_effort),
         ("auth_mode", &row.auth_mode),
         ("billing_channel", &row.billing_channel),
         ("billing_provider", &row.billing_provider),
@@ -171,7 +172,7 @@ pub(crate) struct ClaudeGrainSide {
 }
 
 impl ClaudeGrainSide {
-    fn add(&mut self, tokens: &ClaudeMoneyTokens, requests: u64, cost: Option<u64>) {
+    pub(super) fn add(&mut self, tokens: &ClaudeMoneyTokens, requests: u64, cost: Option<u64>) {
         self.tokens.add(tokens);
         self.requests = self.requests.saturating_add(requests);
         self.contributions += 1;
@@ -1046,5 +1047,113 @@ fn side_calls(
             None,
             Some((&row.tokens, 1, row.cost_micros)),
         );
+    }
+}
+
+/// E2 side calls use only family-local membership. A skipped copy still
+/// supplies membership; an off-page subagent still supplies a census holder.
+/// The telemetry row stays at its reporting root; this never elects an owner.
+pub(super) fn e2_side_calls(
+    items: &mut [SnapshotItem],
+    api: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
+    index: &super::super::ScanIndex,
+) {
+    let mut family_ids = BTreeMap::<String, BTreeSet<u64>>::new();
+    for item in items.iter() {
+        let root = super::super::claude_snapshot_family_root(item);
+        family_ids.entry(root).or_default().extend(
+            item.claude_usage_request_ids
+                .iter()
+                .map(|id| claude_request_hash(id)),
+        );
+    }
+    let hashes = api
+        .values()
+        .flatten()
+        .map(|row| claude_request_hash(&row.request_id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let empty = super::super::claude_request_census::ClaudeRequestCensus::default();
+    let holders = super::super::claude_request_ledger::scan_holders(
+        &index.claude_request_census,
+        &empty,
+        &hashes,
+        &[],
+        std::time::Instant::now() + std::time::Duration::from_millis(250),
+        &mut |_| true,
+    );
+    let mut roots_done = BTreeSet::new();
+    for item in items.iter_mut() {
+        let root = super::super::claude_snapshot_family_root(item);
+        if item.source_session_id != root || !roots_done.insert(root.clone()) {
+            continue;
+        }
+        let Some(fold) = item.claude_money.as_mut() else {
+            continue;
+        };
+        let Some(holders) = &holders else {
+            fold.disclosed += 1;
+            continue;
+        };
+        let mut rows = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        for row in api
+            .get(&root)
+            .into_iter()
+            .flatten()
+            .filter(|row| super::super::validate_claude_api_row(row, &root))
+        {
+            if let Some(prior) = rows.insert(row.request_id.as_str(), row) {
+                if prior != row {
+                    conflicts.insert(row.request_id.as_str());
+                }
+            }
+        }
+        for (id, row) in rows {
+            let hash = claude_request_hash(id);
+            if family_ids.get(&root).is_some_and(|ids| ids.contains(&hash))
+                || holders.has_transcript_holder_in(hash, &root)
+            {
+                continue;
+            }
+            if conflicts.contains(id) || holders.overflowed(hash) {
+                fold.disclosed += 1;
+                continue;
+            }
+            let mut header = super::facts::ClaudeFactsHeader::default();
+            let Some((_, fact)) = super::rows::row_fact(row, &root, &mut header) else {
+                continue;
+            };
+            let api_row = super::rows::ClaudeApiRow {
+                request_hash: hash,
+                tokens: fact.tokens,
+                cost_micros: fact.cost_micros,
+                clock: fact.clock,
+                model: &row.model,
+                speed: &row.speed,
+                effort: &row.effort,
+            };
+            let Some(key) = reported_live_key(&api_row, None) else {
+                fold.disclosed += 1;
+                continue;
+            };
+            let origin = if row.cost_usd_micros.is_some() {
+                ClaudeRequestUsageOrigin::TelemetryReported
+            } else {
+                ClaudeRequestUsageOrigin::TelemetryUnpriced
+            };
+            fold.entity
+                .grains
+                .entry((key.clone(), Some(origin)))
+                .or_default()
+                .add(&fact.tokens, 1, row.cost_usd_micros);
+            if let Some(at) = super::super::rfc3339_unix_nanos(&row.observed_at) {
+                let bounds = fold.entity.bucket_activity.entry(key.0).or_insert((at, at));
+                bounds.0 = bounds.0.min(at);
+                bounds.1 = bounds.1.max(at);
+                fold.entity.activity_nanos = fold.entity.activity_nanos.max(at);
+            }
+        }
     }
 }

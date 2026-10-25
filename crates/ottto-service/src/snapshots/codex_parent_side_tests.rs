@@ -606,6 +606,7 @@ fn side_records_persist_decode_per_record_and_follow_the_index_lifecycle() {
 
 fn file_entry() -> ScanIndexEntry {
     ScanIndexEntry {
+        claude_money_min_birth_nanos: None,
         size_bytes: 42,
         modified_unix_seconds: 1_700_000_000,
         modified_unix_nanos: None,

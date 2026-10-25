@@ -4230,6 +4230,10 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         unattributed_total_tokens: item.unattributed_total_tokens,
         request_count: item.request_count,
         usage_accounting_contract: item.usage_accounting_contract.clone(),
+        removed_request_count: item.removed_request_count,
+        removed_usage: item.removed_usage,
+        telemetry_owned_complete: item.telemetry_owned_complete,
+        claude_money: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
         cache_observations: item.cache_observations.clone(),
@@ -8416,6 +8420,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     };
     match api_load {
         Ok(evidence) => {
+            crate::snapshots::claude_request_money::e2::attach_page(
+                &mut scan_result.snapshots,
+                &evidence.evidence,
+                index,
+            );
             let census_window_end = scan_result.census_window_end.clone();
             crate::snapshots::apply_claude_effort_evidence_with_index(
                 &mut scan_result.snapshots,
@@ -8683,9 +8692,14 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
     }
+    crate::snapshots::claude_request_money::e2::finish_page(&mut scan_result.snapshots);
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
     // its writer thread after this page. Never fails or changes the page.
+    crate::snapshots::claude_request_money::advance_telemetry_page(
+        support_dir,
+        &scan_result.snapshots,
+    );
     crate::snapshots::claude_request_money::shadow_page(
         support_dir,
         &scan_result.snapshots,

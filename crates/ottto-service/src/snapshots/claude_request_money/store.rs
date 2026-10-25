@@ -965,23 +965,27 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
         save,
         reservations,
     } = job;
-    let ready = match failed.run_days {
-        Some((first, last)) if jsonl.now >= first && jsonl.now <= last => true,
-        previous => {
-            let recovered = previous.is_some() || super::note_unclean_run(&support_dir, jsonl.now);
-            let days = previous.map_or(
-                (jsonl.now / 86_400 * 86_400, jsonl.now + 86_400),
-                |(first, last)| (first.min(jsonl.now), last.max(jsonl.now + 86_400)),
-            );
-            if recovered && super::open_run_marker(&support_dir, days) {
-                failed.run_days = Some(days);
-                true
-            } else {
-                false
+    let ready = jsonl.telemetry_only
+        || match failed.run_days {
+            Some((first, last)) if jsonl.now >= first && jsonl.now <= last => true,
+            previous => {
+                let recovered =
+                    previous.is_some() || super::note_unclean_run(&support_dir, jsonl.now);
+                let days = previous.map_or(
+                    (jsonl.now / 86_400 * 86_400, jsonl.now + 86_400),
+                    |(first, last)| (first.min(jsonl.now), last.max(jsonl.now + 86_400)),
+                );
+                if recovered && super::open_run_marker(&support_dir, days) {
+                    failed.run_days = Some(days);
+                    true
+                } else {
+                    false
+                }
             }
-        }
-    };
-    let outcome = if ready {
+        };
+    let outcome = if jsonl.telemetry_only {
+        super::JsonlOutcome::default()
+    } else if ready {
         super::write_jsonl(&support_dir, &mut jsonl, &mut memos)
     } else {
         super::owe_coverage(&support_dir, jsonl.now, true);

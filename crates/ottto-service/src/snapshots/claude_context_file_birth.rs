@@ -128,11 +128,47 @@ impl ClaudeFileBirth {
     /// birth, `Some(false)` for an owned root record, and `None` when the rule
     /// does not apply or the timestamp is unusable (never "owned" by default).
     fn copied(&self, timestamp: Option<&str>) -> Option<bool> {
+        self.copied_with_slack(
+            timestamp.and_then(rfc3339_unix_nanos),
+            CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS,
+        )
+    }
+
+    pub(in crate::snapshots) fn copied_with_slack(
+        &self,
+        at: Option<i128>,
+        slack: i128,
+    ) -> Option<bool> {
         let ClaudeBirthScope::Root(birth) = self.scope else {
             return None;
         };
-        let cutoff = birth.checked_sub(CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS)?;
-        timestamp.and_then(rfc3339_unix_nanos).map(|at| at < cutoff)
+        Some(at? < birth.checked_sub(slack)?)
+    }
+
+    pub(in crate::snapshots) fn birth_nanos(&self) -> Option<i128> {
+        match self.scope {
+            ClaudeBirthScope::Root(birth) => Some(birth),
+            _ => None,
+        }
+    }
+
+    pub(in crate::snapshots) fn with_minimum(mut self, minimum: Option<i128>) -> Self {
+        if matches!(
+            self.scope,
+            ClaudeBirthScope::Root(_) | ClaudeBirthScope::RootUnknownBirth
+        ) {
+            if let Some(minimum) = minimum {
+                self.scope = root_birth_scope(Some(
+                    self.birth_nanos()
+                        .map_or(minimum, |birth| birth.min(minimum)),
+                ));
+            }
+        }
+        self
+    }
+
+    pub(in crate::snapshots) fn uncertain_root(&self) -> bool {
+        self.scope == ClaudeBirthScope::RootUnknownBirth
     }
 
     /// Read through the Claude transcript parser.
@@ -157,13 +193,27 @@ impl ClaudeFileBirth {
 
     /// One resolved response, in transcript order. Today's naive scalars are
     /// computed beside this and stay untouched; the fold decides which ships.
+    #[cfg(test)]
     pub(super) fn observe_response(
         &mut self,
         sequence: u64,
         timestamp: Option<&str>,
         effective_input_context: u64,
     ) {
-        let copied = match self.copied(timestamp) {
+        self.observe_response_at(
+            sequence,
+            timestamp.and_then(rfc3339_unix_nanos),
+            effective_input_context,
+        );
+    }
+
+    pub(super) fn observe_response_at(
+        &mut self,
+        sequence: u64,
+        at: Option<i128>,
+        effective_input_context: u64,
+    ) {
+        let copied = match self.copied_with_slack(at, CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS) {
             Some(copied) => copied,
             None => {
                 if self.root_with_birth() {

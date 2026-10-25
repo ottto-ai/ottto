@@ -81,6 +81,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use store::{ClaudeLedger, ClaudeLedgerAcquire, PendingMemo, WriteJob};
 
+pub(crate) mod e2;
+mod emit;
+pub(crate) const REQUEST_OWNED_CONTRACT: &str = "claude_request_owned_usage:v1";
+
 pub(crate) const CLAUDE_REQUEST_COUNTING: &str = "claude_request_counting:v1";
 /// Row format of the JSONL (B1 reader `claude_money_shadow_report.py`).
 const JSONL_VERSION: u8 = 3;
@@ -424,7 +428,7 @@ fn shadow_enabled(support_dir: &Path) -> bool {
     #[cfg(not(test))]
     {
         let _ = support_dir;
-        true
+        false
     }
 }
 
@@ -529,6 +533,7 @@ fn publish_off(support_dir: &Path, now: u64) {
     let job = WriteJob {
         support_dir: support_dir.to_path_buf(),
         jsonl: JsonlBatch {
+            telemetry_only: false,
             now,
             fault: PageFault::None,
             families: Vec::new(),
@@ -2084,16 +2089,21 @@ fn shadow_page_body(
     // Only these oldest turns can have a captured body. Prioritize their
     // sidecars in the same order; the bounded global sweep still retains
     // cross-root telemetry debt and never treats an unvisited root as absent.
+    #[cfg(test)]
     let mut work = ClaudeLedgerWork::new(
         WORK_MAX_BYTES,
         WORK_MAX_STATS,
         setup_deadline.min(Instant::now() + TELEMETRY_MAX_ELAPSED),
     );
+    #[cfg(test)]
     let unloaded = order[..head]
         .iter()
         .map(|(root, _, _)| *root)
         .filter(|root| !api_report.evidence.contains_key(*root))
         .collect::<Vec<_>>();
+    // The live page advances telemetry before entering the optional P1 work.
+    // Explicit shadow test callers retain their old bounded standalone path.
+    #[cfg(test)]
     let (tail, root_states) = ClaudeTelemetryTail::advance(
         support_dir,
         ledger,
@@ -2102,8 +2112,13 @@ fn shadow_page_body(
         &unloaded,
         &mut work,
     );
+    #[cfg(not(test))]
+    let (tail, root_states) = (Default::default(), BTreeMap::new());
     end.tail = tail;
-    counts.work_stopped = u64::from(work.stopped);
+    #[cfg(test)]
+    {
+        counts.work_stopped = u64::from(work.stopped);
+    }
     counts.telemetry_retired_pressure =
         claude_request_ledger::retire_telemetry_under_pressure(ledger, setup_deadline);
     if counts.telemetry_retired_pressure > 0 {
@@ -3596,6 +3611,7 @@ fn hand_off_reserved_buffer(
     let job = WriteJob {
         support_dir: end.support_dir.to_path_buf(),
         jsonl: JsonlBatch {
+            telemetry_only: false,
             now: end.now,
             fault: current_fault(),
             families,
@@ -4126,6 +4142,7 @@ fn take_owed_coverage(
 
 /// One page's rows for today's JSONL file (serialized by the writer).
 pub(crate) struct JsonlBatch {
+    telemetry_only: bool,
     now: u64,
     fault: PageFault,
     families: Vec<FamilyRows>,
@@ -5134,5 +5151,63 @@ mod schedule_head_tests {
                 assert_eq!(all, keyed, "case {case}: every keyed root is kept once");
             }
         }
+    }
+}
+
+/// Telemetry advancement survives P1 being disabled. The existing ledger
+/// writer checkpoints only facts; it does not emit shadow JSONL or build claims.
+pub(crate) fn advance_telemetry_page(support_dir: &Path, snapshots: &[SnapshotItem]) {
+    #[cfg(test)]
+    if shadow_enabled(support_dir) {
+        return;
+    } // test shadow owns its explicit tail
+    let deadline = Instant::now() + TELEMETRY_MAX_ELAPSED;
+    let Some(reservation) =
+        ShadowReservation::admit(tail_fixed_memory(&ClaudeTelemetryTailBudget::default()))
+    else {
+        return;
+    };
+    let mut ledger = match store::acquire(support_dir) {
+        ClaudeLedgerAcquire::Ready(ledger) => ledger,
+        _ => return,
+    };
+    let now = now_unix();
+    let roots = snapshots
+        .iter()
+        .map(claude_snapshot_family_root_ref)
+        .collect::<BTreeSet<_>>();
+    let roots = roots.into_iter().collect::<Vec<_>>();
+    let mut counts = ClaudeRequestMoneyShadowCounts::default();
+    apply_results(support_dir, &mut ledger, &mut counts, deadline);
+    let mut work = ClaudeLedgerWork::new(WORK_MAX_BYTES, WORK_MAX_STATS, deadline);
+    let _ = ClaudeTelemetryTail::advance(
+        support_dir,
+        &mut ledger,
+        now,
+        &ClaudeTelemetryTailBudget::default(),
+        &roots,
+        &mut work,
+    );
+    if let Some((save, saved)) = ledger.take_save(store::SavePolicy {
+        support_dir,
+        deadline,
+        utc_day: utc_day(now),
+        min_interval: store::SAVE_MIN_INTERVAL,
+    }) {
+        let job = WriteJob {
+            support_dir: support_dir.to_path_buf(),
+            jsonl: JsonlBatch {
+                telemetry_only: true,
+                now,
+                fault: PageFault::None,
+                families: Vec::new(),
+                coverage: CoverageRow::owed(now),
+                buffer_bytes: 0,
+            },
+            memos: Vec::new(),
+            save: Some(save),
+            reservations: vec![reservation, saved],
+        };
+        let _ = store::submit_batch(&mut ledger, job);
     }
 }

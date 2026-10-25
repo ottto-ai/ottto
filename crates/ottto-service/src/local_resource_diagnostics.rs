@@ -159,6 +159,21 @@ impl Probe {
         )
     }
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
+        #[derive(Serialize)]
+        struct WithMoney {
+            #[serde(flatten)]
+            collection: CollectionCounts,
+            #[serde(flatten)]
+            money: crate::snapshots::claude_request_money::e2::Counts,
+        }
+        let counts = WithMoney {
+            collection: counts,
+            money: if source == "claude_code" {
+                crate::snapshots::claude_request_money::e2::take_counts()
+            } else {
+                Default::default()
+            },
+        };
         emit(&Record {
             schema_version: SCHEMA_VERSION,
             process_id: std::process::id(),
