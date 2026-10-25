@@ -4573,6 +4573,197 @@ fn census_rebuild_priors_refusal_keeps_bindings_acks_and_latch() {
     }
 }
 
+/// SI-724-F2: guard-loss alarm lines (count-only, no key identity) with
+/// `cause` emitted since `from`.
+fn census_rebuild_guard_alarms(from: usize, cause: &str) -> usize {
+    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+    bound::alarm_lines()[from..]
+        .iter()
+        .filter(|line| {
+            line.contains("duplicate rebuild guard lost alarm")
+                && line.contains(&format!("cause={cause} "))
+        })
+        .inspect(|line| assert!(!line.contains("key_hash8"), "count-only: {line}"))
+        .count()
+}
+
+/// SI-724-F1-B: a deep (70 nested arrays) or wide (more than the bounded
+/// shape gate's node cap) "N3 initialized" marker value is refused in
+/// isolation by every reader alike. A real load, the bounded decoder, a
+/// bounded CAS save (whose compare-and-swap read decodes the corrupt
+/// checkpoint) and a plain one, and their reloads keep every binding, ACK and
+/// the contract-5 latch exactly as without the marker; only N3 closes (the
+/// guard lost for one window, the marker rewritten present), and the
+/// guard-loss alarm (SI-724-F2) fires once, count-only. OFF and ON.
+#[test]
+fn census_rebuild_deep_or_wide_marker_closes_only_n3_on_every_reader() {
+    use crate::snapshots::claude_request_census::{
+        decode_bounded_index, duplicate_rebuild_test_support as bound,
+    };
+    const KEPT: [&str; 7] = [
+        "files",
+        "session_account_bindings",
+        "accepted_snapshot_fingerprints",
+        "accepted_snapshot_fingerprint_ledger_version",
+        "claude_request_identity_contract",
+        "claude_request_identity_contract_changed",
+        "claude_request_census",
+    ];
+    let deep = format!("{}1{}", "[".repeat(70), "]".repeat(70));
+    let wide = format!("[{}1]", "1,".repeat(crate::snapshot_retry::STATE_NODES + 8));
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let _clock = bound::set_now(N3_T0);
+        let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-marker-shape");
+        let (_root, original, _key) = census_duplicate_rebuild_fixture(&scratch);
+        let mut value = serde_json::to_value(&original).unwrap();
+        let acks = serde_json::json!(["c".repeat(64), "d".repeat(64)]);
+        value["accepted_snapshot_fingerprints"] = acks.clone();
+        let bindings = serde_json::json!({
+            ("f".repeat(64)): { "account_identifier_hash": "a".repeat(64) }
+        });
+        value["session_account_bindings"] = bindings.clone();
+        let contract = serde_json::json!(crate::snapshots::claude_request_identity::COLLECTOR);
+        value["claude_request_identity_contract"] = contract.clone();
+        value["claude_request_identity_contract_changed"] = serde_json::json!(true);
+        let kept = |index: &ScanIndex| {
+            let value = serde_json::to_value(index).unwrap();
+            KEPT.map(|field| value[field].clone())
+        };
+        let control_raw = serde_json::to_string(&value).unwrap();
+        let control_path = scratch.join("control.json");
+        std::fs::write(&control_path, &control_raw).unwrap();
+        let control_index = ScanIndex::load(&control_path).unwrap();
+        assert!(!bound::closed(&control_index), "control: N3 open");
+        let control = kept(&control_index);
+        assert_eq!(control[1], bindings, "the binding decodes");
+        assert_eq!(control[2], acks, "the ACKs decode");
+        assert_eq!(control[4], contract, "the contract decodes");
+        assert_eq!(control[5], serde_json::json!(true), "the latch decodes");
+        assert_eq!(
+            kept(&decode_bounded_index(control_raw.as_bytes()).unwrap()),
+            control
+        );
+
+        for (shape, marker) in [("deep", &deep), ("wide", &wide)] {
+            let case = format!("shadow={enabled} {shape}");
+            bound::restart();
+            let alarms = bound::alarm_lines().len();
+            let mut corrupt = value.clone();
+            corrupt["claude_census_rebuild_initialized"] = serde_json::json!("MARKER_VALUE");
+            let raw = serde_json::to_string(&corrupt)
+                .unwrap()
+                .replace("\"MARKER_VALUE\"", marker);
+            let path = scratch.join(format!("{shape}-{enabled}.json"));
+            std::fs::write(&path, &raw).unwrap();
+            let mut loaded = ScanIndex::load(&path).unwrap();
+            assert!(path.exists(), "{case}: never quarantined");
+            let mut bounded = decode_bounded_index(raw.as_bytes())
+                .unwrap_or_else(|error| panic!("{case}: bounded decode refused: {error:#}"));
+            for index in [&mut loaded, &mut bounded] {
+                assert_eq!(kept(index), control, "{case}: identity kept");
+                assert!(bound::closed(index), "{case}: only N3 closes");
+                assert_eq!(bound::tracked_open(index), None, "{case}");
+                assert_eq!(bound::marker(index), N3_T0, "{case}: rewritten present");
+                assert_eq!(census_rebuild_counters(index).1, 1, "{case}: counted once");
+            }
+            assert_eq!(
+                census_rebuild_guard_alarms(alarms, "marker_refused"),
+                1,
+                "{case}: one rate-limited guard-loss alarm"
+            );
+            let mut plain = loaded.clone();
+            loaded
+                .save_with_read_limit(&path, 64 * 1024 * 1024)
+                .unwrap_or_else(|error| panic!("{case}: bounded CAS refused: {error:#}"));
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                saved["claude_census_rebuild_initialized"],
+                serde_json::json!(N3_T0),
+                "{case}: saved well-formed"
+            );
+            let reloaded = ScanIndex::load(&path).unwrap();
+            assert_eq!(kept(&reloaded), control, "{case}: after bounded CAS");
+            assert!(
+                bound::closed(&reloaded),
+                "{case}: still closed for the window"
+            );
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                kept(&decode_bounded_index(&bytes).unwrap()),
+                control,
+                "{case}: bounded reload"
+            );
+            // The plain CAS over the same corrupt checkpoint.
+            std::fs::write(&path, &raw).unwrap();
+            plain
+                .save(&path)
+                .unwrap_or_else(|error| panic!("{case}: CAS refused: {error:#}"));
+            let reloaded = ScanIndex::load(&path).unwrap();
+            assert_eq!(kept(&reloaded), control, "{case}: after CAS");
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                kept(&decode_bounded_index(&bytes).unwrap()),
+                control,
+                "{case}: bounded reload after CAS"
+            );
+        }
+    }
+}
+
+/// SI-724-F2: losing the guard or its marker while no key is pending (a
+/// healthy index: no duplicate, nothing tracked) closes admission for one
+/// window and raises a count-only, rate-limited guard-loss alarm: `n` dropped
+/// with the marker left (guard missing), a malformed marker, or a malformed
+/// `n` (undecodable). Once per cause per process, again after a restart.
+/// OFF and ON.
+#[test]
+fn census_rebuild_guard_loss_alarms_with_no_key_pending() {
+    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let _clock = bound::set_now(N3_T0 + N3_DAY);
+        let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-guard-loss-alarm");
+        let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+        for (loss, cause) in [
+            ("n_dropped", "guard_missing"),
+            ("marker_malformed", "marker_refused"),
+            ("n_malformed", "guard_undecodable"),
+        ] {
+            let case = format!("shadow={enabled} {loss}");
+            let mut value = serde_json::to_value(&original).unwrap();
+            value["claude_census_rebuild_initialized"] = serde_json::json!(N3_T0);
+            match loss {
+                "marker_malformed" => {
+                    value["claude_census_rebuild_initialized"] = serde_json::json!("x");
+                }
+                "n_malformed" => {
+                    value["claude_request_census_shadow"]["n"] = serde_json::json!("corrupt");
+                }
+                _ => {}
+            }
+            let path = scratch.join(format!("{loss}-{enabled}.json"));
+            std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+            for process in 0..2 {
+                let case = format!("{case} process={process}");
+                bound::restart();
+                let alarms = bound::alarm_lines().len();
+                let mut index = ScanIndex::load(&path).unwrap();
+                assert!(!bound::pending(&index, &key), "{case}: no key pending");
+                assert!(bound::closed(&index), "{case}: closed for one window");
+                census_rebuild_counters(&mut index);
+                census_rebuild_counters(&mut index);
+                assert_eq!(
+                    census_rebuild_guard_alarms(alarms, cause),
+                    1,
+                    "{case}: one alarm per process"
+                );
+            }
+        }
+    }
+}
+
 /// The census line's identity-revoke counter (SI-724-B1b).
 fn census_rebuild_identity_revoked_line(index: &mut ScanIndex) -> u64 {
     let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(

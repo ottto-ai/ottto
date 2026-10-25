@@ -392,6 +392,16 @@ pub(crate) fn decode_marker(bytes: &[u8]) -> u64 {
         .unwrap_or(MARKER_REFUSED)
 }
 
+/// SI-724-F1-B: the marker's isolated wire bytes as both index readers take
+/// them: at most 20 bytes once surrounding whitespace is trimmed, else (or
+/// past the evidence byte cap, `None`) refused.
+pub(crate) fn decode_isolated_marker(bytes: Option<&[u8]>) -> u64 {
+    bytes
+        .map(<[u8]>::trim_ascii)
+        .filter(|bytes| bytes.len() <= 20)
+        .map_or(MARKER_REFUSED, decode_marker)
+}
+
 /// Clamp a future stamp to `now` (recent, fail closed); true while it is
 /// inside the window.
 fn recent(stamp: &mut u64, now: u64) -> bool {
@@ -516,8 +526,11 @@ pub(crate) struct Transient {
     grants: Vec<(String, u64)>,
     rearmed: BTreeSet<String>,
     refusals: Vec<(String, &'static str)>,
+    /// SI-724-F2: the guard itself was lost or refused this load (for the
+    /// count-only guard alarm, raised even with no key pending).
+    guard_loss: Option<&'static str>,
 }
-crate::heap_layout_bound::fields!(Transient; grants, rearmed, refusals);
+crate::heap_layout_bound::fields!(Transient; grants, rearmed, refusals, guard_loss);
 
 pub(crate) fn key_id(key: &str) -> String {
     let mut id = safety_key_id(key);
@@ -619,8 +632,13 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
     // one window. A refused priors field closes it below on its own.
     let marker_refused = marker == MARKER_REFUSED;
     let mut lost = false;
+    // A guard decoded closed (malformed, duplicated or an ambiguous shadow).
+    let mut undecodable = false;
     let mut guard = match index.claude_request_census_shadow.rebuild_bound.take() {
-        Some(guard) => *guard,
+        Some(guard) => {
+            undecodable = guard.closed_at == Some(UNSTAMPED);
+            *guard
+        }
         None => {
             let mut stamp = witness;
             lost = !priors_refused
@@ -632,6 +650,7 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             }
         }
     };
+    let missing = lost;
     if marker_refused && !priors_refused {
         // SI-724-B3b: value-level damage to the marker is isolated, and the
         // guard it vouches for is lost: closed for one window, never fresh.
@@ -669,7 +688,19 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             }
         }
     }
-    let mut transient = Transient::default();
+    let mut transient = Transient {
+        // SI-724-F2: alarmed (count-only) whether or not any key is pending.
+        guard_loss: if marker_refused && !priors_refused {
+            Some("marker_refused")
+        } else if missing {
+            Some("guard_missing")
+        } else if undecodable {
+            Some("guard_undecodable")
+        } else {
+            None
+        },
+        ..Transient::default()
+    };
     // A saved prior whose key the guard no longer holds pending: the guard was
     // lost (malformed, duplicated or closed shadow) after an earlier
     // checkpoint saved that rearm. Its spent attempts are unknown, so
@@ -1103,6 +1134,20 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
     let Some(guard) = index.claude_request_census_shadow.rebuild_bound.as_deref() else {
         return (0, 0, 0, 0);
     };
+    if let Some(cause) = index.claude_request_census.rebuild_transient.guard_loss {
+        // SI-724-F2: count-only (no key identity), once per cause per process.
+        if first_alarm("guard", cause) {
+            let retry_after = guard
+                .closed_at
+                .unwrap_or(guard.orphaned_at)
+                .saturating_add(WINDOW_SECONDS + 1);
+            emit_alarm(format!(
+                "local snapshot census duplicate rebuild guard lost alarm cause={cause} orphaned_7d={} exhausted_keys={} retry_after_unix={retry_after}; admission closed for one window, spent rebuilds not replenished",
+                guard.orphaned,
+                guard.exhausted_keys()
+            ));
+        }
+    }
     let mut emitted = 0;
     let tracked = guard
         .keys

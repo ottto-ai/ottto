@@ -1996,7 +1996,9 @@ pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<Sc
 }
 
 /// The bounded CAS reader's normalizer pass: raw optional evidence bounded,
-/// census/shadow normalized, the priors isolated. Its decode state (the
+/// census/shadow normalized, the priors and the "N3 initialized" marker
+/// isolated (SI-724-F1-B: a refused marker reaches the bounded shape gate as
+/// its sentinel, as normal load reads it). Its decode state (the
 /// duplicate-key identities normalization drops, duplicated census/shadow
 /// fields, the priors refusal) travels with the bytes into the lenient
 /// reader's single `finish_decode`.
@@ -2112,7 +2114,7 @@ pub(super) fn finish_decode(index: &mut ScanIndex, mut state: CensusDecodeState)
 /// Derive positional slots from Serde's own field metadata rather than pinning
 /// offsets to ScanIndex's declaration order. JSON struct sequences are accepted
 /// by the old reader too; they need the same evidence bounds as object fields.
-fn sequence_fields() -> (usize, usize, usize) {
+fn sequence_fields() -> (usize, usize, usize, usize) {
     struct Fields<'a>(&'a mut Option<&'static [&'static str]>);
     impl<'de> Deserializer<'de> for Fields<'_> {
         type Error = serde::de::value::Error;
@@ -2134,7 +2136,7 @@ fn sequence_fields() -> (usize, usize, usize) {
             tuple_struct map enum identifier ignored_any
         }
     }
-    static SLOTS: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    static SLOTS: std::sync::OnceLock<(usize, usize, usize, usize)> = std::sync::OnceLock::new();
     *SLOTS.get_or_init(|| {
         let mut fields = None;
         let _ = ScanIndex::deserialize(Fields(&mut fields));
@@ -2154,6 +2156,7 @@ fn sequence_fields() -> (usize, usize, usize) {
             slot("claude_request_census"),
             slot("claude_request_census_shadow"),
             slot("claude_census_rebuild_priors"),
+            slot("claude_census_rebuild_initialized"),
         )
     })
 }
@@ -2174,7 +2177,7 @@ struct CensusRead<R> {
     depth: usize,
     root_array: bool,
     array_index: usize,
-    sequence_fields: (usize, usize, usize),
+    sequence_fields: (usize, usize, usize, usize),
     quoted: bool,
     escaped: bool,
     expect_key: bool,
@@ -2188,6 +2191,8 @@ struct CensusRead<R> {
     shadow_state: bool,
     /// MONEY P1b: the captured value is `claude_census_rebuild_priors`.
     priors_state: bool,
+    /// SI-724-F1-B: the captured value is `claude_census_rebuild_initialized`.
+    marker_state: bool,
     seen_priors: bool,
     priors_refused: bool,
     normalize: bool,
@@ -2221,6 +2226,7 @@ impl<R: std::io::Read> CensusRead<R> {
             shadow_key: false,
             shadow_state: false,
             priors_state: false,
+            marker_state: false,
             seen_priors: false,
             priors_refused: false,
             normalize: phase_b::enabled(),
@@ -2281,6 +2287,7 @@ impl<R: std::io::Read> CensusRead<R> {
                         self.shadow_key = true;
                         self.shadow_state = false;
                         self.priors_state = false;
+                        self.marker_state = false;
                         let duplicate = self.seen_census;
                         self.seen_census = true;
                         self.duplicate_census |= duplicate;
@@ -2290,6 +2297,7 @@ impl<R: std::io::Read> CensusRead<R> {
                         self.shadow_key = true;
                         self.shadow_state = true;
                         self.priors_state = false;
+                        self.marker_state = false;
                         let duplicate = self.seen_shadow;
                         self.seen_shadow = true;
                         self.duplicate_shadow |= duplicate;
@@ -2302,7 +2310,17 @@ impl<R: std::io::Read> CensusRead<R> {
                         self.shadow_key = true;
                         self.shadow_state = false;
                         self.priors_state = true;
+                        self.marker_state = false;
                         self.seen_priors = true;
+                        false
+                    }
+                    "claude_census_rebuild_initialized" => {
+                        // SI-724-F1-B: the value is isolated like the priors
+                        // (a duplicated name still refuses the index).
+                        self.shadow_key = true;
+                        self.shadow_state = false;
+                        self.priors_state = false;
+                        self.marker_state = true;
                         false
                     }
                     _ => false,
@@ -2391,6 +2409,15 @@ impl<R: std::io::Read> CensusRead<R> {
                 serde_json::to_vec(&priors.unwrap_or_default()).expect("priors serialization")
             );
         }
+        if self.marker_state {
+            // SI-724-F1-B: decoded in isolation in every mode, as the lenient
+            // reader's own marker arm reads it (at most 20 wire bytes). A
+            // deep, wide, oversized or malformed value leaves this reader as
+            // the refused sentinel, a plain u64 the bounded shape gate admits.
+            let marker = rebuild_bound::decode_isolated_marker((!overflow).then_some(&bytes[..]));
+            drop(bytes);
+            return Ok(serde_json::to_vec(&marker).expect("marker serialization"));
+        }
         if overflow {
             return Ok(b"null".to_vec());
         }
@@ -2454,10 +2481,12 @@ impl<R: std::io::Read> CensusRead<R> {
             && !matches!(byte, b',' | b']')
             && (self.array_index == self.sequence_fields.0
                 || self.array_index == self.sequence_fields.1
-                || self.array_index == self.sequence_fields.2)
+                || self.array_index == self.sequence_fields.2
+                || self.array_index == self.sequence_fields.3)
         {
             self.shadow_state = self.array_index == self.sequence_fields.1;
             self.priors_state = self.array_index == self.sequence_fields.2;
+            self.marker_state = self.array_index == self.sequence_fields.3;
             self.replay = Some(byte);
             self.output = std::io::Cursor::new(self.evidence()?);
             return self.next();
