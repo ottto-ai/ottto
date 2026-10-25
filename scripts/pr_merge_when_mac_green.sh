@@ -7,6 +7,9 @@ set -euo pipefail
 # audit" and "Dependency review" jobs.
 
 # Job names from .github/workflows/ci.yml; every other check is informational.
+# Only check runs of that workflow count, so a same-named job elsewhere cannot
+# stand in for (or block) a ci.yml job.
+CI_WORKFLOW=".github/workflows/ci.yml"
 REQUIRED_CHECKS='["Rust contracts","Public surface checks","Rust advisory audit","Dependency review"]'
 DEFAULT_INTERVAL=60
 MIN_INTERVAL=60
@@ -149,7 +152,7 @@ refuse_unmergeable() {
 
 # Prints "<verdict>|<detail>" for the required checks on $1, judging for each
 # name the newest check run that belongs to a pull_request workflow run for
-# this PR and base. <verdict> is success (all four passed), red (at least one
+# this PR and base in ci.yml. <verdict> is success (all four passed), red (at least one
 # finished without success; <detail> names them) or wait (<detail> lists the
 # others as missing, pending or notready:<skipped|neutral>). A check-runs reply
 # that does not hold every run of the commit is "wait", never a verdict.
@@ -164,6 +167,7 @@ checks_status() {
     || return 1
   jq -nr \
     --argjson required "$REQUIRED_CHECKS" \
+    --arg workflow "$CI_WORKFLOW" \
     --arg sha "$sha" \
     --argjson pr "$pr" \
     --argjson pr_view "$pr_json" \
@@ -173,6 +177,7 @@ checks_status() {
       | "\($pr_view.headRepositoryOwner.login)/\($pr_view.headRepository.name)" as $head_repo
       | [ $runs.workflow_runs[]?
         | select(.event == "pull_request" and .head_sha == $sha)
+        | select(.path == $workflow)
         | select(
             any(.pull_requests[]?; .number == $pr and .base.ref == $base)
             or ($pr_view.isCrossRepository == true

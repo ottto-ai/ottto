@@ -104,14 +104,15 @@ pr_checks() {
     "93|Dependency review|completed|success|$suite"
 }
 
-# workflow_runs [<suite>|<event>[|<pr>|<base>|<head-owner>]]...
+# workflow_runs [<suite>|<event>[|<pr>|<base>|<head-owner>[|<path>]]]...
 # <pr> defaults to 7 and <base> to main; an empty <pr> leaves pull_requests
-# empty, as GitHub does for fork PR runs. <head-owner> defaults to example.
+# empty, as GitHub does for fork PR runs. <head-owner> defaults to example,
+# <path> to .github/workflows/ci.yml.
 workflow_runs() {
-  local spec suite event prnum base owner
+  local spec suite event prnum base owner path
   printf '[]' > "$case_dir/runs.tmp"
   for spec in "$@"; do
-    IFS='|' read -r suite event prnum base owner <<EOF_SPEC
+    IFS='|' read -r suite event prnum base owner path <<EOF_SPEC
 $spec
 EOF_SPEC
     case "$spec" in
@@ -120,7 +121,8 @@ EOF_SPEC
     esac
     jq --argjson s "$suite" --arg e "$event" --arg h "$SHA" \
       --arg pr "$prnum" --arg base "${base:-main}" --arg owner "${owner:-example}" \
-      '. + [{check_suite_id: $s, event: $e, head_sha: $h,
+      --arg path "${path:-.github/workflows/ci.yml}" \
+      '. + [{check_suite_id: $s, event: $e, head_sha: $h, path: $path,
              head_branch: "feature",
              head_repository: {full_name: "\($owner)/repo"},
              pull_requests: (if $pr == "" then []
@@ -395,6 +397,27 @@ pr_checks checks 500 "10|Rust contracts|completed|success|500" \
   "14|Rust tests (Linux)|completed|failure|500"
 run_guard 0 7
 expect_log "$MERGE_CALL"
+
+new_case other-workflow-green-does-not-cover-red-ci
+pr_json pr OPEN false "$SHA" MERGEABLE
+workflow_runs "500|pull_request" "600|pull_request|7|main|example|.github/workflows/other.yml"
+check_runs checks "10|Rust contracts|completed|success|500" \
+  "11|Public surface checks|completed|failure|500" \
+  "12|Rust advisory audit|completed|success|500" \
+  "13|Dependency review|completed|success|500" \
+  "20|Public surface checks|completed|success|600"
+run_guard 4 7
+expect_output '"Public surface checks" concluded failure'
+expect_no_log "gh pr merge"
+
+new_case other-workflow-pending-does-not-block-green-ci
+pr_json pr OPEN false "$SHA" MERGEABLE
+workflow_runs "500|pull_request" "600|pull_request|7|main|example|.github/workflows/other.yml"
+pr_checks checks 500 "10|Rust contracts|completed|success|500" \
+  "20|Public surface checks|in_progress||600"
+run_guard 0 7
+expect_log "$MERGE_CALL"
+expect_no_log "sleep"
 
 new_case more-than-one-page-is-not-judged
 pr_json pr OPEN false "$SHA" MERGEABLE
