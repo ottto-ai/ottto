@@ -43843,6 +43843,27 @@ impl ScanIndex {
         self.claude_request_census.remove(key);
     }
 
+    /// Keep move history for 30 days after the last indexed or held member.
+    fn prune_claude_money_births(&mut self, now: u64) {
+        if self.claude_money_birth_store.is_empty() {
+            return;
+        }
+        let members = self
+            .files
+            .keys()
+            .map(String::as_str)
+            .chain(self.decode_holds.file_keys())
+            .filter_map(|path| {
+                let member = claude_index_path_member_ref(Path::new(path))?;
+                let session = match member.subagent_stem {
+                    None => std::borrow::Cow::Borrowed(member.root),
+                    Some(_) => std::borrow::Cow::Owned(member.into_owned().1),
+                };
+                Some((session, path))
+            });
+        self.claude_money_birth_store.prune(now, members);
+    }
+
     /// Retire terminal JSONL dispositions whose file is no longer indexed.
     ///
     /// A disposition is only ever written together with the `files` entry for
@@ -43871,23 +43892,6 @@ impl ScanIndex {
     /// override for Codex (re-reading an oversized rollout every cycle) or
     /// silently drops that file's disclosed terminal loss for every source
     /// without one.
-    fn prune_claude_money_births(&mut self, now: u64) {
-        if self.claude_money_birth_store.is_empty() {
-            return;
-        }
-        let members: Vec<_> = self
-            .files
-            .keys()
-            .map(String::as_str)
-            .chain(self.decode_held_file_keys())
-            .filter_map(|path| {
-                claude_index_path_family_member(Path::new(path))
-                    .map(|(_, member)| (member, path.to_owned()))
-            })
-            .collect();
-        self.claude_money_birth_store
-            .prune(now, members.iter().map(|(s, p)| (s.as_str(), p.as_str())));
-    }
 
     fn prune_terminal_jsonl_dispositions(&mut self) {
         let files = &self.files;

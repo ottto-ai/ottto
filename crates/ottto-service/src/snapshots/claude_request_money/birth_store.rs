@@ -272,12 +272,15 @@ impl BirthStore {
         }
     }
     /// Whole-session absence, not path absence; held keys count as indexed.
-    pub(crate) fn prune<'a>(
+    pub(crate) fn prune<S: AsRef<str>, P: AsRef<str>>(
         &mut self,
         now: u64,
-        indexed: impl IntoIterator<Item = (&'a str, &'a str)>,
+        indexed: impl IntoIterator<Item = (S, P)>,
     ) {
-        let mut live: Vec<_> = indexed.into_iter().map(|(s, _)| session_key(s)).collect();
+        let mut live: Vec<_> = indexed
+            .into_iter()
+            .map(|(s, _)| session_key(s.as_ref()))
+            .collect();
         live.sort_unstable();
         live.dedup();
         for s in &mut self.0 {
@@ -399,10 +402,16 @@ mod tests {
         let mut b = BirthStore::default();
         b.record_observation("s", "A", 100);
         b.prune(10, [("s", "B")]); // /cd keeps session alive even with a new path
-        b.prune(100, std::iter::empty());
-        b.prune(100 + ABSENT_RETENTION_SECONDS - 1, std::iter::empty());
+        b.prune(100, std::iter::empty::<(&str, &str)>());
+        b.prune(
+            100 + ABSENT_RETENTION_SECONDS - 1,
+            std::iter::empty::<(&str, &str)>(),
+        );
         assert_eq!(b.session_effective_cutoff("s"), Some(100));
-        b.prune(100 + ABSENT_RETENTION_SECONDS, std::iter::empty());
+        b.prune(
+            100 + ABSENT_RETENTION_SECONDS,
+            std::iter::empty::<(&str, &str)>(),
+        );
         assert!(b.is_empty());
     }
     #[test]

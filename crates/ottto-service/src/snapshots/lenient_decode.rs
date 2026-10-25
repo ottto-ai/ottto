@@ -80,6 +80,14 @@ impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
     }
 }
 impl Holds {
+    pub(super) fn file_keys(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .get("files")
+            .into_iter()
+            .flat_map(|slots| slots.keys())
+            .map(String::as_str)
+    }
+
     fn rebuild_scopes(&mut self) {
         if self.0.is_empty() {
             // Removing the final repaired slot can leave an allocated empty
@@ -2031,12 +2039,7 @@ impl ScanIndex {
                 .is_some_and(|member| self.decode_holds_family(member.root))
     }
     pub(crate) fn decode_held_file_keys(&self) -> impl Iterator<Item = &str> {
-        self.decode_holds
-            .0
-            .get("files")
-            .into_iter()
-            .flat_map(|slots| slots.keys())
-            .map(String::as_str)
+        self.decode_holds.file_keys()
     }
     // Missing incidence is UNKNOWN, not an empty set. Keep existing ACKs as
     // possible prior members without inventing membership for emission/manifests.
