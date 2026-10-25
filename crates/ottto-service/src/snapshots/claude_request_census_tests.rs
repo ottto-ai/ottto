@@ -2657,6 +2657,11 @@ fn census_duplicate_rows(index: &serde_json::Value, key: &str) -> String {
 
 const N3_T0: u64 = 1_790_000_000;
 const N3_DAY: u64 = 86_400;
+/// MONEY 724h P2: a grant's read span, and how long a rearm stamp counts
+/// toward the bound (one window plus the span).
+const N3_SPAN: u64 =
+    crate::snapshots::claude_request_census::duplicate_rebuild_test_support::N3_GRANT_MAX_LOAD_TO_READ;
+const N3_ATTEMPT_WINDOW: u64 = 7 * N3_DAY + N3_SPAN;
 
 fn census_exhausted_counter(index: &mut ScanIndex) -> u64 {
     let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
@@ -2778,15 +2783,25 @@ fn census_duplicate_rebuild_is_bounded_per_key_per_seven_days() {
         assert_eq!(census_exhausted_counter(&mut index), 1);
         drop(clock);
 
-        // Window expiry re-allows one rebuild, which then decodes clean.
+        // MONEY 724h P2: a stamp counts for one window plus the read span,
+        // so seven days and one second still refuse.
         bound::restart();
         let clock = bound::set_now(N3_T0 + 7 * N3_DAY + 1);
+        let index = ScanIndex::load(&path).unwrap();
+        assert!(bound::exhausted(&index, &key), "counted past seven days");
+        assert!(!census_rebuild_rearms(&index, &key, &fingerprint));
+        assert_eq!(bound::attempts(&index, &key), vec![N3_T0, N3_T0 + N3_DAY]);
+        drop(clock);
+
+        // Window expiry re-allows one rebuild, which then decodes clean.
+        bound::restart();
+        let clock = bound::set_now(N3_T0 + N3_ATTEMPT_WINDOW + 1);
         let mut index = ScanIndex::load(&path).unwrap();
         assert!(!bound::exhausted(&index, &key));
         assert!(census_rebuild_rearms(&index, &key, &fingerprint));
         assert_eq!(
             bound::attempts(&index, &key),
-            vec![N3_T0 + N3_DAY, N3_T0 + 7 * N3_DAY + 1]
+            vec![N3_T0 + N3_DAY, N3_T0 + N3_ATTEMPT_WINDOW + 1]
         );
         persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
         census_scan(&root, &mut index, SECOND_WINDOW);
@@ -3301,9 +3316,17 @@ fn census_duplicate_rebuild_expiry_after_a_clean_decode_leaves_main_shadow_bytes
         index.save(&path).unwrap();
         drop(clock);
 
+        // MONEY 724h P2: one window plus the read span after it, the second
+        // stamp still counts.
+        bound::restart();
+        let clock = bound::set_now(N3_T0 + 8 * N3_DAY + 1);
+        let index = ScanIndex::load(&path).unwrap();
+        assert_eq!(bound::attempts(&index, &key), vec![N3_T0 + N3_DAY]);
+        drop(clock);
+
         // Both stamps expire: the guard is empty and leaves the checkpoint.
         bound::restart();
-        let _clock = bound::set_now(N3_T0 + 8 * N3_DAY + 1);
+        let _clock = bound::set_now(N3_T0 + N3_DAY + N3_ATTEMPT_WINDOW + 1);
         let mut index = ScanIndex::load(&path).unwrap();
         index.save(&path).unwrap();
         let saved: serde_json::Value =
@@ -3468,12 +3491,27 @@ fn census_duplicate_rebuild_migrates_a_guard_saved_in_the_earlier_form() {
         assert_eq!(census_rebuild_alarms(&key, "legacy_rearm_held"), 1);
         index.save(&path).unwrap();
 
-        // The window allows one new counted attempt, which reads it.
+        // MONEY 724h P2: the second stamp counts for one window plus the
+        // read span, so a day past seven days later one attempt is left.
         bound::restart();
-        let _clock = bound::set_now(N3_T0 + 8 * N3_DAY + 1);
+        let clock = bound::set_now(N3_T0 + 8 * N3_DAY + 1);
         let index = ScanIndex::load(&path).unwrap();
         assert!(!bound::held(&index, &key));
-        assert_eq!(bound::attempts(&index, &key), vec![N3_T0 + 8 * N3_DAY + 1]);
+        assert_eq!(
+            bound::attempts(&index, &key),
+            vec![N3_T0 + N3_DAY, N3_T0 + 8 * N3_DAY + 1]
+        );
+        drop(clock);
+
+        // The window allows one new counted attempt, which reads it.
+        bound::restart();
+        let _clock = bound::set_now(N3_T0 + N3_DAY + N3_ATTEMPT_WINDOW + 1);
+        let index = ScanIndex::load(&path).unwrap();
+        assert!(!bound::held(&index, &key));
+        assert_eq!(
+            bound::attempts(&index, &key),
+            vec![N3_T0 + N3_DAY + N3_ATTEMPT_WINDOW + 1]
+        );
         assert_eq!(
             census_rebuild_decision(&index, &key, &fingerprint),
             (
@@ -4061,6 +4099,279 @@ fn census_duplicate_rebuild_total_re_reads_stay_within_the_bound_across_windows(
     }
 }
 
+/// `original` saved with its duplicate `key` fresh (`current`), or in an
+/// earlier checkpoint's form (`earlier`): pending without `CURRENT`, no
+/// stamps, the entry saved empty (this bound's own marked rearm).
+fn census_rebuild_form_raw(original: &ScanIndex, key: &str, form: &str) -> String {
+    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+    if form != "earlier" {
+        return census_duplicate_rebuild_raw(original, key, None);
+    }
+    let mut earlier = original.clone();
+    earlier
+        .files
+        .get_mut(key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    census_duplicate_rebuild_raw(
+        &earlier,
+        key,
+        Some(serde_json::json!({ "k": { (bound::key_id(key)): "1:" } })),
+    )
+}
+
+/// MONEY 724h P2: MONEY's counterexample with independent load and read
+/// clocks. Each cycle loads (a counted attempt is stamped and saved before
+/// its scan), reads later, and discards its failed working scan. Loads and
+/// reads at (0, 60 s), (1 d, 1 d + 60 s), (7 d + 1 s, 7 d + 2 s): the first
+/// stamp still counts at the third load (one window plus the read span), so
+/// the third read is refused. The schedule continues with a long scan (a
+/// read 11 h after its load is admitted). Every read is covered by a saved
+/// stamp at most the span before it, and any rolling seven days hold at most
+/// two actual reads, in one process and with a restart before every cycle.
+/// Current and earlier-checkpoint forms; OFF and ON.
+#[test]
+fn census_duplicate_rebuild_actual_reads_stay_bounded_with_independent_load_and_read_clocks() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started,
+        persist_duplicate_rebuild_grants,
+    };
+    const WINDOW: u64 = 7 * N3_DAY;
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    // (load, read), offsets from N3_T0.
+    let schedule = [
+        (0, 60),
+        (N3_DAY, N3_DAY + 60),
+        (7 * N3_DAY + 1, 7 * N3_DAY + 2),
+        (N3_ATTEMPT_WINDOW + 1, N3_ATTEMPT_WINDOW + 2),
+        (8 * N3_DAY, 8 * N3_DAY + 11 * 3_600),
+        (N3_DAY + N3_ATTEMPT_WINDOW + 1, 8 * N3_DAY + 23 * 3_600),
+        (16 * N3_DAY, 16 * N3_DAY + 60),
+        (16 * N3_DAY + 3_600, 16 * N3_DAY + 3_660),
+    ];
+    let expected = [
+        60,
+        N3_DAY + 60,
+        N3_ATTEMPT_WINDOW + 2,
+        8 * N3_DAY + 23 * 3_600,
+        16 * N3_DAY + 60,
+    ]
+    .map(|offset| N3_T0 + offset);
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for form in ["current", "earlier"] {
+            for restarts in [false, true] {
+                let case = format!("shadow={enabled} {form} restarts={restarts}");
+                bound::restart();
+                let scratch =
+                    crate::test_scratch::ScratchDir::new("census-rebuild-independent-clocks");
+                let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+                let fingerprint = original.files[&key].source_file_fingerprint.clone();
+                let path = scratch.join("index.json");
+                std::fs::write(&path, census_rebuild_form_raw(&original, &key, form)).unwrap();
+                let mut reads: Vec<u64> = Vec::new();
+                for (load, read) in schedule {
+                    let (load, read) = (N3_T0 + load, N3_T0 + read);
+                    if restarts {
+                        bound::restart();
+                    }
+                    let clock = bound::set_now(load);
+                    let mut index = ScanIndex::load(&path).unwrap();
+                    persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                    drop(clock);
+                    let _clock = bound::set_now(read);
+                    if census_rebuild_decision(&index, &key, &fingerprint) != rearmed {
+                        assert_eq!(
+                            census_rebuild_decision(&index, &key, &fingerprint),
+                            (CandidateDecision::Skip, None),
+                            "{case} read at {read}"
+                        );
+                        continue;
+                    }
+                    let stamp = bound::saved_stamps(&path, &key)
+                        .into_iter()
+                        .filter(|stamp| *stamp <= read && read - *stamp <= N3_SPAN)
+                        .max();
+                    assert!(
+                        stamp.is_some(),
+                        "{case}: the read at {read} has no saved stamp within the span"
+                    );
+                    reads.push(read);
+                    let in_window = reads.iter().filter(|earlier| read - **earlier <= WINDOW);
+                    assert!(
+                        in_window.count() <= MAX_N3_REARMS_PER_WINDOW,
+                        "{case}: more than two reads in seven days: {reads:?}"
+                    );
+                    // The read starts; its failed working scan is discarded.
+                    note_duplicate_rebuild_started(&mut index, Path::new(&key));
+                }
+                assert_eq!(reads, expected, "{case}");
+                assert!(
+                    !reads.contains(&(N3_T0 + 7 * N3_DAY + 2)),
+                    "{case}: MONEY's third read refused"
+                );
+            }
+        }
+    }
+}
+
+/// MONEY 724h P2: a grant authorizes a read only within
+/// `N3_GRANT_MAX_LOAD_TO_READ` of its stamp, checked when candidate selection
+/// admits the read. A long scan reaching the key later is refused: the key is
+/// skipped (an earlier checkpoint's marked empty is held), nothing is read,
+/// and the census line counts it as exhausted with its own cause, alarmed
+/// once. The same process reloading finds its saved grant spent, never
+/// moved forward: only a new counted attempt from the same budget, saved
+/// before its scan, reads the key, and with the budget spent it stays
+/// refused (also after a restart). An identity-armed empty fingerprint still
+/// takes the identity path past the span: never held, never counted. OFF and
+/// ON.
+#[test]
+fn census_duplicate_rebuild_read_past_the_grant_span_needs_a_new_counted_attempt() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants, SourceRearm,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    let refused = (CandidateDecision::Skip, None);
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for form in ["current", "earlier", "identity"] {
+            let case = format!("shadow={enabled} {form}");
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-grant-span");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            std::fs::write(&path, census_rebuild_form_raw(&original, &key, form)).unwrap();
+            let load = N3_T0;
+            let clock = bound::set_now(load);
+            let mut index = ScanIndex::load(&path).unwrap();
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert_eq!(
+                bound::saved_stamps(&path, &key),
+                vec![load],
+                "{case}: stamped and saved before the scan"
+            );
+            if form == "identity" {
+                // Identity work's re-arm of the current-form key.
+                census_identity_clear(
+                    &mut index,
+                    &key,
+                    SourceRearm::Identity("identity_contract:grant-span"),
+                );
+                assert!(index.files[&key].source_file_fingerprint.is_empty());
+            }
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                rearmed,
+                "{case}: at the load"
+            );
+            drop(clock);
+            {
+                let _clock = bound::set_now(load + N3_SPAN);
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    rearmed,
+                    "{case}: the span's last second still admits the read"
+                );
+            }
+
+            // A long scan reaches the key one second past the span.
+            let clock = bound::set_now(load + N3_SPAN + 1);
+            if form == "identity" {
+                assert!(!bound::held(&index, &key), "{case}: never held");
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    rearmed,
+                    "{case}: the identity path reads it"
+                );
+                assert_eq!(
+                    census_rebuild_counters(&mut index),
+                    (0, 0),
+                    "{case}: never counted"
+                );
+                assert_eq!(census_rebuild_alarms(&key, "grant_read_span_expired"), 0);
+                continue;
+            }
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                refused,
+                "{case}: refused past the span, nothing read"
+            );
+            assert_eq!(bound::held(&index, &key), form == "earlier", "{case}");
+            for _ in 0..2 {
+                assert_eq!(
+                    census_rebuild_counters(&mut index),
+                    (1, 0),
+                    "{case}: counted as exhausted"
+                );
+            }
+            assert_eq!(
+                census_rebuild_alarms(&key, "grant_read_span_expired"),
+                1,
+                "{case}: alarmed once"
+            );
+            drop(clock);
+
+            // The same process reloads (the working scan discarded): its
+            // saved grant is spent. A new counted attempt reads the key.
+            let again = load + N3_SPAN + 2;
+            let clock = bound::set_now(again);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                bound::attempts(&index, &key),
+                vec![load, again],
+                "{case}: a new counted attempt, never the old stamp moved"
+            );
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                rearmed,
+                "{case}"
+            );
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert_eq!(
+                bound::saved_stamps(&path, &key),
+                vec![load, again],
+                "{case}: saved before the scan"
+            );
+            drop(clock);
+
+            // Late again: refused, and both attempts are spent.
+            let late = again + N3_SPAN + 1;
+            {
+                let _clock = bound::set_now(late);
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    refused,
+                    "{case}: late again"
+                );
+            }
+            for restart in [false, true] {
+                if restart {
+                    bound::restart();
+                }
+                let _clock = bound::set_now(late + 1);
+                let mut index = ScanIndex::load(&path).unwrap();
+                assert!(bound::exhausted(&index, &key), "{case} restart={restart}");
+                assert_eq!(bound::attempts(&index, &key), vec![load, again]);
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    refused,
+                    "{case} restart={restart}: no free read"
+                );
+                assert_eq!(census_rebuild_counters(&mut index), (1, 0), "{case}");
+            }
+        }
+    }
+}
+
 /// MONEY 724g P2 with SI's ruling: closing this process's stale, unspent
 /// grant never holds an identity-armed empty fingerprint. The grant's key is
 /// current-form; identity work then clears its fingerprint (saved). The same
@@ -4394,14 +4705,28 @@ fn census_rebuild_priors_decode_refusal_keeps_the_index() {
             );
             drop(clock);
 
-            // The window passing allows one new counted attempt.
+            // The closure's window passing reopens admission; MONEY 724h P2:
+            // the saved grant's stamp still counts (one window plus the read
+            // span), so one counted attempt is left.
             bound::restart();
-            let _clock = bound::set_now(N3_T0 + 60 + 7 * N3_DAY + 1);
+            let clock = bound::set_now(N3_T0 + 60 + 7 * N3_DAY + 1);
             let mut index = ScanIndex::load(&path).unwrap();
             assert!(census_rebuild_rearms(&index, &key, &fingerprint));
             assert_eq!(
                 bound::attempts(&index, &key),
-                vec![N3_T0 + 60 + 7 * N3_DAY + 1]
+                vec![N3_T0, N3_T0 + 60 + 7 * N3_DAY + 1]
+            );
+            assert_eq!(census_rebuild_counters_all(&mut index).2, 0, "expired");
+            drop(clock);
+
+            // The window passing allows one new counted attempt.
+            bound::restart();
+            let _clock = bound::set_now(N3_T0 + 60 + N3_ATTEMPT_WINDOW + 1);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert!(census_rebuild_rearms(&index, &key, &fingerprint));
+            assert_eq!(
+                bound::attempts(&index, &key),
+                vec![N3_T0 + 60 + N3_ATTEMPT_WINDOW + 1]
             );
             assert_eq!(census_rebuild_counters_all(&mut index).2, 0, "expired");
         }

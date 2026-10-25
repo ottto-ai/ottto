@@ -46,11 +46,15 @@ absent, its duplicate stays counted, and `census_duplicate_rebuild_exhausted`
 plus a rate-limited `key_hash8`/`cause` alarm make it visible. It clears when
 the key's record next decodes clean; the window passing allows only a new
 counted attempt. A read that starts spends its grant even if the failed pass is
-never saved. A saved grant this process has not started yet authorizes a read
-only while its own stamp is still one of the key's attempts in the window
-(MONEY 724g P2): a later load moves that stamp forward to itself and saves it
-before its scan like a new grant, so the window bounds actual reads, not only
-authorizations; an expired grant needs a fresh counted attempt. At most 512 keys are tracked, one compact line each in the saved
+never saved. A grant authorizes a read only within
+`N3_GRANT_MAX_LOAD_TO_READ` (12 h) of its stamp, checked when candidate
+selection admits the read, not only at load (MONEY 724h P2; the longest
+observed full traversal is about 90 min). Past that it is spent, never moved
+forward: the key is skipped (an earlier checkpoint's marked empty is held),
+counted as exhausted with cause `grant_read_span_expired`, and read only
+through a new counted attempt from the same budget, saved before its scan. A
+stamp counts for one window plus that span, so any rolling seven days hold at
+most two actual reads, whenever each load ran. At most 512 keys are tracked, one compact line each in the saved
 index; past that new keys are refused for one window. Only well-formed
 fingerprints (64 lowercase hex) are rearmed.
 
