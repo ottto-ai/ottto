@@ -9542,9 +9542,11 @@ where
     // Request-owned literal bodies travel with their Claude family (early-t7
     // Q1). A family that fits one batch is packed whole; a larger one is cut
     // into consecutive batch-sized groups, root first, never refused. Each
-    // group still settles by its own exact entity ACKs. Without literal items
-    // (gate off) every group is one item and packing is the previous order.
-    let mut groups = Vec::<Vec<(usize, usize, bool)>>::new();
+    // group still settles by its own exact entity ACKs. Units are kept as one
+    // ordered list plus end offsets; an ordinary body is a unit of one, so
+    // without literal items (gate off) packing is the previous order.
+    let mut order = Vec::<(usize, usize, bool)>::with_capacity(pending_by_fingerprint.len());
+    let mut unit_ends = Vec::<usize>::with_capacity(pending_by_fingerprint.len());
     let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, bool)>>::new();
     for (index, body_length, _) in pending_by_fingerprint.into_values() {
         let item = (
@@ -9554,7 +9556,10 @@ where
         );
         match literal_family(&items[index]) {
             Some(root) => literal_families.entry(root).or_default().push(item),
-            None => groups.push(vec![item]),
+            None => {
+                order.push(item);
+                unit_ends.push(order.len());
+            }
         }
     }
     for (root, mut members) in literal_families {
@@ -9562,27 +9567,33 @@ where
             let member = session_id(&items[*index]);
             (member != Some(root), member)
         });
-        groups.extend(literal_family_groups(members));
+        for group in literal_family_groups(members) {
+            order.extend(group);
+            unit_ends.push(order.len());
+        }
     }
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
     let mut current_batch_class = None;
-    for group in groups {
-        let group_bytes = group
+    let mut unit_start = 0;
+    for unit_end in unit_ends {
+        let unit = &order[unit_start..unit_end];
+        unit_start = unit_end;
+        let unit_bytes = unit
             .iter()
             .fold(0usize, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
-        let group_class = group[0].2;
+        let unit_class = unit[0].2;
         if !batch.is_empty()
-            && (batch.len() + group.len() > SNAPSHOT_BATCH_LIMIT
-                || batch_bytes.saturating_add(group_bytes) > SNAPSHOT_BATCH_MAX_BYTES
-                || current_batch_class != Some(group_class))
+            && (batch.len() + unit.len() > SNAPSHOT_BATCH_LIMIT
+                || batch_bytes.saturating_add(unit_bytes) > SNAPSHOT_BATCH_MAX_BYTES
+                || current_batch_class != Some(unit_class))
         {
             batches.push_back((std::mem::take(&mut batch), false));
             batch_bytes = 2;
         }
-        current_batch_class = Some(group_class);
-        batch.extend(group.into_iter().map(|(index, _, _)| index));
-        batch_bytes = batch_bytes.saturating_add(group_bytes);
+        current_batch_class = Some(unit_class);
+        batch.extend(unit.iter().map(|(index, _, _)| *index));
+        batch_bytes = batch_bytes.saturating_add(unit_bytes);
     }
     if !batch.is_empty() {
         batches.push_back((batch, false));
