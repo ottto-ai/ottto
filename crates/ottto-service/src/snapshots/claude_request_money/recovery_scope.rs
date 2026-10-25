@@ -126,6 +126,13 @@ pub(crate) fn close_with_reason(
     let refusal = std::cell::Cell::new(Refusal::Bounds);
     let deadline = Instant::now() + Duration::from_millis(2);
     let scope = store::recovery_evidence(support, |ledger| {
+        // Small inventories fit a borrowed directory inside the existing graph
+        // admission. Avoid re-expanding/hashing every message query on each
+        // fixed-point pass. Large inventories retain the exact point lookup.
+        let message_views = ledger
+            .census()
+            .bounded_message_views(FILE_MAX)
+            .map(|views| views.collect::<BTreeMap<_, _>>());
         let mut scope = original.clone();
         let frozen_files = original
             .roots
@@ -208,13 +215,18 @@ pub(crate) fn close_with_reason(
                 if !connected && scope.messages.is_empty() {
                     continue;
                 }
-                let message = ledger.get(&message_key(key)).filter(|record| {
-                    !record.over_budget()
-                        && index
-                            .claude_request_census
-                            .get(key)
-                            .is_some_and(|file| file.money_revision() == record.money_revision())
-                });
+                let message = message_views
+                    .as_ref()
+                    .map_or_else(
+                        || ledger.get(&message_key(key)),
+                        |views| views.get(key.as_str()).copied(),
+                    )
+                    .filter(|record| {
+                        !record.over_budget()
+                            && index.claude_request_census.get(key).is_some_and(|file| {
+                                file.money_revision() == record.money_revision()
+                            })
+                    });
                 let messages = message.map_or(&[][..], |r| r.request_hashes());
                 if !connected && !overlaps(messages, &scope.messages) {
                     continue;

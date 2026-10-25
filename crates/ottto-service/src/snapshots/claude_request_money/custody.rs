@@ -778,6 +778,23 @@ impl Custody {
             .path
             .as_deref()
     }
+    /// Borrow already validated physical message slots for a bounded reader.
+    /// Larger inventories keep the ordinary point lookup; no retained index,
+    /// query spelling, hash, or payload copy is created here.
+    pub(crate) fn bounded_message_views(
+        &self,
+        limit: usize,
+    ) -> Option<impl Iterator<Item = (&str, RecordRef<'_>)> + '_> {
+        (self.files.len() <= limit).then(|| {
+            self.files.values().filter_map(|file| {
+                let slot = file.current_m.as_deref()?;
+                if !matches!(slot.key.name(), QueryName::Standard(0)) {
+                    return None;
+                }
+                Some((file.path.as_deref()?, slot.value.view()))
+            })
+        })
+    }
     pub(crate) fn records(&self) -> impl Iterator<Item = (String, RecordRef<'_>)> {
         self.entries().flat_map(|(key, carrier)| {
             let path = match carrier {
