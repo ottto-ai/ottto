@@ -1,5 +1,6 @@
-//! Bounded decoding of the optional id-less invalidity marker. Unknown
-//! shapes drain without materializing a JSON value; none grants eligibility.
+//! Fixed-payload decoding of the optional id-less invalidity marker. The
+//! production streaming loader admits its raw span before invoking Serde.
+//! Unknown shapes grant no eligibility and never materialize a JSON Value.
 use serde::de::{Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::fmt;
 

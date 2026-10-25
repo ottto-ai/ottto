@@ -4134,3 +4134,52 @@ fn real_repair_override_marks_history_unverified_before_return_and_first_census(
         .claude_authority_record_for_test("first-census-absent")
         .is_some());
 }
+
+#[test]
+fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
+    let mut seed = fixture();
+    seed.claude_usage_family_pending.insert(
+        "family".into(),
+        ClaudeUsageFamilyPending {
+            census_window_end: "2026-10-25T00:00:00Z".into(),
+            member_request_id_hashes: BTreeMap::new(),
+            member_occurrences: BTreeMap::new(),
+            invalid: true,
+            idless_revision: Some([7; 32]),
+        },
+    );
+    let valid = serde_json::to_vec_pretty(&seed).unwrap();
+    let loaded = lenient_decode::read(std::io::Cursor::new(&valid), "load", "claude_code").unwrap();
+    assert_eq!(
+        loaded.claude_usage_family_pending["family"].idless_revision,
+        Some([7; 32])
+    );
+    let mut value = serde_json::to_value(&seed).unwrap();
+    value["claude_usage_family_pending"]["family"]["idless_revision"] =
+        Value::String("MARKER_PAYLOAD".into());
+    let template = serde_json::to_string(&value).unwrap();
+    let payload = "x".repeat(16 * 1024 * 1024);
+    for malformed in [
+        format!("\"{payload}\""),
+        format!("[\"{payload}\"]"),
+        format!("{{\"{payload}\":0}}"),
+    ] {
+        let bytes = template
+            .replace("\"MARKER_PAYLOAD\"", &malformed)
+            .into_bytes();
+        let (result, allocations) = crate::retry_allocation_probe::measure(|| {
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code")
+        });
+        assert!(matches!(result, Err(lenient_decode::Error::HoldBudget)));
+        assert!(
+            allocations.requested_peak < 256 * 1024,
+            "{}",
+            allocations.requested_peak
+        );
+        assert!(
+            allocations.usable_peak < 512 * 1024,
+            "{}",
+            allocations.usable_peak
+        );
+    }
+}

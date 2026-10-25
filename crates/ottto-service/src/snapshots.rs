@@ -4146,7 +4146,7 @@ struct ClaudeUsageFamilyPending {
     member_occurrences: BTreeMap<String, BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>>,
     invalid: bool,
     /// Narrow B4 exception, never proof: a singleton native revision whose
-    /// only invalidity was entirely id-less responses. Any other observation
+    /// only invalidity was missing request ids. Any other observation
     /// invalidates this marker. Older or damaged provenance keeps BASE.
     #[serde(
         default,

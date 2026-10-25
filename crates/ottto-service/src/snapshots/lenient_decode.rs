@@ -1189,6 +1189,38 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
         Ok(())
     }
+    // The revision marker has a fixed 32-byte payload. Inspect its lexical
+    // span before Serde sees it: from_reader buffers malformed strings and map
+    // keys even when a visitor discards them. Oversize damage enters the same
+    // admitted raw hold as every other undecodable negative record.
+    fn admit_idless_marker(&mut self, record: Span) -> std::result::Result<(), Error> {
+        self.reader.seek(SeekFrom::Start(record.start))?;
+        if self.ws()? != Some(b'{') {
+            return Ok(());
+        }
+        self.eat(b'{')?;
+        while self.ws()? != Some(b'}') {
+            let key = self.span()?;
+            let marker = if key.len <= ("idless_revision".len() * 6 + 2) as u64 {
+                self.typed::<String>(key)? == "idless_revision"
+            } else {
+                false
+            };
+            self.eat(b':')?;
+            let value = self.span()?;
+            // Includes ample space for our pretty-printed fixed array. Wider
+            // spellings are damage, never permission to allocate a token.
+            if marker && value.len > 4096 {
+                return Err(Error::Refused("idless marker size"));
+            }
+            if self.ws()? == Some(b',') {
+                self.eat(b',')?;
+            } else {
+                break;
+            }
+        }
+        self.eat(b'}')
+    }
     fn records<T: serde::de::DeserializeOwned>(
         &mut self,
         field: &'static str,
@@ -1220,7 +1252,12 @@ impl<R: BufRead + Seek> Decoder<R> {
             let value = self.span()?;
             // Decode the value first: only actual opaque debt spends hold
             // admission. Its full charge is checked before allocating the key.
-            let decoded = self.typed(value);
+            let decoded = if field == "claude_usage_family_pending" {
+                self.admit_idless_marker(value)
+                    .and_then(|()| self.typed(value))
+            } else {
+                self.typed(value)
+            };
             if debt && decoded.is_err() {
                 self.check_hold_bytes(Self::hold_charge(key_span, value)?)?;
                 if self.held_count >= HOLD_COUNT_MAX {
