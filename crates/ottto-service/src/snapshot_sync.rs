@@ -2817,6 +2817,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
         None => committable.mark_bounded_sweep_unsettled(),
     }
+    progress.stage_ack_retirement_handoff(committed_index, &mut committable, locally_held)?;
     validate_destination()?;
     if let Some(cap) = read_limit {
         committable.save_with_read_limit(index_path, cap)?;
@@ -5779,6 +5780,11 @@ fn prepare_sync_source(
     )?;
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
+    upload_progress.recover_ack_retirement_handoff(
+        &mut index,
+        &index_path,
+        &upload_progress_path,
+    )?;
     upload_progress.configure_ack_capacity(&index);
     // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
     // and eager hydrate run against the index exactly as loaded, namespaced
@@ -6245,6 +6251,11 @@ fn prepare_continuation_source(
     )?;
     let (mut index, _) =
         ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
+    upload_progress.recover_ack_retirement_handoff(
+        &mut index,
+        &inputs.index_path,
+        &inputs.upload_progress_path,
+    )?;
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(
@@ -7137,21 +7148,9 @@ fn finish_sync_source(
             // delivery cursor after the machine has moved to destination B.
             ensure_authority()?;
         }
-        if ack_admission_limited
-            && matches!(
-                result,
-                ResumableUploadResult::Completed
-                    | ResumableUploadResult::Deferred { .. }
-                    | ResumableUploadResult::Rejected { .. }
-            )
-        {
-            // Never commit omitted files as a completed scan. Adopt the admitted
-            // exact ACKs through the existing partial-index save, then retry.
-            return Err(anyhow!(
-                "snapshot upload progress requires durable index settlement"
-            ));
-        }
-        Ok(result)
+        // Never certify omitted files as a completed scan. Drain admitted
+        // bodies, then enter partial settlement with its typed local counts.
+        ack_retention::require_settlement(result, ack_admission_limited, &upload_progress)
     })
     .map(|result| {
         with_retained_refusal_conflicts(
@@ -7419,7 +7418,19 @@ fn finish_sync_source(
             // Distinguish local serializer drift, authorization failures, and
             // backend payload rejection. The resumable driver has already
             // checkpointed every accepted sibling before this terminal error.
-            let (state, context) = if snapshot_upload_error_class(&error)
+            let (state, context) = if let Some(settlement) =
+                error.downcast_ref::<ack_retention::AckSettlementRequired>()
+            {
+                eprintln!(
+                    "ottto-service: local snapshot upload deferred for {} — {}",
+                    source.api_slug(),
+                    upload_failure_diagnostic(&error)
+                );
+                (
+                    settlement.collector_state(),
+                    "local snapshot ACK settlement pending",
+                )
+            } else if snapshot_upload_error_class(&error)
                 == Some(SnapshotUploadErrorClass::LocalState)
             {
                 (
@@ -7497,14 +7508,7 @@ fn finish_sync_source(
                 // lives. The collector status code stays `network_error` — that
                 // string is a backend contract, and only the loss category is
                 // being classified here.
-                crate::client_report::record(
-                    if is_shed_failure(&error) {
-                        crate::client_report::ClientReportReason::RatelimitBackoff
-                    } else {
-                        crate::client_report::ClientReportReason::NetworkError
-                    },
-                    1,
-                );
+                ack_retention::record_upload_failure_loss(&error);
                 // Everything above this arm names its own cause. This arm is
                 // the catch-all, and it used to log the bare phrase "local
                 // snapshot upload failed" with no status code, endpoint, or
@@ -7573,6 +7577,11 @@ fn finish_sync_source(
             upload_fully_settled = false;
         }
     }
+    upload_progress.stage_ack_retirement_handoff(
+        &committed_index,
+        &mut index,
+        locally_held_fingerprints,
+    )?;
     let retired_upload_acks = upload_progress.retired_ack_candidates(&committed_index, &index);
     // Every selected-state restoration above has finished. A non-current
     // comparison already revoked this lease locally and cannot mint a native
@@ -10768,6 +10777,9 @@ fn rfc3339_after_minutes(minutes: i64) -> Option<String> {
 /// a URL or token) or one of this module's own compile-time reason literals —
 /// never raw error text, which can carry file paths.
 fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
+    if let Some(settlement) = error.downcast_ref::<ack_retention::AckSettlementRequired>() {
+        return settlement.to_string();
+    }
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
     }
@@ -10826,6 +10838,9 @@ fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
 }
 
 pub(crate) fn safe_error(error: &anyhow::Error) -> String {
+    if let Some(settlement) = error.downcast_ref::<ack_retention::AckSettlementRequired>() {
+        return settlement.to_string();
+    }
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
     }

@@ -10,27 +10,99 @@ pub(super) fn default_ack_capacity() -> usize {
     MAX_UNSETTLED_ACKS
 }
 
+/// Local backpressure, distinct from a failed transport attempt. Counts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AckSettlementRequired {
+    pub retained_ack_count: usize,
+    pub capacity: usize,
+    pub deferred_entity_count: usize,
+}
+
+impl std::fmt::Display for AckSettlementRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "kind=ack_settlement_required retained_ack_count={} capacity={} deferred_entity_count={}",
+            self.retained_ack_count, self.capacity, self.deferred_entity_count)
+    }
+}
+impl std::error::Error for AckSettlementRequired {}
+
+impl AckSettlementRequired {
+    pub(super) fn collector_state(self) -> CollectorState<'static> {
+        CollectorState::Error {
+            code: "scan_error",
+            message: "local snapshot ACK settlement pending",
+        }
+    }
+}
+
+pub(super) fn require_settlement(
+    result: ResumableUploadResult,
+    admission: Option<AckSettlementRequired>,
+    progress: &SnapshotUploadProgress,
+) -> Result<ResumableUploadResult> {
+    if let Some(mut settlement) = admission.filter(|_| {
+        matches!(
+            result,
+            ResumableUploadResult::Completed
+                | ResumableUploadResult::Deferred { .. }
+                | ResumableUploadResult::Rejected { .. }
+        )
+    }) {
+        settlement.retained_ack_count = progress.accepted_fingerprints.len();
+        return Err(settlement.into());
+    }
+    Ok(result)
+}
+
+/// Shared with the existing transport-failure arm. Local settlement loses no
+/// upload attempt and must never contribute a network-loss quantity.
+pub(super) fn record_upload_failure_loss(error: &anyhow::Error) {
+    if error.downcast_ref::<AckSettlementRequired>().is_some() {
+        return;
+    }
+    crate::client_report::record(
+        if is_shed_failure(error) {
+            crate::client_report::ClientReportReason::RatelimitBackoff
+        } else {
+            crate::client_report::ClientReportReason::NetworkError
+        },
+        1,
+    );
+}
+
 impl SnapshotUploadProgress {
     pub(super) fn configure_ack_capacity(&mut self, committed: &ScanIndex) {
-        // Count edges, not unique entities: shared incidence is a conservative
-        // upper bound with no extra census allocation. UNKNOWN doesn't grant
-        // unbounded admission; existing evidence remains retained under pressure.
-        self.ack_capacity = committed
-            .upload_progress_ack_incidence()
-            .count()
+        // Only already-held live ACKs grant extra slots. Unindexed debt never
+        // borrows an unused historical incidence allowance. Scratch is bounded
+        // by this ledger, not a cloned index census.
+        let mut unsettled = self.accepted_fingerprints.clone();
+        for fp in committed.upload_progress_ack_incidence() {
+            unsettled.remove(fp);
+        }
+        self.ack_capacity = self
+            .accepted_fingerprints
+            .len()
+            .saturating_sub(unsettled.len())
             .saturating_add(MAX_UNSETTLED_ACKS);
     }
 
     /// Freeze a capacity-bounded subset before bootstrap. Already accepted
     /// entities may replace their body in the same slot. Omitted work remains
     /// uncommitted and the caller must force the partial-index settlement path.
-    pub(super) fn admit_upload_input(&self, items: &mut Vec<SnapshotItem>) -> bool {
+    pub(super) fn admit_upload_input(
+        &self,
+        items: &mut Vec<SnapshotItem>,
+    ) -> Option<AckSettlementRequired> {
         let mut remaining = self
             .ack_capacity
             .saturating_sub(self.accepted_fingerprints.len());
         // At most the available unsettled slots are allocated as hash keys.
         let mut admitted = BTreeSet::new();
-        let before = items.len();
+        let before = items
+            .iter()
+            .map(|item| item.snapshot_fingerprint.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
         items.retain(|item| {
             let fp = &item.snapshot_fingerprint;
             if self.accepted_fingerprints.contains(fp) || admitted.contains(fp) {
@@ -43,7 +115,16 @@ impl SnapshotUploadProgress {
             remaining -= 1;
             true
         });
-        before != items.len()
+        let after = items
+            .iter()
+            .map(|item| item.snapshot_fingerprint.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        (before > after).then_some(AckSettlementRequired {
+            retained_ack_count: self.accepted_fingerprints.len(),
+            capacity: self.ack_capacity,
+            deferred_entity_count: before - after,
+        })
     }
 
     pub(super) fn release_acks_after_partial_index_save(
@@ -54,7 +135,8 @@ impl SnapshotUploadProgress {
         locally_held: &BTreeSet<String>,
         keep_adopted_for_retry: bool,
     ) -> Result<()> {
-        let retired = self.retired_ack_candidates(previous, saved);
+        let mut retired = self.retired_ack_candidates(previous, saved);
+        retired.extend(self.saved_retirement_candidates(saved));
         let before = self.accepted_fingerprints.len();
         if keep_adopted_for_retry {
             // The retained retry driver still reads this resume ledger. Keep
@@ -69,6 +151,7 @@ impl SnapshotUploadProgress {
         if self.accepted_fingerprints.len() != before {
             self.save(path)?;
         }
+        self.configure_ack_capacity(saved);
         Ok(())
     }
 
@@ -76,9 +159,152 @@ impl SnapshotUploadProgress {
         if new_acks > 0
             && self.accepted_fingerprints.len().saturating_add(new_acks) > self.ack_capacity
         {
-            return Err(anyhow!(
-                "snapshot upload progress requires durable index settlement"
-            ));
+            return Err(AckSettlementRequired {
+                retained_ack_count: self.accepted_fingerprints.len(),
+                capacity: self.ack_capacity,
+                deferred_entity_count: new_acks,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Attach the exact retirement obligation before the same atomic index
+    /// commit removes incidence. A failed CAS cannot authorize this generation.
+    pub(super) fn stage_ack_retirement_handoff(
+        &self,
+        previous: &ScanIndex,
+        selected: &mut ScanIndex,
+        locally_held: &BTreeSet<String>,
+    ) -> Result<()> {
+        let mut retired = previous
+            .upload_ack_retirement_handoff
+            .as_ref()
+            .filter(|h| {
+                h.destination_namespace_hash == self.destination_namespace_hash
+                    && h.committed_generation > 0
+                    && h.committed_generation <= previous.generation
+            })
+            .map(|h| {
+                h.bodies
+                    .iter()
+                    .filter(|(fp, body)| self.accepted_body_witnesses.get(*fp) == Some(*body))
+                    .map(|(fp, _)| fp.clone())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut fresh = self.retired_ack_candidates(previous, selected);
+        fresh.retain(|fp| !locally_held.contains(fp));
+        retired.extend(fresh);
+        // Reappearance or carried incidence revokes an old retirement, too.
+        for fp in selected.upload_progress_ack_incidence() {
+            retired.remove(fp);
+        }
+        if selected.upload_progress_ack_incidence_unknown() {
+            // Never replace recoverable authority with an opaque census.
+            selected.upload_ack_retirement_handoff = previous.upload_ack_retirement_handoff.clone();
+            return Ok(());
+        }
+        selected.upload_ack_retirement_handoff = if retired.is_empty() {
+            None
+        } else {
+            Some(crate::snapshots::UploadAckRetirementHandoff {
+                destination_namespace_hash: self.destination_namespace_hash.clone(),
+                committed_generation: selected
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("ACK retirement generation overflow"))?,
+                bodies: retired
+                    .into_iter()
+                    .filter_map(|fp| {
+                        self.accepted_body_witnesses
+                            .get(&fp)
+                            .cloned()
+                            .map(|body| (fp, body))
+                    })
+                    .collect(),
+            })
+        };
+        Ok(())
+    }
+
+    pub(super) fn saved_retirement_candidates(&self, saved: &ScanIndex) -> BTreeSet<String> {
+        let Some(handoff) = saved.upload_ack_retirement_handoff.as_ref().filter(|h| {
+            h.destination_namespace_hash == self.destination_namespace_hash
+                && h.committed_generation > 0
+                && h.committed_generation <= saved.generation
+        }) else {
+            return BTreeSet::new();
+        };
+        if saved.upload_progress_ack_incidence_unknown() {
+            return BTreeSet::new();
+        }
+        let mut retired = handoff
+            .bodies
+            .iter()
+            .filter(|(fp, body)| {
+                self.accepted_body_witnesses.get(*fp) == Some(*body)
+                    && !saved.decode_holds_entity(fp)
+            })
+            .map(|(fp, _)| fp.clone())
+            .collect::<BTreeSet<_>>();
+        for fp in saved.upload_progress_ack_incidence() {
+            retired.remove(fp);
+        }
+        retired
+    }
+
+    /// Replay before configuring admission or cloning the loaded index. Cleanup
+    /// is durable before its handoff is cleared. Either failed save stops work;
+    /// restart retries against the still-committed exact-body authority.
+    pub(super) fn recover_ack_retirement_handoff(
+        &mut self,
+        saved: &mut ScanIndex,
+        index_path: &Path,
+        progress_path: &Path,
+    ) -> Result<()> {
+        let retired = self.saved_retirement_candidates(saved);
+        let mut removed = BTreeMap::new();
+        for fp in retired {
+            if let Some(body) = self.accepted_body_witnesses.remove(&fp) {
+                self.accepted_fingerprints.remove(&fp);
+                removed.insert(fp, body);
+            }
+        }
+        if !removed.is_empty() {
+            let generation = self.generation;
+            if let Err(error) = self.save(progress_path) {
+                self.generation = generation;
+                self.accepted_fingerprints.extend(removed.keys().cloned());
+                self.accepted_body_witnesses.extend(removed);
+                return Err(error);
+            }
+        }
+        let Some(handoff) = saved.upload_ack_retirement_handoff.as_ref() else {
+            return Ok(());
+        };
+        if handoff.destination_namespace_hash != self.destination_namespace_hash
+            || handoff.committed_generation == 0
+            || handoff.committed_generation > saved.generation
+        {
+            return Ok(());
+        }
+        // Keep proof for protected/unknown bodies. Completed or superseded
+        // exact bodies no longer need a handoff; never retain historical scope.
+        let mut pending = handoff.clone();
+        pending
+            .bodies
+            .retain(|fp, body| self.accepted_body_witnesses.get(fp) == Some(body));
+        if pending.bodies.len() == handoff.bodies.len() && !pending.bodies.is_empty() {
+            return Ok(());
+        }
+        let previous = saved.upload_ack_retirement_handoff.take();
+        saved.upload_ack_retirement_handoff = (!pending.bodies.is_empty()).then_some(pending);
+        let generation = saved.generation;
+        if let Err(error) = saved.save(index_path) {
+            saved.generation = generation;
+            saved.upload_ack_retirement_handoff = previous;
+            return Err(error);
         }
         Ok(())
     }
