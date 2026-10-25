@@ -4726,10 +4726,12 @@ fn census_rebuild_guard_loss_alarms_with_no_key_pending() {
         let _clock = bound::set_now(N3_T0 + N3_DAY);
         let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-guard-loss-alarm");
         let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
-        for (loss, cause) in [
-            ("n_dropped", "guard_missing"),
-            ("marker_malformed", "marker_refused"),
-            ("n_malformed", "guard_undecodable"),
+        // The orphaned counter each loss reports (a guard decoded closed
+        // brings none; the census line omits a zero counter).
+        for (loss, cause, orphaned) in [
+            ("n_dropped", "guard_missing", 1),
+            ("marker_malformed", "marker_refused", 1),
+            ("n_malformed", "guard_undecodable", 0),
         ] {
             let case = format!("shadow={enabled} {loss}");
             let mut value = serde_json::to_value(&original).unwrap();
@@ -4755,8 +4757,16 @@ fn census_rebuild_guard_loss_alarms_with_no_key_pending() {
                 let mut index = ScanIndex::load(&path).unwrap();
                 assert!(!bound::pending(&index, &key), "{case}: no key pending");
                 assert!(bound::closed(&index), "{case}: closed for one window");
-                census_rebuild_counters(&mut index);
-                census_rebuild_counters(&mut index);
+                for _ in 0..2 {
+                    let counts =
+                        crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+                            &mut index,
+                            &BTreeSet::new(),
+                            &BTreeSet::new(),
+                            FIRST_WINDOW,
+                        );
+                    assert_eq!(counts.census_duplicate_rebuild_orphaned, orphaned, "{case}");
+                }
                 assert_eq!(
                     census_rebuild_guard_alarms(alarms, cause),
                     1,
