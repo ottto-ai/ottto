@@ -2808,6 +2808,28 @@ fn folded_sizes_and_points_leave_every_identity_unchanged() {
 
 // ---- first_own_request_at (SOURCE ruling, Ron's go) -------------------------
 
+/// Every body that carries `first_own_request_at` also carries this scan
+/// identity, so the server takes the start scalars from the same body.
+#[test]
+fn claude_scan_identity_stays_at_or_above_the_server_posture_minimum() {
+    const WHY: &str = "the server pairs start scalars with first_own_request_at only for \
+        Claude scan identity >= v28 (session_posture_semantics.\
+        CLAUDE_AUTHORITATIVE_POSTURE_SCAN_MIN); lowering it breaks the start-changes rule";
+    let version = CLAUDE_CODE_SCAN_IDENTITY_VERSION
+        .strip_prefix("claude_code_jsonl:v")
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|digits| digits.parse::<u32>().ok());
+    assert!(
+        version.is_some_and(|version| version >= 28),
+        "{CLAUDE_CODE_SCAN_IDENTITY_VERSION:?}: {WHY}"
+    );
+    assert_eq!(
+        SnapshotSource::ClaudeCode.scan_identity_version(),
+        CLAUDE_CODE_SCAN_IDENTITY_VERSION,
+        "{WHY}"
+    );
+}
+
 /// A measured root file: the first own request's end time, even when copied
 /// records with older timestamps (which set `source_started_at`) follow it.
 #[test]
