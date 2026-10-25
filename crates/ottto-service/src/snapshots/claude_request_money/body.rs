@@ -446,6 +446,9 @@ impl ClaudeRequestBody {
 
 /// One family of the page, with what the ledger and the live path know.
 pub(crate) struct ClaudeFamilyInput<'a> {
+    /// Full entity custody is needed by live emission and explicit body consumers.
+    /// Ordinary OFF shadow keeps only main's differing-grain projection.
+    pub(crate) collect_entities: bool,
     pub(crate) root: &'a str,
     pub(crate) items: Vec<&'a SnapshotItem>,
     /// Census key of each page member, None for a member with no single key.
@@ -472,10 +475,10 @@ struct Unit {
     message: u64,
     fingerprint: u64,
     /// The live row holding it (None: the live body does not carry it).
-    live: Option<ClaudeLiveKey>,
+    live: Option<std::sync::Arc<ClaudeLiveKey>>,
     /// The finalizer's row for it: where the new body keys a transcript
     /// grain (equal to `live` unless the live body is a reported rebuild).
-    place: Option<ClaudeLiveKey>,
+    place: Option<std::sync::Arc<ClaudeLiveKey>>,
     /// It won a conflict the live (reported) body resolved the other way.
     conflict_winner: bool,
     /// The live row's own cost of this unit (reported rows: a witness).
@@ -515,6 +518,7 @@ pub(crate) fn build_claude_request_body(
 
     let mut union_units = BTreeMap::<(String, UnitKind, u64, u64), Unit>::new();
     let mut built_members = BTreeSet::new();
+    let mut transcript_parts = [ClaudeMoneyTotals::default(); 4];
     for item in &family.items {
         for request_id in item.claude_usage_occurrences.keys() {
             if position % 1024 == 1023 && ctx.late() {
@@ -532,15 +536,17 @@ pub(crate) fn build_claude_request_body(
             return body;
         }
         let member = item.source_session_id.as_str();
-        let entity = body.entities.entry(member.to_owned()).or_default();
-        if entity.primary_file.is_none() {
-            if let Some(Some(primary)) = family.member_keys.get(member) {
-                entity.primary_file = Some(primary.clone());
-                entity.primary_opened_birth = ctx
-                    .index
-                    .claude_request_census
-                    .get(primary)
-                    .and_then(|record| record.birth());
+        if family.collect_entities {
+            let entity = body.entities.entry(member.to_owned()).or_default();
+            if entity.primary_file.is_none() {
+                if let Some(Some(primary)) = family.member_keys.get(member) {
+                    entity.primary_file = Some(primary.clone());
+                    entity.primary_opened_birth = ctx
+                        .index
+                        .claude_request_census
+                        .get(primary)
+                        .and_then(|record| record.birth());
+                }
             }
         }
         if super::synthetic(item) {
@@ -605,6 +611,17 @@ pub(crate) fn build_claude_request_body(
                 .map(String::as_str)
                 .unwrap_or(family.root)
         };
+        // Placement keys are shared by all units from one captured row. The
+        // pointer is only a temporary interner key; it never enters identity.
+        let mut placements = BTreeMap::<usize, std::sync::Arc<ClaudeLiveKey>>::new();
+        let mut placement_key = |sequence| {
+            capture.placement(sequence).map(|row| {
+                placements
+                    .entry(row as *const super::capture::CapturedRow as usize)
+                    .or_insert_with(|| std::sync::Arc::new(live_key_of_capture(row)))
+                    .clone()
+            })
+        };
         // Units: the kept request-id responses, then the captured ones.
         let mut units = Vec::with_capacity(item.claude_usage_occurrences.len());
         let mut placement_missing = false;
@@ -621,7 +638,9 @@ pub(crate) fn build_claude_request_body(
                     .get(claude_request_hash(request_id))
                     .is_some_and(|row| row.cost_micros.is_some())
                 {
-                    body.entities.get_mut(member).expect("member").held = true;
+                    if let Some(entity) = body.entities.get_mut(member) {
+                        entity.held = true;
+                    }
                 }
                 continue;
             }
@@ -634,13 +653,11 @@ pub(crate) fn build_claude_request_body(
                 .unwrap_or(0);
             let message = capture.message(occurrence.sequence).unwrap_or(0);
             let model = occurrence.model.as_deref().map(claude_model_hash);
-            let place = capture
-                .placement(occurrence.sequence)
-                .map(live_key_of_capture);
+            let place = placement_key(occurrence.sequence);
             let (live, live_cost) = if reported {
                 match rows.get(hash).filter(|_| trace_owner(hash) == member) {
                     Some(row) => match reported_live_key(&row, Some(occurrence)) {
-                        Some(key) => (Some(key), row.cost_micros),
+                        Some(key) => (Some(std::sync::Arc::new(key)), row.cost_micros),
                         None => {
                             placement_missing = true;
                             (None, None)
@@ -683,9 +700,7 @@ pub(crate) fn build_claude_request_body(
             if captured.tokens.conserved() == 0 && captured.tokens.reasoning == 0 {
                 continue;
             }
-            let place = capture
-                .placement(captured.sequence)
-                .map(live_key_of_capture);
+            let place = placement_key(captured.sequence);
             // A reported rebuild carries only API rows: never these.
             let live = if reported { None } else { place.clone() };
             if place.is_none() {
@@ -810,7 +825,7 @@ pub(crate) fn build_claude_request_body(
             losers.push(loser);
         }
         for unit in units.iter().chain(&losers) {
-            if let Some(live) = &unit.live {
+            if let Some(live) = unit.live.as_deref() {
                 let slot = accounted.entry(live.clone()).or_default();
                 slot.0.add(&unit.tokens);
                 slot.1 = slot.1.saturating_add(unit.requests);
@@ -913,7 +928,7 @@ pub(crate) fn build_claude_request_body(
                             ClaudeGrainKey {
                                 member: member.to_owned(),
                                 owner: member.to_owned(),
-                                live,
+                                live: (*live).clone(),
                                 origin: None,
                                 category: ClaudeGrainCategory::UnionSecondary,
                             },
@@ -964,11 +979,13 @@ pub(crate) fn build_claude_request_body(
                 counts.units_conflict_removed += 1;
                 body.removed.add(conserved, unit.requests, None);
                 body.units.add(conserved, unit.requests, None);
-                let entity = body.entities.get_mut(member).expect("member");
-                entity.partition(&unit.tokens, unit.requests, 1);
-                entity.activity_unix = entity.activity_unix.max(unit.clock);
-                entity.activity_nanos = entity.activity_nanos.max(unit.clock_nanos);
-                if let Some(live) = &unit.live {
+                transcript_parts[1].add(conserved, unit.requests, None);
+                if let Some(entity) = body.entities.get_mut(member) {
+                    entity.partition(&unit.tokens, unit.requests, 1);
+                    entity.activity_unix = entity.activity_unix.max(unit.clock);
+                    entity.activity_nanos = entity.activity_nanos.max(unit.clock_nanos);
+                }
+                if let Some(live) = unit.live.as_deref() {
                     body.slice(
                         ClaudeGrainKey {
                             member: member.to_owned(),
@@ -1038,50 +1055,52 @@ pub(crate) fn build_claude_request_body(
                 (0, None)
             }
         };
-        let entity = body.entities.get_mut(member).expect("member");
-        entity.partition(&unit.tokens, unit.requests, part);
-        entity.activity_unix = entity.activity_unix.max(unit.clock);
-        entity.activity_nanos = entity.activity_nanos.max(unit.clock_nanos);
-        if part == 3 {
-            let due = unit.clock.saturating_add(MATURITY_SECONDS);
-            entity.due_unix = Some(entity.due_unix.map_or(due, |old| old.min(due)));
-        }
-        if let Some(ClaudeRequestVerdict::Counted(by)) = verdict {
-            entity.telemetry_owned_complete &= by == ClaudeCountedBy::TelemetryProven;
-            if let Some(key) = unit.place.as_ref() {
-                let matched = match unit.kind {
-                    UnitKind::Request(hash) => rows.get(hash).and_then(|row| row.cost_micros),
-                    _ => None,
-                };
-                let origin = matched.map(|_| ClaudeRequestUsageOrigin::TelemetryMatched);
-                entity.count(key.clone(), origin, &unit.tokens, unit.requests, matched);
-                entity.note_clock(key, unit.clock_nanos);
-                if let UnitKind::Request(hash) = unit.kind {
-                    entity
-                        .contribution_clocks
-                        .insert(hash, Some((unit.clock, unit.event_clock_complete)));
-                }
-                entity.counted.push(ClaudeCountedContribution {
-                    key: key.clone(),
-                    origin,
-                    tokens: unit.tokens,
-                    requests: unit.requests,
-                    cost: matched,
-                    request: match unit.kind {
-                        UnitKind::Request(hash) => Some(hash),
+        transcript_parts[part].add(conserved, unit.requests, None);
+        if let Some(entity) = body.entities.get_mut(member) {
+            entity.partition(&unit.tokens, unit.requests, part);
+            entity.activity_unix = entity.activity_unix.max(unit.clock);
+            entity.activity_nanos = entity.activity_nanos.max(unit.clock_nanos);
+            if part == 3 {
+                let due = unit.clock.saturating_add(MATURITY_SECONDS);
+                entity.due_unix = Some(entity.due_unix.map_or(due, |old| old.min(due)));
+            }
+            if let Some(ClaudeRequestVerdict::Counted(by)) = verdict {
+                entity.telemetry_owned_complete &= by == ClaudeCountedBy::TelemetryProven;
+                if let Some(key) = unit.place.as_deref() {
+                    let matched = match unit.kind {
+                        UnitKind::Request(hash) => rows.get(hash).and_then(|row| row.cost_micros),
                         _ => None,
-                    },
-                    clock: unit.clock,
-                    by,
-                });
-            } else {
-                entity.held = true;
+                    };
+                    let origin = matched.map(|_| ClaudeRequestUsageOrigin::TelemetryMatched);
+                    entity.count(key.clone(), origin, &unit.tokens, unit.requests, matched);
+                    entity.note_clock(key, unit.clock_nanos);
+                    if let UnitKind::Request(hash) = unit.kind {
+                        entity
+                            .contribution_clocks
+                            .insert(hash, Some((unit.clock, unit.event_clock_complete)));
+                    }
+                    entity.counted.push(ClaudeCountedContribution {
+                        key: key.clone(),
+                        origin,
+                        tokens: unit.tokens,
+                        requests: unit.requests,
+                        cost: matched,
+                        request: match unit.kind {
+                            UnitKind::Request(hash) => Some(hash),
+                            _ => None,
+                        },
+                        clock: unit.clock,
+                        by,
+                    });
+                } else {
+                    entity.held = true;
+                }
             }
         }
         match category {
             // Not counted: its live slice leaves the new body.
             Some(category) => {
-                if let Some(live) = &unit.live {
+                if let Some(live) = unit.live.as_deref() {
                     body.slice(
                         ClaudeGrainKey {
                             member: member.to_owned(),
@@ -1104,6 +1123,13 @@ pub(crate) fn build_claude_request_body(
             .add(unit_totals.tokens, unit_totals.requests, None);
     }
 
+    let partition = transcript_parts.iter().fold((0_u64, 0_u64), |sum, part| {
+        (
+            sum.0.saturating_add(part.tokens),
+            sum.1.saturating_add(part.requests),
+        )
+    });
+    body.certificate_ok &= partition == (body.units.tokens, body.units.requests);
     side_calls(
         &mut body,
         family,
@@ -1122,7 +1148,27 @@ pub(crate) fn build_claude_request_body(
     body.unbuilt |= body.entities.values().any(|entity| entity.held);
     // The emitter and shadow consume the same proposed grains. Old-side
     // slices retain their explanations; new sides are rebuilt from entities.
-    finalize_shadow(&mut body, family);
+    if family.collect_entities {
+        finalize_shadow(&mut body, family);
+    } else {
+        // Main's diff projection needs no full entity/contribution copies.
+        let mut tokens = i128::from(body.old.tokens);
+        let mut requests = i128::from(body.old.requests);
+        for (old, new) in body.grains.values() {
+            tokens += i128::from(new.tokens.conserved()) - i128::from(old.tokens.conserved());
+            requests += i128::from(new.requests) - i128::from(old.requests);
+        }
+        body.new = ClaudeMoneyTotals {
+            tokens: u64::try_from(tokens.max(0)).unwrap_or(u64::MAX),
+            requests: u64::try_from(requests.max(0)).unwrap_or(u64::MAX),
+            ..Default::default()
+        };
+        body.grains.retain(|key, (old, new)| {
+            key.category == ClaudeGrainCategory::OwnCost
+                || old.tokens != new.tokens
+                || old.requests != new.requests
+        });
+    }
     body
 }
 
@@ -1225,7 +1271,7 @@ fn counted_slice(
             // The reported body carries it with its row's money: unchanged.
             return;
         }
-        let Some(place) = &unit.place else {
+        let Some(place) = unit.place.as_deref() else {
             return;
         };
         let category = match unit.kind {
@@ -1248,7 +1294,7 @@ fn counted_slice(
         );
         return;
     }
-    let Some(live) = &unit.live else {
+    let Some(live) = unit.live.as_deref() else {
         return;
     };
     let UnitKind::Request(hash) = unit.kind else {
@@ -1304,15 +1350,17 @@ fn side_calls(
 ) {
     let own_telemetry = super::super::claude_request_census::telemetry_key(family.root);
     let mut member_hashes = BTreeMap::<&str, BTreeSet<u64>>::new();
-    for item in &family.items {
-        member_hashes
-            .entry(&item.source_session_id)
-            .or_default()
-            .extend(
-                item.claude_usage_occurrences
-                    .keys()
-                    .map(|id| claude_request_hash(id)),
-            );
+    if family.collect_entities {
+        for item in &family.items {
+            member_hashes
+                .entry(&item.source_session_id)
+                .or_default()
+                .extend(
+                    item.claude_usage_occurrences
+                        .keys()
+                        .map(|id| claude_request_hash(id)),
+                );
+        }
     }
     for (position, row) in rows.iter().enumerate() {
         if position % 1024 == 1023 && ctx.late() {
@@ -1348,10 +1396,9 @@ fn side_calls(
             .collect::<Vec<_>>();
         if family_hashes.contains(&hash) {
             for member in recipients {
-                body.entities
-                    .get_mut(member)
-                    .expect("page member")
-                    .partition(&row.tokens, 1, 1);
+                if let Some(entity) = body.entities.get_mut(member) {
+                    entity.partition(&row.tokens, 1, 1);
+                }
             }
             continue;
         }
@@ -1401,7 +1448,9 @@ fn side_calls(
         };
         let key = reported_live_key(&row, None);
         for member in recipients {
-            let entity = body.entities.get_mut(member).expect("page member");
+            let Some(entity) = body.entities.get_mut(member) else {
+                continue;
+            };
             let assigned_part = if part == 0 && member != target {
                 1
             } else {

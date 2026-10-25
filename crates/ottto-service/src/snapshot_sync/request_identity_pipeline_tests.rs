@@ -798,7 +798,7 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
 fn money_gate_off_shadow_regression_receipt(base: &Path) -> serde_json::Value {
     use crate::snapshots::claude_request_money as money;
     let mut receipts = Vec::new();
-    for (case, units, copied) in [("large-family", 9_000, false), ("copied-member", 1, true)] {
+    for (case, units, copied) in [("large-family", 2_100, false), ("copied-member", 1, true)] {
         let root = base.join(format!("shadow-regression-{case}"));
         if root.exists() { std::fs::remove_dir_all(&root).unwrap(); }
         let support = root.join("support");
@@ -808,7 +808,8 @@ fn money_gate_off_shadow_regression_receipt(base: &Path) -> serde_json::Value {
         let text = (0..units).map(|at| serde_json::json!({
             "timestamp":"2026-08-02T07:00:00Z","type":"assistant","sessionId":session,
             "requestId":format!("req_{at}"),"message":{"id":format!("msg_{at}"),
-                "model":"claude-haiku-4-5","usage":{"input_tokens":1,"output_tokens":1}}
+                "model":"claude-haiku-4-5","usage":{"input_tokens":1,"output_tokens":1,
+                    "service_tier":if copied { "standard".to_string() } else { "s".repeat(3000) }}}
         }).to_string()+"\n").collect::<String>();
         for project in if copied { vec!["-one", "-two"] } else { vec!["-one"] } {
             let path = projects.join(project).join(format!("{session}.jsonl"));
@@ -830,7 +831,7 @@ fn money_gate_off_shadow_regression_receipt(base: &Path) -> serde_json::Value {
             assert_eq!(counts.captures_taken, 0, "OFF must not consume ambiguous physical members: {counts:?}");
         } else {
             assert!(counts.captures_taken > 0, "large input must exercise capture preflight: {counts:?}");
-            assert_eq!(counts.families_unbuilt, 0, "main admits this >6k-unit family OFF: {counts:?}");
+            assert_eq!(counts.families_unbuilt, 0, "main admits this large-selector family OFF: {counts:?}");
             assert_eq!(counts.families_budget_deferred, 0, "OFF does not allocate the live body: {counts:?}");
         }
         let mut paths = std::fs::read_dir(support.join("diagnostics")).unwrap().flatten()

@@ -3173,6 +3173,10 @@ mod p2a_conservation {
         }
 
         fn build(&self, session: &str, now: u64) -> body::ClaudeRequestBody {
+            self.build_mode(session, now, true, false).0
+        }
+        fn build_mode(&self, session: &str, now: u64, collect_entities: bool, measured: bool)
+            -> (body::ClaudeRequestBody, usize, crate::retry_allocation_probe::Stats) {
             let item = &self.items[session];
             let key = &self.paths[session];
             let fp = &self.index.files[key].source_file_fingerprint;
@@ -3258,7 +3262,17 @@ holder_view: crate::snapshots::claude_request_money::coverage::ClaudeHolderView 
                 None => Some(ClaudeRootRows::default()),
             };
             let indexed = BTreeSet::from([session.to_owned()]);
+            let captures = BTreeMap::from([((session.to_owned(), session.to_owned()), captured)]);
+            let admitted = if measured {
+                assert_eq!(money::family_preflight(session, &[item], &captures, &self.ledger,
+                    &self.api, &self.trace, deadline, true), Err("oversize"),
+                    "this family discriminates the old full-body charge");
+                money::family_preflight(session, &[item], &captures, &self.ledger,
+                    &self.api, &self.trace, deadline, false).expect("main/OFF admission")
+            } else { 0 };
+            let captured = captures.into_values().next().unwrap();
             let input = body::ClaudeFamilyInput {
+                collect_entities,
                 root: session,
                 items: vec![item],
                 member_keys: BTreeMap::from([(session, Some(key.clone()))]),
@@ -3268,15 +3282,38 @@ holder_view: crate::snapshots::claude_request_money::coverage::ClaudeHolderView 
                 trace: traces.get(session),
                 captures: BTreeMap::from([(session, captured)]),
             };
-            body::build_claude_request_body(
-                &input,
-                &ctx,
-                &BTreeSet::new(),
-                now,
-                &mut Default::default(),
-            )
+            let build = || body::build_claude_request_body(
+                &input, &ctx, &BTreeSet::new(), now, &mut Default::default());
+            if measured {
+                let (body, stats) = crate::retry_allocation_probe::measure_caller_thread(build);
+                (body, admitted, stats)
+            } else { (build(), 0, Default::default()) }
         }
     }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn off_large_selector_body_builds_within_admission_without_entity_copies() {
+        let mut corpus = Corpus::new("money-off-selector-admission");
+        let text = (0..2100).map(|at| {
+            let mut row: serde_json::Value = serde_json::from_str(&line(A, &format!("req_{at}"),
+                &format!("msg_{at}"), H7, 10)).unwrap();
+            row["message"]["usage"]["service_tier"] = "s".repeat(3000).into();
+            row.to_string()+"\n"
+        }).collect::<String>();
+        corpus.transcript(A, &text, NOW - 86_400);
+        // The setup parse and selected build are distinct real pages; do not
+        // charge two parses to the same cumulative capture allowance.
+        capture::begin_page(&corpus.support);
+        let (body, admitted, allocation) = corpus.build_mode(A, NOW, false, true);
+        assert!(!body.unbuilt, "the admitted family must build: {body:?}");
+        assert_eq!(body.members_built, 1);
+        assert!(body.entities.is_empty(), "OFF must allocate no full entities/contributions");
+        assert!(allocation.requested_peak_with_overlap <= admitted,
+            "builder allocation includes inherited Unit scratch and shared placement keys: {allocation:?}, admitted={admitted}");
+        eprintln!("MONEY_OFF_SELECTOR_ADMISSION units=2100 selector_bytes=3000 full_entities=0 full_contributions=0 admitted={admitted} requested_peak={} requested_peak_with_overlap={} built=1 old_full_charge=oversize inherited_unit_keys=shared",
+            allocation.requested_peak, allocation.requested_peak_with_overlap);
+    }
+
     impl Drop for Corpus {
         fn drop(&mut self) {
             money::disable_shadow_for_test(&self.support);

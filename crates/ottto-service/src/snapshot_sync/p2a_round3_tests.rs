@@ -5234,3 +5234,77 @@ fn p2a_unknown_retry_after_crossing_deadline_expires_without_replay() {
     .unwrap();
     assert_eq!(status["unknown_outcome_unresolved"], 1);
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_initial_post_holds_versionless_before_intent_and_acks_supported_control() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() { return; }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    let posted = unknown_recovery::PostedEntityForTest::new();
+    control.cycle();
+    let supported = posted.take().expect("real finalized supported wire body");
+    drop(posted);
+    assert!(crate::snapshot_client::snapshot_ack_body_witness_version(&supported).unwrap().is_some());
+    control.recovery_startup(current_unix_seconds());
+    let mut index = control.saved();
+    index.load_claude_reemission_exclusions(&control.support);
+    let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+    let binding = unknown_recovery::binding(&namespace, control.client.recovery_origin(), "otm_test",
+        &control.daemon.snapshot_scan_account_witness().unwrap());
+    let token = control.client.issue_relay_token(&control.device, "device-secret", SnapshotSource::ClaudeCode).unwrap();
+    let mut request = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION, source:"claude_code".into(), machine_id:"otm_test".into(),
+        collector_version:Some(collector_version()), snapshots:vec![supported.clone()],
+        upload_policy:SnapshotUploadPolicy::default(), client_report:crate::client_report::ClientReport::empty(),
+    };
+    request.snapshots[0].session_account_evidence = None;
+    request.snapshots[0].context_curve = None;
+    request.snapshots[0].cache_observations = None;
+    assert_eq!(crate::snapshot_client::snapshot_ack_body_witness_version(&request.snapshots[0]).unwrap(), None);
+    let posts = control.server.raw_batches.lock().unwrap().len();
+    let intents = unknown_recovery::active_for_test(&control.support).iter().map(|m|m.id.clone()).collect::<BTreeSet<_>>();
+    let mut send = unknown_recovery::SendState::default();
+    let (result, diagnostics) = crate::local_resource_diagnostics::capture(|| unknown_recovery::initial_post(
+        &control.support, &mut index, &control.client, &token, &request, &binding, false, false, [0;32], &mut send));
+    let error = result.expect_err("unsupported witness must be held before POST");
+    let hold = error.downcast_ref::<unknown_recovery::WitnessHold>().expect("counted witness hold, never UNKNOWN");
+    assert_eq!((hold.missing, hold.unsupported), (1,0));
+    assert!(diagnostics.iter().any(|row| row["stage"] == "claude_request_money_recovery_witness_hold"
+        && row["counts"]["missing_version"] == 1 && row["counts"]["unsupported_version"] == 0));
+    assert!(matches!(send, unknown_recovery::SendState::Empty));
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), posts, "unsupported body produces zero physical POSTs");
+    assert_eq!(unknown_recovery::active_for_test(&control.support).iter().map(|m|m.id.clone()).collect::<BTreeSet<_>>(), intents,
+        "unsupported body creates no intent or UNKNOWN episode");
+    assert!(money::store::live_refused(&control.support), "next collection must use the ordinary path");
+
+    // Explicitly authorize the independent supported control. Production only
+    // clears this latch after a completed ordinary collection.
+    money::store::allow_live(&control.support);
+    request.snapshots = vec![supported];
+    let response = (0..32).find_map(|_| {
+        let result = unknown_recovery::initial_post(&control.support, &mut index, &control.client,
+            &token, &request, &binding, false, false, [0;32], &mut send);
+        if result.as_ref().err().is_some_and(|e|e.is::<unknown_recovery::Pending>()) {
+            money_resume::drive_for_test(unknown_recovery::captured(&control.support, &mut send)).unwrap();
+            None
+        } else { Some(result.unwrap()) }
+    }).expect("supported exact-witness control converges");
+    response.validate_entity_ack(&request).unwrap();
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), posts+1);
+    let path = snapshot_upload_progress_path(&control.index_path);
+    let mut progress = SnapshotUploadProgress::load(&path, &namespace, snapshot_quarantine_witness(SnapshotSource::ClaudeCode)).unwrap();
+    let item = &request.snapshots[0];
+    progress.accepted_fingerprints.insert(item.snapshot_fingerprint.clone());
+    progress.accepted_body_witnesses.insert(item.snapshot_fingerprint.clone(), snapshot_upload_body_witness(item));
+    progress.save(&path).unwrap();
+    unknown_recovery::ack_saved(&control.support, &progress).unwrap();
+    money_resume::drive_for_test(unknown_recovery::outcomes(&control.support)).unwrap();
+    assert!(unknown_recovery::active_for_test(&control.support).iter().all(|m|m.ack_saved));
+    eprintln!("MONEY_RECOVERY_WITNESS_PREFLIGHT missing_version_hold=1 unsupported_posts=0 unsupported_intents=0 unknown=0 legacy_fallback=true supported_posts=1 exact_ack=true");
+}

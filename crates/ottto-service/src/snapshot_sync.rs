@@ -10432,6 +10432,25 @@ where
             inplace_retry.admit(error, inplace_retry_failed_after(attempt_started))
         });
         match attempt {
+            Err(error) if error.is::<unknown_recovery::WitnessHold>() => {
+                // A preflight refusal owns neither a physical POST nor intent.
+                // Preserve due bodies; the live-refusal latch makes the next
+                // completed collection use ordinary emission, never replay.
+                for index in &indices {
+                    let item = &items[*index];
+                    progress.quarantine_transient_body(
+                        fingerprint(item),
+                        &body_witness(item),
+                        current_unix_seconds(),
+                    );
+                }
+                persist(progress).map_err(|_| SnapshotLocalStateRejected {
+                    operation: "save unsupported recovery witness hold",
+                })?;
+                return Ok(ResumableUploadResult::Deferred {
+                    count: indices.len(),
+                });
+            }
             Err(error) if error.is::<unknown_recovery::CapacityFull>() => {
                 let mut held = 0;
                 for item in items {

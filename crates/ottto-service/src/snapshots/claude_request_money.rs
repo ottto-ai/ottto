@@ -2872,7 +2872,7 @@ async fn build_page_with_coverage(
 /// checks the same absolute deadline before touching the next item. Once
 /// oversized, no remaining content is visited.
 #[allow(clippy::too_many_arguments)]
-fn family_preflight(
+pub(in crate::snapshots) fn family_preflight(
     root: &str,
     items: &[&SnapshotItem],
     captures: &BTreeMap<(String, String), ClaudeResponseCapture>,
@@ -3359,6 +3359,7 @@ async fn build_slice(
             }
         }
         let family = ClaudeFamilyInput {
+            collect_entities: live || owned_body,
             root,
             items: items.clone(),
             member_keys: keys,

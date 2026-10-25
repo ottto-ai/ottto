@@ -1564,6 +1564,43 @@ impl crate::snapshots::ClaudeHistoryEmissionItem for Entity {
     }
 }
 
+/// An unsent body without an exact public ACK witness stays on the ordinary
+/// path. It must never create an intent or consume an UNKNOWN/replay slot.
+#[derive(Debug)]
+pub(super) struct WitnessHold {
+    pub missing: u64,
+    pub unsupported: u64,
+}
+impl std::fmt::Display for WitnessHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request money recovery held before POST: unsupported body witness")
+    }
+}
+impl std::error::Error for WitnessHold {}
+fn preflight_witnesses(support: &Path, request: &SnapshotBatchRequest) -> Result<()> {
+    let mut hold = WitnessHold {
+        missing: 0,
+        unsupported: 0,
+    };
+    for item in &request.snapshots {
+        match crate::snapshot_client::snapshot_ack_body_witness_version(item) {
+            Ok(Some(_)) => {}
+            Ok(None) => hold.missing += 1,
+            Err(_) => hold.unsupported += 1,
+        }
+    }
+    if hold.missing + hold.unsupported == 0 {
+        return Ok(());
+    }
+    money::store::refuse_live(support);
+    crate::local_resource_diagnostics::traversal_point(
+        "claude_request_money_recovery_witness_hold",
+        "claude_code",
+        &serde_json::json!({"missing_version":hold.missing,"unsupported_version":hold.unsupported}),
+    );
+    Err(hold.into())
+}
+
 pub(super) fn manifest(
     support: &Path,
     index: &ScanIndex,
@@ -1572,6 +1609,7 @@ pub(super) fn manifest(
     head_cas: bool,
     policy: [u8; 32],
 ) -> Result<Manifest> {
+    preflight_witnesses(support, request)?;
     let head_cas = head_cas
         || request
             .snapshots
@@ -1786,6 +1824,9 @@ pub(super) fn initial_post(
     policy: [u8; 32],
     state: &mut SendState,
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+    // This precedes admission, serialization, durable intent and all POSTs,
+    // including a resumed captured send. Unsupported bodies never become UNKNOWN.
+    preflight_witnesses(support, request)?;
     if matches!(state, SendState::Capacity) {
         return Err(capacity_full());
     }
@@ -2127,7 +2168,10 @@ pub(super) fn admitted(
     m: &Manifest,
     guard: LiteralPermit,
 ) -> Result<bool> {
-    if m.binding != binding
+    if m.entities
+        .iter()
+        .any(|entity| entity.witness_version.is_none())
+        || m.binding != binding
         || m.context != index.recovery_upload_context()
         || now(support) >= m.deadline
         || !money::request_owned_live(support)
