@@ -1050,7 +1050,7 @@ fn unindexed_debt_cannot_borrow_unused_live_incidence_slots() {
 }
 
 #[test]
-#[serial_test::serial]
+#[serial_test::serial(client_report)]
 fn capacity_outcome_reports_deferred_entities_without_counting_network_loss() {
     use crate::client_report::{observe, reset_for_test, ClientReportReason};
     reset_for_test();
