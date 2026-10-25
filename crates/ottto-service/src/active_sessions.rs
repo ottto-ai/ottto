@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ottto_protocol::{
-    ActiveSession, ActiveSessionCompaction, ActiveSessionContextPoint, ActiveSessionReconciliation,
-    AgentLoginState, AgentStatusConfidence, AgentStatusPlanObservation, AgentStatusSnapshot,
+    ActiveSession, ActiveSessionAccountUse, ActiveSessionCompaction, ActiveSessionContextPoint,
+    ActiveSessionCurrentAccount, ActiveSessionReconciliation, AgentLoginState,
+    AgentStatusConfidence, AgentStatusPlanObservation, AgentStatusSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
@@ -370,6 +371,7 @@ fn active_session_from_snapshot(
     let compaction_timestamps =
         bounded_compaction_timestamps(snapshot.compaction_timestamps.clone());
     let (latest_model, latest_reasoning_effort) = latest_model_identity(snapshot);
+    let (current_account, account_history) = session_accounts(source, snapshot);
     ActiveSession {
         source_session_id: snapshot.source_session_id.clone(),
         session_display_name: snapshot.session_display_name.clone(),
@@ -431,6 +433,30 @@ fn active_session_from_snapshot(
         account_attribution_source: attribution.map(|value| value.source),
         latest_model,
         latest_reasoning_effort,
+        current_account,
+        account_history,
+    }
+}
+
+/// The account of the session's newest own request and its usage per
+/// (account, workspace, subscription), from the snapshot's own contract-5
+/// request identity only. Rebuilt from scratch on every re-read (equal last
+/// activity does not prove the same requests), so a cached row never lends
+/// its identity to usage it did not see; only an unread row keeps its own. Other sources, and
+/// Claude items this scan did not tag, leave both absent: the current login,
+/// a plan observation or the lifetime account never stands in for them.
+fn session_accounts(
+    source: SnapshotSource,
+    snapshot: &SnapshotItem,
+) -> (
+    Option<ActiveSessionCurrentAccount>,
+    Vec<ActiveSessionAccountUse>,
+) {
+    match (source, snapshot.claude_account_display.as_deref()) {
+        (SnapshotSource::ClaudeCode, Some(display)) => {
+            (Some(display.current.clone()), display.history.clone())
+        }
+        _ => (None, Vec::new()),
     }
 }
 
@@ -1787,6 +1813,146 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn account_display(account: &str) -> crate::snapshots::claude_request_identity::AccountDisplay {
+        crate::snapshots::claude_request_identity::AccountDisplay {
+            current: ActiveSessionCurrentAccount {
+                status: "known".into(),
+                account_identifier_hash: Some(account.into()),
+                organization_identifier_hash: Some("workspace".into()),
+                subscription_product: Some("max".into()),
+                latest_request_at: Some("2026-07-19T10:04:00Z".into()),
+                unknown_reason: None,
+            },
+            history: vec![ActiveSessionAccountUse {
+                account_identifier_hash: Some(account.into()),
+                organization_identifier_hash: Some("workspace".into()),
+                subscription_product: Some("max".into()),
+                request_count: 1,
+                input_tokens: 100,
+                cache_read_tokens: 0,
+                cache_creation_5m_tokens: 0,
+                cache_creation_1h_tokens: 0,
+                output_tokens: 0,
+                last_used_at: Some("2026-07-19T10:04:00Z".into()),
+                current: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn current_account_and_history_come_only_from_this_reads_own_requests() {
+        let dir = temp_dir("session-accounts");
+        let reconcile = |snapshot: &SnapshotItem, source, at: &str| {
+            reconcile_active_sessions(
+                &dir,
+                source,
+                std::slice::from_ref(snapshot),
+                None,
+                test_policy(),
+                None,
+                at,
+            )
+            .expect("reconciliation")
+            .sessions
+        };
+        let mut tagged = test_snapshot("s-claude", "2026-07-19T10:04:00Z");
+        tagged.claude_account_display = Some(Box::new(account_display("account-a")));
+        let listed = reconcile(&tagged, SnapshotSource::ClaudeCode, "2026-07-19T10:05:00Z");
+        let display = account_display("account-a");
+        assert_eq!(listed[0].current_account.as_ref(), Some(&display.current));
+        assert_eq!(listed[0].account_history, display.history);
+        // Legacy cumulative attribution is untouched by the new fields.
+        assert_eq!(listed[0].account_identifier_hash, None);
+
+        // Not re-read: the carried row keeps what its own requests proved.
+        let quiet = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[],
+            None,
+            test_policy(),
+            None,
+            "2026-07-19T10:06:00Z",
+        )
+        .expect("quiet")
+        .sessions;
+        assert_eq!(quiet[0].current_account.as_ref(), Some(&display.current));
+
+        // Any re-read rebuilds from its own evidence. The same last activity
+        // does not prove the same requests (a second request in that same
+        // instant, or a corrected body), so a re-read this cycle could not
+        // tag clears the listed facts rather than lend them to new usage.
+        let mut untagged = tagged.clone();
+        untagged.claude_account_display = None;
+        untagged.input_tokens += 7;
+        untagged.request_count += 1;
+        let reread = reconcile(
+            &untagged,
+            SnapshotSource::ClaudeCode,
+            "2026-07-19T10:07:00Z",
+        );
+        assert_eq!(reread[0].current_account, None);
+        assert!(reread[0].account_history.is_empty());
+        // Even a byte-identical re-read without an identity pass clears them.
+        let mut same = tagged.clone();
+        same.claude_account_display = None;
+        let unchanged = reconcile(&same, SnapshotSource::ClaudeCode, "2026-07-19T10:07:15Z");
+        assert_eq!(unchanged[0].current_account, None);
+        // A rebuilt answer for the same activity replaces the listed one.
+        let mut retagged = tagged.clone();
+        retagged.claude_account_display = Some(Box::new(account_display("account-b")));
+        let replaced = reconcile(
+            &retagged,
+            SnapshotSource::ClaudeCode,
+            "2026-07-19T10:07:30Z",
+        );
+        assert_eq!(
+            replaced[0].current_account,
+            Some(account_display("account-b").current)
+        );
+        // Newer activity without per-request identity: absent too.
+        let mut newer = untagged.clone();
+        newer.source_last_activity_at = Some("2026-07-19T10:08:00Z".into());
+        let advanced = reconcile(&newer, SnapshotSource::ClaudeCode, "2026-07-19T10:09:00Z");
+        assert_eq!(advanced[0].current_account, None);
+
+        // Other sources never show it, whatever the item carries.
+        let mut codex = test_snapshot("s-codex", "2026-07-19T10:04:00Z");
+        codex.claude_account_display = Some(Box::new(account_display("account-a")));
+        let codex_dir = temp_dir("session-accounts-codex");
+        let codex_sessions = reconcile_active_sessions(
+            &codex_dir,
+            SnapshotSource::Codex,
+            &[codex],
+            None,
+            test_policy(),
+            None,
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("codex")
+        .sessions;
+        assert_eq!(codex_sessions[0].current_account, None);
+        assert!(codex_sessions[0].account_history.is_empty());
+
+        // A cache written by an older daemon decodes with both fields absent.
+        let path = active_session_cache_path(&dir, SnapshotSource::ClaudeCode);
+        std::fs::write(
+            &path,
+            r#"{"reconciliation":{"reconciled_at":"2026-07-19T10:05:00Z","changed_session_count":1,"sessions":[{"source_session_id":"old","source_last_activity_at":"2026-07-19T10:04:00Z","account_identifier_hash":"legacy"}]}}"#,
+        )
+        .unwrap();
+        let old = read_active_session_reconciliation(&dir, SnapshotSource::ClaudeCode).unwrap();
+        assert_eq!(old.sessions[0].current_account, None);
+        assert!(old.sessions[0].account_history.is_empty());
+        assert_eq!(
+            old.sessions[0].account_identifier_hash.as_deref(),
+            Some("legacy")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(codex_dir);
+    }
+
     #[test]
     fn withholds_carried_attribution_that_current_evidence_contradicts() {
         let dir = temp_dir("carried-attribution");
@@ -2895,6 +3061,7 @@ mod tests {
             request_identity_refusals: 0,
             claude_org_markers: None,
             claude_account_withheld_reason: None,
+            claude_account_display: None,
             source_session_id: session_id.to_string(),
             snapshot_fingerprint: format!("fp-{session_id}"),
             status: "active".to_string(),

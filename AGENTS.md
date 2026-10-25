@@ -28,6 +28,16 @@
 - Locally, check and test only the crates you changed (`cargo check|test -p <crate>`).
   Full-workspace `cargo build`/`cargo test` runs only in GitHub CI: push a PR and
   read its result. Coordinate heavy local builds.
+- Iterate on CI, not on the local machine. A local `cargo check -p ottto-service`
+  takes several GB of memory and every core for minutes, and many agents may
+  share one machine. For compile and test feedback, push a branch and run the
+  free Linux lane on it: `gh workflow run linux-tests.yml --ref <branch>`, then
+  read `Rust tests (Linux)`. A branch without a PR uses no macOS runner; every
+  push to an open PR also starts the macOS `Rust contracts` job, so open the PR
+  (or push to it) when the change is ready for that run. Build locally only when
+  no CI path works: one changed crate, one build at a time, on an idle machine,
+  and say why in your report. A Linux green is fast feedback, not Mac evidence;
+  the macOS `Rust contracts` job stays the merge gate.
 - CI runs on pull requests. Push to the PR branch; do not also start Public CI by
   hand on a branch whose PR is open and mergeable. GitHub starts no pull-request
   run while a PR has merge conflicts (`gh pr view <n> --json mergeable`): rebase
@@ -42,6 +52,7 @@
   advisory audit`, `Dependency review`), and squash-merges exactly that head.
   `main`'s ruleset also requires `Rust contracts`. `gh pr checks` exit 0 is not
   evidence, and no Linux job stands in for the macOS `Rust contracts` job.
+- The guard also works when `main` has a merge queue: it enqueues the PR and waits for the merge.
 - The author merges its own reviewed, green, mergeable PR; no merge window, slot
   or extra approval is needed. Wait only for a real dependency or conflict, an
   explicit dated hold, or an announced release freeze.
