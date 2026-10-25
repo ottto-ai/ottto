@@ -38129,7 +38129,8 @@ fn ensure_bounded_traversal(
         // Use the graph-free accepted path for large non-window retries. Its
         // refusal leaves the old red checkpoint and all pending/fingerprints
         // intact; uncovered history must never turn a memory limit into reads.
-        let streaming_carry = stale_pending_roots.len() >= 512
+        let streaming_carry = window_scratch_admitted
+            && stale_pending_roots.len() >= 512
             && scoped_retry_allowed
             && full_rearm_window_roots.is_empty()
             && index.claude_full_rearm_progress.full_rearm_window.is_none()

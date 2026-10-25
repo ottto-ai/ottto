@@ -3522,6 +3522,32 @@ fn scaled_accepted_history_carries_6356_families_through_retry_deadline_expiry()
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(scoped_retry_full_reads(&fixture.index, &held_candidates), 1);
+    // A refused Fix 2 window remains BASE. Dropping its over-budget window
+    // scratch must not accidentally make it look like a non-window retry.
+    let context = fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .context_fingerprint
+        .clone();
+    fixture.index.claude_full_rearm_progress.full_rearm_window = Some(ClaudeFullRearmWindow {
+        context_fingerprint: context,
+        process: claude_full_rearm_process(),
+        window_ends: BTreeSet::from([CARRY_FAILED.to_string()]),
+        member_digests: BTreeMap::new(),
+    });
+    let row = carry_start(
+        &mut fixture.index,
+        "2026-08-03T08:32:00Z",
+        BACKFILL_WINDOW_DAYS,
+    );
+    assert_eq!(row["carried_pending_families"], 0);
+    assert!(healthy
+        .iter()
+        .all(|c| fixture.index.files[&local_index_key(&c.path)]
+            .source_file_fingerprint
+            .is_empty()));
 }
 
 #[test]
