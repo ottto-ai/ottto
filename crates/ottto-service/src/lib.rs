@@ -5177,9 +5177,12 @@ mod tests {
             (OTTTO_KEYCHAIN_ACCOUNT, synthetic_control_token),
             (OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, synthetic_relay_secret),
         ] {
-            ottto_core::token_store::FileControlTokenStore::new(secrets.join(account))
-                .save(value)
-                .expect("save synthetic diagnostic secret");
+            // Fully qualified: the trait import above is macOS-only.
+            ottto_core::ControlTokenStore::save(
+                &ottto_core::token_store::FileControlTokenStore::new(secrets.join(account)),
+                value,
+            )
+            .expect("save synthetic diagnostic secret");
         }
         let daemon = daemon();
         let bundle = daemon
