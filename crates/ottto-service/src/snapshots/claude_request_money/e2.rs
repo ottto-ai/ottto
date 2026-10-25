@@ -429,7 +429,7 @@ impl FileFold {
                 ))
     }
 
-    fn is_skipped(&self, sequence: u64) -> bool {
+    pub(crate) fn is_skipped(&self, sequence: u64) -> bool {
         let at = self.skipped.partition_point(|(_, end)| *end <= sequence);
         self.skipped
             .get(at)
@@ -474,7 +474,7 @@ impl FileFold {
             return;
         };
         let account = self.accounts.as_mut().and_then(|accounts| {
-            accounts.observe(response.sequence);
+            accounts.observe(response.sequence, copied == Some(true));
             accounts.account(response.sequence)
         });
         let tokens = ClaudeMoneyTokens::from_usage(&response.usage);
@@ -526,6 +526,9 @@ impl FileFold {
         }
         let copy = std::mem::take(&mut self.copy);
         self.entity.absorb_grains(&copy);
+        if let Some(accounts) = self.accounts.as_deref_mut() {
+            accounts.restore_copies();
+        }
         self.entity.removed = Default::default();
         self.entity.removed_requests = 0;
         self.skipped.clear();
@@ -980,7 +983,7 @@ pub(crate) fn side_calls_page(
                 row.cost_usd_micros,
                 Some(origin),
                 rfc3339_unix_nanos(&row.observed_at),
-                fold.accounts.as_ref().and_then(|a| a.starting.clone()),
+                fold.accounts.as_ref().and_then(|a| a.fallback.clone()),
             );
             fold.side.add(&tokens);
             fold.side_requests += 1;
