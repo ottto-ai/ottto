@@ -36,8 +36,10 @@ checkpoint round trip between fresh and ordinary service. A separate scheduling
 check covers permission-only changes and identical-content inode replacement.
 Existing carry tests retain their explicit ordinary-page premise.
 
-Pages whose queued population fits the file allowance and a conservative
-full-read-plus-samples byte estimate keep ordinary scheduling. A small repair
+Pages whose queued population fits the file allowance and the singleton byte
+estimate keep ordinary scheduling. As in the page budget plan, a file larger
+than the singleton allowance is cursor work with its own budget and is not
+counted; an indexed file also counts one sample pair for its memo check. A small repair
 or projection-adoption page therefore continues to service its fitting sibling
 in the same page. This estimate changes scheduling only, never read admission
 or the actual byte accounting.

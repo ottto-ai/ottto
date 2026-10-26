@@ -24814,7 +24814,7 @@ impl OwnedSourceScan {
                 .pending_candidates
                 .iter()
                 .any(|candidate| codex_fresh_data_pending(candidate, &index.files))
-            && codex_selection_may_exhaust_page(traversal, selection_limit);
+            && codex_selection_may_exhaust_page(traversal, selection_limit, &index.files);
         let census_page = source == SnapshotSource::Codex
             && continuation.is_none()
             && selection_limit > 0
@@ -39192,12 +39192,16 @@ fn ensure_bounded_traversal(
 
 /// Keep fitting pages together. Dedicated scheduling is only useful when
 /// the queued population could spend the file or singleton byte allowance.
-/// This conservative full-read estimate includes one existing sample pair
-/// per candidate; it never grants a read or increases a budget. Metadata
-/// failure keeps the ordinary path and its existing error handling.
+/// The estimate mirrors `PageBudget::plan`: a file larger than the singleton
+/// allowance is cursor work with its own per-page budget, so it cannot spend
+/// this one. Each indexed singleton also counts one sample pair for its memo
+/// check. It never grants a read or increases a budget; an underestimate
+/// only defers a file to the next page. Metadata failure keeps the ordinary
+/// path and its existing error handling.
 fn codex_selection_may_exhaust_page(
     traversal: &ScanTraversalCheckpoint,
     file_limit: usize,
+    files: &BTreeMap<String, ScanIndexEntry>,
 ) -> bool {
     if traversal.pending_candidates.len() > file_limit {
         return true;
@@ -39208,12 +39212,17 @@ fn codex_selection_may_exhaust_page(
         let Ok(metadata) = fs::symlink_metadata(&candidate.path) else {
             continue;
         };
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > byte_limit {
             continue;
         }
+        let samples = if files.contains_key(&local_index_key(&candidate.path)) {
+            sampled_scan::codex_cursor::SAMPLE_READ_BYTES
+        } else {
+            0
+        };
         expected = expected
             .saturating_add(metadata.len())
-            .saturating_add(sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+            .saturating_add(samples);
         if expected > byte_limit {
             return true;
         }
