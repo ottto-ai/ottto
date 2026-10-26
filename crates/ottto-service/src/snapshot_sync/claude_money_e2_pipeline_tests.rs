@@ -737,6 +737,56 @@ fn e2_pipeline_twins_copy_discovered_first() {
     twins(true);
 }
 
+/// R1: each walk meets both path twins, but a settled twin does not pull its
+/// family into the page. Only a twin the page reads does; otherwise the
+/// family is read again and one batch is sent on every walk.
+#[test]
+fn e2_pipeline_settled_twins_are_not_read_again() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-twins-settled");
+        c.write_at(
+            &format!("a-original/{ROOT}.jsonl"),
+            &line(ROOT, "r1", AT, 10),
+            "2026-08-02T07:00:00Z",
+        );
+        c.write_at(
+            &format!("z-copy/{ROOT}.jsonl"),
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut index = ScanIndex::default();
+        let mut pages = Vec::new();
+        for _ in 0..4 {
+            let mut page = c.raw(&scanner, index, 100, false, &[]);
+            page.enrich(&c);
+            page.finish();
+            if !page.scan.snapshots.is_empty() {
+                let mut progress = e2_progress();
+                let (result, _, _) = upload(&page.scan.snapshots, &mut progress, ack);
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                page.index
+                    .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+            }
+            pages.push((
+                page.scan.scanned_file_count,
+                page.scan.snapshots.len(),
+                page.scan.census_complete,
+            ));
+            index = c.reload(&mut page.index);
+        }
+        assert_eq!(pages[0].0, 2, "the first walk reads both twins: {pages:?}");
+        assert_eq!(
+            pages[2..]
+                .iter()
+                .map(|page| (page.0, page.1))
+                .collect::<Vec<_>>(),
+            [(0, 0), (0, 0)],
+            "settled twins are not read again: {pages:?}"
+        );
+    });
+}
+
 #[test]
 fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
     with_e2(|| {
