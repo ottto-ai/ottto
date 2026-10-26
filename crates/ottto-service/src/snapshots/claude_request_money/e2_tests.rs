@@ -759,25 +759,7 @@ fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory(
             (vec![p.parent().unwrap().join("other-session")], false),
             (vec![], false),
         ] {
-            let mut index = ScanIndex::default();
-            index.traversal = Some(
-                serde_json::from_value(json!({
-                    "context_fingerprint": "side-wait",
-                    "census_window_end": "2026-01-01T00:00:00Z",
-                    "scan_roots": [],
-                    "pending_directories": queued
-                        .iter()
-                        .map(|path| json!({"scan_root": "/", "path": path}))
-                        .collect::<Vec<_>>(),
-                    "pending_candidates": [],
-                    "observed_index_keys": [],
-                    "reconciliation_upper_bound": null,
-                    "reconciliation_after": null,
-                    "reconciliation_started": false,
-                    "counts": {},
-                }))
-                .unwrap(),
-            );
+            let index = queued_traversal(&queued, &[]);
             let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
             attach_page(&mut items, &read);
             let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
@@ -793,6 +775,94 @@ fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory(
         }
         let _ = fs::remove_dir_all(p.parent().unwrap());
     });
+}
+
+fn queued_traversal(queued: &[PathBuf], candidates: &[PathBuf]) -> ScanIndex {
+    let paths = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|path| json!({"scan_root": "/", "path": path}))
+            .collect::<Vec<_>>()
+    };
+    let mut index = ScanIndex::default();
+    index.traversal = Some(
+        serde_json::from_value(json!({
+            "context_fingerprint": "queued",
+            "census_window_end": "2026-01-01T00:00:00Z",
+            "scan_roots": [],
+            "pending_directories": paths(queued),
+            "pending_candidates": paths(candidates),
+            "observed_index_keys": [],
+            "reconciliation_upper_bound": null,
+            "reconciliation_after": null,
+            "reconciliation_started": false,
+            "counts": {},
+        }))
+        .unwrap(),
+    );
+    index
+}
+
+#[test]
+fn e2_dark_leaves_an_undiscovered_members_side_call_to_the_member() {
+    // Dark keeps the reference selection, so the root can be on a page before
+    // its family directory is listed. It neither holds nor counts the row the
+    // trace names for an undiscovered member: the gate would have deferred
+    // the root, and the member counts the row when read.
+    let p = root_file("side-wait-dark");
+    let family = p.parent().unwrap().join(ROOT);
+    let read = sidecar(&[row("r", 1, 10), row("named", 4, 40)]);
+    let trace = ClaudeTraceOwnershipLoadReport {
+        evidence: BTreeMap::from([(
+            ROOT.to_owned(),
+            vec![complete_trace_row(ROOT, "named", "abc")],
+        )]),
+        ..Default::default()
+    };
+    let index = queued_traversal(&[family], &[]);
+    let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
+    attach_page(&mut items, &read);
+    let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
+    let root = fold(&items[0]);
+    assert!(unresolved.is_empty());
+    assert!(!root.entity.held);
+    assert!(root.telemetry.side_calls_done);
+    assert_eq!((root.side_requests, root.root_fallbacks), (0, 0));
+    let _ = fs::remove_dir_all(p.parent().unwrap());
+}
+
+#[test]
+fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
+    let project = PathBuf::from("/projects/p");
+    let waiting = project.join(format!("{ROOT}.jsonl"));
+    let listed = project.join("3338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+    let member = project.join(ROOT).join("subagents/agent-abc.jsonl");
+    let behind = project.join("behind.jsonl");
+    let mut index = queued_traversal(&[project.join(ROOT).join("subagents")], &[behind.clone()]);
+    let mut traversal = index.traversal.take().unwrap();
+    let mut selected = [&waiting, &listed, &member]
+        .into_iter()
+        .map(|path| serde_json::from_value(json!({"scan_root": "/", "path": path})).unwrap())
+        .collect::<Vec<ScanTraversalPath>>();
+    defer_roots_of_queued_families(&mut selected, &mut traversal);
+    fn paths<'a>(candidates: impl IntoIterator<Item = &'a ScanTraversalPath>) -> Vec<PathBuf> {
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.path.clone())
+            .collect()
+    }
+    // The member and the root with no queued family stay; the deferred root
+    // is read next, ahead of the queue.
+    assert_eq!(paths(&selected), vec![listed.clone(), member]);
+    assert_eq!(
+        paths(&traversal.pending_candidates),
+        vec![waiting.clone(), behind]
+    );
+    // Once the walk lists the directory nothing is deferred.
+    traversal.pending_directories.clear();
+    let mut again = vec![traversal.pending_candidates.pop_front().unwrap()];
+    defer_roots_of_queued_families(&mut again, &mut traversal);
+    assert_eq!(paths(&again), vec![waiting]);
 }
 
 #[test]

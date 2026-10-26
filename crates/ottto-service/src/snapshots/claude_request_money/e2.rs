@@ -15,8 +15,8 @@ use super::super::{
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,
     claude_snapshot_family_root_ref, claude_trace_evidence_fingerprint_is_valid,
     claude_trace_owner_session_id, local_index_key, rfc3339_unix_nanos, validate_claude_api_row,
-    ClaudeTranscriptUsageOccurrence, PlacedClaudeUsage, RowKey, ScanIndex, SelectorCapture,
-    SnapshotItem, UsageTotals,
+    ClaudeTranscriptUsageOccurrence, PlacedClaudeUsage, RowKey, ScanIndex, ScanTraversalCheckpoint,
+    ScanTraversalPath, SelectorCapture, SnapshotItem, UsageTotals,
 };
 use super::body::{reported_inputs, ClaudeGrainSide, ClaudeLiveKey, ClaudeRequestUsageOrigin};
 use super::ClaudeMoneyTokens;
@@ -27,7 +27,7 @@ use crate::claude_local_otel::{
 use crate::telemetry_attach::{join, Attachment, DisclosureReason, Holders};
 use serde::Serialize;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1990,13 +1990,17 @@ pub(crate) fn side_calls_page(
             {
                 // The walk has not listed the family's directory yet: the
                 // member's transcript may still turn up and count it, so the
-                // root counting it now would count it twice. Wait (held); once
-                // listed, a member still without a transcript falls back.
+                // root counting it now would count it twice. Gate on, the root
+                // was deferred at selection, so this is a backstop: wait
+                // (held); once listed, a member still without a transcript
+                // falls back. Dark (the reference selection) leaves the row
+                // to the member, as the gate would.
                 if queued
                     .get_or_init(|| queued_directory_names(index))
                     .contains(root.as_str())
                 {
                     waiting = true;
+                    diag("side_call_undiscovered", 1);
                     continue;
                 }
                 owner = root.as_str();
@@ -2066,7 +2070,7 @@ pub(crate) fn side_calls_page(
                 fold.root_fallbacks += 1;
             }
         }
-        if waiting {
+        if waiting && enabled() {
             // The root's session is withheld (re-read on a later page, once
             // the walk lists the directory) and its owed history waits too.
             if let Some(&at) = targets.get(root.as_str()) {
@@ -2094,14 +2098,48 @@ pub(crate) fn side_calls_page(
 fn queued_directory_names(index: &ScanIndex) -> BTreeSet<String> {
     index
         .traversal
+        .as_ref()
+        .map(|traversal| directory_names(&traversal.pending_directories))
+        .unwrap_or_default()
+}
+
+fn directory_names(queued: &VecDeque<ScanTraversalPath>) -> BTreeSet<String> {
+    queued
         .iter()
-        .flat_map(|traversal| traversal.pending_directories.iter())
         .flat_map(|directory| directory.path.components())
         .filter_map(|component| match component {
             std::path::Component::Normal(name) => name.to_str().map(str::to_owned),
             _ => None,
         })
         .collect()
+}
+
+/// Gate on: a root file whose family directory the walk still queues goes
+/// back to the front of the queue for a later page. Its members are not
+/// discovered yet, so a side call their telemetry names could only wait
+/// (`side_calls_page` holds the root, and a held upload costs the sweep a
+/// full re-read) or count at the root, then again at the member. Deferring
+/// costs nothing: the walk lists the directory within its budgeted pages.
+/// Dark keeps the reference selection.
+pub(in crate::snapshots) fn defer_roots_of_queued_families(
+    selected: &mut Vec<ScanTraversalPath>,
+    traversal: &mut ScanTraversalCheckpoint,
+) {
+    if traversal.pending_directories.is_empty() {
+        return;
+    }
+    let queued = directory_names(&traversal.pending_directories);
+    let (deferred, kept): (Vec<_>, Vec<_>) =
+        std::mem::take(selected).into_iter().partition(|candidate| {
+            claude_index_path_member_ref(&candidate.path).is_some_and(|member| {
+                member.subagent_stem.is_none() && queued.contains(member.root)
+            })
+        });
+    *selected = kept;
+    diag("deferred_root_queued_family", deferred.len() as u64);
+    for candidate in deferred.into_iter().rev() {
+        traversal.pending_candidates.push_front(candidate);
+    }
 }
 
 /// The family members of `root` this traversal observed but has not indexed.

@@ -24928,6 +24928,9 @@ impl OwnedSourceScan {
             pending_paths.extend(members);
             pending_paths.extend(rereads);
         }
+        if source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled() {
+            claude_request_money::e2::defer_roots_of_queued_families(&mut pending_paths, traversal);
+        }
         index.resume_census_window_end = Some(census_window_end.clone());
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let mut census = ScanCensus::default();
