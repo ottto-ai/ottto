@@ -318,6 +318,9 @@ pub(crate) struct ClaudeEntityBody {
     pub(crate) resolver_conflicts: u64,
     pub(crate) held: bool,
     pub(crate) certificate_ok: bool,
+    // False proves both live maps have never allocated. Empty live maps
+    // retain their conservative root charge after a removal.
+    pub(super) live_maps_initialized: bool,
     pub(crate) activity_unix: u64,
     pub(crate) activity_nanos: i128,
     /// Gate off: what the trial receipt and the counters read, in place of
@@ -335,6 +338,7 @@ impl Default for ClaudeEntityBody {
             resolver_conflicts: 0,
             held: false,
             certificate_ok: true,
+            live_maps_initialized: false,
             activity_unix: 0,
             activity_nanos: 0,
             dark: DarkTally::default(),
@@ -358,6 +362,7 @@ impl ClaudeEntityBody {
             self.dark.add(hour, tokens, requests, cost);
             return;
         }
+        self.live_maps_initialized = true;
         if let Some(at) = at {
             self.note_activity(&key.0, at, at);
         }
@@ -367,6 +372,7 @@ impl ClaudeEntityBody {
             .add(tokens, requests, cost);
     }
     fn note_activity(&mut self, bucket: &str, first: i128, last: i128) {
+        self.live_maps_initialized = true;
         match self.bucket_activity.get_mut(bucket) {
             Some(bounds) => {
                 bounds.0 = bounds.0.min(first);
@@ -390,6 +396,7 @@ impl ClaudeEntityBody {
         }
     }
     fn map_accounts(&mut self, mut place: impl FnMut(AccountPartition) -> AccountPartition) {
+        self.live_maps_initialized |= !self.grains.is_empty();
         let grains = std::mem::take(&mut self.grains);
         for ((key, origin, account), grain) in grains {
             Self::merge_grain(
@@ -410,6 +417,7 @@ impl ClaudeEntityBody {
 
     /// Grains and their activity only (a held copy moving back to counted).
     fn absorb_grains(&mut self, other: &Self) {
+        self.live_maps_initialized |= !other.grains.is_empty() || !other.bucket_activity.is_empty();
         for (key, grain) in &other.grains {
             let into = self.grains.entry(key.clone()).or_default();
             Self::merge_grain(into, grain);
@@ -474,6 +482,7 @@ impl ClaudeEntityBody {
             return bucket_hour(&slot.0 .0)
                 .is_some_and(|hour| self.dark.take(hour, tokens, requests));
         };
+        self.live_maps_initialized = true;
         let (Some(left), Some(left_requests)) = (
             grain.tokens.checked_sub(tokens),
             grain.requests.checked_sub(requests),
@@ -585,7 +594,41 @@ fn hour_key(timestamp: &str) -> Option<ClaudeLiveKey> {
     let (bucket, _) = super::super::activity_bucket_from_timestamp(timestamp)?;
     Some((bucket, String::new(), BTreeMap::new()))
 }
-money_heap_fields!(ClaudeEntityBody; inline: [removed, removed_requests, telemetry_owned_complete, resolver_conflicts, held, certificate_ok, activity_unix, activity_nanos]; heap: [grains, bucket_activity, dark]);
+// A never-initialized live map cannot have a retained empty root. Charging
+// fictitious roots here makes a dark file exceed the native finish budget.
+// Initialized maps keep the ordinary conservative bound even after emptying.
+macro_rules! entity_heap_method {
+    ($method:ident) => {
+        fn $method(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+            let Self {
+                grains,
+                bucket_activity,
+                dark,
+                live_maps_initialized,
+                removed: _,
+                removed_requests: _,
+                telemetry_owned_complete: _,
+                resolver_conflicts: _,
+                held: _,
+                certificate_ok: _,
+                activity_unix: _,
+                activity_nanos: _,
+            } = self;
+            // Nonempty maps remain charged even for synthetic test entities
+            // whose fields were populated directly.
+            if *live_maps_initialized || !grains.is_empty() || !bucket_activity.is_empty() {
+                crate::heap_layout_bound::HeapLayoutBound::$method(grains, c)?;
+                crate::heap_layout_bound::HeapLayoutBound::$method(bucket_activity, c)?;
+            }
+            crate::heap_layout_bound::HeapLayoutBound::$method(dark, c)
+        }
+    };
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeEntityBody {
+    const STABLE_HEAP: bool = true;
+    entity_heap_method!(heap_bound);
+    entity_heap_method!(completed_heap_bound);
+}
 // Existing grain types were inline P1 values; E retains only the aggregate.
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeGrainSide {
     const INLINE_ONLY: bool = true;
