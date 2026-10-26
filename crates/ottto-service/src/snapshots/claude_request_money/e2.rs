@@ -50,6 +50,12 @@ pub(crate) fn enabled() -> bool {
 }
 #[cfg(test)]
 thread_local! { static ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+/// Force the gate on this thread (None: the shipped `GATE`); returns the
+/// previous setting, for guards that restore it on drop.
+#[cfg(test)]
+pub(crate) fn replace_gate_for_test(on: Option<bool>) -> Option<bool> {
+    ENABLED.with(|v| v.replace(on))
+}
 #[cfg(test)]
 fn with_gate_for_test<T>(on: bool, f: impl FnOnce() -> T) -> T {
     struct Reset(Option<bool>);

@@ -181,6 +181,22 @@ impl HistoryFixture {
         cycle: HistoryCycle<'_>,
         before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
     ) -> HistoryOutcome {
+        // A cycle below revision 3 stands in for a daemon from before the
+        // switch-on, whose E2 gate was off (the flip raised both together).
+        if cycle.revision < 3 {
+            return crate::snapshots::claude_request_money::e2::with_disabled(|| {
+                self.cycle_at_gate(collected_at, cycle, before_evidence)
+            });
+        }
+        self.cycle_at_gate(collected_at, cycle, before_evidence)
+    }
+
+    fn cycle_at_gate(
+        &self,
+        collected_at: &str,
+        cycle: HistoryCycle<'_>,
+        before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
+    ) -> HistoryOutcome {
         let destination = cycle.destination.unwrap_or(HISTORY_DESTINATION);
         let index_path = self.index_path_for(cycle.destination);
         let (mut index, origin) = ScanIndex::load_for_snapshot_source_with_origin(

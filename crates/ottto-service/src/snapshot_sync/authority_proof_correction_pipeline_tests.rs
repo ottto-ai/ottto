@@ -453,6 +453,14 @@ impl ApcFixture {
 
     /// One page through the production stage order of `finish_sync_source`.
     fn page(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
+        // Ordinary transcripts: each file exists before its records (E2).
+        crate::snapshots::claude_request_money::e2::with_fixture_birth(
+            1_785_628_800_000_000_000, // 2026-08-02T00:00:00Z
+            || self.page_born(collected_at, upload),
+        )
+    }
+
+    fn page_born(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
         let before_bytes = std::fs::read(&self.index_path).unwrap_or_default();
         let before = ScanIndex::load(&self.index_path).expect("load scan index");
         let mut index = before.clone();

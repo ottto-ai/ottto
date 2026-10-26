@@ -400,14 +400,17 @@ static SHADOW_ENABLED_FOR_TEST: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Tests opt in per support directory (tests run in parallel); production
 /// always runs the shadow.
+/// The P1 shadow is the gate-off design: an armed test runs with the E2
+/// gate off on its thread (PR D deletes both).
 #[cfg(test)]
 #[must_use = "keep the guard alive until the test finishes using the shadow"]
-pub(crate) struct ShadowTestGuard(PathBuf);
+pub(crate) struct ShadowTestGuard(PathBuf, Option<bool>);
 
 #[cfg(test)]
 impl Drop for ShadowTestGuard {
     fn drop(&mut self) {
         disable_shadow_for_test(&self.0);
+        e2::replace_gate_for_test(self.1);
     }
 }
 
@@ -418,7 +421,10 @@ pub(crate) fn enable_shadow_for_test(support_dir: &Path) -> ShadowTestGuard {
         .lock()
         .expect("shadow control")
         .push(support_dir.to_path_buf());
-    ShadowTestGuard(support_dir.to_path_buf())
+    ShadowTestGuard(
+        support_dir.to_path_buf(),
+        e2::replace_gate_for_test(Some(false)),
+    )
 }
 
 /// Panic-safe cleanup for a synthetic shadow scope. This does not arm it;
