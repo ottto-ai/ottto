@@ -1027,9 +1027,11 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         (counts.matched, counts.unheld, counts.disclosed),
         (MEMBERS, ROWS - MEMBERS, 0)
     );
-    // The optimized target is 20 ms; portable debug CI gets scheduling and
-    // instrumentation margin. Fingerprints/row placement are timed below.
-    let join_budget = Duration::from_millis(if cfg!(debug_assertions) { 500 } else { 20 });
+    // The optimized target is 20 ms. The debug budget is only a flaky-timing
+    // guard against gross regressions (shared Linux runners measured 182-507
+    // ms), not a correctness assertion: the real gate is the optimized Mac
+    // benchmark. Fingerprints/row placement are timed below.
+    let join_budget = Duration::from_millis(if cfg!(debug_assertions) { 2_000 } else { 20 });
     assert!(
         join_time < join_budget,
         "family membership/join took {join_time:?}"
@@ -1747,6 +1749,47 @@ fn e2_identity_conflicting_markers_on_one_request_fall_back_without_splitting() 
         assert_eq!(
             item.request_evidence[0].provider_workspace_hash.as_deref(),
             Some(org_hash(ORG_A).as_str())
+        );
+        assert_evidence_referenced(&item);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_mid_session_request_with_two_orgs_goes_to_the_starting_account() {
+    // R3-N2 (QUOTA): two different trusted orgs on one later request are
+    // never guessed (neither the first nor the last); the request goes to
+    // the starting account, counted, and a later markerless request inherits it.
+    const ORG_C: &str = "33333333-3333-4333-8333-333333333333";
+    with_enabled(|| {
+        let path = root_file("identity-mid-session-pair");
+        let index = ScanIndex::default();
+        let item = tag_owned(
+            vec![parse(
+                &path,
+                Some(t0()),
+                &index,
+                &[
+                    org_marker(ORG_A),
+                    line("a", &at(1), 10),
+                    switch_context(),
+                    org_marker(ORG_B),
+                    switch_context(),
+                    org_marker(ORG_C),
+                    line("b", &at(2), 20),
+                    line("c", &at(3), 30),
+                ],
+            )],
+            &index,
+        )
+        .remove(0);
+        assert_eq!((item.request_count, item.input_tokens), (3, 60));
+        let accounts = fold(&item).accounts.as_ref().unwrap();
+        assert!(accounts.conflict, "the pair is counted as a conflict");
+        assert!(!accounts.mixed);
+        assert_eq!(
+            org_amounts(&item),
+            BTreeMap::from([(org_hash(ORG_A), (60, 3))])
         );
         assert_evidence_referenced(&item);
         cleanup(&[&path]);

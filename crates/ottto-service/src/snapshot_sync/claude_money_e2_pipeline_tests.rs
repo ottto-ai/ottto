@@ -1425,6 +1425,45 @@ fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
     });
 }
 
+#[test]
+fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-branch-orphan");
+        // The original was deleted before it was ever read: no indexed
+        // earlier holder exists, so the all-copied branch is counted once
+        // in its own session and disclosed, never dropped.
+        let original = c.root(ROOT, &line(ROOT, "original", AT, 10));
+        std::fs::remove_file(&original).unwrap();
+        c.births.remove(&original);
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "original", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let p = ready(
+            &c,
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            false,
+        );
+        literal(&p);
+        assert_eq!(p.scan.snapshots.len(), 1);
+        let copy = &p.scan.snapshots[0];
+        assert_eq!(copy.source_session_id, COPY);
+        assert_eq!(
+            (copy.request_count, copy.input_tokens, copy.output_tokens),
+            (1, 10, 10),
+            "an orphan copy is counted once"
+        );
+        assert_eq!(copy.removed_request_count, Some(0));
+        assert!(
+            e2::pipeline_test_observer::disclosed(&p.scan.snapshots) > 0,
+            "an orphan copy is disclosed"
+        );
+    });
+}
+
 fn restored_twins(reverse: bool, equal: bool) {
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-restored-{reverse}-{equal}"));

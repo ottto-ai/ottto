@@ -595,11 +595,14 @@ impl FileFold {
     /// with a writer certificate from the file's OWN post-birth lines; an
     /// all-pre-birth file also needs known response writers and a PROVEN
     /// earlier original (stored birth, deterministic equal-birth order), so twins never
-    /// delete each other. Everything else counts and discloses.
+    /// delete each other: a same-session path, or for a main file another
+    /// session's indexed main file holding every request id (/branch).
+    /// Everything else counts and discloses.
     pub(in crate::snapshots) fn finish_native(
         &mut self,
         context: Option<&ReadContext<'_>>,
         markers: Option<&claude_request_identity::OrgMarkers>,
+        request_ids: &BTreeSet<String>,
     ) {
         if self.money_birth.uncertain_root() {
             self.disclosed += self.responses; // unknown birth: counted, disclosed
@@ -622,7 +625,9 @@ impl FileFold {
                 })
             });
         let keep = self.money_birth.writer_certified(self.first_own)
-            && (!needs_original || self.original_witness(context));
+            && (!needs_original
+                || self.original_witness(context)
+                || self.cross_session_original(context, request_ids));
         if keep {
             self.finish_identity_start(true, markers);
             self.copy = Default::default();
@@ -674,6 +679,56 @@ impl FileFold {
                 context.live(&member, location)
             })
             .is_some()
+    }
+
+    /// Owner ruling (/branch, --fork-session): an all-pre-birth MAIN file is
+    /// a copy when every request id it holds is held by another indexed main
+    /// file of earlier (effective birth, location), found with the census
+    /// holder walk side calls use. Only this rare shape walks; no new index
+    /// or reader. No earlier holder (an orphan copy, its original gone) or
+    /// the walk deadline: counted once here and disclosed (COST).
+    fn cross_session_original(
+        &self,
+        context: Option<&ReadContext<'_>>,
+        request_ids: &BTreeSet<String>,
+    ) -> bool {
+        let (Some(context), Some(physical), Some(Located(here)), None) =
+            (context, self.physical, self.location, self.first_own)
+        else {
+            return false;
+        };
+        if request_ids.is_empty()
+            || !claude_index_path_member_ref(context.path)
+                .is_some_and(|member| member.subagent_stem.is_none())
+        {
+            return false;
+        }
+        let own_key = local_index_key(context.path);
+        let current = (
+            self.money_birth
+                .birth_nanos()
+                .map_or(physical, |b| b.min(physical)),
+            here,
+        );
+        let mut wanted = request_ids
+            .iter()
+            .map(|request_id| claude_request_hash(request_id))
+            .collect::<Vec<_>>();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let store = &context.index.claude_money_birth_store;
+        let earlier = |key: &str| {
+            key != own_key
+                && context.index.files.contains_key(key)
+                && session_member(Path::new(key))
+                    .and_then(|member| store.effective_cutoff(&member, key))
+                    .is_some_and(|birth| (birth, location_key(key)) < current)
+        };
+        context
+            .index
+            .claude_request_census
+            .main_transcript_holders(&wanted, earlier, Instant::now() + SIDE_CALL_DEADLINE)
+            .is_some_and(|held| held.len() == wanted.len())
     }
 
     /// Unmatched counted requests in hours telemetry should have reported:

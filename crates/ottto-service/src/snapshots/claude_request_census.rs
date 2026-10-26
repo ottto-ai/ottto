@@ -732,6 +732,18 @@ pub(crate) struct ClaudeFamilyHolders {
     pub(crate) members: BTreeSet<String>,
 }
 
+/// The sorted unique `candidates` a transcript record holds.
+fn held_candidates<'a>(
+    record: &'a ClaudeRequestCensusRecord,
+    candidates: &'a [u64],
+) -> impl Iterator<Item = u64> + 'a {
+    record
+        .request_hashes()
+        .iter()
+        .copied()
+        .filter(move |hash| candidates.binary_search(hash).is_ok())
+}
+
 /// Why an insert did not store the record as given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeRequestCensusInsert {
@@ -849,31 +861,69 @@ impl ClaudeRequestCensus {
         if wanted.is_empty() {
             return Some(found);
         }
-        for (position, (key, record)) in self.records().enumerate() {
-            if position % 256 == 255 && std::time::Instant::now() >= deadline {
-                return None;
-            }
-            let Some(member) = super::claude_index_path_member_ref(Path::new(key)) else {
-                continue;
-            };
+        self.walk_transcript_holders(deadline, |_, member, record| {
             let Some(candidates) = wanted.get(member.root) else {
-                continue;
+                return;
             };
             if !found.contains_key(member.root) {
                 found.insert(member.root.to_owned(), ClaudeFamilyHolders::default());
             }
             let Some(family) = found.get_mut(member.root) else {
-                continue;
+                return;
             };
-            family.held.extend(
-                record
-                    .request_hashes()
-                    .iter()
-                    .filter(|hash| candidates.binary_search(hash).is_ok()),
-            );
+            family.held.extend(held_candidates(record, candidates));
             family.members.insert(member.into_owned().1);
-        }
+        })?;
         Some(found)
+    }
+
+    /// E2 all-pre-birth main files: which of the sorted unique `wanted`
+    /// hashes a MAIN transcript record (never a subagent) holds whose key
+    /// `admit` accepts (the caller: indexed, earlier birth, not itself). The
+    /// same walk as `family_transcript_holders`, across families. None when
+    /// `deadline` passes: the caller counts and discloses.
+    pub(crate) fn main_transcript_holders(
+        &self,
+        wanted: &[u64],
+        mut admit: impl FnMut(&str) -> bool,
+        deadline: std::time::Instant,
+    ) -> Option<BTreeSet<u64>> {
+        let mut held = BTreeSet::new();
+        if wanted.is_empty() {
+            return Some(held);
+        }
+        self.walk_transcript_holders(deadline, |key, member, record| {
+            if member.subagent_stem.is_some() {
+                return;
+            }
+            let mut hits = held_candidates(record, wanted).peekable();
+            if hits.peek().is_some() && admit(key) {
+                held.extend(hits);
+            }
+        })?;
+        Some(held)
+    }
+
+    /// One walk of the transcript records (a borrowed path parse per key).
+    /// None when `deadline` passes (checked every 256 records).
+    fn walk_transcript_holders<'a>(
+        &'a self,
+        deadline: std::time::Instant,
+        mut visit: impl FnMut(
+            &'a str,
+            super::ClaudeIndexPathMemberRef<'a>,
+            &'a ClaudeRequestCensusRecord,
+        ),
+    ) -> Option<()> {
+        for (position, (key, record)) in self.records().enumerate() {
+            if position % 256 == 255 && std::time::Instant::now() >= deadline {
+                return None;
+            }
+            if let Some(member) = super::claude_index_path_member_ref(Path::new(key)) {
+                visit(key, member, record);
+            }
+        }
+        Some(())
     }
 
     /// Heap this census holds, measured: its shared buffers, boxed ledger

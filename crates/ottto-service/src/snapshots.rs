@@ -17874,9 +17874,16 @@ impl SnapshotAccumulator {
         }
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         for response in responses {
+            let capped = response.record_limit_exceeded;
             let Some(mut response) = response.resolve_with(&selectors) else {
                 money.note_resolver_conflict();
-                self.note_dropped_usage();
+                // COST: with the E2 gate on, a resolver conflict is counted
+                // and disclosed on the body (resolver_conflict_count) and the
+                // root publishes; it is not drop residue held for retry. The
+                // record cap stays a hold. Gate off (dark): unchanged.
+                if capped || !claude_request_money::e2::enabled() {
+                    self.note_dropped_usage();
+                }
                 continue;
             };
             let at = response
@@ -18041,7 +18048,11 @@ impl SnapshotAccumulator {
                     .map(|capture| (capture, response.sequence)),
             );
         }
-        money.finish_native(money_context.as_ref(), self.claude_org_markers.as_deref());
+        money.finish_native(
+            money_context.as_ref(),
+            self.claude_org_markers.as_deref(),
+            &self.claude_usage_request_ids,
+        );
         money.fold_us = money_started.elapsed().as_micros() as u64;
         self.claude_money = Some(Box::new(money));
     }

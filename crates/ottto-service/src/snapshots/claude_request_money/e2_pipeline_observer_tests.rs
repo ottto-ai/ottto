@@ -9,3 +9,11 @@ pub(crate) fn root_fallbacks(items: &[SnapshotItem]) -> u64 {
         .map(|fold| fold.root_fallbacks)
         .sum()
 }
+
+pub(crate) fn disclosed(items: &[SnapshotItem]) -> u64 {
+    items
+        .iter()
+        .filter_map(|item| item.claude_money.as_deref())
+        .map(|fold| fold.disclosed)
+        .sum()
+}

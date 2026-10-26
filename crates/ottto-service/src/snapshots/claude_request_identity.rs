@@ -1597,6 +1597,8 @@ pub(crate) fn request_accounts(
     }
     accounts.fallback = accounts.starting.clone();
     accounts.conflict = markers.overflowed;
+    // Positions where one request carries two different orgs (R3-N2).
+    let mut contradicted = Vec::new();
     for marker in markers.entries.iter().filter(own_marker) {
         let Some(org) = marker.org.as_deref().filter(|_| {
             marker.terminal_trusted
@@ -1625,6 +1627,7 @@ pub(crate) fn request_accounts(
             if previous.position == marker.position {
                 if previous.account.as_ref().and_then(|key| key.org.as_deref()) != Some(org) {
                     accounts.conflict = true;
+                    contradicted.push(marker.position);
                 }
                 continue;
             }
@@ -1668,6 +1671,14 @@ pub(crate) fn request_accounts(
             accounts.starting = Some(key.clone());
         }
         accounts.fallback = accounts.starting.clone();
+    }
+    // R3-N2 (QUOTA): a later request carrying two different orgs is never
+    // guessed: it goes to the starting (or bound) account, counted as a
+    // conflict above. A pair at the session start is the start itself.
+    for run in &mut accounts.runs {
+        if run.position > first && contradicted.contains(&run.position) {
+            run.account = accounts.starting.clone();
+        }
     }
     if accounts
         .runs
