@@ -43,25 +43,33 @@ const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
 pub(crate) fn enabled() -> bool {
     #[cfg(test)]
-    {
-        if ENABLED.with(std::cell::Cell::get) {
-            return true;
-        }
+    if let Some(on) = ENABLED.with(std::cell::Cell::get) {
+        return on;
     }
     GATE
 }
 #[cfg(test)]
-thread_local! { static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
-pub(crate) fn with_enabled<T>(f: impl FnOnce() -> T) -> T {
-    struct Reset(bool);
+fn with_gate_for_test<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<bool>);
     impl Drop for Reset {
         fn drop(&mut self) {
             ENABLED.with(|v| v.set(self.0));
         }
     }
-    let _reset = Reset(ENABLED.with(|v| v.replace(true)));
+    let _reset = Reset(ENABLED.with(|v| v.replace(Some(on))));
     f()
+}
+#[cfg(test)]
+pub(crate) fn with_enabled<T>(f: impl FnOnce() -> T) -> T {
+    with_gate_for_test(true, f)
+}
+/// A build from before the switch-on (gate off), e.g. a fixture cycle that
+/// stands in for an older daemon at body-witness revision 1 or 2.
+#[cfg(test)]
+pub(crate) fn with_disabled<T>(f: impl FnOnce() -> T) -> T {
+    with_gate_for_test(false, f)
 }
 
 // Per-stage wall clock for the F3 perf receipt. Test builds only: the
@@ -121,15 +129,14 @@ fn diag_max(key: &'static str, value: u64) {
 /// Benchmark seam (snapshot_sync money_e2_bench_tests). Test builds only.
 #[cfg(test)]
 pub(crate) mod bench_seam {
-    /// Run `run` with the E2 upload gate forced on (`true`) or at its
-    /// shipped default (`false`, dark) for every page `run` drives on this
-    /// thread (the benchmark is single-threaded).
+    /// Run `run` with the E2 upload gate forced on (`true`) or off
+    /// (`false`, dark) for every page `run` drives on this thread (the
+    /// benchmark is single-threaded).
     pub(crate) fn with_gate<T>(on: bool, run: impl FnOnce() -> T) -> T {
         if on {
             super::with_enabled(run)
         } else {
-            assert!(!super::enabled(), "dark means the shipped gate is off");
-            run()
+            super::with_disabled(run)
         }
     }
     /// E2 counter deltas not yet written to a native_collection_page line,
@@ -743,11 +750,12 @@ pub(crate) struct FileFold {
     e2_nanos: u64,
     responses: u64,
     root_fallbacks: u64,
+    side: ClaudeMoneyTokens,
     pub(crate) side_requests: u64,
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
 }
-crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, copied, first_own, ambiguous, disclosed, e2_nanos, responses, root_fallbacks, side_requests, telemetry, accounts);
+crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, copied, first_own, ambiguous, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, telemetry, accounts);
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,
@@ -2311,6 +2319,7 @@ pub(crate) fn side_calls_page(
                     fold.accounts.as_ref().and_then(|a| a.fallback.clone()),
                 )
             });
+            fold.side.add(&tokens);
             fold.side_requests += 1;
             if fallback {
                 fold.root_fallbacks += 1;
