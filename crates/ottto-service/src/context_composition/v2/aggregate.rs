@@ -347,8 +347,13 @@ impl ToolTotals {
     }
 }
 
+type SessionTools = BTreeMap<(Day, Box<str>), (Kind, u64)>;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct SessionTotals {
+    /// Complete forward-only tool attribution; absent on pre-upgrade sessions
+    /// or after a bound is reached. Never reconstruct it by rereading files.
+    pub(super) tools: Option<SessionTools>,
     /// Earliest line of the session's transcripts, unix seconds.
     pub(super) started: Option<i64>,
     pub(super) days: Vec<(Day, Vec<(Kind, u64)>)>,
@@ -375,6 +380,9 @@ impl SessionTotals {
 /// period, the daily rows keep `KEEP_DAYS`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct Aggregate {
+    /// Derived, never persisted: cap additional per-session attribution across
+    /// the scope, including a read's uncommitted delta.
+    pub(super) tracked_tool_rows: usize,
     pub(super) days: BTreeMap<(Day, Kind), Bucket>,
     pub(super) day_parts: BTreeMap<(Day, Slot), Bucket>,
     pub(super) all_parts: BTreeMap<Slot, Bucket>,
@@ -458,6 +466,20 @@ pub(super) struct Sink<'a> {
 }
 
 impl Sink<'_> {
+    fn session_totals(&mut self, session: &str) -> &mut SessionTotals {
+        let track = self.base.sessions.get(session).map_or(
+            self.base.sessions.len() + self.agg.sessions.len() < 256,
+            |totals| totals.tools.is_some(),
+        );
+        self.agg
+            .sessions
+            .entry(session.into())
+            .or_insert_with(|| SessionTotals {
+                tools: track.then(BTreeMap::new),
+                ..SessionTotals::default()
+            })
+    }
+
     fn touch(&mut self, day: Day) {
         self.agg.day_generation.insert(day, self.generation);
     }
@@ -509,10 +531,7 @@ impl Sink<'_> {
                 .entry((item.day, item.slot.kind))
                 .or_default() += item.tokens;
         }
-        self.agg
-            .sessions
-            .entry(item.session.into())
-            .or_default()
+        self.session_totals(item.session)
             .add(item.day, item.slot.kind, item.tokens);
         true
     }
@@ -568,6 +587,24 @@ impl Sink<'_> {
         if tool.is_empty() || !self.window.contains(day) {
             return;
         }
+        let used = self.base.tracked_tool_rows + self.agg.tracked_tool_rows;
+        let totals = self.session_totals(session);
+        let mut added = 0;
+        let mut removed = 0;
+        if let Some(tools) = &mut totals.tools {
+            let key = (day, Box::<str>::from(tool));
+            let new = !tools.contains_key(&key);
+            if tool.chars().count() > 64 || (new && (tools.len() >= 128 || used >= 8192)) {
+                removed = tools.len();
+                totals.tools = None;
+            } else {
+                added = usize::from(new);
+                let entry = tools.entry(key).or_insert((kind, 0));
+                entry.0 = kind;
+                entry.1 += tokens;
+            }
+        }
+        self.agg.tracked_tool_rows = self.agg.tracked_tool_rows + added - removed;
         let calls = u64::from(call);
         let share = self
             .contribution
@@ -599,7 +636,7 @@ impl Sink<'_> {
     pub(super) fn session_start(&mut self, session: &str, ts: Option<i64>) {
         let Some(ts) = ts else { return };
         if self.agg.sessions.contains_key(session) || self.base.sessions.contains_key(session) {
-            let totals = self.agg.sessions.entry(session.into()).or_default();
+            let totals = self.session_totals(session);
             totals.started = Some(totals.started.map_or(ts, |started| started.min(ts)));
         }
     }
@@ -651,7 +688,33 @@ impl Aggregate {
             if totals.days.is_empty() && !self.sessions.contains_key(&session) {
                 continue;
             }
-            let into = self.sessions.entry(session).or_default();
+            let into = self
+                .sessions
+                .entry(session)
+                .or_insert_with(|| SessionTotals {
+                    tools: totals.tools.as_ref().map(|_| BTreeMap::new()),
+                    ..SessionTotals::default()
+                });
+            let old_rows = into.tools.as_ref().map_or(0, BTreeMap::len);
+            match (&mut into.tools, totals.tools) {
+                (Some(into), Some(tools)) => {
+                    for (key, (kind, tokens)) in tools {
+                        let entry = into.entry(key).or_insert((kind, 0));
+                        entry.0 = kind;
+                        entry.1 += tokens;
+                    }
+                }
+                _ => into.tools = None,
+            }
+            if into.tools.as_ref().is_some_and(|tools| tools.len() > 128) {
+                into.tools = None;
+            }
+            let new_rows = into.tools.as_ref().map_or(0, BTreeMap::len);
+            if self.tracked_tool_rows - old_rows + new_rows > 8192 {
+                into.tools = None;
+            }
+            self.tracked_tool_rows =
+                self.tracked_tool_rows - old_rows + into.tools.as_ref().map_or(0, BTreeMap::len);
             if let Some(ts) = totals.started {
                 into.started = Some(into.started.map_or(ts, |started| started.min(ts)));
             }
@@ -721,6 +784,16 @@ impl Aggregate {
             .as_deref()
             .and_then(|session| self.sessions.get_mut(session))
         {
+            if let Some(tools) = &mut totals.tools {
+                let old_rows = tools.len();
+                for (key, (_, tokens)) in &share.tools {
+                    if let Some((_, value)) = tools.get_mut(key) {
+                        *value = value.saturating_sub(*tokens);
+                    }
+                }
+                tools.retain(|_, (_, tokens)| *tokens > 0);
+                self.tracked_tool_rows -= old_rows - tools.len();
+            }
             for ((day, kind), tokens) in &share.sessions {
                 if let Ok(at) = totals.days.binary_search_by_key(day, |row| row.0) {
                     let kinds = &mut totals.days[at].1;
@@ -734,6 +807,7 @@ impl Aggregate {
             }
             totals.days.retain(|(_, kinds)| !kinds.is_empty());
             if totals.days.is_empty() {
+                self.tracked_tool_rows -= totals.tools.as_ref().map_or(0, BTreeMap::len);
                 self.sessions
                     .remove(share.session.as_deref().unwrap_or_default());
             }
@@ -751,9 +825,18 @@ impl Aggregate {
         self.day_tools.retain(|(day, _), _| *day >= period);
         self.tool_sessions.retain(|_, day| *day >= period);
         self.sessions.retain(|_, totals| {
+            if let Some(tools) = &mut totals.tools {
+                tools.retain(|(day, _), _| *day >= floor);
+            }
             totals.days.retain(|(day, _)| *day >= floor);
             !totals.days.is_empty()
         });
+        self.tracked_tool_rows = self
+            .sessions
+            .values()
+            .filter_map(|totals| totals.tools.as_ref())
+            .map(BTreeMap::len)
+            .sum();
         trim_per_day_files(&mut self.day_files, MAX_FILES_PER_DAY);
         trim_by_tokens(&mut self.all_files, MAX_ALL_FILES, |totals| totals.tokens);
         trim_by_tokens(&mut self.all_tools, MAX_ALL_TOOLS, |totals| totals.tokens);
@@ -766,11 +849,17 @@ impl Aggregate {
             .sessions
             .values()
             .map(|totals| {
-                48 + totals
-                    .days
-                    .iter()
-                    .map(|(_, kinds)| 24 + kinds.capacity() * 16)
-                    .sum::<usize>()
+                totals.tools.as_ref().map_or(0, |tools| {
+                    tools
+                        .iter()
+                        .map(|((_, tool), _)| 96 + tool.len())
+                        .sum::<usize>()
+                }) + 48
+                    + totals
+                        .days
+                        .iter()
+                        .map(|(_, kinds)| 24 + kinds.capacity() * 16)
+                        .sum::<usize>()
             })
             .sum();
         (self.days.len()
@@ -858,7 +947,7 @@ impl Serialize for AggregateRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let agg = self.agg;
-        let mut out = serializer.serialize_struct("StoredAggregate", 10)?;
+        let mut out = serializer.serialize_struct("StoredAggregate", 11)?;
         out.serialize_field(
             "days",
             &Rows(|| {
@@ -968,6 +1057,23 @@ impl Serialize for AggregateRef<'_> {
                 })
             }),
         )?;
+        out.serialize_field(
+            "session_tools",
+            &Rows(|| {
+                agg.sessions.iter().filter_map(|(id, totals)| {
+                    totals.tools.as_ref().map(|tools| {
+                        (
+                            &**id,
+                            Rows(move || {
+                                tools.iter().map(|((day, tool), (kind, tokens))| {
+                                    (*day, &**tool, kind.as_str(), *tokens)
+                                })
+                            }),
+                        )
+                    })
+                })
+            }),
+        )?;
         let generations = self.generations.then_some(&agg.day_generation);
         out.serialize_field(
             "day_generation",
@@ -989,6 +1095,7 @@ type PartRow = (Id<Kind>, Id<Part>, Option<Box<str>>, [u64; 4]);
 type DayToolRow = (Day, Box<str>, Option<Id<Kind>>, u64, u64);
 type ToolRow = (Box<str>, Option<Id<Kind>>, u64, u64, u64);
 type SessionRow = (Box<str>, Option<i64>, Vec<(Day, Vec<(Id<Kind>, u64)>)>);
+type SessionToolRow = (Box<str>, Vec<(Day, Box<str>, Id<Kind>, u64)>);
 
 /// The totals as loaded: wire ids decode to kinds and parts as they are
 /// read, so loading holds no text but names, tools and sessions (written by
@@ -1005,6 +1112,7 @@ pub(super) struct StoredAggregate {
     all_tools: Vec<ToolRow>,
     tool_sessions: Vec<(Box<str>, u64, Day)>,
     sessions: Vec<SessionRow>,
+    session_tools: Vec<SessionToolRow>,
     day_generation: Vec<(Day, u64)>,
 }
 
@@ -1118,6 +1226,23 @@ impl StoredAggregate {
                     )
                 })
                 .collect(),
+            session_tools: agg
+                .sessions
+                .iter()
+                .filter_map(|(id, totals)| {
+                    totals.tools.as_ref().map(|tools| {
+                        (
+                            id.clone(),
+                            tools
+                                .iter()
+                                .map(|((day, tool), (kind, tokens))| {
+                                    (*day, tool.clone(), Id(*kind), *tokens)
+                                })
+                                .collect(),
+                        )
+                    })
+                })
+                .collect(),
             day_generation: agg
                 .day_generation
                 .iter()
@@ -1209,8 +1334,27 @@ impl StoredAggregate {
                     (day, kinds.collect())
                 })
                 .collect();
-            agg.sessions
-                .insert(session, SessionTotals { started, days });
+            agg.sessions.insert(
+                session,
+                SessionTotals {
+                    started,
+                    days,
+                    tools: None,
+                },
+            );
+        }
+        for (id, tools) in self.session_tools.into_iter().take(256) {
+            if tools.len() <= 128 && agg.tracked_tool_rows + tools.len() <= 8192 {
+                if let Some(totals) = agg.sessions.get_mut(&id) {
+                    agg.tracked_tool_rows += tools.len();
+                    totals.tools = Some(
+                        tools
+                            .into_iter()
+                            .map(|(day, tool, Id(kind), tokens)| ((day, tool), (kind, tokens)))
+                            .collect(),
+                    );
+                }
+            }
         }
         agg.day_generation = self.day_generation.into_iter().collect();
         agg

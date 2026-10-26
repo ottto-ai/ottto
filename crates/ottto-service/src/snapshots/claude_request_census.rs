@@ -5,7 +5,11 @@
 //! A record is local-only and content-free: the sorted 8-byte SHA-256 prefixes
 //! of the provider request ids one parse saw. It is never proof, usage or
 //! upload input. D1 only produces, persists, prunes and measures records; no
-//! fence, coverage, rearm, posture or upload decision reads them.
+//! fence, coverage, posture or upload decision reads them. The narrowed
+//! unhealthy-retry carry conservatively refuses its per-family exception
+//! on saved negative evidence for loss or incomplete identity, and uses a
+//! bound native record only to refuse additional causes in the narrow id-less
+//! exception. A record never supplies a body ACK or new-window coverage.
 //!
 //! Census state follows the working index (`self`), never `previous`: a held
 //! or partially committed key keeps the record of the revision this window
@@ -602,6 +606,20 @@ impl ClaudeRequestCensusRecord {
                 .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint)
     }
 
+    /// Negative provenance check for the narrow id-less pending exception.
+    /// The pending marker supplies the exact cause; this only refuses parse
+    /// loss, stale derivation, decode invalidation, twins and retirement.
+    /// It never supplies a body ACK, coverage or a duplicate proof.
+    pub(super) fn idless_native_for(&self, entry_fingerprint: &str) -> bool {
+        self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
+            && self.shape == ClaudeRequestCensusShape::IdentityIncomplete
+            && !self.unverified
+            && !self.twin
+            && self.retired.is_none()
+            && decode_fingerprint(entry_fingerprint)
+                .is_some_and(|fp| fp == self.source_file_fingerprint)
+    }
+
     /// Freshness of a ledger holder: `current_for`, or a loss-free
     /// identity-incomplete record (it has message-only, id-less or displaced
     /// responses) whose message-only ids are known (`message_known`, the
@@ -845,6 +863,14 @@ impl ClaudeRequestCensus {
         self.records
             .get(key)
             .filter(|record| !record.is_birth_stub())
+    }
+
+    /// Retry carry must see retained invalidation stubs as negative evidence.
+    /// An absent census is allowed for an accepted upload body, but a stub
+    /// left by selected restore or failed finish must not look absent. This
+    /// exposes no positive proof and leaves ordinary census readers unchanged.
+    pub(super) fn retry_carry_record(&self, key: &str) -> Option<&ClaudeRequestCensusRecord> {
+        self.records.get(key)
     }
 
     /// Every record; birth stubs are skipped.

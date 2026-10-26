@@ -16,6 +16,29 @@ permissions:
   contents: read
 
 jobs:
+  rust-fmt-linux:
+    # Minutes of Linux instead of a Mac round: fmt is the commonest Mac-only
+    # failure, and in a merge queue a Mac failure ejects the PR.
+    name: Rust format (Linux)
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt
+
+      - name: Rust format
+        run: cargo fmt --all --check
+
+      - name: Connector format
+        run: cargo fmt --manifest-path crates/Cargo.toml --all --check
+
   rust-linux:
     name: Rust tests (Linux)
     timeout-minutes: 45

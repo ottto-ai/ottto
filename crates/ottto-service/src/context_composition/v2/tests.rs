@@ -941,6 +941,7 @@ impl Env {
             machine_id: "machine-test",
             destination: "device|machine|api",
             labels_enabled: true,
+            details_enabled: false,
         });
         fs::create_dir_all(&self.root).unwrap();
         run_source(&mut run, source, std::slice::from_ref(&self.root), target)
@@ -3867,6 +3868,7 @@ fn upload_labels_need_a_fetched_hint_that_allows_them() {
             machine_id: "machine-test",
             destination: "device|machine|api",
             labels_enabled,
+            details_enabled: false,
         };
         let (request, _) =
             super::upload::build_request(&scope, Source::Claude, &target, now, window, 0);
@@ -4051,6 +4053,7 @@ fn a_maximal_upload_meets_the_server_field_rules() {
         machine_id: "machine-test",
         destination: "device|machine|api",
         labels_enabled: true,
+        details_enabled: false,
     };
     let (request, dropped) =
         super::upload::build_request(&scope, Source::Claude, &target, now, window, 0);
@@ -5487,3 +5490,5 @@ mod a34;
 
 #[path = "tests/a2.rs"]
 mod a2;
+
+mod details;

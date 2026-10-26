@@ -1473,6 +1473,7 @@ mod bounded_tests {
     fn planned_capture_rotates_known_roots_without_gating_a_different_native_page() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-turns");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         let _shadow_support = super::super::enable_shadow_for_test(&support);
         let keys = (0..NEXT_PAGE_FAMILIES + 1)
             .map(|at| super::super::family_key(&format!("root-{at}")))
@@ -1536,6 +1537,7 @@ mod bounded_tests {
     fn capture_plan_stops_at_expiry_and_installs_only_the_fallback() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-plan-deadline");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         let before = capture_reserved();
         let keys = (0..4096)
             .map(|at| super::super::family_key(&format!("root-{at}")))
@@ -1661,14 +1663,20 @@ mod bounded_tests {
             fallback_families.is_disjoint(&complete),
             "never the stale plan's eligibility"
         );
-        let plans = PLANS.lock().unwrap();
-        assert!(!plans[&support].allows(&keys[0]));
+        // An assertion must unwind after releasing the shared plan mutex.
+        let (first_allowed, other_allowed, unlisted_allowed) = {
+            let plans = PLANS.lock().unwrap();
+            (
+                plans[&support].allows(&keys[0]),
+                plans[&support].allows(&keys[200]),
+                plans[&support].allows(&super::super::family_key("unlisted")),
+            )
+        };
+        assert!(!first_allowed);
         assert!(
-            !plans[&support].allows(&keys[200])
-                && !plans[&support].allows(&super::super::family_key("unlisted")),
+            !other_allowed && !unlisted_allowed,
             "interruption never changes the next Full to all-eligible"
         );
-        drop(plans);
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
         println!("MONEY_P1B_PLAN entries=4096 expired_visited={} interrupted_checks={} eligible={NEXT_PAGE_FAMILIES} fallback_eligible={} plan_funds={funded} stale_plan_installed=0 carried_turn=300", visited.get(), checks.get(), fallback_families.len());
@@ -1682,6 +1690,7 @@ mod bounded_tests {
     fn fallback_plan_captures_only_prior_incomplete_families() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-fallback");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         let _shadow_support = super::super::enable_shadow_for_test(&support);
         let roots = (0..3 * NEXT_PAGE_FAMILIES)
             .map(|at| format!("root-{at}"))
@@ -1742,6 +1751,7 @@ mod bounded_tests {
     fn a_paged_scope_without_a_plan_captures_nothing_optional() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-closed");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         let _shadow_support = super::super::enable_shadow_for_test(&support);
         let file = scratch.join("root-0.jsonl");
         let other = scratch.join("different-native-page.jsonl");
@@ -1870,6 +1880,7 @@ mod bounded_tests {
     fn another_pages_plan_keeps_earlier_pages_turns_and_exclusions() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-scope-wide");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         let _shadow_support = super::super::enable_shadow_for_test(&support);
         let before = capture_reserved();
         let page = |name: &str| {
@@ -2002,6 +2013,44 @@ mod bounded_tests {
         assert_eq!(capture_reserved(), before);
     }
 
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn shadow_cleanup_releases_plan_and_disables_scope_on_panic() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-plan-panic-cleanup");
+        let support = scratch.join("support");
+        let before = capture_reserved();
+        let failure = std::panic::catch_unwind(|| {
+            let _cleanup = super::super::ShadowTestCleanup::new(&support);
+            let _shadow = super::super::enable_shadow_for_test(&support);
+            assert_eq!(
+                plan_next_page(
+                    &support,
+                    std::iter::once(("root", 0)),
+                    std::iter::empty(),
+                    Instant::now() + Duration::from_secs(1),
+                ),
+                PlanInstall::Complete
+            );
+            assert!(capture_reserved() > before);
+            assert!(super::super::shadow_enabled(&support));
+            let entries = PLANS.lock().unwrap()[&support].entries.len();
+            assert_eq!(entries, 0, "synthetic fixture assertion failure");
+        });
+        let panic = failure.expect_err("the intentional fixture assertion must unwind");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("synthetic fixture assertion failure"),
+            "unexpected panic: {message}"
+        );
+        assert_eq!(capture_reserved(), before);
+        assert!(!super::super::shadow_enabled(&support));
+        assert!(!PLANS.is_poisoned());
+    }
+
     /// Each page updates the plan in place and reuses its funds, so a family
     /// count whose two plans exceed the capture ceiling still installs every
     /// page. Changing family sets near the ceiling, after an interrupted
@@ -2012,6 +2061,7 @@ mod bounded_tests {
     fn replacing_a_large_plan_reuses_the_old_plans_funds() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-large-plan");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         let before = capture_reserved();
         let set = |name: &str| {
             (0..30_000)
@@ -2073,17 +2123,24 @@ mod bounded_tests {
         let eligible = planned_families_for_test(&support).unwrap();
         assert_eq!(eligible.len(), NEXT_PAGE_FAMILIES);
         assert!(eligible.iter().all(|key| third.contains(key)));
+        // Keep the same checks without poisoning shared state on failure.
+        let (entry_count, first_allowed, other_allowed) = {
+            let plans = PLANS.lock().unwrap();
+            (
+                plans[&support].entries.len(),
+                plans[&support].allows(&keys[0]),
+                plans[&support].allows(&other[0]),
+            )
+        };
         assert_eq!(
-            PLANS.lock().unwrap()[&support].entries.len(),
+            entry_count,
             third.len(),
             "only the page's own families stay"
         );
-        let plans = PLANS.lock().unwrap();
         assert!(
-            !plans[&support].allows(&keys[0]) && !plans[&support].allows(&other[0]),
+            !first_allowed && !other_allowed,
             "a family whose entry made room is not eligible again before the loss expires"
         );
-        drop(plans);
         assert_eq!(capture_reserved(), before + plan_funds_for_test(&support));
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
@@ -2145,6 +2202,7 @@ mod bounded_tests {
         let scratch = crate::test_scratch::ScratchDir::new("money-exhausted-fast-path");
         let scope = scratch.join("support");
         let path = scratch.join("transcript.jsonl");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&scope);
         let _shadow_scope = super::super::enable_shadow_for_test(&scope);
         let mut capture = ClaudeResponseCapture::begin(&path).expect("armed capture");
         let pending_deposit = ClaudeResponseCapture::begin(&path).expect("second capture");

@@ -21,6 +21,17 @@ mkdir -p "$FAKE_BIN"
 cat > "$FAKE_BIN/gh" <<'SH'
 #!/usr/bin/env sh
 d="${MERGE_GUARD_TEST_DIR:?}"
+# The enqueue mutation logs as "gh enqueue pr_id=.. head=..", so graphql counts
+# stay queue polls; it exits with merge_exit like "gh pr merge".
+case "$*" in
+  *enqueuePullRequest*)
+    args=""
+    for a in "$@"; do
+      case "$a" in pr_id=*|head=*) args="$args $a" ;; esac
+    done
+    printf 'gh enqueue%s\n' "$args" >> "$d/log"
+    exit "$(cat "$d/merge_exit" 2>/dev/null || echo 0)" ;;
+esac
 printf 'gh %s\n' "$*" >> "$d/log"
 reply() {
   n=$(( $(cat "$d/count.$1" 2>/dev/null || echo 0) + 1 ))
@@ -66,7 +77,7 @@ new_case() {
 # pr_json <file> <state> <isDraft> <sha> <mergeable> [<fork-owner>]
 pr_json() {
   jq -n --arg s "$2" --argjson d "$3" --arg h "$4" --arg m "$5" --arg fork "${6:-}" \
-    '{state: $s, isDraft: $d, headRefOid: $h, mergeable: $m,
+    '{id: "PR_node7", state: $s, isDraft: $d, headRefOid: $h, mergeable: $m,
       baseRefName: "main", headRefName: "feature",
       isCrossRepository: ($fork != ""),
       headRepository: {name: "repo"},
@@ -453,7 +464,7 @@ queue_json() {
     }}}}' > "$case_dir/$1"
 }
 
-ENQUEUE_CALL="gh pr merge 7 --match-head-commit $SHA"
+ENQUEUE_CALL="gh enqueue pr_id=PR_node7 head=$SHA"
 
 queue_case queue-happy-path
 pr_json pr OPEN true "$SHA" MERGEABLE
@@ -465,6 +476,7 @@ expect_count "$ENQUEUE_CALL" 1
 expect_no_log --admin
 expect_no_log --auto
 expect_no_log --squash
+expect_no_log 'gh pr merge'
 expect_count 'rules/branches/main' 1
 expect_count 'gh api graphql' 2
 expect_count 'sleep 60' 1
@@ -568,7 +580,31 @@ queue_case queue-enqueue-error
 printf '1' > "$case_dir/merge_exit"
 run_guard 7 7
 expect_log "$ENQUEUE_CALL"
-expect_no_log 'gh api graphql'
+expect_count 'gh api graphql' 1
+
+# A rerun after a timeout: gh refuses to enqueue a PR that is already queued.
+queue_case queue-rerun-already-queued
+printf '1' > "$case_dir/merge_exit"
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+expect_output 'already in the merge queue or merged; resuming the wait'
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+queue_case queue-rerun-already-merged
+printf '1' > "$case_dir/merge_exit"
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+# A queue entry for another head is not this head's admission.
+queue_case queue-enqueue-error-other-head-queued
+printf '1' > "$case_dir/merge_exit"
+queue_json queue OPEN "$NEW_SHA" QUEUED
+run_guard 7 7
+expect_output "enqueueing PR #7 at $SHA failed"
+expect_count 'gh api graphql' 1
 
 new_case invalid-rules-refused
 pr_json pr OPEN false "$SHA" MERGEABLE

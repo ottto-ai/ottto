@@ -489,6 +489,7 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
     let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
     let cadence = IdentityPipelineCadence::new();
     let support = fixture.base.join("money-parity-support");
+    let _shadow_cleanup = money::ShadowTestCleanup::new(&support);
     let secrets = fixture.base.join("money-parity-secrets");
     std::fs::create_dir_all(&support).unwrap();
     std::fs::create_dir_all(&secrets).unwrap();

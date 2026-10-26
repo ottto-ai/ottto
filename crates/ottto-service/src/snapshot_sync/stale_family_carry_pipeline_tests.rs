@@ -16,6 +16,88 @@
 
 use super::*;
 
+#[test]
+#[serial(source_manifests)]
+fn accepted_retry_no_otel_change_ack_then_carry_again() {
+    if !c1a_layout_supported("accepted_body_retry") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = c1a_fixture("accepted-body-retry");
+    let session = "e7000000-0000-4000-8000-000000000007";
+    let path = fixture.root.join(format!("{session}.jsonl"));
+    std::fs::write(
+        &path,
+        rearm_transcript_line(session, None, "req_accepted_1", 0),
+    )
+    .unwrap();
+    let closing = c1b_generation(&fixture, "accepted", (8, 0));
+    assert!(closing.census_complete && closing.full_rearm);
+    RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+    let seed = c1b_generation(&fixture, "accepted", (8, 10));
+    assert!(seed.red && seed.parsed.contains(session));
+    let before = c1a_saved(&fixture);
+    assert!(before["claude_usage_family_witnesses"]
+        .get(session)
+        .is_none());
+    let entry = |saved: &serde_json::Value| {
+        saved["files"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key.ends_with(&format!("{session}.jsonl")))
+            .unwrap()
+            .1
+            .clone()
+    };
+    let head = entry(&before)["last_snapshot_fingerprint"].clone();
+    let retry = c1b_generation(&fixture, "accepted", (8, 20));
+    assert_eq!(
+        retry.start.as_ref().unwrap().reason,
+        "terminal_unhealthy_retry"
+    );
+    assert!(
+        !retry.parsed.contains(session),
+        "no OTEL witness is needed for an accepted body"
+    );
+    RearmFixture::append(
+        &path,
+        &rearm_transcript_line(session, None, "req_accepted_2", 1),
+    );
+    let changed = c1b_generation(&fixture, "accepted", (8, 30));
+    assert!(changed.parsed.contains(session));
+    let accepted = c1a_saved(&fixture);
+    assert_ne!(entry(&accepted)["last_snapshot_fingerprint"], head);
+    assert!(entry(&accepted)["last_upload_body_witness"]
+        .as_str()
+        .is_some());
+    let current = accepted["file_snapshot_fingerprints"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(key, _)| key.ends_with(&format!("{session}.jsonl")))
+        .unwrap()
+        .1
+        .as_array()
+        .unwrap();
+    for fingerprint in current {
+        assert!(accepted["accepted_snapshot_fingerprints"]
+            .as_array()
+            .unwrap()
+            .contains(fingerprint));
+    }
+    let next = c1b_generation(&fixture, "accepted", (8, 40));
+    assert_eq!(
+        next.start.as_ref().unwrap().reason,
+        "terminal_unhealthy_retry"
+    );
+    assert!(
+        !next.parsed.contains(session),
+        "the new exact ACK restores eligibility on the next retry"
+    );
+    assert_eq!(entry(&c1a_saved(&fixture)), entry(&accepted));
+}
+
 const C1B_MAX_PAGES: usize = 8;
 
 /// Count-only fields of the traversal start that opened a window.
@@ -173,6 +255,27 @@ struct C1bRun {
     family_pending_after: bool,
 }
 
+/// Older C1b controls distinguish the witnessed target from unrelated
+/// sessions whose local upload-body witness is unavailable. ACK ledger entries
+/// and committed heads remain intact. The accepted-body tests and independent
+/// acceptance fixture retain every witness and exercise the widened path.
+fn c1b_without_unrelated_upload_witnesses(fixture: &RearmFixture) {
+    let index = ScanIndex::load(&fixture.index_path).unwrap();
+    let family = RearmFixture::family_keys(&index)
+        .into_values()
+        .collect::<BTreeSet<_>>();
+    c1a_edit_index(fixture, |saved| {
+        for (key, entry) in saved["files"].as_object_mut().unwrap() {
+            if !family.contains(key) {
+                entry
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("last_upload_body_witness");
+            }
+        }
+    });
+}
+
 fn c1b_red_chain(case: &'static str, arm: &str, between: impl FnOnce(&RearmFixture)) -> C1bRun {
     c1b_red_chain_with(c1a_fixture(case), arm, between)
 }
@@ -206,6 +309,7 @@ fn c1b_red_chain_with(
     let heads_after_red = RearmFixture::family_heads(&saved);
     let witness_after_red = saved.claude_usage_family_witness_digest_for_test(REARM_ROOT);
     between(&fixture);
+    c1b_without_unrelated_upload_witnesses(&fixture);
     let retry = c1b_generation(&fixture, arm, (8, 20));
     std::fs::write(
         c1b_sibling_path(&fixture),
@@ -213,6 +317,7 @@ fn c1b_red_chain_with(
             + &rearm_transcript_line(REARM_SIBLING, None, "req_sibling_2", 1),
     )
     .expect("repair the unrelated transcript");
+    c1b_without_unrelated_upload_witnesses(&fixture);
     let repaired = c1b_generation(&fixture, arm, (8, 30));
     let quiet = c1b_generation(&fixture, arm, (8, 40));
     let saved = ScanIndex::load(&fixture.index_path).unwrap();
@@ -584,6 +689,7 @@ fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
         assert!(red.red, "{arm}: the window is red");
         std::fs::remove_file(fixture.member_path(Some(REARM_AGENTS[1])))
             .expect("remove the second subagent");
+        c1b_without_unrelated_upload_witnesses(&fixture);
         let retry = c1b_generation(&fixture, arm, (8, 20));
         std::fs::write(
             c1b_sibling_path(&fixture),
@@ -704,6 +810,7 @@ fn c1b_held_retry_chain(
     let marked_after_red = saved.bounded_sweep_had_unsettled_upload();
     let record_after_red = saved.claude_authority_record_for_test(REARM_TERMINAL);
     before_retry(&fixture);
+    c1b_without_unrelated_upload_witnesses(&fixture);
     let retry = c1b_generation(&fixture, arm, (8, 20));
     let saved = ScanIndex::load(&fixture.index_path).unwrap();
     C1bHeldRun {
@@ -836,9 +943,22 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
                 saved.get("claude_stale_family_carry").is_none(),
                 "no carry is retained yet"
             );
-            // This test predates Fix 2: select the ordinary C1b retry, whose
-            // prior unsettled mark remains authoritative. The companion
-            // test below retains the window and checks Fix 2's exception.
+            // Missing independent request evidence keeps this refusal control
+            // on BASE under the per-family relaxation too. Preserve all its
+            // original no-carry/read/hold assertions. A companion below keeps
+            // the evidence and verifies the newly approved carry instead.
+            saved.remove("claude_request_census");
+            // Absence of census/OTEL evidence is now allowed when the exact
+            // upload-body witness is retained. This negative control lacks
+            // that durable witness too; its original refusal assertions stay.
+            for entry in saved["files"].as_object_mut().unwrap().values_mut() {
+                entry
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("last_upload_body_witness");
+            }
+
+            // Select the ordinary C1b retry, outside Fix 2's window.
             let progress = saved
                 .get_mut("claude_full_rearm_progress")
                 .and_then(serde_json::Value::as_object_mut)
@@ -1147,3 +1267,152 @@ fn fix2_late_api_row_rereads_the_family_like_base() {
     assert_eq!(fix.heads_after, base.heads_after);
     assert_eq!(fix.witness_after, base.witness_after);
 }
+
+/// Exercise Condition X through the widened carry, using actual sidecars,
+/// bounded scanner, proof fold, uploads, ACKs and save/reload between pages.
+#[test]
+#[serial(source_manifests)]
+fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
+    use sha2::{Digest, Sha256};
+    if !c1a_layout_supported("scoped_retry_late_identity") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mut fixture = c1a_fixture("scoped-retry-late-identity");
+    let closing = c1b_generation(&fixture, "scoped", (8, 0));
+    assert!(closing.census_complete && closing.proven && closing.full_rearm);
+    RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+    RearmFixture::append(
+        &c1b_terminal_path(&fixture),
+        &rearm_transcript_line(REARM_TERMINAL, None, "req_terminal_2", 1),
+    );
+    let red = c1b_generation(&fixture, "scoped", (8, 10));
+    assert!(red.red && red.proven);
+    let unsettled = || {
+        c1b_without_full_rearm_window(&fixture);
+        c1b_without_unrelated_upload_witnesses(&fixture);
+        let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+        index.save(&fixture.index_path).unwrap();
+    };
+    unsettled();
+    let retry = c1b_generation(&fixture, "scoped", (8, 20));
+    assert_eq!(
+        retry.start.as_ref().unwrap().carried_pending_families,
+        Some(1)
+    );
+    assert_eq!(
+        retry.family_reads, 0,
+        "the independently accepted family is carried"
+    );
+    assert!(retry.red && retry.census_invalid && retry.fence_after);
+    unsettled();
+
+    let login = "a".repeat(64);
+    let org = "d".repeat(64);
+    let path = fixture.sidecar_path("claude-code-effort");
+    let rows = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+                serde_json::from_str(line).unwrap();
+            row.account_identity_checked = true;
+            row.account_identifier_hash = Some(login.clone());
+            row.request_identity = Some(serde_json::from_value(serde_json::json!({
+            "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
+            "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":login},
+            "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":org},
+        })).unwrap());
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            serde_json::to_string(&row).unwrap() + "\n"
+        })
+        .collect::<String>();
+    std::fs::write(&path, rows).unwrap();
+    // The changed API fingerprint needs a new complete family proof. Repair
+    // the unrelated malformed file and co-observe the family in one normal
+    // page, as the existing late-identity control does. Otherwise the old
+    // witness correctly holds these revisions while the census stays red.
+    std::fs::write(
+        c1b_sibling_path(&fixture),
+        rearm_transcript_line(REARM_SIBLING, None, &format!("req_{REARM_SIBLING}"), 0)
+            + &rearm_transcript_line(REARM_SIBLING, None, "req_sibling_2", 1),
+    )
+    .unwrap();
+    fixture.native_file_limit = 64;
+
+    let mut parsed = BTreeSet::new();
+    let mut tagged_root = false;
+    for number in 0..C1B_MAX_PAGES {
+        let page = fixture.page(
+            &format!("2026-08-02T08:{:02}:00Z", 30 + number),
+            RearmUpload::Accept,
+        );
+        parsed.extend(page.parsed.iter().cloned());
+        if let Some(item) = page
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == REARM_ROOT)
+        {
+            assert!(page.offered.contains(&item.snapshot_fingerprint));
+            assert!(page.uploaded.contains(&item.snapshot_fingerprint));
+            assert!(!item.request_evidence.is_empty());
+            assert!(item.request_evidence.iter().all(|evidence| {
+                evidence.identity_basis == crate::snapshots::claude_request_identity::TELEMETRY
+                    && evidence.provider_workspace_hash.as_deref() == Some(org.as_str())
+            }));
+            tagged_root = true;
+        }
+        if c1b_traversal_ended(&page.index).0 {
+            break;
+        }
+    }
+    assert_eq!(
+        parsed.intersection(&rearm_family_sessions()).count(),
+        rearm_family_sessions().len()
+    );
+    assert!(
+        tagged_root,
+        "late identity evidence emits and ACKs the tagged root in this retry"
+    );
+}
+
+/// The approved complement of the existing missing-evidence refusal: a
+/// global unsettled mark no longer makes a separately accepted family read
+/// again; the unrelated RetryPending family keeps its binding and old head.
+#[test]
+#[serial(source_manifests)]
+fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_family() {
+    if !c1a_layout_supported("scoped_retry_mark_and_authority") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mark = |fixture: &RearmFixture| {
+        c1b_without_full_rearm_window(fixture);
+        c1a_edit_index(fixture, |saved| {
+            saved.insert(
+                "bounded_sweep_had_unsettled_upload".into(),
+                serde_json::json!(true),
+            );
+        });
+    };
+    let run = c1b_held_retry_chain("scoped-retry-mark-and-authority", "scoped", mark);
+    let start = run.retry.start.as_ref().unwrap();
+    assert_eq!(start.reason, "terminal_unhealthy_retry");
+    assert_eq!(start.carried_pending_families, Some(1));
+    assert_eq!(run.retry.family_reads, 0);
+    assert_eq!(run.record_after_retry, run.record_after_red);
+    assert!(run
+        .record_after_retry
+        .as_ref()
+        .is_some_and(|record| { !record.terminal && record.bound_to_retained_witness }));
+    assert_eq!(run.head_after, run.head_before);
+    assert!(run.retry.red && !run.retry.census_complete && run.retry.fence_after);
+}
+
+include!("retry_admission_pipeline_tests.rs");

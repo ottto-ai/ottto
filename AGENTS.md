@@ -52,7 +52,7 @@
   advisory audit`, `Dependency review`), and squash-merges exactly that head.
   `main`'s ruleset also requires `Rust contracts`. `gh pr checks` exit 0 is not
   evidence, and no Linux job stands in for the macOS `Rust contracts` job.
-- The guard also works when `main` has a merge queue: it enqueues the PR and waits for the merge.
+- `main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it; a PR that fails there is removed (exit 4): fix it, push and rerun the guard.
 - The author merges its own reviewed, green, mergeable PR; no merge window, slot
   or extra approval is needed. Wait only for a real dependency or conflict, an
   explicit dated hold, or an announced release freeze.
