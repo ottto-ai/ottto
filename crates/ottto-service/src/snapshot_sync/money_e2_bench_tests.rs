@@ -1732,7 +1732,7 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
     let stamped = HistoryScan::stamped(&load(&harness), 2);
     e2_hook::with_gate(true, || {
         e2_hook::with_switch_on(true, &support, || {
-            let switch_on = || {
+            let mut switch_on = || {
                 let mut pages = Vec::new();
                 let mut before = load(&harness);
                 let (mut walk_files, mut stalled) = (0, false);
