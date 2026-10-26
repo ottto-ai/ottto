@@ -80,6 +80,8 @@ pub(super) fn record_upload_error_cadence(
     error: &anyhow::Error,
 ) {
     if error.downcast_ref::<AckSettlementRequired>().is_some() {
+        // Pending admitted work keeps the source warm without claiming a
+        // completed full sweep or changing any accepted-upload receipt count.
         cadence.record_scan_success(now, accepted.max(1));
     } else {
         cadence.record_scan_failure(now);
@@ -109,9 +111,9 @@ impl SnapshotUploadProgress {
     pub(super) fn admit_upload_input(
         &mut self,
         items: &mut Vec<SnapshotItem>,
-        committed: &ScanIndex,
+        live_index: &ScanIndex,
     ) -> Option<AckSettlementRequired> {
-        self.admit_upload_input_with_unsettled_limit(items, committed, MAX_UNSETTLED_ACKS)
+        self.admit_upload_input_with_unsettled_limit(items, live_index, MAX_UNSETTLED_ACKS)
     }
 
     // The explicit limit permits small persistence oracles. Production always
@@ -119,7 +121,7 @@ impl SnapshotUploadProgress {
     pub(super) fn admit_upload_input_with_unsettled_limit(
         &mut self,
         items: &mut Vec<SnapshotItem>,
-        committed: &ScanIndex,
+        live_index: &ScanIndex,
         unsettled_limit: usize,
     ) -> Option<AckSettlementRequired> {
         let input = items
@@ -129,14 +131,14 @@ impl SnapshotUploadProgress {
         let before = input.len();
         let mut unsettled = self.accepted_fingerprints.clone();
         let mut live_input = BTreeSet::new();
-        for fp in committed.upload_progress_ack_incidence() {
+        for fp in live_index.upload_progress_ack_incidence() {
             unsettled.remove(fp);
             if input.contains(fp) && !self.accepted_fingerprints.contains(fp) {
                 live_input.insert(fp.to_owned());
             }
         }
         drop(input);
-        // New input already in durable incidence uses live slots, even when
+        // New input proved by current scan incidence uses live slots, even when
         // unsettled debt is full. Only unrelated entities consume debt slots.
         // Input/live scratch is bounded by this page, not the index census.
         let held_live = self

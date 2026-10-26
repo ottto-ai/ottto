@@ -1132,7 +1132,7 @@ struct SnapshotUploadProgress {
     /// fingerprint.
     #[serde(default)]
     accepted_body_witnesses: BTreeMap<String, String>,
-    /// Admission only: loaded committed incidence plus bounded unsettled ACK debt.
+    /// Admission only: current live incidence plus bounded unsettled ACK debt.
     #[serde(skip, default = "ack_retention::default_ack_capacity")]
     ack_capacity: usize,
     /// ACKs outside known live incidence; includes valid unindexed debt.
