@@ -12511,6 +12511,8 @@ mod cold_restart_regressions {
         headers: usize,
         header_bytes: usize,
         state_missing: usize,
+        identity_files: usize,
+        identity_sample_bytes_bound: u64,
     }
 
     fn run_page(
@@ -12520,6 +12522,7 @@ mod cold_restart_regressions {
         limit: usize,
         number: u64,
     ) -> (ScanIndex, SourceScanResult, Reads) {
+        let previous = index.clone();
         let mut owned = OwnedSourceScan::new(
             SnapshotSource::Codex,
             std::slice::from_ref(&fixture.root),
@@ -12534,7 +12537,24 @@ mod cold_restart_regressions {
             true,
         )
         .with_sampled_acquisition(cache, Scope("cold-restart-fixture".into()));
-        let mut reads = Reads::default();
+        // Constructor already secured/opened these candidate witnesses. Count
+        // that work separately: it predates acquisition-context metrics.
+        let mut reads = Reads {
+            identity_files: owned.identified_candidates.len(),
+            identity_sample_bytes_bound: owned
+                .identified_candidates
+                .iter()
+                .map(|candidate| {
+                    candidate.size_bytes.min(FILE_CONTENT_SAMPLE_BYTES as u64)
+                        + if candidate.size_bytes > FILE_CONTENT_SAMPLE_BYTES as u64 {
+                            FILE_CONTENT_SAMPLE_BYTES as u64
+                        } else {
+                            0
+                        }
+                })
+                .sum(),
+            ..Reads::default()
+        };
         for _ in 0..1_000_000 {
             if let Some(context) = &owned.sampling {
                 reads.full = context.full_files;
@@ -12566,8 +12586,11 @@ mod cold_restart_regressions {
                         .iter()
                         .map(|item| item.snapshot_fingerprint.clone())
                         .collect();
-                    index.record_accepted_snapshot_fingerprints(&accepted);
-                    return (index, scan, reads);
+                    scan.finish_codex_capture_boundary(&mut index);
+                    let mut selected =
+                        index.committable_subset(&previous, &accepted, &BTreeMap::new());
+                    selected.record_accepted_snapshot_fingerprints(&accepted);
+                    return (selected, scan, reads);
                 }
             }
         }
@@ -12641,6 +12664,11 @@ mod cold_restart_regressions {
         // The ownership roster is separate from transcript acquisition. The
         // open-identity samples happen before sampling-context accounting.
         assert!(
+            reads.identity_files > 0,
+            "{label}: opened identity verification ran"
+        );
+        assert!(reads.identity_sample_bytes_bound <= reads.identity_files as u64 * 8192);
+        assert!(
             reads.headers > 0,
             "{label}: current ownership census actually ran"
         );
@@ -12686,11 +12714,20 @@ mod cold_restart_regressions {
     #[test]
     fn cold_restart_complete_census_3200_settled_files_has_no_replay_or_backlog() {
         let fixture = population(3200);
-        // Two byte-identical files with one native owner exercise the exact
-        // joined-member-set path as part of the 3,200-file population.
-        let source = fixture.file("019fa111-2222-7333-8444-000000000000");
-        let twin = fixture.file("019fa111-2222-7333-8444-000000000001");
-        fs::copy(source, twin).unwrap();
+        // Reuse the native join fixture's two distinct, provably ordered
+        // members. Byte-identical copies are deliberately refused as copies;
+        // they cannot establish a healthy settled population.
+        let owner = "019fa111-2222-7333-8444-000000000000";
+        let members = [owner, "019fa111-2222-7333-8444-000000000001"];
+        for (id, response, input, total) in
+            [(members[0], "r-a", 100, 100), (members[1], "r-b", 200, 300)]
+        {
+            let body = codex_file_join::tests::member(owner, response, input, total)
+                .into_iter()
+                .flat_map(codex_line)
+                .collect::<Vec<_>>();
+            fs::write(fixture.file(id), body).unwrap();
+        }
         let cache = Arc::new(SharedCache::default());
         let (index, first, _) = run_page(
             &fixture,
@@ -12701,6 +12738,14 @@ mod cold_restart_regressions {
         );
         assert!(first.census_complete, "initial population must settle");
         assert_eq!(index.files.len(), 3200);
+        for member in members {
+            assert!(
+                index.files[&local_index_key(&fixture.file(member))]
+                    .codex_joined_member_set
+                    .is_some(),
+                "joined member must have exact-set settlement"
+            );
+        }
         assert!(!index.accepted_snapshot_fingerprints.is_empty());
         drop(cache);
         let index = reload(&fixture, index);
@@ -12748,11 +12793,12 @@ mod cold_restart_regressions {
             );
             assert_eq!(reads.full, 1, "only owed job may restart: {reads:?}");
             let mut publications = scan.snapshots.len();
+            let mut full_reads = reads.full;
             for n in 2..66 {
                 if scan.census_complete {
                     break;
                 }
-                let (next, result, _) = run_page(
+                let (next, result, next_reads) = run_page(
                     &fixture,
                     index,
                     Arc::clone(&cache),
@@ -12761,9 +12807,14 @@ mod cold_restart_regressions {
                 );
                 index = next;
                 publications += result.snapshots.len();
+                full_reads += next_reads.full;
                 scan = result;
             }
             assert!(scan.census_complete, "owed job must converge");
+            assert_eq!(
+                full_reads, 1,
+                "healthy history must Skip on every continuation page"
+            );
             assert_eq!(
                 publications, 1,
                 "owed job publishes once; healthy history stays skipped"
@@ -12807,23 +12858,39 @@ mod cold_restart_regressions {
                 "old continuation cannot authorize cold cache"
             );
             let mut published = scan.snapshots.len();
+            let mut full_reads = reads.full;
             for n in 3..67 {
                 if scan.census_complete {
                     break;
                 }
-                let (next, result, _) = run_page(&fixture, index, Arc::clone(&fresh), 10_000, n);
+                let (next, result, next_reads) =
+                    run_page(&fixture, index, Arc::clone(&fresh), 10_000, n);
                 index = next;
                 published += result.snapshots.len();
+                full_reads += next_reads.full;
                 scan = result;
             }
             assert!(scan.census_complete);
             assert_eq!(published, 1);
+            assert_eq!(
+                full_reads, 1,
+                "healthy sibling must Skip on every continuation page"
+            );
             assert_eq!(counter(&fresh, |c| c.jobs_certified), 1);
         });
     }
 
     #[test]
-    fn cold_restart_upgrade_release_constants_count_reselected_codex_files() {
+    fn cold_restart_upgrade_f8d23a2f_to_1e769c73_counts_reselected_files() {
+        upgrade_profile("f8d23a2f", "1e769c73", None);
+    }
+
+    #[test]
+    fn cold_restart_upgrade_1e769c73_to_03589b16_counts_reselected_files() {
+        upgrade_profile("1e769c73", "03589b16", Some(1_793_016_000_000));
+    }
+
+    fn upgrade_profile(from: &str, to: &str, old_cutover: Option<i64>) {
         // Audited at f8d23a2f, 1e769c73, 03589b16 and branch base:
         // parser/scan/open/index/disposition/replay constants are identical.
         // The only Codex selection constant transition is None -> Some(T)
@@ -12846,49 +12913,50 @@ mod cold_restart_regressions {
             crate::snapshots::codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
             Some(cutover)
         );
-        for (from, to, old_cutover) in [
-            ("f8d23a2f", "1e769c73", None),
-            ("1e769c73", "03589b16", Some(cutover)),
-        ] {
-            let fixture = population(3200);
-            for entry in fs::read_dir(&fixture.root).unwrap() {
-                let path = entry.unwrap().path();
-                let text = fs::read_to_string(&path).unwrap();
-                fs::write(
-                    path,
-                    text.replacen(
-                        "\"payload\":{",
-                        "\"payload\":{\"timestamp\":\"2026-10-27T12:00:00Z\",",
-                        1,
-                    ),
-                )
-                .unwrap();
-            }
-            let old = old_cutover.map(crate::snapshots::codex_counting_version::TestCutover::set);
-            let cache = Arc::new(SharedCache::default());
-            let (mut index, initial, _) = run_page(
-                &fixture,
-                ScanIndex::default(),
-                Arc::clone(&cache),
-                MAX_BACKFILL_FILES_PER_SOURCE,
-                0,
-            );
-            assert!(initial.census_complete, "{from}: old constants settle");
-            assert_eq!(index.files.len(), 3200);
-            index.historical_replay_generation = Some("codex_session_exclusive_usage:v7".into());
-            drop(cache);
-            drop(old);
-            let current = crate::snapshots::codex_counting_version::TestCutover::set(cutover);
-            let loaded = reload(&fixture, index);
-            let (_, scan, reads) = run_page(
-                &fixture,
-                loaded,
-                Arc::new(SharedCache::default()),
-                MAX_BACKFILL_FILES_PER_SOURCE,
-                1,
-            );
-            assert_quiet(&scan, &reads, &format!("upgrade-{from}-to-{to}"));
-            drop(current);
+        let fixture = population(3200);
+        for entry in fs::read_dir(&fixture.root).unwrap() {
+            let path = entry.unwrap().path();
+            let text = fs::read_to_string(&path).unwrap();
+            fs::write(
+                path,
+                text.replacen(
+                    "\"payload\":{",
+                    "\"payload\":{\"timestamp\":\"2026-10-27T12:00:00Z\",",
+                    1,
+                ),
+            )
+            .unwrap();
         }
+        let old = old_cutover.map(crate::snapshots::codex_counting_version::TestCutover::set);
+        let cache = Arc::new(SharedCache::default());
+        let (mut index, initial, _) = run_page(
+            &fixture,
+            ScanIndex::default(),
+            Arc::clone(&cache),
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            0,
+        );
+        assert!(initial.census_complete, "{from}: old constants settle");
+        assert_eq!(index.files.len(), 3200);
+        index.historical_replay_generation = Some("codex_session_exclusive_usage:v7".into());
+        drop(cache);
+        drop(old);
+        let current = crate::snapshots::codex_counting_version::TestCutover::set(cutover);
+        let mut loaded = reload(&fixture, index);
+        let directive = crate::backfill::current_historical_replay(SnapshotSource::Codex);
+        assert_eq!(directive.revision, "codex_session_exclusive_usage:v7");
+        assert!(
+            !loaded.prepare_historical_replay(directive.revision.into()),
+            "unchanged reviewed replay generation must preserve settlement"
+        );
+        let (_, scan, reads) = run_page(
+            &fixture,
+            loaded,
+            Arc::new(SharedCache::default()),
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            1,
+        );
+        assert_quiet(&scan, &reads, &format!("upgrade-{from}-to-{to}"));
+        drop(current);
     }
 }
