@@ -122,7 +122,7 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
         return;
     };
     let mut cost = crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
-    for (key, _) in &index.files {
+    for key in index.files.keys() {
         if traversal.pending_candidates.len() >= CLAUDE_RETRY_DUE_PATHS {
             break;
         }
