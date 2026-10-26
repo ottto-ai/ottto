@@ -41,3 +41,16 @@ full-read-plus-samples byte estimate keep ordinary scheduling. A small repair
 or projection-adoption page therefore continues to service its fitting sibling
 in the same page. This estimate changes scheduling only, never read admission
 or the actual byte accounting.
+
+Codex stores rollouts in day directories, so a new day usually means a new
+directory. A directory that retained-roster refresh finds after the walk
+carries the same freshness provenance as a rollout that appeared directly. The
+bounded walk passes it to every subdirectory and file beneath. The initial
+history walk starts unmarked, so cold history keeps FIFO census order. This
+provenance is scheduling only. It adds no re-read trigger, and a hint alone
+never authorizes a read. As with any hinted path, a marked file that vanishes
+before its read settles as a removal. Coverage: a new day directory found
+without a watcher hint behind 2,800 owed revalidations reaches the upload set
+within two ordinary pages. A portable check confirms that the initial walk
+leaves old nested days unmarked while a later new month is marked through its
+subtree.

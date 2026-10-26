@@ -3788,6 +3788,222 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
     });
 }
 
+/// One Codex page stepped to completion, returning the same post-policy
+/// upload set the collector would offer.
+fn published_scan(
+    fixture: &ScanRoot,
+    cache: &Arc<SharedCache>,
+    index: ScanIndex,
+    collected_at: &str,
+    hints: &[PathBuf],
+) -> (ScanIndex, SourceScanResult) {
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        index,
+        collected_at,
+        BACKFILL_WINDOW_DAYS,
+        10000,
+        false,
+        None,
+        hints,
+        false,
+        true,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    loop {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index,
+                mut scan,
+                ..
+            } => {
+                apply_upload_policy(
+                    SnapshotSource::Codex,
+                    &mut scan.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                let accepted = scan
+                    .snapshots
+                    .iter()
+                    .map(|item| item.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan);
+            }
+        }
+    }
+}
+
+/// Write a one-turn rollout in a day directory below the fixture root.
+fn write_dated_rollout(fixture: &ScanRoot, day: &str, session: &str) -> PathBuf {
+    let directory = fixture.root.join(day);
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("rollout-2026-10-07T10-00-00-{session}.jsonl"));
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": session}}));
+    body.extend(token_line(1));
+    fs::write(&path, body).unwrap();
+    path
+}
+
+/// Only a directory found by retained-roster refresh carries freshness
+/// provenance, through its whole subtree. The initial walk of old nested day
+/// directories queues cold history unmarked, so it keeps FIFO census order.
+#[test]
+fn only_roster_discovered_directories_mark_their_sessions_fresh() {
+    const OLD: &str = "019fa111-2222-7333-8444-888888888891";
+    const NEW: &str = "019fa111-2222-7333-8444-888888888892";
+    let fixture = ScanRoot::new(4);
+    let old = write_dated_rollout(&fixture, "2026/10/01", OLD);
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    let flags = |index: &ScanIndex, path: &PathBuf| {
+        index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .find(|candidate| candidate.path == *path)
+            .map(|candidate| {
+                (
+                    candidate.census_member,
+                    candidate.watcher_hint,
+                    codex_fresh_data_pending(candidate, &index.files),
+                )
+            })
+    };
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+    assert_eq!(flags(&index, &old), Some((true, false, false)));
+    assert_eq!(
+        flags(&index, &fixture.file(SESSION)),
+        Some((true, false, false))
+    );
+
+    // A new month: `2026` moves, and both `11` and `11/01` are new. Wait
+    // past coarse directory timestamps so the move is visible everywhere.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let new = write_dated_rollout(&fixture, "2026/11/01", NEW);
+    refresh_retained_codex_roster(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    assert!(!index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+    assert_eq!(flags(&index, &new), Some((true, true, true)));
+    assert_eq!(flags(&index, &old), Some((true, false, false)));
+}
+
+/// A new Codex day is a new date directory. Retained-roster refresh finds it
+/// with no watcher hint; its rollout must still reach the post-policy upload
+/// set within two ordinary pages instead of waiting behind 2,800 owed old
+/// census members.
+#[test]
+fn new_date_directory_session_bypasses_2800_owed_rereads_within_two_pages() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const NEW: &str = "019fa111-2222-7333-8444-888888888890";
+    let ids = (0..2800)
+        .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
+        .collect::<Vec<_>>();
+    let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
+    sessions.push((SESSION, 4));
+    let fixture = ScanRoot::with_sessions(&sessions);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
+    assert_eq!(warm.snapshots.len(), 2801);
+    for id in &ids {
+        index
+            .files
+            .get_mut(&local_index_key(&fixture.file(id)))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    let budget = fixture.len(SESSION) * 4;
+    cache.clear();
+    with_test_limits(2048, budget, 64, || {
+        let (next, scan) = published_scan(&fixture, &cache, index, NOW, &[]);
+        index = next;
+        assert!(scan.snapshots.is_empty(), "unchanged-output revalidation");
+        assert!(!scan.census_complete);
+        let window = scan.census_window_end.clone();
+        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() > 2700);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        write_dated_rollout(&fixture, "2026/10/08", NEW);
+        cache.clear();
+        let mut published = BTreeSet::new();
+        for page in 1..=2 {
+            let (next, scan) = published_scan(&fixture, &cache, index, &collected_at(page), &[]);
+            index = next;
+            assert_eq!(scan.census_window_end, window, "same open generation");
+            assert!(!scan.census_complete);
+            published.extend(
+                scan.snapshots
+                    .iter()
+                    .map(|item| item.source_session_id.clone()),
+            );
+            if published.contains(NEW) {
+                break;
+            }
+        }
+        assert_eq!(published, BTreeSet::from([NEW.to_string()]));
+    });
+}
+
 /// G1 carry: a census that closes while a re-read is still waiting hands it
 /// to the next generation as a member instead of dropping it. Two small
 /// files, one full read per page. Page 0 reads one (X) and defers the other

@@ -39452,13 +39452,16 @@ fn refresh_retained_codex_roster(
                 });
             }
         }
+        // A directory that appeared after the walk (a new Codex day) carries
+        // the same freshness provenance as a rollout that appeared directly;
+        // the walk hands it to every file beneath. Scheduling only.
         traversal
             .pending_directories
             .extend(new_directories.into_iter().map(|path| ScanTraversalPath {
                 scan_root: scan_root.clone(),
                 path,
                 census_member: true,
-                watcher_hint: false,
+                watcher_hint: true,
             }));
     }
 }
@@ -39707,12 +39710,14 @@ fn advance_bounded_directory_traversal_with_budget(
                 traversal.counts.symlink_rejected_count += 1;
                 continue;
             }
+            // Only retained-roster refresh marks a directory; the initial
+            // history walk starts unmarked, so cold history stays FIFO.
             if file_type.is_dir() {
                 traversal.pending_directories.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
                     path,
                     census_member: true,
-                    watcher_hint: false,
+                    watcher_hint: directory.watcher_hint,
                 });
                 continue;
             }
@@ -39770,12 +39775,13 @@ fn advance_bounded_directory_traversal_with_budget(
                 .find(|candidate| candidate.path == path)
             {
                 existing.census_member = true;
+                existing.watcher_hint |= directory.watcher_hint;
             } else {
                 traversal.pending_candidates.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
                     path,
                     census_member: true,
-                    watcher_hint: false,
+                    watcher_hint: directory.watcher_hint,
                 });
             }
         }
