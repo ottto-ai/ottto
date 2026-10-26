@@ -628,8 +628,9 @@ pub(crate) struct FileFold {
     model_fallbacks: BTreeMap<u64, String>,
     /// Held pre-birth responses, as half-open sequence ranges.
     skipped: Vec<(u64, u64)>,
-    /// Pre-birth grains held until finish_native confirms the skip.
-    copy: ClaudeEntityBody,
+    /// Pre-birth grains held until finish_native confirms the skip. Sparse:
+    /// most files have none, and finish_native drops them before page attach.
+    copy: Option<Box<ClaudeEntityBody>>,
     /// Held copies without a request id: no census can prove them, so a
     /// proof-checked skip counts them after all. Rare, so boxed.
     idless_copy: Option<Box<ClaudeEntityBody>>,
@@ -909,7 +910,13 @@ impl FileFold {
                 Some((_, end)) if *end == sequence => *end += 1,
                 _ => self.skipped.push((sequence, sequence + 1)),
             }
-            key.put(&mut self.copy, &tokens, requests, at, account);
+            key.put(
+                self.copy.get_or_insert_with(Box::default),
+                &tokens,
+                requests,
+                at,
+                account,
+            );
             return;
         }
         if copied.is_none() && self.money_birth.birth_nanos().is_some() {
@@ -999,8 +1006,9 @@ impl FileFold {
             self.keep_copies(false, markers);
             return;
         }
-        let copy = std::mem::take(&mut self.copy);
-        self.entity.absorb_grains(&copy);
+        if let Some(copy) = self.copy.take() {
+            self.entity.absorb_grains(&copy);
+        }
         if let Some(idless) = self.idless_copy.take() {
             self.entity.absorb_grains(&idless);
         }
@@ -1022,7 +1030,7 @@ impl FileFold {
         markers: Option<&claude_request_identity::OrgMarkers>,
     ) {
         self.finish_identity_start(prefix_excluded, markers);
-        self.copy = Default::default();
+        self.copy = None;
     }
 
     fn finish_identity_start(

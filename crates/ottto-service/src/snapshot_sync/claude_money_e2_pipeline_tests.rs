@@ -367,6 +367,13 @@ fn literal(page: &Page) {
         .snapshots
         .iter()
         .all(crate::snapshots::claude_request_money::is_request_owned_literal));
+    assert!(
+        page.scan
+            .snapshots
+            .iter()
+            .all(|item| item.claude_money.is_none()),
+        "final identity-tagged rows must not retain E2 fold storage for upload"
+    );
 }
 fn assert_mode(actual: (usize, usize, usize), expected: (usize, usize, usize)) {
     let expected = if crate::heap_layout_bound::layout_supported() {
