@@ -2205,6 +2205,65 @@ fn e2_identity_mid_session_request_with_two_orgs_goes_to_the_starting_account() 
 }
 
 #[test]
+fn e2_identity_two_org_request_with_its_own_telemetry_login_goes_to_the_starting_account() {
+    // SOURCE R2-N2: the R3-N2 pair request also carries its own exact
+    // telemetry login. Two orgs on one request are never guessed, and the
+    // login does not move it either: starting account, counted.
+    const ORG_C: &str = "33333333-3333-4333-8333-333333333333";
+    with_enabled(|| {
+        let path = root_file("identity-pair-own-login");
+        let index = ScanIndex::default();
+        let mut items = vec![parse(
+            &path,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("a", &at(1), 10),
+                switch_context(),
+                org_marker(ORG_B),
+                json!({"type":"attachment","sessionId":ROOT,
+                    "attachment":{"type":"session_context",
+                        "context":{"userEmail":"other@example.invalid"}}}),
+                org_marker(ORG_C),
+                line("b", &at(2), 20),
+                line("c", &at(3), 30),
+            ],
+        )];
+        let mut own = row("b", 2, 20);
+        own.account_identifier_hash = Some("b".repeat(64));
+        let read = sidecar(&[refingerprint(own)]);
+        attach_page(&mut items, &read);
+        let api = api_report(&read);
+        let trace = ClaudeTraceOwnershipLoadReport::default();
+        let evidence =
+            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
+        let item = tag_owned(items, &index).remove(0);
+        assert_eq!((item.request_count, item.input_tokens), (3, 60));
+        let accounts = fold(&item).accounts.as_ref().unwrap();
+        assert!(accounts.conflict, "the pair is counted as a conflict");
+        assert!(!accounts.mixed);
+        assert_eq!(
+            org_amounts(&item),
+            BTreeMap::from([(org_hash(ORG_A), (60, 3))])
+        );
+        let login_b = "b".repeat(64);
+        assert!(
+            rows_of(&item).all(|row| {
+                row.account_identifier_hash.as_deref() != Some(login_b.as_str())
+                    && row.identity_parts.iter().flatten().all(|part| {
+                        part.account_identifier_hash.as_deref() != Some(login_b.as_str())
+                    })
+            }),
+            "the pair request's own login does not move it"
+        );
+        assert_evidence_referenced(&item);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
 fn e2_identity_attach_unpriced_and_side_calls_keep_account_partition() {
     with_enabled(|| {
         let path = root_file("identity-attached");
