@@ -4257,3 +4257,30 @@ fn e2_api_fingerprint_is_hashed_once_per_row_and_never_leaves_memory() {
     assert!(claude_api_evidence_fingerprint_is_valid(&valid));
     assert_eq!(claude_api_fingerprint_hashes() - start, 2);
 }
+
+/// The native frame walker must be able to account for a real fold even
+/// when optional inline metadata is absent. This runs on portable CI too;
+/// the platform gate belongs to the outer native frame, not its field walk.
+#[test]
+fn e2_native_heap_walk_admits_optional_metadata_in_both_modes() {
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    let path = root_file("heap-walk");
+    let check = || {
+        let item = parse(
+            &path,
+            Some(t0()),
+            &ScanIndex::default(),
+            &[line("heap-request", T0, 123)],
+        );
+        let fold = item.claude_money.as_deref().unwrap();
+        let mut counter = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        assert!(
+            fold.heap_bound(&mut counter).is_some(),
+            "owned heaps must remain measurable"
+        );
+        assert!(counter.bytes > 0, "owned allocations must be charged");
+    };
+    check();
+    with_enabled(check);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
