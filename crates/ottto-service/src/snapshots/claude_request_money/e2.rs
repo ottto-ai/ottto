@@ -4,6 +4,9 @@
 //! session. The upload gate is OFF: DARK never changes an item, a scan
 //! identity, parser scope or body witness.
 use super::super::claude_context_file_birth::ClaudeFileBirth;
+use super::super::claude_history_upgrade::{
+    claude_path_twin_groups, probe_opened_birth, ClaudeTwinGroups,
+};
 use super::super::claude_money_birth_store::{location_key, LocationKey};
 use super::super::claude_request_census::claude_request_hash;
 use super::super::claude_request_identity::{self, AccountPartition, RequestAccounts};
@@ -34,7 +37,8 @@ pub(crate) const GATE: bool = false;
 /// Copies written within it are counted (known residual, disclosed nowhere).
 pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
 const HOUR_NANOS: i128 = 3_600_000_000_000;
-/// Same bound the P1 holder walk used; a hit is counted and disclosed.
+/// Same bound the P1 holder walk used. A census walk that hits it cannot
+/// decide: the affected sessions or families are held, never counted.
 const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
 pub(crate) fn enabled() -> bool {
@@ -85,6 +89,8 @@ pub(crate) mod bench_seam {
 pub(in crate::snapshots) struct ReadContext<'a> {
     pub(in crate::snapshots) index: &'a ScanIndex,
     pub(in crate::snapshots) path: &'a Path,
+    /// The page's path-twin groups: the one twin rule, built once per page.
+    pub(in crate::snapshots) twins: &'a std::cell::OnceCell<ClaudeTwinGroups>,
 }
 impl ReadContext<'_> {
     /// Current membership plus this page's metadata generation probe.
@@ -95,21 +101,18 @@ impl ReadContext<'_> {
     /// An indexed path, or one this traversal observed that is not indexed
     /// yet (a first-seen twin or a new copy still to be read on this page).
     fn indexed(&self, member: &str, location: LocationKey) -> bool {
-        self.index
-            .files
-            .keys()
-            .chain(
-                self.index
-                    .traversal
-                    .iter()
-                    .flat_map(|traversal| traversal.observed_index_keys.iter()),
-            )
-            .any(|key| member_matches(Path::new(key), member) && location_key(key) == location)
+        self.twin_key(member, location).is_some()
     }
-}
-
-fn member_matches(path: &Path, session: &str) -> bool {
-    claude_index_path_member_ref(path).is_some_and(|member| member.matches_member(session))
+    /// The key of `member`'s path twin at `location`. A member with a single
+    /// path has no twin group: no OTHER location of it is indexed.
+    fn twin_key(&self, member: &str, location: LocationKey) -> Option<&str> {
+        self.twins
+            .get_or_init(|| claude_path_twin_groups(self.index))
+            .get(member)?
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .find(|key| location_key(key) == location)
+    }
 }
 
 /// Same member spelling as T4's twin index, including subagent stems.
@@ -145,6 +148,24 @@ impl crate::heap_layout_bound::HeapLayoutBound for Located {
     const INLINE_ONLY: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)
+    }
+}
+
+/// The proof a held copy skip needs; `decide_page_copies` checks it per
+/// request once per page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CopyProof {
+    /// The earliest live same-session path twin (its index key).
+    Twin(String),
+    /// Earlier MAIN files of other sessions (/branch of an all-pre-birth file).
+    Holders,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for CopyProof {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Twin(key) => key.heap_bound(c),
+            Self::Holders => c.add(0),
+        }
     }
 }
 
@@ -352,6 +373,12 @@ pub(crate) struct FileFold {
     skipped: Vec<(u64, u64)>,
     /// Pre-birth grains held until finish_native confirms the skip.
     copy: ClaudeEntityBody,
+    /// Held copies without a request id: no census can prove them, so a
+    /// proof-checked skip counts them after all. Rare, so boxed.
+    idless_copy: Option<Box<ClaudeEntityBody>>,
+    /// The proof `decide_page_copies` checks per request before the page
+    /// treats the held copies as removed.
+    proof: Option<CopyProof>,
     /// Counted requests inheriting a possibly excluded marker. Sparse and
     /// bounded by the existing 64 marker runs, never by response count.
     prefix_inherited: Option<Box<BTreeMap<u64, ClaudeEntityBody>>>,
@@ -368,7 +395,7 @@ pub(crate) struct FileFold {
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
 }
-crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, prefix_inherited, copied, first_own, ambiguous, disclosed, fold_us, responses, root_fallbacks, side, side_requests, telemetry, accounts);
+crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, copied, first_own, ambiguous, disclosed, fold_us, responses, root_fallbacks, side, side_requests, telemetry, accounts);
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,
@@ -418,8 +445,10 @@ impl FileFold {
                         .claude_money_birth_store
                         .observations(&member)
                         .any(|(location, observed)| {
+                            // The roots' total order: of two equal-birth
+                            // twins exactly one is the earlier.
                             location != here
-                                && observed < physical
+                                && (observed, location) < (physical, here)
                                 && context.indexed(&member, location)
                         })
                 })
@@ -440,6 +469,8 @@ impl FileFold {
             model_fallbacks: BTreeMap::new(),
             skipped: Vec::new(),
             copy: Default::default(),
+            idless_copy: None,
+            proof: None,
             prefix_inherited: None,
             copied: 0,
             first_own: None,
@@ -561,6 +592,12 @@ impl FileFold {
             self.copied += 1;
             self.entity.removed.add(&tokens);
             self.entity.removed_requests += requests;
+            if response.request_id.is_none() {
+                self.idless_copy
+                    .get_or_insert_with(Box::default)
+                    .add(key, &tokens, requests, None, None, at, account);
+                return;
+            }
             match self.skipped.last_mut() {
                 Some((_, end)) if *end == response.sequence => *end += 1,
                 _ => self
@@ -591,18 +628,18 @@ impl FileFold {
         into.add(key, &tokens, requests, None, None, at, account);
     }
 
-    /// Confirm or undo the held pre-birth skip. A partial copy is skipped only
-    /// with a writer certificate from the file's OWN post-birth lines; an
-    /// all-pre-birth file also needs known response writers and a PROVEN
-    /// earlier original (stored birth, deterministic equal-birth order), so twins never
-    /// delete each other: a same-session path, or for a main file another
-    /// session's indexed main file holding every request id (/branch).
-    /// Everything else counts and discloses.
+    /// Confirm, or undo, the held pre-birth skip. A partial copy (own lines
+    /// after birth) is skipped on timestamps with a writer certificate from
+    /// those own lines. Every other skip needs a PROOF that
+    /// `decide_page_copies` checks per request on the page: a same-session
+    /// earlier path twin (stored birth, total (birth, location) order, a
+    /// certified writer) or, for an all-pre-birth MAIN file, earlier main
+    /// files of other sessions (/branch; the request ids are the proof, no
+    /// writer certificate). Without one the copies count and are disclosed.
     pub(in crate::snapshots) fn finish_native(
         &mut self,
         context: Option<&ReadContext<'_>>,
         markers: Option<&claude_request_identity::OrgMarkers>,
-        request_ids: &BTreeSet<String>,
     ) {
         if self.money_birth.uncertain_root() {
             self.disclosed += self.responses; // unknown birth: counted, disclosed
@@ -624,17 +661,32 @@ impl FileFold {
                         .staged_location(location)
                 })
             });
-        let keep = self.money_birth.writer_certified(self.first_own)
-            && (!needs_original
-                || self.original_witness(context)
-                || self.cross_session_original(context, request_ids));
-        if keep {
-            self.finish_identity_start(true, markers);
-            self.copy = Default::default();
+        let certified = self.money_birth.writer_certified(self.first_own);
+        if certified && !needs_original {
+            // Timestamp skip: id-less copies stay skipped with the rest.
+            self.idless_copy = None;
+            self.keep_copies(true, markers);
+            return;
+        }
+        if certified {
+            if let Some(witness) = self.original_witness(context) {
+                self.proof = Some(CopyProof::Twin(witness));
+                self.keep_copies(true, markers);
+                return;
+            }
+        }
+        if self.cross_session_candidate(context) {
+            self.proof = Some(CopyProof::Holders);
+            // Should the page find no holder, the restored copies keep the
+            // accounts their own markers give them (QUOTA: never moved).
+            self.keep_copies(false, markers);
             return;
         }
         let copy = std::mem::take(&mut self.copy);
         self.entity.absorb_grains(&copy);
+        if let Some(idless) = self.idless_copy.take() {
+            self.entity.absorb_grains(&idless);
+        }
         if let Some(accounts) = self.accounts.as_deref_mut() {
             accounts.restore_copies();
         }
@@ -644,6 +696,16 @@ impl FileFold {
         self.disclosed += self.copied;
         self.copied = 0;
         self.finish_identity_start(false, markers);
+    }
+
+    /// Hold the copies as removed (finally, or until the page checks them).
+    fn keep_copies(
+        &mut self,
+        prefix_excluded: bool,
+        markers: Option<&claude_request_identity::OrgMarkers>,
+    ) {
+        self.finish_identity_start(prefix_excluded, markers);
+        self.copy = Default::default();
     }
 
     fn finish_identity_start(
@@ -664,77 +726,144 @@ impl FileFold {
         }
     }
 
-    fn original_witness(&self, context: Option<&ReadContext<'_>>) -> bool {
+    /// The key of the earliest live same-session path twin, if any.
+    fn original_witness(&self, context: Option<&ReadContext<'_>>) -> Option<String> {
         let (Some(context), Some(physical)) = (context, self.physical) else {
-            return false;
+            return None;
         };
-        let Some(member) = session_member(context.path) else {
-            return false;
-        };
+        let member = session_member(context.path)?;
         let key = local_index_key(context.path);
-        context
-            .index
-            .claude_money_birth_store
-            .original_witness_at(&member, &key, physical, |location| {
-                context.live(&member, location)
-            })
-            .is_some()
+        let location = context.index.claude_money_birth_store.original_witness_at(
+            &member,
+            &key,
+            physical,
+            |location| context.live(&member, location),
+        )?;
+        context.twin_key(&member, location).map(str::to_owned)
     }
 
-    /// Owner ruling (/branch, --fork-session): an all-pre-birth MAIN file is
-    /// a copy when every request id it holds is held by indexed main files
-    /// of OTHER sessions with earlier (effective birth, location), found
-    /// with the census holder walk side calls use. Only this rare shape
-    /// walks; no new index or reader. No earlier holder (an orphan copy, its
-    /// original gone) or the walk deadline: counted once here and disclosed
-    /// (COST).
-    fn cross_session_original(
-        &self,
-        context: Option<&ReadContext<'_>>,
-        request_ids: &BTreeSet<String>,
-    ) -> bool {
-        let (Some(context), Some(physical), Some(Located(here)), None) =
-            (context, self.physical, self.location, self.first_own)
-        else {
-            return false;
-        };
-        if request_ids.is_empty()
-            || !claude_index_path_member_ref(context.path)
-                .is_some_and(|member| member.subagent_stem.is_none())
-        {
-            return false;
-        }
-        let Some(own_member) = session_member(context.path) else {
-            return false;
-        };
-        let current = (
+    /// Owner ruling (/branch, --fork-session): an all-pre-birth MAIN file
+    /// whose copies `decide_page_copies` checks against other sessions'
+    /// earlier main files, in one census walk per page.
+    fn cross_session_candidate(&self, context: Option<&ReadContext<'_>>) -> bool {
+        self.first_own.is_none()
+            && self.physical.is_some()
+            && self.location.is_some()
+            && context.is_some_and(|context| {
+                claude_index_path_member_ref(context.path)
+                    .is_some_and(|member| member.subagent_stem.is_none())
+            })
+    }
+
+    /// This fold's (effective birth, location): the total copy order.
+    fn copy_order(&self) -> Option<(i128, LocationKey)> {
+        let physical = self.physical?;
+        let Located(here) = self.location?;
+        Some((
             self.money_birth
                 .birth_nanos()
-                .map_or(physical, |b| b.min(physical)),
+                .map_or(physical, |birth| birth.min(physical)),
             here,
-        );
-        let mut wanted = request_ids
-            .iter()
-            .map(|request_id| claude_request_hash(request_id))
-            .collect::<Vec<_>>();
-        wanted.sort_unstable();
-        wanted.dedup();
-        let store = &context.index.claude_money_birth_store;
-        // Same-session paths (twins, moves) are the birth table's to decide.
-        let earlier = |key: &str| {
-            context.index.files.contains_key(key)
-                && session_member(Path::new(key)).is_some_and(|member| {
-                    member != own_member
-                        && store
-                            .effective_cutoff(&member, key)
-                            .is_some_and(|birth| (birth, location_key(key)) < current)
-                })
+        ))
+    }
+
+    /// The estimated grain key `observe` gave this transcript occurrence.
+    fn occurrence_key(
+        &self,
+        occurrence: &ClaudeTranscriptUsageOccurrence,
+    ) -> Option<ClaudeLiveKey> {
+        let model = occurrence
+            .model
+            .as_deref()
+            .or_else(|| {
+                self.model_fallbacks
+                    .get(&occurrence.sequence)
+                    .map(String::as_str)
+            })
+            .unwrap_or("unknown");
+        grain_key(
+            model,
+            &self.base_selector,
+            SelectorCapture::clone(&occurrence.selector),
+            occurrence.reasoning_effort.as_deref(),
+            occurrence.timestamp.as_deref(),
+            self.bucket_fallback.as_deref(),
+        )
+    }
+
+    /// One held copy whose proof failed counts after all: from the removal
+    /// back to its estimated grain, disclosed.
+    fn restore_one(&mut self, occurrence: &ClaudeTranscriptUsageOccurrence) {
+        let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
+        let requests = occurrence.usage.request_count;
+        let (Some(key), Some(removed), Some(removed_requests)) = (
+            self.occurrence_key(occurrence),
+            self.entity.removed.checked_sub(&tokens),
+            self.entity.removed_requests.checked_sub(requests),
+        ) else {
+            // Cannot give it back exactly: never publish over it.
+            self.entity.certificate_ok = false;
+            return;
         };
-        context
-            .index
-            .claude_request_census
-            .main_transcript_holders(&wanted, earlier, Instant::now() + SIDE_CALL_DEADLINE)
-            .is_some_and(|held| held.len() == wanted.len())
+        self.entity.removed = removed;
+        self.entity.removed_requests = removed_requests;
+        let account = self
+            .accounts
+            .as_ref()
+            .and_then(|accounts| accounts.account(occurrence.sequence));
+        let at = occurrence.timestamp.as_deref().and_then(rfc3339_unix_nanos);
+        self.entity
+            .add(key, &tokens, requests, None, None, at, account);
+        self.unskip(occurrence.sequence);
+        self.copied = self.copied.saturating_sub(1);
+        self.disclosed += 1;
+    }
+
+    /// Held id-less copies count: no census can prove them.
+    fn restore_idless(&mut self) {
+        let Some(idless) = self.idless_copy.take() else {
+            return;
+        };
+        let (tokens, requests) = idless.totals();
+        let responses = idless
+            .grains
+            .values()
+            .map(|grain| grain.contributions)
+            .sum::<u64>();
+        match (
+            self.entity.removed.checked_sub(&tokens),
+            self.entity.removed_requests.checked_sub(requests),
+        ) {
+            (Some(removed), Some(removed_requests)) => {
+                self.entity.removed = removed;
+                self.entity.removed_requests = removed_requests;
+                self.entity.absorb_grains(&idless);
+                self.copied = self.copied.saturating_sub(responses);
+                self.disclosed += responses;
+            }
+            _ => self.entity.certificate_ok = false,
+        }
+    }
+
+    fn unskip(&mut self, sequence: u64) {
+        let at = self.skipped.partition_point(|(_, end)| *end <= sequence);
+        let Some(&(start, end)) = self.skipped.get(at) else {
+            return;
+        };
+        if start > sequence {
+            return;
+        }
+        match (start < sequence, sequence + 1 < end) {
+            (false, false) => {
+                self.skipped.remove(at);
+            }
+            (true, false) => self.skipped[at].1 = sequence,
+            (false, true) => self.skipped[at].0 = sequence + 1,
+            (true, true) => {
+                self.skipped[at].1 = sequence;
+                self.skipped.insert(at + 1, (sequence + 1, end));
+            }
+        }
     }
 
     /// Unmatched counted requests in hours telemetry should have reported:
@@ -920,6 +1049,232 @@ fn holders(items: &[SnapshotItem], view: &FamilyMembership, request_id: &str) ->
     }
 }
 
+/// The request ids of `item` whose response is held as a copy.
+fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
+    let fold = item.claude_money.as_deref();
+    item.claude_usage_occurrences
+        .iter()
+        .filter(move |(_, occurrence)| {
+            fold.is_some_and(|fold| fold.is_skipped(occurrence.sequence))
+        })
+        .map(|(id, _)| id)
+}
+
+/// Owner rulings (COST: never twice, never dropped). Decide every held copy
+/// skip of the page once, before telemetry attach, so a copy that counts
+/// after all is matched like any counted request. A request stays removed
+/// only if its proof file's CURRENT revision holds that request id: that
+/// file's parse on this page, else its census record bound to its index
+/// entry's fingerprint. Requests no current revision holds count and are
+/// disclosed. What cannot be decided yet (the proof file not read at its
+/// current revision, a holder not indexed yet, the census walk deadline)
+/// holds the session: delayed to a later page, never counted. All the
+/// page's cross-session checks share ONE census walk. Runs in both gate
+/// modes; dark only counts.
+pub(crate) fn decide_page_copies(items: &mut [SnapshotItem], index: &ScanIndex) {
+    let mut holders = Vec::new();
+    for at in 0..items.len() {
+        let Some(fold) = items[at].claude_money.as_deref_mut() else {
+            continue;
+        };
+        // A page decides afresh (a test re-deciding a larger page included).
+        fold.entity.held = false;
+        let proof = fold.proof.clone();
+        match proof {
+            Some(CopyProof::Twin(witness)) => decide_twin(items, at, &witness, index),
+            Some(CopyProof::Holders) => holders.push(at),
+            None => {}
+        }
+    }
+    if !holders.is_empty() {
+        decide_holders(items, &holders, index);
+    }
+}
+
+fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &ScanIndex) {
+    let location = Some(Located(location_key(witness)));
+    let session = &items[at].source_session_id;
+    // The witness's parse on this page is its current revision by construction.
+    let on_page = items.iter().find(|item| {
+        &item.source_session_id == session
+            && item
+                .claude_money
+                .as_deref()
+                .is_some_and(|fold| fold.location == location)
+    });
+    let uncovered = match on_page {
+        Some(original) => Some(
+            skipped_ids(&items[at])
+                .filter(|id| !original.claude_usage_request_ids.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+        None => index
+            .files
+            .get(witness)
+            .zip(index.claude_request_census.get(witness))
+            .filter(|(entry, record)| record.proves_current(&entry.source_file_fingerprint))
+            .map(|(_, record)| {
+                skipped_ids(&items[at])
+                    .filter(|id| !record.holds_hash(claude_request_hash(id)))
+                    .cloned()
+                    .collect()
+            }),
+    };
+    match uncovered {
+        Some(uncovered) => restore_uncovered(&mut items[at], &uncovered),
+        None => hold_copies(&mut items[at]),
+    }
+}
+
+/// One census walk for every all-pre-birth main file of the page. A holder
+/// proves a request when it is another session's main file, indexed at the
+/// revision its census record describes, and earlier in (effective birth,
+/// location); a holder without a stored birth is probed once.
+fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex) {
+    struct Wanted {
+        at: usize,
+        session: String,
+        order: (i128, LocationKey),
+        hashes: Vec<u64>,
+        covered: BTreeSet<u64>,
+        unproven: BTreeSet<u64>,
+    }
+    let mut wanted = folds
+        .iter()
+        .filter_map(|&at| {
+            let item = &items[at];
+            let order = item.claude_money.as_deref()?.copy_order()?;
+            let mut hashes = skipped_ids(item)
+                .map(|id| claude_request_hash(id))
+                .collect::<Vec<_>>();
+            hashes.sort_unstable();
+            hashes.dedup();
+            Some(Wanted {
+                at,
+                session: item.source_session_id.clone(),
+                order,
+                hashes,
+                covered: BTreeSet::new(),
+                unproven: BTreeSet::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut union = wanted
+        .iter()
+        .flat_map(|wanted| wanted.hashes.iter().copied())
+        .collect::<Vec<_>>();
+    union.sort_unstable();
+    union.dedup();
+    let store = &index.claude_money_birth_store;
+    let mut births = BTreeMap::<&str, Option<i128>>::new();
+    let walked = index.claude_request_census.main_transcript_holders(
+        &union,
+        Instant::now() + SIDE_CALL_DEADLINE,
+        |key, root, record, hits| {
+            let current = index
+                .files
+                .get(key)
+                .is_some_and(|entry| record.proves_current(&entry.source_file_fingerprint));
+            for wanted in wanted.iter_mut().filter(|wanted| wanted.session != root) {
+                let mine = hits
+                    .iter()
+                    .copied()
+                    .filter(|hash| wanted.hashes.binary_search(hash).is_ok());
+                if !current {
+                    // Changed since its census: decided when it is read again.
+                    wanted.unproven.extend(mine);
+                    continue;
+                }
+                let birth = *births.entry(key).or_insert_with(|| {
+                    store.effective_cutoff(root, key).or_else(|| {
+                        probe_opened_birth(key)
+                            .filter(|opened| opened.birth != 0)
+                            .map(|opened| i128::from(opened.birth))
+                    })
+                });
+                if birth.is_some_and(|birth| (birth, location_key(key)) < wanted.order) {
+                    wanted.covered.extend(mine);
+                }
+            }
+        },
+    );
+    // Another session's main file seen by this traversal but not indexed yet
+    // is read later: an id no holder proves now may be proven then.
+    let pending_roots = std::cell::OnceCell::<BTreeSet<&str>>::new();
+    let pending = || {
+        pending_roots.get_or_init(|| {
+            index
+                .traversal
+                .iter()
+                .flat_map(|traversal| traversal.observed_index_keys.iter())
+                .filter(|key| !index.files.contains_key(*key))
+                .filter_map(|key| claude_index_path_member_ref(Path::new(key)))
+                .filter(|member| member.subagent_stem.is_none())
+                .map(|member| member.root)
+                .collect()
+        })
+    };
+    for wanted in wanted {
+        let uncovered = wanted
+            .hashes
+            .iter()
+            .copied()
+            .filter(|hash| !wanted.covered.contains(hash))
+            .collect::<Vec<_>>();
+        let undecided = walked.is_none()
+            || uncovered.iter().any(|hash| wanted.unproven.contains(hash))
+            || (!uncovered.is_empty()
+                && pending()
+                    .iter()
+                    .any(|root| *root != wanted.session.as_str()));
+        if undecided {
+            hold_copies(&mut items[wanted.at]);
+            continue;
+        }
+        let ids = skipped_ids(&items[wanted.at])
+            .filter(|id| uncovered.binary_search(&claude_request_hash(id)).is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        restore_uncovered(&mut items[wanted.at], &ids);
+    }
+}
+
+/// The proof cannot be decided on this page: the session is withheld.
+fn hold_copies(item: &mut SnapshotItem) {
+    if let Some(fold) = item.claude_money.as_deref_mut() {
+        fold.entity.held = true;
+    }
+}
+
+/// Decided: `uncovered` (and every id-less copy) counts, disclosed.
+fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
+    let SnapshotItem {
+        claude_money: Some(fold),
+        claude_usage_occurrences,
+        ..
+    } = item
+    else {
+        return;
+    };
+    for id in uncovered {
+        if fold.is_ambiguous(id) {
+            // Two responses claim it: no single grain to give back.
+            fold.entity.certificate_ok = false;
+        } else if let Some(occurrence) = claude_usage_occurrences.get(id) {
+            fold.restore_one(occurrence);
+        }
+    }
+    fold.restore_idless();
+    fold.proof = None;
+    if fold.copied == 0 {
+        // Every copy counts after all: their inherited-marker tally too.
+        if let Some(accounts) = fold.accounts.as_deref_mut() {
+            accounts.restore_copies();
+        }
+    }
+}
+
 /// Move one matched transcript request from its estimated grain to its
 /// reported grain: priced => telemetry_matched, no cost => telemetry_unpriced
 /// (server rule). Counts never change. False when the estimated grain cannot
@@ -936,23 +1291,7 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
     let Some(occurrence) = claude_usage_occurrences.get(row.request_id.as_str()) else {
         return false;
     };
-    let model = occurrence
-        .model
-        .as_deref()
-        .or_else(|| {
-            fold.model_fallbacks
-                .get(&occurrence.sequence)
-                .map(String::as_str)
-        })
-        .unwrap_or("unknown");
-    let Some(estimated) = grain_key(
-        model,
-        &fold.base_selector,
-        SelectorCapture::clone(&occurrence.selector),
-        occurrence.reasoning_effort.as_deref(),
-        occurrence.timestamp.as_deref(),
-        fold.bucket_fallback.as_deref(),
-    ) else {
+    let Some(estimated) = fold.occurrence_key(occurrence) else {
         return false;
     };
     let Some(reported) = reported_key(row, Some(occurrence), &fold.base_selector) else {
@@ -1095,12 +1434,18 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
 /// family's rows; off-page holders come from the family-scoped census
 /// lookup, skipped when there are no candidates. Runs after the per-root
 /// trace read: `api`/`trace` hold only roots whose sidecars are complete.
+///
+/// Returns the family roots whose side calls could not be decided (the
+/// census walk hit its deadline): the caller holds their owed history files
+/// through the unhealthy-telemetry seam, so a later page publishes the exact
+/// side-call money; their bodies stay telemetry-incomplete meanwhile.
 pub(crate) fn side_calls_page(
     items: &mut [SnapshotItem],
     api: &ClaudeLocalOtelLoadReport,
     trace: &ClaudeTraceOwnershipLoadReport,
     index: &ScanIndex,
-) {
+) -> BTreeSet<String> {
+    let mut unresolved = BTreeSet::new();
     if enabled() {
         claude_request_identity::inherit_root_accounts(items, false);
     }
@@ -1110,7 +1455,7 @@ pub(crate) fn side_calls_page(
             .is_some_and(|fold| fold.telemetry.read && !fold.telemetry.side_calls_done)
     };
     if !items.iter().any(owing) {
-        return;
+        return unresolved;
     }
     let families = page_families(items)
         .into_iter()
@@ -1171,11 +1516,15 @@ pub(crate) fn side_calls_page(
             .iter()
             .copied()
             .find(|index| items[*index].claude_money.is_some());
-        let (Some(first), Some(rows), Some(census)) =
-            (first, candidates.remove(root.as_str()), census.as_mut())
-        else {
-            // Unhealthy pair or deadline: counted and disclosed, never dropped
-            // silently; the family stays telemetry-incomplete.
+        let rows = candidates.remove(root.as_str());
+        // The census deadline: no candidate is counted (an off-page
+        // transcript may hold it); the family's owed history is held so a
+        // later page decides. An unhealthy pair is already held by its caller.
+        if census.is_none() && rows.as_ref().is_some_and(|rows| !rows.is_empty()) {
+            unresolved.insert(root.clone());
+        }
+        let (Some(first), Some(rows), Some(census)) = (first, rows, census.as_mut()) else {
+            // The family stays telemetry-incomplete.
             if let Some(index) = first {
                 if let Some(fold) = items[index].claude_money.as_deref_mut() {
                     fold.disclosed += fold.telemetry.side_candidates;
@@ -1207,17 +1556,27 @@ pub(crate) fn side_calls_page(
                 targets
             });
         let mut disclosed = invalid.get(root.as_str()).copied().unwrap_or(0);
+        // Members this traversal saw but has not indexed yet: read later.
+        let unread = std::cell::OnceCell::<BTreeSet<String>>::new();
         for (row, owner) in rows.iter().zip(owners) {
-            let fallback = owner.is_none();
+            let mut fallback = owner.is_none();
             let owner = owner.map(|row| claude_trace_owner_session_id(root, &row.agent_id));
-            let owner = owner.as_deref().unwrap_or(root);
-            let target = targets.get(owner).copied();
-            let Some(target) = target else {
-                // Its member counts it when read; a named member with no
-                // transcript anywhere cannot, so that is disclosed.
-                if !fallback && owner != root.as_str() && !family_census.members.contains(owner) {
-                    disclosed += 1;
-                }
+            let mut owner = owner.as_deref().unwrap_or(root);
+            // A named member with no transcript anywhere can never count it:
+            // the root does, counted as a fallback (COST Q3). A member with
+            // a transcript (indexed, or seen and still to be read) counts it
+            // itself when read.
+            if !targets.contains_key(owner)
+                && owner != root.as_str()
+                && !family_census.members.contains(owner)
+                && !unread
+                    .get_or_init(|| unread_members(index, root))
+                    .contains(owner)
+            {
+                owner = root.as_str();
+                fallback = true;
+            }
+            let Some(target) = targets.get(owner).copied() else {
                 continue;
             };
             let Some((cache_5m, cache_1h, unattributed)) = claude_api_cache_creation(row) else {
@@ -1269,6 +1628,20 @@ pub(crate) fn side_calls_page(
             fold.disclosed += disclosed;
         }
     }
+    unresolved
+}
+
+/// The family members of `root` this traversal observed but has not indexed.
+fn unread_members(index: &ScanIndex, root: &str) -> BTreeSet<String> {
+    index
+        .traversal
+        .iter()
+        .flat_map(|traversal| traversal.observed_index_keys.iter())
+        .filter(|key| !index.files.contains_key(*key))
+        .filter_map(|key| claude_index_path_member_ref(Path::new(key)))
+        .filter(|member| member.root == root)
+        .map(|member| member.into_owned().1)
+        .collect()
 }
 
 /// The trace-named owner of each sorted candidate row (None: no trace row,
@@ -1467,9 +1840,10 @@ pub(crate) fn visit_identity_rows(
     Some(())
 }
 
-/// Sessions with a live indexed root path that is not on this page: never
-/// publish one path over complete twin history. Only sessions whose birth
-/// table knows more paths than the page holds trigger one index walk.
+/// Sessions (roots and subagent members) with a live indexed path that is
+/// not on this page: never publish one path over complete twin history. Only
+/// sessions whose birth table knows more paths than the page holds build the
+/// shared twin groups (after the scan, so not the page's own copy).
 fn absent_twins(sessions: &[(&str, &[LocationKey])], index: &ScanIndex) -> BTreeSet<String> {
     let store = &index.claude_money_birth_store;
     let suspects = sessions
@@ -1484,18 +1858,14 @@ fn absent_twins(sessions: &[(&str, &[LocationKey])], index: &ScanIndex) -> BTree
     if suspects.is_empty() {
         return held;
     }
-    for key in index.files.keys() {
-        let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
-            continue;
-        };
-        if member.subagent_stem.is_some() {
-            continue;
-        }
-        let Some((session, here)) = suspects.iter().find(|(session, _)| *session == member.root)
-        else {
-            continue;
-        };
-        if !here.contains(&location_key(key)) && Path::new(key).is_file() {
+    let groups = claude_path_twin_groups(index);
+    for (session, here) in suspects {
+        let absent = groups.get(*session).is_some_and(|keys| {
+            keys.iter().any(|(key, size)| {
+                size.is_some() && !here.contains(&location_key(key)) && Path::new(key).is_file()
+            })
+        });
+        if absent {
             held.insert((*session).to_owned());
         }
     }
@@ -1552,29 +1922,12 @@ mod tests;
 /// page's forced-family path. No parser/scope/identity bump is involved.
 pub(in crate::snapshots) fn selected_twin_roots<'a>(
     paths: impl Iterator<Item = &'a Path>,
-    index: &ScanIndex,
+    twins: &ClaudeTwinGroups,
 ) -> BTreeSet<String> {
-    let selected = paths
+    paths
         .filter_map(claude_index_path_family_member)
-        .map(|(root, member)| (member, root))
-        .collect::<BTreeMap<_, _>>();
-    let mut seen = BTreeMap::<String, BTreeSet<&str>>::new();
-    for key in index.files.keys().chain(
-        index
-            .traversal
-            .as_ref()
-            .into_iter()
-            .flat_map(|t| t.observed_index_keys.iter()),
-    ) {
-        if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
-            if selected.contains_key(&member) {
-                seen.entry(member).or_default().insert(key);
-            }
-        }
-    }
-    seen.into_iter()
-        .filter(|(_, keys)| keys.len() > 1)
-        .filter_map(|(member, _)| selected.get(&member).cloned())
+        .filter(|(_, member)| twins.contains_key(member))
+        .map(|(root, _)| root)
         .collect()
 }
 

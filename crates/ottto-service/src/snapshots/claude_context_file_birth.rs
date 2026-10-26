@@ -69,6 +69,51 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeWriterRun {
     }
 }
 
+/// Money only: the writer certificate of the lines at or after a cutoff that
+/// finalize decides (the EFFECTIVE money birth, earlier than the physical
+/// birth after a proven move), not only the physical birth. `others[k]` is
+/// the latest line (untimed: `i64::MAX`) NOT written by
+/// `KNOWN_COPY_WRITERS[k]`, `latest` the latest line of any writer. Lines at
+/// or after T are certified by writer k iff `latest >= T && others[k] < T`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaudeOwnWriters {
+    latest: i64,
+    others: [i64; KNOWN_COPY_WRITERS.len()],
+}
+impl Default for ClaudeOwnWriters {
+    fn default() -> Self {
+        Self {
+            latest: i64::MIN,
+            others: [i64::MIN; KNOWN_COPY_WRITERS.len()],
+        }
+    }
+}
+impl ClaudeOwnWriters {
+    fn clamp(at: i128) -> i64 {
+        i64::try_from(at).unwrap_or(if at < 0 { i64::MIN } else { i64::MAX })
+    }
+    fn observe(&mut self, version: Option<&str>, at: Option<i128>) {
+        let at = at.map_or(i64::MAX, Self::clamp);
+        self.latest = self.latest.max(at);
+        for (other, known) in self.others.iter_mut().zip(KNOWN_COPY_WRITERS) {
+            if version != Some(*known) {
+                *other = (*other).max(at);
+            }
+        }
+    }
+    fn certified_from(self, cutoff: i128) -> bool {
+        let cutoff = Self::clamp(cutoff);
+        self.latest >= cutoff && self.others.iter().any(|other| *other < cutoff)
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeOwnWriters {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
 /// Open-descriptor metadata, also used by the page's one metadata probe per twin.
 /// A zero inode means unavailable; no timestamp or file identity is invented.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -159,8 +204,8 @@ pub(crate) struct ClaudeFileBirth {
     own_last_context: Option<u64>,
     /// A tagged response came before the first own response.
     tagged_before_first_own: bool,
-    /// Money only: the writer version of the file's own lines.
-    writer: ClaudeWriterRun,
+    /// Money only: the writer versions of the file's lines by time.
+    writer: ClaudeOwnWriters,
     all_response_writers: ClaudeWriterRun,
     opened: ClaudeOpenedBirth,
 }
@@ -278,19 +323,19 @@ impl ClaudeFileBirth {
     ) {
         self.all_response_writers.observe(version);
         // An untimed response cannot prove it belongs to the copied prefix;
-        // include its writer conservatively among possible own responses.
-        let at = timestamp.and_then(rfc3339_unix_nanos);
-        let own = self.physical_birth_nanos().is_some_and(|birth| {
-            at.is_none_or(|at| at >= birth - super::claude_request_money::e2::SLACK)
-        });
-        if own {
-            self.writer.observe(version);
-        }
+        // it counts conservatively among the own responses of every cutoff.
+        self.writer
+            .observe(version, timestamp.and_then(rfc3339_unix_nanos));
     }
 
+    /// Own lines are those at or after THIS birth's money cutoff (minus
+    /// slack), the same split `copied_with_slack` makes for money.
     pub(in crate::snapshots) fn writer_certified(&self, first_own_sequence: Option<u64>) -> bool {
         if first_own_sequence.is_some() {
-            self.writer.certified()
+            self.birth_nanos().is_some_and(|birth| {
+                self.writer
+                    .certified_from(birth - super::claude_request_money::e2::SLACK)
+            })
         } else {
             // Restored all-pre-birth files have no own run. Require a known
             // version on EVERY response, never a header or inherited version.

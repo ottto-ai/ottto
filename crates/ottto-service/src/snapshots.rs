@@ -14466,6 +14466,17 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
     effective_input_context: u64,
 }
 
+/// Why a retained Claude response has no resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeResolveFailure {
+    /// The per-file record cap dropped some of its records.
+    Capped,
+    /// A compact record no longer decodes against the file's selector table.
+    Decode,
+    /// Incompatible observations: the native resolver's conflict.
+    Conflict,
+}
+
 impl ClaudeResponseObservation {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -14549,11 +14560,20 @@ impl ClaudeResponseObservation {
     }
 
     fn resolve_with(self, selectors: &ClaudeSelectorTable) -> Option<ResolvedClaudeResponse> {
+        self.resolve_classified(selectors).ok()
+    }
+
+    /// `resolve_with`, telling why a response has no resolution.
+    fn resolve_classified(
+        self,
+        selectors: &ClaudeSelectorTable,
+    ) -> Result<ResolvedClaudeResponse, ClaudeResolveFailure> {
         if self.record_limit_exceeded {
-            return None;
+            return Err(ClaudeResolveFailure::Capped);
         }
         let mut records =
-            claude_response_records::decode_records(self.records.into_vec(), selectors)?;
+            claude_response_records::decode_records(self.records.into_vec(), selectors)
+                .ok_or(ClaudeResolveFailure::Decode)?;
         // Provider time is authoritative only when it proves a complete order
         // for this response. Mixed valid/missing timestamps retain physical
         // append order, preserving the conservative legacy behavior instead
@@ -14578,7 +14598,7 @@ impl ClaudeResponseObservation {
                     canonical_records.last_mut().expect("record exists"),
                     record,
                 ) {
-                    return None;
+                    return Err(ClaudeResolveFailure::Conflict);
                 }
             } else {
                 canonical_records.push(record);
@@ -14586,14 +14606,14 @@ impl ClaudeResponseObservation {
         }
 
         let mut records = canonical_records.into_iter();
-        let mut aggregate = records.next()?;
+        let mut aggregate = records.next().ok_or(ClaudeResolveFailure::Conflict)?;
         let first_timestamp = aggregate.timestamp.clone();
         for record in records {
             if !merge_claude_response_record(&mut aggregate, record) {
-                return None;
+                return Err(ClaudeResolveFailure::Conflict);
             }
         }
-        Some(ResolvedClaudeResponse {
+        Ok(ResolvedClaudeResponse {
             cache_slot: aggregate.cache_slot,
             sequence: self.sequence,
             usage: aggregate.usage,
@@ -17874,17 +17894,25 @@ impl SnapshotAccumulator {
         }
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         for response in responses {
-            let capped = response.record_limit_exceeded;
-            let Some(mut response) = response.resolve_with(&selectors) else {
-                money.note_resolver_conflict();
+            let mut response = match response.resolve_classified(&selectors) {
+                Ok(response) => response,
                 // COST: with the E2 gate on, a resolver conflict is counted
                 // and disclosed on the body (resolver_conflict_count) and the
-                // root publishes; it is not drop residue held for retry. The
-                // record cap stays a hold. Gate off (dark): unchanged.
-                if capped || !claude_request_money::e2::enabled() {
-                    self.note_dropped_usage();
+                // root publishes; it is not drop residue held for retry. Gate
+                // off (dark): unchanged drop residue, still counted.
+                Err(ClaudeResolveFailure::Conflict) => {
+                    money.note_resolver_conflict();
+                    if !claude_request_money::e2::enabled() {
+                        self.note_dropped_usage();
+                    }
+                    continue;
                 }
-                continue;
+                // The record cap and an undecodable compact record are loss
+                // held for retry, never a resolver conflict.
+                Err(ClaudeResolveFailure::Capped | ClaudeResolveFailure::Decode) => {
+                    self.note_dropped_usage();
+                    continue;
+                }
             };
             let at = response
                 .terminal_timestamp
@@ -18048,11 +18076,7 @@ impl SnapshotAccumulator {
                     .map(|capture| (capture, response.sequence)),
             );
         }
-        money.finish_native(
-            money_context.as_ref(),
-            self.claude_org_markers.as_deref(),
-            &self.claude_usage_request_ids,
-        );
+        money.finish_native(money_context.as_ref(), self.claude_org_markers.as_deref());
         money.fold_us = money_started.elapsed().as_micros() as u64;
         self.claude_money = Some(Box::new(money));
     }
@@ -19142,7 +19166,17 @@ impl SnapshotAccumulator {
                 last_activity_at: bucket.last_activity_at,
             });
         }
-        if session_rows.is_empty() {
+        // E2 (gate on): a file whose every response is a resolver conflict
+        // keeps a zero-usage carrier, so its conflict disclosure publishes
+        // through the literal emitter like any request-owned body. No tokens
+        // are invented; gate off, nothing changes.
+        let conflict_carrier = self.source == SnapshotSource::ClaudeCode
+            && claude_request_money::e2::enabled()
+            && self
+                .claude_money
+                .as_deref()
+                .is_some_and(|money| money.entity.resolver_conflicts > 0);
+        if session_rows.is_empty() && !conflict_carrier {
             return Vec::new();
         }
         let mut model_usage: Vec<SnapshotModelUsage> = session_rows
@@ -24887,12 +24921,16 @@ impl OwnedSourceScan {
             }
         }
         let mut claude_twin_only_family_reparses = BTreeSet::new();
+        // E2: the page's path-twin groups, built at most once per page and
+        // shared with twin staging and the parse-time birth context.
+        let claude_twin_groups = std::cell::OnceCell::new();
         if source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled() {
             for root in claude_request_money::e2::selected_twin_roots(
                 identified_candidates
                     .iter()
                     .map(|candidate| candidate.path.as_path()),
-                &index,
+                claude_twin_groups
+                    .get_or_init(|| claude_history_upgrade::claude_path_twin_groups(&index)),
             ) {
                 if forced_claude_family_reparses.insert(root.clone()) {
                     claude_twin_only_family_reparses.insert(root);
@@ -25020,7 +25058,7 @@ impl OwnedSourceScan {
             scanned_file_count,
             scanned_session_count,
             semantic_noop_count,
-            history_upgrade: HistoryPage::default(),
+            history_upgrade: HistoryPage::with_twin_groups(claude_twin_groups),
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
@@ -27213,6 +27251,7 @@ impl OwnedSourceScan {
                     Some(claude_request_money::e2::ReadContext {
                         index,
                         path: &candidate.path,
+                        twins: history_upgrade.twin_groups(),
                     }),
                 );
                 // A committed cursor attempt counts as published only now (M4).

@@ -8476,6 +8476,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         requested_session_count: session_ids.len(),
         ..Default::default()
     };
+    // E2: every held copy skip is decided (or the session held) before
+    // telemetry attaches, so a copy that counts after all can be matched.
+    crate::snapshots::claude_request_money::e2::decide_page_copies(
+        &mut scan_result.snapshots,
+        index,
+    );
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
@@ -8646,7 +8652,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
     }
     // E2 side calls need the trace-named owner, so they follow the trace read.
-    crate::snapshots::claude_request_money::e2::side_calls_page(
+    let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
         &mut scan_result.snapshots,
         &api_report,
         &trace_report,
@@ -8657,6 +8663,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // sidecars are ordinary absence; partial pairs and failed strict reads
         // hold only that root's permitted owed history through the existing seam.
         index.hold_claude_history_for_unhealthy_telemetry_roots(&identity_unhealthy_roots);
+        // A side-call census walk past its deadline decided nothing for its
+        // families: the same seam keeps their owed history for a later page.
+        index.hold_claude_history_for_unhealthy_telemetry_roots(&side_calls_unresolved);
     }
     // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.

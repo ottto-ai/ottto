@@ -66,9 +66,19 @@ fn parse(path: &Path, birth: Option<i128>, index: &ScanIndex, lines: &[Value]) -
     for value in lines {
         apply_claude_code_line(value, &mut a);
     }
-    a.finalize_claude_responses_e2(None, Some(ReadContext { index, path }));
-    a.into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None)
-        .remove(0)
+    a.finalize_claude_responses_e2(
+        None,
+        Some(ReadContext {
+            index,
+            path,
+            twins: &Default::default(),
+        }),
+    );
+    let mut items = a.into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None);
+    // The page's copy decision, as the scan runs it; `publish` decides again
+    // over the whole page, where a parsed witness proves its own requests.
+    decide_page_copies(&mut items, index);
+    items.remove(0)
 }
 /// Parse, then record the read like the scan does (birth + indexed path).
 fn parse_and_remember(
@@ -145,6 +155,7 @@ fn publish(
     telemetry: TelemetryRead,
     index: &ScanIndex,
 ) -> Vec<SnapshotItem> {
+    decide_page_copies(&mut items, index);
     if let Some(read) = read {
         attach_page(&mut items, read);
         side_calls_page(
@@ -1418,6 +1429,7 @@ fn org_hash(org: &str) -> String {
     ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap()
 }
 fn tag_owned(mut items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
+    decide_page_copies(&mut items, index);
     let api = ClaudeLocalOtelLoadReport::default();
     let trace = ClaudeTraceOwnershipLoadReport::default();
     let per_file_originals = claude_request_identity::capture_request_owned_originals(&items);
@@ -2083,6 +2095,7 @@ fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding()
                     Some(ReadContext {
                         index: &index,
                         path: &path,
+                        twins: &Default::default(),
                     }),
                 );
                 let item = accumulator
@@ -2327,6 +2340,7 @@ fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
                 Some(ReadContext {
                     index: &index,
                     path: &path,
+                    twins: &Default::default(),
                 }),
             );
             let mut items =
@@ -2655,6 +2669,7 @@ fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
                     Some(ReadContext {
                         index: &index,
                         path: &path,
+                        twins: &Default::default(),
                     }),
                 );
                 let item = accumulator
@@ -3055,6 +3070,7 @@ fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
                 Some(ReadContext {
                     index: &index,
                     path: &path,
+                    twins: &Default::default(),
                 }),
             );
             let item = accumulator
@@ -3194,6 +3210,7 @@ fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
                 Some(ReadContext {
                     index: &index,
                     path: &copy,
+                    twins: &Default::default(),
                 }),
             );
             let item = accumulator
@@ -3283,6 +3300,7 @@ fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
                         Some(ReadContext {
                             index: &index,
                             path: &b,
+                            twins: &Default::default(),
                         }),
                     );
                     markerless = accumulator
@@ -3355,6 +3373,7 @@ fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
                 Some(ReadContext {
                     index: &index,
                     path: &path,
+                    twins: &Default::default(),
                 }),
             );
             let mut items =
@@ -3421,6 +3440,7 @@ fn e2_identity_conflicting_twin_bindings_clear_root_fallback_in_every_order() {
                 Some(ReadContext {
                     index: &index,
                     path,
+                    twins: &Default::default(),
                 }),
             );
             accumulator
