@@ -9460,13 +9460,28 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             };
             let duplicate_owner =
                 claude_duplicate_request_owner(&root_session_id, &source_session_id);
-            let current_member_owns_changed_request = index
-                .claude_usage_family_pending
-                .get(&root_session_id)
-                .and_then(|pending| pending.member_request_id_hashes.get(&source_session_id))
-                .is_some_and(|request_hashes| {
-                    !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
-                });
+            // A fence that stays closed keeps no duplicate witness (it is
+            // cleared above), so every duplicate this census detects compares
+            // as changed against nothing, and re-arming its owners re-read
+            // them on every complete walk. While the fence stays closed,
+            // `unresolved_duplicate` keeps the strict duplicate-dependent
+            // ownership outputs (posture and curve ownership) unresolved: a
+            // strict ownership gate, not an upload hold. This guard changes
+            // neither that gate nor any money or account gate. A real append
+            // or edit still re-reads through its own changed size or
+            // fingerprint, and the fence's liveness full re-arm re-reads every
+            // family to reopen it, so only an open or opening fence re-arms
+            // changed duplicate owners.
+            let changed_duplicate_owner =
+                !fence_stays_closed && changed_duplicate_owners.contains(&duplicate_owner);
+            let current_member_owns_changed_request = !fence_stays_closed
+                && index
+                    .claude_usage_family_pending
+                    .get(&root_session_id)
+                    .and_then(|pending| pending.member_request_id_hashes.get(&source_session_id))
+                    .is_some_and(|request_hashes| {
+                        !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
+                    });
             let proof_candidate = proven.contains_key(&root_session_id)
                 && !current_ids.contains(source_session_id.as_str());
             let negative = negative_keys.contains(index_key.as_str());
@@ -9478,7 +9493,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 || identity_contract_rearm
                 || fence_recovery_rearm
                 || invalidated_witness_roots.contains(&root_session_id)
-                || changed_duplicate_owners.contains(&duplicate_owner)
+                || changed_duplicate_owner
                 || current_member_owns_changed_request;
             rearm.proof_candidates = rearm
                 .proof_candidates
@@ -9505,7 +9520,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     }
                 }
                 || invalidated_witness_roots.contains(&root_session_id)
-                || changed_duplicate_owners.contains(&duplicate_owner)
+                || changed_duplicate_owner
                 || current_member_owns_changed_request;
             if rearmed {
                 // Reparse earlier-page members of every proven family unless

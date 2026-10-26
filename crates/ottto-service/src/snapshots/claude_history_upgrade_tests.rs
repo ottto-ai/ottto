@@ -1620,3 +1620,282 @@ fn revision_two_drops_every_request_owned_literal_on_both_upload_paths() {
     );
     let _ = fs::remove_dir_all(home);
 }
+
+/// Copies that share a copied request are cross-family duplicates. Under a
+/// duplicate fence that stays closed the witness is cleared at every complete
+/// census, so a duplicate the census detects compared as changed against
+/// nothing and re-armed its owners: the copies were read again on every walk.
+/// Read once (here: re-armed while the fence is closed), they now settle and
+/// two complete walks after read none of them. A real append to one copy is
+/// still read once under the closed fence, and once the fence's liveness
+/// re-arm is due, a whole covered walk reopens the fence and the appended
+/// request stays in the accepted bodies exactly once, across pages and a
+/// reload. Walks span two pages.
+#[test]
+fn copies_read_under_a_closed_duplicate_fence_settle_after_one_walk() {
+    use std::cell::{Cell, RefCell};
+    use std::io::Write as _;
+    /// The appended request's input tokens: the rest of the corpus sums to
+    /// less than one of them, so the accepted total counts it.
+    const APPENDED_INPUT: u64 = 1_000_000;
+    let root = crate::test_scratch::unique_path("ottto-closed-fence-copies");
+    fs::create_dir_all(&root).unwrap();
+    let line = |session: &str, request: &str, at: &str, input: u64| {
+        format!(
+            "{}\n",
+            json!({
+                "timestamp": at,
+                "type": "assistant",
+                "sessionId": session,
+                "requestId": request,
+                "message": {
+                    "id": format!("msg-{request}"),
+                    "model": "claude-haiku-4-5",
+                    "usage": {"input_tokens": input, "output_tokens": 1}
+                }
+            })
+        )
+    };
+    let source = session(1);
+    fs::write(
+        root.join(format!("{source}.jsonl")),
+        line(&source, "req-a", "2026-08-20T09:00:00Z", 10)
+            + &line(&source, "req-b", "2026-08-20T09:01:00Z", 10),
+    )
+    .unwrap();
+    let copies = [session(2), session(3)];
+    for (n, copy) in copies.iter().enumerate() {
+        fs::write(
+            root.join(format!("{copy}.jsonl")),
+            line(copy, "req-a", "2026-08-20T09:00:00Z", 10)
+                + &line(copy, &format!("req-own-{n}"), "2026-08-20T09:05:00Z", 10),
+        )
+        .unwrap();
+    }
+    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+    let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    // Minutes after 10:00 on the census clock.
+    let minute = Cell::new(0_u32);
+    // Last accepted body per session: (fingerprint, input tokens).
+    let accepted = RefCell::new(BTreeMap::<String, (String, u64)>::new());
+    // One page of two files: scan, fold, finalize, and accept every body
+    // the page sends, as the server does.
+    let page = |index: &mut ScanIndex| {
+        minute.set(minute.get() + 1);
+        let at = format!(
+            "2026-08-20T{:02}:{:02}:00Z",
+            10 + minute.get() / 60,
+            minute.get() % 60
+        );
+        let mut result = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            index,
+            &at,
+            BACKFILL_WINDOW_DAYS,
+            2,
+            true,
+        )
+        .unwrap();
+        let window = result.census_window_end.clone();
+        apply_claude_reported_usage_with_index(
+            &mut result.snapshots,
+            &api,
+            &trace,
+            index,
+            result.census_complete,
+            &window,
+        );
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, index);
+        let fingerprints = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        index.record_accepted_snapshot_fingerprints(&fingerprints);
+        let mut accepted = accepted.borrow_mut();
+        for item in &result.snapshots {
+            accepted.insert(
+                item.source_session_id.clone(),
+                (item.snapshot_fingerprint.clone(), item.input_tokens),
+            );
+        }
+        result
+    };
+    // Whole walks: per walk, the files it reads, its pages, and the input
+    // tokens each session it sends reports.
+    #[derive(Debug, Default)]
+    struct Walk {
+        reads: usize,
+        pages: usize,
+        sent: BTreeMap<String, u64>,
+    }
+    let walks = |index: &mut ScanIndex, count: usize| {
+        let (mut done, mut current, mut pages) = (Vec::new(), Walk::default(), 0);
+        while done.len() < count {
+            pages += 1;
+            assert!(pages <= 8 * count, "the walks complete: {done:?}");
+            let result = page(index);
+            current.reads += result.scanned_file_count;
+            current.pages += 1;
+            for item in &result.snapshots {
+                current
+                    .sent
+                    .insert(item.source_session_id.clone(), item.input_tokens);
+            }
+            if result.census_complete {
+                done.push(std::mem::take(&mut current));
+            }
+        }
+        done
+    };
+    let reads = |walks: &[Walk]| walks.iter().map(|walk| walk.reads).collect::<Vec<_>>();
+    let accepted_total = || {
+        accepted
+            .borrow()
+            .values()
+            .map(|(_, input)| input)
+            .sum::<u64>()
+    };
+    let mut index = ScanIndex::default();
+    let mut settle = Vec::new();
+    while settle.last() != Some(&0) {
+        assert!(settle.len() < 6, "the corpus settles: {settle:?}");
+        settle.extend(reads(&walks(&mut index, 1)));
+    }
+    assert_eq!(settle[0], 3, "the first walk reads every file: {settle:?}");
+
+    // Close the fence (its liveness re-arm not due) and re-arm the copies,
+    // as the switch-on re-read does.
+    index.claude_duplicate_request_owners.clear();
+    index.claude_duplicate_request_witness_overflowed = true;
+    index.claude_duplicate_fence_next_full_rearm_unix_seconds =
+        rfc3339_unix_seconds("2026-08-20T23:00:00Z");
+    for copy in &copies {
+        index
+            .files
+            .get_mut(&local_index_key(&root.join(format!("{copy}.jsonl"))))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
+    let closed = walks(&mut index, 3);
+    assert!(
+        index.claude_duplicate_request_witness_overflowed,
+        "the fence stays closed: only the copies were read"
+    );
+    assert_eq!(
+        reads(&closed),
+        [2, 0, 0],
+        "the copies are read once, then two complete walks read none: {closed:?}"
+    );
+
+    // A real change under the closed fence: append a request to the first
+    // copy (on the walk's first page); nothing else is touched.
+    let appended = &copies[0];
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root.join(format!("{appended}.jsonl")))
+        .unwrap()
+        .write_all(
+            line(
+                appended,
+                "req-appended",
+                "2026-08-20T09:30:00Z",
+                APPENDED_INPUT,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let deadline = index.claude_duplicate_fence_next_full_rearm_unix_seconds;
+    let changed = walks(&mut index, 3);
+    assert!(
+        index.claude_duplicate_request_witness_overflowed,
+        "the fence stays closed through the append: {changed:?}"
+    );
+    assert_eq!(
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds, deadline,
+        "the liveness deadline is untouched"
+    );
+    assert_eq!(
+        reads(&changed),
+        [1, 0, 0],
+        "only the appended copy is read, then the copies settle again: {changed:?}"
+    );
+    let sent = changed[0].sent.get(appended).copied().unwrap_or(0);
+    assert!(
+        sent >= APPENDED_INPUT,
+        "the appended request is in the sent body: {changed:?}"
+    );
+    assert!(
+        changed[1..].iter().all(|walk| walk.sent.is_empty()),
+        "settled walks send nothing: {changed:?}"
+    );
+    assert_eq!(
+        accepted_total() / APPENDED_INPUT,
+        1,
+        "the appended request is accepted once: {:?}",
+        accepted.borrow()
+    );
+
+    // Recovery: past the deadline the liveness full re-arm runs, a whole
+    // covered walk reopens the fence, and the walks settle.
+    minute.set(13 * 60);
+    let mut recovery = Vec::new();
+    while index.claude_duplicate_request_witness_overflowed {
+        assert!(recovery.len() < 6, "the fence reopens: {recovery:?}");
+        recovery.extend(walks(&mut index, 1));
+    }
+    assert!(
+        recovery
+            .iter()
+            .any(|walk| walk.reads == 3 && walk.pages > 1),
+        "the full re-arm reads every file across pages: {recovery:?}"
+    );
+    assert_eq!(
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds,
+        None
+    );
+    let mut after = Vec::new();
+    while after.last().map(|walk: &Walk| walk.reads) != Some(0) {
+        assert!(after.len() < 4, "the open fence settles: {after:?}");
+        after.extend(walks(&mut index, 1));
+    }
+    assert!(
+        !index.claude_duplicate_request_witness_overflowed,
+        "the fence stays open: {after:?}"
+    );
+    assert!(
+        after.last().unwrap().sent.is_empty(),
+        "a settled walk sends nothing: {after:?}"
+    );
+    assert_eq!(
+        accepted_total() / APPENDED_INPUT,
+        1,
+        "accepted once after reopening: {recovery:?} {after:?} {:?}",
+        accepted.borrow()
+    );
+    assert!(
+        accepted.borrow()[appended].1 >= APPENDED_INPUT,
+        "the appended copy's accepted body keeps the request: {:?}",
+        accepted.borrow()
+    );
+
+    // The accepted checkpoint survives a save and reload: nothing is read
+    // or sent again, and the appended copy's accepted body is still current.
+    let path = root.join("scan-index.json");
+    index.save(&path).unwrap();
+    let mut index = ScanIndex::load(&path).unwrap();
+    let reloaded = walks(&mut index, 2);
+    assert_eq!(reads(&reloaded), [0, 0], "{reloaded:?}");
+    assert!(
+        reloaded.iter().all(|walk| walk.sent.is_empty()),
+        "a reload sends nothing again: {reloaded:?}"
+    );
+    assert!(!index.claude_duplicate_request_witness_overflowed);
+    assert!(index
+        .accepted_snapshot_fingerprints
+        .contains(&accepted.borrow()[appended].0));
+    assert_eq!(accepted_total() / APPENDED_INPUT, 1);
+    let _ = fs::remove_dir_all(root);
+}
