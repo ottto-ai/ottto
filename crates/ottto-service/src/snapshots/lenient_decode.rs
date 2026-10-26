@@ -2380,6 +2380,13 @@ fn present_raw<'de, D: serde::Deserializer<'de>>(
 }
 #[derive(Deserialize)]
 struct QuarantineRepair<'a> {
+    #[serde(
+        default = "terminal_contract_retry::legacy_contract",
+        deserialize_with = "terminal_contract_retry::decode_contract"
+    )]
+    reconstruction_contract: u16,
+    #[serde(default, deserialize_with = "terminal_contract_retry::decode_claims")]
+    contract_retry_claims: Option<u16>,
     witness: SnapshotQuarantineWitness,
     #[serde(borrow)]
     retry_after_unix_seconds: &'a RawValue,
@@ -2401,6 +2408,8 @@ fn repaired_quarantine(raw: &RawValue) -> Option<SnapshotQuarantineRecord> {
         })
     });
     let mut record = SnapshotQuarantineRecord {
+        contract_retry_claims: wire.contract_retry_claims,
+        reconstruction_contract: wire.reconstruction_contract,
         witness: wire.witness,
         retry_after_unix_seconds: serde_json::from_str(wire.retry_after_unix_seconds.get())
             .unwrap_or(0),
