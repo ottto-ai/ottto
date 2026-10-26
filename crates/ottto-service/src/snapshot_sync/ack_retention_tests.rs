@@ -1244,8 +1244,13 @@ fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
         let (previous, mut progress) = f.load();
         // A later clean selection resolves the hold/opaque census. It has no
         // historical incidence left: only the persisted obligation can retire.
-        let mut clean = ScanIndex::default();
-        clean.generation = previous.generation;
+        // Repair the synthetic damage and reload through the real decoder.
+        // A fresh default index is rightly refused by the CAS repair guard.
+        let mut repaired = serde_json::to_value(&previous).unwrap();
+        repaired["files"] = serde_json::json!({});
+        repaired["quarantined_snapshot_fingerprints"] = serde_json::json!({});
+        std::fs::write(&f.index_path, serde_json::to_vec(&repaired).unwrap()).unwrap();
+        let mut clean = ScanIndex::load(&f.index_path).unwrap();
         progress
             .stage_ack_retirement_handoff(&previous, &mut clean, &BTreeSet::new())
             .unwrap();
@@ -1442,4 +1447,105 @@ fn first_install_current_live_incidence_admits_more_than_4096_without_a_stop() {
         "one normal first-install pass, no capacity backoff"
     );
     assert_eq!(f.load().1.accepted_fingerprints.len(), 4100);
+}
+
+#[test]
+fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
+    let f = AckFixture::new(false);
+    let (committed, mut progress) = f.load();
+    let mut item = f.item.clone();
+    item.cache_observations = pending_head_index_item().1.cache_observations;
+    prepare_snapshot_cache_for_upload(&mut item, &progress, true, false, &BTreeSet::new());
+    let probe = cache_head_probe(&item);
+    assert_ne!(
+        snapshot_upload_body_witness(&item),
+        snapshot_upload_body_witness(&probe)
+    );
+    progress.record_body(
+        &probe.snapshot_fingerprint,
+        &snapshot_upload_body_witness(&probe),
+    );
+    for entity in 0..5001 {
+        let fp = format!("{entity:064x}");
+        progress.record_body(&fp, &fp);
+    }
+    progress.save(&f.progress_path).unwrap();
+    progress.configure_ack_capacity(&committed);
+    let generation = progress.generation;
+    assert_eq!(progress.accepted_fingerprints.len(), 5002);
+    let error = bootstrap_cache_heads_with_budget(
+        std::slice::from_ref(&probe),
+        &unique_poison_scope(),
+        &mut progress,
+        true,
+        &mut InplaceRetryBudget::default(),
+        |_, _| panic!("full-cap reoffer must not POST"),
+        |state| state.save(&f.progress_path),
+    )
+    .unwrap_err();
+    assert!(error
+        .downcast_ref::<ack_retention::AckSettlementRequired>()
+        .is_some());
+    assert_eq!(progress.generation, generation);
+    assert_eq!(
+        progress.accepted_body_witnesses,
+        f.load().1.accepted_body_witnesses,
+        "resumed exact probe ACK must remain present before partial checkpoint CAS"
+    );
+    let mut scanned = committed.clone();
+    let mut scan = AckFixture::scan(&f.sources, &mut scanned);
+    assert!(scan.census_complete);
+    scan.snapshots = vec![item];
+    let saved = checkpoint_partial_snapshot_index(
+        &scanned,
+        &committed,
+        &progress,
+        &scan.snapshots,
+        Some(&scan),
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+    )
+    .expect("partial durable equality and retirement commit must succeed");
+    progress
+        .release_acks_after_partial_index_save(
+            &f.progress_path,
+            &committed,
+            &saved,
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
+    let (_, mut progress) = f.load();
+    assert_eq!(progress.accepted_fingerprints.len(), 1);
+    assert!(progress
+        .accepted_fingerprints
+        .contains(&probe.snapshot_fingerprint));
+    let mut attempts = 0;
+    bootstrap_cache_heads_with_budget(
+        std::slice::from_ref(&probe),
+        &unique_poison_scope(),
+        &mut progress,
+        true,
+        &mut InplaceRetryBudget::default(),
+        |batch, _| {
+            attempts += 1;
+            let mut response = exact_ack(batch)?;
+            for entity in &mut response.accepted_entities {
+                entity.head_etag = Some("a".repeat(64));
+            }
+            Ok(response)
+        },
+        |state| state.save(&f.progress_path),
+    )
+    .unwrap();
+    assert_eq!(
+        attempts, 1,
+        "live re-offer succeeds once stale debt is durably retired"
+    );
+    assert_eq!(
+        f.load().1.accepted_cache_heads[&cache_session_key(&probe.source_session_id)],
+        "a".repeat(64)
+    );
 }

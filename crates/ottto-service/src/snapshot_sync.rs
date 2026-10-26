@@ -165,6 +165,9 @@ fn bootstrap_cache_heads_with_budget(
             // A prior ordinary body ACK has no head proof. Force the exact probe
             // even when delivery of these bytes was previously acknowledged.
             if enforce_head_cas {
+                // Refusal must leave the in-memory ledger equal to its saved
+                // checkpoint so partial settlement can commit retirement proof.
+                progress.admit_ack_reoffers(probes)?;
                 for probe in probes {
                     progress
                         .accepted_fingerprints

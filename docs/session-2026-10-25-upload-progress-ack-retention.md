@@ -37,7 +37,8 @@ only the existing ACK ledger against the complete pre-selection scan incidence
 a partial upload save, so a file that vanished before its first committed
 settlement cannot permanently consume the unsettled allowance.
 A restart replays this authority before admission, preserving current/shared,
-carried, unknown and held incidence and every unindexed or changed-body ACK.
+carried, unknown and held incidence, and unindexed/changed-body ACKs without
+matching retirement authority.
 Progress cleanup must save before its handoff can be removed from the index.
 A cleanup-save failure retains the proof and stops admission; a failure clearing
 the proof is idempotently recoverable after the already durable cleanup.
@@ -92,7 +93,10 @@ a stale 5,000-entry cap followed by successful unrelated upload, and a
 terminal status, cadence and zero network/rate-limit loss with no upload POST;
 the callback-level case also checks successful HTTP attempts and omitted counts.
 A cache-head probe capacity stop follows this same partial-settlement path
-before returning; it cannot exit ahead of the durable retirement proof. The
+before returning; it cannot exit ahead of the durable retirement proof.
+Head-CAS re-offer capacity is checked before removing a saved ordinary probe
+ACK, including zero net-growth re-offers in an already overfull ledger. This
+keeps the durable-equality checkpoint guard usable after a resumed-probe stop. The
 actual finish regression covers both main/probe capacity stops and all 4,100
 first-install entities in one successful pass.
 

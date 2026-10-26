@@ -207,6 +207,31 @@ impl SnapshotUploadProgress {
         Ok(())
     }
 
+    /// A head-CAS re-offer replaces existing ACK slots, but even zero net
+    /// growth must stop before mutating an already-overfull durable ledger.
+    pub(super) fn admit_ack_reoffers(&self, probes: &[SnapshotItem]) -> Result<()> {
+        let offered = probes
+            .iter()
+            .map(|item| item.snapshot_fingerprint.as_str())
+            .collect::<BTreeSet<_>>();
+        let additional = offered
+            .iter()
+            .filter(|fp| !self.accepted_fingerprints.contains(**fp))
+            .count();
+        if !offered.is_empty()
+            && self.accepted_fingerprints.len().saturating_add(additional) > self.ack_capacity
+        {
+            return Err(AckSettlementRequired {
+                retained_ack_count: self.accepted_fingerprints.len(),
+                retained_stale_ack_count: self.retained_stale_ack_count,
+                capacity: self.ack_capacity,
+                deferred_entity_count: offered.len(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     pub(super) fn admit_ack_batch(&self, new_acks: usize) -> Result<()> {
         if new_acks > 0
             && self.accepted_fingerprints.len().saturating_add(new_acks) > self.ack_capacity
