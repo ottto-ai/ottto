@@ -406,6 +406,7 @@ impl OwnedSourceScan {
             return;
         };
         let candidate = CandidateFile {
+            physical_identity: None,
             scan_root: root,
             path,
             size_bytes: entry.size_bytes,
