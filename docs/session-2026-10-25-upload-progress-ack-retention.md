@@ -91,6 +91,10 @@ a stale 5,000-entry cap followed by successful unrelated upload, and a
 4,100-entity first install. The actual finish capacity case checks typed reason,
 terminal status, cadence and zero network/rate-limit loss with no upload POST;
 the callback-level case also checks successful HTTP attempts and omitted counts.
+A cache-head probe capacity stop follows this same partial-settlement path
+before returning; it cannot exit ahead of the durable retirement proof. The
+actual finish regression covers both main/probe capacity stops and all 4,100
+first-install entities in one successful pass.
 
 The existing cache-event restart-correction test now explicitly settles and
 saves its exact ACK into the durable index before retiring disposable resume

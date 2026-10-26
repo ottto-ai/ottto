@@ -7013,6 +7013,7 @@ fn finish_sync_source(
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
+    let mut bootstrap_capacity_error = None;
     // One in-place resend budget for the whole source page: both bootstrap
     // stages and the main upload draw on it, so the page never waits more
     // than two resends and 10 s under the sync lock.
@@ -7035,7 +7036,7 @@ fn finish_sync_source(
             && probes
                 .iter()
                 .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
-        bootstrap_deferred = bootstrap_cache_heads_with_budget(
+        let bootstrap_result = bootstrap_cache_heads_with_budget(
             &probes,
             source.api_slug(),
             &mut upload_progress,
@@ -7066,21 +7067,37 @@ fn finish_sync_source(
             },
             |progress| progress.save(&upload_progress_path),
         )
-        .inspect_err(log_bootstrap_failure("probe"))?;
-        let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
-            .inspect_err(log_bootstrap_failure("apply"))
-            .inspect_err(|_| {
-                upload_progress.finish_reason_reoffers(
-                    &attempted_reason_reoffers,
-                    false,
-                    source.api_slug(),
-                );
-            })?;
-        if held > 0 {
-            eprintln!(
+        .inspect_err(log_bootstrap_failure("probe"));
+        match bootstrap_result {
+            Ok(deferred) => bootstrap_deferred = deferred,
+            Err(error)
+                if error
+                    .downcast_ref::<ack_retention::AckSettlementRequired>()
+                    .is_some() =>
+            {
+                // A local probe stop owes the same partial-index retirement
+                // and cadence handling as a stop in the main uploader.
+                bootstrap_capacity_error =
+                    Some(error.context("cache-head bootstrap ACK settlement pending"));
+            }
+            Err(error) => return Err(error),
+        }
+        if bootstrap_capacity_error.is_none() {
+            let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
+                .inspect_err(log_bootstrap_failure("apply"))
+                .inspect_err(|_| {
+                    upload_progress.finish_reason_reoffers(
+                        &attempted_reason_reoffers,
+                        false,
+                        source.api_slug(),
+                    );
+                })?;
+            if held > 0 {
+                eprintln!(
                 "local snapshot cache-head bootstrap carried {held} held probe(s) for {} as exact quarantined bodies; siblings continue",
                 source.api_slug()
             );
+            }
         }
     }
     // The same hook every resend path calls; nothing held is left by now.
@@ -7088,97 +7105,102 @@ fn finish_sync_source(
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
-    let upload_result = upload_resumable_batches_with_body_witness_partitioned(
-        &scan_result.snapshots,
-        source.api_slug(),
-        &mut upload_progress,
-        &mut accepted,
-        |snapshot| snapshot.snapshot_fingerprint.as_str(),
-        snapshot_upload_body_witness,
-        |snapshot| Some(snapshot.source_session_id.as_str()),
-        |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
-        &mut inplace_retry,
-        |snapshots| {
-            // A first Codex/Claude scan can spend several minutes parsing local
-            // history and retroactive backfill before the first upload. Relay
-            // tokens are intentionally short-lived, so mint them at the network
-            // boundary instead of reusing the pre-scan activity-hint token.
-            // Leased, not read: exactly one in-flight batch may claim the
-            // counters, and dropping the lease on any failure below leaves the
-            // losses owed instead of stranded.
-            let client_report = crate::client_report::lease();
-            let request = SnapshotBatchRequest {
-                schema_version: SNAPSHOT_SCHEMA_VERSION,
-                source: source.api_slug().to_string(),
-                machine_id: machine_id.to_string(),
-                collector_version: Some(collector_version()),
-                snapshots,
-                upload_policy,
-                client_report: client_report.report().clone(),
-            };
-            let reconcile_class = request.snapshots.iter().all(|snapshot| {
-                legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-            });
-            debug_assert!(
-                reconcile_class
-                    || request.snapshots.iter().all(|snapshot| {
-                        !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-                    }),
-                "legacy reconciliation must stay isolated at a batch boundary"
-            );
-            if let Err(reason) = validate_snapshot_batch_request(&request) {
-                return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
-                    reason,
-                }));
-            }
-            ensure_authority()?;
-            let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
-            ensure_authority()?;
-            validate_joined(&request.snapshots)?;
-            let response = client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
-            response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
-            let request_fingerprints = request
-                .snapshots
-                .iter()
-                .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                .collect::<BTreeSet<_>>();
-            require_normal_write_ack_for_legacy_reconciliation(
-                &response,
-                &request_fingerprints,
-                &legacy_reconciliation_pending,
-            )?;
-            // Clear only what this accepted request carried. A failed upload
-            // leaves the counters in place so the losses are reported on the
-            // next batch instead of vanishing with the request that died.
-            client_report.commit();
-            Ok(response)
-        },
-        |progress| progress.save(&upload_progress_path),
-    )
-    .and_then(|result| {
-        if matches!(
-            result,
-            ResumableUploadResult::Completed
-                | ResumableUploadResult::Deferred { .. }
-                | ResumableUploadResult::Rejected { .. }
-        ) {
-            // A setup/account switch can replace the relay binding while a
-            // long historical scan is uploading. Never commit destination A's
-            // delivery cursor after the machine has moved to destination B.
-            ensure_authority()?;
-        }
-        // Never certify omitted files as a completed scan. Drain admitted
-        // bodies, then enter partial settlement with its typed local counts.
-        ack_retention::require_settlement(result, ack_admission_limited, &upload_progress)
-    })
-    .map(|result| {
-        with_retained_refusal_conflicts(
-            with_bootstrap_deferred(result, bootstrap_deferred),
-            &index,
-            &upload_progress,
-            reason_reoffer::now_unix_seconds(),
+    let upload_result = if let Some(error) = bootstrap_capacity_error {
+        Err(error)
+    } else {
+        upload_resumable_batches_with_body_witness_partitioned(
+            &scan_result.snapshots,
+            source.api_slug(),
+            &mut upload_progress,
+            &mut accepted,
+            |snapshot| snapshot.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |snapshot| Some(snapshot.source_session_id.as_str()),
+            |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+            &mut inplace_retry,
+            |snapshots| {
+                // A first Codex/Claude scan can spend several minutes parsing local
+                // history and retroactive backfill before the first upload. Relay
+                // tokens are intentionally short-lived, so mint them at the network
+                // boundary instead of reusing the pre-scan activity-hint token.
+                // Leased, not read: exactly one in-flight batch may claim the
+                // counters, and dropping the lease on any failure below leaves the
+                // losses owed instead of stranded.
+                let client_report = crate::client_report::lease();
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: source.api_slug().to_string(),
+                    machine_id: machine_id.to_string(),
+                    collector_version: Some(collector_version()),
+                    snapshots,
+                    upload_policy,
+                    client_report: client_report.report().clone(),
+                };
+                let reconcile_class = request.snapshots.iter().all(|snapshot| {
+                    legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+                });
+                debug_assert!(
+                    reconcile_class
+                        || request.snapshots.iter().all(|snapshot| {
+                            !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+                        }),
+                    "legacy reconciliation must stay isolated at a batch boundary"
+                );
+                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                    return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                        reason,
+                    }));
+                }
+                ensure_authority()?;
+                let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
+                ensure_authority()?;
+                validate_joined(&request.snapshots)?;
+                let response =
+                    client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
+                response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
+                let request_fingerprints = request
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect::<BTreeSet<_>>();
+                require_normal_write_ack_for_legacy_reconciliation(
+                    &response,
+                    &request_fingerprints,
+                    &legacy_reconciliation_pending,
+                )?;
+                // Clear only what this accepted request carried. A failed upload
+                // leaves the counters in place so the losses are reported on the
+                // next batch instead of vanishing with the request that died.
+                client_report.commit();
+                Ok(response)
+            },
+            |progress| progress.save(&upload_progress_path),
         )
-    });
+        .and_then(|result| {
+            if matches!(
+                result,
+                ResumableUploadResult::Completed
+                    | ResumableUploadResult::Deferred { .. }
+                    | ResumableUploadResult::Rejected { .. }
+            ) {
+                // A setup/account switch can replace the relay binding while a
+                // long historical scan is uploading. Never commit destination A's
+                // delivery cursor after the machine has moved to destination B.
+                ensure_authority()?;
+            }
+            // Never certify omitted files as a completed scan. Drain admitted
+            // bodies, then enter partial settlement with its typed local counts.
+            ack_retention::require_settlement(result, ack_admission_limited, &upload_progress)
+        })
+        .map(|result| {
+            with_retained_refusal_conflicts(
+                with_bootstrap_deferred(result, bootstrap_deferred),
+                &index,
+                &upload_progress,
+                reason_reoffer::now_unix_seconds(),
+            )
+        })
+    };
     // The logical offer ends here; normal bounded HTTP retries happened inside.
     upload_progress.finish_reason_reoffers(
         &attempted_reason_reoffers,
