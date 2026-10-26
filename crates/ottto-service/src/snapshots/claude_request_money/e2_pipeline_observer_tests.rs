@@ -17,3 +17,26 @@ pub(crate) fn disclosed(items: &[SnapshotItem]) -> u64 {
         .map(|fold| fold.disclosed)
         .sum()
 }
+
+/// The census key of the one indexed file named `file_name`.
+fn census_key(index: &ScanIndex, file_name: &str) -> String {
+    let mut keys = index
+        .files
+        .keys()
+        .filter(|key| Path::new(key).file_name().and_then(|n| n.to_str()) == Some(file_name));
+    let key = keys.next().expect("an indexed file").clone();
+    assert!(keys.next().is_none(), "one indexed file named {file_name}");
+    key
+}
+
+/// Retirement as 35 idle days leave a record: its count stays, its request
+/// hashes go.
+pub(crate) fn retire_census(index: &mut ScanIndex, file_name: &str) {
+    let key = census_key(index, file_name);
+    let mut record = index
+        .claude_request_census
+        .take(&key)
+        .expect("a census record");
+    record.retire();
+    index.claude_request_census.insert(key, record);
+}

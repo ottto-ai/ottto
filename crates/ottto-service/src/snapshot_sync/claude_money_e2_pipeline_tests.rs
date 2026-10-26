@@ -2084,6 +2084,75 @@ fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
     });
 }
 
+/// The `fork-context-ref` line `/branch` (Claude Code 2.1.309+) writes into
+/// the new session, naming the session it copied.
+fn fork_ref(session: &str, parent: &str) -> String {
+    json!({"type":"fork-context-ref", "sessionId":session, "agentId":"fork-agent",
+        "contextLength":1, "parentSessionId":parent, "parentLastUuid":"parent-last",
+        "timestamp":"2026-08-02T07:03:00Z"})
+    .to_string()
+        + "\n"
+}
+
+/// PR C (a): the /branch of a session untouched for over 35 days, whose
+/// census record is retired (it keeps no request ids). `named` writes the
+/// branch's `fork-context-ref` line naming `parent`. Returns the branch body
+/// (requests, removed) and the page's disclosed count.
+fn branch_of_retired(name: &str, named: Option<&str>) -> ((u64, Option<u64>), u64) {
+    with_e2(|| {
+        let mut c = Corpus::new(name);
+        c.root(ROOT, &line(ROOT, "original", AT, 10));
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let original = ready(&c, &scanner, old.clone(), 100, false);
+        assert_eq!(total(&original), 1, "the original counts its request");
+        let mut prior = settle(&c, &old, original, &mut progress);
+        e2::pipeline_test_observer::retire_census(&mut prior, &format!("{ROOT}.jsonl"));
+        let fork = named
+            .map(|parent| fork_ref(COPY, parent))
+            .unwrap_or_default();
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(fork + &line(COPY, "original", AT, 10)),
+            "2026-08-02T07:03:00Z",
+        );
+        let branch = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&branch);
+        assert!(body(&branch, ROOT).is_none(), "the original is unchanged");
+        let copy = body(&branch, COPY).expect("the branch publishes its body");
+        (
+            (copy.request_count, copy.removed_request_count),
+            e2::pipeline_test_observer::disclosed(&branch.scan.snapshots),
+        )
+    })
+}
+#[test]
+fn e2_pipeline_branch_of_a_retired_original_named_by_its_fork_line_is_skipped() {
+    assert_eq!(
+        branch_of_retired("e2-pipeline-retired-named", Some(ROOT)),
+        ((0, Some(1)), 0),
+        "the still-indexed original the fork line names proves the copy: never counted twice"
+    );
+}
+#[test]
+fn e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discloses() {
+    // No durable per-request store: without the name, the retired original
+    // proves nothing, so the copy counts once more and is disclosed.
+    assert_eq!(
+        branch_of_retired("e2-pipeline-retired-unnamed", None),
+        ((1, Some(0)), 1)
+    );
+}
+#[test]
+fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
+    // The fork line names a session that is not indexed: no proof.
+    assert_eq!(
+        branch_of_retired("e2-pipeline-retired-unindexed", Some(LATE)),
+        ((1, Some(0)), 1)
+    );
+}
+
 /// Owner ruling 5 (Codex P1-2): a file whose every response conflicts keeps
 /// a zero-usage carrier that publishes its conflict disclosure through the
 /// literal, ACK and restart path, over an accepted prior body.

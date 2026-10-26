@@ -239,13 +239,14 @@ enum CopyProof {
     /// The earliest live same-session path twin (its index key).
     Twin(String),
     /// Earlier MAIN files of other sessions (/branch of an all-pre-birth file).
-    Holders,
+    /// With the index key of the original its `fork-context-ref` line names.
+    Holders(Option<String>),
 }
 impl crate::heap_layout_bound::HeapLayoutBound for CopyProof {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
-            Self::Twin(key) => key.heap_bound(c),
-            Self::Holders => c.add(0),
+            Self::Twin(key) | Self::Holders(Some(key)) => key.heap_bound(c),
+            Self::Holders(None) => c.add(0),
         }
     }
 }
@@ -906,13 +907,16 @@ impl FileFold {
     /// certified writer) or, for an all-pre-birth MAIN file, earlier main
     /// files of other sessions (/branch; the request ids are the proof, no
     /// writer certificate). Without one the copies count and are disclosed.
+    /// `fork_parent`: the session a `fork-context-ref` line names (empty:
+    /// none single).
     pub(in crate::snapshots) fn finish_native(
         &mut self,
         context: Option<&ReadContext<'_>>,
         markers: Option<&claude_request_identity::OrgMarkers>,
+        fork_parent: Option<&str>,
     ) {
         let started = Instant::now();
-        self.decide_native(context, markers);
+        self.decide_native(context, markers, fork_parent);
         // The fold lives until the page finishes: keep no parse-time slack.
         self.entity.dark.shrink();
         self.skipped.shrink_to_fit();
@@ -923,6 +927,7 @@ impl FileFold {
         &mut self,
         context: Option<&ReadContext<'_>>,
         markers: Option<&claude_request_identity::OrgMarkers>,
+        fork_parent: Option<&str>,
     ) {
         if self.money_birth.uncertain_root() {
             self.disclose("uncertain_birth", self.responses); // counted, disclosed
@@ -959,7 +964,14 @@ impl FileFold {
             }
         }
         if self.cross_session_candidate(context) {
-            self.proof = Some(CopyProof::Holders);
+            // The named original is a sibling file of the same project.
+            let parent = fork_parent
+                .filter(|parent| !parent.is_empty())
+                .zip(context)
+                .map(|(parent, context)| {
+                    local_index_key(&context.path.with_file_name(format!("{parent}.jsonl")))
+                });
+            self.proof = Some(CopyProof::Holders(parent));
             // Should the page find no holder, the restored copies keep the
             // accounts their own markers give them (QUOTA: never moved).
             self.keep_copies(false, markers);
@@ -1402,7 +1414,7 @@ pub(crate) fn decide_page_copies(items: &mut [SnapshotItem], index: &ScanIndex) 
         let proof = fold.proof.clone();
         match proof {
             Some(CopyProof::Twin(witness)) => decide_twin(items, at, &witness, index),
-            Some(CopyProof::Holders) => holders.push(at),
+            Some(CopyProof::Holders(_)) => holders.push(at),
             None => {}
         }
     }
@@ -1489,11 +1501,52 @@ fn unscanned_main_roots(index: &ScanIndex) -> BTreeSet<String> {
         .collect()
 }
 
+/// A holder's place in the total copy order: (effective birth, location).
+/// A holder without a stored birth is probed once.
+fn holder_order(
+    store: &super::super::claude_money_birth_store::BirthStore,
+    root: &str,
+    key: &str,
+) -> Option<(i128, LocationKey)> {
+    let birth = store.effective_cutoff(root, key).or_else(|| {
+        probe_opened_birth(key)
+            .filter(|opened| opened.birth != 0)
+            .map(|opened| i128::from(opened.birth))
+    })?;
+    Some((birth, location_key(key)))
+}
+
+/// Owner direction (PR C (a)): a /branch names its original in a
+/// `fork-context-ref` line. When that original is still indexed but its
+/// census cannot answer (retired after 35 idle days, over budget, older
+/// derivation, none), the named earlier original is the copy proof for the
+/// requests no current record covers. A current record that lacks a request
+/// proves the original does not hold it: no proof then.
+fn parent_proves(
+    index: &ScanIndex,
+    parent: &str,
+    session: &str,
+    order: (i128, LocationKey),
+) -> bool {
+    let Some(member) = claude_index_path_member_ref(Path::new(parent)) else {
+        return false;
+    };
+    member.subagent_stem.is_none()
+        && member.root != session
+        && index.files.contains_key(parent)
+        && !index
+            .claude_request_census
+            .get(parent)
+            .is_some_and(|record| record.proves_scan())
+        && holder_order(&index.claude_money_birth_store, member.root, parent)
+            .is_some_and(|holder| holder < order)
+}
+
 /// One census walk for every all-pre-birth main file of the page. A holder
 /// proves a request when it is another session's main file whose scan state
-/// holds it (`scan_evidence`) and earlier in (effective birth, location); a
-/// holder without a stored birth is probed once. Only the walk deadline and
-/// an unscanned other-session main file delay a decision.
+/// holds it (`scan_evidence`) and earlier in (effective birth, location).
+/// Only the walk deadline and an unscanned other-session main file delay a
+/// decision.
 fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex) {
     struct Wanted {
         at: usize,
@@ -1501,12 +1554,19 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
         order: (i128, LocationKey),
         hashes: Vec<u64>,
         covered: BTreeSet<u64>,
+        /// The original its `fork-context-ref` line names.
+        parent: Option<String>,
     }
     let mut wanted = folds
         .iter()
         .filter_map(|&at| {
             let item = &items[at];
-            let order = item.claude_money.as_deref()?.copy_order()?;
+            let fold = item.claude_money.as_deref()?;
+            let order = fold.copy_order()?;
+            let parent = match &fold.proof {
+                Some(CopyProof::Holders(parent)) => parent.clone(),
+                _ => None,
+            };
             let mut hashes = skipped_ids(item)
                 .map(|id| claude_request_hash(id))
                 .collect::<Vec<_>>();
@@ -1518,6 +1578,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                 order,
                 hashes,
                 covered: BTreeSet::new(),
+                parent,
             })
         })
         .collect::<Vec<_>>();
@@ -1550,12 +1611,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                         if !scan_evidence(index, key, record) {
                             return None;
                         }
-                        let birth = store.effective_cutoff(root, key).or_else(|| {
-                            probe_opened_birth(key)
-                                .filter(|opened| opened.birth != 0)
-                                .map(|opened| i128::from(opened.birth))
-                        })?;
-                        Some((birth, location_key(key)))
+                        holder_order(store, root, key)
                     });
                     if holder.is_some_and(|holder| holder < file.order) {
                         file.covered.insert(hash);
@@ -1574,6 +1630,16 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
             .collect::<Vec<_>>();
         if walked.is_none() {
             hold_copies(&mut items[wanted.at], "held_copy_deadline");
+            continue;
+        }
+        if !uncovered.is_empty()
+            && wanted
+                .parent
+                .as_deref()
+                .is_some_and(|parent| parent_proves(index, parent, &wanted.session, wanted.order))
+        {
+            diag("copy_parent_ref", uncovered.len() as u64);
+            restore_uncovered(&mut items[wanted.at], &[]);
             continue;
         }
         if !uncovered.is_empty()
