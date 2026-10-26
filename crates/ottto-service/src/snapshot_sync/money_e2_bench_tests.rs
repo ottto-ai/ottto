@@ -67,6 +67,11 @@ mod reference_hook {
         assert!(!on, "the reference build has no switch-on");
         run()
     }
+
+    /// The reread probe (switch-on) runs on the candidate build only.
+    pub(super) fn with_history_byte_budget<T>(_budget: u64, _run: impl FnOnce() -> T) -> T {
+        unreachable!("the reference build has no switch-on reread")
+    }
 }
 
 // MONEY_E2_BENCH_HOOK_BEGIN
@@ -97,6 +102,11 @@ mod e2_hook {
         crate::snapshots::with_max_gated_claude_revision(3, || {
             crate::snapshot_sync::with_claude_cycle_revision(3, run)
         })
+    }
+
+    /// The history page byte budget (the reference's seam is private).
+    pub(super) fn with_history_byte_budget<T>(budget: u64, run: impl FnOnce() -> T) -> T {
+        crate::snapshots::with_body_witness_adoption_byte_budget(budget, run)
     }
 }
 // MONEY_E2_BENCH_HOOK_END
@@ -1795,9 +1805,7 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
                 })
             };
             match byte_budget {
-                Some(budget) => {
-                    crate::snapshots::with_body_witness_adoption_byte_budget(budget, switch_on)
-                }
+                Some(budget) => e2_hook::with_history_byte_budget(budget, switch_on),
                 None => switch_on(),
             }
         })
