@@ -25689,21 +25689,54 @@ impl OwnedSourceScan {
         // shared with twin staging and the parse-time birth context.
         let claude_twin_groups = std::cell::OnceCell::new();
         if source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled() {
-            for root in claude_request_money::e2::selected_twin_roots(
-                identified_candidates
+            let twin_groups = claude_twin_groups.get_or_init(|| {
+                // A page file not known yet (a new copy) keeps its member's
+                // single known path as its twin.
+                let page_members = identified_candidates
                     .iter()
-                    .map(|candidate| candidate.path.as_path()),
-                claude_twin_groups.get_or_init(|| {
-                    // A page file not known yet (a new copy) keeps its
-                    // member's single known path as its twin.
-                    let page_members = identified_candidates
-                        .iter()
-                        .filter_map(|candidate| claude_index_path_family_member(&candidate.path))
-                        .map(|(_, member)| member)
-                        .collect::<BTreeSet<_>>();
-                    claude_history_upgrade::claude_path_twin_groups(index, &page_members)
-                }),
-            ) {
+                    .filter_map(|candidate| claude_index_path_family_member(&candidate.path))
+                    .map(|(_, member)| member)
+                    .collect::<BTreeSet<_>>();
+                claude_history_upgrade::claude_path_twin_groups(index, &page_members)
+            });
+            // Only a twin this page reads pulls its family in: every walk meets
+            // each settled twin too, and pulling its family then re-read the
+            // family on every walk (R1 probe: 8 files and one upload batch per
+            // walk). Outside the authority preflight a candidate still carries
+            // its sidecar digest in the scan fingerprint slot, so each twin is
+            // identified on a copy first: one more open per twin candidate. A
+            // twin that cannot be identified pulls its family in, as before.
+            let read_twins = identified_candidates
+                .iter()
+                .filter(|candidate| {
+                    !claude_request_money::e2::selected_twin_roots(
+                        std::iter::once(candidate.path.as_path()),
+                        twin_groups,
+                    )
+                    .is_empty()
+                })
+                .filter(|candidate| {
+                    let mut twin = (*candidate).clone();
+                    prepare_candidate_context(&mut twin);
+                    match open_and_identify_scan_candidate(
+                        source,
+                        twin,
+                        &mut ScanCensus::default(),
+                        census_unix_seconds,
+                        backfill_window_days,
+                        &index.files,
+                    ) {
+                        Some((twin, _)) => {
+                            index.candidate_decision(&twin) == CandidateDecision::Parse
+                        }
+                        None => true,
+                    }
+                })
+                .map(|candidate| candidate.path.as_path())
+                .collect::<Vec<_>>();
+            for root in
+                claude_request_money::e2::selected_twin_roots(read_twins.into_iter(), twin_groups)
+            {
                 if forced_claude_family_reparses.insert(root.clone()) {
                     claude_twin_only_family_reparses.insert(root);
                 }
@@ -30138,7 +30171,9 @@ impl OwnedSourceScan {
             // context, re-arm, family, audit, authority, a rebuilt or replayed
             // index) still parses for its local work, but none of its bodies
             // is emitted and its upload tuple stays (`veto_claude_history_emission`).
-            // Codex and Pi keep the adoption-only page budget.
+            // A skipped Claude file held only by this page's budget is queued
+            // again as a re-read for the next page of the walk. Codex and Pi
+            // keep the adoption-only page budget.
             if decision == CandidateDecision::Parse {
                 let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
                     && index.candidate_requires_only_body_witness_adoption(&candidate);
@@ -30176,7 +30211,7 @@ impl OwnedSourceScan {
                 // A listed genuine change is never held (it is literal-only
                 // denied), so a held correction-only member is unchanged.
                 match history {
-                    HistoryDecision::Held(_)
+                    HistoryDecision::Held(hold)
                         if (adoption_only || correction_only) && !comparison_target =>
                     {
                         if source == SnapshotSource::ClaudeCode {
@@ -30188,6 +30223,26 @@ impl OwnedSourceScan {
                                 .claude_history_emission
                                 .skipped_carried_entries
                                 .saturating_add(carried);
+                            // A budget hold paces the upgrade page by page:
+                            // the file goes back to the walk's queue as a
+                            // re-read, so the next page of this walk continues
+                            // the upgrade (Design E2 item 8, the switch-on
+                            // re-read). A re-read is not a census member
+                            // (G1): it never holds the census, and a walk
+                            // that ends first drops it for the next walk to
+                            // list again. Only once this page admitted
+                            // history: a file that cannot fit an empty page
+                            // waits for the next walk as before.
+                            if hold == HistoryHold::Budget && history_upgrade.admitted_any() {
+                                if let Some(traversal) = index.traversal.as_mut() {
+                                    traversal.pending_candidates.push_back(ScanTraversalPath {
+                                        scan_root: candidate.scan_root.clone(),
+                                        path: candidate.path.clone(),
+                                        census_member: false,
+                                        watcher_hint: false,
+                                    });
+                                }
+                            }
                         }
                         decision = CandidateDecision::Skip;
                     }
@@ -41265,7 +41320,7 @@ fn body_witness_adoption_byte_budget() -> u64 {
 }
 
 #[cfg(test)]
-fn with_body_witness_adoption_byte_budget<T>(budget: u64, run: impl FnOnce() -> T) -> T {
+pub(crate) fn with_body_witness_adoption_byte_budget<T>(budget: u64, run: impl FnOnce() -> T) -> T {
     BODY_WITNESS_ADOPTION_TEST_BYTE_BUDGET.with(|slot| slot.set(Some(budget)));
     let value = run();
     BODY_WITNESS_ADOPTION_TEST_BYTE_BUDGET.with(|slot| slot.set(None));

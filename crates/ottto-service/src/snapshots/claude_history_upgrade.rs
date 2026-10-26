@@ -23,7 +23,10 @@
 //! reason (census records, proofs, index identity), but none of its new
 //! bodies reaches an upload path, and its upload tuple (revision, semantic
 //! group, body witness, membership) stays as it was. A file that only owes
-//! the upgrade is skipped as before.
+//! the upgrade is skipped as before; one held only by the page budget, once
+//! the page admitted history, is queued again as a re-read (never a census
+//! member) for the next page of the same walk, so a revision bump re-reads
+//! the history in consecutive paced pages instead of one page per walk.
 //!
 //! The parse reason is a diagnostic only; no decision here reads it.
 //!
@@ -666,6 +669,11 @@ impl HistoryPage {
     pub(super) fn note_family_closure_root_absent(&mut self) {
         self.family_closure_root_absent_excluded =
             self.family_closure_root_absent_excluded.saturating_add(1);
+    }
+
+    /// This page admitted at least one history file to its budget.
+    pub(super) fn admitted_any(&self) -> bool {
+        self.files > 0
     }
 
     pub(super) fn any(&self) -> bool {

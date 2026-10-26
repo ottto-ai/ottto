@@ -13,8 +13,10 @@
 //   until the census completes, against an in-process accept-all backend;
 //   then FINISHES appends to the largest file, one page each. Arm
 //   (OTTTO_E2_BENCH_ARM) is reference (the pre-E2 build), dark or on.
-// - reread: the switch-on lever on a stamped corpus: body-witness revision
-//   2 to 3, paced pages until every file carries revision 3.
+// - reread: the switch-on lever through the production cycle: today's daemon
+//   (gate off, body-witness revision 2) stamps the corpus, then the switch-on
+//   (gate on, revision 3) pages until every file carries revision 3, then
+//   one more whole walk must read no file.
 // - history: one whole-history page (up to 2,000 files / 1 GiB) per arm on
 //   a corpus stamped at revision 2, in a fresh process (peak footprint).
 use super::*;
@@ -1267,6 +1269,8 @@ struct Harness {
     daemon: LocalDaemon,
     transport: crate::net_resilience::TransportCycleOutcome,
     retry: live_snapshot_retry::LiveRetryOwner,
+    /// The scan index the last page saved.
+    index_path: Option<PathBuf>,
     _guards: Vec<EnvVarGuard>,
     _native: crate::snapshots::claude_native_comparison::TestScope,
 }
@@ -1315,6 +1319,7 @@ impl Harness {
             daemon: test_daemon("otm_test"),
             transport: crate::net_resilience::TransportCycleOutcome::default(),
             retry: live_snapshot_retry::LiveRetryOwner::closed(),
+            index_path: None,
             _guards: guards,
             _native: native,
         }
@@ -1378,6 +1383,7 @@ impl Harness {
         let backend_cpu = self.backend.stats.cpu_us.load(Ordering::Relaxed) - backend_before;
         let (census_complete, scanned_files, index_path) = observed;
         let index_path = index_path.expect("the page completed its scan");
+        self.index_path = Some(index_path.clone());
         let e2 = window_counts(&records);
         let (footprint_now, _) = footprint();
         serde_json::json!({
@@ -1600,26 +1606,6 @@ impl HistoryScan {
         scan
     }
 
-    /// The files still below `revision`: count, bytes and this cycle's
-    /// history hold per file (`none`: not held, yet not stamped).
-    fn remaining(index: &ScanIndex, revision: u64) -> serde_json::Value {
-        let mut holds = BTreeMap::<&str, u64>::new();
-        let (mut files, mut bytes) = (0u64, 0u64);
-        for entry in index
-            .files
-            .values()
-            .filter(|entry| entry.effective_upload_body_witness_revision < revision)
-        {
-            files += 1;
-            bytes += entry.size_bytes;
-            let hold = index
-                .claude_history_emission_held(&entry.source_file_fingerprint)
-                .map_or("none", |hold| hold.as_str());
-            *holds.entry(hold).or_default() += 1;
-        }
-        serde_json::json!({ "files": files, "bytes": bytes, "holds": holds })
-    }
-
     fn stamped(index: &ScanIndex, revision: u64) -> usize {
         index
             .files
@@ -1683,51 +1669,137 @@ impl HistoryScan {
     }
 }
 
-/// The switch-on lever: stamp the corpus at revision 2, then raise it to 3
-/// (PR C's lever) and page until every file carries 3. Scan level: the
-/// production activation reads the compiled revision, which stays 2 here.
+/// The files below `revision`, and their bytes.
+fn below(index: &ScanIndex, revision: u64) -> (u64, u64) {
+    index
+        .files
+        .values()
+        .filter(|entry| entry.effective_upload_body_witness_revision < revision)
+        .fold((0, 0), |(files, bytes), entry| {
+            (files + 1, bytes + entry.size_bytes)
+        })
+}
+
+/// The switch-on lever through the production cycle, as PR C reaches the
+/// M4: today's daemon (gate off, body-witness revision 2) sends the corpus
+/// and pages until a whole walk reads no file (the first traversal's own
+/// re-read included); then the switch-on (gate on, revision 3, an installed
+/// empty list) pages until every file carries revision 3, and then until the
+/// walk in flight and one whole walk after it complete, which must read no
+/// file (no second re-read). A whole walk that upgrades no file is a stall.
+/// Below full byte scale the history byte budget scales with the corpus, so
+/// the page count keeps the M4 shape; request lines keep a minimum size, so
+/// the largest file shrinks less: below ~0.15 its path-twin pair (one group,
+/// 2 x 260 MB at full scale) no longer fits a page and never upgrades.
 fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
-    let support = base.join("runs").join("reread-support");
-    assert!(!support.exists(), "the probe starts from an empty state");
+    let run = base.join("runs").join("reread");
+    let support = run.join("support");
     let files = manifest["files"].as_u64().unwrap() as usize;
-    let history = HistoryScan::new(base);
+    let bytes_scale = manifest["bytes_scale"].as_f64().unwrap_or(1.0);
+    // HISTORY_UPGRADE_BYTES_PER_PAGE (1 GiB), scaled with the corpus bytes.
+    let byte_budget = (bytes_scale < 1.0).then(|| ((1u64 << 30) as f64 * bytes_scale) as u64);
+    let mut harness = Harness::new(base, &run, true);
+    let load = |harness: &Harness| {
+        ScanIndex::load(
+            harness
+                .index_path
+                .as_deref()
+                .expect("a page saved the index"),
+        )
+        .expect("the saved index loads")
+    };
+    // Whole walks until one reads no file.
+    let walk_until_settled = |harness: &mut Harness, pages: &mut Vec<serde_json::Value>| {
+        let mut reads = 0;
+        loop {
+            assert!(
+                pages.len() < MAX_PAGES,
+                "the walks settle within {MAX_PAGES} pages"
+            );
+            let page = harness.page();
+            reads += page["scanned_files"].as_u64().unwrap();
+            let complete = page["census_complete"] == true;
+            pages.push(page);
+            if complete {
+                if reads == 0 {
+                    break;
+                }
+                reads = 0;
+            }
+        }
+    };
+    let mut stamp_pages = Vec::new();
+    e2_hook::with_gate(false, || walk_until_settled(&mut harness, &mut stamp_pages));
+    let stamped = HistoryScan::stamped(&load(&harness), 2);
     e2_hook::with_gate(true, || {
-        crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-            let mut index = ScanIndex::default();
-            let indexed = history.stamp(&mut index, &support);
-            crate::snapshots::with_max_gated_claude_revision(3, || {
+        e2_hook::with_switch_on(true, &support, || {
+            let mut switch_on = || {
                 let mut pages = Vec::new();
-                // A page that stamps nothing ends the probe: the files left
-                // would never upgrade at this shape, so it reports them.
-                let mut stalled = false;
-                while HistoryScan::stamped(&index, 3) < indexed && pages.len() < MAX_PAGES {
-                    let page = history.upgrade_page(&mut index);
-                    stalled = page["files"].as_u64() == Some(0);
+                let mut before = load(&harness);
+                let (mut walk_files, mut stalled) = (0, false);
+                while HistoryScan::stamped(&before, 3) < stamped && pages.len() < MAX_PAGES {
+                    let mut page = harness.page();
+                    let after = load(&harness);
+                    let (owed_before, bytes_before) = below(&before, 3);
+                    let (owed_after, bytes_after) = below(&after, 3);
+                    page["files"] = serde_json::json!(owed_before.saturating_sub(owed_after));
+                    page["bytes"] = serde_json::json!(bytes_before.saturating_sub(bytes_after));
+                    walk_files += owed_before.saturating_sub(owed_after);
+                    let walk_complete = page["census_complete"] == true;
                     pages.push(page);
-                    if stalled {
-                        break;
+                    before = after;
+                    if walk_complete {
+                        stalled = walk_files == 0;
+                        if stalled {
+                            break;
+                        }
+                        walk_files = 0;
                     }
                 }
-                let complete = HistoryScan::stamped(&index, 3) >= indexed;
+                let complete = HistoryScan::stamped(&before, 3) >= stamped;
+                let mut settle = Vec::new();
+                if complete {
+                    let mut walks = 0;
+                    while walks < 2 {
+                        assert!(settle.len() < MAX_PAGES, "the walks complete");
+                        let page = harness.page();
+                        walks += usize::from(page["census_complete"] == true);
+                        settle.push(page);
+                    }
+                }
+                let (remaining_files, remaining_bytes) = below(&load(&harness), 3);
                 let (_, max_rss) = rusage();
                 serde_json::json!({
                     "mode": "reread",
                     "hook": e2_hook::STATE,
-                    "revision": "2->3 (PR C's body-witness lever, test seam with_max_gated_claude_revision(3))",
+                    "revision": "2->3 through the production cycle (PR C's body-witness lever, test seams with_max_gated_claude_revision(3) and with_claude_cycle_revision(3))",
                     "files": files,
-                    "stamped_files": indexed,
+                    "stamped_files": stamped,
                     "bytes": manifest["bytes"],
+                    "byte_budget": byte_budget.unwrap_or(1 << 30),
+                    "stamp_pages": stamp_pages.len(),
                     "complete": complete,
                     "stalled": stalled,
-                    "remaining": HistoryScan::remaining(&index, 3),
+                    "remaining": { "files": remaining_files, "bytes": remaining_bytes },
                     "pages": pages.len(),
+                    "reading_pages": pages.iter().filter(|page| page["files"].as_u64() > Some(0)).count(),
                     "wall_us": sum_field(&pages, "wall_us"),
                     "cpu_us": sum_field(&pages, "cpu_us"),
+                    "reads": sum_field(&pages, "scanned_files"),
                     "page_receipts": pages,
+                    "settle_pages": settle.len(),
+                    "settle_reads": sum_field(&settle, "scanned_files"),
+                    "settle_batches": sum_field(&settle, "batches"),
                     "sync_interval_s": SNAPSHOT_SYNC_INTERVAL.as_secs(),
                     "max_rss_bytes": max_rss,
                 })
-            })
+            };
+            match byte_budget {
+                Some(budget) => {
+                    crate::snapshots::with_body_witness_adoption_byte_budget(budget, switch_on)
+                }
+                None => switch_on(),
+            }
         })
     })
 }
@@ -1850,5 +1922,11 @@ fn money_e2_bench_receipt() {
         receipt["pages"],
         receipt["stalled"],
         receipt["remaining"]
+    );
+    assert!(
+        mode != "reread" || receipt["settle_reads"] == 0,
+        "MONEY_E2_BENCH reread read {} files again in the {} pages after it completed",
+        receipt["settle_reads"],
+        receipt["settle_pages"]
     );
 }
