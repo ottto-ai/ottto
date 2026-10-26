@@ -1129,8 +1129,9 @@ fn ack_first_install_real_finish_uploads_4100_live_entities_without_a_capacity_s
 #[derive(Clone, Copy, Debug)]
 enum AckScriptedPost {
     Accept,
-    /// Not shed, not an in-place-retry status: an ordinary transport failure.
-    GatewayTimeout,
+    /// Not shed (429/503), not resent in place (500/502), not split as a
+    /// batch deadline (504): an ordinary failed upload.
+    UnretriedServerError,
     Disabled,
 }
 
@@ -1193,9 +1194,9 @@ impl AckScriptedServer {
                         .pop_front()
                         .unwrap_or(AckScriptedPost::Accept);
                     match post {
-                        AckScriptedPost::GatewayTimeout => {
-                            status = "504 Gateway Timeout";
-                            serde_json::json!({"detail":"synthetic gateway timeout"})
+                        AckScriptedPost::UnretriedServerError => {
+                            status = "507 Insufficient Storage";
+                            serde_json::json!({"detail":"synthetic server error"})
                         }
                         AckScriptedPost::Disabled => serde_json::json!({"accepted":0,
                             "sessions_reconciled":0,"session_ids":[],"disabled":true,
@@ -1510,7 +1511,7 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
         for _ in 0..30 {
             script.push_back(AckScriptedPost::Accept);
         }
-        script.push_back(AckScriptedPost::GatewayTimeout);
+        script.push_back(AckScriptedPost::UnretriedServerError);
     }
     let error = home
         .finish(preparation, index, scan)
