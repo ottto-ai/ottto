@@ -1597,6 +1597,7 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
 fn superseded_revision_ack_never_drains_the_current_revision() {
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(current_unix_seconds());
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-superseded", false);
     let (_, grant) = fixture.reach_grant();

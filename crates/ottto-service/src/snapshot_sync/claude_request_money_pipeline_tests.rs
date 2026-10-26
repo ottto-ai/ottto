@@ -169,9 +169,9 @@ fn money_pipeline_arm(name: &str, corpus: MoneyCorpus) -> MoneyPipelineArm {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new(name);
     money_write_corpus(&fixture, corpus);
-    if corpus.shadow {
-        money::enable_shadow_for_test(&fixture.support);
-    }
+    let _shadow_fixture = corpus
+        .shadow
+        .then(|| money::enable_shadow_for_test(&fixture.support));
     let _ = money::take_shadow_lines_for_test();
     let mut facts = Vec::new();
     let mut last = None;
@@ -425,7 +425,7 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
     let mut unarmed_index = ScanIndex::default();
     let unarmed = scan(&mut unarmed_index);
     assert_eq!(money::capture::capture_reserved(), baseline_reserved);
-    money::enable_shadow_for_test(&fixture.support);
+    let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
     let mut armed_index = ScanIndex::default();
     let armed = scan(&mut armed_index);
     assert!(
@@ -573,7 +573,7 @@ fn money_shadow_capture_stops_at_start_and_contains_its_panics() {
     let fixture = PipelineFixture::new("money-shadow-capture-start-off");
     money_write_corpus(&fixture, corpus);
     std::fs::write(fixture.support.join("claude-request-money-shadow.off"), b"").unwrap();
-    money::enable_shadow_for_test(&fixture.support);
+    let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
     money::seed_shadow_off(&fixture.support);
     let _ = money_scan(&fixture);
     assert_eq!(
@@ -586,7 +586,7 @@ fn money_shadow_capture_stops_at_start_and_contains_its_panics() {
     let fixture = PipelineFixture::new("money-shadow-capture-panic");
     money_write_corpus(&fixture, corpus);
     let unarmed = money_scan(&fixture);
-    money::enable_shadow_for_test(&fixture.support);
+    let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
     money::capture::set_panic_for_test(true);
     let armed = money_scan(&fixture);
     money::capture::set_panic_for_test(false);
@@ -637,7 +637,7 @@ fn money_shadow_batch_admits_long_models_in_full() {
                 .replace("claude-haiku-4-5", model),
         )
         .unwrap();
-        money::enable_shadow_for_test(&fixture.support);
+        let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
         let mut index = ScanIndex::default();
         let scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -771,9 +771,9 @@ fn money_shadow_refusal_logs_and_changes_nothing() {
 }
 
 /// One armed scan of a fresh fixture, for direct `shadow_page_at` calls.
-fn money_armed_scan(name: &str) -> (PipelineFixture, ScanIndex, crate::snapshots::SourceScanResult) {
+fn money_armed_scan(name: &str) -> (PipelineFixture, money::ShadowTestGuard, ScanIndex, crate::snapshots::SourceScanResult) {
     let fixture = PipelineFixture::new(name);
-    money::enable_shadow_for_test(&fixture.support);
+    let shadow = money::enable_shadow_for_test(&fixture.support);
     let mut index = ScanIndex::default();
     let scan = crate::snapshots::scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,
@@ -785,7 +785,7 @@ fn money_armed_scan(name: &str) -> (PipelineFixture, ScanIndex, crate::snapshots
         true,
     )
     .expect("scan synthetic Claude root");
-    (fixture, index, scan)
+    (fixture, shadow, index, scan)
 }
 
 
@@ -805,7 +805,7 @@ fn money_shadow_lazy_family_admission_defers_suffix_and_resumes_in_order() {
         std::fs::write(fixture.root.join(format!("{session}.jsonl")),
             pipeline_transcript_line(&session, &format!("lazy-{at}"), 7)).unwrap();
     }
-    money::enable_shadow_for_test(&fixture.support);
+    let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
     money::store::prime_credit_for_test(&fixture.support, 0);
     let mut index = ScanIndex::default();
     let scan = crate::snapshots::scan_source_roots_with_test_limit(
@@ -818,7 +818,7 @@ fn money_shadow_lazy_family_admission_defers_suffix_and_resumes_in_order() {
     // Measure the same minimum in an isolated ledger without consuming the
     // real page's captures or scheduling turns. No body runs in this probe.
     let probe_support = fixture.base.join("admission-probe");
-    money::enable_shadow_for_test(&probe_support);
+    let _shadow_probe_support = money::enable_shadow_for_test(&probe_support);
     money::set_page_fault_for_test(money::PageFault::BodyDeadline);
     let probe = money::shadow_page_at(&probe_support, &scan.snapshots, &index, &api, &trace, true, now);
     money::set_page_fault_for_test(money::PageFault::None);
@@ -891,7 +891,7 @@ fn money_shadow_lazy_family_admission_defers_suffix_and_resumes_in_order() {
 #[serial(claude_request_money_shadow)]
 fn money_shadow_upfront_minimum_refusal_purges_captures() {
     for ceiling in [0, 1024] {
-        let (fixture, index, scan) = money_armed_scan("money-page-minimum-refusal");
+        let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-page-minimum-refusal");
         let captured = money::capture::keys_for_test(&fixture.support).len();
         assert!(captured > 0);
         // Prepare while the scope is unpaged: this fixture helper requires
@@ -931,7 +931,7 @@ fn money_shadow_holds_immature_units_until_they_mature() {
     let none = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let no_trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
     let units = PIPELINE_SESSIONS.len() as u64;
-    let (fixture, index, scan) = money_armed_scan("money-shadow-immature");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-shadow-immature");
     let young = money::shadow_page_at(
         &fixture.support,
         &scan.snapshots,
@@ -948,7 +948,7 @@ fn money_shadow_holds_immature_units_until_they_mature() {
         units * MONEY_PIPELINE_RESPONSE_TOKENS
     );
     assert_eq!(young.tokens_new, young.tokens_old - young.tokens_immature, "{young:?}");
-    let (fixture, index, scan) = money_armed_scan("money-shadow-mature");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-shadow-mature");
     let mature = money::shadow_page_at(
         &fixture.support,
         &scan.snapshots,
@@ -1098,7 +1098,7 @@ fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
 #[serial(claude_request_money_shadow)]
 fn money_shadow_memos_move_only_with_published_rows() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
-    let (fixture, index, scan) = money_armed_scan("money-shadow-unpublished");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-shadow-unpublished");
     std::fs::write(fixture.support.join("diagnostics"), b"not a directory").unwrap();
     let page = || {
         let counts = money::shadow_page_at(
@@ -1143,7 +1143,7 @@ fn money_shadow_memos_move_only_with_published_rows() {
 #[serial(claude_request_money_shadow)]
 fn money_shadow_writes_every_page_and_owes_coverage_for_lost_batches() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
-    let (fixture, index, scan) = money_armed_scan("money-shadow-every-page");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-shadow-every-page");
     let page = |now| {
         let counts = money::shadow_page_at(
             &fixture.support,
@@ -1223,7 +1223,7 @@ fn money_shadow_writes_every_page_and_owes_coverage_for_lost_batches() {
 #[serial(claude_request_money_shadow)]
 fn money_shadow_deleted_debt_marker_survives_restart() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
-    let (fixture, index, scan) = money_armed_scan("money-shadow-deleted-debt-marker");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-shadow-deleted-debt-marker");
     money::owe_coverage_for_test(&fixture.support, response + 3600, false);
     money::store::flush();
     assert_eq!(money_owed_markers(&fixture.support), 1);
@@ -1282,7 +1282,7 @@ fn money_owed_markers(support: &Path) -> usize {
 fn money_shadow_seal_needs_its_false_row() {
     use std::os::unix::fs::PermissionsExt;
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
-    let (fixture, index, scan) = money_armed_scan("money-shadow-failed-seal");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-shadow-failed-seal");
     let page = |now| {
         let counts = money::shadow_page_at(
             &fixture.support,
@@ -1353,7 +1353,7 @@ fn money_shadow_seal_needs_its_false_row() {
 #[serial(claude_request_money_shadow)]
 fn money_shadow_late_page_publishes_only_refused_coverage() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
-    let (fixture, index, scan) = money_armed_scan("money-shadow-late-hand-off");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-shadow-late-hand-off");
     // Never paged: every file is eligible.
     assert_eq!(money::capture::plan_allows_capture_for_test(&fixture.support), None);
     assert!(index.files.keys().all(|key| money::capture::capture_eligible_for_test(std::path::Path::new(key))));
@@ -1421,7 +1421,7 @@ fn money_armed_cycle_saves_the_baseline_index() {
         },
     );
     // Populate the ledger with an armed cycle, then save it and forget it.
-    money::enable_shadow_for_test(&fixture.support);
+    let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
     // This fixture requires a saved-ledger starting point. Prime the
     // asynchronous ticket before the cycle rather than racing two fast
     // pages against writer fsync. Production pages still never wait.
@@ -1436,11 +1436,12 @@ fn money_armed_cycle_saves_the_baseline_index() {
     let cycle = |armed: bool, ledger_fails: bool| {
         money_restore_files(&fixture.base, &saved);
         money::store::forget_for_test(&fixture.support);
-        if armed {
-            money::enable_shadow_for_test(&fixture.support);
+        let _shadow_fixture = if armed {
+            Some(money::enable_shadow_for_test(&fixture.support))
         } else {
             money::disable_shadow_for_test(&fixture.support);
-        }
+            None
+        };
         if ledger_fails {
             for name in std::fs::read_dir(&ledger_dir).unwrap().flatten() {
                 let staged = name.path().with_extension("json.tmp");
@@ -1537,7 +1538,7 @@ const MONEY_P1B_CI_SCHEDULING_TOLERANCE: std::time::Duration = std::time::Durati
 #[serial(claude_request_money_shadow)]
 fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
-    let (fixture, index, mut scan) = money_armed_scan("money-p1b-70k");
+    let (fixture, _shadow_fixture, index, mut scan) = money_armed_scan("money-p1b-70k");
     let large = &mut scan.snapshots[0];
     let root = large.source_session_id.as_str().to_owned();
     let occurrence = large.claude_usage_occurrences.values().next().unwrap().clone();
@@ -1585,6 +1586,7 @@ fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     let fixture = PipelineFixture::new("money-p1b-full-reads");
     for at in 0..2048 {
         let session = format!("{at:08x}-1234-4567-890a-123456789abc");
@@ -1601,7 +1603,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     // replay probe below, which keeps its empty starting state.
     let native_support = fixture.base.join("native-support");
     std::fs::create_dir_all(&native_support).unwrap();
-    money::enable_shadow_for_test(&native_support);
+    let _shadow_native_support = money::enable_shadow_for_test(&native_support);
     let mut armed_index = ScanIndex::default();
     let finalizers_started = std::time::Instant::now();
     let armed = scan(&mut armed_index);
@@ -1656,7 +1658,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
         item.attribution_facts.iter().find(|fact| fact.field == "root_session_ref")
             .map(|fact| fact.value.as_str()).unwrap_or(&item.source_session_id)).collect::<BTreeSet<_>>().len());
     money::disable_shadow_for_test(&native_support);
-    money::enable_shadow_for_test(&fixture.support);
+    let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
     // Keep all admitted-page accounting/progress assertions below. Run the
     // real finalizers on prepared synthetic input, so this probe's capture
     // work is deterministic (native I/O is no longer charged either way).
@@ -1867,7 +1869,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_setup_overrun_still_attempts_first_scheduled_family() {
-    let (fixture, index, scan) = money_armed_scan("money-p1b-setup-overrun");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-p1b-setup-overrun");
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
     let dense = (0..256).map(|at| {
         let mut item = scan.snapshots[0].clone();
@@ -1928,7 +1930,7 @@ fn money_p1b_schedule_stall_still_builds_first_scheduled_family() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_cut_off_schedule_keeps_a_captured_family_zero() {
-    let (fixture, index, scan) = money_armed_scan("money-p1b-cut-off-captured-zero");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-p1b-cut-off-captured-zero");
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
     let _ = money::take_shadow_lines_for_test();
     let captured = money::captured_roots_for_test(&fixture.support).into_iter()
@@ -1966,7 +1968,7 @@ fn money_p1b_cut_off_schedule_keeps_a_captured_family_zero() {
 }
 
 fn money_p1b_stall_still_builds_first_scheduled_family(name: &str, fault: money::PageFault) {
-    let (fixture, index, scan) = money_armed_scan(name);
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan(name);
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
     let _ = money::take_shadow_lines_for_test();
     money::set_page_fault_for_test(fault);
@@ -2018,7 +2020,7 @@ fn money_p1b_stall_still_builds_first_scheduled_family(name: &str, fault: money:
 fn money_p1b_slow_native_scan_page_is_admitted_and_builds() {
     const NATIVE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
     let fixture = PipelineFixture::new("money-p1b-slow-native-scan");
-    money::enable_shadow_for_test(&fixture.support);
+    let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
     crate::snapshots::set_claude_native_delay_for_test(Some((fixture.root.clone(), NATIVE_DELAY)));
     let mut index = ScanIndex::default();
     let scan_started = std::time::Instant::now();
@@ -2074,7 +2076,7 @@ fn money_p1b_steps_outside_the_body_are_charged_to_money_us() {
     const ENABLE_CHECK: std::time::Duration = std::time::Duration::from_millis(20);
     const KILL_SWITCH: std::time::Duration = std::time::Duration::from_millis(60);
     const LOG_WRITE: std::time::Duration = std::time::Duration::from_millis(40);
-    let (fixture, index, scan) = money_armed_scan("money-p1b-steps-outside-body");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-p1b-steps-outside-body");
     money::store::prime_credit_for_test(&fixture.support, 0);
     let _ = money::take_shadow_lines_for_test();
     let page = || {
@@ -2135,7 +2137,7 @@ fn money_p1b_steps_outside_the_body_are_charged_to_money_us() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_plan_install_failure_is_counted() {
-    let (fixture, index, scan) = money_armed_scan("money-p1b-plan-install-failed");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-p1b-plan-install-failed");
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
     let dense = (0..money::capture::NEXT_PAGE_FAMILIES + 6).map(|at| {
         let mut item = scan.snapshots[0].clone();
@@ -2185,7 +2187,7 @@ fn money_p1b_plan_install_failure_is_counted() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_full_page_zero_built_is_counted() {
-    let (fixture, index, scan) = money_armed_scan("money-p1b-full-zero-built");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-p1b-full-zero-built");
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
     let page = |snapshots: &[crate::snapshots::SnapshotItem], index: &ScanIndex, now| {
         let counts = money::shadow_page_at(&fixture.support, snapshots, index,
@@ -2226,7 +2228,7 @@ fn money_p1b_full_page_zero_built_is_counted() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_dense_deferred_day_suppresses_unchanged_rows_and_closes() {
-    let (fixture, index, scan) = money_armed_scan("money-p1b-deferred-day");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-p1b-deferred-day");
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
     let dense = (0..2051).map(|at| {
         let mut item = scan.snapshots[0].clone();
@@ -2280,6 +2282,7 @@ fn money_p1b_dense_deferred_day_suppresses_unchanged_rows_and_closes() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     let fixture = PipelineFixture::new("money-p1b-natural-deferred-day");
     for at in 0..2048 {
         let session = format!("{at:08x}-1234-4567-890a-123456789abc");
@@ -2293,7 +2296,7 @@ fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
     let baseline = scan(&mut baseline_index);
     let expected_bytes = serde_json::to_vec(&baseline.snapshots).unwrap();
     let expected_index = serde_json::to_vec(&baseline_index).unwrap();
-    money::enable_shadow_for_test(&fixture.support);
+    let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
     money::store::prime_credit_for_test(&fixture.support, 0);
     money::set_page_fault_for_test(money::PageFault::None);
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
@@ -2366,6 +2369,7 @@ fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     for (family_count, ack_mode) in [65_usize, 129].into_iter().flat_map(|n| ["ack", "lag", "sealed"].map(|mode| (n, mode))) {
         let fixture = PipelineFixture::new("money-p1b-small-full-rotation");
         for session in PIPELINE_SESSIONS {
@@ -2383,7 +2387,7 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
         let mut baseline_index = ScanIndex::default();
         let baseline = scan(&mut baseline_index);
-        money::enable_shadow_for_test(&fixture.support);
+        let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
         money::store::prime_credit_for_test(&fixture.support, 0);
         if ack_mode == "sealed" {
             std::fs::create_dir_all(fixture.support.join("diagnostics")).unwrap();
@@ -2482,7 +2486,7 @@ fn money_p1b_failed_plan_installs_fallback_and_captures_prior_incomplete_familie
         let scan = |index: &mut ScanIndex| crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), index,
             "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
-        money::enable_shadow_for_test(&fixture.support);
+        let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
         money::store::prime_credit_for_test(&fixture.support, 0);
         let now = census_pipeline_window("2026-08-02T08:00:00Z");
         let planned = || money::capture::planned_families_for_test(&fixture.support)
@@ -2580,7 +2584,7 @@ fn money_p1b_scope_wide_plan_keeps_page_a_through_page_b() {
         let scan = |root: &std::path::Path, index: &mut ScanIndex| crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode, std::slice::from_ref(&root.to_path_buf()), index,
             "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
-        money::enable_shadow_for_test(&fixture.support);
+        let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
         money::store::prime_credit_for_test(&fixture.support, 0);
         money::set_page_fault_for_test(if ack_mode == "lost" { money::PageFault::LostAck } else { money::PageFault::None });
         let paused = (ack_mode == "lag").then(money::store::pause_for_test);
@@ -2680,7 +2684,7 @@ fn money_p1b_budget_expiring_after_a_capture_counts_the_spent_family_unbuilt() {
         let scan = |index: &mut ScanIndex| crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), index,
             "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
-        money::enable_shadow_for_test(&fixture.support);
+        let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
         money::store::prime_credit_for_test(&fixture.support, 0);
         money::set_page_fault_for_test(if ack_mode == "lost" { money::PageFault::LostAck } else { money::PageFault::None });
         let now = census_pipeline_window("2026-08-02T08:00:00Z");
@@ -2780,7 +2784,7 @@ fn money_p1b_write_sync_save_and_ack_faults_never_create_false_progress() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
     for (at, fault) in [money::PageFault::WriteFailure, money::PageFault::SyncFailure,
         money::PageFault::SaveFailure, money::PageFault::LostAck].into_iter().enumerate() {
-        let (fixture, index, scan) = money_armed_scan(&format!("money-p1b-fault-{at}"));
+        let (fixture, _shadow_fixture, index, scan) = money_armed_scan(&format!("money-p1b-fault-{at}"));
         // Injected page clock: a save past its closing slice is skipped
         // (`ledger_save_late`), which is not the fault under test.
         let page = |now| {
@@ -2815,6 +2819,7 @@ fn money_p1b_write_sync_save_and_ack_faults_never_create_false_progress() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_64k_capture_input_refusal_preserves_live_output() {
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     let fixture = PipelineFixture::new("money-long-capture-refusal");
     const SESSION: &str = "10000000-1234-4567-890a-123456789abc";
     let model = format!("claude-haiku-4-5-{}", "x".repeat(64 * 1024));
@@ -2823,7 +2828,7 @@ fn money_p1b_64k_capture_input_refusal_preserves_live_output() {
         SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), index, "2026-08-02T08:00:00Z", 183, 16, true).unwrap();
     let mut baseline_index = ScanIndex::default();
     let baseline = scan(&mut baseline_index);
-    money::enable_shadow_for_test(&fixture.support);
+    let _shadow_fixture = money::enable_shadow_for_test(&fixture.support);
     let mut armed_index = ScanIndex::default();
     let armed = scan(&mut armed_index);
     assert_eq!(serde_json::to_vec(&baseline.snapshots).unwrap(), serde_json::to_vec(&armed.snapshots).unwrap());
@@ -2839,7 +2844,7 @@ fn money_p1b_64k_capture_input_refusal_preserves_live_output() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_mid_preflight_uses_pre_admitted_failure_rows() {
-    let (fixture, index, scan) = money_armed_scan("money-preflight-expiry");
+    let (fixture, _shadow_fixture, index, scan) = money_armed_scan("money-preflight-expiry");
     money::preflight_checks_for_test(Some(5));
     let counts = money::shadow_page_at(&fixture.support, &scan.snapshots, &index,
         &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
