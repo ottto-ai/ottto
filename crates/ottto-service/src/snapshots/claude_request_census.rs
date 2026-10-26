@@ -35,29 +35,43 @@ use std::sync::Arc;
 // N1 diagnostics only: process totals on the existing local census line.
 // Reloading a held record does not enter it again; a lost/over-budget record
 // is not a successful clearance. No persisted or uploaded bookkeeping.
+// Slots: entered, cleared, audit deadline restored (option B).
 #[cfg(not(test))]
-static IDENTITY_INCOMPLETE_HOLDS: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static IDENTITY_INCOMPLETE_HOLDS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 #[cfg(test)]
 thread_local! {
-    static IDENTITY_INCOMPLETE_HOLDS: [std::cell::Cell<u64>; 2] = const {
-        [std::cell::Cell::new(0), std::cell::Cell::new(0)]
+    static IDENTITY_INCOMPLETE_HOLDS: [std::cell::Cell<u64>; 3] = const {
+        [std::cell::Cell::new(0), std::cell::Cell::new(0), std::cell::Cell::new(0)]
     };
+}
+
+fn add_identity_incomplete_hold_total(slot: usize, count: u64) {
+    #[cfg(not(test))]
+    let _ = IDENTITY_INCOMPLETE_HOLDS[slot].fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |total| Some(total.saturating_add(count)),
+    );
+    #[cfg(test)]
+    IDENTITY_INCOMPLETE_HOLDS.with(|totals| {
+        totals[slot].set(totals[slot].get().saturating_add(count));
+    });
+}
+
+fn identity_incomplete_hold_total(slot: usize) -> u64 {
+    #[cfg(not(test))]
+    {
+        IDENTITY_INCOMPLETE_HOLDS[slot].load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    IDENTITY_INCOMPLETE_HOLDS.with(|totals| totals[slot].get())
 }
 
 fn note_identity_incomplete_hold(entered: bool, cleared: bool) {
     for (slot, changed) in [entered, cleared].into_iter().enumerate() {
         if changed {
-            #[cfg(not(test))]
-            let _ = IDENTITY_INCOMPLETE_HOLDS[slot].fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |count| Some(count.saturating_add(1)),
-            );
-            #[cfg(test)]
-            IDENTITY_INCOMPLETE_HOLDS.with(|counts| {
-                counts[slot].set(counts[slot].get().saturating_add(1));
-            });
+            add_identity_incomplete_hold_total(slot, 1);
         }
     }
 }
@@ -65,15 +79,20 @@ fn note_identity_incomplete_hold(entered: bool, cleared: bool) {
 /// Independent relaxed process totals (entered, cleared), test-thread local
 /// in unit tests as the existing history-upgrade local counts are.
 pub(super) fn identity_incomplete_hold_totals() -> (u64, u64) {
-    #[cfg(not(test))]
-    {
-        (
-            IDENTITY_INCOMPLETE_HOLDS[0].load(std::sync::atomic::Ordering::Relaxed),
-            IDENTITY_INCOMPLETE_HOLDS[1].load(std::sync::atomic::Ordering::Relaxed),
-        )
-    }
-    #[cfg(test)]
-    IDENTITY_INCOMPLETE_HOLDS.with(|counts| (counts[0].get(), counts[1].get()))
+    (
+        identity_incomplete_hold_total(0),
+        identity_incomplete_hold_total(1),
+    )
+}
+
+/// Held entries whose erased audit deadline a sampled scan re-derived. A
+/// restoration whose index is never saved is restored, and counted, again.
+pub(super) fn note_identity_incomplete_hold_deadlines_restored(count: u64) {
+    add_identity_incomplete_hold_total(2, count);
+}
+
+pub(super) fn identity_incomplete_hold_deadlines_restored_total() -> u64 {
+    identity_incomplete_hold_total(2)
 }
 
 /// Bumped only when request-id or occurrence extraction, or the shape rule,
@@ -468,7 +487,9 @@ impl ClaudeRequestCensusRecord {
             )
     }
 
-    fn identity_incomplete_hold(&self) -> bool {
+    /// N1: an unverified identity-incomplete record holds its root until a
+    /// Full audit verifies its source (SOURCE rule 3: delay, never cancel).
+    pub(super) fn identity_incomplete_hold(&self) -> bool {
         self.current_derivation()
             && self.unverified
             && !self.twin
@@ -2540,12 +2561,23 @@ pub(crate) fn record_claude_request_census(
 
 /// A parse that reaches no record (a failed finish, or a native comparison
 /// target whose record allocation is not prepaid) leaves the key without
-/// one, never with an older revision's.
+/// one, never with an older revision's. A virtual recovery audit retains its
+/// old unverified hold solely as an exclusion/retry obligation until a fully
+/// finalized, verified Full replaces it.
 pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Path) {
+    let key = super::local_index_key(path);
+    // A recovery Full has no sampled marker to retain its obligation. Its
+    // old unverified IdentityIncomplete record cannot bind a body or grant
+    // proof; keep that exclusion/retry obligation after failed validation.
+    // Successful Full verification and explicit vanished-file retirement
+    // still replace/remove it at their existing authority boundaries.
+    if super::sampled_audit::progress_debt(index, &key, super::sampled_scan::now_seconds())
+        .is_some()
+    {
+        return;
+    }
     if claude_index_path_family_member(path).is_some() {
-        index
-            .claude_request_census
-            .invalidate_keeping_birth(&super::local_index_key(path));
+        index.claude_request_census.invalidate_keeping_birth(&key);
     }
 }
 
