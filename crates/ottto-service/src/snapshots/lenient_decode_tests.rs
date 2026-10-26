@@ -2737,6 +2737,85 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
 }
 
 #[test]
+fn malformed_upload_ack_retirement_handoff_keeps_index_identity_without_pause() {
+    for bounded in [false, true] {
+        for (case, damaged) in [
+            ("null", serde_json::json!(null)),
+            ("string", serde_json::json!("damaged-handoff")),
+            (
+                "negative-generation",
+                serde_json::json!({
+                    "destination_namespace_hash": "c".repeat(64),
+                    "committed_generation": -1,
+                    "bodies": {"d".repeat(64): "e".repeat(64)}
+                }),
+            ),
+        ] {
+            let scratch = crate::test_scratch::ScratchDir::new("lenient-ack-handoff");
+            let path = scratch.join("index.json");
+            let support = scratch.join("support");
+            let source = SnapshotSource::ClaudeCode;
+            let mut seed = override_identity_seed("handoff-owner", true);
+            seed.save(&path).unwrap();
+            let mut value = serde_json::to_value(&seed).unwrap();
+            value["upload_ack_retirement_handoff"] = damaged;
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&path, &bytes).unwrap();
+
+            let before = scan_index_containment_lines_for_test().len();
+            let (mut loaded, origin) =
+                ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support).unwrap();
+            assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{case}");
+            assert!(!scan_index_rebuild_paused(source), "{case}");
+            assert!(loaded.upload_ack_retirement_handoff.is_none(), "{case}");
+            assert_identity_carried(&loaded, &seed, case);
+            assert_eq!(
+                loaded.accepted_snapshot_fingerprints,
+                seed.accepted_snapshot_fingerprints
+            );
+            assert_eq!(as_json(&loaded.files), as_json(&seed.files));
+            assert_eq!(
+                loaded.file_snapshot_fingerprints,
+                seed.file_snapshot_fingerprints
+            );
+            assert_eq!(loaded.snapshot_activity_at, seed.snapshot_activity_at);
+            assert_eq!(loaded.generation, seed.generation);
+            assert!(loaded.decode_holds.is_empty(), "{case}");
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "load never rewrites {case}"
+            );
+            assert_eq!(corrupt_count(&scratch), 0);
+            assert!(
+                !scan_index_containment_lines_for_test()[before..]
+                    .iter()
+                    .any(|line| line.contains("source_paused=1")),
+                "{case}"
+            );
+
+            // Both CAS readers must accept the repaired cleanup field, too.
+            if bounded {
+                loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
+            } else {
+                loaded.save(&path).unwrap();
+            }
+            let reloaded = ScanIndex::load(&path).unwrap();
+            assert!(reloaded.upload_ack_retirement_handoff.is_none());
+            assert_identity_carried(&reloaded, &seed, case);
+            assert_eq!(
+                reloaded.accepted_snapshot_fingerprints,
+                seed.accepted_snapshot_fingerprints
+            );
+            assert_eq!(
+                reloaded.file_snapshot_fingerprints,
+                seed.file_snapshot_fingerprints
+            );
+        }
+    }
+}
+
+#[test]
 fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
     let mut item = tests::valid_v6_batch_request().snapshots.remove(0);
     let session = item.source_session_id.clone();

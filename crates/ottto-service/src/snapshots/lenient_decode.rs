@@ -1446,7 +1446,10 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "generation" => index.generation = self.typed(value)?,
                         "reread_guard" => index.reread_guard = self.typed(value)?,
                         "upload_ack_retirement_handoff" => {
-                            index.upload_ack_retirement_handoff = self.typed(value)?
+                            // Damaged cleanup authority delays retirement; it must
+                            // never discard identity custody or pause ingestion.
+                            index.upload_ack_retirement_handoff =
+                                self.history_scalar(value, None)?
                         }
                         "upload_context_fingerprint" => {
                             index.upload_context_fingerprint = self.typed(value)?

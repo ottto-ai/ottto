@@ -113,3 +113,13 @@ This change does not implement per-entity file settlement. Complete-census
 cleanup is included here, so it is not left as a recovery follow-up. The
 terminal-contract lease integration regression remains with its separate
 integration change once that contract is available.
+
+
+Malformed retirement handoffs now decode to no cleanup authority instead of
+refusing the entire index. Null, string and negative-generation fixtures load
+through the source-aware boundary without pausing and retain bindings, accepted
+fingerprints, request-identity token and latch; both CAS save readers and restart
+are covered. Cleanup waits for fresh durable proof or a complete census.
+The optional retained-retry equality reader also restores the runtime stale-count
+scalar before comparison; the existing loopback recovery test now supplies a
+nonzero runtime count. The production activation gate remains closed.

@@ -59,7 +59,11 @@ fn bounded_native_read(stream: &mut std::net::TcpStream) -> Vec<u8> {
         let n = stream
             .read(&mut buf)
             .unwrap_or_else(|e| panic!("fixture request read after {} bytes: {e}", bytes.len()));
-        assert!(n > 0, "client closed fixture request after {} bytes", bytes.len());
+        assert!(
+            n > 0,
+            "client closed fixture request after {} bytes",
+            bytes.len()
+        );
         bytes.extend_from_slice(&buf[..n]);
     }
     bytes
@@ -228,6 +232,8 @@ fn bounded_retry_native_transport_fallback_auth_exact_ack_checkpoint_and_recover
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let mut f = SameSourceAckFixture::new();
+    // Runtime-only pressure diagnostics cannot invalidate durable equality.
+    f.progress.retained_stale_ack_count = 1;
     let item = f.items[0].clone();
     let fingerprint = item.snapshot_fingerprint.clone();
     let mut page = bounded_native_capture(&f, Instant::now() - Duration::from_secs(61));

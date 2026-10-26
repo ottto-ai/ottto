@@ -206,6 +206,7 @@ impl PreparedRetry {
         durable.active_quarantine_witness = self.progress.active_quarantine_witness.clone();
         durable.active_quarantine_retries = self.progress.active_quarantine_retries.clone();
         durable.ack_capacity = self.progress.ack_capacity;
+        durable.retained_stale_ack_count = self.progress.retained_stale_ack_count;
         if crate::heap_layout_bound::bound(&durable, RETAINED_BUDGET).is_none()
             || durable != self.progress
         {
