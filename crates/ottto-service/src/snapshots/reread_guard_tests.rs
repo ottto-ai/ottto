@@ -706,3 +706,22 @@ fn scoped_plan_replaces_the_same_window_baseline_without_counting_retained_keys(
         |key| key.starts_with("owed-"),
     ));
 }
+
+/// Whole-index parity fixtures can pin the observer without leaking a clock
+/// into the next test, including when an equality assertion unwinds.
+#[test]
+fn scoped_clock_restores_after_nested_fixture_panic() {
+    let previous = TEST_CLOCK.with(|clock| clock.get());
+    {
+        let _outer = TestClock::at(WALL);
+        assert_eq!(now(), WALL);
+        let failure = std::panic::catch_unwind(|| {
+            let _fixture = TestClock::at(WALL + 3_600);
+            assert_eq!(now(), WALL + 3_600);
+            panic!("synthetic fixture assertion failure");
+        });
+        assert!(failure.is_err());
+        assert_eq!(now(), WALL);
+    }
+    assert_eq!(TEST_CLOCK.with(|clock| clock.get()), previous);
+}

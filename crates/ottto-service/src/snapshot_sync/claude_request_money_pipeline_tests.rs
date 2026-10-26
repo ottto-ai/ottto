@@ -818,6 +818,7 @@ fn money_shadow_lazy_family_admission_defers_suffix_and_resumes_in_order() {
     // Measure the same minimum in an isolated ledger without consuming the
     // real page's captures or scheduling turns. No body runs in this probe.
     let probe_support = fixture.base.join("admission-probe");
+    let _probe_support_cleanup = money::ShadowTestCleanup::new(&probe_support);
     money::enable_shadow_for_test(&probe_support);
     money::set_page_fault_for_test(money::PageFault::BodyDeadline);
     let probe = money::shadow_page_at(&probe_support, &scan.snapshots, &index, &api, &trace, true, now);
@@ -1585,6 +1586,8 @@ fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
+    // Keep exact saved-index comparisons independent of the wall-clock hour.
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     let fixture = PipelineFixture::new("money-p1b-full-reads");
     for at in 0..2048 {
         let session = format!("{at:08x}-1234-4567-890a-123456789abc");
@@ -1601,6 +1604,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     // replay probe below, which keeps its empty starting state.
     let native_support = fixture.base.join("native-support");
     std::fs::create_dir_all(&native_support).unwrap();
+    let _native_support_cleanup = money::ShadowTestCleanup::new(&native_support);
     money::enable_shadow_for_test(&native_support);
     let mut armed_index = ScanIndex::default();
     let finalizers_started = std::time::Instant::now();
@@ -2280,6 +2284,8 @@ fn money_p1b_dense_deferred_day_suppresses_unchanged_rows_and_closes() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
+    // Keep exact saved-index comparisons independent of the wall-clock hour.
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     let fixture = PipelineFixture::new("money-p1b-natural-deferred-day");
     for at in 0..2048 {
         let session = format!("{at:08x}-1234-4567-890a-123456789abc");
@@ -2366,6 +2372,8 @@ fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
+    // Keep exact saved-index comparisons independent of the wall-clock hour.
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     for (family_count, ack_mode) in [65_usize, 129].into_iter().flat_map(|n| ["ack", "lag", "sealed"].map(|mode| (n, mode))) {
         let fixture = PipelineFixture::new("money-p1b-small-full-rotation");
         for session in PIPELINE_SESSIONS {
@@ -2815,6 +2823,8 @@ fn money_p1b_write_sync_save_and_ack_faults_never_create_false_progress() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_64k_capture_input_refusal_preserves_live_output() {
+    // Keep exact saved-index comparisons independent of the wall-clock hour.
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     let fixture = PipelineFixture::new("money-long-capture-refusal");
     const SESSION: &str = "10000000-1234-4567-890a-123456789abc";
     let model = format!("claude-haiku-4-5-{}", "x".repeat(64 * 1024));
@@ -2853,4 +2863,20 @@ fn money_p1b_mid_preflight_uses_pre_admitted_failure_rows() {
     assert!(!families.is_empty());
     assert!(families.iter().all(|row| row["p1_reasons"] == serde_json::json!(["deadline"])));
     assert_eq!(money::reserved_for_test(), 0);
+}
+
+/// An assertion before explicit shadow cleanup must not poison later tests'
+/// process-global capture allowance.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_pipeline_fixture_releases_shadow_captures_on_panic() {
+    let before = money::capture::capture_reserved();
+    let failure = std::panic::catch_unwind(|| {
+        let (fixture, _index, _scan) = money_armed_scan("money-shadow-panic-cleanup");
+        assert!(money::capture::capture_reserved() > before);
+        assert!(fixture.root.is_dir());
+        panic!("synthetic fixture assertion failure");
+    });
+    assert!(failure.is_err());
+    assert_eq!(money::capture::capture_reserved(), before);
 }

@@ -1473,6 +1473,7 @@ mod bounded_tests {
     fn planned_capture_rotates_known_roots_without_gating_a_different_native_page() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-turns");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         super::super::enable_shadow_for_test(&support);
         let keys = (0..NEXT_PAGE_FAMILIES + 1)
             .map(|at| super::super::family_key(&format!("root-{at}")))
@@ -1682,6 +1683,7 @@ mod bounded_tests {
     fn fallback_plan_captures_only_prior_incomplete_families() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-fallback");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         super::super::enable_shadow_for_test(&support);
         let roots = (0..3 * NEXT_PAGE_FAMILIES)
             .map(|at| format!("root-{at}"))
@@ -1742,6 +1744,7 @@ mod bounded_tests {
     fn a_paged_scope_without_a_plan_captures_nothing_optional() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-closed");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         super::super::enable_shadow_for_test(&support);
         let file = scratch.join("root-0.jsonl");
         let other = scratch.join("different-native-page.jsonl");
@@ -1870,6 +1873,7 @@ mod bounded_tests {
     fn another_pages_plan_keeps_earlier_pages_turns_and_exclusions() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-scope-wide");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         super::super::enable_shadow_for_test(&support);
         let before = capture_reserved();
         let page = |name: &str| {
@@ -1970,6 +1974,33 @@ mod bounded_tests {
         println!("MONEY_P1B_PLAN_SCOPE_WIDE pages=A,B,A,B,fallback(B),A families_per_page=192 a_rebuilt=0 b_consumed_eligible_after_a=0 b_fallback_eligible_after_a=64");
     }
 
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn shadow_cleanup_releases_plan_and_disables_scope_on_panic() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-plan-panic-cleanup");
+        let support = scratch.join("support");
+        let before = capture_reserved();
+        let failure = std::panic::catch_unwind(|| {
+            let _cleanup = super::super::ShadowTestCleanup::new(&support);
+            super::super::enable_shadow_for_test(&support);
+            assert_eq!(
+                plan_next_page(
+                    &support,
+                    std::iter::once(("root", 0)),
+                    std::iter::empty(),
+                    Instant::now() + Duration::from_secs(1),
+                ),
+                PlanInstall::Complete
+            );
+            assert!(capture_reserved() > before);
+            assert!(super::super::shadow_enabled(&support));
+            panic!("synthetic fixture assertion failure");
+        });
+        assert!(failure.is_err());
+        assert_eq!(capture_reserved(), before);
+        assert!(!super::super::shadow_enabled(&support));
+    }
+
     /// Each page updates the plan in place and reuses its funds, so a family
     /// count whose two plans exceed the capture ceiling still installs every
     /// page. Changing family sets near the ceiling, after an interrupted
@@ -1980,6 +2011,7 @@ mod bounded_tests {
     fn replacing_a_large_plan_reuses_the_old_plans_funds() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-large-plan");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         let before = capture_reserved();
         let set = |name: &str| {
             (0..30_000)
@@ -2113,6 +2145,7 @@ mod bounded_tests {
         let scratch = crate::test_scratch::ScratchDir::new("money-exhausted-fast-path");
         let scope = scratch.join("support");
         let path = scratch.join("transcript.jsonl");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&scope);
         super::super::enable_shadow_for_test(&scope);
         let mut capture = ClaudeResponseCapture::begin(&path).expect("armed capture");
         let pending_deposit = ClaudeResponseCapture::begin(&path).expect("second capture");

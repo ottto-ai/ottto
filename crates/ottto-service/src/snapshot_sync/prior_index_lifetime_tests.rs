@@ -480,6 +480,7 @@ enum MoneyArm {
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
 fn money_shadow_real_caller_parity_at_tight_allowances() {
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -488,6 +489,7 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
     let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
     let cadence = IdentityPipelineCadence::new();
     let support = fixture.base.join("money-parity-support");
+    let _shadow_cleanup = money::ShadowTestCleanup::new(&support);
     let secrets = fixture.base.join("money-parity-secrets");
     std::fs::create_dir_all(&support).unwrap();
     std::fs::create_dir_all(&secrets).unwrap();
