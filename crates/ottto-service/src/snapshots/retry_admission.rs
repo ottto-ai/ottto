@@ -42,11 +42,11 @@ fn claude_retry_admit_batch(
 ) {
     let mut state = previous
         .filter(|state| {
-            !state.complete
-                && !(state.roots_complete
+            !(state.complete
+                || (state.roots_complete
                     && state.storage_deferred
                     && state.oversized_root.is_none()
-                    && state.due_complete)
+                    && state.due_complete))
         })
         .cloned()
         .unwrap_or_else(|| ClaudeRetryAdmission {
