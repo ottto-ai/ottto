@@ -3,8 +3,8 @@
 .github/dependabot.yml
 .github/workflows/ci.yml
 .github/workflows/linux-tests.yml
-.github/workflows/merge-queue-cleanup.yml
 .github/workflows/macos-stable-release.yml
+.github/workflows/merge-queue-cleanup.yml
 AGENTS.md
 CLAUDE.md
 CODE_OF_CONDUCT.md
