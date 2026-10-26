@@ -1510,9 +1510,14 @@ pub(crate) fn side_calls_page(
         wanted.insert(root.as_str(), hashes);
         candidates.insert(root.as_str(), family);
     }
-    let mut census = index
-        .claude_request_census
-        .family_transcript_holders(&wanted, Instant::now() + SIDE_CALL_DEADLINE);
+    // Families with no candidate row need no census answer: no walk.
+    let mut census = if wanted.values().all(Vec::is_empty) {
+        Some(BTreeMap::new())
+    } else {
+        index
+            .claude_request_census
+            .family_transcript_holders(&wanted, Instant::now() + SIDE_CALL_DEADLINE)
+    };
     drop(wanted);
     for (root, members) in &families {
         let first = members
@@ -1526,7 +1531,16 @@ pub(crate) fn side_calls_page(
         if census.is_none() && rows.as_ref().is_some_and(|rows| !rows.is_empty()) {
             unresolved.insert(root.clone());
         }
-        let (Some(first), Some(rows), Some(census)) = (first, rows, census.as_mut()) else {
+        // A family without candidates is decided whatever the walk did.
+        let family_census = match (first, rows.as_ref(), census.as_mut()) {
+            (Some(_), Some(_), Some(census)) => {
+                Some(census.remove(root.as_str()).unwrap_or_default())
+            }
+            (Some(_), Some(rows), None) if rows.is_empty() => Some(Default::default()),
+            _ => None,
+        };
+        let (Some(first), Some(rows), Some(mut family_census)) = (first, rows, family_census)
+        else {
             // The family stays telemetry-incomplete.
             if let Some(index) = first {
                 if let Some(fold) = items[index].claude_money.as_deref_mut() {
@@ -1535,7 +1549,6 @@ pub(crate) fn side_calls_page(
             }
             continue;
         };
-        let mut family_census = census.remove(root.as_str()).unwrap_or_default();
         let mut rows = rows;
         rows.retain(|row| {
             !family_census
