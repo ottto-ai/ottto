@@ -24854,23 +24854,14 @@ impl OwnedSourceScan {
                 .as_ref()
                 .and_then(|origin| origin.admission.as_ref())
             {
-                let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
-                while pending_paths.len() < selection_limit {
-                    let due = traversal.pending_candidates.front().is_some_and(|path| {
-                        claude_retry_path_owed(
-                            state,
-                            &index.claude_usage_authority_quarantine,
-                            &local_index_key(&path.path),
-                            now,
-                        )
-                    });
-                    if !due {
-                        break;
-                    }
-                    if let Some(path) = traversal.pending_candidates.pop_front() {
-                        pending_paths.push(path);
-                    }
-                }
+                claude_retry_select_due_paths(
+                    state,
+                    &index.claude_usage_authority_quarantine,
+                    &mut traversal.pending_candidates,
+                    &mut pending_paths,
+                    rfc3339_unix_seconds(collected_at).unwrap_or_default(),
+                    selection_limit,
+                );
             }
         }
         let retry_service_end = pending_paths.len();

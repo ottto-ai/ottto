@@ -264,6 +264,29 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
     }
 }
 
+// Keep the real pre-audit selector portable: carry allocation itself requires
+// validated native layouts, but deadline priority and cursor service do not.
+fn claude_retry_select_due_paths(
+    state: &ClaudeRetryAdmission,
+    records: &BTreeMap<String, ClaudeUsageAuthorityQuarantineRecord>,
+    candidates: &mut VecDeque<ScanTraversalPath>,
+    selected: &mut Vec<ScanTraversalPath>,
+    now: u64,
+    limit: usize,
+) {
+    while selected.len() < limit {
+        let due = candidates.front().is_some_and(|path| {
+            claude_retry_path_owed(state, records, &local_index_key(&path.path), now)
+        });
+        if !due {
+            break;
+        }
+        if let Some(path) = candidates.pop_front() {
+            selected.push(path);
+        }
+    }
+}
+
 fn claude_retry_note_offered(
     index: &mut ScanIndex,
     paths: &[ScanTraversalPath],

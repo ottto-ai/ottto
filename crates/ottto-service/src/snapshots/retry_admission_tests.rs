@@ -12,6 +12,98 @@ impl Drop for RetryMultiRefusal {
     }
 }
 
+// Unlike the older in-memory carry fixtures, scheduling fixtures cross the
+// real strict save/load boundary. ACKs must therefore be canonical identities.
+fn retry_durable_fixture(held: usize, healthy: usize) -> ScopedRetryFixture {
+    let mut fixture = scoped_retry_fixture(0, held + healthy, false);
+    fixture.index.accepted_snapshot_fingerprints.clear();
+    fixture.index.snapshot_activity_at.clear();
+    let keys = fixture.index.files.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        let entities = fixture
+            .index
+            .file_snapshot_fingerprints
+            .get_mut(&key)
+            .unwrap();
+        *entities = entities
+            .iter()
+            .map(|body| format!("{:x}", Sha256::digest(body.as_bytes())))
+            .collect();
+        fixture
+            .index
+            .accepted_snapshot_fingerprints
+            .extend(entities.iter().cloned());
+        scoped_retry_accept_member(&mut fixture.index, &key);
+    }
+    for family in fixture.roots.iter().take(held) {
+        let key = local_index_key(&fixture._scratch.join(format!("{family}.jsonl")));
+        fixture.index.bind_retry_pending_claude_authority_for_test(
+            family,
+            BTreeMap::from([(
+                family.clone(),
+                fixture.index.files[&key].source_file_fingerprint.clone(),
+            )]),
+        );
+    }
+    fixture
+}
+
+fn retry_test_reload(index: &ScanIndex, path: &Path) -> ScanIndex {
+    let accepted = index.accepted_snapshot_fingerprints.clone();
+    let authority = serde_json::to_value(&index.claude_usage_authority_quarantine).unwrap();
+    let admission = serde_json::to_value(&index.claude_stale_family_carry.origin).unwrap();
+    let drops = claude_authority_drops_for_test();
+    index.save(path).unwrap();
+    let loaded = ScanIndex::load(path).unwrap();
+    assert_eq!(
+        loaded.accepted_snapshot_fingerprints, accepted,
+        "strict persistence retains every ACK"
+    );
+    assert_eq!(
+        serde_json::to_value(&loaded.claude_usage_authority_quarantine).unwrap(),
+        authority,
+        "strict persistence retains every bound authority record"
+    );
+    assert_eq!(
+        serde_json::to_value(&loaded.claude_stale_family_carry.origin).unwrap(),
+        admission,
+        "strict persistence retains runnable admission debt"
+    );
+    assert_eq!(
+        claude_authority_drops_for_test(),
+        drops,
+        "no malformed fixture authority was discarded"
+    );
+    loaded
+}
+
+fn retry_test_corrections(fixture: &mut ScopedRetryFixture) {
+    let deadline = rfc3339_unix_seconds(CARRY_FAILED).unwrap() + 1;
+    for (number, family) in fixture.roots.iter().take(70).enumerate() {
+        let record = fixture
+            .index
+            .claude_usage_authority_quarantine
+            .get_mut(family)
+            .unwrap();
+        record.retry_after_unix_seconds = deadline;
+        if number < 65 {
+            // A correction is a terminal re-offer, never a RetryPending grant.
+            record.contract = CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.to_string();
+            record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
+            record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+            record.retry_after_unix_seconds = 0;
+            record.proof_correction = Some(ClaudeAuthorityProofCorrection {
+                proof_witness_fingerprint: record.proven_witness_fingerprint.clone(),
+                owed_member_ids: BTreeSet::from([family.clone()]),
+            });
+        }
+        assert!(claude_usage_authority_preserves_pending(
+            record,
+            &fixture.index.claude_usage_family_witnesses[family]
+        ));
+    }
+}
+
 fn retry_test_context(index: &mut ScanIndex, root: &Path) {
     let context = scan_traversal_context_fingerprint(
         SnapshotSource::ClaudeCode,
@@ -25,11 +117,14 @@ fn retry_test_context(index: &mut ScanIndex, root: &Path) {
 }
 
 fn retry_test_page(
-    index: ScanIndex,
+    mut index: ScanIndex,
     root: &Path,
     at: &str,
     limit: usize,
 ) -> (ScanIndex, SourceScanResult, Vec<String>) {
+    // OwnedSourceScan is below pipeline configuration, which reloads policy
+    // before scanning a durable index. Mirror that boundary, including on restart.
+    index.claude_reemission_exclusions = ReemissionExclusions::load(&root.join("support"));
     let mut scan = OwnedSourceScan::new_with_identity_capture(
         SnapshotSource::ClaudeCode,
         &[root.to_owned()],
@@ -68,13 +163,16 @@ fn oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
         return;
     }
     let started = std::time::Instant::now();
-    let mut fixture = scoped_retry_fixture(0, 3, false);
+    let mut fixture = retry_durable_fixture(0, 3);
     let root = fixture
         ._scratch
         .join("p".repeat(200))
         .join("q".repeat(200))
         .join("r".repeat(200));
     std::fs::create_dir_all(&root).unwrap();
+    let list = ReemissionExclusions::path(&root.join("support"));
+    std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+    std::fs::write(list, b"").unwrap();
     // One real root file plus stale synthetic missing members. The missing
     // members are ordinary runnable open opportunities, never fake ACKs.
     let old_files = std::mem::take(&mut fixture.index.files);
@@ -158,8 +256,7 @@ fn oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
         .pending_candidates
         .clear();
     let path = fixture._scratch.join("oversized-index.json");
-    fixture.index.save(&path).unwrap();
-    let loaded = ScanIndex::load(&path).unwrap();
+    let loaded = retry_test_reload(&fixture.index, &path);
     let (mut index, scan, selected) = retry_test_page(loaded, &root, CARRY_RETRY, 1);
     assert_eq!(selected, vec![real.clone()]);
     assert_eq!(
@@ -181,8 +278,7 @@ fn oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
         !state.complete,
         "unoffered missing members still owe service"
     );
-    index.save(&path).unwrap();
-    let mut loaded = ScanIndex::load(&path).unwrap();
+    let mut loaded = retry_test_reload(&index, &path);
     // An exhausted/red ordinary checkpoint may leave unoffered fallback
     // members. The actual next start must advance siblings without dropping it.
     carry_red(&mut loaded, CARRY_RETRY, 7);
@@ -224,24 +320,11 @@ fn rotating_due_seed_services_over_64_paths_before_audits_across_reload() {
     let started = std::time::Instant::now();
     let _refusal = RetryMultiRefusal::new();
     let _native = claude_native_comparison::enable_for_test();
-    let mut fixture = scoped_retry_fixture(70, 2, false);
+    let mut fixture = retry_durable_fixture(70, 2);
     let root = fixture._scratch.to_path_buf();
     retry_test_context(&mut fixture.index, &root);
-    let deadline = rfc3339_unix_seconds(CARRY_FAILED).unwrap() + 1;
-    for (number, family) in fixture.roots.iter().take(70).enumerate() {
-        let record = fixture
-            .index
-            .claude_usage_authority_quarantine
-            .get_mut(family)
-            .unwrap();
-        record.retry_after_unix_seconds = deadline;
-        if number < 65 {
-            record.proof_correction = Some(ClaudeAuthorityProofCorrection {
-                proof_witness_fingerprint: record.proven_witness_fingerprint.clone(),
-                owed_member_ids: BTreeSet::from([family.clone()]),
-            });
-        }
-    }
+    retry_test_corrections(&mut fixture);
+    fixture.index = retry_test_reload(&fixture.index, &root.join("initial-state.json"));
     // A competing due audit remains available on every page, but cannot
     // consume the existing two slots ahead of runnable authority work.
     let audit = root.join(format!("{CARRY_OTHER}.jsonl"));
@@ -339,8 +422,7 @@ fn rotating_due_seed_services_over_64_paths_before_audits_across_reload() {
             // consume them en masse by advancing the traversal clock.
             carry_red(&mut index, CARRY_RETRY, 7);
         }
-        index.save(&path).unwrap();
-        index = ScanIndex::load(&path).unwrap();
+        index = retry_test_reload(&index, &path);
     }
     assert_eq!(seen, due_keys, "all70due paths reach actual selection within35two-file pages despite persistent prefix and audits");
     assert!(
@@ -359,7 +441,7 @@ fn completed_retry_admission_releases_to_whole_carry_when_history_fits() {
         return;
     }
     let started = std::time::Instant::now();
-    let mut fixture = scoped_retry_fixture(0, 2, false);
+    let mut fixture = retry_durable_fixture(0, 2);
     let stale = fixture.roots.iter().cloned().collect();
     let (mut carry, _, state) = claude_retry_admit_batch(&fixture.index, &stale, None, CARRY_RETRY);
     carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
@@ -405,4 +487,130 @@ fn completed_retry_admission_releases_to_whole_carry_when_history_fits() {
         "completed scheduling must not keep clean traversal/reconciliation permanently disabled"
     );
     eprintln!("retry_scheduling_runtime: test=completed_retry_admission_releases_to_whole_carry_when_history_fits elapsed_ms={}", started.elapsed().as_millis());
+}
+
+// Runs on Linux too: the strict persistence checks reproduce both original
+// fixture defects without asking an unsupported platform to mint native carry.
+#[test]
+fn retry_scheduling_fixtures_keep_ack_and_correction_custody_on_reload() {
+    let mut fixture = retry_durable_fixture(70, 3);
+    retry_test_corrections(&mut fixture);
+    fixture.index = retry_test_reload(&fixture.index, &fixture._scratch.join("custody.json"));
+    assert_eq!(fixture.index.accepted_snapshot_fingerprints.len(), 73);
+    assert_eq!(fixture.index.claude_usage_authority_quarantine.len(), 70);
+    assert_eq!(
+        fixture
+            .index
+            .claude_usage_authority_quarantine
+            .values()
+            .filter(|r| r.proof_correction.is_some())
+            .count(),
+        65
+    );
+    assert_eq!(
+        fixture
+            .index
+            .claude_usage_authority_quarantine
+            .values()
+            .filter(|r| r.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending)
+            .count(),
+        5
+    );
+}
+
+#[test]
+fn retry_due_cursor_rotates_portably_across_reload_without_consuming_gaps() {
+    let mut fixture = retry_durable_fixture(70, 0);
+    retry_test_corrections(&mut fixture);
+    let root = fixture._scratch.to_path_buf();
+    retry_test_context(&mut fixture.index, &root);
+    // An empty root pass takes the real batch helper without any native carry
+    // allocation. All 70 authority opportunities still use the real seed,
+    // pre-audit selection and actual-offer cursor functions below.
+    let (mut carry, _, state) =
+        claude_retry_admit_batch(&fixture.index, &BTreeSet::new(), None, CARRY_RETRY);
+    carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+        context_fingerprint: fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .context_fingerprint
+            .clone(),
+        process: claude_full_rearm_process(),
+        full_rearm_window: false,
+        admission: Some(state),
+    });
+    fixture.index.claude_stale_family_carry = carry;
+    let due = fixture.index.files.keys().cloned().collect::<BTreeSet<_>>();
+    let audit = root.join(format!("{CARRY_OTHER}.jsonl"));
+    let mut seen = BTreeSet::new();
+    let path = root.join("portable-state.json");
+    for tick in 0..35 {
+        fixture.index = retry_test_reload(&fixture.index, &path);
+        let traversal = fixture.index.traversal.as_mut().unwrap();
+        traversal.pending_candidates.push_front(ScanTraversalPath {
+            scan_root: root.clone(),
+            path: audit.clone(),
+            census_member: true,
+            watcher_hint: false,
+        });
+        claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
+        let mut selected = Vec::new();
+        let state = fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        let traversal = fixture.index.traversal.as_mut().unwrap();
+        claude_retry_select_due_paths(
+            state,
+            &fixture.index.claude_usage_authority_quarantine,
+            &mut traversal.pending_candidates,
+            &mut selected,
+            rfc3339_unix_seconds(CARRY_RETRY).unwrap(),
+            2,
+        );
+        assert_eq!(
+            selected.len(),
+            2,
+            "two due slots ahead of audit, tick {tick}"
+        );
+        let keys = selected
+            .iter()
+            .map(|p| local_index_key(&p.path))
+            .collect::<Vec<_>>();
+        assert!(keys.iter().all(|key| due.contains(key)));
+        assert!(
+            keys.iter().all(|key| !seen.contains(key)),
+            "persistent correction prefix must not repeat"
+        );
+        claude_retry_note_offered(&mut fixture.index, &selected, CARRY_RETRY);
+        let state = fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        assert_eq!(state.due_after_path.as_ref(), keys.last());
+        assert_eq!(
+            state.served_before,
+            rfc3339_unix_seconds(CARRY_FAILED).unwrap()
+        );
+        seen.extend(keys);
+        if tick == 31 {
+            assert_eq!(seen.len(), 64);
+            assert!(!state.due_complete);
+        }
+    }
+    assert_eq!(seen, due, "all70 offered within35 pages on every platform");
+    fixture.index = retry_test_reload(&fixture.index, &path);
+    assert_eq!(fixture.index.claude_usage_authority_quarantine.len(), 70);
 }
