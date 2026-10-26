@@ -6938,6 +6938,8 @@ fn finish_sync_source(
         &claude_authority_disposition,
     );
     let locally_held_fingerprints = &local_holds.held_fingerprints;
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_cache_probe_for_test(&mut scan_result.snapshots);
 
     let cache_head_groups = if cache_observations_enabled
         && (activity_hint.snapshot_head_cas_required
