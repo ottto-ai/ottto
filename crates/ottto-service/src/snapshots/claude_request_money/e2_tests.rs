@@ -917,7 +917,7 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     // Held (absent twin, uncertified, ...): both paths stay, untouched, and
     // the session is returned so the caller holds it (owed, not settled).
     // Gate on publishes, so it parses gate on too: dark keeps no grains.
-    let mut items = with_enabled(&page);
+    let mut items = with_enabled(page);
     items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
     let before = canonical(&items);
     let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
@@ -928,7 +928,7 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
         .iter()
         .all(|item| item.usage_accounting_contract.is_none()));
     // Not held: one summed body, nothing withheld.
-    let mut items = with_enabled(&page);
+    let mut items = with_enabled(page);
     let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
     assert!(withheld.is_empty());
     assert_eq!(items.len(), 1);
