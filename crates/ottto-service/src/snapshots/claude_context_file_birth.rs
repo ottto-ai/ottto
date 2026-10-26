@@ -320,20 +320,6 @@ impl ClaudeFileBirth {
 
     /// One resolved response, in transcript order. Today's naive scalars are
     /// computed beside this and stay untouched; the fold decides which ships.
-    #[cfg(test)]
-    pub(super) fn observe_response(
-        &mut self,
-        sequence: u64,
-        timestamp: Option<&str>,
-        effective_input_context: u64,
-    ) {
-        self.observe_response_at(
-            sequence,
-            timestamp.and_then(rfc3339_unix_nanos),
-            effective_input_context,
-        );
-    }
-
     pub(super) fn observe_response_at(
         &mut self,
         sequence: u64,
