@@ -3585,6 +3585,52 @@ fn freshness_priority_ignores_metadata_and_identical_replacement() {
     assert!(codex_fresh_data_pending(&candidate, &index.files));
 }
 
+/// An ordinary page that fits must still service both old revalidation and
+/// a new hinted session; fresh traffic must not create unnecessary pages.
+#[test]
+fn freshness_selection_keeps_a_fitting_census_page_together() {
+    let fixture = ScanRoot::new(4);
+    let (mut index, _) = page(&fixture, ScanIndex::default(), None);
+    index
+        .files
+        .get_mut(&local_index_key(&fixture.file(SESSION)))
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": SESSION_B}}));
+    body.extend(token_line(1));
+    fs::write(fixture.file(SESSION_B), body).unwrap();
+    let scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[fixture.file(SESSION_B)],
+        false,
+        true,
+    );
+    assert_eq!(scan.identified_candidates.len(), 2);
+    assert!(!scan.index.traversal.as_ref().unwrap().codex_freshness_yield);
+}
+
 /// The production-shaped 2,800-member revalidation backlog must not spend
 /// the byte budget before a new session or an appended, processed session.
 /// A persisted yield then gives the census a whole ordinary page even when

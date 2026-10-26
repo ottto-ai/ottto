@@ -24813,7 +24813,8 @@ impl OwnedSourceScan {
             && traversal
                 .pending_candidates
                 .iter()
-                .any(|candidate| codex_fresh_data_pending(candidate, &index.files));
+                .any(|candidate| codex_fresh_data_pending(candidate, &index.files))
+            && codex_selection_may_exhaust_page(traversal, selection_limit);
         let census_page = source == SnapshotSource::Codex
             && continuation.is_none()
             && selection_limit > 0
@@ -39187,6 +39188,37 @@ fn ensure_bounded_traversal(
     {
         claude_retry_queue_due_families(index, collected_at);
     }
+}
+
+/// Keep fitting pages together. Dedicated scheduling is only useful when
+/// the queued population could spend the file or singleton byte allowance.
+/// This conservative full-read estimate includes one existing sample pair
+/// per candidate; it never grants a read or increases a budget. Metadata
+/// failure keeps the ordinary path and its existing error handling.
+fn codex_selection_may_exhaust_page(
+    traversal: &ScanTraversalCheckpoint,
+    file_limit: usize,
+) -> bool {
+    if traversal.pending_candidates.len() > file_limit {
+        return true;
+    }
+    let byte_limit = sampled_scan::codex_cursor::Limits::current().singleton();
+    let mut expected = 0_u64;
+    for candidate in &traversal.pending_candidates {
+        let Ok(metadata) = fs::symlink_metadata(&candidate.path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        expected = expected
+            .saturating_add(metadata.len())
+            .saturating_add(sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+        if expected > byte_limit {
+            return true;
+        }
+    }
+    false
 }
 
 /// Priority only, never read admission. Byte length is content-relevant;

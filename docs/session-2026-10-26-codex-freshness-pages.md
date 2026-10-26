@@ -6,7 +6,8 @@ refresh appended new members behind old revalidation work and discarded a
 watcher hint when that path was already queued. The singleton byte budget could
 then delay new uploads until thousands of old members drained.
 
-When fresh work exists, an ordinary scan can select a freshness-only page up to
+When fresh work exists and queued work could exhaust a page, an ordinary scan
+can select a freshness-only page up to
 the existing watcher/file cap. A hinted new path or an indexed file whose byte
 length changed qualifies for priority. The same candidate, ownership, parse,
 pricing, identity, post-policy body and acknowledgement gates still decide
@@ -34,3 +35,9 @@ found without a watcher hint, growth of an already processed rollout, and a
 checkpoint round trip between fresh and ordinary service. A separate scheduling
 check covers permission-only changes and identical-content inode replacement.
 Existing carry tests retain their explicit ordinary-page premise.
+
+Pages whose queued population fits the file allowance and a conservative
+full-read-plus-samples byte estimate keep ordinary scheduling. A small repair
+or projection-adoption page therefore continues to service its fitting sibling
+in the same page. This estimate changes scheduling only, never read admission
+or the actual byte accounting.
