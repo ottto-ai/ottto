@@ -818,6 +818,7 @@ fn money_shadow_lazy_family_admission_defers_suffix_and_resumes_in_order() {
     // Measure the same minimum in an isolated ledger without consuming the
     // real page's captures or scheduling turns. No body runs in this probe.
     let probe_support = fixture.base.join("admission-probe");
+    let _probe_support_cleanup = money::ShadowTestCleanup::new(&probe_support);
     let _shadow_probe_support = money::enable_shadow_for_test(&probe_support);
     money::set_page_fault_for_test(money::PageFault::BodyDeadline);
     let probe = money::shadow_page_at(&probe_support, &scan.snapshots, &index, &api, &trace, true, now);
@@ -1603,6 +1604,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     // replay probe below, which keeps its empty starting state.
     let native_support = fixture.base.join("native-support");
     std::fs::create_dir_all(&native_support).unwrap();
+    let _native_support_cleanup = money::ShadowTestCleanup::new(&native_support);
     let _shadow_native_support = money::enable_shadow_for_test(&native_support);
     let mut armed_index = ScanIndex::default();
     let finalizers_started = std::time::Instant::now();
@@ -2858,4 +2860,19 @@ fn money_p1b_mid_preflight_uses_pre_admitted_failure_rows() {
     assert!(!families.is_empty());
     assert!(families.iter().all(|row| row["p1_reasons"] == serde_json::json!(["deadline"])));
     assert_eq!(money::reserved_for_test(), 0);
+}
+
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_pipeline_fixture_releases_shadow_captures_on_panic() {
+    let before = money::capture::capture_reserved();
+    let failure = std::panic::catch_unwind(|| {
+        let (fixture, _shadow, _index, _scan) = money_armed_scan("money-shadow-panic-cleanup");
+        assert!(money::capture::capture_reserved() > before);
+        assert!(fixture.root.is_dir());
+        panic!("synthetic fixture assertion failure");
+    });
+    let panic = failure.expect_err("the intentional fixture assertion must unwind");
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"synthetic fixture assertion failure"));
+    assert_eq!(money::capture::capture_reserved(), before);
 }

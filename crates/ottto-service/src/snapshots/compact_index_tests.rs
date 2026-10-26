@@ -56,6 +56,7 @@ fn synthetic_index(families: usize) -> ScanIndex {
                 member_request_id_hashes: BTreeMap::from([(root.clone(), hashes.clone())]),
                 member_occurrences: BTreeMap::from([(root.clone(), occurrences)]),
                 invalid: false,
+                idless_revision: None,
             },
         );
         index.claude_account_family_pending.insert(

@@ -544,6 +544,7 @@ fn run_both(layout: &Layout, now: OffsetDateTime) -> ScaleResults {
             machine_id: "machine-scale",
             destination: "device|machine|api",
             labels_enabled: true,
+            details_enabled: false,
         };
         let scan = || run_source(&mut run, source, std::slice::from_ref(&root), Some(target));
         let stats = if std::env::var_os("COMPOSITION_SCALE_HEAP").is_some() {

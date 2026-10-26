@@ -784,23 +784,24 @@ fn queued_traversal(queued: &[PathBuf], candidates: &[PathBuf]) -> ScanIndex {
             .map(|path| json!({"scan_root": "/", "path": path}))
             .collect::<Vec<_>>()
     };
-    let mut index = ScanIndex::default();
-    index.traversal = Some(
-        serde_json::from_value(json!({
-            "context_fingerprint": "queued",
-            "census_window_end": "2026-01-01T00:00:00Z",
-            "scan_roots": [],
-            "pending_directories": paths(queued),
-            "pending_candidates": paths(candidates),
-            "observed_index_keys": [],
-            "reconciliation_upper_bound": null,
-            "reconciliation_after": null,
-            "reconciliation_started": false,
-            "counts": {},
-        }))
-        .unwrap(),
-    );
-    index
+    ScanIndex {
+        traversal: Some(
+            serde_json::from_value(json!({
+                "context_fingerprint": "queued",
+                "census_window_end": "2026-01-01T00:00:00Z",
+                "scan_roots": [],
+                "pending_directories": paths(queued),
+                "pending_candidates": paths(candidates),
+                "observed_index_keys": [],
+                "reconciliation_upper_bound": null,
+                "reconciliation_after": null,
+                "reconciliation_started": false,
+                "counts": {},
+            }))
+            .unwrap(),
+        ),
+        ..ScanIndex::default()
+    }
 }
 
 #[test]
@@ -838,7 +839,10 @@ fn e2_gate_on_defers_a_root_whose_family_directory_is_queued() {
     let listed = project.join("3338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
     let member = project.join(ROOT).join("subagents/agent-abc.jsonl");
     let behind = project.join("behind.jsonl");
-    let mut index = queued_traversal(&[project.join(ROOT).join("subagents")], &[behind.clone()]);
+    let mut index = queued_traversal(
+        &[project.join(ROOT).join("subagents")],
+        std::slice::from_ref(&behind),
+    );
     let mut traversal = index.traversal.take().unwrap();
     let mut selected = [&waiting, &listed, &member]
         .into_iter()
