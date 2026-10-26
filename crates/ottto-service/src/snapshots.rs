@@ -25062,6 +25062,13 @@ impl OwnedSourceScan {
             for root in claude_request_money::e2::selected_twin_roots(
                 identified_candidates
                     .iter()
+                    // Only a twin this page reads pulls its family in: every
+                    // walk selects a settled twin too, and pulling its family
+                    // then would re-read it on every walk (R1 probe: the four
+                    // path twins and their sources, one batch per walk).
+                    .filter(|candidate| {
+                        index.candidate_decision(candidate) == CandidateDecision::Parse
+                    })
                     .map(|candidate| candidate.path.as_path()),
                 claude_twin_groups.get_or_init(|| {
                     // A page file not known yet (a new copy) keeps its
