@@ -1124,3 +1124,494 @@ fn ack_bootstrap_capacity_real_finish_commits_census_retirement() {
 fn ack_first_install_real_finish_uploads_4100_live_entities_without_a_capacity_stop() {
     ack_finish_pipeline_case("first_install");
 }
+
+/// #794: one scripted response per snapshot POST; an empty script accepts.
+#[derive(Clone, Copy, Debug)]
+enum AckScriptedPost {
+    Accept,
+    /// Not shed (429/503), not resent in place (500/502), not split as a
+    /// batch deadline (504): an ordinary failed upload.
+    UnretriedServerError,
+    Disabled,
+}
+
+struct AckScriptedServer {
+    url: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// Every snapshot offered, accepted or not.
+    offered: Arc<Mutex<Vec<serde_json::Value>>>,
+    script: Arc<Mutex<VecDeque<AckScriptedPost>>>,
+}
+
+impl AckScriptedServer {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let offered = Arc::new(Mutex::new(Vec::new()));
+        let bodies = offered.clone();
+        let script = Arc::new(Mutex::new(VecDeque::new()));
+        let posts = script.clone();
+        let worker = std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("synthetic scripted accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_complete_http_request(&mut stream);
+                assert!(http_request_complete(request.as_bytes()));
+                let raw = request.split_once("\r\n\r\n").unwrap().1;
+                let value: serde_json::Value = if raw.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(raw).unwrap()
+                };
+                let mut status = "200 OK";
+                let response = if request.contains("/relay-token") {
+                    serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
+                } else if request.contains("/activity-hints") {
+                    serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                        "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
+                        "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
+                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                } else if request.contains("/agent-status/snapshots") {
+                    serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
+                } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
+                    assert!(!items.is_empty());
+                    bodies.lock().unwrap().extend(items.iter().cloned());
+                    let post = posts
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(AckScriptedPost::Accept);
+                    match post {
+                        AckScriptedPost::UnretriedServerError => {
+                            status = "507 Insufficient Storage";
+                            serde_json::json!({"detail":"synthetic server error"})
+                        }
+                        AckScriptedPost::Disabled => serde_json::json!({"accepted":0,
+                            "sessions_reconciled":0,"session_ids":[],"disabled":true,
+                            "disabled_reason":"synthetic_disabled","accepted_entities":[],
+                            "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]}),
+                        AckScriptedPost::Accept => {
+                            let entities = items.iter().map(|item| {
+                                let mut payload = serde_json::Map::new();
+                                for key in ["session_account_evidence", "tool_usage", "tool_usage_truncated"] {
+                                    if let Some(value) = item.get(key) { payload.insert(key.into(), value.clone()); }
+                                }
+                                let exclusive = item.get("usage_accounting_contract").and_then(|v| v.as_str())
+                                    == Some("session_exclusive_reported_usage:v1");
+                                let version = item.get("session_account_evidence").is_some()
+                                    .then_some(if exclusive { 8u64 } else { 7u64 });
+                                let digest = format!("{:x}", Sha256::digest(
+                                    crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()));
+                                serde_json::json!({"source_session_id":item["source_session_id"],
+                                    "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
+                                    "body_witness_version":version,"body_witness_digest":version.map(|_|digest)})
+                            }).collect::<Vec<_>>();
+                            serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
+                                "session_ids":[],"disabled":false,"disabled_reason":null,
+                                "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":entities,
+                                "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]})
+                        }
+                    }
+                } else {
+                    serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
+                };
+                bounded_native_response(&mut stream, status, &response.to_string());
+            }
+        });
+        Self {
+            url,
+            stop,
+            worker: Some(worker),
+            offered,
+            script,
+        }
+    }
+
+    fn offered_fingerprints(&self) -> Vec<String> {
+        self.offered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|item| item["snapshot_fingerprint"].as_str().unwrap().to_owned())
+            .collect()
+    }
+}
+
+impl Drop for AckScriptedServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = self.worker.take().unwrap().join();
+        if !std::thread::panicking() {
+            result.unwrap();
+        }
+    }
+}
+
+/// Real prepare/finish for one synthetic Claude home. Each finished scan is
+/// marked census-incomplete (see `prepare`) so complete-census cleanup never
+/// retires the injected unrelated debt.
+struct AckFinishHome {
+    fixture: IdentityPipelineHome,
+    cadence: IdentityPipelineCadence,
+    support: PathBuf,
+    device: LocalDeviceBinding,
+    client: SnapshotApiClient,
+    daemon: LocalDaemon,
+    transport: crate::net_resilience::TransportCycleOutcome,
+    retry: live_snapshot_retry::LiveRetryOwner,
+    _env: [EnvVarGuard; 3],
+}
+
+impl AckFinishHome {
+    fn new(server: &AckScriptedServer) -> Self {
+        crate::client_report::reset_for_test();
+        let fixture = IdentityPipelineHome::new();
+        let cadence = IdentityPipelineCadence::new();
+        let support = fixture.base.join("ack-followup-support");
+        let secrets = fixture.base.join("ack-followup-secrets");
+        std::fs::create_dir_all(&support).unwrap();
+        std::fs::create_dir_all(&secrets).unwrap();
+        let env = [
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
+            EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url),
+        ];
+        let device = LocalDeviceBinding {
+            device_id: "ack-followup-device".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["claude_code".into()],
+        };
+        FileDeviceStore::default().save(&device).unwrap();
+        std::fs::write(
+            secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .unwrap();
+        Self {
+            fixture,
+            cadence,
+            support,
+            device,
+            client: SnapshotApiClient::new(server.url.clone()),
+            daemon: test_daemon("otm_test"),
+            transport: crate::net_resilience::TransportCycleOutcome::default(),
+            retry: live_snapshot_retry::LiveRetryOwner::closed(),
+            _env: env,
+        }
+    }
+
+    fn collection() -> AgentStatusCollection {
+        AgentStatusCollection {
+            snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+            source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+        }
+    }
+
+    fn prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
+        self.cadence.next_due_cycle();
+        let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
+            prepare_sync_source(
+                &self.client,
+                &self.device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &self.fixture.home,
+                &self.support,
+                &self.daemon,
+                &mut self.transport,
+                self.daemon.snapshot_scan_account_witness().unwrap(),
+                false,
+            )
+        })
+        .unwrap()
+        .expect("actual due source preparation");
+        let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
+        assert!(scan.census_complete, "{cycle}: the real scan is clean");
+        assert_eq!(
+            scan.snapshots.len(),
+            1,
+            "{cycle}: the never-committed transcript is read again"
+        );
+        // Finish reads this flag only for census-dependent decisions
+        // (complete-census ACK cleanup, backfill and manifest completion).
+        // Marking it incomplete keeps the injected debt unretired.
+        scan.census_complete = false;
+        (preparation, index, scan)
+    }
+
+    fn finish(
+        &mut self,
+        preparation: SourcePreparation,
+        index: ScanIndex,
+        scan: SourceScanResult,
+    ) -> Result<()> {
+        crate::agent_status_refresh::with_test_collection(Self::collection(), || {
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                &self.client,
+                &self.device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &self.fixture.home,
+                &self.support,
+                &self.daemon,
+                &mut self.transport,
+                &mut self.retry,
+            )
+        })
+    }
+
+    fn progress(&self, preparation_paths: &(PathBuf, String)) -> SnapshotUploadProgress {
+        SnapshotUploadProgress::load(
+            &preparation_paths.0,
+            &preparation_paths.1,
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap()
+    }
+}
+
+fn ack_followup_debt(entities: usize) -> Vec<String> {
+    (0..entities)
+        .map(|entity| format!("{entity:064x}"))
+        .collect()
+}
+
+fn ack_followup_set_debt(preparation: &mut SourcePreparation, debt: &[String], present: bool) {
+    let progress = &mut preparation.upload_progress;
+    if present {
+        for fp in debt {
+            progress.record_body(fp, fp);
+        }
+    } else {
+        let debt = debt.iter().collect::<BTreeSet<_>>();
+        progress
+            .accepted_body_witnesses
+            .retain(|fp, _| !debt.contains(fp));
+        progress
+            .accepted_fingerprints
+            .retain(|fp| !debt.contains(fp));
+    }
+    progress.save(&preparation.upload_progress_path).unwrap();
+}
+
+/// #794 F3: incomplete-census capacity stop, then a Disabled finish, then
+/// another incomplete-census capacity stop. The Disabled exit resets the
+/// consecutive count, so the second stop reports 1, not 2.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    let source = SnapshotSource::ClaudeCode;
+    ack_retention::note_capacity_stop_census(source, false, true);
+    let debt = ack_followup_debt(5000);
+    for (cycle, (with_debt, expected)) in [(true, 1), (false, 0), (true, 1)].into_iter().enumerate()
+    {
+        let (mut preparation, index, scan) = home.prepare(&format!("cycle {cycle}"));
+        ack_followup_set_debt(&mut preparation, &debt, with_debt);
+        if !with_debt {
+            server
+                .script
+                .lock()
+                .unwrap()
+                .push_back(AckScriptedPost::Disabled);
+        }
+        let offered_before = server.offered.lock().unwrap().len();
+        let result = home.finish(preparation, index, scan);
+        if with_debt {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<ack_retention::AckSettlementRequired>()
+                    .is_some(),
+                "cycle {cycle}: actual capacity stop"
+            );
+            assert_eq!(server.offered.lock().unwrap().len(), offered_before);
+        } else {
+            result.unwrap_or_else(|error| {
+                panic!("cycle {cycle}: the backend disabled upload: {error:#}")
+            });
+            assert_eq!(
+                server.offered.lock().unwrap().len(),
+                offered_before + 1,
+                "the Disabled response came from an actual POST"
+            );
+            assert!(server.script.lock().unwrap().is_empty());
+        }
+        assert_eq!(
+            ack_retention::incomplete_census_capacity_stops(source),
+            expected,
+            "cycle {cycle}"
+        );
+    }
+    ack_retention::note_capacity_stop_census(source, false, true);
+}
+
+/// #794 F2: real prepare/scan and real finish finalization (incidence and the
+/// file body-set witness come from production code) for one file group of
+/// 5,000 entities next to 4,096 unrelated ACKs of debt. Current Claude and
+/// Codex parsers emit one file-backed entity per parsed file, so no real
+/// transcript yields 5,000; the scanned item is the template for the group,
+/// exactly as the first-install finish case does. The finish pipeline derives
+/// each entity fingerprint itself, so the file set is read back from what it
+/// offered and ACKed. A real HTTP failure stops the first finish after
+/// accepted pages; the second finish offers only the remainder and transfers
+/// every file ACK to the saved index.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() {
+    const ENTITIES: usize = 5000;
+    let server = AckScriptedServer::new();
+    let mut home = AckFinishHome::new(&server);
+    let debt = ack_followup_debt(4096);
+    let debt_set = debt.iter().cloned().collect::<BTreeSet<_>>();
+    let group = |scan: &mut SourceScanResult| {
+        let template = scan.snapshots[0].clone();
+        scan.snapshots = (0..ENTITIES)
+            .map(|entity| {
+                let mut item = template.clone();
+                item.source_session_id = format!("huge-file-{entity}");
+                item.snapshot_fingerprint = format!("{:064x}", 1_000_000 + entity);
+                item
+            })
+            .collect();
+    };
+
+    let (mut preparation, index, mut scan) = home.prepare("first finish");
+    group(&mut scan);
+    ack_followup_set_debt(&mut preparation, &debt, true);
+    let paths = (
+        preparation.upload_progress_path.clone(),
+        preparation.upload_destination_namespace.clone(),
+    );
+    let index_path = preparation.index_path.clone();
+    {
+        let mut script = server.script.lock().unwrap();
+        script.extend([AckScriptedPost::Accept; 30]);
+        script.push_back(AckScriptedPost::UnretriedServerError);
+    }
+    let error = home
+        .finish(preparation, index, scan)
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "first finish settled: offered={} script_left={}",
+                server.offered.lock().unwrap().len(),
+                server.script.lock().unwrap().len()
+            )
+        });
+    assert!(
+        error
+            .downcast_ref::<ack_retention::AckSettlementRequired>()
+            .is_none(),
+        "the whole live file was admitted beside full debt: {error:#}"
+    );
+    assert!(server.script.lock().unwrap().is_empty(), "failure reached");
+    let first_offers = server
+        .offered_fingerprints()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        first_offers.len(),
+        server.offered.lock().unwrap().len(),
+        "distinct file entities"
+    );
+    assert!(first_offers.is_disjoint(&debt_set));
+    let progress = home.progress(&paths);
+    assert!(
+        debt_set.is_subset(&progress.accepted_fingerprints),
+        "unrelated debt is kept"
+    );
+    let retained = progress
+        .accepted_fingerprints
+        .difference(&debt_set)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        (1..ENTITIES).contains(&retained.len()),
+        "{}",
+        retained.len()
+    );
+    assert!(
+        retained.is_subset(&first_offers),
+        "only accepted file pages are retained"
+    );
+    assert!(
+        first_offers.len() > retained.len(),
+        "the failed page was offered but not acknowledged"
+    );
+    let saved = ScanIndex::load(&index_path).unwrap();
+    assert!(
+        !saved
+            .upload_progress_ack_incidence()
+            .any(|fp| first_offers.contains(fp)),
+        "an unsettled file is not committed"
+    );
+
+    server.offered.lock().unwrap().clear();
+    let (preparation, index, mut scan) = home.prepare("second finish");
+    group(&mut scan);
+    home.finish(preparation, index, scan)
+        .unwrap_or_else(|error| panic!("second finish settles the file: {error:#}"));
+    let second_offers = server
+        .offered_fingerprints()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        second_offers.len(),
+        ENTITIES - retained.len(),
+        "accepted pages are not re-sent"
+    );
+    assert_eq!(server.offered.lock().unwrap().len(), second_offers.len());
+    assert!(second_offers.is_disjoint(&retained));
+    assert!(second_offers.is_disjoint(&debt_set));
+    let file_fingerprints = retained
+        .union(&second_offers)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(file_fingerprints.len(), ENTITIES);
+    let saved = ScanIndex::load(&index_path).unwrap();
+    assert!(file_fingerprints
+        .iter()
+        .all(|fp| saved.accepted_snapshot_fingerprint_recorded(fp)));
+    assert_eq!(
+        saved
+            .current_snapshot_fingerprints()
+            .intersection(&file_fingerprints)
+            .count(),
+        ENTITIES,
+        "production finalization recorded the whole file group"
+    );
+    let progress = home.progress(&paths);
+    assert!(
+        file_fingerprints
+            .iter()
+            .all(|fp| !progress.accepted_fingerprints.contains(fp)),
+        "every file ACK transferred to the index"
+    );
+    assert_eq!(
+        progress.accepted_fingerprints, debt_set,
+        "only the unrelated debt remains"
+    );
+}
