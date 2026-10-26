@@ -188,10 +188,22 @@ fn e2_pipeline_tags_a_copied_transcript_once() {
     let copy_dir = temp_dir("e2-identity-copy");
     let copy = copy_dir.join(format!("{root}.jsonl"));
     std::thread::sleep(std::time::Duration::from_millis(20));
-    fs::copy(&original, &copy).unwrap();
-    let births_known = [&original, &copy]
-        .iter()
-        .all(|path| fs::metadata(path).and_then(|m| m.created()).is_ok());
+    // APFS copy/clone may preserve the original birth. Write a new file:
+    // this fixture specifically requires a physically later-born twin.
+    fs::write(&copy, fs::read(&original).unwrap()).unwrap();
+    let births_known = match (
+        fs::metadata(&original).and_then(|m| m.created()),
+        fs::metadata(&copy).and_then(|m| m.created()),
+    ) {
+        (Ok(original_birth), Ok(copy_birth)) => {
+            assert!(
+                copy_birth > original_birth,
+                "the copy fixture must be born later"
+            );
+            true
+        }
+        _ => false,
+    };
     let dirs = [dir.clone(), copy_dir.clone()];
     let mut index = ScanIndex::default();
     // The first page may meet the twins in either order (disclosed residual).

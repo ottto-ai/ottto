@@ -209,9 +209,31 @@ pub(crate) struct ClaudeFileBirth {
     all_response_writers: ClaudeWriterRun,
     opened: ClaudeOpenedBirth,
 }
-crate::heap_layout_bound::fields!(ClaudeFileBirth; scope, path_key_hash, tagged_in_opening,
-    tagged_responses, own_responses, untimed_records, first_own_sequence, own_first_context,
-    own_peak_context, own_last_context, tagged_before_first_own, writer, all_response_writers, opened);
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeFileBirth {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        // This Copy witness owns no heap. Keep exhaustive coverage so a new
+        // field cannot silently enter native frame/cache accounting.
+        let Self {
+            scope: _,
+            path_key_hash: _,
+            tagged_in_opening: _,
+            tagged_responses: _,
+            own_responses: _,
+            untimed_records: _,
+            first_own_sequence: _,
+            own_first_context: _,
+            own_peak_context: _,
+            own_last_context: _,
+            tagged_before_first_own: _,
+            writer: _,
+            all_response_writers: _,
+            opened: _,
+        } = self;
+        c.add(0)
+    }
+}
 
 /// A reported birth at or before the floor is no evidence (F5).
 fn root_birth_scope(created_unix_nanos: Option<i128>) -> ClaudeBirthScope {
