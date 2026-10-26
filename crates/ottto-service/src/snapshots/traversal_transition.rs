@@ -339,6 +339,7 @@ mod tests {
                 member_request_id_hashes: Default::default(),
                 member_occurrences: Default::default(),
                 invalid: false,
+                idless_revision: None,
             },
         );
         index.bounded_sweep_had_unsettled_upload = true;
@@ -713,6 +714,7 @@ mod tests {
                     member_request_id_hashes: Default::default(),
                     member_occurrences: Default::default(),
                     invalid: false,
+                    idless_revision: None,
                 },
             );
             plain.bounded_sweep_had_unsettled_upload = flag;

@@ -414,6 +414,26 @@ pub(crate) fn enable_shadow_for_test(support_dir: &Path) -> ShadowTestGuard {
     ShadowTestGuard(support_dir.to_path_buf())
 }
 
+/// Panic-safe cleanup for a synthetic shadow scope. This does not arm it;
+/// callers can switch the shadow off and on while retaining one cleanup guard.
+#[cfg(test)]
+pub(crate) struct ShadowTestCleanup<'a>(&'a Path);
+
+#[cfg(test)]
+impl<'a> ShadowTestCleanup<'a> {
+    pub(crate) fn new(support_dir: &'a Path) -> Self {
+        Self(support_dir)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShadowTestCleanup<'_> {
+    fn drop(&mut self) {
+        disable_shadow_for_test(self.0);
+        capture::purge_scope_for_test(self.0);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn disable_shadow_for_test(support_dir: &Path) {
     capture::forget_plan(support_dir);

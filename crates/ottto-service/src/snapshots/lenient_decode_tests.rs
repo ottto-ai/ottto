@@ -4229,6 +4229,166 @@ fn real_repair_override_marks_history_unverified_before_return_and_first_census(
 }
 
 #[test]
+fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
+    let mut seed = fixture();
+    seed.claude_usage_family_pending.insert(
+        "family".into(),
+        ClaudeUsageFamilyPending {
+            census_window_end: "2026-10-25T00:00:00Z".into(),
+            member_request_id_hashes: BTreeMap::new(),
+            member_occurrences: BTreeMap::new(),
+            invalid: true,
+            idless_revision: Some([7; 32]),
+        },
+    );
+    let valid = serde_json::to_vec_pretty(&seed).unwrap();
+    let loaded = lenient_decode::read(std::io::Cursor::new(&valid), "load", "claude_code").unwrap();
+    assert_eq!(
+        loaded.claude_usage_family_pending["family"].idless_revision,
+        Some([7; 32])
+    );
+    for positional in [false, true] {
+        let mut value = serde_json::to_value(&seed).unwrap();
+        if positional {
+            value["claude_usage_family_pending"]["family"] =
+                serde_json::json!(["2026-10-25T00:00:00Z", {}, {}, true, vec![7; 32],]);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let loaded =
+                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code").unwrap();
+            assert_eq!(
+                loaded.claude_usage_family_pending["family"].idless_revision,
+                Some([7; 32])
+            );
+            value["claude_usage_family_pending"]["family"][4] =
+                Value::String("MARKER_PAYLOAD".into());
+        } else {
+            value["claude_usage_family_pending"]["family"]["idless_revision"] =
+                Value::String("MARKER_PAYLOAD".into());
+        }
+        let template = serde_json::to_string(&value).unwrap();
+        let payload = "x".repeat(16 * 1024 * 1024);
+        for malformed in [
+            format!("\"{payload}\""),
+            format!("[\"{payload}\"]"),
+            format!("{{\"{payload}\":0}}"),
+        ] {
+            let bytes = template
+                .replace("\"MARKER_PAYLOAD\"", &malformed)
+                .into_bytes();
+            let (result, allocations) = crate::retry_allocation_probe::measure(|| {
+                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code")
+            });
+            // Optional optimization damage is normalized at its boundary;
+            // it must not consume opaque debt or reset the identity index.
+            let loaded = result.unwrap();
+            assert!(loaded.claude_usage_family_pending["family"].invalid);
+            assert_eq!(
+                loaded.claude_usage_family_pending["family"].idless_revision,
+                None
+            );
+            assert!(loaded.decode_holds.is_empty());
+            assert!(
+                allocations.requested_peak < 256 * 1024,
+                "{}",
+                allocations.requested_peak
+            );
+            assert!(
+                allocations.usable_peak < 512 * 1024,
+                "{}",
+                allocations.usable_peak
+            );
+        }
+    }
+}
+
+#[test]
+fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
+    let mut seed = fixture();
+    seed.claude_request_identity_contract = Some(claude_request_identity::COLLECTOR.to_owned());
+    seed.claude_request_identity_contract_changed = true;
+    seed.session_account_bindings.insert(
+        "/synthetic/0.jsonl".into(),
+        SessionAccountBinding {
+            account_identifier_hash: "a".repeat(64),
+            workspace_identifier_hash: Some("b".repeat(64)),
+        },
+    );
+    let pending = ClaudeUsageFamilyPending {
+        census_window_end: "2026-10-25T00:00:00Z".into(),
+        member_request_id_hashes: BTreeMap::from([("family".into(), BTreeSet::new())]),
+        member_occurrences: BTreeMap::new(),
+        invalid: true,
+        idless_revision: None,
+    };
+    seed.claude_usage_family_pending
+        .insert("family".into(), pending.clone());
+    for positional in [false, true] {
+        let mut value = serde_json::to_value(&seed).unwrap();
+        if positional {
+            value["claude_usage_family_pending"]["family"] = serde_json::json!([
+                pending.census_window_end,
+                pending.member_request_id_hashes,
+                {},
+                true,
+                "MARKER"
+            ]);
+        } else {
+            value["claude_usage_family_pending"]["family"]["idless_revision"] = "MARKER".into();
+        }
+        let template = serde_json::to_string(&value).unwrap();
+        let oversized = "x".repeat(16 * 1024 * 1024);
+        for marker in [
+            format!("\"{oversized}\""),
+            format!("[\"{oversized}\"]"),
+            format!("{{\"{oversized}\":0}}"),
+            "1e400".into(),
+            "{\"wrong\":true}".into(),
+        ] {
+            let scratch = crate::test_scratch::ScratchDir::new("idless-marker-identity");
+            let path = scratch.join("index.json");
+            fs::write(&path, template.replace("\"MARKER\"", &marker)).unwrap();
+            let mut loaded = ScanIndex::load(&path).expect("field damage cannot quarantine index");
+            for round in 0..2 {
+                assert_eq!(corrupt_count(scratch.as_ref()), 0);
+                assert!(loaded.decode_holds.is_empty());
+                assert_eq!(loaded.claude_usage_family_pending["family"], pending);
+                assert_eq!(
+                    loaded.session_account_bindings,
+                    seed.session_account_bindings
+                );
+                assert_eq!(
+                    loaded.accepted_snapshot_fingerprints,
+                    seed.accepted_snapshot_fingerprints
+                );
+                assert_eq!(
+                    loaded.file_snapshot_fingerprints,
+                    seed.file_snapshot_fingerprints
+                );
+                assert_eq!(
+                    loaded.claude_request_identity_contract,
+                    seed.claude_request_identity_contract
+                );
+                assert!(loaded.claude_request_identity_contract_changed);
+                assert_eq!(
+                    serde_json::to_value(&loaded.files).unwrap(),
+                    serde_json::to_value(&seed.files).unwrap()
+                );
+                assert!(
+                    !claude_stale_carry_start_admitted(&loaded),
+                    "BASE; no proof from marker damage"
+                );
+                if round == 0 {
+                    loaded
+                        .save(&path)
+                        .expect("normalized index retains CAS custody");
+                    loaded = ScanIndex::load(&path).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
     // The old short sequence meant discovered=7, not a guard admission.
     // Also exercise the full legacy sequence, including its structured slots.

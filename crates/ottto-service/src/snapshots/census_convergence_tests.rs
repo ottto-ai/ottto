@@ -47,6 +47,7 @@ fn current_pending(member: &str, request: &str) -> ClaudeUsageFamilyPending {
             occurrences(&[(request, occurrence(0, 1))]),
         )]),
         invalid: false,
+        idless_revision: None,
     }
 }
 
@@ -603,6 +604,7 @@ fn retry_pending_root_is_never_an_unchanged_proof_root() {
             )]),
             member_occurrences: BTreeMap::new(),
             invalid: false,
+            idless_revision: None,
         },
     );
     let witness = held.claude_usage_family_witnesses[&root].clone();

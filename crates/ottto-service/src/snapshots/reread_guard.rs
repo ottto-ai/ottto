@@ -619,12 +619,50 @@ impl ScanIndex {
         }
         self.mark_bounded_sweep_unsettled();
     }
-    /// A conservative metadata-only plan. No transcript or private log reads.
+    /// Independent metadata obligations only. Stale pending is not itself
+    /// a read: the traversal composes its actual funded re-arm set below.
+    pub(super) fn reread_revision_changed(&self, source: SnapshotSource) -> bool {
+        !self.reread_guard.source_revision.is_empty()
+            && self.reread_guard.source_revision != source.scan_identity_version()
+    }
+
     pub(super) fn reread_plan(
         &mut self,
         source: SnapshotSource,
         collected_at: &str,
         context: &str,
+    ) -> bool {
+        let version_changed = self.reread_revision_changed(source);
+        self.reread_plan_inner(source, collected_at, context, None, version_changed)
+    }
+
+    /// Refresh even a same-window preliminary plan, before clearing entries.
+    /// The predicate names only keys the caller will actually re-arm. Keep
+    /// runtime observations already recorded on that traversal intact.
+    pub(super) fn reread_plan_for_rearms(
+        &mut self,
+        source: SnapshotSource,
+        collected_at: &str,
+        context: &str,
+        version_changed: bool,
+        will_rearm: impl Fn(&str) -> bool,
+    ) -> bool {
+        self.reread_plan_inner(
+            source,
+            collected_at,
+            context,
+            Some(&will_rearm),
+            version_changed,
+        )
+    }
+
+    fn reread_plan_inner(
+        &mut self,
+        source: SnapshotSource,
+        collected_at: &str,
+        context: &str,
+        will_rearm: Option<&dyn Fn(&str) -> bool>,
+        version_changed: bool,
     ) -> bool {
         #[cfg(test)]
         if !TEST_OBSERVATIONS.with(std::cell::Cell::get) {
@@ -634,11 +672,10 @@ impl ScanIndex {
             return false;
         }
         let id = sha256_hex(&[context, collected_at]);
-        if self.reread_guard.tripwire.traversal == id {
+        let same_traversal = self.reread_guard.tripwire.traversal == id;
+        if same_traversal && will_rearm.is_none() {
             return REREAD_GUARD_ENFORCE && self.reread_guard.tripwire.plan_held;
         }
-        let version_changed = !self.reread_guard.source_revision.is_empty()
-            && self.reread_guard.source_revision != source.scan_identity_version();
         self.reread_guard.source_revision = source.scan_identity_version().to_owned();
         let mut detached_keys: BTreeSet<_> =
             self.reread_guard.replay_witnesses.keys().copied().collect();
@@ -651,19 +688,25 @@ impl ScanIndex {
             traversal: id,
             indexed: self.files.len() as u64 + detached,
             last_alarm: self.reread_guard.tripwire.last_alarm,
+            full_reads: if same_traversal {
+                self.reread_guard.tripwire.full_reads
+            } else {
+                0
+            },
+            runtime_cause_counts: if same_traversal {
+                self.reread_guard.tripwire.runtime_cause_counts
+            } else {
+                [0; CAUSES]
+            },
             ..Tripwire::default()
         };
         for (key, entry) in &self.files {
-            let stale = source == SnapshotSource::ClaudeCode
-                && claude_index_path_member_ref(Path::new(key)).is_some_and(|m| {
-                    self.claude_usage_family_pending
-                        .get(m.root)
-                        .is_some_and(|pending| pending.census_window_end != collected_at)
-                });
             let reason =
                 if self.upload_context_fingerprint != self.active_upload_context_fingerprint {
                     Some(CandidateParseReason::UploadContext)
-                } else if entry.source_file_fingerprint.is_empty() || stale {
+                } else if entry.source_file_fingerprint.is_empty()
+                    || will_rearm.is_some_and(|contains| contains(key))
+                {
                     Some(CandidateParseReason::Rearmed)
                 } else if self.effective_upload_body_witness_revision_requires_adoption(key) {
                     Some(CandidateParseReason::BodyWitnessAdoption)
@@ -1137,6 +1180,11 @@ pub(crate) fn observe_plan_for_test(index: &mut ScanIndex, collected_at: &str) -
         index.reread_guard.tripwire.planned,
         index.reread_guard.tripwire.last_alarm,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn planned_for_test(index: &ScanIndex) -> u64 {
+    index.reread_guard.tripwire.planned
 }
 
 // Counterfactual control for the NEW observe-parity test only. This switches
