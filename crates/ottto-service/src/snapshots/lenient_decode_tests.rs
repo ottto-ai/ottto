@@ -2043,6 +2043,9 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                 serde_json::json!({"/synthetic/carried.jsonl":["a".repeat(64)]})
             }
             "claude_stale_family_carry" => serde_json::json!({"roots":["carried-family"]}),
+            "held_audit_progress" => serde_json::json!({
+                "key":"/synthetic/0.jsonl", "due":7, "attempted":true
+            }),
             "traversal" => {
                 serde_json::json!({"context_fingerprint":"context","census_window_end":"2026-10-22T00:00:00Z","scan_roots":["/synthetic"],"pending_directories":[],"pending_candidates":[],"observed_index_keys":["file"],"reconciliation_upper_bound":"file","reconciliation_after":null,"reconciliation_started":true,"counts":{}})
             }
@@ -2238,7 +2241,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
             let mut completed = None;
             for _ in 0..1000 {
                 assert_eq!(
-                    owned.census.claude_parse_reasons[CandidateParseReason::NewFile as usize],
+                    owned.census.parse_reasons[CandidateParseReason::NewFile as usize],
                     0
                 );
                 assert!(owned

@@ -315,6 +315,7 @@ impl Serialize for ScanIndex {
             codex_counting_version::EvictedLegacyOwners::is_empty
         );
         field!(upload_ack_retirement_handoff, Option::is_none);
+        field!(held_audit_progress, Option::is_none);
         map.end()
     }
 }
@@ -404,6 +405,7 @@ pub(super) const FIELDS: &[&str] = &[
     "reread_guard",
     "codex_counting_evicted_legacy",
     "upload_ack_retirement_handoff",
+    "held_audit_progress",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1782,6 +1784,15 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.bounded_sweep_unsettled_causes = self
                                 .census(value, "bounded_sweep_unsettled_causes")?
                                 .bounded_sweep_unsettled_causes
+                        }
+                        "held_audit_progress" => {
+                            // Scheduling damage cannot erase or verify a census
+                            // hold. Bound the single path before allocating it.
+                            index.held_audit_progress = if value.len <= 8192 {
+                                self.history_scalar(value, None)?
+                            } else {
+                                None
+                            };
                         }
                         "traversal" => index.traversal = self.typed(value)?,
                         "claude_stale_family_carry" => {
