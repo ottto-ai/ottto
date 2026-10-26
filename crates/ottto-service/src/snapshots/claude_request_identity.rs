@@ -1890,7 +1890,13 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                             keys.push(Arc::clone(&own));
                             Some(own)
                         }
-                        None => None,
+                        None => {
+                            // Preserve the verdict for the existing grouping
+                            // cap allocator; valid overflow is not missing data.
+                            fold.entity.identity_over_cap = true;
+                            accounts.conflict = true;
+                            None
+                        }
                     }
                 }
                 _ => None,
@@ -2368,6 +2374,11 @@ fn request_owned_grouping(
             );
         },
     )?;
+    grouping.keys_over_cap |= fallback.is_none()
+        && item
+            .claude_money
+            .as_deref()
+            .is_some_and(|fold| fold.entity.identity_over_cap);
     grouping.latest.unordered |= item
         .claude_money
         .as_deref()

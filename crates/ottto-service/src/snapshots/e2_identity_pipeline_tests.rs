@@ -439,3 +439,65 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[test]
+fn e2_pipeline_exact_telemetry_over_cap_uses_the_existing_counted_start_fallback() {
+    let dir = temp_dir("e2-identity-telemetry-cap");
+    let root = "1449b91b-f36e-4cbc-a5bb-50fc66430ba5";
+    let support = dir.join("support");
+    let mut lines = String::new();
+    let mut api = Vec::new();
+    let mut trace = Vec::new();
+    for n in 1..=17 {
+        let request = format!("req_{n}");
+        lines.push_str(&format!("{}\n", json!({
+            "timestamp": format!("2026-08-02T07:00:{n:02}Z"), "type": "assistant",
+            "sessionId": root, "requestId": request,
+            "message": {"id": format!("msg_{n}"), "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 10}}
+        })));
+        let mut row = complete_api_row(root, &request, n, 10, 10, 0);
+        row.account_identifier_hash = Some(format!("{n:064x}"));
+        e2_resign(&mut row);
+        api.push(row);
+        trace.push(complete_trace_row(root, &request, ""));
+    }
+    fs::write(dir.join(format!("{root}.jsonl")), lines).unwrap();
+    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, root, &api);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        root,
+        &trace,
+    );
+    let (items, disposition, failed) = e2_page(
+        std::slice::from_ref(&dir),
+        &support,
+        &mut ScanIndex::default(),
+        true,
+    );
+    assert!(!failed);
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert!(e2_is_literal(item));
+    assert_eq!(item.request_count, 17);
+    assert_eq!(
+        e2_login_counts(item),
+        BTreeMap::from([(Some(format!("{:064x}", 1)), 17)]),
+        "bounded fallback uses the start, never the sixteenth login"
+    );
+    assert_eq!(
+        item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+        Some("0.0017")
+    );
+    let display = item.claude_account_display.as_deref().unwrap();
+    assert_eq!(display.current.status, "known");
+    assert_eq!(
+        display.current.account_identifier_hash,
+        Some(format!("{:064x}", 1))
+    );
+    let counts =
+        serde_json::to_value(claude_request_identity::page_identity_counts(&items)).unwrap();
+    assert_eq!(counts["claude_identity_conflict_fallbacks"], 1);
+    assert_eq!(disposition.quarantined_entity_count(), 0);
+    fs::remove_dir_all(dir).unwrap();
+}

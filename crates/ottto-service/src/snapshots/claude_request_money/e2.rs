@@ -518,6 +518,8 @@ pub(crate) struct ClaudeEntityBody {
     pub(crate) certificate_ok: bool,
     /// Local-only uncertainty from every counted path twin.
     pub(crate) clock_incomplete: bool,
+    /// Exact telemetry exceeded the identity owner's bounded key pool.
+    pub(crate) identity_over_cap: bool,
     // False proves both live maps have never allocated. Empty live maps
     // retain their conservative root charge after a removal.
     pub(super) live_maps_initialized: bool,
@@ -539,6 +541,7 @@ impl Default for ClaudeEntityBody {
             held: false,
             certificate_ok: true,
             clock_incomplete: false,
+            identity_over_cap: false,
             live_maps_initialized: false,
             activity_unix: 0,
             activity_nanos: 0,
@@ -639,6 +642,7 @@ impl ClaudeEntityBody {
         self.held |= other.held;
         self.certificate_ok &= other.certificate_ok;
         self.clock_incomplete |= other.clock_incomplete;
+        self.identity_over_cap |= other.identity_over_cap;
         self.activity_unix = self.activity_unix.max(other.activity_unix);
         self.activity_nanos = self.activity_nanos.max(other.activity_nanos);
     }
@@ -814,6 +818,7 @@ macro_rules! entity_heap_method {
                 held: _,
                 certificate_ok: _,
                 clock_incomplete: _,
+                identity_over_cap: _,
                 activity_unix: _,
                 activity_nanos: _,
             } = self;
