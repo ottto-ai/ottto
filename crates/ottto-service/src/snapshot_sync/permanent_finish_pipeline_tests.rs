@@ -872,7 +872,9 @@ fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
         "unverified_marker",
         "backfill_completion",
         "finish_cycle",
+        "capacity",
     ] {
+        crate::client_report::reset_for_test();
         let fixture = IdentityPipelineHome::new();
         let _cadence = IdentityPipelineCadence::new();
         let support = fixture.base.join("ack-post-save-support");
@@ -929,6 +931,12 @@ fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
         preparation
             .upload_progress
             .record_body(&stale, &"e".repeat(64));
+        if stage == "capacity" {
+            for entity in 0..5000 {
+                let fp = format!("{entity:064x}");
+                preparation.upload_progress.record_body(&fp, &fp);
+            }
+        }
         preparation
             .upload_progress
             .save(&preparation.upload_progress_path)
@@ -936,7 +944,7 @@ fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
         let index_path = preparation.index_path.clone();
         let progress_path = preparation.upload_progress_path.clone();
         let namespace = preparation.upload_destination_namespace.clone();
-        ACK_POST_SAVE_FAILURE.with(|slot| slot.set(Some(stage)));
+        ACK_POST_SAVE_FAILURE.with(|slot| slot.set((stage != "capacity").then_some(stage)));
         let _reset = AckPostSaveFailure;
         let result = crate::agent_status_refresh::with_test_collection(collection(), || {
             finish_sync_source(
@@ -955,7 +963,40 @@ fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
                 &mut retry,
             )
         });
-        assert!(result.unwrap_err().to_string().contains(stage));
+        let error = result.unwrap_err();
+        if stage == "capacity" {
+            let settlement = error
+                .downcast_ref::<ack_retention::AckSettlementRequired>()
+                .expect("actual finish preserves typed local capacity outcome");
+            assert_eq!(settlement.retained_stale_ack_count, 5001);
+            assert!(settlement.deferred_entity_count > 0);
+            assert!(
+                server.offered.lock().unwrap().is_empty(),
+                "no HTTP upload attempt"
+            );
+            assert!(matches!(
+                source_cadences().lock().unwrap()["claude_code"].state(),
+                ottto_protocol::LocalCollectorState::Warm
+            ));
+            assert_eq!(
+                crate::client_report::observe()
+                    .quantity(crate::client_report::ClientReportReason::NetworkError),
+                0
+            );
+            assert_eq!(
+                crate::client_report::observe()
+                    .quantity(crate::client_report::ClientReportReason::RatelimitBackoff),
+                0
+            );
+            let terminal = server.terminal.lock().unwrap();
+            assert_eq!(terminal.last().unwrap()["last_error_code"], "scan_error");
+            assert_eq!(
+                terminal.last().unwrap()["last_error_message"],
+                "local snapshot ACK settlement pending"
+            );
+        } else {
+            assert!(error.to_string().contains(stage));
+        }
         assert!(
             ACK_POST_SAVE_FAILURE.with(|slot| slot.get().is_none()),
             "actual exit reached"
@@ -973,9 +1014,10 @@ fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
         )
         .unwrap();
-        assert!(
+        assert_eq!(
             progress.accepted_fingerprints.contains(&stale),
-            "failed finish retains durable ACK"
+            stage != "capacity",
+            "ordinary exit keeps ACK; capacity partial save may already clean it durably"
         );
         progress
             .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
