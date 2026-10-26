@@ -7,8 +7,6 @@ const PIPELINE_MACHINE_ID: &str = "machine-census-convergence";
 const PIPELINE_DESTINATION: &str = "census-convergence-destination";
 const PIPELINE_PAGE_FILES: usize = 2;
 const PIPELINE_MAX_PAGES: usize = 4;
-/// 2026-08-02T00:00:00Z, before every synthetic record (unix nanos).
-const PIPELINE_FILE_BIRTH: u64 = 1_785_628_800_000_000_000;
 const PIPELINE_HELD_SESSION: &str = "a1111111-1111-4111-8111-111111111111";
 const PIPELINE_SESSIONS: [&str; 3] = [
     PIPELINE_HELD_SESSION,
@@ -134,20 +132,6 @@ impl PipelineFixture {
     }
 
     fn page_with_reoffers(
-        &self,
-        collected_at: &str,
-        cycle: &PipelineCycle<'_>,
-        upload: PipelineUpload,
-        before_classify: impl FnOnce(&mut ScanIndex),
-        reoffers: bool,
-    ) -> PipelinePage {
-        // Ordinary transcripts: each file exists before its records (E2).
-        crate::snapshots::claude_request_money::e2::with_fixture_birth(PIPELINE_FILE_BIRTH, || {
-            self.page_with_reoffers_born(collected_at, cycle, upload, before_classify, reoffers)
-        })
-    }
-
-    fn page_with_reoffers_born(
         &self,
         collected_at: &str,
         cycle: &PipelineCycle<'_>,
