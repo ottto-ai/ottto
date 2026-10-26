@@ -40,3 +40,10 @@ pub(crate) fn retire_census(index: &mut ScanIndex, file_name: &str) {
     record.retire();
     index.claude_request_census.insert(key, record);
 }
+
+/// An indexed file left without a census record.
+pub(crate) fn forget_census(index: &mut ScanIndex, file_name: &str) {
+    let key = census_key(index, file_name);
+    index.claude_request_census.remove(&key);
+    assert!(index.claude_request_census.get(&key).is_none());
+}

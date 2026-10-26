@@ -1444,7 +1444,7 @@ fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &Sca
         None => index
             .claude_request_census
             .get(witness)
-            .filter(|record| scan_evidence(index, witness, record))
+            .filter(|record| scan_evidence(index, witness, record) == Evidence::Current)
             .map(|record| {
                 skipped_ids(&items[at])
                     .filter(|id| !record.holds_hash(claude_request_hash(id)))
@@ -1458,39 +1458,84 @@ fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &Sca
     }
 }
 
+/// What a census record proves about its file now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// It lists the requests the file holds.
+    Current,
+    /// The file changed since that scan and this traversal still queues it:
+    /// the decision waits for the re-read (a stale holder never decides).
+    Queued,
+    /// Nothing: retired, over budget, twin, older derivation, or a held
+    /// scan whose file is gone.
+    None,
+}
+
 /// What `key`'s census record proves about the file now (owner rule P2:
 /// holding a session withholds its UPLOAD only; its scan state stays
 /// evidence). The record of the settled revision (its index entry, same
 /// fingerprint) proves it; so does the record of a scan whose upload is held
-/// (entry absent or not advanced), while the file is still there. Retired,
-/// over-budget, twin and older-derivation records prove nothing.
+/// (entry absent or not advanced), while the file is still there. A file
+/// that changed since (a size change for the settled revision, as history
+/// classification; an mtime change for a held scan) is decided by its
+/// re-read while this traversal queues it; once the queue is past it, what
+/// exists decides.
 fn scan_evidence(
     index: &ScanIndex,
     key: &str,
     record: &super::super::claude_request_census::ClaudeRequestCensusRecord,
-) -> bool {
-    record.proves_scan()
-        && (index
-            .files
-            .get(key)
-            .is_some_and(|entry| record.proves_current(&entry.source_file_fingerprint))
-            || Path::new(key).is_file())
+) -> Evidence {
+    if !record.proves_scan() {
+        return Evidence::None;
+    }
+    let settled = index
+        .files
+        .get(key)
+        .filter(|entry| record.proves_current(&entry.source_file_fingerprint));
+    let metadata = std::fs::metadata(key).ok().filter(|m| m.is_file());
+    let changed = match (settled, &metadata) {
+        (Some(entry), Some(metadata)) => metadata.len() != entry.size_bytes,
+        (Some(_), None) => false,
+        (None, Some(metadata)) => record.modified().is_some_and(|at| {
+            metadata
+                .modified()
+                .ok()
+                .and_then(super::super::unix_seconds)
+                != Some(at)
+        }),
+        (None, None) => return Evidence::None,
+    };
+    if changed && queued(index, key) {
+        Evidence::Queued
+    } else {
+        Evidence::Current
+    }
 }
 
-/// Another session's main file this traversal has not put on any page yet:
-/// queued, not indexed, and without scan state. Only these can make a copy
-/// wait. A scanned file, held or not, is evidence (`scan_evidence`), never a
-/// reason to wait, so held sessions never wait on each other; with the queue
-/// drained (traversal complete) nothing is pending and what exists decides.
+/// This traversal still queues `key` for a page.
+fn queued(index: &ScanIndex, key: &str) -> bool {
+    index.traversal.as_ref().is_some_and(|traversal| {
+        traversal
+            .pending_candidates
+            .iter()
+            .any(|candidate| candidate.path == Path::new(key))
+    })
+}
+
+/// Another session's main file this traversal has not put on any page yet
+/// and that has no scan state: queued, without a census record (unscanned,
+/// or indexed without one). Only these, and a queued stale holder
+/// (`Evidence::Queued`), can make a copy wait. A scanned file, held or not,
+/// is evidence (`scan_evidence`), never a reason to wait, so held sessions
+/// never wait on each other; with the queue drained (traversal complete)
+/// nothing is pending and what exists decides.
 fn unscanned_main_roots(index: &ScanIndex) -> BTreeSet<String> {
     index
         .traversal
         .iter()
         .flat_map(|traversal| traversal.pending_candidates.iter())
         .map(|candidate| local_index_key(&candidate.path))
-        .filter(|key| {
-            !index.files.contains_key(key) && index.claude_request_census.get(key).is_none()
-        })
+        .filter(|key| index.claude_request_census.get(key).is_none())
         .filter_map(|key| {
             let member = claude_index_path_member_ref(Path::new(&key))?;
             member
@@ -1545,8 +1590,8 @@ fn parent_proves(
 /// One census walk for every all-pre-birth main file of the page. A holder
 /// proves a request when it is another session's main file whose scan state
 /// holds it (`scan_evidence`) and earlier in (effective birth, location).
-/// Only the walk deadline and an unscanned other-session main file delay a
-/// decision.
+/// Only the walk deadline, a queued stale holder and an unscanned
+/// other-session main file delay a decision.
 fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex) {
     struct Wanted {
         at: usize,
@@ -1554,6 +1599,8 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
         order: (i128, LocationKey),
         hashes: Vec<u64>,
         covered: BTreeSet<u64>,
+        /// A holder that would cover it changed and is still queued.
+        waiting: bool,
         /// The original its `fork-context-ref` line names.
         parent: Option<String>,
     }
@@ -1578,6 +1625,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                 order,
                 hashes,
                 covered: BTreeSet::new(),
+                waiting: false,
                 parent,
             })
         })
@@ -1599,7 +1647,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
         |key, root, record, hits| {
             // Per holder record, each at most once and only when another
             // session wants one of its ids: evidence, then (birth, location).
-            let mut holder = None::<Option<(i128, LocationKey)>>;
+            let mut holder = None::<Option<(Evidence, (i128, LocationKey))>>;
             for &hash in hits {
                 let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
                 for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
@@ -1608,13 +1656,21 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                         continue;
                     }
                     let holder = *holder.get_or_insert_with(|| {
-                        if !scan_evidence(index, key, record) {
+                        let evidence = scan_evidence(index, key, record);
+                        if evidence == Evidence::None {
                             return None;
                         }
-                        holder_order(store, root, key)
+                        Some((evidence, holder_order(store, root, key)?))
                     });
-                    if holder.is_some_and(|holder| holder < file.order) {
-                        file.covered.insert(hash);
+                    match holder {
+                        Some((evidence, holder)) if holder < file.order => {
+                            if evidence == Evidence::Queued {
+                                file.waiting = true;
+                            } else {
+                                file.covered.insert(hash);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1630,6 +1686,10 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
             .collect::<Vec<_>>();
         if walked.is_none() {
             hold_copies(&mut items[wanted.at], "held_copy_deadline");
+            continue;
+        }
+        if wanted.waiting {
+            hold_copies(&mut items[wanted.at], "held_copy_stale_holder");
             continue;
         }
         if !uncovered.is_empty()

@@ -2153,6 +2153,84 @@ fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
     );
 }
 
+/// PR C (c) and (d): the copy is read while its holder `LATE`, changed
+/// since its last read, is still queued by the traversal. `stale_record`:
+/// the holder keeps a census record of its old content (rewritten in place
+/// without the request); else it has none (indexed, record lost) and grew.
+/// The copy waits for the holder's re-read instead of deciding on what the
+/// stale (or absent) record says, then each request counts exactly once.
+fn copy_waits_for_queued_holder(stale_record: bool) {
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-pipeline-queued-holder-{stale_record}"));
+        let original = c.root(LATE, &line(LATE, "original", AT, 10));
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let first = ready(&c, &scanner, old.clone(), 100, false);
+        let mut prior = settle(&c, &old, first, &mut progress);
+        let expected_original = if stale_record {
+            std::fs::write(&original, line(LATE, "rewritten", AT, 100)).unwrap();
+            1
+        } else {
+            e2::pipeline_test_observer::forget_census(&mut prior, &format!("{LATE}.jsonl"));
+            let grown = line(LATE, "original", AT, 10) + &line(LATE, "more", AT, 20);
+            std::fs::write(&original, grown).unwrap();
+            2
+        };
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "original", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut held = c.raw(&scanner, prior.clone(), 1, false, &[]);
+        held.enrich(&c);
+        let opened = scanner.paths();
+        assert_eq!(opened.len(), 1, "one file per page");
+        assert!(
+            opened[0].ends_with(format!("{COPY}.jsonl")),
+            "the copy is read while its changed holder is still queued"
+        );
+        assert_withheld(&held, COPY, "the holder's re-read decides");
+        prior = settle(&c, &prior, held, &mut progress);
+        let (mut copy_body, mut original_requests) = (None, None);
+        for _ in 0..4 {
+            let page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+            if let Some(found) = body(&page, LATE) {
+                literal(&page);
+                original_requests = Some(found.request_count);
+            }
+            if let Some(found) = body(&page, COPY) {
+                literal(&page);
+                copy_body = Some((found.request_count, found.removed_request_count));
+            }
+            prior = settle(&c, &prior, page, &mut progress);
+            if copy_body.is_some() && original_requests.is_some() {
+                break;
+            }
+        }
+        assert_eq!(original_requests, Some(expected_original));
+        assert_eq!(
+            copy_body,
+            Some(if stale_record {
+                (1, Some(0))
+            } else {
+                (0, Some(1))
+            }),
+            "the copy's request counts exactly once: in the copy only when the \
+             re-read holder no longer holds it"
+        );
+    });
+}
+#[test]
+fn e2_pipeline_copy_waits_for_a_queued_stale_holder() {
+    copy_waits_for_queued_holder(true);
+}
+#[test]
+fn e2_pipeline_copy_waits_for_a_queued_indexed_holder_without_a_census_record() {
+    copy_waits_for_queued_holder(false);
+}
+
 /// Owner ruling 5 (Codex P1-2): a file whose every response conflicts keeps
 /// a zero-usage carrier that publishes its conflict disclosure through the
 /// literal, ACK and restart path, over an accepted prior body.
