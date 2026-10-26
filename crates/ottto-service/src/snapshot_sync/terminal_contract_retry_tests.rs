@@ -509,7 +509,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
         // The unrelated permanent refusal remains in the durable fixture,
         // outside this attempt's frozen input. Including it would correctly
         // report the whole input as Rejected despite accepting the retry.
-        let items = vec![held_fingerprint(), retained_ack()];
+        let items = vec![held_fingerprint()];
         let mut accepted = 0;
         let mut offered = Vec::new();
         let result = upload_resumable_batches_with_body_witness(
@@ -796,10 +796,9 @@ fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
                 InterruptedOutcome::Restart => {} // Lose all volatile state before any outcome.
                 InterruptedOutcome::Conflict | InterruptedOutcome::SaveFailure => {
                     let mut accepted = 0;
-                    // The uploader's frozen input owns ACK-ledger pruning.
-                    // Keep the retained ACK in that input so this fixture tests
-                    // conflict/outcome persistence, rather than orphan pruning.
-                    let items = vec![fixture.fingerprint.clone(), retained_ack()];
+                    // ACK lifetime is independent of this incremental input.
+                    // Keep the sibling out of the delta to exercise retention.
+                    let items = vec![fixture.fingerprint.clone()];
                     let temp = fixture
                         .retained
                         .progress_path
@@ -1035,4 +1034,185 @@ fn terminal_contract_next_version_starts_a_distinct_paced_budget() {
 #[test]
 fn terminal_contract_legacy_unknown_body_conflicts_keep_the_two_source_read_cap() {
     contract_read_cap(InterruptedOutcome::Conflict, true);
+}
+
+// SOURCE's post-ACK/pre-index crash seam: the scanner's actual next delta
+// omits the accepted retry. Both checkpoints must retain the evidence until
+// index settlement is durably adopted. No ACK body is added to uploader input.
+fn contract_ack_saved_before_index_restart(unrelated: bool) {
+    let fixture = ReadBudgetFixture::new();
+    with_contract(2, || {
+        let (index, mut progress) = fixture.due_claim();
+        let mut scan_index = index.clone();
+        let first = ReadBudgetFixture::scan_root(&fixture.root, &mut scan_index);
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first.snapshots[0].snapshot_fingerprint, fixture.fingerprint);
+        assert!(!index.accepted_snapshot_fingerprint_recorded(&fixture.fingerprint));
+        let items = vec![fixture.fingerprint.clone()];
+        let mut accepted = 0;
+        let result = upload_resumable_batches_with_body_witness(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |_| fixture.body.clone(),
+            |batch| {
+                assert_eq!(batch, vec![fixture.fingerprint.clone()]);
+                let response = entity_ack_batch(&batch, &[], &[]);
+                let identities: Vec<_> = batch
+                    .iter()
+                    .map(|fp| (format!("session-{fp}"), fp.clone()))
+                    .collect();
+                response.validate_entity_ack_identities(
+                    identities.iter().map(|(id, fp)| (id.as_str(), fp.as_str())),
+                )?;
+                Ok(response)
+            },
+            |state| state.save(&fixture.retained.progress_path),
+        )
+        .unwrap();
+        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(accepted, 1);
+        assert_eq!(
+            progress.accepted_body_witnesses.get(&fixture.fingerprint),
+            Some(&fixture.body)
+        );
+        fixture.retained.assert_retained(&index, &progress);
+
+        // Crash after the actual uploader's ACK checkpoint, with no index
+        // settlement/save. Index still owns the first contract claim.
+        drop(scan_index);
+        drop(index);
+        drop(progress);
+        let (mut index, mut progress) = fixture.retained.load();
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&fixture.fingerprint));
+        assert!(!index.accepted_snapshot_fingerprint_recorded(&fixture.fingerprint));
+        if progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints) {
+            progress.save(&fixture.retained.progress_path).unwrap();
+        }
+        assert!(progress.active_quarantine_retries.is_empty());
+        save_terminal_contract_claims_for_scan(&mut index, &progress, &fixture.retained.index_path)
+            .unwrap();
+        if unrelated {
+            std::fs::write(fixture.root.join("later.jsonl"), format!("{}\n", serde_json::json!({
+                "timestamp":"2026-10-25T07:00:00Z", "type":"assistant", "sessionId":"later",
+                "requestId":"req-later", "message":{"id":"msg-later", "model":"claude-haiku-4-5",
+                "usage":{"input_tokens":20,"output_tokens":2}}
+            }))).unwrap();
+        }
+        let committed_index = index.clone();
+        let (next, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+            ReadBudgetFixture::scan_root(&fixture.root, &mut index)
+        });
+        assert_eq!(next.snapshots.len(), usize::from(unrelated));
+        assert!(next
+            .snapshots
+            .iter()
+            .all(|s| s.source_session_id == "later"));
+        assert_eq!(
+            reads.get(&fixture.root.join("held.jsonl")),
+            None,
+            "durably ACKed retry receives no source lease after restart"
+        );
+        assert_eq!(reads.get(&fixture.root.join("unrelated.jsonl")), None);
+        assert_eq!(reads.values().sum::<usize>(), usize::from(unrelated));
+        // Pass the scanner's ACTUAL empty or unrelated-only delta.
+        let delta: Vec<String> = next
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect();
+        assert!(!delta.contains(&fixture.fingerprint));
+        assert!(!delta.contains(&retained_ack()));
+        let bodies: BTreeMap<_, _> = next
+            .snapshots
+            .iter()
+            .map(|s| {
+                (
+                    s.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(s),
+                )
+            })
+            .collect();
+        let mut delta_accepted = 0;
+        let mut posts = 0;
+        let result = upload_resumable_batches_with_body_witness(
+            &delta,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut delta_accepted,
+            String::as_str,
+            |fp| bodies[fp].clone(),
+            |batch| {
+                assert!(unrelated, "empty delta must not POST");
+                assert_eq!(batch, delta);
+                posts += 1;
+                Ok(entity_ack_batch(&batch, &[], &[]))
+            },
+            |state| state.save(&fixture.retained.progress_path),
+        )
+        .unwrap();
+        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(posts, usize::from(unrelated));
+        assert_eq!(delta_accepted, u64::from(unrelated));
+        progress.save(&fixture.retained.progress_path).unwrap();
+        // Crash again before index adoption: the ACK must still be in progress.
+        let mut selected = index.clone();
+        (index, progress) = fixture.retained.load();
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&fixture.fingerprint));
+        assert_eq!(
+            progress.accepted_body_witnesses.get(&fixture.fingerprint),
+            Some(&fixture.body)
+        );
+        assert!(!index.accepted_snapshot_fingerprint_recorded(&fixture.fingerprint));
+        settle_index_after_upload(&mut selected, &committed_index, &progress);
+        selected.save(&fixture.retained.index_path).unwrap();
+        let (index, progress) = fixture.retained.load();
+        assert!(index.accepted_snapshot_fingerprint_recorded(&fixture.fingerprint));
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&fixture.fingerprint));
+        assert_eq!(
+            progress.accepted_body_witnesses.get(&fixture.fingerprint),
+            Some(&fixture.body)
+        );
+        assert!(!index
+            .quarantined_snapshot_fingerprints
+            .contains_key(&fixture.fingerprint));
+        assert!(progress
+            .quarantined_fingerprints
+            .get(&fixture.fingerprint)
+            .is_none());
+        for fp in &delta {
+            assert!(index.accepted_snapshot_fingerprint_recorded(fp));
+        }
+        fixture.retained.assert_retained(&index, &progress);
+        // A later cycle cannot regrant the accepted retry from its old claim.
+        let mut restarted = progress;
+        assert!(!restarted
+            .prepare_quarantine_retries(&committed_index.quarantined_snapshot_fingerprints));
+        assert!(restarted.active_quarantine_retries.is_empty());
+        let value = serde_json::to_value(&index).unwrap();
+        for field in [
+            "session_account_bindings",
+            "claude_request_identity_contract",
+            "claude_request_identity_contract_changed",
+        ] {
+            assert_eq!(value[field], fixture.retained.index_guard[field]);
+        }
+    });
+}
+
+#[test]
+fn terminal_contract_ack_saved_before_index_restart_survives_empty_delta() {
+    contract_ack_saved_before_index_restart(false);
+}
+#[test]
+fn terminal_contract_ack_saved_before_index_restart_survives_unrelated_only_delta() {
+    contract_ack_saved_before_index_restart(true);
 }

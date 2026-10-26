@@ -40,6 +40,7 @@ impl Env {
             machine_id: "machine-test",
             destination: "device|machine|api",
             labels_enabled: true,
+            details_enabled: false,
         });
         fs::create_dir_all(&self.root).unwrap();
         let stats = run_source(&mut run, source, std::slice::from_ref(&self.root), target);

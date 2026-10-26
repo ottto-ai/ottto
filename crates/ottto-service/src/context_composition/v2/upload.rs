@@ -37,6 +37,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+/// Advertised on the existing fresh activity hint only after backend admission.
+pub(super) const DETAILS_CONTRACT: &str = "context_composition_details:v1";
+pub(super) fn details_enabled(contract: Option<&str>) -> bool {
+    contract == Some(DETAILS_CONTRACT)
+}
+
 pub(super) trait Uploader {
     fn upload(&mut self, request: &Value) -> Result<UploadReceipt>;
 }
@@ -58,10 +64,13 @@ pub(super) struct UploadTarget<'a> {
     /// destination does not count here.
     pub(super) destination: &'a str,
     pub(super) labels_enabled: bool,
+    pub(super) details_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct UploadAck {
+    #[serde(default)]
+    pub(super) details_enabled: bool,
     pub(super) generation: u64,
     pub(super) state_sha: String,
     pub(super) posted_at: i64,
@@ -135,10 +144,13 @@ pub(super) fn upload_scope(
         .day_generation
         .values()
         .any(|generation| *generation > acked_generation);
-    if !stale && !changed {
+    let capability_changed = ack
+        .as_ref()
+        .is_some_and(|ack| ack.details_enabled != target.details_enabled);
+    if !stale && !changed && !capability_changed {
         return UploadResult::only(UploadOutcome::Unchanged);
     }
-    let state_sha = state_sha(scope, target.labels_enabled);
+    let state_sha = state_sha(scope, target.labels_enabled, target.details_enabled);
     if let Some(ack) = ack
         .as_ref()
         .filter(|ack| !stale && ack.state_sha == state_sha)
@@ -173,6 +185,7 @@ pub(super) fn upload_scope(
         ..failed
     };
     let ack = UploadAck {
+        details_enabled: target.details_enabled,
         generation: scope.generation,
         state_sha,
         posted_at: now_secs,
@@ -187,7 +200,7 @@ pub(super) fn upload_scope(
 /// Hash of everything an upload is built from (not the commit generations),
 /// written straight into the hash. The same value as `sha256_hex` over the
 /// stored totals, the scope info and the labels setting.
-fn state_sha(scope: &Scope, labels_enabled: bool) -> String {
+fn state_sha(scope: &Scope, labels_enabled: bool, details_enabled: bool) -> String {
     use sha2::{Digest, Sha256};
     struct Hashing(Sha256);
     impl std::io::Write for Hashing {
@@ -215,6 +228,9 @@ fn state_sha(scope: &Scope, labels_enabled: bool) -> String {
     };
     hashing.0.update(labels.as_bytes());
     hashing.0.update([0]);
+    if details_enabled {
+        hashing.0.update(DETAILS_CONTRACT.as_bytes());
+    }
     format!("{:x}", hashing.0.finalize())
 }
 
@@ -252,6 +268,8 @@ pub(super) struct FileRow {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(super) struct SessionRow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) top_tool: Option<SessionTool>,
     pub(super) session_id_hash: String,
     pub(super) source_session_id: String,
     pub(super) top_kind_tokens_entered_est: u64,
@@ -260,6 +278,28 @@ pub(super) struct SessionRow {
     pub(super) total_tokens_entered_est: u64,
     pub(super) top_kind: String,
     pub(super) in_30d: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(super) struct SessionTool {
+    pub(super) label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) server_label: Option<String>,
+    pub(super) kind: String,
+    pub(super) tokens_entered_est: u64,
+}
+
+/// A file's actual totals in the seven UTC calendar days ending at scan day.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(super) struct FileWindowRow {
+    pub(super) relative_path_or_name: String,
+    pub(super) category: String,
+    pub(super) part: Option<String>,
+    pub(super) events: u64,
+    pub(super) tokens_entered_est: u64,
+    pub(super) session_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) last_accessed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -321,6 +361,12 @@ pub(super) struct RequestV2 {
     pub(super) tools: Vec<ToolRow>,
     pub(super) session_count_window: u64,
     pub(super) session_count_30d: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) top_files_7d: Option<Vec<FileWindowRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sessions_7d: Option<Vec<SessionRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) session_count_7d: Option<u64>,
     pub(super) retention_floor: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) history_reset_at: Option<String>,
@@ -462,8 +508,44 @@ pub(super) fn build_request(
         (None, Some(label)) => (Some(label), Some("directory_name".to_string())),
         (None, None) => (None, None),
     };
-    let (sessions, session_count_window, session_count_30d) =
-        build_sessions(scope, window, &mut dropped);
+    let (sessions, session_count_window, session_count_30d) = build_sessions(
+        scope,
+        window,
+        target.details_enabled && labels,
+        &mut dropped,
+    );
+    let short_window = Window {
+        floor: window.floor.max(window.today - 6),
+        period_floor: window.floor.max(window.today - 6),
+        today: window.today,
+    };
+    let (top_files_7d, sessions_7d, session_count_7d) = if target.details_enabled {
+        let files = build_files(scope, short_window, true, &mut dropped)
+            .into_iter()
+            .map(|row| FileWindowRow {
+                relative_path_or_name: row.relative_path_or_name,
+                category: row.category,
+                part: row.part,
+                events: row.events_30d,
+                tokens_entered_est: row.tokens_entered_est_30d,
+                session_count: row.session_count_30d,
+                last_accessed_at: row.last_accessed_at,
+            })
+            .collect();
+        let (sessions, count, _) = build_sessions(scope, short_window, labels, &mut dropped);
+        (Some(files), Some(sessions), Some(count))
+    } else {
+        (None, None, None)
+    };
+    let mut tools = if labels {
+        build_tools(scope, window, "30d", true, &mut dropped)
+    } else {
+        Vec::new()
+    };
+    if target.details_enabled && labels {
+        // Reuse bounded daily totals; no transcript or state-file reads.
+        tools.extend(build_tools(scope, short_window, "7d", false, &mut dropped));
+    }
     let request = RequestV2 {
         agent_source: source.label().to_string(),
         machine_id: target.machine_id.to_string(),
@@ -487,15 +569,14 @@ pub(super) fn build_request(
         collector_version: COLLECTOR_VERSION.to_string(),
         counter_source: COUNTER_SOURCE.to_string(),
         daily_aggregates,
-        top_files: build_files(scope, window, &mut dropped),
+        top_files: build_files(scope, window, false, &mut dropped),
         sessions,
         kinds_version: 2,
         parts: build_parts(scope, window, labels, &mut dropped),
-        tools: if labels {
-            build_tools(scope, window, &mut dropped)
-        } else {
-            Vec::new()
-        },
+        tools,
+        top_files_7d,
+        sessions_7d,
+        session_count_7d,
         session_count_window,
         session_count_30d,
         retention_floor: ymd(window.floor),
@@ -598,7 +679,13 @@ fn part_rows(
     rows
 }
 
-fn build_tools(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<ToolRow> {
+fn build_tools(
+    scope: &Scope,
+    window: Window,
+    period_label: &'static str,
+    include_all: bool,
+    dropped: &mut Dropped,
+) -> Vec<ToolRow> {
     let agg = &scope.agg;
     let mut period: BTreeMap<&str, (u64, u64, Option<Kind>)> = BTreeMap::new();
     for ((day, tool), totals) in &agg.day_tools {
@@ -620,13 +707,13 @@ fn build_tools(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<Tool
     for (tool, (calls, tokens, kind)) in period {
         let Some(kind) = kind else { continue };
         let sessions = period_sessions.get(tool).copied().unwrap_or(0);
-        if let Some(row) = tool_row(tool, kind, "30d", calls, sessions, tokens, dropped) {
+        if let Some(row) = tool_row(tool, kind, period_label, calls, sessions, tokens, dropped) {
             period_rows.push(row);
         }
     }
     rows.extend(top_tools(period_rows));
     let mut all_rows = Vec::new();
-    for (tool, totals) in &agg.all_tools {
+    for (tool, totals) in agg.all_tools.iter().filter(|_| include_all) {
         let Some(kind) = totals.kind else { continue };
         if totals.calls == 0 && totals.tokens == 0 {
             continue;
@@ -702,7 +789,12 @@ fn tool_row(
     })
 }
 
-fn build_files(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<FileRow> {
+fn build_files(
+    scope: &Scope,
+    window: Window,
+    recent_only: bool,
+    dropped: &mut Dropped,
+) -> Vec<FileRow> {
     let agg = &scope.agg;
     // Names were resolved when their lines were read; this only keeps the
     // server's rules. A top file is a file read (a `files_read` part).
@@ -720,7 +812,7 @@ fn build_files(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<File
     // name -> per (kind, part) totals, all kept and 30 days.
     type Totals = BTreeMap<(Kind, Part), (FileTotals, FileTotals)>;
     let mut by_name: BTreeMap<String, Totals> = BTreeMap::new();
-    for (key, totals) in &agg.all_files {
+    for (key, totals) in agg.all_files.iter().filter(|_| !recent_only) {
         let Some(name) = keep(&key.path, key.kind, key.part) else {
             continue;
         };
@@ -732,7 +824,7 @@ fn build_files(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<File
         merge_file_totals(&mut entry.0, totals);
     }
     for ((day, key), totals) in &agg.day_files {
-        if *day < window.period_floor {
+        if *day < window.period_floor || *day > window.today {
             continue;
         }
         let Some(name) = keep(&key.path, key.kind, key.part) else {
@@ -752,11 +844,17 @@ fn build_files(scope: &Scope, window: Window, dropped: &mut Dropped) -> Vec<File
         .filter_map(|(name, slots)| {
             // The file's part is the one it entered the most tokens under.
             let (&(kind, part), _) = slots.iter().max_by(|a, b| {
-                (a.1)
-                    .0
-                    .tokens
-                    .cmp(&(b.1).0.tokens)
-                    .then_with(|| b.0.cmp(a.0))
+                let a_tokens = if recent_only {
+                    (a.1).1.tokens
+                } else {
+                    (a.1).0.tokens
+                };
+                let b_tokens = if recent_only {
+                    (b.1).1.tokens
+                } else {
+                    (b.1).0.tokens
+                };
+                a_tokens.cmp(&b_tokens).then_with(|| b.0.cmp(a.0))
             })?;
             let mut all = FileTotals::default();
             let mut recent = FileTotals::default();
@@ -850,6 +948,7 @@ fn count_file_sessions(scope: &Scope, window: Window, rows: &mut [FileRow]) {
 fn build_sessions(
     scope: &Scope,
     window: Window,
+    tool_labels: bool,
     dropped: &mut Dropped,
 ) -> (Vec<SessionRow>, u64, u64) {
     struct Row<'a> {
@@ -878,6 +977,9 @@ fn build_sessions(
         let mut recent = 0u64;
         let mut other = 0u64;
         for (day, kinds) in &totals.days {
+            if !window.contains(*day) {
+                continue;
+            }
             for (kind, tokens) in kinds {
                 if !is_v2(*kind) {
                     other += tokens;
@@ -926,6 +1028,11 @@ fn build_sessions(
             continue;
         }
         out.push(SessionRow {
+            top_tool: if tool_labels {
+                session_top_tool(scope, row.id, window, dropped)
+            } else {
+                None
+            },
             session_id_hash: format!("sha256:{}", sha256_hex(&[row.id])),
             source_session_id: row.id.to_string(),
             top_kind_tokens_entered_est: row.top_tokens,
@@ -946,4 +1053,36 @@ impl TopKind for Option<(Kind, u64)> {
     fn is_none_or_less(&self, tokens: u64) -> bool {
         self.map_or(true, |(_, best)| tokens > best)
     }
+}
+
+/// Largest tool by entered tokens, never call frequency. Incomplete histories
+/// and unsafe winners are omitted rather than replaced by a guessed runner-up.
+fn session_top_tool(
+    scope: &Scope,
+    id: &str,
+    window: Window,
+    dropped: &mut Dropped,
+) -> Option<SessionTool> {
+    let tools = scope.agg.sessions.get(id)?.tools.as_ref()?;
+    let mut totals: BTreeMap<&str, (Kind, u64)> = BTreeMap::new();
+    for ((day, tool), (kind, tokens)) in tools {
+        if window.contains(*day) {
+            let entry = totals.entry(tool).or_insert((*kind, 0));
+            entry.0 = *kind;
+            entry.1 += tokens;
+        }
+    }
+    let (tool, (kind, tokens)) = totals
+        .into_iter()
+        .max_by(|a, b| a.1 .1.cmp(&b.1 .1).then_with(|| b.0.cmp(a.0)))?;
+    if tokens == 0 {
+        return None;
+    }
+    let row = tool_row(tool, kind, "all", 0, 0, tokens, dropped)?;
+    Some(SessionTool {
+        label: row.label,
+        server_label: row.server,
+        kind: row.kind,
+        tokens_entered_est: tokens,
+    })
 }

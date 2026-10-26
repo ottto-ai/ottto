@@ -87,3 +87,21 @@ not erase a contract-origin counter. Budget merges conservatively bind that
 unknown witness to the learned body, while two different known bodies retain
 the existing independent-pair behavior. A separate real-scanner conflict case
 covers the absent-body migration and its two-acquisition bound.
+
+## ACK lifetime across a post-upload crash
+
+Incremental upload input is a delta, not a census. A crash after an exact ACK
+is saved in upload progress but before index settlement can leave that ACK
+outside the next scan's empty or unrelated-only delta. Preserving its body in
+test input masked this reachable production boundary. Upload-progress ACK
+retention now owns that lifetime independently of the current delta and retires
+evidence only after durable index adoption or a bound retirement handoff.
+
+Contract-retry tests no longer insert an already ACKed sibling into uploader
+input. The SOURCE regression claims and reads the held file, saves its validated
+ACK through the actual uploader, drops both checkpoint objects before index
+settlement, and resumes using the scanner's actual empty or unrelated-only
+delta. It checks both crash windows, no reread of the accepted file, exact body
+witness retention, durable index adoption, and preserved bindings, contract token
+and latch. The existing conflict and failed-outcome-save tests retain every
+ACK/read-cap assertion while excluding the ACKed sibling from upload input.

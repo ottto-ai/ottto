@@ -25,6 +25,7 @@ use crate::claude_local_otel::{
     ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport, ClaudeRequestIdentityEvidence,
     ClaudeTraceOwnershipEvidence, ClaudeTraceOwnershipLoadReport,
 };
+use ottto_protocol::{ActiveSessionAccountUse, ActiveSessionCurrentAccount};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
@@ -277,6 +278,9 @@ struct Amounts {
     poisoned: [bool; 5],
     /// Some request carried no observed money at all.
     cost_missing: bool,
+    /// Local display only: the newest own transcript request folded here.
+    /// Never on the wire and never compared with a row.
+    last_at: Option<OffsetDateTime>,
 }
 
 impl Amounts {
@@ -306,6 +310,7 @@ impl Amounts {
         }
         self.observed |= other.observed;
         self.cost_missing |= other.cost_missing;
+        self.last_at = self.last_at.max(other.last_at);
         for index in 0..5 {
             self.poisoned[index] |= other.poisoned[index];
             if let Some(value) = other.costs[index] {
@@ -410,6 +415,95 @@ pub(crate) struct Grouping {
     /// disagrees with its occurrence: such a grouping is never tagged.
     unowned_request: bool,
     desktop_recent: crate::desktop_recent::RecentActivity,
+    /// Local display only: the item's newest own transcript requests.
+    latest: LatestRequests,
+}
+
+/// At most this many distinct (row, key) requests share the newest time;
+/// more makes the current account unknown rather than growing.
+const MAX_LATEST_TIES: usize = 4;
+
+/// The newest own transcript requests, by their own full-precision time (not
+/// their hour bucket), folded in any order: every distinct (bucket row, key)
+/// at that instant, bounded by `MAX_LATEST_TIES`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LatestRequests {
+    at: Option<OffsetDateTime>,
+    ties: Vec<(String, RowKey, Option<AuthorityKey>)>,
+    ties_overflowed: bool,
+    /// A transcript request's time did not parse: no request is provably newest.
+    unordered: bool,
+}
+
+impl LatestRequests {
+    fn note(
+        &mut self,
+        at: OffsetDateTime,
+        bucket_start: &str,
+        row_key: &RowKey,
+        key: Option<KeyRef<'_>>,
+    ) {
+        let same = |(bucket, row, known): &(String, RowKey, Option<AuthorityKey>)| {
+            bucket == bucket_start
+                && row == row_key
+                && match (known, key) {
+                    (None, None) => true,
+                    (Some(known), Some(key)) => key.matches(known),
+                    _ => false,
+                }
+        };
+        match self.at.cmp(&Some(at)) {
+            std::cmp::Ordering::Greater => return,
+            std::cmp::Ordering::Less => {
+                self.at = Some(at);
+                self.ties_overflowed = false;
+                // Reuse a retained tie, including its string buffers, when a
+                // newer request replaces the previous newest set. Alternating
+                // accounts must not allocate copies on every request.
+                if let Some(index) = self.ties.iter().position(same) {
+                    self.ties.swap(0, index);
+                    self.ties.truncate(1);
+                    return;
+                }
+                if let Some((bucket, row, known)) = self.ties.first_mut() {
+                    bucket_start.clone_into(bucket);
+                    if *row != *row_key {
+                        *row = row_key.clone();
+                    }
+                    match (known.as_mut(), key) {
+                        (Some(known), Some(key)) => {
+                            for (stored, incoming) in
+                                [(&mut known.login, key.login), (&mut known.org, key.org)]
+                            {
+                                match (stored.as_mut(), incoming) {
+                                    (Some(stored), Some(incoming)) => incoming.clone_into(stored),
+                                    (_, incoming) => *stored = incoming.map(str::to_string),
+                                }
+                            }
+                            known.basis = key.basis;
+                        }
+                        (_, key) => *known = key.map(KeyRef::to_key),
+                    }
+                    self.ties.truncate(1);
+                    return;
+                }
+            }
+            std::cmp::Ordering::Equal => {
+                if self.ties.iter().any(same) {
+                    return;
+                }
+                if self.ties.len() == MAX_LATEST_TIES {
+                    self.ties_overflowed = true;
+                    return;
+                }
+            }
+        }
+        self.ties.push((
+            bucket_start.to_string(),
+            row_key.clone(),
+            key.map(KeyRef::to_key),
+        ));
+    }
 }
 
 impl Grouping {
@@ -431,9 +525,11 @@ impl Grouping {
             excluded_requests: Some(0),
             unowned_request: false,
             desktop_recent: crate::desktop_recent::RecentActivity::default(),
+            latest: LatestRequests::default(),
         }
     }
 
+    #[cfg(test)]
     pub(super) fn add(
         &mut self,
         bucket_start: &str,
@@ -441,9 +537,29 @@ impl Grouping {
         usage: &UsageTotals,
         identity: IdentityRef<'_>,
     ) {
+        self.add_at(bucket_start, row_key, usage, identity, None);
+    }
+
+    /// `add` for an own transcript request at its own time (`Some`), which
+    /// orders it for local display. Auxiliary telemetry-only requests pass
+    /// `None`: their clock may be the observer's, so they never decide the
+    /// current account or a last use.
+    pub(super) fn add_at(
+        &mut self,
+        bucket_start: &str,
+        row_key: &RowKey,
+        usage: &UsageTotals,
+        identity: IdentityRef<'_>,
+        transcript_at: Option<&str>,
+    ) {
         if self.failed.is_some() {
             return;
         }
+        let at = transcript_at.and_then(|text| {
+            let at = OffsetDateTime::parse(text, &Rfc3339).ok();
+            self.latest.unordered |= at.is_none();
+            at
+        });
         if !self
             .groups
             .get(bucket_start)
@@ -468,6 +584,7 @@ impl Grouping {
             self.failed = Some(Ineligible::RowsNotReproduced);
             return;
         }
+        group.total.last_at = group.total.last_at.max(at);
         let key = match identity {
             // Only a strictly lowercase-hex login reaches the wire; anything
             // else is refused here, never transformed into another identity.
@@ -506,6 +623,11 @@ impl Grouping {
         };
         if amounts.add(usage).is_none() {
             self.failed = Some(Ineligible::RowsNotReproduced);
+            return;
+        }
+        amounts.last_at = amounts.last_at.max(at);
+        if let Some(at) = at {
+            self.latest.note(at, bucket_start, row_key, key);
         }
     }
 
@@ -520,16 +642,21 @@ impl Grouping {
         for group in self.groups.values_mut().flat_map(BTreeMap::values_mut) {
             let mut kept: BTreeMap<Option<AuthorityKey>, Amounts> = BTreeMap::new();
             for (key, amounts) in std::mem::take(&mut group.by_key) {
-                let key = key.and_then(|key| match key.basis {
-                    TELEMETRY => Some(key),
-                    TELEMETRY_LOGIN => Some(AuthorityKey { org: None, ..key }),
-                    _ => None,
-                });
-                if kept.entry(key).or_default().merge(&amounts).is_none() {
+                if kept
+                    .entry(key.and_then(withdrawn))
+                    .or_default()
+                    .merge(&amounts)
+                    .is_none()
+                {
                     self.failed = Some(Ineligible::RowsNotReproduced);
                 }
             }
             group.by_key = kept;
+        }
+        // The newest requests' keys withdraw the same way; ties that now
+        // agree stay separate entries naming one triple.
+        for (_, _, key) in &mut self.latest.ties {
+            *key = key.take().and_then(withdrawn);
         }
     }
 
@@ -592,6 +719,27 @@ pub(crate) fn apply(
             contribution.identity.as_ref(),
         );
     }
+    apply_grouped(item, grouping)
+}
+
+/// `apply` with each request's own transcript time (`None`: auxiliary),
+/// withdrawing transcript tags first exactly as `tag_item` does.
+#[cfg(test)]
+pub(crate) fn apply_timed(
+    item: &mut SnapshotItem,
+    requests: &[(Contribution, Option<&str>)],
+) -> Result<Tagged, Ineligible> {
+    let mut grouping = Grouping::new(bucket_row_count(item));
+    for (contribution, at) in requests {
+        grouping.add_at(
+            &contribution.bucket_start,
+            &contribution.row_key,
+            &contribution.usage,
+            contribution.identity.as_ref(),
+            *at,
+        );
+    }
+    grouping.withdraw_transcript_tags();
     apply_grouped(item, grouping)
 }
 
@@ -658,6 +806,7 @@ pub(crate) fn apply_grouped(
             group.refused = true;
         }
     }
+    let display = |withheld: bool| Some(Box::new(account_display(&grouping, withheld)));
 
     let evidence = grouping
         .rows()
@@ -750,6 +899,7 @@ pub(crate) fn apply_grouped(
         install(item, &evidence, top_identities, bucket_identities, refusals);
         if item_bytes(item) <= MAX_ITEM_BYTES {
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+            item.claude_account_display = display(grouping.unowned_request);
             return Ok(Tagged::Sent { refusals });
         }
         over_cap.insert(OverCap::Bytes);
@@ -763,10 +913,162 @@ pub(crate) fn apply_grouped(
     }
     item.request_identity_refusals = refusals;
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+    // The rows carry no identity, so neither may the display.
+    item.claude_account_display = display(true);
     Ok(Tagged::Fallback {
         over_cap: over_cap.into_iter().collect(),
         refusals,
     })
+}
+
+fn withdrawn(key: AuthorityKey) -> Option<AuthorityKey> {
+    match key.basis {
+        TELEMETRY => Some(key),
+        TELEMETRY_LOGIN => Some(AuthorityKey { org: None, ..key }),
+        _ => None,
+    }
+}
+
+/// Local display evidence of a tagged item's accounts, read from the same
+/// final grouping its wire rows are: usage per (account, workspace,
+/// subscription) and the account of its newest own transcript request. Never
+/// serialized or uploaded, and never account evidence for anything else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AccountDisplay {
+    pub(crate) current: ActiveSessionCurrentAccount,
+    pub(crate) history: Vec<ActiveSessionAccountUse>,
+}
+
+pub(crate) const CURRENT_KNOWN: &str = "known";
+pub(crate) const CURRENT_UNKNOWN: &str = "unknown";
+const LATEST_UNIDENTIFIED: &str = "latest_request_unidentified";
+const LATEST_CONFLICTING: &str = "conflicting_latest_requests";
+const ORDER_UNAVAILABLE: &str = "request_order_unavailable";
+pub(crate) const IDENTITY_WITHHELD: &str = "identity_withheld";
+
+/// (account, workspace, subscription), compared whole.
+type AccountTriple = (Option<String>, Option<String>, Option<String>);
+
+fn account_triple(key: Option<&AuthorityKey>, row_key: &RowKey) -> AccountTriple {
+    (
+        key.and_then(|key| key.login.clone()),
+        key.and_then(|key| key.org.clone()),
+        row_key.subscription_product.clone(),
+    )
+}
+
+fn display_time(at: Option<OffsetDateTime>) -> Option<String> {
+    at?.to_offset(time::UtcOffset::UTC).format(&Rfc3339).ok()
+}
+
+/// `withheld`: the rows carry no identity, so every use is unnamed and the
+/// current account is unknown.
+fn account_display(grouping: &Grouping, withheld: bool) -> AccountDisplay {
+    let mut uses: BTreeMap<AccountTriple, ([u64; 8], Option<OffsetDateTime>)> = BTreeMap::new();
+    for (row_key, group) in grouping.rows() {
+        let named = (!withheld).then_some(&group.by_key);
+        let entries = named
+            .into_iter()
+            .flatten()
+            .map(|(key, amounts)| (key.as_ref(), amounts));
+        let unnamed = withheld.then_some((None, &group.total));
+        for (key, amounts) in entries.chain(unnamed) {
+            if amounts.counts == [0; 8] {
+                continue;
+            }
+            let (counts, last_at) = uses.entry(account_triple(key, row_key)).or_default();
+            for (total, value) in counts.iter_mut().zip(amounts.counts) {
+                *total = total.saturating_add(value);
+            }
+            *last_at = (*last_at).max(amounts.last_at);
+        }
+    }
+
+    let latest = &grouping.latest;
+    let current = if withheld {
+        Err(IDENTITY_WITHHELD)
+    } else if latest.unordered || latest.at.is_none() {
+        Err(ORDER_UNAVAILABLE)
+    } else if latest.ties_overflowed {
+        Err(LATEST_CONFLICTING)
+    } else {
+        // A newest request's key counts only while its row still carries it
+        // (an unsplittable row was untagged after the request was noted).
+        let triples = latest
+            .ties
+            .iter()
+            .map(|(bucket_start, row_key, key)| {
+                let carried = key.as_ref().filter(|key| {
+                    grouping
+                        .get(bucket_start, row_key)
+                        .and_then(|group| group.by_key.get(&Some((*key).clone())))
+                        .is_some_and(|amounts| amounts.counts != [0; 8])
+                });
+                account_triple(carried, row_key)
+            })
+            .collect::<BTreeSet<_>>();
+        if triples.iter().any(|(account, _, _)| account.is_none()) {
+            Err(LATEST_UNIDENTIFIED)
+        } else if triples.len() != 1 {
+            Err(LATEST_CONFLICTING)
+        } else {
+            Ok(triples.into_iter().next().expect("one triple"))
+        }
+    };
+
+    let mut history = uses
+        .into_iter()
+        .map(|(triple, (counts, last_at))| {
+            let current = current.as_ref().is_ok_and(|current| *current == triple);
+            let (account, organization, subscription) = triple;
+            (
+                last_at,
+                ActiveSessionAccountUse {
+                    account_identifier_hash: account,
+                    organization_identifier_hash: organization,
+                    subscription_product: subscription,
+                    input_tokens: counts[0],
+                    output_tokens: counts[1],
+                    cache_read_tokens: counts[2],
+                    cache_creation_5m_tokens: counts[3],
+                    cache_creation_1h_tokens: counts[4],
+                    request_count: counts[7],
+                    last_used_at: display_time(last_at),
+                    current,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    // Newest use first, uses without a provable time last; ties keep triple order.
+    history.sort_by(|(left, _), (right, _)| match (left, right) {
+        (Some(left), Some(right)) => right.cmp(left),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    let latest_request_at = display_time(latest.at);
+    let current = match current {
+        Ok((account, organization, subscription)) => ActiveSessionCurrentAccount {
+            status: CURRENT_KNOWN.to_string(),
+            account_identifier_hash: account,
+            organization_identifier_hash: organization,
+            subscription_product: subscription,
+            latest_request_at,
+            unknown_reason: None,
+        },
+        Err(reason) => ActiveSessionCurrentAccount {
+            status: CURRENT_UNKNOWN.to_string(),
+            account_identifier_hash: None,
+            organization_identifier_hash: None,
+            subscription_product: None,
+            latest_request_at,
+            unknown_reason: Some(reason.to_string()),
+        },
+    };
+    AccountDisplay {
+        current,
+        history: history.into_iter().map(|(_, entry)| entry).collect(),
+    }
 }
 
 fn reproduces(row: &SnapshotModelUsage, amounts: &Amounts) -> Result<(), Ineligible> {
@@ -2000,11 +2302,22 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 identity,
             );
         }
-        self.grouping.add(
+        self.grouping.add_at(
             request.bucket_start,
             request.row_key,
             request.usage,
             identity,
+            // The owned occurrence's own complete clock, never the observer
+            // time a reported rebuild falls back to. A response with an
+            // unstamped record keeps an earlier record's time, which proves no
+            // order: without a complete clock ("") no request is provably newest.
+            request.occurrence.map(|(_, event_clock_complete)| {
+                item.claude_usage_occurrences
+                    .get(request.request_id)
+                    .and_then(|occurrence| occurrence.timestamp.as_deref())
+                    .filter(|_| event_clock_complete)
+                    .unwrap_or("")
+            }),
         );
     }
 
@@ -2324,3 +2637,6 @@ fn tag_item(
 crate::heap_layout_bound::fields!(OrgMarkers; entries, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
 crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_seconds, process_id, inventory);
+crate::heap_layout_bound::fields!(AccountDisplay; current, history);
+crate::heap_layout_bound::fields!(ActiveSessionCurrentAccount; status, account_identifier_hash, organization_identifier_hash, subscription_product, latest_request_at, unknown_reason);
+crate::heap_layout_bound::fields!(ActiveSessionAccountUse; account_identifier_hash, organization_identifier_hash, subscription_product, request_count, input_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, output_tokens, last_used_at, current);

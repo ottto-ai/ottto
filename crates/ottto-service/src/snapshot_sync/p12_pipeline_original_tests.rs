@@ -153,6 +153,8 @@ struct RearmBodyTrace {
 }
 
 struct RearmFixture {
+    // New structural-guard acceptance opts into the real save-before-read seam.
+    reread_guard_cache: Option<std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>>,
     case: &'static str,
     base: PathBuf,
     root: PathBuf,
@@ -161,6 +163,7 @@ struct RearmFixture {
     progress_path: PathBuf,
     request_identity: bool,
     native_file_limit: usize,
+    serial_active_frame: bool,
     owned_base_preparation: bool,
     body_trace: std::cell::RefCell<RearmBodyTrace>,
     native_lifecycle:
@@ -181,9 +184,11 @@ impl RearmFixture {
             std::fs::create_dir_all(directory).expect("create synthetic directory");
         }
         let fixture = Self {
+            reread_guard_cache: None,
             case,
             request_identity: false,
             native_file_limit: REARM_PAGE_FILES,
+            serial_active_frame: false,
             owned_base_preparation: false,
             body_trace: Default::default(),
             native_lifecycle: std::sync::Arc::new(Default::default()),
@@ -315,7 +320,11 @@ impl RearmFixture {
         collected_at: &str,
     ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
         let frame = self.native_preparation(index, collected_at);
-        collect_native_preparation_with_rotation(frame, true)
+        if self.serial_active_frame {
+            collect_unparkable_preparation_with_rotation(frame)
+        } else {
+            collect_native_preparation_with_rotation(frame, true)
+        }
     }
 
     fn native_preparation(&self, index: ScanIndex, collected_at: &str) -> SourcePreparation {
@@ -333,6 +342,12 @@ impl RearmFixture {
             true, // Match its context-curve setting; byte parity includes it.
             self.request_identity,
         );
+        if let Some(cache) = self.reread_guard_cache.as_ref() {
+            scan = scan.with_reread_persistence().with_sampled_acquisition(
+                cache.clone(),
+                crate::transcript_acquisition::Scope("structural-reread-fixture".into()),
+            );
+        }
         if crate::snapshots::claude_native_comparison::enabled() {
             scan.enable_native_comparison();
         }
@@ -407,7 +422,27 @@ impl RearmFixture {
         upload: RearmUpload,
         target: Option<&str>,
     ) -> RearmPage {
-        let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.page_with_input_index(collected_at, upload, target, None)
+    }
+
+    /// Scale-only adapter: retain ordinary settled state between the explicit
+    /// durable checkpoints, without repeatedly decoding the same large index.
+    fn scale_page(&self, index: ScanIndex, collected_at: &str) -> RearmPage {
+        assert!(self.serial_active_frame);
+        assert!(!crate::snapshots::claude_native_comparison::enabled());
+        self.page_with_input_index(collected_at, RearmUpload::Accept, None, Some(index))
+    }
+
+    fn page_with_input_index(
+        &self,
+        collected_at: &str,
+        upload: RearmUpload,
+        target: Option<&str>,
+        input: Option<ScanIndex>,
+    ) -> RearmPage {
+        let checkpoint = input.is_none();
+        let mut index =
+            input.unwrap_or_else(|| ScanIndex::load(&self.index_path).expect("load scan index"));
         index.activate_upload_context("upload-context-rearm".to_string());
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
@@ -792,16 +827,18 @@ impl RearmFixture {
         );
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");
-        save_index_and_publish_manifest(
-            &mut index,
-            &self.index_path,
-            REARM_DESTINATION,
-            SnapshotSource::ClaudeCode,
-            census_complete,
-            &window_start,
-            &window_end,
-        )
-        .expect("save index and publish manifest");
+        if checkpoint {
+            save_index_and_publish_manifest(
+                &mut index,
+                &self.index_path,
+                REARM_DESTINATION,
+                SnapshotSource::ClaudeCode,
+                census_complete,
+                &window_start,
+                &window_end,
+            )
+            .expect("save index and publish manifest");
+        }
         let mut native_receipts = 0;
         if let Some(frame) = native_preparation.as_mut() {
             if fully_settled
@@ -872,7 +909,11 @@ impl RearmFixture {
             scan,
             duplicate_census,
             parsed,
-            index: ScanIndex::load(&self.index_path).expect("reload scan index"),
+            index: if checkpoint {
+                ScanIndex::load(&self.index_path).expect("reload scan index")
+            } else {
+                index
+            },
             fully_settled,
             held: holds.held_fingerprints,
             offered,
@@ -1398,6 +1439,7 @@ fn native_comparison_pending_ack_corrective_parse_partial_save_and_terminal_use_
 fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture {
     let base = test_dir("native-parity-independent-index");
     RearmFixture {
+        reread_guard_cache: None,
         root: source.root.clone(),
         support: source.support.clone(),
         index_path: base.join("claude-scan-index.json"),
@@ -1406,6 +1448,7 @@ fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture 
         case: "native-parity-independent-index",
         request_identity: source.request_identity,
         native_file_limit: source.native_file_limit,
+        serial_active_frame: source.serial_active_frame,
         owned_base_preparation: source.owned_base_preparation,
         body_trace: Default::default(),
         native_lifecycle: std::sync::Arc::new(Default::default()),

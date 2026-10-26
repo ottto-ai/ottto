@@ -332,6 +332,8 @@ impl PipelineFixture {
         // Completed/restorable holds are the sole changed production route.
         // Keep all existing field/ACK/debt/restart assertions below, and compare
         // the full state at that boundary with the borrowed reference surface.
+        // Both whole-index arms may remember replay witnesses during restore.
+        let _reread_clock = crate::snapshots::reread_guard::TestClock::freeze();
         let borrowed_reference = (matches!(
             &upload,
             PipelineUpload::Accept
@@ -557,6 +559,8 @@ impl PipelineFixture {
 
 impl Drop for PipelineFixture {
     fn drop(&mut self) {
+        // A failed money assertion must not retain process-global capture funds.
+        drop(crate::snapshots::claude_request_money::ShadowTestCleanup::new(&self.support));
         let _ = std::fs::remove_dir_all(&self.base);
     }
 }

@@ -490,6 +490,7 @@ impl Scene {
             root: root.clone(),
             parent,
             child: CandidateFile {
+                physical_identity: None,
                 scan_root: root,
                 path: child_path,
                 size_bytes: 0,

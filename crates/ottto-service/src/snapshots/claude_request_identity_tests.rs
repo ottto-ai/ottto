@@ -4420,3 +4420,505 @@ fn desktop_recent_refuses_foreign_conflicting_and_other_account_requests_without
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+// --- Local account display: current account and account history -------------
+
+/// One own request of the account-display tests: plan, hour bucket, input
+/// tokens, identity and own transcript time (`None`: auxiliary request).
+struct DisplayRequest {
+    plan: Option<&'static str>,
+    bucket: &'static str,
+    tokens: u64,
+    identity: RequestIdentity,
+    at: Option<&'static str>,
+}
+
+const HOUR_10: &str = "2026-09-01T10:00:00Z";
+const HOUR_11: &str = "2026-09-01T11:00:00Z";
+
+fn display_request(
+    plan: Option<&'static str>,
+    bucket: &'static str,
+    tokens: u64,
+    identity: RequestIdentity,
+    at: Option<&'static str>,
+) -> DisplayRequest {
+    DisplayRequest {
+        plan,
+        bucket,
+        tokens,
+        identity,
+        at,
+    }
+}
+
+fn display_row(plan: Option<&str>) -> SnapshotModelUsage {
+    let mut row = typed_row(
+        &json!({"model": "claude-haiku-4-5", "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_creation_5m_tokens": 0, "cache_creation_1h_tokens": 0,
+        "reasoning_output_tokens": 0, "request_count": 0}),
+    );
+    row.subscription_product = plan.map(str::to_string);
+    row
+}
+
+/// An untagged item whose rows the requests reproduce, and the requests.
+fn display_item(
+    requests: &[DisplayRequest],
+) -> (SnapshotItem, Vec<(Contribution, Option<&'static str>)>) {
+    let mut item = valid_v6_batch_request().snapshots.remove(0);
+    item.provenance.collector = "claude_code_jsonl".to_string();
+    let mut top: BTreeMap<Option<&str>, SnapshotModelUsage> = BTreeMap::new();
+    let mut buckets: BTreeMap<&str, BTreeMap<Option<&str>, SnapshotModelUsage>> = BTreeMap::new();
+    for request in requests {
+        for row in [
+            top.entry(request.plan)
+                .or_insert_with(|| display_row(request.plan)),
+            buckets
+                .entry(request.bucket)
+                .or_default()
+                .entry(request.plan)
+                .or_insert_with(|| display_row(request.plan)),
+        ] {
+            row.input_tokens += request.tokens;
+            row.request_count += 1;
+        }
+    }
+    item.model_usage = top.into_values().collect();
+    item.usage_buckets = buckets
+        .into_iter()
+        .map(|(bucket_start, rows)| SnapshotUsageBucket {
+            bucket_start: bucket_start.to_string(),
+            model_usage: rows.into_values().collect(),
+            first_activity_at: None,
+            last_activity_at: None,
+        })
+        .collect();
+    let contributions = requests
+        .iter()
+        .map(|request| {
+            let mut one = display_row(request.plan);
+            one.input_tokens = request.tokens;
+            one.request_count = 1;
+            (
+                Contribution {
+                    bucket_start: request.bucket.to_string(),
+                    row_key: row_key_from_model_usage(&one),
+                    usage: holder_usage(&one, None),
+                    identity: request.identity.clone(),
+                },
+                request.at,
+            )
+        })
+        .collect();
+    (item, contributions)
+}
+
+fn displayed(requests: &[DisplayRequest]) -> (SnapshotItem, identity::AccountDisplay) {
+    let (mut item, contributions) = display_item(requests);
+    identity::apply_timed(&mut item, &contributions).expect("reproduces");
+    let display = *item.claude_account_display.clone().expect("display");
+    (item, display)
+}
+
+fn hex(c: char) -> String {
+    c.to_string().repeat(64)
+}
+
+fn login_org(login: char, org: Option<char>, basis: &'static str) -> RequestIdentity {
+    RequestIdentity::Tagged(AuthorityKey {
+        login: Some(hex(login)),
+        org: org.map(hex),
+        basis,
+    })
+}
+
+/// (account, workspace, plan, requests, input tokens, last use, current).
+type Use = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    u64,
+    u64,
+    Option<String>,
+    bool,
+);
+
+fn uses(display: &identity::AccountDisplay) -> Vec<Use> {
+    display
+        .history
+        .iter()
+        .map(|entry| {
+            (
+                entry.account_identifier_hash.clone(),
+                entry.organization_identifier_hash.clone(),
+                entry.subscription_product.clone(),
+                entry.request_count,
+                entry.input_tokens,
+                entry.last_used_at.clone(),
+                entry.current,
+            )
+        })
+        .collect()
+}
+
+fn current_of(display: &identity::AccountDisplay) -> (&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
+    let current = &display.current;
+    (
+        current.status.as_str(),
+        current.account_identifier_hash.as_deref(),
+        current.organization_identifier_hash.as_deref(),
+        current.subscription_product.as_deref(),
+        current.unknown_reason.as_deref(),
+    )
+}
+
+fn owned(value: &str) -> Option<String> {
+    Some(value.to_string())
+}
+
+/// A -> B -> A inside one hour bucket: the newest request decides, by its own
+/// time, in any input order; the history keeps both accounts exactly.
+#[test]
+fn current_account_follows_the_newest_request_not_its_hour_bucket() {
+    let requests = || {
+        vec![
+            display_request(Some("max"), HOUR_10, 10, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:05:00.100Z")),
+            display_request(Some("max"), HOUR_10, 20, login_org('b', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:20:00Z")),
+            display_request(Some("max"), HOUR_10, 30, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:40:00.250Z")),
+        ]
+    };
+    let (_, display) = displayed(&requests());
+    assert_eq!(
+        current_of(&display),
+        ("known", Some(hex('a').as_str()), Some(hex('d').as_str()), Some("max"), None)
+    );
+    assert_eq!(
+        display.current.latest_request_at.as_deref(),
+        Some("2026-09-01T10:40:00.25Z")
+    );
+    assert_eq!(
+        uses(&display),
+        vec![
+            (owned(&hex('a')), owned(&hex('d')), owned("max"), 2, 40, owned("2026-09-01T10:40:00.25Z"), true),
+            (owned(&hex('b')), owned(&hex('d')), owned("max"), 1, 20, owned("2026-09-01T10:20:00Z"), false),
+        ]
+    );
+    // Every input order folds to the same display.
+    for order in [[2, 1, 0], [1, 2, 0], [2, 0, 1]] {
+        let mut shuffled = requests();
+        let mut reordered = Vec::new();
+        for index in order {
+            reordered.push(std::mem::replace(
+                &mut shuffled[index],
+                display_request(None, HOUR_10, 0, RequestIdentity::Missing, None),
+            ));
+        }
+        assert_eq!(displayed(&reordered).1, display, "{order:?}");
+    }
+    // B last: B is current, across buckets too.
+    let mut b_last = requests();
+    b_last[1].bucket = HOUR_11;
+    b_last[1].at = Some("2026-09-01T11:01:00Z");
+    let (_, display) = displayed(&b_last);
+    assert_eq!(display.current.account_identifier_hash, owned(&hex('b')));
+}
+
+/// A newer unidentified request makes the current account unknown; it never
+/// falls back to the previous or the most-used account. Totals stay whole.
+#[test]
+fn a_newer_unidentified_request_clears_the_current_account() {
+    let (item, display) = displayed(&[
+        display_request(Some("max"), HOUR_10, 500, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:05:00Z")),
+        display_request(Some("max"), HOUR_10, 7, RequestIdentity::Missing, Some("2026-09-01T10:06:00Z")),
+        display_request(Some("max"), HOUR_11, 9, RequestIdentity::Refused(Refusal::Pending), Some("2026-09-01T11:00:00Z")),
+    ]);
+    assert_eq!(
+        current_of(&display),
+        ("unknown", None, None, None, Some("latest_request_unidentified"))
+    );
+    assert_eq!(
+        display.current.latest_request_at.as_deref(),
+        Some("2026-09-01T11:00:00Z")
+    );
+    assert_eq!(
+        uses(&display),
+        vec![
+            (None, None, owned("max"), 2, 16, owned("2026-09-01T11:00:00Z"), false),
+            (owned(&hex('a')), owned(&hex('d')), owned("max"), 1, 500, owned("2026-09-01T10:05:00Z"), false),
+        ]
+    );
+    let row_requests: u64 = item.usage_buckets.iter().flat_map(|b| &b.model_usage).map(|r| r.request_count).sum();
+    let row_input: u64 = item.usage_buckets.iter().flat_map(|b| &b.model_usage).map(|r| r.input_tokens).sum();
+    assert_eq!(display.history.iter().map(|u| u.request_count).sum::<u64>(), row_requests);
+    assert_eq!(display.history.iter().map(|u| u.input_tokens).sum::<u64>(), row_input);
+}
+
+/// Requests at the same newest instant that disagree on any of account,
+/// workspace or plan leave the current account unknown; agreeing ones do not.
+#[test]
+fn equal_newest_times_with_different_triples_are_unknown() {
+    const AT: Option<&str> = Some("2026-09-01T10:30:00Z");
+    for (case, second) in [
+        ("account", display_request(Some("max"), HOUR_10, 2, login_org('b', Some('d'), identity::TELEMETRY), AT)),
+        ("workspace", display_request(Some("max"), HOUR_10, 2, login_org('a', Some('e'), identity::TELEMETRY), AT)),
+        ("plan", display_request(Some("pro"), HOUR_10, 2, login_org('a', Some('d'), identity::TELEMETRY), AT)),
+        ("unidentified", display_request(Some("max"), HOUR_10, 2, RequestIdentity::Missing, AT)),
+    ] {
+        let (_, display) = displayed(&[
+            display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), AT),
+            second,
+            display_request(Some("max"), HOUR_10, 4, login_org('c', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:29:59.999Z")),
+        ]);
+        assert_eq!(display.current.status, "unknown", "{case}");
+        let reason = if case == "unidentified" { "latest_request_unidentified" } else { "conflicting_latest_requests" };
+        assert_eq!(display.current.unknown_reason.as_deref(), Some(reason), "{case}");
+    }
+    // The same triple twice at the newest instant is still that triple.
+    let (_, display) = displayed(&[
+        display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), AT),
+        display_request(Some("max"), HOUR_10, 2, login_org('a', Some('d'), identity::TELEMETRY), AT),
+    ]);
+    assert_eq!(display.current.account_identifier_hash, owned(&hex('a')));
+}
+
+/// A newer request replaces the entire conflicting tie set, even when its
+/// storage reuses one of those ties. No old account/workspace/plan may survive.
+#[test]
+fn newer_request_replaces_conflicting_latest_ties() {
+    for (plan, identity) in [
+        (Some("max"), login_org('b', Some('e'), identity::TELEMETRY)),
+        (Some("pro"), login_org('c', None, identity::TELEMETRY_LOGIN)),
+        (None, RequestIdentity::Missing),
+    ] {
+        let latest = display_request(plan, HOUR_10, 4, identity, Some("2026-09-01T10:31:00Z"));
+        let expected = displayed(std::slice::from_ref(&latest)).1.current;
+        let (_, actual) = displayed(&[
+            display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:30:00Z")),
+            display_request(Some("max"), HOUR_10, 2, login_org('b', Some('e'), identity::TELEMETRY), Some("2026-09-01T10:30:00Z")),
+            latest,
+        ]);
+        assert_eq!(actual.current, expected);
+        assert_eq!(actual.history.iter().map(|entry| entry.request_count).sum::<u64>(), 3);
+    }
+}
+
+/// One login across two workspaces and two plans: every exact triple stays
+/// its own use, and the current one names the newest request's own workspace
+/// and plan, never the first observation's.
+#[test]
+fn one_login_keeps_each_workspace_and_plan_apart() {
+    let (_, display) = displayed(&[
+        display_request(Some("team"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:01:00Z")),
+        display_request(Some("team"), HOUR_10, 2, login_org('a', Some('e'), identity::TELEMETRY), Some("2026-09-01T10:02:00Z")),
+        display_request(Some("max"), HOUR_11, 4, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T11:03:00Z")),
+        display_request(Some("max"), HOUR_11, 8, login_org('a', None, identity::TELEMETRY_LOGIN), Some("2026-09-01T11:04:00Z")),
+    ]);
+    assert_eq!(
+        current_of(&display),
+        ("known", Some(hex('a').as_str()), None, Some("max"), None)
+    );
+    assert_eq!(
+        uses(&display),
+        vec![
+            (owned(&hex('a')), None, owned("max"), 1, 8, owned("2026-09-01T11:04:00Z"), true),
+            (owned(&hex('a')), owned(&hex('d')), owned("max"), 1, 4, owned("2026-09-01T11:03:00Z"), false),
+            (owned(&hex('a')), owned(&hex('e')), owned("team"), 1, 2, owned("2026-09-01T10:02:00Z"), false),
+            (owned(&hex('a')), owned(&hex('d')), owned("team"), 1, 1, owned("2026-09-01T10:01:00Z"), false),
+        ]
+    );
+}
+
+/// A transcript request without its own clock proves no order; an auxiliary
+/// telemetry-only request, newest or not, never decides the current account
+/// or a last use, though its usage counts.
+#[test]
+fn missing_clocks_and_auxiliary_requests_never_decide_the_current_account() {
+    let (_, display) = displayed(&[
+        display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:01:00Z")),
+        display_request(Some("max"), HOUR_10, 2, login_org('a', Some('d'), identity::TELEMETRY), Some("")),
+    ]);
+    assert_eq!(
+        current_of(&display),
+        ("unknown", None, None, None, Some("request_order_unavailable"))
+    );
+
+    let (_, display) = displayed(&[
+        display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:01:00Z")),
+        // Auxiliary, unidentified and observed later.
+        display_request(Some("max"), HOUR_11, 2, RequestIdentity::Missing, None),
+        // Auxiliary on another account.
+        display_request(Some("max"), HOUR_11, 4, login_org('b', Some('d'), identity::TELEMETRY), None),
+    ]);
+    assert_eq!(display.current.account_identifier_hash, owned(&hex('a')));
+    assert_eq!(
+        uses(&display),
+        vec![
+            (owned(&hex('a')), owned(&hex('d')), owned("max"), 1, 1, owned("2026-09-01T10:01:00Z"), true),
+            (None, None, owned("max"), 1, 2, None, false),
+            (owned(&hex('b')), owned(&hex('d')), owned("max"), 1, 4, None, false),
+        ]
+    );
+
+    // Only auxiliary requests: nothing is provably newest.
+    let (_, display) = displayed(&[display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), None)]);
+    assert_eq!(display.current.unknown_reason.as_deref(), Some("request_order_unavailable"));
+    assert_eq!(display.current.latest_request_at, None);
+}
+
+/// Transcript-marker tags withdraw from the display exactly as from the wire:
+/// an org-only newest request is unidentified, and login-only telemetry loses
+/// a marker org.
+#[test]
+fn withdrawn_transcript_tags_withdraw_from_the_display() {
+    let (item, display) = displayed(&[
+        display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY_LOGIN), Some("2026-09-01T10:01:00Z")),
+        display_request(Some("max"), HOUR_10, 2, RequestIdentity::Tagged(AuthorityKey { login: None, org: Some(hex('e')), basis: identity::TRANSCRIPT_ORG }), Some("2026-09-01T10:02:00Z")),
+    ]);
+    assert_eq!(display.current.unknown_reason.as_deref(), Some("latest_request_unidentified"));
+    assert_eq!(
+        uses(&display),
+        vec![
+            (None, None, owned("max"), 1, 2, owned("2026-09-01T10:02:00Z"), false),
+            (owned(&hex('a')), None, owned("max"), 1, 1, owned("2026-09-01T10:01:00Z"), false),
+        ]
+    );
+    assert!(item.request_evidence.iter().all(|entry| entry.provider_workspace_hash.is_none()));
+}
+
+/// A row whose money cannot be split is untagged on the wire, so its newest
+/// request names no account on the card either.
+#[test]
+fn an_unsplittable_row_untags_its_newest_request() {
+    let mut item = one_row_item(&[(10, Some("1")), (20, None)]);
+    let requests = vec![
+        (contribution(&item, 10, Some("1"), login_key(OWNER_A)), Some("2026-09-01T10:01:00Z")),
+        (contribution(&item, 20, None, login_key(OWNER_A)), Some("2026-09-01T10:02:00Z")),
+    ];
+    identity::apply_timed(&mut item, &requests).unwrap();
+    let display = item.claude_account_display.as_deref().unwrap();
+    assert_eq!(display.current.unknown_reason.as_deref(), Some("latest_request_unidentified"));
+    assert_eq!(display.history.len(), 1);
+    assert_eq!(display.history[0].account_identifier_hash, None);
+    assert_eq!(display.history[0].request_count, 2);
+}
+
+/// Over the identity caps the item falls back untagged: every use is unnamed
+/// and the current account is withheld. An ineligible item gets no display.
+/// The display never changes the wire bytes or the fingerprint.
+#[test]
+fn fallback_withholds_and_ineligible_items_carry_no_display() {
+    let requests = (0..17_u8)
+        .map(|n| {
+            DisplayRequest {
+                plan: Some("max"),
+                bucket: HOUR_10,
+                tokens: 1,
+                identity: RequestIdentity::Tagged(AuthorityKey {
+                    login: Some(format!("{n:064x}")),
+                    org: None,
+                    basis: identity::TELEMETRY,
+                }),
+                at: Some("2026-09-01T10:01:00Z"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let (mut item, contributions) = display_item(&requests);
+    let result = identity::apply_timed(&mut item, &contributions).unwrap();
+    assert!(matches!(result, Tagged::Fallback { .. }), "{result:?}");
+    let display = item.claude_account_display.as_deref().unwrap();
+    assert_eq!(display.current.unknown_reason.as_deref(), Some("identity_withheld"));
+    assert_eq!(
+        uses(display),
+        vec![(None, None, owned("max"), 17, 17, owned("2026-09-01T10:01:00Z"), false)]
+    );
+
+    // Rows the requests do not reproduce: today's path, no display.
+    let (mut item, mut contributions) = display_item(&requests[..2]);
+    contributions.pop();
+    let before = serde_json::to_vec(&item).unwrap();
+    assert!(identity::apply_timed(&mut item, &contributions).is_err());
+    assert!(item.claude_account_display.is_none());
+    assert_eq!(serde_json::to_vec(&item).unwrap(), before);
+
+    // Same requests with and without times: identical wire and fingerprint.
+    let two = [
+        display_request(Some("max"), HOUR_10, 1, login_org('a', Some('d'), identity::TELEMETRY), Some("2026-09-01T10:01:00Z")),
+        display_request(Some("pro"), HOUR_11, 2, login_org('b', Some('d'), identity::TELEMETRY), Some("2026-09-01T11:01:00Z")),
+    ];
+    let (mut timed, contributions) = display_item(&two);
+    let mut untimed = timed.clone();
+    identity::apply_timed(&mut timed, &contributions).unwrap();
+    let plain = contributions.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    identity::apply(&mut untimed, &plain).unwrap();
+    assert_eq!(serde_json::to_vec(&timed).unwrap(), serde_json::to_vec(&untimed).unwrap());
+    assert_eq!(timed.snapshot_fingerprint, untimed.snapshot_fingerprint);
+    let wire = serde_json::to_string(&timed).unwrap();
+    assert!(!wire.contains("latest_request_at") && !wire.contains("last_used_at"));
+}
+
+/// End to end on parsed requests: the newest own request's account is
+/// current, and a response without a complete event clock proves no order.
+#[test]
+fn transcript_path_current_account_is_the_newest_parsed_request() {
+    let (dir, root, mut items) = claude_account_family_fixture();
+    items.truncate(1);
+    let api = (1..=4)
+        .map(|n| {
+            let mut row = complete_api_row(&root, &format!("req_{n}"), n, 10, 10, 0);
+            if n > 2 {
+                row.account_identifier_hash = Some("b".repeat(64));
+            }
+            signed(row)
+        })
+        .collect::<Vec<_>>();
+    let trace = (1..=4)
+        .map(|n| complete_trace_row(&root, &format!("req_{n}"), ""))
+        .collect::<Vec<_>>();
+    let (api, trace) = reports(api, trace);
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let mut unclocked = items.clone();
+
+    identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+    let display = items[0].claude_account_display.as_deref().expect("display");
+    assert_eq!(display.current.status, "known");
+    assert_eq!(display.current.account_identifier_hash, Some("b".repeat(64)));
+    assert_eq!(
+        display.current.latest_request_at.as_deref(),
+        Some("2026-08-02T07:00:03Z")
+    );
+    let accounts = display
+        .history
+        .iter()
+        .map(|entry| {
+            (
+                entry.account_identifier_hash.clone(),
+                entry.request_count,
+                entry.last_used_at.clone(),
+                entry.current,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accounts,
+        vec![
+            (Some("b".repeat(64)), 2, Some("2026-08-02T07:00:03Z".to_string()), true),
+            (Some(OWNER_A.to_string()), 2, Some("2026-08-02T07:00:01Z".to_string()), false),
+        ]
+    );
+
+    unclocked[0]
+        .claude_usage_occurrences
+        .get_mut("req_1")
+        .unwrap()
+        .event_clock_complete = false;
+    identity::apply_scan(&mut unclocked, &evidence, BTreeMap::new());
+    if let Some(display) = unclocked[0].claude_account_display.as_deref() {
+        assert_eq!(display.current.status, "unknown");
+        assert_eq!(
+            display.current.unknown_reason.as_deref(),
+            Some("request_order_unavailable")
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}

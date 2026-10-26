@@ -394,12 +394,44 @@ static SHADOW_ENABLED_FOR_TEST: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// Tests opt in per support directory (tests run in parallel); production
 /// always runs the shadow.
 #[cfg(test)]
-pub(crate) fn enable_shadow_for_test(support_dir: &Path) {
+#[must_use = "keep the guard alive until the test finishes using the shadow"]
+pub(crate) struct ShadowTestGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for ShadowTestGuard {
+    fn drop(&mut self) {
+        disable_shadow_for_test(&self.0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn enable_shadow_for_test(support_dir: &Path) -> ShadowTestGuard {
     capture::begin_page(support_dir);
     SHADOW_ENABLED_FOR_TEST
         .lock()
         .expect("shadow control")
         .push(support_dir.to_path_buf());
+    ShadowTestGuard(support_dir.to_path_buf())
+}
+
+/// Panic-safe cleanup for a synthetic shadow scope. This does not arm it;
+/// callers can switch the shadow off and on while retaining one cleanup guard.
+#[cfg(test)]
+pub(crate) struct ShadowTestCleanup<'a>(&'a Path);
+
+#[cfg(test)]
+impl<'a> ShadowTestCleanup<'a> {
+    pub(crate) fn new(support_dir: &'a Path) -> Self {
+        Self(support_dir)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShadowTestCleanup<'_> {
+    fn drop(&mut self) {
+        disable_shadow_for_test(self.0);
+        capture::purge_scope_for_test(self.0);
+    }
 }
 
 #[cfg(test)]

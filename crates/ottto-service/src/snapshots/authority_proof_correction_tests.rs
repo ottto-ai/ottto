@@ -107,6 +107,7 @@ fn apc_terminal_fixture() -> ScanIndex {
             member_request_id_hashes: BTreeMap::new(),
             member_occurrences: BTreeMap::new(),
             invalid: false,
+            idless_revision: None,
         },
     );
     index

@@ -67,6 +67,7 @@ fn carry_family(index: &mut ScanIndex, root: &str, subagents: &[Option<&str>], w
         member_request_id_hashes: BTreeMap::new(),
         member_occurrences: BTreeMap::new(),
         invalid: false,
+        idless_revision: None,
     };
     let mut witness = ClaudeUsageFamilyWitness {
         evidence_fingerprint: "e".repeat(64),
@@ -1205,6 +1206,56 @@ fn carry_resumed_index(base: bool, passed: bool) -> ScanIndex {
     carry_reload(index)
 }
 
+/// Exercise the refund observer even where native carry funding is unavailable.
+#[test]
+fn unfunded_replay_refreshes_the_plan_before_clearing_on_every_platform() {
+    let mut fix = carry_index();
+    fix.claude_stale_family_carry
+        .roots
+        .insert(CARRY_ROOT.to_owned());
+    let context = fix.traversal.as_ref().unwrap().context_fingerprint.clone();
+    fix.reread_plan_for_rearms(
+        SnapshotSource::ClaudeCode,
+        CARRY_FAILED,
+        &context,
+        false,
+        |_| false,
+    );
+    let mut base = fix.clone();
+    for key in carry_family_keys() {
+        base.files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
+    base.claude_stale_family_carry.roots.clear();
+    base.reread_plan_for_rearms(
+        SnapshotSource::ClaudeCode,
+        CARRY_FAILED,
+        &context,
+        false,
+        |_| false,
+    );
+    {
+        let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+        assert!(refund_claude_stale_family_carry(
+            &mut fix,
+            SnapshotSource::ClaudeCode,
+            CARRY_FAILED,
+            &context,
+            false,
+        ));
+    }
+    let fix_value = serde_json::to_value(&fix).unwrap();
+    assert_eq!(
+        fix_value["reread_guard"]["tripwire"]["cause_counts"]
+            [CandidateParseReason::Rearmed as usize],
+        2
+    );
+    assert_eq!(fix_value, serde_json::to_value(&base).unwrap());
+}
+
 /// R1, re-funding refused at a reload before the walk passed any member: the
 /// family is uncarried in place, every member's revision cleared, and the
 /// index equals a real BASE arm resumed the same way, apart from the carried
@@ -2046,3 +2097,1685 @@ fn new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader() {
     let old: OldCarry = serde_json::from_slice(&serde_json::to_vec(&decoded).unwrap()).unwrap();
     assert_eq!(old.roots, BTreeSet::from([CARRY_ROOT.to_string()]));
 }
+
+/// Source-only reproduction of the hold/unsettled retry shape. The optional
+/// acquisition cache is deliberately empty: StateMissing denotes that fact,
+/// independently of the durable ScanIndex. No provider state is read.
+#[test]
+fn unhealthy_retry_with_held_families_rearms_healthy_history_reproduction() {
+    use crate::transcript_acquisition::{FullReason, ReadMode, Scope};
+
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    struct SyntheticFiles(PathBuf);
+    impl Drop for SyntheticFiles {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    let dir = SyntheticFiles(std::env::temp_dir().join(format!(
+        "ottto-unhealthy-retry-repro-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+    )));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    const HELD: usize = 9;
+    const HEALTHY: usize = 32;
+    // The unrelated committed file makes the existing reachability guard
+    // false, isolating prior_unsettled_upload in the first two arms. The
+    // third arm shows the separate reachable-full-retry veto without it.
+    for (unsettled, unrelated, expected_healthy_full) in [
+        (true, true, HEALTHY),
+        (false, true, 0),
+        (false, false, HEALTHY),
+    ] {
+        let mut index = ScanIndex {
+            claude_request_identity_contract: Some(claude_request_identity::COLLECTOR.to_string()),
+            claude_duplicate_request_witness_overflowed: true,
+            ..ScanIndex::default()
+        };
+        if unrelated {
+            carry_file(&mut index, CARRY_OTHER, None);
+        }
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut index,
+            CARRY_FAILED,
+            BACKFILL_WINDOW_DAYS,
+        );
+        let mut roots = Vec::new();
+        for number in 0..HELD + HEALTHY {
+            let root = format!("d{number:07}-1111-4111-8111-111111111111");
+            carry_family(&mut index, &root, &[None], true);
+            roots.push(root);
+        }
+        // Supply current index metadata, accepted bodies and well-formed
+        // revisions. Only traversal-start rearming may select healthy files.
+        let mut candidates = Vec::new();
+        let old_files = std::mem::take(&mut index.files);
+        let old_bodies = std::mem::take(&mut index.file_snapshot_fingerprints);
+        for (old_key, mut entry) in old_files {
+            let name = Path::new(&old_key).file_name().unwrap();
+            let path = dir.0.join(name);
+            std::fs::write(&path, b"{}\n").unwrap();
+            let key = local_index_key(&path);
+            entry.source_file_fingerprint = format!("{:x}", Sha256::digest(key.as_bytes()));
+            entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+            entry.size_bytes = 3;
+            for body in &old_bodies[&old_key] {
+                index
+                    .snapshot_activity_at
+                    .insert(body.clone(), Some(CARRY_FAILED.to_string()));
+            }
+            let mut candidate = test_candidate(path);
+            candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+            candidate.size_bytes = entry.size_bytes;
+            candidate.modified_unix_seconds = entry.modified_unix_seconds;
+            candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
+            index.files.insert(key.clone(), entry);
+            index
+                .file_snapshot_fingerprints
+                .insert(key, old_bodies[&old_key].clone());
+            candidates.push(candidate);
+        }
+        for root in roots.iter().take(HELD) {
+            let key = local_index_key(&dir.0.join(format!("{root}.jsonl")));
+            index.bind_retry_pending_claude_authority_for_test(
+                root,
+                BTreeMap::from([(
+                    root.clone(),
+                    index.files[&key].source_file_fingerprint.clone(),
+                )]),
+            );
+        }
+        carry_red(&mut index, CARRY_FAILED, 7);
+        if unsettled {
+            index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+        }
+        let records = index.claude_usage_authority_quarantine.clone();
+        let accepted = index.accepted_snapshot_fingerprints.clone();
+        let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["reason"], "terminal_unhealthy_retry");
+        assert_eq!(row["stale_pending_families"], HEALTHY);
+        assert_eq!(row["rearmed_index_files"], expected_healthy_full);
+        assert_eq!(index.claude_usage_authority_pending_count(), HELD);
+        assert_eq!(index.claude_usage_authority_quarantine, records);
+        assert_eq!(index.accepted_snapshot_fingerprints, accepted);
+        assert!(!index.claude_request_identity_contract_changed);
+        let mut healthy_full = 0;
+        let mut held_reads_before_deadline = 0;
+        for candidate in &candidates {
+            let root = claude_index_path_member_ref(&candidate.path).unwrap().root;
+            let held = records.contains_key(root);
+            let (decision, reason) = index.candidate_decision_with_reason_at(candidate, 0);
+            if held {
+                held_reads_before_deadline += usize::from(decision == CandidateDecision::Parse);
+                continue;
+            }
+            if decision != CandidateDecision::Parse {
+                assert_eq!(decision, CandidateDecision::Skip);
+                continue;
+            }
+            assert_eq!(reason, Some(CandidateParseReason::Rearmed));
+            let file = File::open(&candidate.path).unwrap();
+            let mut parser = OwnedJsonlParser::new(
+                file,
+                &candidate.path,
+                SnapshotSource::ClaudeCode,
+                apply_claude_code_line,
+                Some(&CodexTitleMetadata::default()),
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                parser
+                    .prepare_acquisition(
+                        None,
+                        &Scope("synthetic-unhealthy-retry".into()),
+                        None,
+                        100
+                    )
+                    .unwrap(),
+                ReadMode::Full(FullReason::StateMissing),
+            );
+            while !parser.step().unwrap() {}
+            healthy_full += 1;
+        }
+        assert_eq!(healthy_full, expected_healthy_full);
+        assert_eq!(held_reads_before_deadline, 0);
+        // Control: the held families still select when their own deadline is
+        // due. This changes no binding, accepted body or identity latch.
+        for record in index.claude_usage_authority_quarantine.values_mut() {
+            record.retry_after_unix_seconds = 0;
+        }
+        let held_reads_when_due = candidates
+            .iter()
+            .filter(|candidate| {
+                let root = claude_index_path_member_ref(&candidate.path).unwrap().root;
+                records.contains_key(root)
+                    && index.candidate_decision_with_reason_at(candidate, 0)
+                        == (
+                            CandidateDecision::Parse,
+                            Some(CandidateParseReason::AuthorityQuarantine),
+                        )
+            })
+            .count();
+        assert_eq!(held_reads_when_due, HELD);
+        eprintln!("UNHEALTHY_RETRY_REPRO held={HELD} healthy={HEALTHY} unsettled={unsettled} unrelated={unrelated} healthy_full={healthy_full} held_reads_before_deadline={held_reads_before_deadline} held_reads_when_due={held_reads_when_due}");
+    }
+}
+
+fn scoped_retry_record(
+    key: &str,
+    value: serde_json::Value,
+) -> claude_request_census::ClaudeRequestCensusRecord {
+    let census: claude_request_census::ClaudeRequestCensus =
+        serde_json::from_value(serde_json::json!({ key: value })).unwrap();
+    census
+        .get(key)
+        .expect("valid synthetic request record")
+        .clone()
+}
+
+/// Complete durable request evidence and an accepted head for this exact
+/// scan identity. The legacy reproduction above intentionally lacks these
+/// records and remains unchanged: missing evidence still takes BASE.
+fn scoped_retry_accept_member(index: &mut ScanIndex, key: &str) -> CandidateFile {
+    let entry = index.files.get_mut(key).unwrap();
+    entry.source_file_fingerprint = format!("{:x}", Sha256::digest(key.as_bytes()));
+    entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+    let mut group = Sha256::new();
+    update_length_prefixed(&mut group, b"snapshot_file_entity_set:v1");
+    for fingerprint in &index.file_snapshot_fingerprints[key] {
+        update_length_prefixed(&mut group, fingerprint.as_bytes());
+    }
+    entry.last_snapshot_fingerprint = Some(format!("{:x}", group.finalize()));
+    entry.last_upload_body_witness = Some("a".repeat(64));
+    let mut candidate = test_candidate(PathBuf::from(key));
+    candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+    // Native candidates also carry a nonempty legacy digest. An empty
+    // fixture digest would make a re-armed old-version entry migrate.
+    candidate.legacy_source_file_fingerprint = entry.source_file_fingerprint.clone();
+    candidate.size_bytes = entry.size_bytes;
+    candidate.modified_unix_seconds = entry.modified_unix_seconds;
+    candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
+    let record = scoped_retry_record(
+        key,
+        serde_json::json!({
+            "v": claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+            "fp": entry.source_file_fingerprint,
+            "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "s": "exact", "h": "0000000000000001",
+            // Native opened-file records retain birth through invalidation.
+            // Without birth the existing invalidator removes the record, so
+            // that fixture would test allowed absence instead of damage.
+            "bi": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "bd": 1, "bn": 1,
+        }),
+    );
+    index.claude_request_census.insert(key.to_string(), record);
+    for body in &index.file_snapshot_fingerprints[key] {
+        index
+            .snapshot_activity_at
+            .insert(body.clone(), Some(CARRY_FAILED.to_string()));
+    }
+    index.session_account_bindings.insert(
+        key.to_string(),
+        SessionAccountBinding {
+            account_identifier_hash: "a".repeat(64),
+            workspace_identifier_hash: Some("b".repeat(64)),
+        },
+    );
+    candidate
+}
+
+struct ScopedRetryFixture {
+    _scratch: crate::test_scratch::ScratchDir,
+    index: ScanIndex,
+    candidates: Vec<CandidateFile>,
+    roots: Vec<String>,
+}
+
+fn scoped_retry_fixture(held: usize, healthy: usize, unrelated: bool) -> ScopedRetryFixture {
+    let scratch = crate::test_scratch::ScratchDir::new("scoped-unhealthy-retry");
+    let support = scratch.join("support");
+    let list = ReemissionExclusions::path(&support);
+    std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+    std::fs::write(list, b"").unwrap();
+    let mut index = ScanIndex {
+        claude_request_identity_contract: Some(claude_request_identity::COLLECTOR.to_string()),
+        claude_duplicate_request_witness_overflowed: true,
+        claude_reemission_exclusions: ReemissionExclusions::load(&support),
+        claude_duplicate_fence_next_full_rearm_unix_seconds: rfc3339_unix_seconds(CARRY_FAILED)
+            .map(|now| now + 86_400),
+        ..ScanIndex::default()
+    };
+    if unrelated {
+        carry_file(&mut index, CARRY_OTHER, None);
+    }
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[],
+        &mut index,
+        CARRY_FAILED,
+        BACKFILL_WINDOW_DAYS,
+    );
+    let mut roots = Vec::new();
+    for number in 0..held + healthy {
+        let root = format!("d{number:07}-1111-4111-8111-111111111111");
+        carry_family(&mut index, &root, &[None], true);
+        roots.push(root);
+    }
+    let mut candidates = Vec::new();
+    let old_files = std::mem::take(&mut index.files);
+    let old_bodies = std::mem::take(&mut index.file_snapshot_fingerprints);
+    for (old_key, entry) in old_files {
+        let path = scratch.join(Path::new(&old_key).file_name().unwrap());
+        std::fs::write(&path, b"{}\n").unwrap();
+        let key = local_index_key(&path);
+        index.files.insert(key.clone(), entry);
+        index
+            .file_snapshot_fingerprints
+            .insert(key.clone(), old_bodies[&old_key].clone());
+        candidates.push(scoped_retry_accept_member(&mut index, &key));
+    }
+    for root in roots.iter().take(held) {
+        let key = local_index_key(&scratch.join(format!("{root}.jsonl")));
+        index.bind_retry_pending_claude_authority_for_test(
+            root,
+            BTreeMap::from([(
+                root.clone(),
+                index.files[&key].source_file_fingerprint.clone(),
+            )]),
+        );
+    }
+    carry_red(&mut index, CARRY_FAILED, 7);
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+    ScopedRetryFixture {
+        _scratch: scratch,
+        index,
+        candidates,
+        roots,
+    }
+}
+
+/// Count actual native Full reads, not just fingerprint clears. The optional
+/// reduction cache is cold, exactly as in the unchanged reproduction.
+fn scoped_retry_full_reads(index: &ScanIndex, candidates: &[CandidateFile]) -> usize {
+    use crate::transcript_acquisition::{FullReason, ReadMode, Scope};
+    candidates
+        .iter()
+        .filter(|candidate| {
+            if index.candidate_decision_with_reason_at(candidate, 0).0 != CandidateDecision::Parse {
+                return false;
+            }
+            let mut parser = OwnedJsonlParser::new(
+                File::open(&candidate.path).unwrap(),
+                &candidate.path,
+                SnapshotSource::ClaudeCode,
+                apply_claude_code_line,
+                Some(&CodexTitleMetadata::default()),
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                parser
+                    .prepare_acquisition(None, &Scope("scoped-retry".into()), None, 100)
+                    .unwrap(),
+                ReadMode::Full(FullReason::StateMissing)
+            );
+            while !parser.step().unwrap() {}
+            true
+        })
+        .count()
+}
+
+/// SOURCE (a)-(e), B1/B3: each healthy file's own accepted evidence removes
+/// both global vetoes. Saved request evidence, authority witnesses, accepted
+/// heads and account bindings are byte-identical, including across reload.
+#[test]
+fn scoped_unhealthy_retry_reads_zero_of_32_healthy_files_and_keeps_evidence() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for unrelated in [true, false] {
+        let mut fixture = scoped_retry_fixture(9, 32, unrelated);
+        let before = serde_json::to_value(&fixture.index).unwrap();
+        let mut base = fixture.index.clone();
+        {
+            let _base = KeepStaleClaudeFamilyRearmForTest::new();
+            carry_start(&mut base, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        }
+        assert_eq!(scoped_retry_full_reads(&base, &fixture.candidates), 32);
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["prior_unsettled_upload"], true);
+        assert_eq!(row["carried_pending_families"], 32);
+        assert_eq!(row["rearmed_index_files"], 0);
+        assert_eq!(
+            scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+            0
+        );
+        let saved: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&fixture.index).unwrap()).unwrap();
+        let after = serde_json::to_value(&saved).unwrap();
+        for field in [
+            "claude_request_census",
+            "session_account_bindings",
+            "claude_usage_family_witnesses",
+            "claude_usage_authority_quarantine",
+            "accepted_snapshot_fingerprints",
+            "file_snapshot_fingerprints",
+        ] {
+            assert_eq!(
+                serde_json::to_vec(&after[field]).unwrap(),
+                serde_json::to_vec(&before[field]).unwrap(),
+                "{field}"
+            );
+        }
+        assert!(saved.claude_duplicate_request_witness_overflowed);
+        assert_eq!(saved.claude_usage_authority_pending_count(), 9);
+        for root in fixture.roots.iter().skip(9) {
+            assert_compacted_and_invalid(&saved, root);
+        }
+        eprintln!("SCOPED_UNHEALTHY_RETRY held=9 healthy=32 unrelated={unrelated} base_full=32 healthy_full=0");
+    }
+}
+
+/// SOURCE (c)/(d): overdue RetryPending work runs on this next cycle, while
+/// healthy siblings remain unread. Terminal holds retain disclosure/bindings
+/// and retry a changed revision, without an early terminal conversion.
+#[test]
+fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_holds() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = scoped_retry_fixture(9, 32, false);
+    fixture
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .unhealthy_retry_not_before_unix_seconds =
+        rfc3339_unix_seconds(CARRY_RETRY).map(|now| now + UNHEALTHY_SCAN_RETRY_MAX_SECONDS);
+    // Control: neither the traversal nor a family's own retry is due yet.
+    let before_wait = serde_json::to_value(&fixture.index).unwrap();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut fixture.index,
+            CARRY_RETRY,
+            BACKFILL_WINDOW_DAYS,
+        );
+    });
+    assert!(!rows.iter().any(|row| row["counts"]["event"] == "starting"));
+    assert_eq!(serde_json::to_value(&fixture.index).unwrap(), before_wait);
+    for record in fixture.index.claude_usage_authority_quarantine.values_mut() {
+        record.retry_after_unix_seconds = rfc3339_unix_seconds(CARRY_FAILED).unwrap() + 1;
+    }
+    let terminal = fixture.roots[0].clone();
+    let record = fixture
+        .index
+        .claude_usage_authority_quarantine
+        .get_mut(&terminal)
+        .unwrap();
+    record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
+    record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+    let holds = fixture.index.claude_usage_authority_quarantine.clone();
+    let bindings = fixture.index.session_account_bindings.clone();
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 32);
+    assert_eq!(row["rearmed_index_files"], 0);
+    assert_eq!(
+        scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+        8
+    );
+    assert_eq!(fixture.index.claude_usage_authority_pending_count(), 8);
+    assert_eq!(
+        fixture.index.claude_usage_authority_terminal_entity_count(),
+        1
+    );
+    assert_eq!(fixture.index.claude_usage_authority_quarantine, holds);
+    assert_eq!(fixture.index.session_account_bindings, bindings);
+    // Third cycle: the served family yielded no item (e.g. deleted while
+    // red), so its record/deadline did not advance. Persist that checkpoint
+    // and require the hourly backoff rather than another deadline wake.
+    std::fs::remove_file(
+        &fixture
+            .candidates
+            .iter()
+            .find(|candidate| {
+                claude_index_path_member_ref(&candidate.path).unwrap().root == fixture.roots[1]
+            })
+            .unwrap()
+            .path,
+    )
+    .unwrap();
+    carry_red(&mut fixture.index, CARRY_RETRY, 7);
+    fixture
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .unhealthy_retry_not_before_unix_seconds =
+        rfc3339_unix_seconds(CARRY_RETRY).map(|now| now + UNHEALTHY_SCAN_RETRY_MAX_SECONDS);
+    fixture.index = carry_reload(fixture.index);
+    // The production cycle reloads this runtime-only protection policy
+    // before scanning (snapshot_sync::sync_source). Keep that same installed
+    // synthetic list across index reload; no acceptance is reconstructed.
+    fixture
+        .index
+        .load_claude_reemission_exclusions(&fixture._scratch.join("support"));
+    let waiting = serde_json::to_value(&fixture.index).unwrap();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut fixture.index,
+            CARRY_RESUME,
+            BACKFILL_WINDOW_DAYS,
+        );
+    });
+    assert!(!rows.iter().any(|row| row["counts"]["event"] == "starting"));
+    assert_eq!(serde_json::to_value(&fixture.index).unwrap(), waiting);
+    let hourly = OffsetDateTime::from_unix_timestamp(
+        (rfc3339_unix_seconds(CARRY_RETRY).unwrap() + UNHEALTHY_SCAN_RETRY_MAX_SECONDS) as i64,
+    )
+    .unwrap()
+    .format(&Rfc3339)
+    .unwrap();
+    let third = carry_start(&mut fixture.index, &hourly, BACKFILL_WINDOW_DAYS);
+    assert_eq!(third["reason"], "terminal_unhealthy_retry");
+    assert_eq!(third["carried_pending_families"], 32);
+    assert_eq!(third["rearmed_index_files"], 0);
+    assert_eq!(fixture.index.claude_usage_authority_quarantine, holds);
+    assert_eq!(fixture.index.session_account_bindings, bindings);
+    let candidate = fixture
+        .candidates
+        .iter_mut()
+        .find(|candidate| claude_index_path_member_ref(&candidate.path).unwrap().root == terminal)
+        .unwrap();
+    assert_eq!(
+        fixture.index.candidate_decision_at(candidate, 0),
+        CandidateDecision::Skip
+    );
+    candidate.source_file_fingerprint = "f".repeat(64);
+    assert_eq!(
+        fixture
+            .index
+            .candidate_decision_with_reason_at(candidate, 0),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::AuthorityQuarantine)
+        )
+    );
+}
+
+/// A restart after a red terminal discards the process-local carry decision,
+/// then recomputes from durable acceptance, fingerprints and witnesses. A
+/// context change, mid-walk checkpoint or lost acceptance still keeps BASE.
+#[test]
+fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in [
+        "restart",
+        "context",
+        "mid_walk",
+        "missing_ack",
+        "invalid_pending",
+        "missing_body_ack",
+        "list_missing",
+    ] {
+        let mut fixture = scoped_retry_fixture(9, 32, false);
+        let first = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(first["carried_pending_families"], 32);
+        assert_eq!(
+            scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+            0
+        );
+        carry_red(&mut fixture.index, CARRY_RETRY, 7);
+        fixture
+            .index
+            .mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+        fixture.index = carry_reload(fixture.index);
+        assert!(fixture
+            .index
+            .claude_reemission_exclusions
+            .holds_without_list(None));
+        fixture
+            .index
+            .load_claude_reemission_exclusions(&fixture._scratch.join("support"));
+        assert!(!fixture
+            .index
+            .claude_reemission_exclusions
+            .holds_without_list(None));
+        fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_mut()
+            .unwrap()
+            .process = claude_full_rearm_process().wrapping_add(2);
+        match case {
+            "mid_walk" => fixture
+                .index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .pending_candidates
+                .push_back(carry_replayed(&local_index_key(
+                    &fixture.candidates[0].path,
+                ))),
+            "missing_ack" => fixture.index.accepted_snapshot_fingerprints.clear(),
+            "list_missing" => {
+                fixture.index.claude_reemission_exclusions = ReemissionExclusions::default()
+            }
+            "invalid_pending" => {
+                for root in fixture.roots.iter().skip(9) {
+                    fixture
+                        .index
+                        .claude_usage_family_pending
+                        .get_mut(root)
+                        .unwrap()
+                        .invalid = true;
+                }
+            }
+            "missing_body_ack" => {
+                for entry in fixture.index.files.values_mut() {
+                    entry.last_upload_body_witness = None;
+                }
+            }
+            _ => (),
+        }
+        let before = serde_json::to_value(&fixture.index).unwrap();
+        if case == "restart" {
+            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    &[],
+                    &mut fixture.index,
+                    CARRY_RETRY,
+                    BACKFILL_WINDOW_DAYS,
+                );
+            });
+            assert!(!rows.iter().any(|row| row["counts"]["event"] == "starting"));
+            assert!(fixture.index.claude_stale_family_carry.is_empty());
+            assert_eq!(
+                serde_json::to_value(&fixture.index).unwrap()["files"],
+                before["files"]
+            );
+            assert_eq!(
+                scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+                0
+            );
+        }
+        let days = BACKFILL_WINDOW_DAYS + u64::from(case == "context");
+        let row = carry_start(&mut fixture.index, CARRY_SECOND_RETRY, days);
+        let healthy_full = scoped_retry_full_reads(&fixture.index, &fixture.candidates);
+        if case == "restart" {
+            assert_eq!(row["reason"], "terminal_unhealthy_retry");
+            assert_eq!(row["carried_pending_families"], 32);
+            assert_eq!(row["rearmed_index_files"], 0);
+            assert_eq!(healthy_full, 0);
+            assert_eq!(
+                fixture
+                    .index
+                    .claude_stale_family_carry
+                    .origin
+                    .as_ref()
+                    .unwrap()
+                    .process,
+                claude_full_rearm_process()
+            );
+            let after = serde_json::to_value(carry_reload(fixture.index.clone())).unwrap();
+            for field in [
+                "claude_request_census",
+                "session_account_bindings",
+                "claude_usage_family_witnesses",
+                "claude_usage_authority_quarantine",
+                "accepted_snapshot_fingerprints",
+                "file_snapshot_fingerprints",
+            ] {
+                assert_eq!(
+                    serde_json::to_vec(&before[field]).unwrap(),
+                    serde_json::to_vec(&after[field]).unwrap(),
+                    "{field}"
+                );
+            }
+            for root in fixture.roots.iter().skip(9) {
+                assert_compacted_and_invalid(&fixture.index, root);
+            }
+        } else {
+            assert_eq!(row["carried_pending_families"], 0, "{case}");
+            if !matches!(case, "context" | "mid_walk") {
+                assert_eq!(row["rearmed_index_files"], 32, "{case}");
+            }
+            assert_eq!(healthy_full, 32, "{case}");
+        }
+    }
+}
+
+/// Each refusal affects only its own family. None is hidden by the acceptance
+/// of a sibling, even with a global unsettled sweep and plausible full retry.
+#[test]
+fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_evidence() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in [
+        "missing_ack",
+        "mismatched_ack",
+        "missing_record",
+        "damaged_record",
+        "damaged_record_after_reload",
+        "old_version",
+        "record_revision",
+        "identity_incomplete",
+        "lossy",
+        "unverified",
+        "twin",
+        "retired",
+        "scan_version",
+        "empty_revision",
+        "invalid_pending",
+        "witness_mismatch",
+        "no_witness",
+        "account_hold",
+        "authority_hold",
+        "protected_root",
+        "list_missing",
+    ] {
+        let mut fixture = scoped_retry_fixture(1, 2, false);
+        let root = fixture.roots[1].clone();
+        let key = local_index_key(&fixture._scratch.join(format!("{root}.jsonl")));
+        // These historical local-witness controls remain refusal tests only
+        // with missing body ACK state. Local witness absence/mismatch alone
+        // is accepted by SOURCE; the positive test below isolates that rule.
+        if matches!(case, "missing_record" | "witness_mismatch" | "no_witness") {
+            fixture
+                .index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .last_upload_body_witness = None;
+        }
+        match case {
+            "missing_ack" => {
+                let head = fixture.index.file_snapshot_fingerprints[&key]
+                    .first()
+                    .unwrap();
+                fixture.index.accepted_snapshot_fingerprints.remove(head);
+            }
+            "mismatched_ack" => {
+                fixture
+                    .index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .last_snapshot_fingerprint = Some("other-head".into())
+            }
+            "missing_record" => fixture.index.claude_request_census.remove(&key),
+            "damaged_record" | "damaged_record_after_reload" => {
+                fixture
+                    .index
+                    .claude_request_census
+                    .invalidate_keeping_birth(&key);
+                assert!(fixture.index.claude_request_census.get(&key).is_none());
+                assert!(fixture
+                    .index
+                    .claude_request_census
+                    .retry_carry_record(&key)
+                    .unwrap()
+                    .is_birth_stub());
+                if case == "damaged_record_after_reload" {
+                    fixture.index.claude_request_census = serde_json::from_slice(
+                        &serde_json::to_vec(&fixture.index.claude_request_census).unwrap(),
+                    )
+                    .unwrap();
+                }
+            }
+            "scan_version" => {
+                fixture
+                    .index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .scan_identity_version = Some("old-scan".into())
+            }
+            "empty_revision" => fixture
+                .index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .source_file_fingerprint
+                .clear(),
+            "invalid_pending" => {
+                fixture
+                    .index
+                    .claude_usage_family_pending
+                    .get_mut(&root)
+                    .unwrap()
+                    .invalid = true
+            }
+            "witness_mismatch" => {
+                fixture
+                    .index
+                    .claude_usage_family_witnesses
+                    .get_mut(&root)
+                    .unwrap()
+                    .member_occurrence_fingerprints
+                    .insert(root.clone(), "f".repeat(64));
+            }
+            "no_witness" => {
+                fixture.index.claude_usage_family_witnesses.remove(&root);
+            }
+            "account_hold" => {
+                fixture
+                    .index
+                    .claude_account_deferred_holds
+                    .insert(key.clone(), "held".into());
+            }
+            "authority_hold" => {
+                fixture.index.bind_retry_pending_claude_authority_for_test(
+                    &root,
+                    BTreeMap::from([(
+                        root.clone(),
+                        fixture.index.files[&key].source_file_fingerprint.clone(),
+                    )]),
+                );
+                fixture
+                    .index
+                    .claude_usage_authority_quarantine
+                    .get_mut(&root)
+                    .unwrap()
+                    .retry_after_unix_seconds = 0;
+            }
+            "protected_root" => {
+                fixture.index.claude_reemission_exclusions = ReemissionExclusions::parse(
+                    format!("{:x}\n", Sha256::digest(root.as_bytes())).as_bytes(),
+                )
+            }
+            "list_missing" => {
+                fixture.index.claude_reemission_exclusions = ReemissionExclusions::default()
+            }
+            _ => {
+                let mut record =
+                    serde_json::to_value(fixture.index.claude_request_census.get(&key).unwrap())
+                        .unwrap();
+                match case {
+                    "old_version" => {
+                        record["v"] = serde_json::json!(
+                            claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION + 1
+                        )
+                    }
+                    "record_revision" => record["fp"] = serde_json::json!("e".repeat(64)),
+                    "identity_incomplete" => record["s"] = serde_json::json!("identity_incomplete"),
+                    "lossy" => record["s"] = serde_json::json!("lossy"),
+                    "unverified" => record["u"] = serde_json::json!(true),
+                    "twin" => record["tw"] = serde_json::json!(true),
+                    "retired" => {
+                        record["r"] = serde_json::json!(1);
+                        record.as_object_mut().unwrap().remove("b");
+                    }
+                    _ => unreachable!(),
+                }
+                fixture
+                    .index
+                    .claude_request_census
+                    .insert(key.clone(), scoped_retry_record(&key, record));
+            }
+        }
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert!(
+            !fixture.index.claude_stale_family_carry.contains(&root),
+            "{case}"
+        );
+        let candidate = fixture
+            .candidates
+            .iter()
+            .find(|candidate| local_index_key(&candidate.path) == key)
+            .unwrap();
+        assert_eq!(
+            fixture.index.candidate_decision_at(candidate, 0),
+            CandidateDecision::Parse,
+            "{case}"
+        );
+        if case != "list_missing" {
+            assert_eq!(
+                row["carried_pending_families"], 1,
+                "{case}: healthy sibling is independent"
+            );
+        }
+    }
+}
+
+#[test]
+fn accepted_retry_carries_without_otel_census_or_fence_deadline() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for deadline in [None, Some(0), Some(u64::MAX)] {
+        let mut fixture = scoped_retry_fixture(0, 1, false);
+        fixture.index.claude_usage_family_witnesses.clear();
+        fixture.index.claude_request_census = claude_request_census::ClaudeRequestCensus::default();
+        fixture.index.claude_duplicate_request_witness_overflowed = false;
+        fixture
+            .index
+            .claude_duplicate_fence_next_full_rearm_unix_seconds = deadline;
+        let before = serde_json::to_value(&fixture.index).unwrap();
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["carried_pending_families"], 1);
+        assert_eq!(row["rearmed_index_files"], 0);
+        assert_eq!(
+            scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+            0
+        );
+        let after = serde_json::to_value(&fixture.index).unwrap();
+        for field in [
+            "files",
+            "session_account_bindings",
+            "accepted_snapshot_fingerprints",
+            "file_snapshot_fingerprints",
+            "claude_usage_family_witnesses",
+            "claude_request_census",
+        ] {
+            assert_eq!(before[field], after[field], "{field}");
+        }
+    }
+}
+
+#[test]
+fn accepted_idless_retry_preserves_invalid_evidence_and_refuses_second_causes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in [
+        "idless",
+        "message_only",
+        "second_cause",
+        "member_changed",
+        "occurrence_mismatch",
+        "lossy",
+        "changed",
+        "version",
+        "parser",
+        "decode",
+    ] {
+        let mut fixture = scoped_retry_fixture(0, 1, false);
+        let root = fixture.roots[0].clone();
+        let candidate = &mut fixture.candidates[0];
+        let key = local_index_key(&candidate.path);
+        std::fs::write(&candidate.path, format!("{{\"timestamp\":\"2026-08-02T07:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{root}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")).unwrap();
+        if case == "message_only" {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&candidate.path).unwrap()).unwrap();
+            value["message"]["id"] = serde_json::json!("msg-without-request-id");
+            std::fs::write(
+                &candidate.path,
+                serde_json::to_string(&value).unwrap() + "\n",
+            )
+            .unwrap();
+        }
+        let items = parse_claude_code_jsonl_file(
+            &candidate.path,
+            CARRY_FAILED,
+            candidate.source_file_fingerprint.clone(),
+        )
+        .unwrap();
+        fixture.index.claude_usage_family_pending.clear();
+        accumulate_claude_usage_family_pending_with_limit(
+            &items,
+            &mut fixture.index.claude_usage_family_pending,
+            CARRY_FAILED,
+            100,
+        );
+        assert!(fixture.index.claude_usage_family_pending[&root].invalid);
+        assert!(fixture.index.claude_usage_family_pending[&root]
+            .idless_revision
+            .is_some());
+        let mut record =
+            serde_json::to_value(fixture.index.claude_request_census.get(&key).unwrap()).unwrap();
+        record["s"] = serde_json::json!("identity_incomplete");
+        fixture
+            .index
+            .claude_request_census
+            .insert(key.clone(), scoped_retry_record(&key, record));
+        match case {
+            "second_cause" => {
+                let pending = fixture
+                    .index
+                    .claude_usage_family_pending
+                    .get_mut(&root)
+                    .unwrap();
+                let mut retained = 0;
+                invalidate_claude_usage_family_pending(pending, &mut retained);
+            }
+            "member_changed" | "occurrence_mismatch" => {
+                let mut second = items[0].clone();
+                if case == "member_changed" {
+                    second.source_session_id += "_agent-secondary";
+                } else {
+                    second.claude_usage_request_ids.insert("other".into());
+                }
+                accumulate_claude_usage_family_pending_with_limit(
+                    &[second],
+                    &mut fixture.index.claude_usage_family_pending,
+                    CARRY_FAILED,
+                    100,
+                );
+            }
+            "lossy" => {
+                let mut value =
+                    serde_json::to_value(fixture.index.claude_request_census.get(&key).unwrap())
+                        .unwrap();
+                value["s"] = serde_json::json!("lossy");
+                fixture
+                    .index
+                    .claude_request_census
+                    .insert(key.clone(), scoped_retry_record(&key, value));
+            }
+            "changed" => candidate.source_file_fingerprint = "e".repeat(64),
+            "version" => {
+                fixture
+                    .index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .scan_identity_version = Some("old".into())
+            }
+            "parser" => {
+                fixture
+                    .index
+                    .claude_usage_family_pending
+                    .get_mut(&root)
+                    .unwrap()
+                    .idless_revision = Some([1; 32])
+            }
+            "decode" => fixture.index.claude_request_census.remove(&key),
+            _ => (),
+        }
+        let before = serde_json::to_value(&fixture.index).unwrap();
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        if matches!(case, "idless" | "message_only") {
+            assert_eq!(row["carried_pending_families"], 1);
+            assert_eq!(
+                scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+                0
+            );
+            let after = serde_json::to_value(&fixture.index).unwrap();
+            for field in [
+                "claude_usage_family_pending",
+                "claude_request_census",
+                "files",
+                "session_account_bindings",
+                "accepted_snapshot_fingerprints",
+                "file_snapshot_fingerprints",
+            ] {
+                assert_eq!(before[field], after[field], "{field}");
+            }
+            assert!(fixture.index.claude_duplicate_request_witness_overflowed);
+        } else {
+            assert_eq!(
+                fixture
+                    .index
+                    .candidate_decision_at(&fixture.candidates[0], 0),
+                CandidateDecision::Parse,
+                "{case}"
+            );
+            if case != "changed" {
+                assert_eq!(row["carried_pending_families"], 0, "{case}");
+            }
+        }
+        assert!(fixture.index.claude_usage_family_pending[&root].invalid);
+    }
+}
+
+/// A new scan fingerprint (sidecar evidence included), truncation and object
+/// replacement independently select a carried member at unchanged mtime.
+#[test]
+fn scoped_unhealthy_retry_changed_members_and_due_replays_keep_base() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in [
+        "sidecar_fingerprint",
+        "replacement",
+        "truncation",
+        "audit",
+        "identity_latch",
+    ] {
+        let mut fixture = scoped_retry_fixture(1, 2, false);
+        match case {
+            "identity_latch" => fixture.index.claude_request_identity_contract_changed = true,
+            "daily_replay" => {
+                fixture
+                    .index
+                    .claude_duplicate_fence_next_full_rearm_unix_seconds =
+                    rfc3339_unix_seconds(CARRY_RETRY)
+            }
+            "missing_replay" => {
+                fixture
+                    .index
+                    .claude_duplicate_fence_next_full_rearm_unix_seconds = None
+            }
+            "invalid_replay" => {
+                fixture
+                    .index
+                    .claude_duplicate_fence_next_full_rearm_unix_seconds = Some(u64::MAX)
+            }
+            _ => (),
+        }
+        let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        let candidate = fixture
+            .candidates
+            .iter_mut()
+            .find(|candidate| {
+                claude_index_path_member_ref(&candidate.path).unwrap().root == fixture.roots[1]
+            })
+            .unwrap();
+        match case {
+            "sidecar_fingerprint" | "replacement" => {
+                candidate.source_file_fingerprint = "e".repeat(64)
+            }
+            "truncation" => candidate.size_bytes = 0,
+            "audit" => {
+                fixture
+                    .index
+                    .files
+                    .get_mut(&local_index_key(&candidate.path))
+                    .unwrap()
+                    .set_unverified_deadline(0);
+            }
+            _ => assert_eq!(row["carried_pending_families"], 0),
+        }
+        assert_eq!(
+            fixture.index.candidate_decision_at(candidate, 1),
+            CandidateDecision::Parse,
+            "{case}"
+        );
+        if case == "identity_latch" {
+            assert!(fixture.index.claude_request_identity_contract_changed);
+        }
+    }
+}
+
+#[test]
+fn scoped_unhealthy_retry_changed_member_cancels_only_its_funded_family() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut index = carry_index();
+    index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+    index.claude_duplicate_fence_next_full_rearm_unix_seconds =
+        rfc3339_unix_seconds(CARRY_FAILED).map(|now| now + 86_400);
+    let [root_key, agent_key] = carry_family_keys();
+    let mut changed = scoped_retry_accept_member(&mut index, &root_key);
+    scoped_retry_accept_member(&mut index, &agent_key);
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+    let before = index.clone();
+    let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 1);
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
+    traversal.observed_index_keys.extend(carry_family_keys());
+    carry_fill_queue(&mut index);
+    // New evidence changes the existing scan identity, independently of
+    // mtime. Normal candidate selection reaches the existing cancellation.
+    changed.source_file_fingerprint = "e".repeat(64);
+    assert_eq!(
+        index.candidate_decision_with_reason_at(&changed, 0),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::SourceChanged)
+        )
+    );
+    carry_cancel(&mut index);
+    assert!(!index.claude_stale_family_carry.contains(CARRY_ROOT));
+    assert!(index.files[&agent_key].source_file_fingerprint.is_empty());
+    assert_eq!(
+        index.claude_stale_family_carry.replay,
+        vec![carry_replayed(&agent_key)]
+    );
+    assert_eq!(
+        index.claude_usage_family_witnesses,
+        before.claude_usage_family_witnesses
+    );
+    assert_eq!(
+        index.session_account_bindings,
+        before.session_account_bindings
+    );
+    assert_eq!(
+        serde_json::to_value(&index.files[&carry_key(CARRY_OTHER, None)]).unwrap(),
+        serde_json::to_value(&before.files[&carry_key(CARRY_OTHER, None)]).unwrap()
+    );
+}
+
+#[test]
+fn scoped_unhealthy_retry_preserves_member_protection_and_scratch_refusal() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for protected in [true, false] {
+        let mut index = carry_index();
+        index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds =
+            rfc3339_unix_seconds(CARRY_FAILED).map(|now| now + 86_400);
+        for key in carry_family_keys() {
+            scoped_retry_accept_member(&mut index, &key);
+        }
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+        if protected {
+            let member = carry_member(CARRY_ROOT, Some(CARRY_AGENT));
+            index.claude_reemission_exclusions = ReemissionExclusions::parse(
+                format!("{:x}\n", Sha256::digest(member.as_bytes())).as_bytes(),
+            );
+        }
+        let _refused = (!protected).then(RefuseClaudeStaleFamilyCarryBudgetForTest::new);
+        let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["carried_pending_families"], 0);
+        for key in carry_family_keys() {
+            assert!(index.files[&key].source_file_fingerprint.is_empty());
+        }
+    }
+}
+
+#[test]
+fn scoped_retry_observer_counts_actual_rearms_and_preserves_selection() {
+    // Portable CI exercises BASE fallback too; macOS exercises the funded
+    // carry and proves 320 healthy families spend no planned re-arm count.
+    let supported = crate::heap_layout_bound::layout_supported();
+    let mut fixture = scoped_retry_fixture(3, 320, true);
+    for root in fixture.roots.iter().take(3) {
+        fixture
+            .index
+            .claude_usage_authority_quarantine
+            .get_mut(root)
+            .unwrap()
+            .proven_witness_fingerprint = "stale-binding".into();
+    }
+    let before = serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap();
+    let mut unobserved = fixture.index.clone();
+    {
+        let _off = reread_guard::TestObservations::enabled(false);
+        carry_start(&mut unobserved, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    }
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    let actual = fixture
+        .index
+        .files
+        .iter()
+        .filter(|(_, entry)| entry.source_file_fingerprint.is_empty())
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        reread_guard::planned_for_test(&fixture.index),
+        actual.len() as u64
+    );
+    assert_eq!(
+        row["rearmed_index_files"].as_u64(),
+        Some(actual.len() as u64)
+    );
+    if supported {
+        let held = fixture
+            .roots
+            .iter()
+            .take(3)
+            .map(|root| local_index_key(&fixture._scratch.join(format!("{root}.jsonl"))))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, held);
+        assert_eq!(row["carried_pending_families"], 320);
+    } else {
+        assert_eq!(actual.len(), 323);
+        assert_eq!(row["carried_pending_families"], 0);
+    }
+    assert_eq!(
+        serde_json::to_value(&fixture.index.files).unwrap(),
+        serde_json::to_value(&unobserved.files).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap(),
+        before
+    );
+
+    if supported {
+        // Invalid carry provenance re-arms its actual roots plus a replay-only
+        // key outside them. The consumed replay ordering cannot affect reads.
+        let extra = fixture
+            .candidates
+            .iter()
+            .find(|candidate| {
+                claude_index_path_member_ref(&candidate.path).unwrap().root == CARRY_OTHER
+            })
+            .unwrap();
+        fixture
+            .index
+            .claude_stale_family_carry
+            .replay
+            .push(carry_replayed(&local_index_key(&extra.path)));
+        fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_mut()
+            .unwrap()
+            .process = claude_full_rearm_process().wrapping_add(1);
+        fixture
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_candidates
+            .push_back(carry_replayed(&local_index_key(
+                &fixture.candidates[0].path,
+            )));
+        let mut unobserved = fixture.index.clone();
+        {
+            let _off = reread_guard::TestObservations::enabled(false);
+            carry_start(&mut unobserved, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+        }
+        carry_start(&mut fixture.index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+        assert!(fixture
+            .index
+            .files
+            .values()
+            .all(|entry| entry.source_file_fingerprint.is_empty()));
+        assert_eq!(
+            reread_guard::planned_for_test(&fixture.index),
+            fixture.index.files.len() as u64
+        );
+        assert_eq!(
+            serde_json::to_value(&fixture.index.files).unwrap(),
+            serde_json::to_value(&unobserved.files).unwrap()
+        );
+    }
+    assert_eq!(
+        fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .reread_budget_refused,
+        0
+    );
+}
+
+#[test]
+fn scaled_accepted_history_carries_6356_families_through_retry_deadline_expiry() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const HEALTHY: usize = 6356;
+    let mut fixture = scoped_retry_fixture(1, HEALTHY, false);
+    let held = fixture.roots[0].clone();
+    fixture
+        .index
+        .claude_usage_family_witnesses
+        .retain(|root, _| root == &held);
+    let healthy = fixture
+        .candidates
+        .iter()
+        .filter(|candidate| claude_index_path_member_ref(&candidate.path).unwrap().root != held)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(healthy.len(), HEALTHY);
+    let stale = fixture
+        .index
+        .claude_usage_family_pending
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        !claude_stale_family_carry_scratch_admitted(&fixture.index, &stale, 0),
+        "the former whole-graph gate actually refuses this scale"
+    );
+    fixture
+        .index
+        .claude_duplicate_fence_next_full_rearm_unix_seconds =
+        rfc3339_unix_seconds(CARRY_SECOND_RETRY);
+    let before = serde_json::to_value(&fixture.index).unwrap();
+    for at in [CARRY_RETRY, CARRY_SECOND_RETRY, "2026-08-03T07:31:00Z"] {
+        // Starting a retry frees old pending payload and retained carry.
+        // Count born-in-scope pointers so those pre-existing frees cannot
+        // hide a peak or make the signed net-allocation probe negative.
+        let (row, allocations) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            carry_start(&mut fixture.index, at, BACKFILL_WINDOW_DAYS)
+        });
+        assert!(
+            allocations.requested_peak <= crate::source_rotation::PARKED_BUDGET,
+            "bounded start scratch: {}",
+            allocations.requested_peak
+        );
+        assert_eq!(row["reason"], "terminal_unhealthy_retry");
+        assert_eq!(row["carried_pending_families"], HEALTHY);
+        assert_eq!(row["rearmed_index_files"], 0);
+        assert_eq!(
+            scoped_retry_full_reads(&fixture.index, &healthy),
+            0,
+            "cold acquisition state, including after the fence deadline"
+        );
+        assert!(fixture
+            .index
+            .claude_full_rearm_progress
+            .full_rearm_window
+            .is_none());
+        assert_eq!(fixture.index.claude_usage_authority_pending_count(), 1);
+        assert!(fixture.index.claude_duplicate_request_witness_overflowed);
+        for field in [
+            "session_account_bindings",
+            "accepted_snapshot_fingerprints",
+            "file_snapshot_fingerprints",
+            "claude_usage_authority_quarantine",
+        ] {
+            assert_eq!(
+                serde_json::to_value(&fixture.index).unwrap()[field],
+                before[field],
+                "{field}"
+            );
+        }
+        // A red terminal persists between unhealthy retries; local process
+        // acquisition cache is never populated for these healthy files.
+        fixture
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_directories
+            .clear();
+        fixture
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_candidates
+            .clear();
+        carry_red(&mut fixture.index, at, 7);
+        fixture
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds(at);
+        let exclusions = fixture.index.claude_reemission_exclusions.clone();
+        fixture.index = carry_reload(fixture.index);
+        fixture.index.claude_reemission_exclusions = exclusions;
+    }
+    // The unrelated held debt still retries when due, without charging any
+    // healthy history a read. Authority custody and the fence stay intact.
+    fixture
+        .index
+        .claude_usage_authority_quarantine
+        .get_mut(&held)
+        .unwrap()
+        .retry_after_unix_seconds = 0;
+    let held_candidates = fixture
+        .candidates
+        .iter()
+        .filter(|c| claude_index_path_member_ref(&c.path).unwrap().root == held)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(scoped_retry_full_reads(&fixture.index, &held_candidates), 1);
+    // A refused Fix 2 window remains BASE. Dropping its over-budget window
+    // scratch must not accidentally make it look like a non-window retry.
+    let context = fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .context_fingerprint
+        .clone();
+    fixture.index.claude_full_rearm_progress.full_rearm_window = Some(ClaudeFullRearmWindow {
+        context_fingerprint: context,
+        process: claude_full_rearm_process(),
+        window_ends: BTreeSet::from([CARRY_FAILED.to_string()]),
+        member_digests: BTreeMap::new(),
+    });
+    let row = carry_start(
+        &mut fixture.index,
+        "2026-08-03T08:32:00Z",
+        BACKFILL_WINDOW_DAYS,
+    );
+    assert_eq!(row["carried_pending_families"], 0);
+    assert!(healthy
+        .iter()
+        .all(|c| fixture.index.files[&local_index_key(&c.path)]
+            .source_file_fingerprint
+            .is_empty()));
+}
+
+#[test]
+fn streaming_accepted_carry_matches_the_existing_family_refusals() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for damage in [
+        "none",
+        "duplicate_path",
+        "missing_ack",
+        "account_hold",
+        "retained_stub",
+        "missing_root",
+        "foreign_member",
+        "invalid_pending",
+    ] {
+        let mut fixture = scoped_retry_fixture(1, 4, false);
+        let root = fixture.roots[1].clone();
+        let key = local_index_key(&fixture._scratch.join(format!("{root}.jsonl")));
+        match damage {
+            "duplicate_path" => {
+                let duplicate = format!("/another-project/{root}.jsonl");
+                fixture
+                    .index
+                    .files
+                    .insert(duplicate.clone(), fixture.index.files[&key].clone());
+                fixture.index.file_snapshot_fingerprints.insert(
+                    duplicate,
+                    fixture.index.file_snapshot_fingerprints[&key].clone(),
+                );
+            }
+            "missing_ack" => {
+                let body = fixture.index.file_snapshot_fingerprints[&key]
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .clone();
+                fixture.index.accepted_snapshot_fingerprints.remove(&body);
+            }
+            "account_hold" => {
+                fixture
+                    .index
+                    .claude_account_deferred_holds
+                    .insert(key.clone(), "held".into());
+            }
+            "retained_stub" => {
+                fixture
+                    .index
+                    .claude_request_census
+                    .invalidate_keeping_birth(&key);
+            }
+            "missing_root" => {
+                fixture.index.files.remove(&key);
+            }
+            "foreign_member" => {
+                fixture
+                    .index
+                    .claude_usage_family_pending
+                    .get_mut(&root)
+                    .unwrap()
+                    .member_request_id_hashes
+                    .insert("foreign".into(), BTreeSet::new());
+            }
+            "invalid_pending" => {
+                fixture
+                    .index
+                    .claude_usage_family_pending
+                    .get_mut(&root)
+                    .unwrap()
+                    .invalid = true;
+            }
+            _ => {}
+        }
+        let stale = fixture
+            .index
+            .claude_usage_family_pending
+            .keys()
+            .cloned()
+            .collect();
+        let legacy = claude_fence_closed_retry_carry(&fixture.index, &stale, true, true, true);
+        let streaming = claude_stream_accepted_retry_carry(&fixture.index, &stale).unwrap();
+        assert_eq!(streaming.roots, legacy.roots, "{damage}");
+        assert_eq!(
+            streaming.roots.len(),
+            if damage == "none" { 4 } else { 3 },
+            "{damage}"
+        );
+    }
+}
+
+#[test]
+fn accepted_carry_streams_when_request_graph_refuses_even_a_small_family_set() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = scoped_retry_fixture(0, 2, false);
+    let root = fixture.roots[0].clone();
+    let pending = fixture
+        .index
+        .claude_usage_family_pending
+        .get_mut(&root)
+        .unwrap();
+    pending.member_occurrences.clear();
+    pending
+        .member_request_id_hashes
+        .insert(root, (0..12000).map(|n| format!("{n:064x}")).collect());
+    let stale = fixture
+        .index
+        .claude_usage_family_pending
+        .keys()
+        .cloned()
+        .collect();
+    assert!(!claude_stale_family_carry_scratch_admitted(
+        &fixture.index,
+        &stale,
+        0
+    ));
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 2);
+    assert_eq!(row["rearmed_index_files"], 0);
+    assert_eq!(
+        scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+        0
+    );
+}
+
+#[test]
+fn admitted_legacy_carry_keeps_its_existing_path_at_512_families() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = scoped_retry_fixture(0, 512, true);
+    fixture.index.bounded_sweep_had_unsettled_upload = false;
+    for entry in fixture.index.files.values_mut() {
+        entry.last_upload_body_witness = None;
+    }
+    let stale = fixture
+        .index
+        .claude_usage_family_pending
+        .keys()
+        .cloned()
+        .collect();
+    assert!(claude_stale_family_carry_scratch_admitted(
+        &fixture.index,
+        &stale,
+        0
+    ));
+    assert!(!claude_stale_rearm_can_reopen_fence(&fixture.index, &stale));
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 512);
+    assert_eq!(row["rearmed_index_files"], 0);
+    assert_eq!(
+        scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+        0
+    );
+}
+
+#[test]
+fn scaled_retry_defers_without_clearing_when_cancellation_cannot_be_funded() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = scoped_retry_fixture(1, 6356, false);
+    let files = serde_json::to_value(&fixture.index.files).unwrap();
+    let pending = fixture.index.claude_usage_family_pending.clone();
+    let bindings = fixture.index.session_account_bindings.clone();
+    let old_window = fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .census_window_end
+        .clone();
+    let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut fixture.index,
+            CARRY_RETRY,
+            BACKFILL_WINDOW_DAYS,
+        )
+    });
+    assert!(!rows.iter().any(|r| r["counts"]["event"] == "starting"));
+    assert_eq!(serde_json::to_value(&fixture.index.files).unwrap(), files);
+    assert_eq!(fixture.index.claude_usage_family_pending, pending);
+    assert_eq!(fixture.index.session_account_bindings, bindings);
+    assert_eq!(
+        fixture.index.traversal.as_ref().unwrap().census_window_end,
+        old_window
+    );
+    assert_eq!(
+        scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+        0
+    );
+}
+
+#[test]
+fn deferred_retry_resumes_after_transient_funding_refusal() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = scoped_retry_fixture(0, 6356, false);
+    let before = serde_json::to_value(&fixture.index.files).unwrap();
+    {
+        let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut fixture.index,
+            CARRY_RETRY,
+            BACKFILL_WINDOW_DAYS,
+        );
+        assert_eq!(serde_json::to_value(&fixture.index.files).unwrap(), before);
+    }
+    let exclusions = fixture.index.claude_reemission_exclusions.clone();
+    fixture.index = carry_reload(fixture.index);
+    fixture.index.claude_reemission_exclusions = exclusions;
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 6356);
+    assert_eq!(
+        scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+        0
+    );
+}
+
+include!("retry_admission_tests.rs");

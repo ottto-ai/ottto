@@ -158,16 +158,44 @@ impl Probe {
             process_sample(),
         )
     }
+    #[cfg(test)]
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
+        self.collection_with_account_pending(source, counts, None);
+    }
+    pub(crate) fn collection_with_account_pending(
+        &self,
+        source: &str,
+        counts: CollectionCounts,
+        pending: Option<ClaudeAccountRetainedPending>,
+    ) {
+        #[derive(Serialize)]
+        struct Counts {
+            #[serde(flatten)]
+            collection: CollectionCounts,
+            #[serde(flatten)]
+            pending: Option<ClaudeAccountRetainedPending>,
+        }
         emit(&Record {
             schema_version: SCHEMA_VERSION,
             process_id: std::process::id(),
             stage: "native_collection_page",
             source: Source::from_slug(source),
             observation: self.observation(),
-            counts,
+            counts: Counts {
+                collection: counts,
+                pending,
+            },
         });
     }
+}
+
+/// All retained account-pending families, including held/incomplete families;
+/// a conservative local-only gauge, never an authority or eviction decision.
+#[derive(Debug, Serialize)]
+pub(crate) struct ClaudeAccountRetainedPending {
+    pub(crate) claude_account_retained_pending_families: usize,
+    /// Pretty JSON bytes of the retained field, including its field wrapper.
+    pub(crate) claude_account_retained_pending_bytes: u64,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
     const INLINE_ONLY: bool = true;

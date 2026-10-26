@@ -1969,6 +1969,12 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             | "claude_usage_authority_quarantine"
             | "codex_parent_prefix_proofs"
             | "accepted_snapshot_fingerprint_ledger_version" => continue,
+            "upload_ack_retirement_handoff" => serde_json::json!({
+                "destination_namespace_hash":"c".repeat(64),
+                "committed_generation":1,
+                "bodies":{"d".repeat(64):"e".repeat(64)},
+                "pending_bodies":{"a".repeat(64):"b".repeat(64)}
+            }),
             "session_account_bindings" => {
                 serde_json::json!({"session":{"account_identifier_hash":"account","workspace_identifier_hash":"workspace"}})
             }
@@ -2013,10 +2019,17 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                 serde_json::json!({"/synthetic/0.jsonl":{"v":claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,"fp":"a".repeat(64),"w":7,"s":"exact","b":"AAAAAAAAAAE="}})
             }
             "claude_request_census_shadow" => serde_json::json!({"o":true}),
+            "reread_guard" => serde_json::json!({"closed":true}),
             "claude_retired_family_tombstones" => {
                 serde_json::json!({"a".repeat(64): 1})
             }
             "claude_full_rearm_progress" => serde_json::json!({"structural_rearm_owed":true}),
+            "codex_counting_evicted_legacy" => {
+                serde_json::json!([{"owner":"b".repeat(64),"selected_v2":false}])
+            }
+            "codex_counting_tombstones" => {
+                serde_json::json!({"a".repeat(64):{"evidence":"legacy_acked","retired_in":"2026-10-22T00:00:00Z"}})
+            }
             "claude_duplicate_request_owners" => {
                 serde_json::json!({"request":[{"root_session_id_hash":"root","source_session_id_hash":"session"}]})
             }
@@ -2187,6 +2200,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
             // Pins the NewFile decision independently of the scan's earlier
             // candidate guard, including when the held native entry is absent.
             let candidate = CandidateFile {
+                physical_identity: None,
                 scan_root: root.clone(),
                 path: transcript_paths[0].clone(),
                 size_bytes: fs::metadata(&transcript_paths[0]).unwrap().len(),
@@ -2720,6 +2734,85 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
         as_json(&seed.claude_owned_start_census),
         "{context}"
     );
+}
+
+#[test]
+fn malformed_upload_ack_retirement_handoff_keeps_index_identity_without_pause() {
+    for bounded in [false, true] {
+        for (case, damaged) in [
+            ("null", serde_json::json!(null)),
+            ("string", serde_json::json!("damaged-handoff")),
+            (
+                "negative-generation",
+                serde_json::json!({
+                    "destination_namespace_hash": "c".repeat(64),
+                    "committed_generation": -1,
+                    "bodies": {"d".repeat(64): "e".repeat(64)}
+                }),
+            ),
+        ] {
+            let scratch = crate::test_scratch::ScratchDir::new("lenient-ack-handoff");
+            let path = scratch.join("index.json");
+            let support = scratch.join("support");
+            let source = SnapshotSource::ClaudeCode;
+            let mut seed = override_identity_seed("handoff-owner", true);
+            seed.save(&path).unwrap();
+            let mut value = serde_json::to_value(&seed).unwrap();
+            value["upload_ack_retirement_handoff"] = damaged;
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&path, &bytes).unwrap();
+
+            let before = scan_index_containment_lines_for_test().len();
+            let (mut loaded, origin) =
+                ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support).unwrap();
+            assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{case}");
+            assert!(!scan_index_rebuild_paused(source), "{case}");
+            assert!(loaded.upload_ack_retirement_handoff.is_none(), "{case}");
+            assert_identity_carried(&loaded, &seed, case);
+            assert_eq!(
+                loaded.accepted_snapshot_fingerprints,
+                seed.accepted_snapshot_fingerprints
+            );
+            assert_eq!(as_json(&loaded.files), as_json(&seed.files));
+            assert_eq!(
+                loaded.file_snapshot_fingerprints,
+                seed.file_snapshot_fingerprints
+            );
+            assert_eq!(loaded.snapshot_activity_at, seed.snapshot_activity_at);
+            assert_eq!(loaded.generation, seed.generation);
+            assert!(loaded.decode_holds.is_empty(), "{case}");
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "load never rewrites {case}"
+            );
+            assert_eq!(corrupt_count(&scratch), 0);
+            assert!(
+                !scan_index_containment_lines_for_test()[before..]
+                    .iter()
+                    .any(|line| line.contains("source_paused=1")),
+                "{case}"
+            );
+
+            // Both CAS readers must accept the repaired cleanup field, too.
+            if bounded {
+                loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
+            } else {
+                loaded.save(&path).unwrap();
+            }
+            let reloaded = ScanIndex::load(&path).unwrap();
+            assert!(reloaded.upload_ack_retirement_handoff.is_none());
+            assert_identity_carried(&reloaded, &seed, case);
+            assert_eq!(
+                reloaded.accepted_snapshot_fingerprints,
+                seed.accepted_snapshot_fingerprints
+            );
+            assert_eq!(
+                reloaded.file_snapshot_fingerprints,
+                seed.file_snapshot_fingerprints
+            );
+        }
+    }
 }
 
 #[test]
@@ -4133,4 +4226,235 @@ fn real_repair_override_marks_history_unverified_before_return_and_first_census(
     assert!(loaded
         .claude_authority_record_for_test("first-census-absent")
         .is_some());
+}
+
+#[test]
+fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
+    let mut seed = fixture();
+    seed.claude_usage_family_pending.insert(
+        "family".into(),
+        ClaudeUsageFamilyPending {
+            census_window_end: "2026-10-25T00:00:00Z".into(),
+            member_request_id_hashes: BTreeMap::new(),
+            member_occurrences: BTreeMap::new(),
+            invalid: true,
+            idless_revision: Some([7; 32]),
+        },
+    );
+    let valid = serde_json::to_vec_pretty(&seed).unwrap();
+    let loaded = lenient_decode::read(std::io::Cursor::new(&valid), "load", "claude_code").unwrap();
+    assert_eq!(
+        loaded.claude_usage_family_pending["family"].idless_revision,
+        Some([7; 32])
+    );
+    for positional in [false, true] {
+        let mut value = serde_json::to_value(&seed).unwrap();
+        if positional {
+            value["claude_usage_family_pending"]["family"] =
+                serde_json::json!(["2026-10-25T00:00:00Z", {}, {}, true, vec![7; 32],]);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let loaded =
+                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code").unwrap();
+            assert_eq!(
+                loaded.claude_usage_family_pending["family"].idless_revision,
+                Some([7; 32])
+            );
+            value["claude_usage_family_pending"]["family"][4] =
+                Value::String("MARKER_PAYLOAD".into());
+        } else {
+            value["claude_usage_family_pending"]["family"]["idless_revision"] =
+                Value::String("MARKER_PAYLOAD".into());
+        }
+        let template = serde_json::to_string(&value).unwrap();
+        let payload = "x".repeat(16 * 1024 * 1024);
+        for malformed in [
+            format!("\"{payload}\""),
+            format!("[\"{payload}\"]"),
+            format!("{{\"{payload}\":0}}"),
+        ] {
+            let bytes = template
+                .replace("\"MARKER_PAYLOAD\"", &malformed)
+                .into_bytes();
+            let (result, allocations) = crate::retry_allocation_probe::measure(|| {
+                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code")
+            });
+            // Optional optimization damage is normalized at its boundary;
+            // it must not consume opaque debt or reset the identity index.
+            let loaded = result.unwrap();
+            assert!(loaded.claude_usage_family_pending["family"].invalid);
+            assert_eq!(
+                loaded.claude_usage_family_pending["family"].idless_revision,
+                None
+            );
+            assert!(loaded.decode_holds.is_empty());
+            assert!(
+                allocations.requested_peak < 256 * 1024,
+                "{}",
+                allocations.requested_peak
+            );
+            assert!(
+                allocations.usable_peak < 512 * 1024,
+                "{}",
+                allocations.usable_peak
+            );
+        }
+    }
+}
+
+#[test]
+fn damaged_idless_marker_load_and_save_preserve_all_identity_custody() {
+    let mut seed = fixture();
+    seed.claude_request_identity_contract = Some(claude_request_identity::COLLECTOR.to_owned());
+    seed.claude_request_identity_contract_changed = true;
+    seed.session_account_bindings.insert(
+        "/synthetic/0.jsonl".into(),
+        SessionAccountBinding {
+            account_identifier_hash: "a".repeat(64),
+            workspace_identifier_hash: Some("b".repeat(64)),
+        },
+    );
+    let pending = ClaudeUsageFamilyPending {
+        census_window_end: "2026-10-25T00:00:00Z".into(),
+        member_request_id_hashes: BTreeMap::from([("family".into(), BTreeSet::new())]),
+        member_occurrences: BTreeMap::new(),
+        invalid: true,
+        idless_revision: None,
+    };
+    seed.claude_usage_family_pending
+        .insert("family".into(), pending.clone());
+    for positional in [false, true] {
+        let mut value = serde_json::to_value(&seed).unwrap();
+        if positional {
+            value["claude_usage_family_pending"]["family"] = serde_json::json!([
+                pending.census_window_end,
+                pending.member_request_id_hashes,
+                {},
+                true,
+                "MARKER"
+            ]);
+        } else {
+            value["claude_usage_family_pending"]["family"]["idless_revision"] = "MARKER".into();
+        }
+        let template = serde_json::to_string(&value).unwrap();
+        let oversized = "x".repeat(16 * 1024 * 1024);
+        for marker in [
+            format!("\"{oversized}\""),
+            format!("[\"{oversized}\"]"),
+            format!("{{\"{oversized}\":0}}"),
+            "1e400".into(),
+            "{\"wrong\":true}".into(),
+        ] {
+            let scratch = crate::test_scratch::ScratchDir::new("idless-marker-identity");
+            let path = scratch.join("index.json");
+            fs::write(&path, template.replace("\"MARKER\"", &marker)).unwrap();
+            let mut loaded = ScanIndex::load(&path).expect("field damage cannot quarantine index");
+            for round in 0..2 {
+                assert_eq!(corrupt_count(scratch.as_ref()), 0);
+                assert!(loaded.decode_holds.is_empty());
+                assert_eq!(loaded.claude_usage_family_pending["family"], pending);
+                assert_eq!(
+                    loaded.session_account_bindings,
+                    seed.session_account_bindings
+                );
+                assert_eq!(
+                    loaded.accepted_snapshot_fingerprints,
+                    seed.accepted_snapshot_fingerprints
+                );
+                assert_eq!(
+                    loaded.file_snapshot_fingerprints,
+                    seed.file_snapshot_fingerprints
+                );
+                assert_eq!(
+                    loaded.claude_request_identity_contract,
+                    seed.claude_request_identity_contract
+                );
+                assert!(loaded.claude_request_identity_contract_changed);
+                assert_eq!(
+                    serde_json::to_value(&loaded.files).unwrap(),
+                    serde_json::to_value(&seed.files).unwrap()
+                );
+                assert!(
+                    !claude_stale_carry_start_admitted(&loaded),
+                    "BASE; no proof from marker damage"
+                );
+                if round == 0 {
+                    loaded
+                        .save(&path)
+                        .expect("normalized index retains CAS custody");
+                    loaded = ScanIndex::load(&path).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
+    // The old short sequence meant discovered=7, not a guard admission.
+    // Also exercise the full legacy sequence, including its structured slots.
+    let legacy = [
+        "discovered_file_count",
+        "directory_entry_cap_exceeded_count",
+        "symlink_rejected_count",
+        "unreadable_path_count",
+        "unreadable_causes",
+        "parent_unresolvable",
+        "oversized_file_count",
+        "disappeared_file_count",
+        "malformed_json_line_count",
+        "invalid_utf8_line_count",
+        "over_line_cap_count",
+        "recognized_usage_drop_count",
+        "ownership_incomplete_file_count",
+        "zero_snapshot_usage_evidence_count",
+        "dropped_usage_record_count",
+        "terminal_over_line_cap_count",
+        "terminal_recognized_usage_drop_count",
+        "terminal_dropped_usage_record_count",
+        "terminal_ownership_incomplete_file_count",
+        "terminal_zero_snapshot_usage_evidence_count",
+    ];
+    for full in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("nested-counts-sequence");
+        let path = scratch.join("index.json");
+        let defaults = serde_json::to_value(ScanTraversalCounts::default()).unwrap();
+        let mut expected = defaults.clone();
+        let slots = legacy
+            .iter()
+            .take(if full { legacy.len() } else { 1 })
+            .enumerate()
+            .map(|(n, name)| {
+                let value = if defaults[*name].is_number() {
+                    serde_json::json!(n + 7)
+                } else {
+                    defaults[*name].clone()
+                };
+                expected[*name] = value.clone();
+                value
+            })
+            .collect::<Vec<_>>();
+        let mut root = serde_json::to_value(ScanIndex::default()).unwrap();
+        root["traversal"] = serde_json::json!({
+            "context_fingerprint":"context", "census_window_end":"2026-10-24T23:00:00Z",
+            "scan_roots":[], "pending_directories":[], "pending_candidates":[],
+            "observed_index_keys":[], "reconciliation_upper_bound":null,
+            "reconciliation_after":null, "reconciliation_started":true, "counts":slots
+        });
+        fs::write(&path, serde_json::to_vec(&root).unwrap()).unwrap();
+        let mut loaded = ScanIndex::load(&path).expect("legacy nested sequence loads");
+        let counts = &loaded.traversal.as_ref().unwrap().counts;
+        assert_eq!(serde_json::to_value(counts).unwrap(), expected);
+        assert_eq!(counts.discovered_file_count, 7);
+        assert_eq!(counts.unchanged_reread_admitted, 0);
+        assert_eq!(counts.reread_budget_refused, 0);
+        assert_eq!(counts.has_retryable_problems(), full);
+        loaded
+            .save(&path)
+            .expect("legacy checkpoint can still CAS-save");
+        let reopened = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reopened.traversal.as_ref().unwrap().counts).unwrap(),
+            expected
+        );
+    }
 }
