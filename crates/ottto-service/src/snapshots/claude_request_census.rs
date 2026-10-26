@@ -761,8 +761,8 @@ fn held_candidates<'a>(
         .filter(move |hash| candidates.binary_search(hash).is_ok())
 }
 
-/// Test seam: transcript holder walks on this thread hit their deadline
-/// (bit 1: the copy-decision walk, bit 2: the side-call walk).
+// Test seam: transcript holder walks on this thread hit their deadline
+// (bit 1: the copy-decision walk, bit 2: the side-call walk).
 #[cfg(test)]
 thread_local! {
     static WALK_DEADLINE_FOR_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };

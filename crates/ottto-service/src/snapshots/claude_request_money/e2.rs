@@ -63,8 +63,8 @@ pub(crate) fn with_enabled<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Per-stage wall clock for the F3 perf receipt. Test builds only: the
-/// daemon build has no timer here, `timed` is just the call.
+// Per-stage wall clock for the F3 perf receipt. Test builds only: the
+// daemon build has no timer here, `timed` is just the call.
 #[cfg(test)]
 thread_local! {
     static STAGES: RefCell<BTreeMap<&'static str, Duration>> = const { RefCell::new(BTreeMap::new()) };

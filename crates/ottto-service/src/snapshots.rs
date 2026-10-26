@@ -14571,11 +14571,13 @@ impl ClaudeResponseObservation {
         self.resolve_with(&ClaudeSelectorTable::default())
     }
 
+    #[cfg(test)]
     fn resolve_with(self, selectors: &ClaudeSelectorTable) -> Option<ResolvedClaudeResponse> {
         self.resolve_classified(selectors).ok()
     }
 
-    /// `resolve_with`, telling why a response has no resolution.
+    /// Resolve against the file's selector table, telling why a response
+    /// has no resolution.
     fn resolve_classified(
         self,
         selectors: &ClaudeSelectorTable,
