@@ -1774,7 +1774,9 @@ fn e2_identity_mid_session_request_with_two_orgs_goes_to_the_starting_account() 
                     line("a", &at(1), 10),
                     switch_context(),
                     org_marker(ORG_B),
-                    switch_context(),
+                    json!({"type":"attachment","sessionId":ROOT,
+                        "attachment":{"type":"session_context",
+                            "context":{"userEmail":"other@example.invalid"}}}),
                     org_marker(ORG_C),
                     line("b", &at(2), 20),
                     line("c", &at(3), 30),
@@ -3161,6 +3163,11 @@ fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
             &[marker.clone(), line("original", &at(2), 10)],
         );
         for fresh in [false, true] {
+            // The page's metadata probe witnesses the live original (F1c).
+            stage_twins(
+                &mut index,
+                &[(&original, t0()), (&copy, t0() + 100_000_000_000)],
+            );
             let mut lines = vec![marker.clone(), line("original", &at(2), 10)];
             if fresh {
                 let mut own = org_marker(ORG_B);

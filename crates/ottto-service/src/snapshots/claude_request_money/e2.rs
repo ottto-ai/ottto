@@ -682,11 +682,12 @@ impl FileFold {
     }
 
     /// Owner ruling (/branch, --fork-session): an all-pre-birth MAIN file is
-    /// a copy when every request id it holds is held by another indexed main
-    /// file of earlier (effective birth, location), found with the census
-    /// holder walk side calls use. Only this rare shape walks; no new index
-    /// or reader. No earlier holder (an orphan copy, its original gone) or
-    /// the walk deadline: counted once here and disclosed (COST).
+    /// a copy when every request id it holds is held by indexed main files
+    /// of OTHER sessions with earlier (effective birth, location), found
+    /// with the census holder walk side calls use. Only this rare shape
+    /// walks; no new index or reader. No earlier holder (an orphan copy, its
+    /// original gone) or the walk deadline: counted once here and disclosed
+    /// (COST).
     fn cross_session_original(
         &self,
         context: Option<&ReadContext<'_>>,
@@ -703,7 +704,9 @@ impl FileFold {
         {
             return false;
         }
-        let own_key = local_index_key(context.path);
+        let Some(own_member) = session_member(context.path) else {
+            return false;
+        };
         let current = (
             self.money_birth
                 .birth_nanos()
@@ -717,12 +720,15 @@ impl FileFold {
         wanted.sort_unstable();
         wanted.dedup();
         let store = &context.index.claude_money_birth_store;
+        // Same-session paths (twins, moves) are the birth table's to decide.
         let earlier = |key: &str| {
-            key != own_key
-                && context.index.files.contains_key(key)
-                && session_member(Path::new(key))
-                    .and_then(|member| store.effective_cutoff(&member, key))
-                    .is_some_and(|birth| (birth, location_key(key)) < current)
+            context.index.files.contains_key(key)
+                && session_member(Path::new(key)).is_some_and(|member| {
+                    member != own_member
+                        && store
+                            .effective_cutoff(&member, key)
+                            .is_some_and(|birth| (birth, location_key(key)) < current)
+                })
         };
         context
             .index

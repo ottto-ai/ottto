@@ -1368,8 +1368,26 @@ fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
         let mut c = Corpus::new("e2-pipeline-branch-no-new-reply");
         c.root(ROOT, &line(ROOT, "original", AT, 10));
         let scanner = E2ScanFixture::default();
+        let sum = |items: &[SnapshotItem]| {
+            items.iter().fold([0_u64; 8], |mut sum, s| {
+                for (target, n) in sum.iter_mut().zip([
+                    s.request_count,
+                    s.input_tokens,
+                    s.output_tokens,
+                    s.cache_read_tokens,
+                    s.cache_creation_5m_tokens,
+                    s.cache_creation_1h_tokens,
+                    s.reasoning_output_tokens,
+                    s.unattributed_total_tokens,
+                ]) {
+                    *target += n;
+                }
+                sum
+            })
+        };
         let mut original = ready(&c, &scanner, ScanIndex::default(), 100, false);
         assert_eq!(total(&original), 1);
+        let original_totals = sum(&original.scan.snapshots);
         original.finish();
         let prior = c.reload(&mut original.index);
         c.write_at(
@@ -1379,21 +1397,11 @@ fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
         );
         let branch = ready(&c, &scanner, prior, 100, false);
         literal(&branch);
-        let totals = branch.scan.snapshots.iter().fold([0_u64; 8], |mut sum, s| {
-            for (target, n) in sum.iter_mut().zip([
-                s.request_count,
-                s.input_tokens,
-                s.output_tokens,
-                s.cache_read_tokens,
-                s.cache_creation_5m_tokens,
-                s.cache_creation_1h_tokens,
-                s.reasoning_output_tokens,
-                s.unattributed_total_tokens,
-            ]) {
-                *target += n;
-            }
-            sum
-        });
+        // The unchanged original is not re-emitted on the branch page (it
+        // holds only the copy), so the money published is the original page
+        // plus the branch page: the original's exactly once, the branch none.
+        let branch_totals = sum(&branch.scan.snapshots);
+        let totals: [u64; 8] = std::array::from_fn(|at| original_totals[at] + branch_totals[at]);
         let shape = branch
             .scan
             .snapshots
