@@ -17359,6 +17359,8 @@ mod tests {
     // A local preflight quarantine records Poisoned in the shared client_report counters.
     #[serial(client_report)]
     fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
+        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = test_dir("admission-native-hourly");
         std::fs::create_dir_all(&root).unwrap();
         let source = SnapshotSource::ClaudeCode;

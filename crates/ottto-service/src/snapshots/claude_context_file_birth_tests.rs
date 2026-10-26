@@ -1636,6 +1636,8 @@ fn api_row_without_trace_row_counts_as_owned() {
 
 #[test]
 fn telemetry_proven_session_keeps_todays_numbers() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-file-birth-parity");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -2976,6 +2978,8 @@ fn first_own_request_time_is_absent_unless_the_birth_is_measured() {
 /// for the same file the birth rule measures.
 #[test]
 fn strict_path_has_no_first_own_request_time() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-file-birth-first-own-strict");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(

@@ -2710,6 +2710,8 @@ mod tests {
 
     #[test]
     fn own_request_parts_gate_account_fallbacks() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         use crate::claude_local_otel::{
             ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipEvidence,
             ClaudeTraceOwnershipLoadReport,

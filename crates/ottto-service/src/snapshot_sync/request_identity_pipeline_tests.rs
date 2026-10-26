@@ -205,6 +205,8 @@ fn identity_pipeline_cycle(
 #[serial]
 #[serial(source_cadences, source_manifests)]
 fn native_comparison_real_source_preparation_stays_base_without_paired_evidence() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
     let cycle = identity_pipeline_cycle(&fixture, "native-preparation", "").unwrap();

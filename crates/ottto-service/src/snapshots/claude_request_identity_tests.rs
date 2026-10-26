@@ -1888,6 +1888,8 @@ fn assert_usage_conserved(tagged: &SnapshotItem, before: &SnapshotItem) {
 /// refused while the transcript requests keep their telemetry login.
 #[test]
 fn reported_rebuild_groups_requests_without_changing_its_output() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     for (with_aux, aux_login) in [(false, true), (true, true), (true, false)] {
         let (dir, parent, items) = claude_account_family_fixture();
         let (api, trace) = family_reports(&parent, with_aux, aux_login);
@@ -3248,6 +3250,8 @@ fn parse_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
 
 #[test]
 fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conserved() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-request-identity-email");
     let slot = dir.join("slot");
     let home = crate::claude_status_coverage::home_key(&slot);
@@ -3335,6 +3339,8 @@ fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conse
 
 #[test]
 fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::claude_status_coverage::{home_key, Ledger, Registration, MAX_LOST};
     let dir = temp_dir("claude-request-identity-removed-slot");
     let (slot, loose) = (dir.join("slot"), dir.join("loose"));
@@ -3550,6 +3556,8 @@ fn rows_under_another_root_own_the_request() {
 /// Usage never moves and full telemetry remains authoritative.
 #[test]
 fn transcript_markers_are_withdrawn_even_when_a_settled_census_shows_unduplicated() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::ClaudeDuplicateCensusCounts;
     let dir = temp_dir("claude-request-identity-ownership");
     let org = org_hash(ORG_1);
@@ -3870,6 +3878,8 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
 /// grouping and apply it directly, which a settled pass did on that head.
 #[test]
 fn capture_on_non_marker_body_matches_main_before_withdrawal() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-i1b-non-marker-parity");
     let lines = vec![
         json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
@@ -4119,6 +4129,8 @@ fn zero_usage_without_an_id_or_before_final_usage_keeps_todays_contract5() {
 /// plain request-id count coincide, which never admitted them either.
 #[test]
 fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-request-identity-zero-usage-negatives");
     let (api, trace) = owned_session_reports();
     let with_error = |extra: Option<Value>| {
@@ -4891,6 +4903,8 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
 /// current, and a response without a complete event clock proves no order.
 #[test]
 fn transcript_path_current_account_is_the_newest_parsed_request() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, mut items) = claude_account_family_fixture();
     items.truncate(1);
     let api = (1..=4)

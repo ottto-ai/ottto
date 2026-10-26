@@ -539,6 +539,8 @@ fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
 
 #[test]
 fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
@@ -680,6 +682,8 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
 
 #[test]
 fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     for conflict in [false, true] {
         let f = Fixture::new(2);
         let cache = Arc::new(SharedCache::default());

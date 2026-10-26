@@ -755,6 +755,8 @@ impl ProcessPermit {
 
 #[test]
 fn envelope_experiment_native_save_bootstrap_restart_matches_base_owners() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, parent, raw) = claude_account_family_fixture();
     let scratch = crate::test_scratch::ScratchDir::new("envelope-bootstrap");
     let path = scratch.join("index.json");

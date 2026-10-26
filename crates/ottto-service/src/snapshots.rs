@@ -61084,6 +61084,8 @@ mod tests {
 
     #[test]
     fn claude_reported_usage_union_assigns_aux_and_preserves_graph() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, parent, mut items) = claude_account_family_fixture();
         let occurrences = items[0]
             .claude_usage_occurrences
@@ -63138,6 +63140,8 @@ mod tests {
 
     #[test]
     fn claude_d1_multiple_requests_typed_identity_and_unreadable_import() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
         let path = dir
             .join(&root)

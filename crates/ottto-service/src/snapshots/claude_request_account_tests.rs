@@ -602,6 +602,8 @@ fn h296_trace_refingerprint(row: &mut crate::claude_local_otel::ClaudeTraceOwner
 
 #[test]
 fn claude_h296_root_and_child_have_independent_exact_request_logins() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, mut api, trace) = h296_root_evidence();
     let child_path = dir.join(&root.source_session_id).join("subagents/agent-a4d1585d310070d0f.jsonl");
     let child = parse_claude_code_jsonl_file(&child_path, "2026-08-02T07:01:00Z", "child-fp".into()).unwrap().remove(0);
@@ -676,6 +678,8 @@ fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
 
 #[test]
 fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, original, api, trace) = h296_root_evidence();
     for case in ["missing_clock", "observer_fallback", "hour_minimum", "missing_hour", "creator_conflict", "creator_other_account", "unsupported_route", "multiple_logins"] {
         let mut item = original.clone(); let mut api = api.clone();
