@@ -24591,27 +24591,26 @@ pub(crate) enum OwnedSourceScanStep {
         terminal_native_traversal: Option<Box<claude_native_comparison::TerminalTraversal>>,
     },
 }
-// E2 can defer paths from the priority prefix. Record service only after
-// that deferral, using the surviving page rather than the stale prefix length.
-// The retry recorder itself credits only contiguous owed paths, so audits and
-// other unrelated candidates cannot consume debt or clear their fingerprints.
+// E2 can defer paths from the priority prefix. Stable removal keeps every
+// surviving priority path within the old prefix bound; clamp it to the page's
+// new length. Any ordinary suffix included was actually offered too, and the
+// recorder credits only contiguous owed paths. Its membership scan stays no
+// larger than the original prefix, including when the whole prefix deferred.
 fn finish_claude_retry_selection(
     index: &mut ScanIndex,
     pending_paths: &mut Vec<ScanTraversalPath>,
     retry_service_end: usize,
     census_window_end: &str,
 ) {
-    let offered = if claude_request_money::e2::enabled() {
+    if claude_request_money::e2::enabled() {
         claude_request_money::e2::defer_roots_of_queued_families(
             pending_paths,
             index.traversal.as_mut().expect("traversal initialized"),
         );
-        pending_paths.as_slice()
-    } else {
-        &pending_paths[..retry_service_end]
-    };
-    if retry_service_end > 0 {
-        claude_retry_note_offered(index, offered, census_window_end);
+    }
+    let offered_end = retry_service_end.min(pending_paths.len());
+    if offered_end > 0 {
+        claude_retry_note_offered(index, &pending_paths[..offered_end], census_window_end);
     }
 }
 
