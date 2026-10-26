@@ -3681,15 +3681,10 @@ pub(super) mod tests {
                 .iter()
                 .map(|item| snapshot_fingerprint(SnapshotSource::Codex, item))
                 .collect::<BTreeSet<_>>();
-            let mut digest = Sha256::new();
-            update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
-            for fingerprint in &fingerprints {
-                update_length_prefixed(&mut digest, fingerprint.as_bytes());
-            }
             let key = local_index_key(&member.path);
             index.record(
                 member,
-                Some(format!("{:x}", digest.finalize())),
+                Some(snapshot_file_entity_set_hex(&fingerprints)),
                 ScanParseOutcome::Snapshot,
             );
             index.file_snapshot_fingerprints.insert(key, fingerprints);
