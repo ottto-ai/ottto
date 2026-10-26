@@ -1135,6 +1135,9 @@ struct SnapshotUploadProgress {
     /// Admission only: loaded committed incidence plus bounded unsettled ACK debt.
     #[serde(skip, default = "ack_retention::default_ack_capacity")]
     ack_capacity: usize,
+    /// ACKs outside known live incidence; includes valid unindexed debt.
+    #[serde(skip)]
+    retained_stale_ack_count: usize,
     #[serde(default)]
     accepted_cache_states: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -1192,6 +1195,7 @@ impl SnapshotUploadProgress {
             accepted_fingerprints: BTreeSet::new(),
             accepted_body_witnesses: BTreeMap::new(),
             ack_capacity: ack_retention::default_ack_capacity(),
+            retained_stale_ack_count: 0,
             accepted_cache_states: BTreeMap::new(),
             accepted_cache_heads: BTreeMap::new(),
             pending_cache_heads: BTreeMap::new(),
@@ -2761,6 +2765,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     durable.attempted_reason_reoffers = progress.attempted_reason_reoffers.clone();
     durable.reason_reoffer_counts = progress.reason_reoffer_counts;
     durable.ack_capacity = progress.ack_capacity;
+    durable.retained_stale_ack_count = progress.retained_stale_ack_count;
     if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
@@ -2817,7 +2822,16 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
         None => committable.mark_bounded_sweep_unsettled(),
     }
-    progress.stage_ack_retirement_handoff(committed_index, &mut committable, locally_held)?;
+    let census_absent = progress.complete_census_ack_retirements(
+        index,
+        correction_scan.is_some_and(|scan| scan.census_complete),
+    );
+    progress.stage_ack_retirement_handoff_with_census(
+        committed_index,
+        &mut committable,
+        locally_held,
+        &census_absent,
+    )?;
     validate_destination()?;
     if let Some(cap) = read_limit {
         committable.save_with_read_limit(index_path, cap)?;
@@ -6986,8 +7000,12 @@ fn finish_sync_source(
     // Exact settled ACKs enter the same atomic progress ledger as normal pages.
     // Bootstrap and main upload must drain the same admitted subset. A larger
     // page stops through partial settlement only after those bodies can finish.
+    let census_absent_upload_acks =
+        upload_progress.complete_census_ack_retirements(&index, scan_result.census_complete);
+    // Current scanner incidence grants live slots on a first install, too.
+    // No absent ACK or unrelated entity borrows those slots.
     let ack_admission_limited =
-        upload_progress.admit_upload_input(&mut scan_result.snapshots, &committed_index);
+        upload_progress.admit_upload_input(&mut scan_result.snapshots, &index);
     let probes = scan_result
         .snapshots
         .iter()
@@ -7534,7 +7552,12 @@ fn finish_sync_source(
                 )
             };
             with_source_cadence(source, |cadence| {
-                cadence.record_scan_failure(Instant::now())
+                ack_retention::record_upload_error_cadence(
+                    cadence,
+                    Instant::now(),
+                    accepted,
+                    &error,
+                )
             });
             let _ = report_status_with_fresh_relay_token(
                 client,
@@ -7578,12 +7601,13 @@ fn finish_sync_source(
             upload_fully_settled = false;
         }
     }
-    upload_progress.stage_ack_retirement_handoff(
+    upload_progress.stage_ack_retirement_handoff_with_census(
         &committed_index,
         &mut index,
         locally_held_fingerprints,
+        &census_absent_upload_acks,
     )?;
-    let retired_upload_acks = upload_progress.retired_ack_candidates(&committed_index, &index);
+    let mut retired_upload_acks = upload_progress.retired_ack_candidates(&committed_index, &index);
     // Every selected-state restoration above has finished. A non-current
     // comparison already revoked this lease locally and cannot mint a native
     // correction later in this finish. Retire only that Claude prior index
@@ -7647,6 +7671,8 @@ fn finish_sync_source(
         &manifest_window_end,
     )?;
     note_codex_side_saved(daemon, &index_path, true, side_mark);
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("native_receipt")?;
     if upload_fully_settled
         && native_comparison_lease
             .as_ref()
@@ -7729,6 +7755,8 @@ fn finish_sync_source(
     // history gate clears the unverified marker. A fresh index recorded its
     // cutoff this cycle and an intact one keeps its entries, so the rebuilt
     // history stays gated; Claude's bootstrap and replays may then run.
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("unverified_marker")?;
     if claude_replay_suppressed(source, &backfill_state)
         && scan_result.census_complete
         && upload_fully_settled
@@ -7743,6 +7771,8 @@ fn finish_sync_source(
         }
     }
 
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("backfill_completion")?;
     if backfill_succeeded {
         // Keep completion's reload, mutation and save atomic with claims,
         // list intent and deliberate installation reset.
@@ -7779,11 +7809,14 @@ fn finish_sync_source(
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
     let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
+    retired_upload_acks.extend(upload_progress.saved_retirement_candidates(&index));
     upload_progress.retire_acks_after_index_save(
         &index,
         &retired_upload_acks,
         locally_held_fingerprints,
     );
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("finish_cycle")?;
     upload_progress.finish_cycle(&upload_progress_path)?;
 
     if let Some(count) = deferred_entity_count {
@@ -22990,7 +23023,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, ack_capacity, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

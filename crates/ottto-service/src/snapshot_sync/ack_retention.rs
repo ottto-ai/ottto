@@ -14,14 +14,15 @@ pub(super) fn default_ack_capacity() -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AckSettlementRequired {
     pub retained_ack_count: usize,
+    pub retained_stale_ack_count: usize,
     pub capacity: usize,
     pub deferred_entity_count: usize,
 }
 
 impl std::fmt::Display for AckSettlementRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "kind=ack_settlement_required retained_ack_count={} capacity={} deferred_entity_count={}",
-            self.retained_ack_count, self.capacity, self.deferred_entity_count)
+        write!(f, "kind=ack_settlement_required retained_ack_count={} retained_stale_ack_count={} capacity={} deferred_entity_count={}",
+            self.retained_ack_count, self.retained_stale_ack_count, self.capacity, self.deferred_entity_count)
     }
 }
 impl std::error::Error for AckSettlementRequired {}
@@ -70,6 +71,21 @@ pub(super) fn record_upload_failure_loss(error: &anyhow::Error) {
     );
 }
 
+/// Finish uses this same classification for both local admission stops and
+/// actual upload errors. Settlement work must not enter failure backoff.
+pub(super) fn record_upload_error_cadence(
+    cadence: &mut crate::adaptive_collector::SourceCadence,
+    now: Instant,
+    accepted: u64,
+    error: &anyhow::Error,
+) {
+    if error.downcast_ref::<AckSettlementRequired>().is_some() {
+        cadence.record_scan_success(now, accepted.max(1));
+    } else {
+        cadence.record_scan_failure(now);
+    }
+}
+
 impl SnapshotUploadProgress {
     pub(super) fn configure_ack_capacity(&mut self, committed: &ScanIndex) {
         // Only already-held live ACKs grant extra slots. Unindexed debt never
@@ -79,6 +95,7 @@ impl SnapshotUploadProgress {
         for fp in committed.upload_progress_ack_incidence() {
             unsettled.remove(fp);
         }
+        self.retained_stale_ack_count = unsettled.len();
         self.ack_capacity = self
             .accepted_fingerprints
             .len()
@@ -126,6 +143,7 @@ impl SnapshotUploadProgress {
             .accepted_fingerprints
             .len()
             .saturating_sub(unsettled.len());
+        self.retained_stale_ack_count = unsettled.len();
         self.ack_capacity = held_live
             .saturating_add(live_input.len())
             .saturating_add(unsettled_limit);
@@ -153,6 +171,7 @@ impl SnapshotUploadProgress {
             .len();
         (before > after).then_some(AckSettlementRequired {
             retained_ack_count: self.accepted_fingerprints.len(),
+            retained_stale_ack_count: self.retained_stale_ack_count,
             capacity: self.ack_capacity,
             deferred_entity_count: before - after,
         })
@@ -192,6 +211,7 @@ impl SnapshotUploadProgress {
         {
             return Err(AckSettlementRequired {
                 retained_ack_count: self.accepted_fingerprints.len(),
+                retained_stale_ack_count: self.retained_stale_ack_count,
                 capacity: self.ack_capacity,
                 deferred_entity_count: new_acks,
             }
@@ -202,13 +222,50 @@ impl SnapshotUploadProgress {
 
     /// Attach the exact retirement obligation before the same atomic index
     /// commit removes incidence. A failed CAS cannot authorize this generation.
+    #[cfg(test)]
     pub(super) fn stage_ack_retirement_handoff(
         &self,
         previous: &ScanIndex,
         selected: &mut ScanIndex,
         locally_held: &BTreeSet<String>,
     ) -> Result<()> {
-        let mut retired = previous
+        self.stage_ack_retirement_handoff_with_census(
+            previous,
+            selected,
+            locally_held,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// A complete scanner census (including legacy, state-only and carried
+    /// incidence) can prove absence even for an ACK never committed before its
+    /// file vanished. A partial upload must use the pre-selection scan index:
+    /// its committable subset alone is never an absence proof.
+    pub(super) fn complete_census_ack_retirements(
+        &self,
+        scanned: &ScanIndex,
+        census_complete: bool,
+    ) -> BTreeSet<String> {
+        if !census_complete || scanned.upload_progress_ack_incidence_unknown() {
+            return BTreeSet::new();
+        }
+        let mut absent = self.accepted_fingerprints.clone();
+        for fp in scanned.upload_progress_ack_incidence() {
+            absent.remove(fp);
+        }
+        absent
+    }
+
+    pub(super) fn stage_ack_retirement_handoff_with_census(
+        &self,
+        previous: &ScanIndex,
+        selected: &mut ScanIndex,
+        locally_held: &BTreeSet<String>,
+        census_absent: &BTreeSet<String>,
+    ) -> Result<()> {
+        // Keep unresolved obligations across opaque/held saves instead of
+        // forgetting them when the same save removes their last incidence.
+        let mut candidates = previous
             .upload_ack_retirement_handoff
             .as_ref()
             .filter(|h| {
@@ -219,24 +276,41 @@ impl SnapshotUploadProgress {
             .map(|h| {
                 h.bodies
                     .iter()
+                    .chain(h.pending_bodies.iter())
                     .filter(|(fp, body)| self.accepted_body_witnesses.get(*fp) == Some(*body))
                     .map(|(fp, _)| fp.clone())
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
-        let mut fresh = self.retired_ack_candidates(previous, selected);
-        fresh.retain(|fp| !locally_held.contains(fp));
-        retired.extend(fresh);
-        // Reappearance or carried incidence revokes an old retirement, too.
+        if previous.generation > 0 {
+            candidates.extend(
+                previous
+                    .upload_progress_ack_incidence()
+                    .filter(|fp| self.accepted_fingerprints.contains(*fp))
+                    .map(str::to_owned),
+            );
+        }
+        candidates.extend(census_absent.iter().cloned());
+        let mut live = BTreeSet::new();
         for fp in selected.upload_progress_ack_incidence() {
-            retired.remove(fp);
+            if candidates.contains(fp) {
+                live.insert(fp.to_owned());
+            }
         }
-        if selected.upload_progress_ack_incidence_unknown() {
-            // Never replace recoverable authority with an opaque census.
-            selected.upload_ack_retirement_handoff = previous.upload_ack_retirement_handoff.clone();
-            return Ok(());
+        let unknown = selected.upload_progress_ack_incidence_unknown();
+        let mut bodies = BTreeMap::new();
+        let mut pending_bodies = BTreeMap::new();
+        for fp in candidates {
+            let Some(body) = self.accepted_body_witnesses.get(&fp) else {
+                continue;
+            };
+            if unknown || locally_held.contains(&fp) || selected.decode_holds_entity(&fp) {
+                pending_bodies.insert(fp, body.clone());
+            } else if !live.contains(&fp) {
+                bodies.insert(fp, body.clone());
+            }
         }
-        selected.upload_ack_retirement_handoff = if retired.is_empty() {
+        selected.upload_ack_retirement_handoff = if bodies.is_empty() && pending_bodies.is_empty() {
             None
         } else {
             Some(crate::snapshots::UploadAckRetirementHandoff {
@@ -245,15 +319,8 @@ impl SnapshotUploadProgress {
                     .generation
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("ACK retirement generation overflow"))?,
-                bodies: retired
-                    .into_iter()
-                    .filter_map(|fp| {
-                        self.accepted_body_witnesses
-                            .get(&fp)
-                            .cloned()
-                            .map(|body| (fp, body))
-                    })
-                    .collect(),
+                bodies,
+                pending_bodies,
             })
         };
         Ok(())
@@ -326,7 +393,12 @@ impl SnapshotUploadProgress {
         pending
             .bodies
             .retain(|fp, body| self.accepted_body_witnesses.get(fp) == Some(body));
-        if pending.bodies.len() == handoff.bodies.len() && !pending.bodies.is_empty() {
+        pending
+            .pending_bodies
+            .retain(|fp, body| self.accepted_body_witnesses.get(fp) == Some(body));
+        let pending_count = pending.bodies.len() + pending.pending_bodies.len();
+        if pending_count == handoff.bodies.len() + handoff.pending_bodies.len() && pending_count > 0
+        {
             return Ok(());
         }
         if removed.is_empty() {
@@ -339,7 +411,7 @@ impl SnapshotUploadProgress {
             }
         }
         let previous = saved.upload_ack_retirement_handoff.take();
-        saved.upload_ack_retirement_handoff = (!pending.bodies.is_empty()).then_some(pending);
+        saved.upload_ack_retirement_handoff = (pending_count > 0).then_some(pending);
         let generation = saved.generation;
         if let Err(error) = saved.save(index_path) {
             saved.generation = generation;

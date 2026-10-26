@@ -1972,7 +1972,8 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             "upload_ack_retirement_handoff" => serde_json::json!({
                 "destination_namespace_hash":"c".repeat(64),
                 "committed_generation":1,
-                "bodies":{"d".repeat(64):"e".repeat(64)}
+                "bodies":{"d".repeat(64):"e".repeat(64)},
+                "pending_bodies":{"a".repeat(64):"b".repeat(64)}
             }),
             "session_account_bindings" => {
                 serde_json::json!({"session":{"account_identifier_hash":"account","workspace_identifier_hash":"workspace"}})

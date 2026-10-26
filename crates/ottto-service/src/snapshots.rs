@@ -3091,6 +3091,10 @@ pub(crate) struct UploadAckRetirementHandoff {
     pub destination_namespace_hash: String,
     pub committed_generation: u64,
     pub bodies: BTreeMap<String, String>,
+    /// Exact obligations blocked by opaque incidence or a hold. Only a later
+    /// selected index commit can promote these to cleanup authority.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending_bodies: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85184,4 +85188,4 @@ fn pause_scan_index_cas_if_requested_for_test() {
     }
 }
 
-crate::heap_layout_bound::fields!(UploadAckRetirementHandoff; destination_namespace_hash, committed_generation, bodies);
+crate::heap_layout_bound::fields!(UploadAckRetirementHandoff; destination_namespace_hash, committed_generation, bodies, pending_bodies);
