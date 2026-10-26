@@ -539,6 +539,8 @@ fn a_pending_admission_reoffer_refuses_the_continuation_prepare() {
     index.quarantined_snapshot_fingerprints.insert(
         fingerprint,
         SnapshotQuarantineRecord {
+            contract_retry_claims: None,
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: SnapshotQuarantineWitness {
                 item_wire_byte_limit: 128 * 1024,
                 ..snapshot_quarantine_witness(SnapshotSource::Codex)
@@ -582,6 +584,8 @@ fn a_due_quarantine_retry_refuses_the_continuation_prepare() {
     progress.quarantined_fingerprints.insert(
         "f".repeat(64),
         SnapshotQuarantineRecord {
+            contract_retry_claims: None,
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: snapshot_quarantine_witness(SnapshotSource::Codex),
             retry_after_unix_seconds: 0,
             upload_body_witness: None,
@@ -610,6 +614,8 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
     index.quarantined_snapshot_fingerprints.insert(
         fingerprint.clone(),
         SnapshotQuarantineRecord {
+            contract_retry_claims: None,
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: snapshot_quarantine_witness(SnapshotSource::Codex),
             retry_after_unix_seconds: 0,
             upload_body_witness: Some(body.clone()),

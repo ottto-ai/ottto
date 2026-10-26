@@ -1160,6 +1160,7 @@ fn census_of(key: &str) -> ScanTraversalCheckpoint {
         reconciliation_after: None,
         reconciliation_started: false,
         watcher_hint_seen: false,
+        codex_freshness_yield: false,
         codex_parent_resolution_retry_required: false,
         unhealthy_retry_attempt: 0,
         unhealthy_retry_not_before_unix_seconds: None,

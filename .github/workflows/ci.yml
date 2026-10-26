@@ -50,7 +50,9 @@ jobs:
     # merge pass this job in the queue. Rollback: remove this line FIRST, and
     # only then the queue rule; never leave the skip without the queue.
     if: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
-    timeout-minutes: 40
+    # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
+    # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
+    timeout-minutes: 55
     runs-on: macos-15
     env:
       RUSTUP_TOOLCHAIN: "1.95.0"

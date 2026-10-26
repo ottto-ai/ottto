@@ -23,6 +23,8 @@ fn ledger() -> SnapshotUploadProgress {
 
 fn terminal_record(body: &str) -> SnapshotQuarantineRecord {
     SnapshotQuarantineRecord {
+        contract_retry_claims: None,
+        reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
         witness: snapshot_quarantine_witness(SnapshotSource::Codex),
         retry_after_unix_seconds: 0,
         upload_body_witness: Some(body.to_string()),

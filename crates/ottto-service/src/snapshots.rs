@@ -2538,6 +2538,10 @@ struct ScanTraversalCheckpoint {
     reconciliation_started: bool,
     #[serde(default)]
     watcher_hint_seen: bool,
+    /// Scheduling only: a freshness page owes the next ordinary page to the
+    /// census. Persist across restart so continuous appends cannot starve it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    codex_freshness_yield: bool,
     /// At least one ordinary fork needs another clean generation after its
     /// parent ledger was discovered/refreshed later in this bounded pass.
     #[serde(default)]
@@ -3589,6 +3593,9 @@ pub struct ScanIndex {
     /// scheduling permission only, never acceptance evidence.
     #[serde(skip)]
     reason_reoffer_retries: BTreeMap<String, String>,
+    /// Runtime leases backed by claims saved in both checkpoints before scanning.
+    #[serde(skip)]
+    terminal_contract_retries: BTreeMap<String, String>,
     /// Runtime-only: this index's path was loaded in this process with no
     /// verified prior history (missing, quarantined, or generation 0 with no
     /// files), so a census absence there is not positive and retires nothing.
@@ -3956,6 +3963,7 @@ impl Default for ScanIndex {
             effective_upload_body_witness_revision_excluded_source_files: BTreeSet::new(),
             claude_reemission_exclusions: ReemissionExclusions::default(),
             reason_reoffer_retries: BTreeMap::new(),
+            terminal_contract_retries: BTreeMap::new(),
             claude_history_unverified_in_process: false,
             claude_rebuild_read_load_eligible: false,
             reason_reoffer_cooldowns: BTreeMap::new(),
@@ -3996,6 +4004,20 @@ const fn legacy_snapshot_item_wire_byte_limit() -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotQuarantineRecord {
+    /// Reconstruction semantics last assessed; legacy records were assessed under v1.
+    #[serde(
+        default = "terminal_contract_retry::legacy_contract",
+        deserialize_with = "terminal_contract_retry::decode_contract"
+    )]
+    pub reconstruction_contract: u16,
+    /// Claimed source acquisitions for a contract-origin retry at this version.
+    /// None is an ordinary retry; Some(0) is a newly owed contract attempt.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "terminal_contract_retry::decode_claims"
+    )]
+    pub contract_retry_claims: Option<u16>,
     pub witness: SnapshotQuarantineWitness,
     pub retry_after_unix_seconds: u64,
     /// Optional exact hash-neutral body rejected under this contract. A body
@@ -4039,6 +4061,8 @@ pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineR
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     SnapshotQuarantineRecord {
+        contract_retry_claims: None,
+        reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
         witness: snapshot_quarantine_witness(source),
         retry_after_unix_seconds: now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS),
         upload_body_witness: None,
@@ -4643,6 +4667,9 @@ mod compact_index_tests;
 mod lenient_decode;
 #[cfg(test)]
 mod lenient_decode_tests;
+pub(crate) mod terminal_contract_retry;
+#[cfg(test)]
+mod terminal_contract_retry_tests;
 
 #[cfg(test)]
 pub(crate) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST: u8 =
@@ -9488,13 +9515,28 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             };
             let duplicate_owner =
                 claude_duplicate_request_owner(&root_session_id, &source_session_id);
-            let current_member_owns_changed_request = index
-                .claude_usage_family_pending
-                .get(&root_session_id)
-                .and_then(|pending| pending.member_request_id_hashes.get(&source_session_id))
-                .is_some_and(|request_hashes| {
-                    !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
-                });
+            // A fence that stays closed keeps no duplicate witness (it is
+            // cleared above), so every duplicate this census detects compares
+            // as changed against nothing, and re-arming its owners re-read
+            // them on every complete walk. While the fence stays closed,
+            // `unresolved_duplicate` keeps the strict duplicate-dependent
+            // ownership outputs (posture and curve ownership) unresolved: a
+            // strict ownership gate, not an upload hold. This guard changes
+            // neither that gate nor any money or account gate. A real append
+            // or edit still re-reads through its own changed size or
+            // fingerprint, and the fence's liveness full re-arm re-reads every
+            // family to reopen it, so only an open or opening fence re-arms
+            // changed duplicate owners.
+            let changed_duplicate_owner =
+                !fence_stays_closed && changed_duplicate_owners.contains(&duplicate_owner);
+            let current_member_owns_changed_request = !fence_stays_closed
+                && index
+                    .claude_usage_family_pending
+                    .get(&root_session_id)
+                    .and_then(|pending| pending.member_request_id_hashes.get(&source_session_id))
+                    .is_some_and(|request_hashes| {
+                        !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
+                    });
             let proof_candidate = proven.contains_key(&root_session_id)
                 && !current_ids.contains(source_session_id.as_str());
             let negative = negative_keys.contains(index_key.as_str());
@@ -9506,7 +9548,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 || identity_contract_rearm
                 || fence_recovery_rearm
                 || invalidated_witness_roots.contains(&root_session_id)
-                || changed_duplicate_owners.contains(&duplicate_owner)
+                || changed_duplicate_owner
                 || current_member_owns_changed_request;
             rearm.proof_candidates = rearm
                 .proof_candidates
@@ -9533,7 +9575,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     }
                 }
                 || invalidated_witness_roots.contains(&root_session_id)
-                || changed_duplicate_owners.contains(&duplicate_owner)
+                || changed_duplicate_owner
                 || current_member_owns_changed_request;
             if rearmed {
                 // Reparse earlier-page members of every proven family unless
@@ -25215,6 +25257,78 @@ impl OwnedSourceScan {
         } else {
             file_limit
         };
+        // Fresh data gets a bounded page of its own, at most every other
+        // ordinary page. Mixing it behind 64 MiB of census revalidation
+        // starves it; always putting it first can starve the census instead.
+        // Continuations never select new work. A hint alone does not trigger
+        // a read: all selected paths still pass the unchanged candidate gate.
+        let freshness_page = source == SnapshotSource::Codex
+            && continuation.is_none()
+            && selection_limit > 0
+            && !traversal.codex_freshness_yield
+            && traversal
+                .pending_candidates
+                .iter()
+                .any(|candidate| codex_fresh_data_pending(candidate, &index.files))
+            && codex_selection_may_exhaust_page(traversal, selection_limit, &index.files);
+        let census_page = source == SnapshotSource::Codex
+            && continuation.is_none()
+            && selection_limit > 0
+            && traversal.codex_freshness_yield
+            && traversal
+                .pending_candidates
+                .iter()
+                .any(|candidate| candidate.census_member);
+        if source == SnapshotSource::Codex && continuation.is_none() && selection_limit > 0 {
+            traversal.codex_freshness_yield = freshness_page;
+        }
+        if freshness_page || census_page {
+            let limit = if freshness_page {
+                selection_limit.min(MAX_WATCHER_HINTED_FILES_PER_TICK)
+            } else {
+                selection_limit
+            };
+            // Rotate the original queue once without allocating another
+            // backlog-sized container. Keep unselected paths in FIFO order.
+            for _ in 0..traversal.pending_candidates.len() {
+                let Some(candidate) = traversal.pending_candidates.pop_front() else {
+                    break;
+                };
+                let eligible = pending_paths.len() < limit
+                    && if freshness_page {
+                        codex_fresh_data_pending(&candidate, &index.files)
+                    } else {
+                        candidate.census_member
+                            && !codex_fresh_data_pending(&candidate, &index.files)
+                    };
+                if eligible {
+                    pending_paths.push(candidate);
+                } else {
+                    traversal.pending_candidates.push_back(candidate);
+                }
+            }
+            // If every remaining member has fresh bytes, service those
+            // members in FIFO order rather than wasting their census turn.
+            if census_page && pending_paths.is_empty() {
+                for _ in 0..traversal.pending_candidates.len() {
+                    let Some(candidate) = traversal.pending_candidates.pop_front() else {
+                        break;
+                    };
+                    if pending_paths.len() < limit && candidate.census_member {
+                        pending_paths.push(candidate);
+                    } else {
+                        traversal.pending_candidates.push_back(candidate);
+                    }
+                }
+            }
+        }
+        // Dedicated turns select only their own work: new hinted members,
+        // audits or old groups cannot consume the other turn's allowance.
+        let selection_limit = if freshness_page || census_page {
+            pending_paths.len()
+        } else {
+            selection_limit
+        };
         let hinted_budget = selection_limit
             .min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             .saturating_sub(usize::from(ordinary_census_pending && file_limit > 0));
@@ -31882,6 +31996,8 @@ type ParserReader = BoundedJsonlReader<OpenedInput>;
 type LineSink<'a> = &'a mut dyn FnMut(&Value);
 
 struct OwnedJsonlParser {
+    #[cfg(test)]
+    source_read_probe: Option<PathBuf>,
     reread_required: bool,
     reread_ticket: Option<reread_guard::Ticket>,
     reader: BoundedJsonlReader<OpenedInput>,
@@ -31967,6 +32083,8 @@ impl OwnedJsonlParser {
         }
 
         Ok(Self {
+            #[cfg(test)]
+            source_read_probe: Some(path.to_owned()),
             reread_required: false,
             reread_ticket: None,
             reader: BoundedJsonlReader::new(
@@ -31984,6 +32102,10 @@ impl OwnedJsonlParser {
         })
     }
     fn step(&mut self) -> Result<bool> {
+        #[cfg(test)]
+        if let Some(path) = self.source_read_probe.take() {
+            terminal_contract_retry::record_source_acquisition(&path);
+        }
         self.step_with_observer(|_| {})
     }
     fn step_with_observer(&mut self, observe: impl FnMut(&Value)) -> Result<bool> {
@@ -39677,6 +39799,7 @@ fn ensure_bounded_traversal(
         reconciliation_after: None,
         reconciliation_started: false,
         watcher_hint_seen: false,
+        codex_freshness_yield: false,
         codex_parent_resolution_retry_required: false,
         unhealthy_retry_attempt: retry_attempt,
         unhealthy_retry_not_before_unix_seconds: None,
@@ -39693,6 +39816,64 @@ fn ensure_bounded_traversal(
     {
         claude_retry_queue_due_families(index, collected_at);
     }
+}
+
+/// Keep fitting pages together. Dedicated scheduling is only useful when
+/// the queued population could spend the file or singleton byte allowance.
+/// The estimate mirrors `PageBudget::plan`: a file larger than the singleton
+/// allowance is cursor work with its own per-page budget, so it cannot spend
+/// this one. Each indexed singleton also counts one sample pair for its memo
+/// check. It never grants a read or increases a budget; an underestimate
+/// only defers a file to the next page. Metadata failure keeps the ordinary
+/// path and its existing error handling.
+fn codex_selection_may_exhaust_page(
+    traversal: &ScanTraversalCheckpoint,
+    file_limit: usize,
+    files: &BTreeMap<String, ScanIndexEntry>,
+) -> bool {
+    if traversal.pending_candidates.len() > file_limit {
+        return true;
+    }
+    let byte_limit = sampled_scan::codex_cursor::Limits::current().singleton();
+    let mut expected = 0_u64;
+    for candidate in &traversal.pending_candidates {
+        let Ok(metadata) = fs::symlink_metadata(&candidate.path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > byte_limit {
+            continue;
+        }
+        let samples = if files.contains_key(&local_index_key(&candidate.path)) {
+            sampled_scan::codex_cursor::SAMPLE_READ_BYTES
+        } else {
+            0
+        };
+        expected = expected
+            .saturating_add(metadata.len())
+            .saturating_add(samples);
+        if expected > byte_limit {
+            return true;
+        }
+    }
+    false
+}
+
+/// Priority only, never read admission. Byte length is content-relevant;
+/// ctime, inode, permissions and mtime alone cannot promote an unchanged file.
+/// New paths need a watcher/roster hint so a cold history walk stays FIFO.
+fn codex_fresh_data_pending(
+    candidate: &ScanTraversalPath,
+    files: &BTreeMap<String, ScanIndexEntry>,
+) -> bool {
+    let entry = files.get(&local_index_key(&candidate.path));
+    if entry.is_none() && !candidate.watcher_hint {
+        return false;
+    }
+    fs::symlink_metadata(&candidate.path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && entry.map_or(true, |entry| entry.size_bytes != metadata.len())
+    })
 }
 
 /// Returns how many Codex hints re-entered as next-generation evidence.
@@ -39712,14 +39893,22 @@ fn enqueue_watcher_hints(
     let mut pending = traversal
         .pending_candidates
         .iter()
-        .map(|candidate| candidate.path.clone())
-        .collect::<BTreeSet<_>>();
+        .enumerate()
+        .map(|(position, candidate)| (candidate.path.clone(), position))
+        .collect::<BTreeMap<_, _>>();
     for path in hinted_paths.iter().take(MAX_BACKFILL_FILES_PER_SOURCE) {
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
             || (source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(path))
-            || !pending.insert(path.clone())
         {
+            continue;
+        }
+        if let Some(&position) = pending.get(path) {
+            if source == SnapshotSource::Codex {
+                if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
+                    candidate.watcher_hint = true;
+                }
+            }
             continue;
         }
         let Some(scan_root) = traversal
@@ -39742,6 +39931,7 @@ fn enqueue_watcher_hints(
         next_generation += u64::from(!census_member);
         // FIFO keeps an actively rewritten path from repeatedly jumping ahead
         // of an older remove/rename hint in a small bounded page.
+        pending.insert(path.clone(), traversal.pending_candidates.len());
         traversal.pending_candidates.push_back(ScanTraversalPath {
             scan_root,
             path: path.clone(),
@@ -39889,22 +40079,26 @@ fn refresh_retained_codex_roster(
                 .find(|candidate| candidate.path == path)
             {
                 existing.census_member = true;
+                existing.watcher_hint = true;
             } else {
                 traversal.pending_candidates.push_back(ScanTraversalPath {
                     scan_root: scan_root.clone(),
                     path,
                     census_member: true,
-                    watcher_hint: false,
+                    watcher_hint: true,
                 });
             }
         }
+        // A directory that appeared after the walk (a new Codex day) carries
+        // the same freshness provenance as a rollout that appeared directly;
+        // the walk hands it to every file beneath. Scheduling only.
         traversal
             .pending_directories
             .extend(new_directories.into_iter().map(|path| ScanTraversalPath {
                 scan_root: scan_root.clone(),
                 path,
                 census_member: true,
-                watcher_hint: false,
+                watcher_hint: true,
             }));
     }
 }
@@ -40153,12 +40347,14 @@ fn advance_bounded_directory_traversal_with_budget(
                 traversal.counts.symlink_rejected_count += 1;
                 continue;
             }
+            // Only retained-roster refresh marks a directory; the initial
+            // history walk starts unmarked, so cold history stays FIFO.
             if file_type.is_dir() {
                 traversal.pending_directories.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
                     path,
                     census_member: true,
-                    watcher_hint: false,
+                    watcher_hint: directory.watcher_hint,
                 });
                 continue;
             }
@@ -40216,12 +40412,13 @@ fn advance_bounded_directory_traversal_with_budget(
                 .find(|candidate| candidate.path == path)
             {
                 existing.census_member = true;
+                existing.watcher_hint |= directory.watcher_hint;
             } else {
                 traversal.pending_candidates.push_back(ScanTraversalPath {
                     scan_root: directory.scan_root.clone(),
                     path,
                     census_member: true,
-                    watcher_hint: false,
+                    watcher_hint: directory.watcher_hint,
                 });
             }
         }
@@ -43669,6 +43866,9 @@ impl ScanIndex {
             self.quarantined_snapshot_fingerprints.insert(
                 fingerprint.clone(),
                 SnapshotQuarantineRecord {
+                    contract_retry_claims: None,
+                    reconstruction_contract:
+                        crate::snapshots::terminal_contract_retry::current_contract(),
                     witness: witness.clone(),
                     retry_after_unix_seconds: 0,
                     upload_body_witness: None,
@@ -43812,6 +44012,7 @@ impl ScanIndex {
             reconciliation_after: None,
             reconciliation_started: false,
             watcher_hint_seen: false,
+            codex_freshness_yield: false,
             codex_parent_resolution_retry_required: false,
             unhealthy_retry_attempt: 1,
             unhealthy_retry_not_before_unix_seconds: Some(retry_not_before_unix_seconds),
@@ -43926,9 +44127,34 @@ impl ScanIndex {
             .get(fingerprint)
             .zip(self.active_quarantine_witness.as_ref())
             .is_some_and(|(persisted, active)| {
+                if persisted.contract_retry_claims.is_some() {
+                    return self.terminal_contract_retries.contains_key(fingerprint);
+                }
                 persisted.disposition == SnapshotQuarantineDisposition::RetryPending
                     && (&persisted.witness != active || persisted.retry_after_unix_seconds <= now)
             })
+    }
+
+    /// Merge the already saved upload claims before source acquisition. The caller
+    /// saves changes before activating these runtime-only leases or reading files.
+    pub(crate) fn merge_terminal_contract_claims(
+        &mut self,
+        records: &BTreeMap<String, SnapshotQuarantineRecord>,
+    ) -> bool {
+        terminal_contract_retry::merge_maps(&mut self.quarantined_snapshot_fingerprints, records)
+    }
+
+    pub(crate) fn activate_terminal_contract_retries(&mut self, leases: BTreeSet<String>) {
+        self.terminal_contract_retries.clear();
+        // A fingerprint can have more than one indexed incidence. One claim
+        // selects one owning file, never every duplicate incidence.
+        for (key, fingerprints) in &self.file_snapshot_fingerprints {
+            for fingerprint in fingerprints.intersection(&leases) {
+                self.terminal_contract_retries
+                    .entry(fingerprint.clone())
+                    .or_insert_with(|| key.clone());
+            }
+        }
     }
 
     /// Arm this cycle's exact refusal re-offer leases and return the indexed
@@ -43997,8 +44223,12 @@ impl ScanIndex {
 
     /// The ordinary retry gate of candidate selection, without the retry an
     /// exact-body cooldown defers.
-    fn quarantine_retry_selects_file(&self, fingerprint: &str) -> bool {
+    fn quarantine_retry_selects_file(&self, fingerprint: &str, key: &str) -> bool {
         self.quarantine_requires_retry(fingerprint)
+            && self
+                .terminal_contract_retries
+                .get(fingerprint)
+                .map_or(true, |owner| owner == key)
             && !self.reason_reoffer_cooldown_defers(fingerprint)
     }
 
@@ -44204,6 +44434,11 @@ impl ScanIndex {
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
                 }
+                let active_witness = source.map(snapshot_quarantine_witness);
+                terminal_contract_retry::rearm(
+                    &mut index.quarantined_snapshot_fingerprints,
+                    active_witness.as_ref(),
+                );
                 index.codex_parent_proof_parents_live =
                     codex_parent_proof_parents_live(&index.codex_parent_prefix_proofs);
                 index
@@ -44519,6 +44754,10 @@ impl ScanIndex {
                     "local snapshot scan index changed concurrently"
                 ));
             }
+            terminal_contract_retry::merge_maps(
+                &mut self.quarantined_snapshot_fingerprints,
+                &current.quarantined_snapshot_fingerprints,
+            );
             if !current.decode_holds.same_as(&self.decode_holds)
                 || !current.decode_repairs_match(self)
             {
@@ -45774,6 +46013,7 @@ impl ScanIndex {
                 .clone(),
             claude_reemission_exclusions: self.claude_reemission_exclusions.clone(),
             reason_reoffer_retries: self.reason_reoffer_retries.clone(),
+            terminal_contract_retries: self.terminal_contract_retries.clone(),
             claude_history_unverified_in_process: self.claude_history_unverified_in_process,
             claude_rebuild_read_load_eligible: self.claude_rebuild_read_load_eligible,
             reason_reoffer_cooldowns: self.reason_reoffer_cooldowns.clone(),
@@ -45859,6 +46099,12 @@ impl ScanIndex {
             })
             .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
             .collect::<BTreeMap<_, _>>();
+        let previous_claims = self
+            .quarantined_snapshot_fingerprints
+            .iter()
+            .filter(|(_, record)| record.contract_retry_claims.is_some())
+            .map(|(fp, record)| (fp.clone(), record.clone()))
+            .collect();
         self.quarantined_snapshot_fingerprints = quarantined
             .iter()
             .filter(|(fingerprint, record)| {
@@ -45872,6 +46118,10 @@ impl ScanIndex {
                 .entry(fingerprint)
                 .or_insert(record);
         }
+        terminal_contract_retry::merge_maps(
+            &mut self.quarantined_snapshot_fingerprints,
+            &previous_claims,
+        );
         let opaque_incidence = self.decode_has_opaque_file_incidence();
         let carried = self.carried_ack_fingerprints();
         self.accepted_snapshot_fingerprints.retain(|fingerprint| {
@@ -46346,7 +46596,7 @@ impl ScanIndex {
                         .snapshot_activity_at
                         .get(fingerprint)
                         .is_some_and(valid_snapshot_activity)
-                        || self.quarantine_retry_selects_file(fingerprint)
+                        || self.quarantine_retry_selects_file(fingerprint, &key)
                 })
             })
         {
@@ -46385,7 +46635,8 @@ impl ScanIndex {
                                     .is_some_and(|record| {
                                         self.active_quarantine_witness.as_ref()
                                             == Some(&record.witness)
-                                            && !self.quarantine_requires_retry(fingerprint)
+                                            && !self
+                                                .quarantine_retry_selects_file(fingerprint, &key)
                                     })
                             })
                     });
@@ -47984,6 +48235,7 @@ mod tests {
             reconciliation_after: None,
             reconciliation_started: false,
             watcher_hint_seen: false,
+            codex_freshness_yield: false,
             codex_parent_resolution_retry_required: false,
             unhealthy_retry_attempt: 1,
             unhealthy_retry_not_before_unix_seconds: Some(0),
@@ -49783,6 +50035,8 @@ mod tests {
     fn quarantine_deadline_never_becomes_authoritative_after_clock_rollback() {
         let original_now = 1_000_000;
         let record = SnapshotQuarantineRecord {
+            contract_retry_claims: None,
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: snapshot_quarantine_witness(SnapshotSource::Codex),
             retry_after_unix_seconds: original_now
                 + SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2),
@@ -51045,6 +51299,9 @@ mod tests {
             quarantined_snapshot_fingerprints: BTreeMap::from([(
                 fingerprint,
                 SnapshotQuarantineRecord {
+                    contract_retry_claims: None,
+                    reconstruction_contract:
+                        crate::snapshots::terminal_contract_retry::current_contract(),
                     witness: stale_witness,
                     retry_after_unix_seconds: u64::MAX,
                     upload_body_witness: None,
@@ -51825,6 +52082,9 @@ mod tests {
         index.quarantined_snapshot_fingerprints.insert(
             fingerprint.clone(),
             SnapshotQuarantineRecord {
+                contract_retry_claims: None,
+                reconstruction_contract:
+                    crate::snapshots::terminal_contract_retry::current_contract(),
                 witness: snapshot_quarantine_witness(SnapshotSource::Pi),
                 retry_after_unix_seconds: 0,
                 upload_body_witness: None,
@@ -51993,6 +52253,7 @@ mod tests {
             reconciliation_after: None,
             reconciliation_started: false,
             watcher_hint_seen: false,
+            codex_freshness_yield: false,
             codex_parent_resolution_retry_required: false,
             unhealthy_retry_attempt: 0,
             unhealthy_retry_not_before_unix_seconds: None,
@@ -52525,6 +52786,7 @@ mod tests {
                 reconciliation_after: None,
                 reconciliation_started: false,
                 watcher_hint_seen: false,
+                codex_freshness_yield: false,
                 codex_parent_resolution_retry_required: false,
                 unhealthy_retry_attempt: 0,
                 unhealthy_retry_not_before_unix_seconds: None,
@@ -53648,6 +53910,7 @@ mod tests {
                 reconciliation_after: None,
                 reconciliation_started: false,
                 watcher_hint_seen: false,
+                codex_freshness_yield: false,
                 codex_parent_resolution_retry_required: false,
                 unhealthy_retry_attempt: attempt,
                 unhealthy_retry_not_before_unix_seconds: deadline,
@@ -64631,6 +64894,7 @@ mod tests {
                     reconciliation_after: None,
                     reconciliation_started: false,
                     watcher_hint_seen: false,
+                    codex_freshness_yield: false,
                     codex_parent_resolution_retry_required: false,
                     unhealthy_retry_attempt: 0,
                     unhealthy_retry_not_before_unix_seconds: None,
@@ -84920,6 +85184,9 @@ mod tests {
         index.quarantined_snapshot_fingerprints.insert(
             "old-entity".into(),
             SnapshotQuarantineRecord {
+                contract_retry_claims: None,
+                reconstruction_contract:
+                    crate::snapshots::terminal_contract_retry::current_contract(),
                 witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
                 retry_after_unix_seconds: 0,
                 upload_body_witness: Some("old-body".into()),
@@ -84997,6 +85264,8 @@ mod tests {
             .insert("refused-entity".into(), Some("2026-10-14T10:00:00Z".into()));
         // The newer conflict on the exact refused body, its timer due.
         let conflict = SnapshotQuarantineRecord {
+            contract_retry_claims: None,
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
             retry_after_unix_seconds: 0,
             upload_body_witness: Some("refused-body".into()),
@@ -85903,6 +86172,7 @@ mod tests {
             reconciliation_after: None,
             reconciliation_started: false,
             watcher_hint_seen: false,
+            codex_freshness_yield: false,
             codex_parent_resolution_retry_required: false,
             unhealthy_retry_attempt: 0,
             unhealthy_retry_not_before_unix_seconds: None,
@@ -86506,16 +86776,16 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
-crate::heap_layout_bound::fields!(OwnedJsonlParser; reread_required, reread_ticket, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
+crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reread_required, reread_ticket, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, reread_guard, held_audit_progress,  claude_money_birth_store);
+crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, reread_guard, held_audit_progress, claude_money_birth_store);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
-crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
+crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; unchanged_reread_admitted, reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
@@ -86545,7 +86815,7 @@ crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash,
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);
 crate::heap_layout_bound::fields!(SnapshotOrigin; thread_source, source, source_subagent, originator, agent_role, entrypoint, is_sidechain, session_kind, used_workflow_orchestration, parent_session_ref);
 crate::heap_layout_bound::fields!(SnapshotProvenance; collector, source_file_count, input_token_scope, state_total_tokens, state_archived);
-crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition);
+crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contract, contract_retry_claims, witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition);
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
 crate::heap_layout_bound::fields!(SnapshotToolUsage; name, count);
 crate::heap_layout_bound::fields!(SnapshotUsageBucket; bucket_start, model_usage, first_activity_at, last_activity_at);
