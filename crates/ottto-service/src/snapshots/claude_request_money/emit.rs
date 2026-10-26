@@ -116,6 +116,7 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
         let row = grain_row(key, *origin, grain, account.clone());
         let row_key = super::super::row_key_from_model_usage(&row);
         let cost = grain.cost();
+        let identity = (key.0.clone(), row_key.clone());
         match row_costs.entry(row_key) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(cost);
@@ -132,7 +133,6 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
             }
         }
         let rows = buckets.entry(key.0.clone()).or_default();
-        let identity = (key.0.clone(), super::super::row_key_from_model_usage(&row));
         if let Some(&(position, prior)) = positions.get(&identity) {
             let existing = &mut rows[position];
             let mut usage = super::super::usage_totals_from_model_usage(existing);
