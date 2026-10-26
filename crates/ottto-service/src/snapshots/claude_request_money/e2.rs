@@ -69,7 +69,7 @@ fn require_inline<T: crate::heap_layout_bound::HeapLayoutBound>(_: &T) -> Option
     T::INLINE_ONLY.then_some(())
 }
 
-pub(crate) const GATE: bool = false;
+pub(crate) const GATE: bool = true;
 /// A record this much older than its file's effective birth was copied in.
 /// Copies written within it are counted (known residual, disclosed nowhere).
 pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
