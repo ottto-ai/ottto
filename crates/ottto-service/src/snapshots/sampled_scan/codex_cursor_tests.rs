@@ -4145,7 +4145,6 @@ fn unsettled_close_keeps_the_clean_follow_up_and_rereads_once() {
         fixture.append(x, &token_line(5));
         assert!(fixture.len(x) <= singleton);
         cache.clear();
-        let mut index = index;
         // An earlier page of this sweep settled only partially.
         index.mark_bounded_sweep_unsettled();
         let (index, scan) = hinted_page(
