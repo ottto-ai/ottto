@@ -78,6 +78,35 @@ fn with_gate_for_test<T>(on: bool, f: impl FnOnce() -> T) -> T {
 pub(crate) fn with_enabled<T>(f: impl FnOnce() -> T) -> T {
     with_gate_for_test(true, f)
 }
+/// Owner B (SOURCE Amendment 14): revision 3 keeps a listed family, and
+/// every family while the list pauses adoption, on ordinary (pre-E2)
+/// money. With the gate on, E2 applies to every other family; a family it
+/// does not apply to behaves exactly as gate off (no fold, so no literal).
+pub(crate) fn family_applies(index: &ScanIndex, root: &str, subagent_stem: Option<&str>) -> bool {
+    applies_unless_listed(
+        index,
+        index
+            .claude_reemission_exclusions
+            .excludes(root, subagent_stem),
+    )
+}
+
+/// `family_applies` for the family of the file a parse opened.
+pub(in crate::snapshots) fn file_applies(context: &ReadContext<'_>) -> bool {
+    applies_unless_listed(
+        context.index,
+        claude_index_path_member_ref(context.path).is_some_and(|member| {
+            context
+                .index
+                .claude_reemission_exclusions
+                .excludes(member.root, member.subagent_stem)
+        }),
+    )
+}
+
+fn applies_unless_listed(index: &ScanIndex, listed: bool) -> bool {
+    enabled() && !listed && !index.claude_reemission_exclusions.pauses_adoption()
+}
 /// A build from before the switch-on (gate off), e.g. a fixture cycle that
 /// stands in for an older daemon at body-witness revision 1 or 2.
 #[cfg(test)]

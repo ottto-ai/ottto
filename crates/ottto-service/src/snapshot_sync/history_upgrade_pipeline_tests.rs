@@ -2609,6 +2609,125 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     });
 }
 
+/// The listed session's item on a page: read without an E2 fold, so it
+/// publishes exactly as gate off (native hours, no request-owned literal).
+impl HistoryFixture {
+    /// The list as the cycle's load reads it. The returned index is reloaded
+    /// from disk, and the list state is not persisted with it.
+    fn list_status(&self, outcome: &HistoryOutcome) -> &'static str {
+        let mut index = outcome.index.clone();
+        index.load_claude_reemission_exclusions(&self.support);
+        index.claude_reemission_list_status_for_test()
+    }
+}
+
+fn e2_assert_ordinary_body(outcome: &HistoryOutcome, session: &str) {
+    let items = outcome
+        .scan
+        .snapshots
+        .iter()
+        .filter(|item| item.source_session_id == session)
+        .collect::<Vec<_>>();
+    assert!(!items.is_empty(), "{session} was read");
+    for item in items {
+        assert!(item.claude_money.is_none(), "no E2 fold for {session}");
+        assert_ne!(
+            item.usage_accounting_contract.as_deref(),
+            Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT)
+        );
+        assert!(!item.usage_buckets.is_empty(), "native hours for {session}");
+    }
+}
+
+/// Owner B (SOURCE Amendment 14) with the gate on: a listed family keeps
+/// ordinary money. Its genuine change uploads its ordinary body once; an
+/// unlisted family changed on the same page uploads the E2 literal; the
+/// listed file is never stamped 3 nor re-read by revision 3.
+#[test]
+fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
+    let fixture = HistoryFixture::new("e2-listed-ordinary");
+    fixture.baseline();
+    fixture.cycle("2026-08-02T08:30:00Z", HISTORY_REVISION_2);
+    with_e2_history(&fixture, || {
+        fixture.install_list(&[HISTORY_SESSIONS[0]]);
+        fixture.append(HISTORY_SESSIONS[0], "req_0_2");
+        fixture.append(HISTORY_SESSIONS[1], "req_1_2");
+        let changed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
+        assert!(changed.uploaded.contains(HISTORY_SESSIONS[0]));
+        assert!(!changed.uploaded_literal.contains(HISTORY_SESSIONS[0]));
+        assert!(changed.uploaded_literal.contains(HISTORY_SESSIONS[1]));
+        e2_assert_ordinary_body(&changed, HISTORY_SESSIONS[0]);
+        let listed = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[0]);
+        let unlisted = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[1]);
+        assert_eq!(
+            changed.index.files[&listed].effective_upload_body_witness_revision, 2,
+            "the listed file is never stamped 3"
+        );
+        assert_eq!(
+            changed.index.files[&unlisted].effective_upload_body_witness_revision,
+            3
+        );
+        for hour in [10, 11] {
+            let quiet = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), E2_HISTORY_UPGRADE);
+            assert!(
+                quiet.uploaded.is_empty(),
+                "uploaded once: {:?}",
+                quiet.uploaded
+            );
+            assert_eq!(
+                quiet.scan.scanned_file_count, 0,
+                "never re-read by revision 3"
+            );
+            assert_eq!(
+                quiet.index.files[&listed].effective_upload_body_witness_revision,
+                2
+            );
+        }
+    });
+}
+
+/// Owner B: a list seen once and now missing keeps today's pause and alarm
+/// with the gate on. No owed file is re-read or stamped 3, and a genuine
+/// change uploads its ordinary body (every family is kept on ordinary money
+/// while the list pauses adoption), never the literal and never withheld.
+#[test]
+fn e2_missing_list_pauses_history_and_keeps_changes_on_ordinary_money() {
+    let fixture = HistoryFixture::new("e2-list-missing-ordinary");
+    fixture.baseline();
+    fixture.install_list(&[]);
+    fixture.cycle("2026-08-02T08:30:00Z", HISTORY_REVISION_2);
+    std::fs::remove_file(
+        fixture
+            .support
+            .join("snapshots/claude_code-reemission-exclusions.txt"),
+    )
+    .expect("lose the list");
+    crate::snapshots::with_max_gated_claude_revision(3, || {
+        crate::snapshots::claude_request_money::e2::with_enabled(|| {
+            fixture.append(HISTORY_SESSIONS[1], "req_1_2");
+            let changed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
+            assert_eq!(fixture.list_status(&changed), "missing_after_install");
+            assert_eq!(
+                changed.uploaded,
+                BTreeSet::from([HISTORY_SESSIONS[1].to_string()]),
+                "only the genuine change uploads"
+            );
+            assert!(changed.uploaded_literal.is_empty());
+            assert_eq!(changed.scan.scanned_file_count, 1, "no owed file re-read");
+            e2_assert_ordinary_body(&changed, HISTORY_SESSIONS[1]);
+            assert!(changed
+                .index
+                .files
+                .values()
+                .all(|entry| entry.effective_upload_body_witness_revision == 2));
+            let quiet = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
+            assert_eq!(fixture.list_status(&quiet), "missing_after_install");
+            assert!(quiet.uploaded.is_empty(), "{:?}", quiet.uploaded);
+            assert_eq!(quiet.scan.scanned_file_count, 0);
+        })
+    });
+}
+
 #[test]
 fn e2_live_trace_read_failure_keeps_body_but_never_claims_complete() {
     let fixture = HistoryFixture::new("e2-live-bad-trace");

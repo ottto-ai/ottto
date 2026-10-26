@@ -8722,6 +8722,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
     let request_owned_enabled = crate::snapshots::claude_request_money::e2::enabled();
+    // A family kept on ordinary money (listed) reads its telemetry as gate off.
+    let request_owned =
+        |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
     let mut identity_unhealthy_roots = BTreeSet::new();
     let usage_roots = usage_roots
         .into_iter()
@@ -8739,7 +8742,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             // Attachment already consumed the permissive read. A later strict
             // reread may recover, but this page must not settle the earlier
             // incomplete attachment as final history.
-            if request_owned_enabled
+            if request_owned(session_id)
                 && paired
                 && api_read
                     .session_report(session_id)
@@ -8752,7 +8755,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
                 full_rearm_evidence_complete = false;
-                if emission_permitted || request_owned_enabled {
+                if emission_permitted || request_owned(session_id) {
                     identity_unhealthy_roots.insert(session_id.clone());
                 }
             }
@@ -8808,13 +8811,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
-            if emission_permitted || request_owned_enabled {
+            if emission_permitted || request_owned(&root_session_id) {
                 identity_unhealthy_roots.insert(root_session_id);
             }
             continue;
         }
         stats.complete_sidecar_root_count += 1;
-        if request_owned_enabled {
+        if request_owned(&root_session_id) {
             strict_healthy_roots.insert(root_session_id.clone());
         }
         let api_request_ids = api

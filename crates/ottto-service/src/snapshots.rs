@@ -18335,19 +18335,29 @@ impl SnapshotAccumulator {
         } else {
             SelectorCapture::default()
         };
-        let mut money = claude_request_money::e2::FileFold::new(
-            self.claude_file_birth,
-            money_context.as_ref(),
-            base_selector,
-            self.fallback_bucket_timestamp(None),
-        );
-        money.set_identity(
-            self.claude_org_markers.as_deref(),
-            self.account_identifier_hash.as_deref(),
-            self.source_session_id.as_deref(),
-            money_context.as_ref(),
-            responses.first().map(|response| response.sequence),
-        );
+        // Gate on, a family revision 3 keeps on ordinary money gets no fold:
+        // its file is read exactly as gate off publishes it (fold-absent).
+        let mut money = (!claude_request_money::e2::enabled()
+            || money_context
+                .as_ref()
+                .map_or(true, claude_request_money::e2::file_applies))
+        .then(|| {
+            claude_request_money::e2::FileFold::new(
+                self.claude_file_birth,
+                money_context.as_ref(),
+                base_selector,
+                self.fallback_bucket_timestamp(None),
+            )
+        });
+        if let Some(money) = money.as_mut() {
+            money.set_identity(
+                self.claude_org_markers.as_deref(),
+                self.account_identifier_hash.as_deref(),
+                self.source_session_id.as_deref(),
+                money_context.as_ref(),
+                responses.first().map(|response| response.sequence),
+            );
+        }
         if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE / 2 {
             crate::local_resource_diagnostics::claude_record_cap_half_file();
         }
@@ -18360,8 +18370,10 @@ impl SnapshotAccumulator {
                 // root publishes; it is not drop residue held for retry. Gate
                 // off (dark): unchanged drop residue, still counted.
                 Err(ClaudeResolveFailure::Conflict) => {
-                    money.note_resolver_conflict();
-                    if !claude_request_money::e2::enabled() {
+                    if let Some(money) = money.as_mut() {
+                        money.note_resolver_conflict();
+                    }
+                    if !(claude_request_money::e2::enabled() && money.is_some()) {
                         self.note_dropped_usage();
                     }
                     continue;
@@ -18449,7 +18461,9 @@ impl SnapshotAccumulator {
                 };
                 if self.claude_usage_request_ids.contains(&request_id) || prior_occurrence.is_some()
                 {
-                    money.note_ambiguous(&request_id);
+                    if let Some(money) = money.as_mut() {
+                        money.note_ambiguous(&request_id);
+                    }
                 }
                 let request_id_was_new = self.claude_usage_request_ids.insert(request_id);
                 // Progressive rows for one response were merged by response
@@ -18534,16 +18548,18 @@ impl SnapshotAccumulator {
                     response.reasoning_effort.as_deref(),
                 )
             });
-            claude_request_money::e2::timed("e2.observe", || {
-                money.observe(
-                    response.sequence,
-                    has_request_id,
-                    &response.usage,
-                    at,
-                    placed.as_ref(),
-                    response.reasoning_effort.as_deref(),
-                )
-            });
+            if let Some(money) = money.as_mut() {
+                claude_request_money::e2::timed("e2.observe", || {
+                    money.observe(
+                        response.sequence,
+                        has_request_id,
+                        &response.usage,
+                        at,
+                        placed.as_ref(),
+                        response.reasoning_effort.as_deref(),
+                    )
+                });
+            }
             if let Some(placed) = placed {
                 claude_request_money::e2::timed("native.add", || {
                     self.add_placed_usage(
@@ -18557,14 +18573,16 @@ impl SnapshotAccumulator {
                 });
             }
         }
-        claude_request_money::e2::timed("e2.finish_native", || {
-            money.finish_native(
-                money_context.as_ref(),
-                self.claude_org_markers.as_deref(),
-                self.claude_fork_parent.as_deref(),
-            )
-        });
-        self.claude_money = Some(Box::new(money));
+        if let Some(mut money) = money {
+            claude_request_money::e2::timed("e2.finish_native", || {
+                money.finish_native(
+                    money_context.as_ref(),
+                    self.claude_org_markers.as_deref(),
+                    self.claude_fork_parent.as_deref(),
+                )
+            });
+            self.claude_money = Some(Box::new(money));
+        }
     }
 
     fn note_tool_usage(&mut self, name: String) {
@@ -42078,6 +42096,13 @@ impl ScanIndex {
 
     /// True when the list names the family of this indexed Claude file (its
     /// root or the member itself), as the candidate decision reads it.
+    /// The re-emission list's status reason (`missing_after_install` raises
+    /// the local alarm each cycle).
+    #[cfg(test)]
+    pub(crate) fn claude_reemission_list_status_for_test(&self) -> &'static str {
+        self.claude_reemission_exclusions.status()
+    }
+
     fn claude_family_listed(&self, index_key: &str) -> bool {
         !self.claude_reemission_exclusions.is_empty()
             && claude_index_path_member_ref(Path::new(index_key)).is_some_and(|member| {
