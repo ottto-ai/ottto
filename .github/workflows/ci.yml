@@ -303,6 +303,7 @@ jobs:
           du -sh "$OTTTO_E2_BENCH_ROOT"
           df -h "$RUNNER_TEMP"
       - name: Arms (reference, dark, gate on; counterbalanced)
+        id: arms
         run: |
           set -euo pipefail
           export OTTTO_E2_BENCH_ROOT="$RUNNER_TEMP/e2-bench"
@@ -323,25 +324,45 @@ jobs:
             for arm in $order; do run_arm "$arm" "$round"; done
           done
       - name: Whole-history page (one per arm, fresh process each)
+        id: history
         run: |
           set -euo pipefail
           test_name="$(cat "$RUNNER_TEMP/e2-test-name.txt")"
           for arm in reference dark on; do
             bin="$RUNNER_TEMP/bench-candidate"
             [ "$arm" = reference ] && bin="$RUNNER_TEMP/bench-reference"
+            status=0
             OTTTO_E2_BENCH_ROOT="$RUNNER_TEMP/e2-bench" OTTTO_E2_BENCH_MODE=history OTTTO_E2_BENCH_ARM="$arm" OTTTO_E2_BENCH_TAG="$arm" \
               OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/e2-history-$arm.json" \
-              "$bin" "$test_name" --exact --ignored --nocapture --test-threads 1 2>&1 \
-              | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
+              "$bin" "$test_name" --exact --ignored --nocapture --test-threads 1 > "$RUNNER_TEMP/e2-step.log" 2>&1 || status=$?
+            cat "$RUNNER_TEMP/e2-step.log" >> "$RUNNER_TEMP/e2-bench.log"
+            grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)' "$RUNNER_TEMP/e2-step.log" || true
+            if [ "$status" -ne 0 ]; then
+              grep -E -A8 'panicked at' "$RUNNER_TEMP/e2-step.log" | head -40 || true
+              echo "::error::MONEY_E2_BENCH history page ($arm) exited $status: see the panic above"
+              exit "$status"
+            fi
             rm -rf "$RUNNER_TEMP/e2-bench/runs/history-$arm"
           done
       - name: Switch-on reread probe (revision 2 to 3)
+        id: reread
         run: |
           set -euo pipefail
+          status=0
           OTTTO_E2_BENCH_ROOT="$RUNNER_TEMP/e2-bench" OTTTO_E2_BENCH_MODE=reread OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/e2-reread.json" \
-            "$RUNNER_TEMP/bench-candidate" "$(cat "$RUNNER_TEMP/e2-test-name.txt")" --exact --ignored --nocapture --test-threads 1 2>&1 \
-            | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
+            "$RUNNER_TEMP/bench-candidate" "$(cat "$RUNNER_TEMP/e2-test-name.txt")" --exact --ignored --nocapture --test-threads 1 > "$RUNNER_TEMP/e2-step.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/e2-step.log" >> "$RUNNER_TEMP/e2-bench.log"
+          # The receipt line prints before any failure; the gate reads its file.
+          grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)' "$RUNNER_TEMP/e2-step.log" || true
+          if [ "$status" -ne 0 ]; then
+            grep -E -A8 'panicked at' "$RUNNER_TEMP/e2-step.log" | head -40 || true
+            echo "::error::MONEY_E2_BENCH reread probe exited $status: see the panic above (remaining files and their holds are in e2-reread.json when it was written)"
+            exit "$status"
+          fi
       - name: Gate (HANDOFF section 6 marks; fails closed)
+        # Evaluates the arms even when the reread probe failed; the reread
+        # targets then fail on their own.
+        if: ${{ !cancelled() && steps.arms.outcome == 'success' && steps.history.outcome == 'success' }}
         run: |
           set -euo pipefail
           cp "$RUNNER_TEMP/e2-bench/manifest.json" "$RUNNER_TEMP/e2-manifest.json"
@@ -354,7 +375,8 @@ jobs:
           arms = {a: [json.loads(p.read_text()) for p in sorted(root.glob(f"e2-arm-{a}-*.json"))] for a in ("reference", "dark", "on")}
           candidate = arms["dark"] + arms["on"]
           history = {a: [json.loads(p.read_text()) for p in sorted(root.glob(f"e2-history-{a}.json"))] for a in ("reference", "dark", "on")}
-          reread = read("e2-reread.json")
+          reread_path = root / "e2-reread.json"
+          reread = json.loads(reread_path.read_text()) if reread_path.exists() else None
           MIB = 1 << 20
           med = lambda values: statistics.median(values) if values else None
           def per_arm(f):
@@ -389,8 +411,8 @@ jobs:
           def spread(values):
               values = sorted(values)
               return {"p50": values[len(values) // 2], "p95": values[min(len(values) - 1, int(len(values) * 0.95))], "max": values[-1]} if values else None
-          reread_page_wall = med([p["wall_us"] for p in reread["page_receipts"]]) or 0
-          reread_hours = reread["pages"] * (reread["sync_interval_s"] + reread_page_wall / 1e6) / 3600
+          reread_page_wall = (med([p["wall_us"] for p in reread["page_receipts"]]) or 0) if reread else None
+          reread_hours = reread["pages"] * (reread["sync_interval_s"] + reread_page_wall / 1e6) / 3600 if reread else None
           digests = {a: sorted({r["uploads"]["fingerprint_digest"] for r in runs}) for a, runs in arms.items()}
           result = {
               "candidate_sha": (root / "e2-candidate-sha.txt").read_text().strip(),
@@ -410,7 +432,7 @@ jobs:
               "phys_footprint_steady_bytes": steady,
               "phys_footprint_peak_bytes": peak,
               "phys_footprint_peak_delta_bytes": {a: peak[a] - peak["reference"] for a in ("dark", "on") if peak[a] is not None and peak["reference"] is not None},
-              "history_page": {a: {k: runs[0][k] for k in ("hook", "stamped_files", "page", "phys_footprint_before_bytes", "phys_footprint_after_bytes", "phys_footprint_peak_bytes", "max_rss_bytes")} for a, runs in history.items() if runs},
+              "history_page": {a: {k: runs[0].get(k) for k in ("hook", "stamped_files", "page", "stages_us", "phys_footprint_before_bytes", "phys_footprint_after_bytes", "phys_footprint_peak_bytes", "max_rss_bytes")} for a, runs in history.items() if runs},
               "history_page_wall_ratio": {a: history_wall[a] / history_wall["reference"] if history_wall[a] is not None and history_wall["reference"] else None for a in ("dark", "on")},
               "history_page_cpu_ratio": {a: history_cpu[a] / history_cpu["reference"] if history_cpu[a] is not None and history_cpu["reference"] else None for a in ("dark", "on")},
               "index_bytes": index,
@@ -422,8 +444,8 @@ jobs:
               "uploads": {a: [r["uploads"] | {"tag": r["tag"]} for r in runs] for a, runs in arms.items()},
               "upload_fingerprint_digests": digests,
               "dark_uploads_equal_reference": digests["dark"] == digests["reference"] and len(digests["dark"]) == 1,
-              "reread": {k: reread[k] for k in ("revision", "files", "stamped_files", "bytes", "pages", "wall_us", "cpu_us", "sync_interval_s", "max_rss_bytes")} | {
-                  "page_wall_us_median": reread_page_wall, "projected_hours": reread_hours},
+              "reread": {k: reread.get(k) for k in ("revision", "files", "stamped_files", "bytes", "complete", "stalled", "remaining", "pages", "wall_us", "cpu_us", "sync_interval_s", "max_rss_bytes")} | {
+                  "page_wall_us_median": reread_page_wall, "projected_hours": reread_hours} if reread else None,
           }
           def within(value, limit):
               return value is not None and value <= limit
@@ -448,7 +470,8 @@ jobs:
               # Dark must not change what is uploaded: the same snapshot
               # fingerprints as the pre-E2 reference, stable across rounds.
               "dark_uploads_equal_reference": result["dark_uploads_equal_reference"],
-              "reread_le_6h": reread["pages"] > 0 and reread_hours <= 6.0,
+              "reread_complete": bool(reread) and reread.get("complete") is True,
+              "reread_le_6h": bool(reread) and reread.get("complete") is True and reread["pages"] > 0 and reread_hours <= 6.0,
           }
           result["targets"] = targets
           result["verdict"] = "pass" if all(targets.values()) else "fail"

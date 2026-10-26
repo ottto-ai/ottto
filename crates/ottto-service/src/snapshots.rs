@@ -17915,10 +17915,16 @@ impl SnapshotAccumulator {
         }
         let (mut responses, selectors) = std::mem::take(&mut self.claude_responses).into_parts();
         responses.sort_by_key(|response| response.sequence);
+        // Gate off, the fold keys by hour only: it never reads the selector.
+        let base_selector = if claude_request_money::e2::enabled() {
+            self.current_selector.clone()
+        } else {
+            SelectorCapture::default()
+        };
         let mut money = claude_request_money::e2::FileFold::new(
             self.claude_file_birth,
             money_context.as_ref(),
-            self.current_selector.clone(),
+            base_selector,
             self.fallback_bucket_timestamp(None),
         );
         money.set_identity(
@@ -18105,33 +18111,41 @@ impl SnapshotAccumulator {
                 self.note_tool_usage(name);
             }
             // One native placement per response; the money fold reuses it.
-            let placed = self.place_usage(
-                response.model,
-                &response.usage,
-                response.selector,
-                response.terminal_timestamp.as_deref(),
-                response.reasoning_effort.as_deref(),
-            );
-            money.observe(
-                response.sequence,
-                has_request_id,
-                &response.usage,
-                at,
-                placed.as_ref(),
-                response.reasoning_effort.as_deref(),
-            );
+            let placed = claude_request_money::e2::timed("native.place", || {
+                self.place_usage(
+                    response.model,
+                    &response.usage,
+                    response.selector,
+                    response.terminal_timestamp.as_deref(),
+                    response.reasoning_effort.as_deref(),
+                )
+            });
+            claude_request_money::e2::timed("e2.observe", || {
+                money.observe(
+                    response.sequence,
+                    has_request_id,
+                    &response.usage,
+                    at,
+                    placed.as_ref(),
+                    response.reasoning_effort.as_deref(),
+                )
+            });
             if let Some(placed) = placed {
-                self.add_placed_usage(
-                    placed,
-                    response.usage,
-                    response.reasoning_effort,
-                    capture
-                        .as_deref_mut()
-                        .map(|capture| (capture, response.sequence)),
-                );
+                claude_request_money::e2::timed("native.add", || {
+                    self.add_placed_usage(
+                        placed,
+                        response.usage,
+                        response.reasoning_effort,
+                        capture
+                            .as_deref_mut()
+                            .map(|capture| (capture, response.sequence)),
+                    )
+                });
             }
         }
-        money.finish_native(money_context.as_ref(), self.claude_org_markers.as_deref());
+        claude_request_money::e2::timed("e2.finish_native", || {
+            money.finish_native(money_context.as_ref(), self.claude_org_markers.as_deref())
+        });
         money.fold_us = money_started.elapsed().as_micros() as u64;
         self.claude_money = Some(Box::new(money));
     }
@@ -19241,8 +19255,20 @@ impl SnapshotAccumulator {
         let totals = self.accepted_usage_totals.clone();
         let mut session_rows: BTreeMap<RowKey, BucketRowAccumulator> = BTreeMap::new();
         let mut usage_buckets: Vec<SnapshotUsageBucket> = Vec::new();
+        // E2 (gate on): the fold's grains are this body's one per-hour store
+        // until `e2::finish_page` emits them; native per-hour rows would only
+        // duplicate them on the page. A withheld body never uploads.
+        let request_owned_hours = self.source == SnapshotSource::ClaudeCode
+            && claude_request_money::e2::enabled()
+            && self.claude_money.is_some();
         for (bucket_start, bucket) in self.usage_buckets {
             if bucket.rows.is_empty() {
+                continue;
+            }
+            if request_owned_hours {
+                for (row_key, row) in bucket.rows {
+                    merge_session_row(&mut session_rows, row_key, row);
+                }
                 continue;
             }
             let mut bucket_rows: Vec<SnapshotModelUsage> = Vec::new();
@@ -31699,7 +31725,9 @@ impl OwnedJsonlParser {
             claude_native_delay_for_test(path);
             // P1 money shadow: a side capture only where the shadow is armed.
             let mut capture = claude_request_money::ClaudeResponseCapture::begin(path);
-            accumulator.finalize_claude_responses_e2(capture.as_mut(), money_context);
+            claude_request_money::e2::timed("claude.finalize", || {
+                accumulator.finalize_claude_responses_e2(capture.as_mut(), money_context)
+            });
             if let Some(capture) = capture {
                 capture.deposit(path, &source_file_fingerprint);
             }
@@ -31854,13 +31882,15 @@ impl OwnedJsonlParser {
                     && observation.pair_key.is_none()
             })
             .count();
-        let snapshots = accumulator.into_items_with_repository_identity(
-            path,
-            collected_at,
-            source_file_fingerprint,
-            attribution_context,
-            repository_identity,
-        );
+        let snapshots = claude_request_money::e2::timed("native.into_items", || {
+            accumulator.into_items_with_repository_identity(
+                path,
+                collected_at,
+                source_file_fingerprint,
+                attribution_context,
+                repository_identity,
+            )
+        });
         // A syntactically valid, positive provider usage record that yields no
         // entity is still loss. Typical causes are an absent/unparseable activity
         // timestamp or an identity shape the accumulator cannot settle. Treat the
@@ -40996,7 +41026,9 @@ impl ScanIndex {
             birth_unix_seconds,
         );
         if claude_request_money::e2::enabled() {
-            self.stage_claude_history_twins(&key, page);
+            claude_request_money::e2::timed("e2.stage_twins", || {
+                self.stage_claude_history_twins(&key, page)
+            });
         }
         let decision = claude_history_upgrade::decide(
             kind,

@@ -392,6 +392,34 @@ const _: () = assert!(
         <= crate::snapshots::MAX_GATED_CLAUDE_REVISION
 );
 
+/// The revision a sync cycle activates: the compiled one. Test builds only:
+/// the Money E2 benchmark's switch-on arm activates the next Claude revision
+/// as its activation PR will compile it (`with_claude_cycle_revision`).
+fn cycle_body_witness_revision(source: SnapshotSource) -> u64 {
+    #[cfg(test)]
+    if source == SnapshotSource::ClaudeCode {
+        if let Some(revision) = CLAUDE_CYCLE_REVISION.with(std::cell::Cell::get) {
+            return revision;
+        }
+    }
+    effective_upload_body_witness_revision(source)
+}
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_CYCLE_REVISION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn with_claude_cycle_revision<T>(revision: u64, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CLAUDE_CYCLE_REVISION.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(CLAUDE_CYCLE_REVISION.with(|value| value.replace(Some(revision))));
+    f()
+}
+
 /// Where this destination's Claude prior history comes from (SOURCE
 /// F1a/F1b, StateMissing H1/N1). A fresh install is only a positively empty
 /// support state.
@@ -5946,9 +5974,7 @@ fn prepare_sync_source(
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
-    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
-        source,
-    ));
+    index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(source));
     if source == SnapshotSource::ClaudeCode {
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
@@ -6356,9 +6382,7 @@ fn prepare_continuation_source(
     if !upload_progress.active_reason_reoffers.is_empty() {
         return Ok(Err(ContinuationRefusal::ReasonReoffer));
     }
-    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
-        source,
-    ));
+    index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(source));
     // K3: as the ordinary prepare, before the scan advances it. It is dropped
     // here unless the page commits, and crosses to the parent only by move.
     let committed_index = index.clone();

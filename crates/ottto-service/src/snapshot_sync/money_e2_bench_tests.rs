@@ -41,14 +41,50 @@ mod reference_hook {
     pub(super) fn drain_counts() -> serde_json::Value {
         serde_json::Value::Object(Default::default())
     }
+
+    pub(super) fn take_stages() -> serde_json::Value {
+        serde_json::Value::Object(Default::default())
+    }
+
+    pub(super) fn with_switch_on<T>(
+        on: bool,
+        _support: &std::path::Path,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        assert!(!on, "the reference build has no switch-on");
+        run()
+    }
 }
 
 // MONEY_E2_BENCH_HOOK_BEGIN
 mod e2_hook {
     pub(super) const STATE: &str = "live";
     pub(super) use crate::snapshots::claude_request_money::e2::bench_seam::{
-        drain_counts, with_gate,
+        drain_counts, take_stages, with_gate,
     };
+
+    /// The gate-on arm as PR C ships it: revision 3 active (its policy row
+    /// carries the request-owned literal; revision 2 denies every literal
+    /// at the upload guard) and an installed, empty exclusions list
+    /// (revision 3 holds all history without one).
+    pub(super) fn with_switch_on<T>(
+        on: bool,
+        support: &std::path::Path,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        if !on {
+            return run();
+        }
+        std::fs::create_dir_all(support.join("snapshots")).unwrap();
+        std::fs::write(
+            support.join("snapshots/claude_code-reemission-exclusions.txt"),
+            "",
+        )
+        .unwrap();
+        crate::snapshots::with_max_gated_claude_revision(3, || {
+            crate::snapshot_sync::with_claude_cycle_revision(3, run)
+        })
+    }
 }
 // MONEY_E2_BENCH_HOOK_END
 
@@ -1377,86 +1413,89 @@ fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Valu
     restore.now();
     let footprint_start = footprint();
     let mut harness = Harness::new(base, &base.join("runs").join(&tag), p1_off);
+    let support = base.join("runs").join(&tag).join("support");
     e2_hook::with_gate(arm == "on", || {
-        let mut pages = Vec::new();
-        loop {
-            let page = harness.page();
-            let complete = page["census_complete"] == true;
-            pages.push(page);
-            if complete {
-                break;
+        e2_hook::with_switch_on(arm == "on", &support, || {
+            let mut pages = Vec::new();
+            loop {
+                let page = harness.page();
+                let complete = page["census_complete"] == true;
+                pages.push(page);
+                if complete {
+                    break;
+                }
+                assert!(
+                    pages.len() < MAX_PAGES,
+                    "the traversal completes within {MAX_PAGES} pages"
+                );
             }
-            assert!(
-                pages.len() < MAX_PAGES,
-                "the traversal completes within {MAX_PAGES} pages"
-            );
-        }
-        let (footprint_steady, _) = footprint();
-        let mut traversal_e2 = BTreeMap::<String, u64>::new();
-        for page in &pages {
-            for (key, value) in page["e2"].as_object().unwrap() {
-                *traversal_e2.entry(key.clone()).or_default() += value.as_u64().unwrap();
+            let (footprint_steady, _) = footprint();
+            let mut traversal_e2 = BTreeMap::<String, u64>::new();
+            for page in &pages {
+                for (key, value) in page["e2"].as_object().unwrap() {
+                    *traversal_e2.entry(key.clone()).or_default() += value.as_u64().unwrap();
+                }
             }
-        }
-        // One page per append to the largest file: never retained (over the
-        // cache entry size), so each is a full read and a whole native finalize.
-        let mut finishes = Vec::new();
-        for n in 0..FINISHES {
-            let mut out = std::fs::File::options()
-                .append(true)
-                .open(&largest)
-                .unwrap();
-            let pad = "x".repeat(256);
-            let line = Line {
-                session: &session(0),
-                agent: None,
-                writer: COPY_WRITER,
-                pad: &pad,
-            };
-            write_request(
-                &mut out,
-                &line,
-                0,
-                2_000_000 + n,
-                plans_end + n as i64 * 60_000,
-            );
-            drop(out);
-            finishes.push(harness.page());
-        }
-        restore.now();
-        let stats = &harness.backend.stats;
-        let mut fingerprints = std::mem::take(&mut *stats.fingerprints.lock().unwrap());
-        fingerprints.sort();
-        let (_, footprint_peak) = footprint();
-        let (_, max_rss) = rusage();
-        serde_json::json!({
-            "mode": "arm",
-            "arm": arm,
-            "tag": tag,
-            "hook": e2_hook::STATE,
-            "p1_kill_file": p1_off,
-            "pages": pages.len(),
-            "traversal": {
-                "wall_us": sum_field(&pages, "wall_us"),
-                "cpu_us": sum_field(&pages, "cpu_us"),
-                "process_cpu_us": sum_field(&pages, "process_cpu_us"),
-                "backend_cpu_us": sum_field(&pages, "backend_cpu_us"),
-                "e2": traversal_e2,
-            },
-            "page_receipts": pages,
-            "finishes": finishes,
-            "uploads": {
-                "batches": stats.batches.load(Ordering::Relaxed),
-                "items": stats.items.load(Ordering::Relaxed),
-                "literal_items": stats.literal_items.load(Ordering::Relaxed),
-                "body_bytes": stats.body_bytes.load(Ordering::Relaxed),
-                "fingerprint_digest": format!("{:x}", Sha256::digest(fingerprints.join("\n"))),
-            },
-            "index_bytes": finishes.last().and_then(|f| f["index_bytes"].as_u64()),
-            "phys_footprint_start_bytes": footprint_start.0,
-            "phys_footprint_steady_bytes": footprint_steady,
-            "phys_footprint_peak_bytes": footprint_peak,
-            "max_rss_bytes": max_rss,
+            // One page per append to the largest file: never retained (over the
+            // cache entry size), so each is a full read and a whole native finalize.
+            let mut finishes = Vec::new();
+            for n in 0..FINISHES {
+                let mut out = std::fs::File::options()
+                    .append(true)
+                    .open(&largest)
+                    .unwrap();
+                let pad = "x".repeat(256);
+                let line = Line {
+                    session: &session(0),
+                    agent: None,
+                    writer: COPY_WRITER,
+                    pad: &pad,
+                };
+                write_request(
+                    &mut out,
+                    &line,
+                    0,
+                    2_000_000 + n,
+                    plans_end + n as i64 * 60_000,
+                );
+                drop(out);
+                finishes.push(harness.page());
+            }
+            restore.now();
+            let stats = &harness.backend.stats;
+            let mut fingerprints = std::mem::take(&mut *stats.fingerprints.lock().unwrap());
+            fingerprints.sort();
+            let (_, footprint_peak) = footprint();
+            let (_, max_rss) = rusage();
+            serde_json::json!({
+                "mode": "arm",
+                "arm": arm,
+                "tag": tag,
+                "hook": e2_hook::STATE,
+                "p1_kill_file": p1_off,
+                "pages": pages.len(),
+                "traversal": {
+                    "wall_us": sum_field(&pages, "wall_us"),
+                    "cpu_us": sum_field(&pages, "cpu_us"),
+                    "process_cpu_us": sum_field(&pages, "process_cpu_us"),
+                    "backend_cpu_us": sum_field(&pages, "backend_cpu_us"),
+                    "e2": traversal_e2,
+                },
+                "page_receipts": pages,
+                "finishes": finishes,
+                "uploads": {
+                    "batches": stats.batches.load(Ordering::Relaxed),
+                    "items": stats.items.load(Ordering::Relaxed),
+                    "literal_items": stats.literal_items.load(Ordering::Relaxed),
+                    "body_bytes": stats.body_bytes.load(Ordering::Relaxed),
+                    "fingerprint_digest": format!("{:x}", Sha256::digest(fingerprints.join("\n"))),
+                },
+                "index_bytes": finishes.last().and_then(|f| f["index_bytes"].as_u64()),
+                "phys_footprint_start_bytes": footprint_start.0,
+                "phys_footprint_steady_bytes": footprint_steady,
+                "phys_footprint_peak_bytes": footprint_peak,
+                "max_rss_bytes": max_rss,
+            })
         })
     })
 }
@@ -1506,6 +1545,26 @@ impl HistoryScan {
         scan
     }
 
+    /// The files still below `revision`: count, bytes and this cycle's
+    /// history hold per file (`none`: not held, yet not stamped).
+    fn remaining(index: &ScanIndex, revision: u64) -> serde_json::Value {
+        let mut holds = BTreeMap::<&str, u64>::new();
+        let (mut files, mut bytes) = (0u64, 0u64);
+        for entry in index
+            .files
+            .values()
+            .filter(|entry| entry.effective_upload_body_witness_revision < revision)
+        {
+            files += 1;
+            bytes += entry.size_bytes;
+            let hold = index
+                .claude_history_emission_held(&entry.source_file_fingerprint)
+                .map_or("none", |hold| hold.as_str());
+            *holds.entry(hold).or_default() += 1;
+        }
+        serde_json::json!({ "files": files, "bytes": bytes, "holds": holds })
+    }
+
     fn stamped(index: &ScanIndex, revision: u64) -> usize {
         index
             .files
@@ -1553,7 +1612,6 @@ impl HistoryScan {
         let items = scan.snapshots.len();
         drop(scan);
         let upgraded = Self::stamped(index, 3) - before;
-        assert!(upgraded > 0, "every reread page makes progress");
         let bytes = owed
             .iter()
             .filter_map(|key| index.files.get(key))
@@ -1584,13 +1642,18 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
             let indexed = history.stamp(&mut index, &support);
             crate::snapshots::with_max_gated_claude_revision(3, || {
                 let mut pages = Vec::new();
-                while HistoryScan::stamped(&index, 3) < indexed {
-                    assert!(
-                        pages.len() < MAX_PAGES,
-                        "the reread completes within {MAX_PAGES} pages"
-                    );
-                    pages.push(history.upgrade_page(&mut index));
+                // A page that stamps nothing ends the probe: the files left
+                // would never upgrade at this shape, so it reports them.
+                let mut stalled = false;
+                while HistoryScan::stamped(&index, 3) < indexed && pages.len() < MAX_PAGES {
+                    let page = history.upgrade_page(&mut index);
+                    stalled = page["files"].as_u64() == Some(0);
+                    pages.push(page);
+                    if stalled {
+                        break;
+                    }
                 }
+                let complete = HistoryScan::stamped(&index, 3) >= indexed;
                 let (_, max_rss) = rusage();
                 serde_json::json!({
                     "mode": "reread",
@@ -1599,6 +1662,9 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
                     "files": files,
                     "stamped_files": indexed,
                     "bytes": manifest["bytes"],
+                    "complete": complete,
+                    "stalled": stalled,
+                    "remaining": HistoryScan::remaining(&index, 3),
                     "pages": pages.len(),
                     "wall_us": sum_field(&pages, "wall_us"),
                     "cpu_us": sum_field(&pages, "cpu_us"),
@@ -1627,9 +1693,15 @@ fn history(base: &Path, arm: &str) -> serde_json::Value {
             let stamped = scan.stamp(&mut index, &support);
             let (footprint_before, _) = footprint();
             let _ = e2_hook::drain_counts();
+            let _ = e2_hook::take_stages();
             let page = crate::snapshots::with_max_gated_claude_revision(3, || {
                 scan.upgrade_page(&mut index)
             });
+            assert!(
+                page["files"].as_u64() > Some(0),
+                "MONEY_E2_BENCH history page upgraded no file: {page}"
+            );
+            let stages = e2_hook::take_stages();
             let e2 = e2_hook::drain_counts();
             let (footprint_after, footprint_peak) = footprint();
             let (_, max_rss) = rusage();
@@ -1641,6 +1713,7 @@ fn history(base: &Path, arm: &str) -> serde_json::Value {
                 "stamped_files": stamped,
                 "page": page,
                 "e2": e2,
+                "stages_us": stages,
                 "phys_footprint_before_bytes": footprint_before,
                 "phys_footprint_after_bytes": footprint_after,
                 "phys_footprint_peak_bytes": footprint_peak,
@@ -1705,4 +1778,12 @@ fn money_e2_bench_receipt() {
     if let Some(output) = env("OTTTO_E2_BENCH_OUTPUT") {
         std::fs::write(output, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     }
+    // After the receipt line and file: the gate reads both either way.
+    assert!(
+        mode != "reread" || receipt["complete"] == true,
+        "MONEY_E2_BENCH reread incomplete after {} pages (stalled={}): remaining {}",
+        receipt["pages"],
+        receipt["stalled"],
+        receipt["remaining"]
+    );
 }

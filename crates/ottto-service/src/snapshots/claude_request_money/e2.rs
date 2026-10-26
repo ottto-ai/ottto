@@ -74,7 +74,7 @@ pub(crate) fn take_stages() -> BTreeMap<&'static str, Duration> {
     STAGES.with(|stages| std::mem::take(&mut *stages.borrow_mut()))
 }
 #[inline(always)]
-fn timed<T>(stage: &'static str, f: impl FnOnce() -> T) -> T {
+pub(in crate::snapshots) fn timed<T>(stage: &'static str, f: impl FnOnce() -> T) -> T {
     #[cfg(test)]
     let start = Instant::now();
     let value = f();
@@ -103,6 +103,19 @@ pub(crate) mod bench_seam {
     /// then zeroed: the same nonzero-only keys as that line.
     pub(crate) fn drain_counts() -> serde_json::Value {
         serde_json::to_value(super::take_counts()).expect("E2 counts serialize")
+    }
+    /// Per-stage wall clock (µs) since the last take, then zeroed.
+    pub(crate) fn take_stages() -> serde_json::Value {
+        super::take_stages()
+            .into_iter()
+            .map(|(stage, spent)| {
+                (
+                    stage.to_owned(),
+                    serde_json::json!(spent.as_micros() as u64),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into()
     }
 }
 
@@ -230,6 +243,9 @@ pub(crate) struct ClaudeEntityBody {
     pub(crate) certificate_ok: bool,
     pub(crate) activity_unix: u64,
     pub(crate) activity_nanos: i128,
+    /// Gate off: what the trial receipt and the counters read, in place of
+    /// `grains` (which then stays empty).
+    dark: DarkTally,
 }
 impl Default for ClaudeEntityBody {
     fn default() -> Self {
@@ -244,6 +260,7 @@ impl Default for ClaudeEntityBody {
             certificate_ok: true,
             activity_unix: 0,
             activity_nanos: 0,
+            dark: DarkTally::default(),
         }
     }
 }
@@ -259,6 +276,11 @@ impl ClaudeEntityBody {
         at: Option<i128>,
         account: AccountPartition,
     ) {
+        if !enabled() {
+            let hour = origin.is_none().then(|| bucket_hour(&key.0)).flatten();
+            self.dark.add(hour, tokens, requests, cost);
+            return;
+        }
         if let Some(at) = at {
             self.note_activity(&key.0, at, at);
         }
@@ -318,6 +340,7 @@ impl ClaudeEntityBody {
         for (bucket, (first, last)) in &other.bucket_activity {
             self.note_activity(bucket, *first, *last);
         }
+        self.dark.absorb(&other.dark);
     }
     /// Path twins of one session sum into the one emitted entity.
     fn sum(&mut self, other: &Self) {
@@ -333,8 +356,8 @@ impl ClaudeEntityBody {
         self.activity_nanos = self.activity_nanos.max(other.activity_nanos);
     }
     fn totals(&self) -> (ClaudeMoneyTokens, u64) {
-        let mut tokens = ClaudeMoneyTokens::default();
-        let mut requests = 0u64;
+        let mut tokens = self.dark.side.tokens;
+        let mut requests = self.dark.side.requests;
         for grain in self.grains.values() {
             tokens.add(&grain.tokens);
             requests = requests.saturating_add(grain.requests);
@@ -347,10 +370,145 @@ impl ClaudeEntityBody {
             .iter()
             .filter(|((_, origin, _), _)| origin.is_none())
             .map(|(_, grain)| grain.requests)
-            .sum()
+            .sum::<u64>()
+            + self.dark.estimated_in(0, u32::MAX)
+    }
+    /// Responses folded in (grains and the dark tally).
+    fn contributions(&self) -> u64 {
+        self.grains
+            .values()
+            .map(|grain| grain.contributions)
+            .sum::<u64>()
+            + self.dark.side.contributions
+    }
+    /// Take one estimated request back from `slot` (its usage moves to a
+    /// reported grain next). False when the slot cannot give it back.
+    fn take_estimated(
+        &mut self,
+        slot: &(
+            ClaudeLiveKey,
+            Option<ClaudeRequestUsageOrigin>,
+            AccountPartition,
+        ),
+        tokens: &ClaudeMoneyTokens,
+        requests: u64,
+    ) -> bool {
+        let Some(grain) = self.grains.get_mut(slot) else {
+            return bucket_hour(&slot.0 .0)
+                .is_some_and(|hour| self.dark.take(hour, tokens, requests));
+        };
+        let (Some(left), Some(left_requests)) = (
+            grain.tokens.checked_sub(tokens),
+            grain.requests.checked_sub(requests),
+        ) else {
+            return false;
+        };
+        grain.tokens = left;
+        grain.requests = left_requests;
+        grain.contributions = grain.contributions.saturating_sub(1);
+        grain.unpriced = grain.unpriced.saturating_sub(1);
+        if grain.contributions == 0 {
+            self.grains.remove(slot);
+        }
+        true
     }
 }
-crate::heap_layout_bound::fields!(ClaudeEntityBody; grains, bucket_activity, removed, removed_requests, telemetry_owned_complete, resolver_conflicts, held, certificate_ok, activity_unix, activity_nanos);
+
+/// Gate off (dark): no per-hour grain map. The trial receipt reads the
+/// totals; `unmatched_1h` reads the estimated requests per unix hour that
+/// telemetry attach has not moved. 8 bytes per hour with estimated usage.
+#[derive(Debug, Clone, Default)]
+struct DarkTally {
+    side: ClaudeGrainSide,
+    /// (unix hour, estimated requests), sorted by hour.
+    estimated: Vec<(u32, u32)>,
+}
+crate::heap_layout_bound::fields!(DarkTally; side, estimated);
+impl DarkTally {
+    fn add(
+        &mut self,
+        hour: Option<u32>,
+        tokens: &ClaudeMoneyTokens,
+        requests: u64,
+        cost: Option<u64>,
+    ) {
+        self.side.add(tokens, requests, cost);
+        if let Some(hour) = hour {
+            self.bump(hour, requests);
+        }
+    }
+    fn bump(&mut self, hour: u32, requests: u64) {
+        let requests = u32::try_from(requests).unwrap_or(u32::MAX);
+        // Responses arrive in transcript order: almost always the last hour.
+        match self.estimated.last_mut() {
+            Some((last, count)) if *last == hour => *count = count.saturating_add(requests),
+            Some((last, _)) if *last > hour => {
+                match self.estimated.binary_search_by_key(&hour, |(at, _)| *at) {
+                    Ok(at) => {
+                        let count = &mut self.estimated[at].1;
+                        *count = count.saturating_add(requests);
+                    }
+                    Err(at) => self.estimated.insert(at, (hour, requests)),
+                }
+            }
+            _ => self.estimated.push((hour, requests)),
+        }
+    }
+    fn take(&mut self, hour: u32, tokens: &ClaudeMoneyTokens, requests: u64) -> bool {
+        let Ok(at) = self.estimated.binary_search_by_key(&hour, |(at, _)| *at) else {
+            return false;
+        };
+        let (Some(count), Some(left), Some(left_requests)) = (
+            u32::try_from(requests)
+                .ok()
+                .and_then(|requests| self.estimated[at].1.checked_sub(requests)),
+            self.side.tokens.checked_sub(tokens),
+            self.side.requests.checked_sub(requests),
+        ) else {
+            return false;
+        };
+        if count == 0 {
+            self.estimated.remove(at);
+        } else {
+            self.estimated[at].1 = count;
+        }
+        self.side.tokens = left;
+        self.side.requests = left_requests;
+        self.side.contributions = self.side.contributions.saturating_sub(1);
+        self.side.unpriced = self.side.unpriced.saturating_sub(1);
+        true
+    }
+    fn absorb(&mut self, other: &Self) {
+        ClaudeEntityBody::merge_grain(&mut self.side, &other.side);
+        for &(hour, requests) in &other.estimated {
+            self.bump(hour, u64::from(requests));
+        }
+    }
+    /// Estimated requests in hours `[from, to)`.
+    fn estimated_in(&self, from: u32, to: u32) -> u64 {
+        self.estimated
+            .iter()
+            .filter(|(hour, _)| (from..to).contains(hour))
+            .map(|(_, requests)| u64::from(*requests))
+            .sum()
+    }
+    fn shrink(&mut self) {
+        self.estimated.shrink_to_fit();
+    }
+}
+
+/// The unix hour of a normalized bucket start (`activity_bucket_from_timestamp`).
+fn bucket_hour(bucket: &str) -> Option<u32> {
+    u32::try_from(rfc3339_unix_nanos(bucket)?.div_euclid(HOUR_NANOS)).ok()
+}
+
+/// The gate-off grain key: the hour bucket only. Dark keeps no grain map, so
+/// it never builds a placement for a key it would not keep.
+fn hour_key(timestamp: &str) -> Option<ClaudeLiveKey> {
+    let (bucket, _) = super::super::activity_bucket_from_timestamp(timestamp)?;
+    Some((bucket, String::new(), BTreeMap::new()))
+}
+crate::heap_layout_bound::fields!(ClaudeEntityBody; grains, bucket_activity, removed, removed_requests, telemetry_owned_complete, resolver_conflicts, held, certificate_ok, activity_unix, activity_nanos, dark);
 // Existing grain types were inline P1 values; E retains only the aggregate.
 crate::heap_layout_bound::fields!(ClaudeGrainSide; tokens, requests, cost_micros, unpriced, contributions);
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestUsageOrigin {
@@ -593,10 +751,14 @@ impl FileFold {
         let Some(placed) = placed else {
             return;
         };
-        if placed.fell_back {
+        let live = enabled();
+        if placed.fell_back && live {
             self.model_fallbacks.insert(sequence, placed.model.clone());
         }
         let Some(key) = placed.placement.as_ref().map(|placement| {
+            if !live {
+                return (placement.bucket.clone(), String::new(), BTreeMap::new());
+            }
             live_key(
                 &placed.model,
                 placement.bucket.clone(),
@@ -663,6 +825,17 @@ impl FileFold {
     /// files of other sessions (/branch; the request ids are the proof, no
     /// writer certificate). Without one the copies count and are disclosed.
     pub(in crate::snapshots) fn finish_native(
+        &mut self,
+        context: Option<&ReadContext<'_>>,
+        markers: Option<&claude_request_identity::OrgMarkers>,
+    ) {
+        self.decide_native(context, markers);
+        // The fold lives until the page finishes: keep no parse-time slack.
+        self.entity.dark.shrink();
+        self.skipped.shrink_to_fit();
+    }
+
+    fn decide_native(
         &mut self,
         context: Option<&ReadContext<'_>>,
         markers: Option<&claude_request_identity::OrgMarkers>,
@@ -798,6 +971,14 @@ impl FileFold {
         &self,
         occurrence: &ClaudeTranscriptUsageOccurrence,
     ) -> Option<ClaudeLiveKey> {
+        if !enabled() {
+            return hour_key(
+                occurrence
+                    .timestamp
+                    .as_deref()
+                    .or(self.bucket_fallback.as_deref())?,
+            );
+        }
         let model = occurrence
             .model
             .as_deref()
@@ -851,11 +1032,7 @@ impl FileFold {
             return;
         };
         let (tokens, requests) = idless.totals();
-        let responses = idless
-            .grains
-            .values()
-            .map(|grain| grain.contributions)
-            .sum::<u64>();
+        let responses = idless.contributions();
         match (
             self.entity.removed.checked_sub(&tokens),
             self.entity.removed_requests.checked_sub(requests),
@@ -898,6 +1075,9 @@ impl FileFold {
         let Some(start) = self.telemetry.start_bucket.as_deref() else {
             return 0;
         };
+        let dark = bucket_hour(start)
+            .zip(bucket_hour(hour_ago_bucket))
+            .map_or(0, |(from, to)| self.entity.dark.estimated_in(from, to));
         self.entity
             .grains
             .iter()
@@ -905,7 +1085,8 @@ impl FileFold {
                 origin.is_none() && key.0.as_str() >= start && key.0.as_str() < hour_ago_bucket
             })
             .map(|(_, grain)| grain.requests)
-            .sum()
+            .sum::<u64>()
+            + dark
     }
 
     fn telemetry_complete(&self) -> bool {
@@ -927,6 +1108,9 @@ fn grain_key(
     timestamp: Option<&str>,
     fallback: Option<&str>,
 ) -> Option<ClaudeLiveKey> {
+    if !enabled() {
+        return hour_key(timestamp.or(fallback)?);
+    }
     let placed = claude_row_placement(model, base, selector, effort, timestamp, fallback)?;
     Some(live_key(
         model,
@@ -1355,21 +1539,8 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
         .as_ref()
         .and_then(|a| a.account(occurrence.sequence));
     let slot = (estimated, None, account.clone());
-    let Some(grain) = fold.entity.grains.get_mut(&slot) else {
+    if !fold.entity.take_estimated(&slot, &tokens, requests) {
         return false;
-    };
-    let (Some(left), Some(left_requests)) = (
-        grain.tokens.checked_sub(&tokens),
-        grain.requests.checked_sub(requests),
-    ) else {
-        return false;
-    };
-    grain.tokens = left;
-    grain.requests = left_requests;
-    grain.contributions = grain.contributions.saturating_sub(1);
-    grain.unpriced = grain.unpriced.saturating_sub(1);
-    if grain.contributions == 0 {
-        fold.entity.grains.remove(&slot);
     }
     // Parse a clock only when the reported key landed in another hour.
     let at = (reported.0 != slot.0 .0)

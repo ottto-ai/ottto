@@ -183,135 +183,150 @@ fn cleanup(paths: &[&Path]) {
 
 #[test]
 fn e2_thinking_300_matches_an_otel_zero_and_rejects_a_different_count() {
-    let p = root_file("thinking");
-    let index = ScanIndex::default();
-    let mut thinking = line("r", &at(1), 10);
-    thinking["message"]["usage"]["output_tokens"] = json!(301);
-    thinking["message"]["usage"]["output_tokens_details"] = json!({"thinking_tokens":300});
-    let item = parse(&p, Some(t0()), &index, std::slice::from_ref(&thinking));
-    let mut otel = complete_api_row(ROOT, "r", 1, 10, 301, 0);
-    assert_eq!(otel.reasoning_output_tokens, 0);
-    let got = publish(
-        vec![item],
-        Some(&sidecar(std::slice::from_ref(&otel))),
-        TelemetryRead::Loaded,
-        &index,
-    );
-    assert_eq!(got[0].reasoning_output_tokens, 300, "transcript tokens win");
-    assert_eq!(got[0].telemetry_owned_complete, Some(true));
-    assert_eq!(
-        got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
-        Some("0.0001")
-    );
-    otel.reasoning_output_tokens = 299;
-    let mut items = vec![parse(&p, Some(t0()), &index, &[thinking])];
-    attach_page(&mut items, &sidecar(&[refingerprint(otel)]));
-    assert_eq!(requests(&items[0], MATCHED), 0);
-    assert_eq!(requests(&items[0], None), 1);
-    assert_eq!(fold(&items[0]).disclosed, 1, "incompatible row disclosed");
-    cleanup(&[&p]);
+    // Grain detail exists only with the gate on: dark keeps no grain map.
+    with_enabled(|| {
+        let p = root_file("thinking");
+        let index = ScanIndex::default();
+        let mut thinking = line("r", &at(1), 10);
+        thinking["message"]["usage"]["output_tokens"] = json!(301);
+        thinking["message"]["usage"]["output_tokens_details"] = json!({"thinking_tokens":300});
+        let item = parse(&p, Some(t0()), &index, std::slice::from_ref(&thinking));
+        let mut otel = complete_api_row(ROOT, "r", 1, 10, 301, 0);
+        assert_eq!(otel.reasoning_output_tokens, 0);
+        let got = publish(
+            vec![item],
+            Some(&sidecar(std::slice::from_ref(&otel))),
+            TelemetryRead::Loaded,
+            &index,
+        );
+        assert_eq!(got[0].reasoning_output_tokens, 300, "transcript tokens win");
+        assert_eq!(got[0].telemetry_owned_complete, Some(true));
+        assert_eq!(
+            got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        otel.reasoning_output_tokens = 299;
+        let mut items = vec![parse(&p, Some(t0()), &index, &[thinking])];
+        attach_page(&mut items, &sidecar(&[refingerprint(otel)]));
+        assert_eq!(requests(&items[0], MATCHED), 0);
+        assert_eq!(requests(&items[0], None), 1);
+        assert_eq!(fold(&items[0]).disclosed, 1, "incompatible row disclosed");
+        cleanup(&[&p]);
+    });
 }
 
 #[test]
 fn e2_model_less_record_attaches_through_its_native_fallback_key() {
-    let p = root_file("model-none");
-    let index = ScanIndex::default();
-    let mut bare = line("b", &at(2), 20);
-    bare["message"].as_object_mut().unwrap().remove("model");
-    let mut items = vec![parse(
-        &p,
-        Some(t0()),
-        &index,
-        &[line("a", &at(1), 10), bare],
-    )];
-    assert_eq!(fold(&items[0]).model_fallbacks.len(), 1);
-    attach_page(&mut items, &sidecar(&[row("b", 2, 20)]));
-    let f = fold(&items[0]);
-    assert_eq!(
-        (requests(&items[0], MATCHED), requests(&items[0], None)),
-        (1, 1)
-    );
-    assert_eq!(f.disclosed, 0);
-    assert_eq!(f.entity.totals().0.input, 30);
-    cleanup(&[&p]);
+    // Grain detail exists only with the gate on: dark keeps no grain map.
+    with_enabled(|| {
+        let p = root_file("model-none");
+        let index = ScanIndex::default();
+        let mut bare = line("b", &at(2), 20);
+        bare["message"].as_object_mut().unwrap().remove("model");
+        let mut items = vec![parse(
+            &p,
+            Some(t0()),
+            &index,
+            &[line("a", &at(1), 10), bare],
+        )];
+        assert_eq!(fold(&items[0]).model_fallbacks.len(), 1);
+        attach_page(&mut items, &sidecar(&[row("b", 2, 20)]));
+        let f = fold(&items[0]);
+        assert_eq!(
+            (requests(&items[0], MATCHED), requests(&items[0], None)),
+            (1, 1)
+        );
+        assert_eq!(f.disclosed, 0);
+        assert_eq!(f.entity.totals().0.input, 30);
+        cleanup(&[&p]);
+    });
 }
 
 #[test]
 fn e2_untimed_record_attaches_from_the_bucket_fallback() {
-    let p = root_file("untimed");
-    let index = ScanIndex::default();
-    let mut untimed = line("b", &at(2), 20);
-    untimed.as_object_mut().unwrap().remove("timestamp");
-    let mut items = vec![parse(
-        &p,
-        Some(t0()),
-        &index,
-        &[line("a", &at(1), 10), untimed],
-    )];
-    assert_eq!(
-        fold(&items[0]).disclosed,
-        1,
-        "untimed root record disclosed"
-    );
-    assert_eq!(fold(&items[0]).entity.totals().1, 2);
-    attach_page(&mut items, &sidecar(&[row("b", 2, 20)]));
-    assert_eq!(
-        (requests(&items[0], MATCHED), requests(&items[0], None)),
-        (1, 1)
-    );
-    assert_eq!(fold(&items[0]).disclosed, 1, "the attach discloses nothing");
-    cleanup(&[&p]);
+    // Grain detail exists only with the gate on: dark keeps no grain map.
+    with_enabled(|| {
+        let p = root_file("untimed");
+        let index = ScanIndex::default();
+        let mut untimed = line("b", &at(2), 20);
+        untimed.as_object_mut().unwrap().remove("timestamp");
+        let mut items = vec![parse(
+            &p,
+            Some(t0()),
+            &index,
+            &[line("a", &at(1), 10), untimed],
+        )];
+        assert_eq!(
+            fold(&items[0]).disclosed,
+            1,
+            "untimed root record disclosed"
+        );
+        assert_eq!(fold(&items[0]).entity.totals().1, 2);
+        attach_page(&mut items, &sidecar(&[row("b", 2, 20)]));
+        assert_eq!(
+            (requests(&items[0], MATCHED), requests(&items[0], None)),
+            (1, 1)
+        );
+        assert_eq!(fold(&items[0]).disclosed, 1, "the attach discloses nothing");
+        cleanup(&[&p]);
+    });
 }
 
 #[test]
 fn e2_hour_boundary_keeps_the_transcript_hour() {
-    let p = root_file("hour");
-    let index = ScanIndex::default();
-    let mut items = vec![parse(
-        &p,
-        Some(t0()),
-        &index,
-        &[line("r", "2026-08-02T07:59:59.900Z", 10)],
-    )];
-    let mut late = row("r", 1, 10);
-    late.observed_at = "2026-08-02T08:00:01Z".into();
-    attach_page(&mut items, &sidecar(&[refingerprint(late)]));
-    let buckets = fold(&items[0])
-        .entity
-        .grains
-        .keys()
-        .map(|(key, origin, _)| (key.0.as_str(), *origin))
-        .collect::<Vec<_>>();
-    assert_eq!(buckets, vec![(HOUR, MATCHED)]);
-    cleanup(&[&p]);
+    // Grain detail exists only with the gate on: dark keeps no grain map.
+    with_enabled(|| {
+        let p = root_file("hour");
+        let index = ScanIndex::default();
+        let mut items = vec![parse(
+            &p,
+            Some(t0()),
+            &index,
+            &[line("r", "2026-08-02T07:59:59.900Z", 10)],
+        )];
+        let mut late = row("r", 1, 10);
+        late.observed_at = "2026-08-02T08:00:01Z".into();
+        attach_page(&mut items, &sidecar(&[refingerprint(late)]));
+        let buckets = fold(&items[0])
+            .entity
+            .grains
+            .keys()
+            .map(|(key, origin, _)| (key.0.as_str(), *origin))
+            .collect::<Vec<_>>();
+        assert_eq!(buckets, vec![(HOUR, MATCHED)]);
+        cleanup(&[&p]);
+    });
 }
 
 #[test]
 fn e2_otel_only_fast_speed_and_effort_join_the_reported_key() {
-    let p = root_file("speed");
-    let index = ScanIndex::default();
-    let items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
-    let estimated = fold(&items[0])
-        .entity
-        .grains
-        .keys()
-        .next()
-        .unwrap()
-        .0
-        .clone();
-    assert!(!estimated.2.contains_key("speed_mode"));
-    let mut items = items;
-    attach_page(&mut items, &sidecar(&[row("r", 1, 10)]));
-    let ((key, origin, _), _) = fold(&items[0]).entity.grains.iter().next().unwrap();
-    assert_eq!(*origin, MATCHED);
-    assert!(key.2.contains_key("speed_mode"), "OTEL speed joins the key");
-    assert_eq!(
-        key.2.get("reasoning_effort").map(String::as_str),
-        Some("high")
-    );
-    let got = publish(items, None, TelemetryRead::Loaded, &index);
-    assert!(rows_of(&got[0]).all(|row| row.reasoning_effort.as_deref() == Some("high")));
-    cleanup(&[&p]);
+    // Grain detail exists only with the gate on: dark keeps no grain map.
+    with_enabled(|| {
+        let p = root_file("speed");
+        let index = ScanIndex::default();
+        let items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
+        let estimated = fold(&items[0])
+            .entity
+            .grains
+            .keys()
+            .next()
+            .unwrap()
+            .0
+            .clone();
+        assert!(!estimated.2.contains_key("speed_mode"));
+        let mut items = items;
+        attach_page(&mut items, &sidecar(&[row("r", 1, 10)]));
+        let ((key, origin, _), _) = fold(&items[0]).entity.grains.iter().next().unwrap();
+        assert_eq!(*origin, MATCHED);
+        assert!(key.2.contains_key("speed_mode"), "OTEL speed joins the key");
+        assert_eq!(
+            key.2.get("reasoning_effort").map(String::as_str),
+            Some("high")
+        );
+        let got = publish(items, None, TelemetryRead::Loaded, &index);
+        assert!(rows_of(&got[0]).all(|row| row.reasoning_effort.as_deref() == Some("high")));
+        cleanup(&[&p]);
+    });
 }
 
 #[test]
@@ -432,40 +447,43 @@ fn e2_unpriced_row_is_telemetry_unpriced() {
 
 #[test]
 fn e2_priced_and_unpriced_rows_in_one_hour_stay_separate() {
-    let p = root_file("mixed");
-    let index = ScanIndex::default();
-    let mut unpriced = row("u", 2, 20);
-    unpriced.cost_usd_micros = None;
-    let mut items = vec![parse(
-        &p,
-        Some(t0()),
-        &index,
-        &[line("p", &at(1), 10), line("u", &at(2), 20)],
-    )];
-    attach_page(
-        &mut items,
-        &sidecar(&[row("p", 1, 10), refingerprint(unpriced)]),
-    );
-    assert_eq!(
-        (requests(&items[0], MATCHED), requests(&items[0], UNPRICED)),
-        (1, 1)
-    );
-    let got = publish(items, None, TelemetryRead::Loaded, &index);
-    assert_eq!(got[0].request_count, 2);
-    assert_eq!(
-        got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
-        Some("0.0001")
-    );
-    let origins = got[0].usage_buckets[0]
-        .model_usage
-        .iter()
-        .map(|row| row.selector_context["request_usage_origin"].as_str())
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        origins,
-        BTreeSet::from(["telemetry_matched", "telemetry_unpriced"])
-    );
-    cleanup(&[&p]);
+    // Grain detail exists only with the gate on: dark keeps no grain map.
+    with_enabled(|| {
+        let p = root_file("mixed");
+        let index = ScanIndex::default();
+        let mut unpriced = row("u", 2, 20);
+        unpriced.cost_usd_micros = None;
+        let mut items = vec![parse(
+            &p,
+            Some(t0()),
+            &index,
+            &[line("p", &at(1), 10), line("u", &at(2), 20)],
+        )];
+        attach_page(
+            &mut items,
+            &sidecar(&[row("p", 1, 10), refingerprint(unpriced)]),
+        );
+        assert_eq!(
+            (requests(&items[0], MATCHED), requests(&items[0], UNPRICED)),
+            (1, 1)
+        );
+        let got = publish(items, None, TelemetryRead::Loaded, &index);
+        assert_eq!(got[0].request_count, 2);
+        assert_eq!(
+            got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        let origins = got[0].usage_buckets[0]
+            .model_usage
+            .iter()
+            .map(|row| row.selector_context["request_usage_origin"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            origins,
+            BTreeSet::from(["telemetry_matched", "telemetry_unpriced"])
+        );
+        cleanup(&[&p]);
+    });
 }
 
 #[test]
@@ -627,64 +645,67 @@ fn e2_exact_removal_totals() {
 
 #[test]
 fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
-    let p = root_file("side");
-    let agent = p
-        .parent()
-        .unwrap()
-        .join(ROOT)
-        .join("subagents/agent-abc.jsonl");
-    fs::create_dir_all(agent.parent().unwrap()).unwrap();
-    fs::write(&agent, b"fixture\n").unwrap();
-    let index = ScanIndex::default();
-    let mut sub = line("s", &at(3), 30);
-    sub["agentId"] = json!("abc");
-    sub["isSidechain"] = json!(true);
-    let mut items = vec![
-        parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)]),
-        parse(&agent, Some(t0()), &index, &[sub]),
-    ];
-    let subagent = items[1].source_session_id.clone();
-    assert_eq!(subagent, format!("{ROOT}_agent-abc"));
-    let read = sidecar(&[
-        row("r", 1, 10),
-        row("s", 3, 30),
-        row("named", 4, 40),
-        row("orphan", 5, 50),
-    ]);
-    attach_page(&mut items, &read);
-    assert!(items
-        .iter()
-        .all(|item| !fold(item).telemetry.side_calls_done));
-    let trace = ClaudeTraceOwnershipLoadReport {
-        evidence: BTreeMap::from([(
-            ROOT.to_owned(),
-            vec![complete_trace_row(ROOT, "named", "abc")],
-        )]),
-        ..Default::default()
-    };
-    side_calls_page(&mut items, &api_report(&read), &trace, &index);
-    let (root, sub) = (fold(&items[0]), fold(&items[1]));
-    assert_eq!((requests(&items[1], REPORTED), sub.root_fallbacks), (1, 0));
-    assert_eq!((requests(&items[0], REPORTED), root.root_fallbacks), (1, 1));
-    assert_eq!((root.side_requests, sub.side_requests), (1, 1));
-    assert_eq!(root.side.input, 50);
-    assert_eq!(sub.side.input, 40);
-    let got = publish(items, None, TelemetryRead::Loaded, &index);
-    let by_session = got
-        .iter()
-        .map(|item| {
-            (
-                item.source_session_id.as_str(),
-                (item.request_count, item.input_tokens),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(by_session[ROOT], (2, 60));
-    assert_eq!(by_session[subagent.as_str()], (2, 70));
-    assert!(got
-        .iter()
-        .all(|item| item.telemetry_owned_complete == Some(true)));
-    let _ = fs::remove_dir_all(p.parent().unwrap());
+    // Grain detail exists only with the gate on: dark keeps no grain map.
+    with_enabled(|| {
+        let p = root_file("side");
+        let agent = p
+            .parent()
+            .unwrap()
+            .join(ROOT)
+            .join("subagents/agent-abc.jsonl");
+        fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"fixture\n").unwrap();
+        let index = ScanIndex::default();
+        let mut sub = line("s", &at(3), 30);
+        sub["agentId"] = json!("abc");
+        sub["isSidechain"] = json!(true);
+        let mut items = vec![
+            parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)]),
+            parse(&agent, Some(t0()), &index, &[sub]),
+        ];
+        let subagent = items[1].source_session_id.clone();
+        assert_eq!(subagent, format!("{ROOT}_agent-abc"));
+        let read = sidecar(&[
+            row("r", 1, 10),
+            row("s", 3, 30),
+            row("named", 4, 40),
+            row("orphan", 5, 50),
+        ]);
+        attach_page(&mut items, &read);
+        assert!(items
+            .iter()
+            .all(|item| !fold(item).telemetry.side_calls_done));
+        let trace = ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(
+                ROOT.to_owned(),
+                vec![complete_trace_row(ROOT, "named", "abc")],
+            )]),
+            ..Default::default()
+        };
+        side_calls_page(&mut items, &api_report(&read), &trace, &index);
+        let (root, sub) = (fold(&items[0]), fold(&items[1]));
+        assert_eq!((requests(&items[1], REPORTED), sub.root_fallbacks), (1, 0));
+        assert_eq!((requests(&items[0], REPORTED), root.root_fallbacks), (1, 1));
+        assert_eq!((root.side_requests, sub.side_requests), (1, 1));
+        assert_eq!(root.side.input, 50);
+        assert_eq!(sub.side.input, 40);
+        let got = publish(items, None, TelemetryRead::Loaded, &index);
+        let by_session = got
+            .iter()
+            .map(|item| {
+                (
+                    item.source_session_id.as_str(),
+                    (item.request_count, item.input_tokens),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_session[ROOT], (2, 60));
+        assert_eq!(by_session[subagent.as_str()], (2, 70));
+        assert!(got
+            .iter()
+            .all(|item| item.telemetry_owned_complete == Some(true)));
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    });
 }
 
 #[test]
@@ -3648,36 +3669,39 @@ fn remove_agent_scratch(paths: &[&Path]) {
 
 #[test]
 fn e2_side_call_named_member_without_transcript_falls_back_to_the_root() {
-    let p = root_file("side-ghost");
-    let agent = p
-        .parent()
-        .unwrap()
-        .join(ROOT)
-        .join("subagents/agent-abc.jsonl");
-    fs::create_dir_all(agent.parent().unwrap()).unwrap();
-    fs::write(&agent, b"fixture\n").unwrap();
-    let index = ScanIndex::default();
-    let mut items = vec![
-        parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)]),
-        parse(&agent, Some(t0()), &index, &[sub_line("s", 3, 30)]),
-    ];
-    let read = sidecar(&[row("r", 1, 10), row("s", 3, 30), row("ghost", 4, 40)]);
-    attach_page(&mut items, &read);
-    // The trace names agent `zzz`: no transcript of it exists anywhere.
-    let trace = ClaudeTraceOwnershipLoadReport {
-        evidence: BTreeMap::from([(
-            ROOT.to_owned(),
-            vec![complete_trace_row(ROOT, "ghost", "zzz")],
-        )]),
-        ..Default::default()
-    };
-    let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
-    assert!(unresolved.is_empty(), "the census walk decided");
-    let (root, sub) = (fold(&items[0]), fold(&items[1]));
-    assert_eq!((requests(&items[0], REPORTED), root.root_fallbacks), (1, 1));
-    assert_eq!((requests(&items[1], REPORTED), sub.root_fallbacks), (0, 0));
-    assert_eq!(root.side.input, 40, "counted once, on the root");
-    let _ = fs::remove_dir_all(p.parent().unwrap());
+    // Grain detail exists only with the gate on: dark keeps no grain map.
+    with_enabled(|| {
+        let p = root_file("side-ghost");
+        let agent = p
+            .parent()
+            .unwrap()
+            .join(ROOT)
+            .join("subagents/agent-abc.jsonl");
+        fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"fixture\n").unwrap();
+        let index = ScanIndex::default();
+        let mut items = vec![
+            parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)]),
+            parse(&agent, Some(t0()), &index, &[sub_line("s", 3, 30)]),
+        ];
+        let read = sidecar(&[row("r", 1, 10), row("s", 3, 30), row("ghost", 4, 40)]);
+        attach_page(&mut items, &read);
+        // The trace names agent `zzz`: no transcript of it exists anywhere.
+        let trace = ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(
+                ROOT.to_owned(),
+                vec![complete_trace_row(ROOT, "ghost", "zzz")],
+            )]),
+            ..Default::default()
+        };
+        let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
+        assert!(unresolved.is_empty(), "the census walk decided");
+        let (root, sub) = (fold(&items[0]), fold(&items[1]));
+        assert_eq!((requests(&items[0], REPORTED), root.root_fallbacks), (1, 1));
+        assert_eq!((requests(&items[1], REPORTED), sub.root_fallbacks), (0, 0));
+        assert_eq!(root.side.input, 40, "counted once, on the root");
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    });
 }
 
 #[test]
