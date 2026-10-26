@@ -938,6 +938,68 @@ fn e2_membership_hash_collision_never_substitutes_for_exact_request_identity() {
 }
 
 #[test]
+fn e2_membership_view_lists_each_request_set_and_occurrence_id_once() {
+    let p = root_file("membership-union");
+    let index = ScanIndex::default();
+    let mut items = vec![parse(
+        &p,
+        Some(t0()),
+        &index,
+        &[line("b", &at(1), 10), line("d", &at(2), 10)],
+    )];
+    let occurrence = items[0].claude_usage_occurrences["b"].clone();
+    items[0].claude_usage_request_ids.insert("a".into());
+    items[0].claude_usage_request_ids.insert("e".into());
+    items[0]
+        .claude_usage_occurrences
+        .insert("c".into(), occurrence.clone());
+    items[0]
+        .claude_usage_occurrences
+        .insert("f".into(), occurrence);
+    let ids = item_request_ids(&items[0]).cloned().collect::<Vec<_>>();
+    assert_eq!(ids.len(), 6, "no id twice: {ids:?}");
+    assert_eq!(
+        ids.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from(["a", "b", "c", "d", "e", "f"].map(String::from))
+    );
+    let view = family_membership(&items, &[0]);
+    assert_eq!(view.entries.capacity(), 6);
+    for id in ["a", "b", "c", "d", "e", "f"] {
+        assert_eq!(matching_members(&view, id).collect::<Vec<_>>(), [0usize]);
+    }
+    cleanup(&[&p]);
+}
+
+/// Side calls reuse one key per (model, speed, effort, UTC hour): the
+/// placement reads the clock only for its hour bucket, offsets included.
+#[test]
+fn e2_side_call_key_reuse_is_exact_per_utc_hour() {
+    let clocks = [
+        "2026-08-02T07:00:00Z",
+        "2026-08-02T07:59:59.999999999Z",
+        "2026-08-02T09:30:00+02:00",
+        "2026-08-02T08:00:00Z",
+        "2026-08-02T03:15:00-05:00",
+    ];
+    let base = SelectorCapture::default();
+    for a in clocks {
+        for b in clocks {
+            let (mut x, mut y) = (row("x", 1, 10), row("y", 2, 10));
+            x.observed_at = a.into();
+            y.observed_at = b.into();
+            let hour = |clock: &str| rfc3339_unix_nanos(clock).unwrap().div_euclid(HOUR_NANOS);
+            let key = reported_key(&x, None, &base);
+            assert!(key.is_some());
+            assert_eq!(
+                key == reported_key(&y, None, &base),
+                hour(a) == hour(b),
+                "{a} vs {b}"
+            );
+        }
+    }
+}
+
+#[test]
 fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
     use crate::snapshots::claude_request_census::{
         record_claude_request_census, ClaudeRequestCensusParse,

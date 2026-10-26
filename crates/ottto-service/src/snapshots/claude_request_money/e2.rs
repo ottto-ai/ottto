@@ -24,8 +24,7 @@ use crate::claude_local_otel::{
 use crate::telemetry_attach::{join, Attachment, Holders};
 use serde::Serialize;
 use std::cell::RefCell;
-use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -731,11 +730,32 @@ fn page_families(items: &[SnapshotItem]) -> BTreeMap<String, Vec<usize>> {
 }
 
 /// Transient acceleration only, never an ownership identity. Every hit is
-/// checked against the exact request id in the existing member map/set.
+/// checked against the exact request id in the existing member map/set. A
+/// word-at-a-time multiply mix: entropy lands in the high bits the view keeps.
 fn membership_hash(request_id: &str) -> u64 {
-    let mut hash = DefaultHasher::new();
-    request_id.hash(&mut hash);
-    hash.finish()
+    const MIX: u64 = 0x517c_c1b7_2722_0a95;
+    let bytes = request_id.as_bytes();
+    let mut hash = bytes.len() as u64;
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        let word = u64::from_le_bytes(word.try_into().unwrap());
+        hash = (hash.rotate_left(5) ^ word).wrapping_mul(MIX);
+    }
+    let mut tail = [0u8; 8];
+    tail[..words.remainder().len()].copy_from_slice(words.remainder());
+    (hash.rotate_left(5) ^ u64::from_le_bytes(tail)).wrapping_mul(MIX)
+}
+
+/// One item's request ids: its request set, then the occurrence keys outside
+/// it. Both are sorted, so one merge walk replaces a set lookup per key.
+fn item_request_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> {
+    let mut ids = item.claude_usage_request_ids.iter().peekable();
+    item.claude_usage_request_ids
+        .iter()
+        .chain(item.claude_usage_occurrences.keys().filter(move |key| {
+            while ids.next_if(|id| id < key).is_some() {}
+            ids.peek() != Some(key)
+        }))
 }
 
 /// A transient member index in the low bits, a hash accelerator in the rest.
@@ -753,26 +773,13 @@ crate::heap_layout_bound::fields!(FamilyMembership; entries, member_mask);
 fn family_membership(items: &[SnapshotItem], members: &[usize]) -> FamilyMembership {
     let count = members
         .iter()
-        .map(|&index| {
-            let item = &items[index];
-            item.claude_usage_request_ids.len()
-                + item
-                    .claude_usage_occurrences
-                    .keys()
-                    .filter(|id| !item.claude_usage_request_ids.contains(*id))
-                    .count()
-        })
+        .map(|&index| item_request_ids(&items[index]).count())
         .sum();
     let bits = usize::BITS - items.len().saturating_sub(1).leading_zeros();
     let member_mask = u64::MAX.checked_shr(64 - bits).unwrap_or(0);
     let mut entries = Vec::with_capacity(count);
     for &index in members {
-        let item = &items[index];
-        for id in item.claude_usage_request_ids.iter().chain(
-            item.claude_usage_occurrences
-                .keys()
-                .filter(|id| !item.claude_usage_request_ids.contains(*id)),
-        ) {
+        for id in item_request_ids(&items[index]) {
             entries.push((membership_hash(id) & !member_mask) | index as u64);
         }
     }
@@ -1118,13 +1125,15 @@ pub(crate) fn side_calls_page(
         };
         let mut family_census = census.remove(root.as_str()).unwrap_or_default();
         let mut rows = rows;
-        timed("side.retain", || {
-            rows.retain(|row| {
-                !family_census
-                    .held
-                    .contains(&claude_request_hash(&row.request_id))
-            })
-        });
+        if !family_census.held.is_empty() {
+            timed("side.retain", || {
+                rows.retain(|row| {
+                    !family_census
+                        .held
+                        .contains(&claude_request_hash(&row.request_id))
+                })
+            });
+        }
         // Held candidates never allocate a trace-owner slot. Release the census
         // intersection before the borrowed owner vector is allocated.
         family_census.held.clear();
@@ -1146,12 +1155,20 @@ pub(crate) fn side_calls_page(
                 })
         });
         let mut disclosed = invalid.get(root.as_str()).copied().unwrap_or(0);
+        // Built once per distinct value: member ids per trace agent, and keys
+        // per (model, speed, effort, hour), since a side call's placement
+        // reads its clock only for the hour bucket (`claude_row_placement`).
+        let mut owner_ids = BTreeMap::<&str, String>::new();
+        let mut keys = BTreeMap::<(&str, &str, &str, i128), Option<ClaudeLiveKey>>::new();
         for (row, owner) in rows.iter().zip(owners) {
             let fallback = owner.is_none();
-            let owner = timed("side.owner_id", || {
-                owner.map(|row| claude_trace_owner_session_id(root, &row.agent_id))
-            });
-            let owner = owner.as_deref().unwrap_or(root);
+            let owner = match owner {
+                Some(trace) => owner_ids
+                    .entry(trace.agent_id.as_str())
+                    .or_insert_with(|| claude_trace_owner_session_id(root, &trace.agent_id))
+                    .as_str(),
+                None => root.as_str(),
+            };
             let target = targets.get(owner).copied();
             let Some(target) = target else {
                 // Its member counts it when read; a named member with no
@@ -1179,8 +1196,21 @@ pub(crate) fn side_calls_page(
             let Some(fold) = items[target].claude_money.as_deref_mut() else {
                 continue;
             };
+            let at = rfc3339_unix_nanos(&row.observed_at);
             let Some(key) = timed("side.reported_key", || {
-                reported_key(row, None, &SelectorCapture::default())
+                let build = || reported_key(row, None, &SelectorCapture::default());
+                match at {
+                    Some(at) => keys
+                        .entry((
+                            row.model.as_str(),
+                            row.speed.as_str(),
+                            row.effort.as_str(),
+                            at.div_euclid(HOUR_NANOS),
+                        ))
+                        .or_insert_with(build)
+                        .clone(),
+                    None => build(),
+                }
             }) else {
                 disclosed += 1;
                 continue;
@@ -1197,7 +1227,7 @@ pub(crate) fn side_calls_page(
                     1,
                     row.cost_usd_micros,
                     Some(origin),
-                    rfc3339_unix_nanos(&row.observed_at),
+                    at,
                     fold.accounts.as_ref().and_then(|a| a.fallback.clone()),
                 )
             });
