@@ -322,6 +322,7 @@ impl Serialize for ScanIndex {
             codex_counting_evicted_legacy,
             codex_counting_version::EvictedLegacyOwners::is_empty
         );
+        field!(upload_ack_retirement_handoff, Option::is_none);
         field!(
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
@@ -414,6 +415,7 @@ pub(super) const FIELDS: &[&str] = &[
     "codex_counting_tombstones",
     "reread_guard",
     "codex_counting_evicted_legacy",
+    "upload_ack_retirement_handoff",
     "claude_money_birth_store",
 ];
 
@@ -1459,6 +1461,12 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
                         "reread_guard" => index.reread_guard = self.typed(value)?,
+                        "upload_ack_retirement_handoff" => {
+                            // Damaged cleanup authority delays retirement; it must
+                            // never discard identity custody or pause ingestion.
+                            index.upload_ack_retirement_handoff =
+                                self.history_scalar(value, None)?
+                        }
                         "upload_context_fingerprint" => {
                             index.upload_context_fingerprint = self.typed(value)?
                         }
