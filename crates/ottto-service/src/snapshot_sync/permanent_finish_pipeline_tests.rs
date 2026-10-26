@@ -1536,13 +1536,36 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
         .iter()
         .filter(|fp| progress.accepted_fingerprints.contains(*fp))
         .count();
-    assert!((1..ENTITIES).contains(&retained), "{retained}");
+    let saved = ScanIndex::load(&index_path).unwrap();
+    let progress_dir = paths.0.parent().unwrap();
+    assert!(
+        (1..ENTITIES).contains(&retained),
+        "retained={retained} ledger={} debt_kept={} offers={} saved_generation={} \
+         saved_recorded={} saved_current={} error={error:#} dir={:?}",
+        progress.accepted_fingerprints.len(),
+        debt.iter()
+            .filter(|fp| progress.accepted_fingerprints.contains(*fp))
+            .count(),
+        first_offers.len(),
+        saved.generation,
+        file_fingerprints
+            .iter()
+            .filter(|fp| saved.accepted_snapshot_fingerprint_recorded(fp))
+            .count(),
+        saved
+            .current_snapshot_fingerprints()
+            .intersection(&file_fingerprints)
+            .count(),
+        std::fs::read_dir(progress_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+    );
     assert_eq!(progress.accepted_fingerprints.len(), debt.len() + retained);
     assert!(
         first_offers.len() > retained,
         "the failed page was offered but not acknowledged"
     );
-    let saved = ScanIndex::load(&index_path).unwrap();
     assert!(
         !saved
             .upload_progress_ack_incidence()
