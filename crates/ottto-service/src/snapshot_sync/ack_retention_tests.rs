@@ -1316,7 +1316,7 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
         .accepted_fingerprints
         .contains(&first.snapshot_fingerprint));
     std::fs::remove_file(f.sources.join("held.jsonl")).unwrap();
-    let (previous, mut progress) = f.load();
+    let (previous, progress) = f.load();
     let mut scanned = previous.clone();
     let scan = AckFixture::scan(&f.sources, &mut scanned);
     assert!(scan.census_complete);
