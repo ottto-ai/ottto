@@ -16,15 +16,12 @@ adapters.
 
 ## Local Checks
 
-Run the smallest relevant checks first. For broad changes, run:
-
-```bash
-cargo fmt --check
-cargo test
-cargo test --manifest-path crates/Cargo.toml -p ottto-connector-testkit --test first_party_sources
-jq empty connectors/registry.generated.json schemas/*.schema.json
-bash scripts/public_repo_export_check.sh
-```
+Run the smallest relevant checks first: `cargo fmt --check`, checks or tests of
+the one crate you changed (`cargo test -p <crate>`), `jq empty` on changed JSON.
+Full-workspace builds and tests run in GitHub CI, not locally: push a branch and
+run the free Linux lane (`gh workflow run linux-tests.yml --ref <branch>`), or
+open the pull request. A local full-workspace build takes several GB of memory
+and every core for minutes, on a machine other agents may share.
 
 Release, installer, and supply-chain changes must also run their targeted
 script tests and dry-run gates before review.
