@@ -234,6 +234,7 @@ impl HistoryFixture {
         index.activate_effective_upload_body_witness_revision(cycle.revision);
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(&self.support);
+        crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
         let committed_index = index.clone();
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -2489,6 +2490,104 @@ fn e2_no_sidecar_old_history_settles_with_incomplete_token_estimates() {
         let again = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
         assert!(again.uploaded.is_empty());
         assert_eq!(again.scan.scanned_file_count, 0);
+    });
+}
+
+/// Pages of `cycle` until one reads nothing; per page (uploaded sessions,
+/// files read). Panics if the re-read does not finish within `hours`.
+fn e2_history_pages(
+    fixture: &HistoryFixture,
+    hours: std::ops::Range<u32>,
+    cycle: HistoryCycle<'_>,
+) -> (Vec<(BTreeSet<String>, usize)>, HistoryOutcome) {
+    let mut pages = Vec::new();
+    for hour in hours {
+        let page = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), cycle);
+        if page.scan.scanned_file_count == 0 {
+            return (pages, page);
+        }
+        pages.push((page.uploaded.clone(), page.scan.scanned_file_count));
+    }
+    panic!("the paced re-read did not finish: {pages:?}");
+}
+
+/// Design item 8 at the switch-on: from revision 2, the revision-3 lever
+/// re-reads every idle file once, paced by the history budget (one file a
+/// page here; 2,000 files / 1 GiB in production), then reads nothing again:
+/// no second re-read, no re-arm. Every settled body records its money-rule
+/// marks; a later money rule re-owes only the files whose marks it names,
+/// once, under the same budget.
+#[test]
+fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_files() {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::claude_request_money::e2::{money_mark, with_money_rules};
+    use crate::snapshots::{history_local_count, HistoryLocalCount};
+    const RELEASE: &[(u16, u8)] = &[(1, 0), (2, money_mark::ESTIMATED)];
+    let fixture = HistoryFixture::new("e2-switch-on-once");
+    fixture.baseline();
+    let at_two = fixture.cycle("2026-08-02T08:30:00Z", HISTORY_REVISION_2);
+    assert!(at_two
+        .index
+        .files
+        .values()
+        .all(|entry| entry.effective_upload_body_witness_revision == 2));
+    // Only the first session's telemetry is on disk: the others settle on
+    // token estimates and carry that mark.
+    e2_history_reported(&fixture, HISTORY_SESSIONS[0], 0);
+    with_e2_history(&fixture, || {
+        crate::snapshots::with_body_witness_adoption_page_budget(1, || {
+            let (pages, done) = e2_history_pages(&fixture, 9..14, E2_HISTORY_UPGRADE);
+            assert_eq!(pages.len(), HISTORY_SESSIONS.len(), "paced: {pages:?}");
+            let mut sent = BTreeMap::<String, usize>::new();
+            for (uploaded, read) in &pages {
+                assert_eq!(*read, 1, "one file a page: {pages:?}");
+                for session in uploaded {
+                    *sent.entry(session.clone()).or_default() += 1;
+                }
+            }
+            assert!(
+                HISTORY_SESSIONS.iter().all(|s| sent.get(*s) == Some(&1)),
+                "each idle file re-sent exactly once: {sent:?}"
+            );
+            assert!(done.uploaded.is_empty());
+            let again = fixture.cycle("2026-08-02T14:30:00Z", E2_HISTORY_UPGRADE);
+            assert_eq!(again.scan.scanned_file_count, 0, "no second re-read");
+            assert!(again.uploaded.is_empty());
+            let index = &again.index;
+            let store = &index.claude_money_birth_store;
+            assert_eq!(store.money_rule_version(), 1);
+            for (session, marks) in
+                HISTORY_SESSIONS
+                    .iter()
+                    .zip([0, money_mark::ESTIMATED, money_mark::ESTIMATED])
+            {
+                let key = HistoryFixture::key(index, session);
+                assert_eq!(index.files[&key].effective_upload_body_witness_revision, 3);
+                assert_eq!(store.money_marks(location_key(&key)), marks, "{session}");
+            }
+
+            // A later money fix: only the two estimated files are re-owed and
+            // read once more, paced; the reported one is never touched.
+            with_money_rules(RELEASE, || {
+                let reowed = history_local_count(HistoryLocalCount::Reowed);
+                let (pages, done) = e2_history_pages(&fixture, 15..19, E2_HISTORY_UPGRADE);
+                assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
+                assert_eq!(pages.iter().map(|(_, read)| read).sum::<usize>(), 2);
+                assert!(pages.iter().all(|(_, read)| *read == 1), "{pages:?}");
+                assert!(pages
+                    .iter()
+                    .all(|(uploaded, _)| !uploaded.contains(HISTORY_SESSIONS[0])));
+                let index = &done.index;
+                assert_eq!(index.claude_money_birth_store.money_rule_version(), 2);
+                assert!(index
+                    .files
+                    .values()
+                    .all(|entry| entry.effective_upload_body_witness_revision == 3));
+                let again = fixture.cycle("2026-08-02T19:30:00Z", E2_HISTORY_UPGRADE);
+                assert_eq!(again.scan.scanned_file_count, 0, "each rule applies once");
+                assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
+            });
+        });
     });
 }
 

@@ -7237,11 +7237,30 @@ pub fn finalize_scan_after_policy_with_body_witness(
             entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
             entry.last_upload_body_witness = final_upload_body_witness.clone();
         }
-        index.stamp_effective_upload_body_witness_revision(
+        let stamped = index.stamp_effective_upload_body_witness_revision(
             &pending.index_key,
             &pending.source_file_fingerprint,
             pending.effective_upload_body_witness_revision,
         );
+        if stamped && source == SnapshotSource::ClaudeCode {
+            // The settled body's money-rule marks (design item 8), with its stamp.
+            let mut items = result
+                .snapshots
+                .iter()
+                .filter(|item| {
+                    item.source_file_fingerprint.as_deref()
+                        == Some(pending.source_file_fingerprint.as_str())
+                })
+                .peekable();
+            if items.peek().is_some() {
+                let marks = items.fold(0, |marks, item| {
+                    marks | claude_request_money::e2::money_marks(item)
+                });
+                index
+                    .claude_money_birth_store
+                    .set_money_marks(&pending.index_key, marks);
+            }
+        }
         if let Some(diagnostic) = result.local_codex_diagnostics.as_mut() {
             let key_digest = codex_scan_diagnostics::digest(&pending.index_key);
             for sample in diagnostic.lineage.iter_mut().flatten() {
@@ -45072,6 +45091,7 @@ impl ScanIndex {
         self.file_snapshot_fingerprints.remove(key);
         self.claude_account_deferred_holds.remove(key);
         self.claude_request_census.remove(key);
+        self.claude_money_birth_store.set_money_marks(key, 0);
     }
 
     /// Keep move history for 30 days after the last indexed or held member.

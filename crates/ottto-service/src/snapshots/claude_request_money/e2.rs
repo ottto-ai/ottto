@@ -6,6 +6,7 @@
 use super::super::claude_context_file_birth::ClaudeFileBirth;
 use super::super::claude_history_upgrade::{
     claude_path_twin_groups, path_twins, probe_opened_birth, ClaudeTwinGroups,
+    REQUEST_OWNED_USAGE_CONTRACT,
 };
 use super::super::claude_money_birth_store::{location_key, LocationKey};
 use super::super::claude_request_census::claude_request_hash;
@@ -263,6 +264,127 @@ pub(in crate::snapshots) fn remember_birth(index: &mut ScanIndex, path: &Path, f
     if let Role::Moved(from) = fold.role {
         store.record_proven_move(&member, from, &key);
     }
+}
+
+/// Money-rule marks of a settled request-owned body (design item 8).
+pub(crate) mod money_mark {
+    /// Copies were removed from the body.
+    pub(crate) const COPY: u8 = 1;
+    /// Copies counted without proof (disclosed).
+    pub(crate) const DISCLOSED: u8 = 2;
+    /// Usage on transcript estimates (telemetry not complete).
+    pub(crate) const ESTIMATED: u8 = 4;
+    /// A telemetry-matched request without a reported price.
+    pub(crate) const UNPRICED: u8 = 8;
+    /// The native resolver dropped one of two incompatible records.
+    pub(crate) const CONFLICT: u8 = 16;
+}
+/// Money-rule versions and the marks each one re-reads. Version 1 is the
+/// switch-on, whose revision 3 already re-reads every file. A later money
+/// fix appends a row naming the marks it changes, so only those files are
+/// re-owed (once, under the history budget); never a revision bump, which
+/// re-reads the whole history.
+const MONEY_RULES: &[(u16, u8)] = &[(1, 0)];
+#[cfg(test)]
+thread_local! {
+    static TEST_MONEY_RULES: std::cell::Cell<Option<&'static [(u16, u8)]>> =
+        const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn with_money_rules<T>(rules: &'static [(u16, u8)], f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<&'static [(u16, u8)]>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MONEY_RULES.with(|v| v.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_MONEY_RULES.with(|v| v.replace(Some(rules))));
+    f()
+}
+fn money_rules() -> &'static [(u16, u8)] {
+    #[cfg(test)]
+    if let Some(rules) = TEST_MONEY_RULES.with(std::cell::Cell::get) {
+        return rules;
+    }
+    MONEY_RULES
+}
+
+/// The marks of one finalized item; zero for a body without the literal.
+pub(crate) fn money_marks(item: &SnapshotItem) -> u8 {
+    if item.usage_accounting_contract.as_deref() != Some(REQUEST_OWNED_USAGE_CONTRACT) {
+        return 0;
+    }
+    let unpriced = item
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .any(|row| {
+            row.selector_context
+                .get("request_usage_origin")
+                .is_some_and(|origin| origin == "telemetry_unpriced")
+        });
+    [
+        (
+            item.removed_request_count.unwrap_or(0) > 0,
+            money_mark::COPY,
+        ),
+        (
+            item.claude_money
+                .as_deref()
+                .is_some_and(|f| f.disclosed > 0),
+            money_mark::DISCLOSED,
+        ),
+        (
+            item.telemetry_owned_complete != Some(true),
+            money_mark::ESTIMATED,
+        ),
+        (unpriced, money_mark::UNPRICED),
+        (item.resolver_conflict_count.is_some(), money_mark::CONFLICT),
+    ]
+    .into_iter()
+    .filter(|(set, _)| *set)
+    .fold(0, |marks, (_, mark)| marks | mark)
+}
+
+/// Once per money-rule version, after the revision activates: re-owe every
+/// indexed Claude file whose marks a newer rule names; the history gate
+/// paces them like any owed file. The version is recorded in the same index
+/// save, and marks of paths no longer indexed are dropped.
+pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
+    let rules = money_rules();
+    let stored = index.claude_money_birth_store.money_rule_version();
+    let Some(&(current, _)) = rules.last() else {
+        return;
+    };
+    if !enabled() || stored >= current {
+        return;
+    }
+    let mask = rules
+        .iter()
+        .filter(|(version, _)| *version > stored)
+        .fold(0, |mask, (_, marks)| mask | marks);
+    let to = index
+        .active_effective_upload_body_witness_revision
+        .saturating_sub(1);
+    let mut live = Vec::new();
+    let mut owed = Vec::new();
+    for key in index.files.keys() {
+        if claude_index_path_member_ref(Path::new(key)).is_none() {
+            continue;
+        }
+        let location = location_key(key);
+        if index.claude_money_birth_store.money_marks(location) & mask != 0 {
+            owed.push(key.clone());
+        }
+        live.push(location);
+    }
+    for key in owed {
+        index.re_owe_effective_upload_body_witness_revision(&key, to);
+    }
+    live.sort_unstable();
+    let store = &mut index.claude_money_birth_store;
+    store.retain_money_marks(&live);
+    store.set_money_rule_version(current);
 }
 
 /// Pure accumulation consumed by the #699 literal emitter. No census, claims,
