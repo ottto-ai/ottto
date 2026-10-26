@@ -12194,7 +12194,7 @@ fn apply_claude_effort_evidence_with_families(
         };
         let identity_changed = veto_claude_original_identity(item, evidence);
         if apply_claude_account_evidence(item, evidence) || identity_changed {
-            rebuild_snapshot_model_usage(item);
+            rebuild_retagged_model_usage(item);
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         }
     }
@@ -12390,7 +12390,7 @@ fn apply_claude_family_account_evidence(
         for index in family_indices {
             let item = &mut snapshots[index];
             if set_claude_account_hash(item, Some(witness.account_identifier_hash.clone())) {
-                rebuild_snapshot_model_usage(item);
+                rebuild_retagged_model_usage(item);
                 item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
             }
         }
@@ -12734,15 +12734,21 @@ fn claude_account_evidence_covers_request_ids(
     covered.len() == item.claude_usage_request_ids.len()
 }
 
-fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
-    // E2 (gate on): the fold holds the per-hour rows until emission, so the
-    // session rows are the body's only rows and the caller has tagged them.
+/// After an account owner retags rows. E2 (gate on): the fold holds the
+/// per-hour rows until emission, so the session rows are the body's only
+/// rows and the owner has tagged them; rebuilding from no buckets would
+/// drop them.
+fn rebuild_retagged_model_usage(item: &mut SnapshotItem) {
     if item.usage_buckets.is_empty()
         && item.claude_money.is_some()
         && claude_request_money::e2::enabled()
     {
         return;
     }
+    rebuild_snapshot_model_usage(item);
+}
+
+fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
     let account_hashes = item
         .usage_buckets
         .iter()
