@@ -925,7 +925,7 @@ fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
         })
         .unwrap()
         .expect("actual due source preparation");
-        let (mut preparation, mut index, mut scan) =
+        let (mut preparation, index, mut scan) =
             collect_native_preparation_with_rotation(frame, false);
         assert!(scan.census_complete);
         if stage == "bootstrap_capacity" {
@@ -940,10 +940,6 @@ fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
                     let mut item = template.clone();
                     item.source_session_id = format!("first-install-{entity}");
                     item.snapshot_fingerprint = format!("{entity:064x}");
-                    index.codex_state_only_snapshot_fingerprints.insert(
-                        item.source_session_id.clone(),
-                        item.snapshot_fingerprint.clone(),
-                    );
                     item
                 })
                 .collect();
@@ -1009,7 +1005,11 @@ fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
             ));
             let saved = ScanIndex::load(&index_path).unwrap();
             assert_eq!(saved.current_snapshot_fingerprints().len(), 4100);
-            assert!(saved.accepted_snapshot_fingerprint_recorded(&format!("{:064x}", 4099)));
+            let last = server.offered.lock().unwrap().last().unwrap()["snapshot_fingerprint"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(saved.accepted_snapshot_fingerprint_recorded(&last));
             continue;
         }
         let error = result.unwrap_err();
