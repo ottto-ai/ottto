@@ -2447,7 +2447,10 @@ const COUNT_NAMES: [&str; 8] = [
 ];
 static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
-struct PageSpent(Instant, &'static str);
+struct PageSpent(
+    Instant,
+    #[cfg_attr(not(test), allow(dead_code))] &'static str,
+);
 impl PageSpent {
     fn start(stage: &'static str) -> Self {
         Self(Instant::now(), stage)
