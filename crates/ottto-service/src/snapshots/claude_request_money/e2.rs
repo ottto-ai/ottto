@@ -1391,7 +1391,7 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// page's cross-session checks share ONE census walk. Runs in both gate
 /// modes; dark only counts.
 pub(crate) fn decide_page_copies(items: &mut [SnapshotItem], index: &ScanIndex) {
-    let _spent = PageSpent::start();
+    let _spent = PageSpent::start("page.copies");
     let mut holders = Vec::new();
     for at in 0..items.len() {
         let Some(fold) = items[at].claude_money.as_deref_mut() else {
@@ -1688,7 +1688,7 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
 /// the existing owner `claude_api_matches_transcript_occurrence` (a sidecar
 /// thinking count of 0 matches). Row-driven: no per-row map is built.
 pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRead) {
-    let _spent = PageSpent::start();
+    let _spent = PageSpent::start("page.attach");
     let families = timed("attach.families", || page_families(items));
     let items = RefCell::new(items);
     for (root, members) in &families {
@@ -1809,7 +1809,7 @@ pub(crate) fn side_calls_page(
     trace: &ClaudeTraceOwnershipLoadReport,
     index: &ScanIndex,
 ) -> BTreeSet<String> {
-    let _spent = PageSpent::start();
+    let _spent = PageSpent::start("page.side_calls");
     let mut unresolved = BTreeSet::new();
     if enabled() {
         timed("side.inherit", || {
@@ -2203,7 +2203,7 @@ pub(crate) fn finish_page(
     index: &ScanIndex,
     telemetry: TelemetryRead,
 ) -> BTreeSet<String> {
-    let _spent = PageSpent::start();
+    let _spent = PageSpent::start("page.finish");
     struct Session {
         entity: ClaudeEntityBody,
         complete: bool,
@@ -2447,16 +2447,20 @@ const COUNT_NAMES: [&str; 8] = [
 ];
 static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
-struct PageSpent(Instant);
+struct PageSpent(Instant, &'static str);
 impl PageSpent {
-    fn start() -> Self {
-        Self(Instant::now())
+    fn start(stage: &'static str) -> Self {
+        Self(Instant::now(), stage)
     }
 }
 impl Drop for PageSpent {
     fn drop(&mut self) {
-        let spent = u64::try_from(self.0.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let elapsed = self.0.elapsed();
+        let spent = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         record_counts(Counts([spent, 0, 0, 0, 0, 0, 0, 0]));
+        // The bench's fold_us breakdown: per page pass, the rest is per file.
+        #[cfg(test)]
+        STAGES.with(|stages| *stages.borrow_mut().entry(self.1).or_default() += elapsed);
     }
 }
 fn record_counts(counts: Counts) {

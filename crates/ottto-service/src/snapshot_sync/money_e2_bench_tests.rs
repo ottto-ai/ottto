@@ -1395,8 +1395,10 @@ impl Harness {
                 "snapshot_batch_call": stage(&records, "snapshot_batch_call"),
             },
             "e2": e2,
-            // Test builds only: disclosures and holds by reason.
+            // Test builds only: disclosures and holds by reason, and the
+            // E2 page passes' share of fold_us (µs; the rest is per file).
             "e2_diag": e2_hook::take_diag(),
+            "e2_stages_us": e2_hook::take_stages(),
             "phys_footprint_after_bytes": footprint_now,
             "index_bytes": std::fs::metadata(&index_path).map_or(0, |m| m.len()),
         })
