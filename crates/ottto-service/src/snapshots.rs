@@ -11775,17 +11775,31 @@ fn claude_evidence_fingerprint_checks() -> (u64, u64) {
     CLAUDE_EVIDENCE_FINGERPRINT_CHECKS.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of API row fingerprints actually hashed on this thread
+    /// (a row's later checks reuse its kept result).
+    static CLAUDE_API_FINGERPRINT_HASHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn claude_api_fingerprint_hashes() -> u64 {
+    CLAUDE_API_FINGERPRINT_HASHES.with(std::cell::Cell::get)
+}
+
+/// Hashed once per row: the first caller fills the row's kept result.
 fn claude_api_evidence_fingerprint_is_valid(
     row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
 ) -> bool {
     #[cfg(test)]
     CLAUDE_EVIDENCE_FINGERPRINT_CHECKS.with(|cell| cell.set((cell.get().0 + 1, cell.get().1)));
-    let mut canonical = row.clone();
-    canonical.fingerprint.clear();
-    serialized_json_digest(&canonical, b"")
-        .map(|digest| format!("sha256:{:x}", digest.finalize()))
-        .as_deref()
-        == Some(row.fingerprint.as_str())
+    row.fingerprint_check.get_or_check(|| {
+        #[cfg(test)]
+        CLAUDE_API_FINGERPRINT_HASHES.with(|cell| cell.set(cell.get() + 1));
+        claude_evidence_fingerprint_matches(row, &row.capture_revision, &row.fingerprint, |row| {
+            row.fingerprint.clear()
+        })
+    })
 }
 
 fn claude_trace_evidence_fingerprint_is_valid(
@@ -11793,12 +11807,58 @@ fn claude_trace_evidence_fingerprint_is_valid(
 ) -> bool {
     #[cfg(test)]
     CLAUDE_EVIDENCE_FINGERPRINT_CHECKS.with(|cell| cell.set((cell.get().0, cell.get().1 + 1)));
-    let mut canonical = row.clone();
-    canonical.fingerprint.clear();
-    serialized_json_digest(&canonical, b"")
-        .map(|digest| format!("sha256:{:x}", digest.finalize()))
-        .as_deref()
-        == Some(row.fingerprint.as_str())
+    claude_evidence_fingerprint_matches(row, &row.capture_revision, &row.fingerprint, |row| {
+        row.fingerprint.clear()
+    })
+}
+
+/// Sidecar row fingerprint rule: `sha256:` + lowercase hex SHA-256 of the
+/// row's JSON with its fingerprint blanked. Both row types serialize
+/// `capture_revision` then `fingerprint` first, so the row's own JSON is hashed
+/// with that one value replaced by `""`: no row copy, no hex string. Should the
+/// bytes ever not start that way, the blanked copy is serialized instead.
+fn claude_evidence_fingerprint_matches<T: Serialize + Clone>(
+    row: &T,
+    capture_revision: &str,
+    fingerprint: &str,
+    blank: impl FnOnce(&mut T),
+) -> bool {
+    let Some(expected) = fingerprint.strip_prefix("sha256:") else {
+        return false;
+    };
+    let mut bytes = Vec::with_capacity(1024);
+    if serde_json::to_writer(&mut bytes, row).is_err() {
+        return false;
+    }
+    let mut head = Vec::with_capacity(128);
+    head.extend_from_slice(br#"{"capture_revision":"#);
+    let _ = serde_json::to_writer(&mut head, capture_revision);
+    head.extend_from_slice(br#","fingerprint":"#);
+    let field = head.len();
+    let _ = serde_json::to_writer(&mut head, fingerprint);
+    let digest = if bytes.starts_with(&head) {
+        let mut digest = Sha256::new();
+        digest.update(&head[..field]);
+        digest.update(b"\"\"");
+        digest.update(&bytes[head.len()..]);
+        digest
+    } else {
+        let mut canonical = row.clone();
+        blank(&mut canonical);
+        match serialized_json_digest(&canonical, b"") {
+            Some(digest) => digest,
+            None => return false,
+        }
+    };
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = digest.finalize();
+    expected.len() == 2 * digest.len()
+        && digest
+            .iter()
+            .zip(expected.as_bytes().chunks_exact(2))
+            .all(|(byte, pair)| {
+                pair[0] == HEX[usize::from(byte >> 4)] && pair[1] == HEX[usize::from(byte & 15)]
+            })
 }
 
 fn accumulate_claude_family_pending(

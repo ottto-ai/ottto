@@ -2530,3 +2530,114 @@ fn e2_identity_recent_desktop_activity_survives_discarded_twin_in_both_orders() 
         }
     });
 }
+
+/// The sidecar fingerprint rule before F3b: hash the blanked clone's JSON
+/// and compare the formatted string.
+fn reference_fingerprint_ok<T: serde::Serialize + Clone>(
+    row: &T,
+    fingerprint: &str,
+    blank: impl FnOnce(&mut T),
+) -> bool {
+    let mut canonical = row.clone();
+    blank(&mut canonical);
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap())
+    ) == fingerprint
+}
+
+#[test]
+fn e2_fingerprint_check_matches_the_blanked_copy_rule_on_every_shape() {
+    use crate::snapshots::{
+        claude_api_evidence_fingerprint_is_valid, claude_evidence_fingerprint_matches,
+        claude_trace_evidence_fingerprint_is_valid,
+    };
+    let valid = row("req-a", 1, 10);
+    let mut apis = vec![valid.clone(), identity_api_row("req-b", 2, 10, "org")];
+    let mut tampered = valid.clone();
+    tampered.input_tokens += 1;
+    apis.push(tampered);
+    let mut upper = valid.clone();
+    upper.fingerprint = upper
+        .fingerprint
+        .to_uppercase()
+        .replace("SHA256:", "sha256:");
+    apis.push(upper);
+    let mut short = valid.clone();
+    short.fingerprint.pop();
+    apis.push(short);
+    let mut bare = valid.clone();
+    bare.fingerprint = bare.fingerprint.replace("sha256:", "");
+    apis.push(bare);
+    // JSON escapes in the two leading fields must not shift the blanked value.
+    let mut escaped = valid.clone();
+    escaped.capture_revision = "claude_api_request:v2\"\\\u{1}".into();
+    apis.push(refingerprint(escaped.clone()));
+    escaped.fingerprint = "sha256:\"\\".into();
+    apis.push(escaped);
+    let mut empty = valid.clone();
+    empty.fingerprint.clear();
+    apis.push(empty);
+    let mut expected = Vec::new();
+    for api in &apis {
+        let want = reference_fingerprint_ok(api, &api.fingerprint, |r| r.fingerprint.clear());
+        expected.push(want);
+        assert_eq!(
+            claude_api_evidence_fingerprint_is_valid(api),
+            want,
+            "{api:?}"
+        );
+        // A mismatched leading layout takes the blanked-copy path: same answer.
+        assert_eq!(
+            claude_evidence_fingerprint_matches(api, "not-the-revision", &api.fingerprint, |r| {
+                r.fingerprint.clear()
+            }),
+            want
+        );
+    }
+    assert_eq!(
+        expected,
+        [true, true, false, false, false, false, true, false, false]
+    );
+    let trace = complete_trace_row(ROOT, "req-a", "7");
+    let mut traces = vec![trace.clone()];
+    let mut moved = trace.clone();
+    moved.agent_id = "8".into();
+    traces.push(moved);
+    let mut quoted = trace;
+    quoted.capture_revision = "\"".into();
+    traces.push(quoted);
+    for trace in &traces {
+        let want = reference_fingerprint_ok(trace, &trace.fingerprint, |r| r.fingerprint.clear());
+        assert_eq!(claude_trace_evidence_fingerprint_is_valid(trace), want);
+    }
+}
+
+#[test]
+fn e2_api_fingerprint_is_hashed_once_per_row_and_never_leaves_memory() {
+    use crate::snapshots::{
+        claude_api_evidence_fingerprint_is_valid, claude_api_fingerprint_hashes,
+    };
+    let valid = row("req-a", 1, 10);
+    let bytes = serde_json::to_vec(&valid).unwrap();
+    let start = claude_api_fingerprint_hashes();
+    for _ in 0..3 {
+        assert!(claude_api_evidence_fingerprint_is_valid(&valid));
+    }
+    assert_eq!(claude_api_fingerprint_hashes() - start, 1);
+    assert_eq!(
+        serde_json::to_vec(&valid).unwrap(),
+        bytes,
+        "never serialized"
+    );
+    let decoded: ClaudeLocalOtelEvidence = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, valid, "ignored by ==");
+    // A copy is checked anew, so editing it cannot inherit the result.
+    let mut copy = valid.clone();
+    copy.input_tokens += 1;
+    assert!(!claude_api_evidence_fingerprint_is_valid(&copy));
+    assert!(!claude_api_evidence_fingerprint_is_valid(&copy));
+    assert_eq!(claude_api_fingerprint_hashes() - start, 2);
+    assert!(claude_api_evidence_fingerprint_is_valid(&valid));
+    assert_eq!(claude_api_fingerprint_hashes() - start, 2);
+}
