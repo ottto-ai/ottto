@@ -101,6 +101,7 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
     let mut buckets = BTreeMap::<String, Vec<SnapshotModelUsage>>::new();
     let mut positions = BTreeMap::<(String, super::super::RowKey), (usize, Option<u64>)>::new();
     let mut row_costs = BTreeMap::new();
+    let mut hashes = super::super::SelectorHashes::default();
     for ((key, origin, _partition), grain) in &entity.grains {
         tokens.add(&grain.tokens);
         requests = match requests.checked_add(grain.requests) {
@@ -114,7 +115,7 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
             });
         }
         let row = grain_row(key, *origin, grain, account.clone());
-        let row_key = super::super::row_key_from_model_usage(&row);
+        let row_key = hashes.row_key(&row);
         let cost = grain.cost();
         let identity = (key.0.clone(), row_key.clone());
         match row_costs.entry(row_key) {
@@ -217,13 +218,13 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
             model_usage,
         })
         .collect();
-    super::super::rebuild_snapshot_model_usage(item);
+    super::super::rebuild_snapshot_model_usage_with(item, &mut hashes);
     // The ordinary token-only rebuild deliberately drops monetary fields.
     // Literal top rows must retain the exact per-row sum of own costs so
     // contract 5 can reproduce both bucket and top-level rows.
     for row in &mut item.model_usage {
         row.cost_usd = row_costs
-            .get(&super::super::row_key_from_model_usage(row))
+            .get(&hashes.row_key(row))
             .copied()
             .flatten()
             .map(dollars);
