@@ -806,6 +806,10 @@ fn queued_traversal(queued: &[PathBuf], candidates: &[PathBuf]) -> ScanIndex {
 
 #[test]
 fn e2_dark_leaves_an_undiscovered_members_side_call_to_the_member() {
+    with_disabled(e2_dark_leaves_an_undiscovered_members_side_call_to_the_member_body);
+}
+
+fn e2_dark_leaves_an_undiscovered_members_side_call_to_the_member_body() {
     // Dark keeps the reference selection, so the root can be on a page before
     // its family directory is listed. It neither holds nor counts the row the
     // trace names for an undiscovered member: the gate would have deferred
@@ -938,16 +942,20 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].request_count, 2);
     // Gate off withholds nothing and changes nothing.
-    let mut items = page();
+    let mut items = with_disabled(page);
     items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
     let before = canonical(&items);
-    assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
+    assert!(with_disabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded)).is_empty());
     assert_eq!(canonical(&items), before);
     cleanup(&[&first, &copy]);
 }
 
 #[test]
 fn e2_gate_off_keeps_canonical_bytes_and_fingerprint() {
+    with_disabled(e2_gate_off_keeps_canonical_bytes_and_fingerprint_body);
+}
+
+fn e2_gate_off_keeps_canonical_bytes_and_fingerprint_body() {
     let p = root_file("dark");
     let index = ScanIndex::default();
     let mut items = vec![parse(
@@ -1244,7 +1252,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         }
         items
     };
-    let items = parse_page(&index);
+    let items = with_disabled(|| parse_page(&index));
     let items_enabled = with_enabled(|| parse_page(&index));
     // An off-page member is parsed through the native resolver and recorded
     // through the actual census writer, rather than hand-feeding holder sets.
@@ -1333,7 +1341,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             if enabled {
                 with_enabled(run)
             } else {
-                run()
+                with_disabled(run)
             }
         };
         let parsed = if enabled { &items_enabled } else { &items };
@@ -1428,7 +1436,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         let withheld = if enabled {
             with_enabled(|| finish_page(&mut page, &index, TelemetryRead::Loaded))
         } else {
-            finish_page(&mut page, &index, TelemetryRead::Loaded)
+            with_disabled(|| finish_page(&mut page, &index, TelemetryRead::Loaded))
         };
         assert!(withheld.is_empty());
         let pipeline_time = enrichment_time + finish_start.elapsed();

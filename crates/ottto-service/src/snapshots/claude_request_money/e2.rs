@@ -50,21 +50,28 @@ pub(crate) fn enabled() -> bool {
 }
 #[cfg(test)]
 thread_local! { static ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
-/// Force the gate on this thread (None: the shipped `GATE`); returns the
-/// previous setting, for guards that restore it on drop.
+/// Forces the gate on this thread until dropped, then restores the previous
+/// setting. `GateForTest::off()` pins a test of the gate-off (pre-flip) path.
 #[cfg(test)]
-pub(crate) fn replace_gate_for_test(on: Option<bool>) -> Option<bool> {
-    ENABLED.with(|v| v.replace(on))
+pub(crate) struct GateForTest(Option<bool>);
+#[cfg(test)]
+impl GateForTest {
+    pub(crate) fn set(on: bool) -> Self {
+        Self(ENABLED.with(|v| v.replace(Some(on))))
+    }
+    pub(crate) fn off() -> Self {
+        Self::set(false)
+    }
+}
+#[cfg(test)]
+impl Drop for GateForTest {
+    fn drop(&mut self) {
+        ENABLED.with(|v| v.set(self.0));
+    }
 }
 #[cfg(test)]
 fn with_gate_for_test<T>(on: bool, f: impl FnOnce() -> T) -> T {
-    struct Reset(Option<bool>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            ENABLED.with(|v| v.set(self.0));
-        }
-    }
-    let _reset = Reset(ENABLED.with(|v| v.replace(Some(on))));
+    let _gate = GateForTest::set(on);
     f()
 }
 #[cfg(test)]

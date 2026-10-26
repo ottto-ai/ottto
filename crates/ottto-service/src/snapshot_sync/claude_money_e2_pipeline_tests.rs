@@ -434,6 +434,10 @@ fn ready(
 
 #[test]
 fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
+    e2::with_disabled(e2_pipeline_dark_matches_fold_absent_publication_and_selection_body);
+}
+
+fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
     let mut c = Corpus::new("e2-pipeline-dark");
     c.root(
         ROOT,
