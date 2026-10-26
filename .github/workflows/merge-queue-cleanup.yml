@@ -1,0 +1,52 @@
+name: Merge queue cleanup
+
+# When the merge queue drops a PR (a failed check, a conflict, a manual
+# removal) GitHub deletes that PR's queue branch but leaves its Public CI run
+# going, so the macOS "Rust contracts" job holds one of the org's five hosted
+# Macs for its full ~25 minutes. Cancel every merge_group run whose queue
+# branch no longer exists. A run is cancelled only after a successful lookup
+# shows its branch is gone; an API error keeps the run.
+
+on:
+  pull_request:
+    types: [dequeued]
+
+concurrency:
+  group: merge-queue-cleanup
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel-orphaned:
+    name: Cancel orphaned merge queue runs
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Cancel runs whose queue branch is gone
+        run: |
+          set -euo pipefail
+          for status in queued waiting in_progress; do
+            gh api "repos/$GH_REPO/actions/runs?event=merge_group&status=$status&per_page=100" \
+              --jq '.workflow_runs[] | "\(.id) \(.head_branch)"'
+          done | sort -u | while read -r id branch; do
+            case "$branch" in
+              gh-readonly-queue/*) ;;
+              *) continue ;;
+            esac
+            if ! refs="$(gh api "repos/$GH_REPO/git/matching-refs/heads/$branch")"; then
+              echo "kept $id: could not look up $branch"
+              continue
+            fi
+            if printf '%s' "$refs" | jq -e --arg ref "refs/heads/$branch" 'any(.[]; .ref == $ref)' >/dev/null; then
+              echo "kept $id: $branch is still queued"
+            else
+              echo "cancelling $id: $branch left the queue"
+              gh run cancel "$id" || echo "could not cancel $id"
+            fi
+          done

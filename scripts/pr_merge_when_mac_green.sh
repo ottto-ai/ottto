@@ -236,9 +236,11 @@ report_queue_failure() {
          | select(.event == "merge_group" and .path == $workflow)
          | select((.head_branch // "") | startswith($prefix))]
         | sort_by(.id) | last
-        | select(.conclusion != null and .conclusion != "success"
+        # A failed required job ejects the PR while the run is still going
+        # (the macOS job runs on), so an unfinished run is reported too.
+        | select(.conclusion != "success"
                  and .conclusion != "skipped" and .conclusion != "neutral")
-        | "merge_group run \(.id): \(.conclusion) \(.html_url) (head \(.head_sha))"')" || detail=""
+        | "merge_group run \(.id): \(.conclusion // .status) \(.html_url) (head \(.head_sha))"')" || detail=""
     if [ -n "$detail" ]; then log "$detail"; fi
   else
     log "could not read merge_group runs for queue failure diagnostics"

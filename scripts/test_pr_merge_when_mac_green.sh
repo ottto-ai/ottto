@@ -517,6 +517,14 @@ expect_log "$ENQUEUE_CALL"
 expect_output 'removed from merge queue'
 expect_output 'merge_group run 800: failure https://example.invalid/actions/runs/800 (head queue-sha)'
 
+# Ejected while the queue run's macOS job is still running.
+queue_case queue-removed-run-in-progress
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue OPEN "$SHA" ""
+printf '%s' '{"workflow_runs":[{"id":801,"event":"merge_group","path":".github/workflows/ci.yml","head_branch":"gh-readonly-queue/main/pr-7-abc","head_sha":"queue-sha","status":"in_progress","conclusion":null,"html_url":"https://example.invalid/actions/runs/801"}]}' > "$case_dir/queue_runs"
+run_guard 4 7
+expect_output 'merge_group run 801: in_progress https://example.invalid/actions/runs/801 (head queue-sha)'
+
 queue_case queue-removed-diagnostics-unavailable
 queue_json queue OPEN "$SHA" ""
 run_guard 4 7
