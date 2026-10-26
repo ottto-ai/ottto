@@ -28733,12 +28733,13 @@ impl OwnedSourceScan {
                     .cloned()
                     .expect("traversal remains active");
                 let traversal_healthy = !traversal_snapshot.counts.has_errors()
-                    && index
-                        .claude_stale_family_carry
-                        .origin
-                        .as_ref()
-                        .and_then(|origin| origin.admission.as_ref())
-                        .is_none();
+                    && (source != SnapshotSource::ClaudeCode
+                        || index
+                            .claude_stale_family_carry
+                            .origin
+                            .as_ref()
+                            .and_then(|origin| origin.admission.as_ref())
+                            .is_none());
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 let reconciliation_complete = if traversal_discovery_done
                     && traversal_healthy
