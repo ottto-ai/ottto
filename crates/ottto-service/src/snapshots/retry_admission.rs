@@ -269,21 +269,69 @@ fn claude_retry_note_offered(
     paths: &[ScanTraversalPath],
     collected_at: &str,
 ) {
-    let oversized = index
+    let Some(state) = index
         .claude_stale_family_carry
         .origin
         .as_ref()
         .and_then(|origin| origin.admission.as_ref())
-        .and_then(|state| state.oversized_root.clone());
+    else {
+        return;
+    };
+    let now = rfc3339_unix_seconds(collected_at)
+        .unwrap_or_default()
+        .min(state.due_through);
+    // Recovery can select owed opportunities before the authority selector.
+    // Consume the actually offered contiguous prefix, regardless of which
+    // selector chose it. An out-of-order recovery must not skip an unserved gap.
+    let offered = |key: &str| paths.iter().any(|path| path.path == Path::new(key));
+    let mut due_after = None;
+    if !state.due_complete {
+        for key in index.files.keys() {
+            if !state
+                .due_after_path
+                .as_deref()
+                .is_none_or(|after| key.as_str() > after)
+                || !state
+                    .due_upper_path
+                    .as_deref()
+                    .is_some_and(|upper| key.as_str() <= upper)
+                || !claude_index_path_member_ref(Path::new(key))
+                    .and_then(|member| index.claude_usage_authority_quarantine.get(member.root))
+                    .is_some_and(|record| claude_retry_record_due(record, now, state.served_before))
+            {
+                continue;
+            }
+            if !offered(key) {
+                break;
+            }
+            due_after = Some(key.clone());
+        }
+    }
+    let mut oversized_after = None;
+    for key in index.files.keys() {
+        if !state
+            .oversized_after_path
+            .as_deref()
+            .is_none_or(|after| key.as_str() > after)
+            || !claude_index_path_member_ref(Path::new(key))
+                .is_some_and(|member| state.oversized_root.as_deref() == Some(member.root))
+        {
+            continue;
+        }
+        if !offered(key) {
+            break;
+        }
+        oversized_after = Some(key.clone());
+    }
+    let oversized = state.oversized_root.clone();
+    let previous = state.oversized_after_path.clone();
     let context = index
         .traversal
         .as_ref()
         .expect("active traversal")
         .context_fingerprint
         .clone();
-    // Observe exactly the fallback keys that are actually about to be cleared.
-    // The guard remains observe-only; no acceptance or identity gate is skipped.
-    let held = oversized.is_some()
+    let held = oversized_after.is_some()
         && index.reread_plan_for_rearms(
             SnapshotSource::ClaudeCode,
             collected_at,
@@ -292,37 +340,39 @@ fn claude_retry_note_offered(
             |key| {
                 oversized.as_deref().is_some_and(|root| {
                     claude_index_path_member_ref(Path::new(key)).is_some_and(|m| m.root == root)
-                }) && paths.iter().any(|path| path.path == Path::new(key))
+                }) && previous.as_deref().is_none_or(|after| key > after)
+                    && oversized_after.as_deref().is_some_and(|after| key <= after)
+                    && offered(key)
             },
         );
-    let Some(state) = index
+    if !held && oversized_after.is_some() {
+        for path in paths {
+            let key = local_index_key(&path.path);
+            if claude_index_path_member_ref(&path.path)
+                .is_some_and(|m| oversized.as_deref() == Some(m.root))
+                && previous.as_deref().is_none_or(|after| key.as_str() > after)
+                && oversized_after
+                    .as_deref()
+                    .is_some_and(|after| key.as_str() <= after)
+            {
+                if let Some(entry) = index.files.get_mut(&key) {
+                    entry.source_file_fingerprint.clear();
+                }
+            }
+        }
+    }
+    let state = index
         .claude_stale_family_carry
         .origin
         .as_mut()
         .and_then(|origin| origin.admission.as_mut())
-    else {
-        return;
-    };
-    state.progressed |= !paths.is_empty();
-    for path in paths {
-        let key = local_index_key(&path.path);
-        let Some(member) = claude_index_path_member_ref(&path.path) else {
-            continue;
-        };
-        if !state.due_complete
-            && state
-                .due_after_path
-                .as_deref()
-                .is_none_or(|after| key.as_str() > after)
-        {
-            state.due_after_path = Some(key.clone());
-        }
-        if state.oversized_root.as_deref() == Some(member.root) && !held {
-            if let Some(entry) = index.files.get_mut(&key) {
-                entry.source_file_fingerprint.clear();
-            }
-            state.oversized_after_path = Some(key);
-        }
+        .expect("retained admission");
+    state.progressed |= due_after.is_some() || (!held && oversized_after.is_some());
+    if due_after.is_some() {
+        state.due_after_path = due_after;
+    }
+    if !held && oversized_after.is_some() {
+        state.oversized_after_path = oversized_after;
     }
 }
 

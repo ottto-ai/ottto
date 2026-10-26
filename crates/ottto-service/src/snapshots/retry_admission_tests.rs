@@ -67,6 +67,7 @@ fn oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    let started = std::time::Instant::now();
     let mut fixture = scoped_retry_fixture(0, 3, false);
     let root = fixture
         ._scratch
@@ -212,6 +213,7 @@ fn oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
         !next.complete,
         "root iteration is not full coverage while fallback is owed"
     );
+    eprintln!("retry_scheduling_runtime: test=oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload elapsed_ms={}", started.elapsed().as_millis());
 }
 
 #[test]
@@ -219,7 +221,9 @@ fn rotating_due_seed_services_over_64_paths_before_audits_across_reload() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
+    let started = std::time::Instant::now();
     let _refusal = RetryMultiRefusal::new();
+    let _native = claude_native_comparison::enable_for_test();
     let mut fixture = scoped_retry_fixture(70, 2, false);
     let root = fixture._scratch.to_path_buf();
     retry_test_context(&mut fixture.index, &root);
@@ -273,6 +277,16 @@ fn rotating_due_seed_services_over_64_paths_before_audits_across_reload() {
     let mut seen = BTreeSet::new();
     let mut index = fixture.index;
     for tick in 0..35 {
+        // Retained recovery debt stays empty while held/deferred. Production's
+        // earlier native recovery selector must count as actual service too.
+        for family in fixture.roots.iter().take(65) {
+            index
+                .files
+                .get_mut(&local_index_key(&root.join(format!("{family}.jsonl"))))
+                .unwrap()
+                .source_file_fingerprint
+                .clear();
+        }
         index
             .files
             .get_mut(&audit_key)
@@ -336,4 +350,59 @@ fn rotating_due_seed_services_over_64_paths_before_audits_across_reload() {
             .is_some_and(|c| !c.owed_member_ids.is_empty())),
         "persistent prefix was not settled to fake fairness"
     );
+    eprintln!("retry_scheduling_runtime: test=rotating_due_seed_services_over_64_paths_before_audits_across_reload elapsed_ms={}", started.elapsed().as_millis());
+}
+
+#[test]
+fn completed_retry_admission_releases_to_whole_carry_when_history_fits() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut fixture = scoped_retry_fixture(0, 2, false);
+    let stale = fixture.roots.iter().cloned().collect();
+    let (mut carry, _, state) = claude_retry_admit_batch(&fixture.index, &stale, None, CARRY_RETRY);
+    carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+        context_fingerprint: fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .context_fingerprint
+            .clone(),
+        process: claude_full_rearm_process(),
+        full_rearm_window: false,
+        admission: Some(state),
+    });
+    fixture.index.claude_stale_family_carry = carry;
+    claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
+    assert!(
+        fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap()
+            .complete,
+        "the real empty due/fallback pass finishes"
+    );
+    carry_red(&mut fixture.index, CARRY_FAILED, 7);
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 2);
+    assert_eq!(row["rearmed_index_files"], 0);
+    assert!(
+        fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .is_none(),
+        "completed scheduling must not keep clean traversal/reconciliation permanently disabled"
+    );
+    eprintln!("retry_scheduling_runtime: test=completed_retry_admission_releases_to_whole_carry_when_history_fits elapsed_ms={}", started.elapsed().as_millis());
 }

@@ -24845,7 +24845,6 @@ impl OwnedSourceScan {
             &mut index.files,
             selection_limit,
         );
-        let retry_service_start = pending_paths.len();
         // Authority deadlines are serviced independently of history admission,
         // before audits can consume the existing per-page selection allowance.
         if source == SnapshotSource::ClaudeCode {
@@ -24954,10 +24953,10 @@ impl OwnedSourceScan {
             pending_paths.extend(members);
             pending_paths.extend(rereads);
         }
-        if source == SnapshotSource::ClaudeCode && retry_service_end > retry_service_start {
+        if source == SnapshotSource::ClaudeCode && retry_service_end > 0 {
             claude_retry_note_offered(
                 index,
-                &pending_paths[retry_service_start..retry_service_end],
+                &pending_paths[..retry_service_end],
                 &census_window_end,
             );
         }
@@ -38756,7 +38755,10 @@ fn ensure_bounded_traversal(
         let carry = if streaming_carry {
             // Existing scheduling debt survives even if the whole set now fits.
             // Re-price its batch, but do not discard unoffered service cursors.
-            let whole = if prior_admission.is_some() {
+            let whole = if prior_admission
+                .as_ref()
+                .is_some_and(|state| !state.complete)
+            {
                 Err(ClaudeRetryAdmissionRefusal::Structure)
             } else {
                 claude_stream_accepted_retry_carry(index, &stale_pending_roots)
