@@ -2885,10 +2885,11 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         index,
         correction_scan.is_some_and(|scan| scan.census_complete),
     );
+    let scan_referenced = progress.ack_retirement_scan_references(committed_index, index);
     progress.stage_ack_retirement_handoff_with_scan(
         committed_index,
         &mut committable,
-        Some(index),
+        &scan_referenced,
         locally_held,
         &census_absent,
     )?;
@@ -6664,6 +6665,8 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    // Resets the census-wait count on every exit that is not a capacity stop.
+    let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     if let Some(lease) = native_comparison_lease.as_mut() {
         lease.observe_policy_page(
             &scan_result.census_window_end,
@@ -7355,6 +7358,11 @@ fn finish_sync_source(
     let mut upload_fully_settled = true;
     let mut deferred_entity_count = None;
     let mut resolved_permanent_rejections = false;
+    // Local-hold Completed/Deferred/Rejected subsets and selected-state
+    // restoration below can omit a still-live file. Capture which retirement
+    // obligations this full scan references before any selection (#794 F1).
+    let ack_scan_referenced =
+        upload_progress.ack_retirement_scan_references(&committed_index, &index);
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -7432,7 +7440,7 @@ fn finish_sync_source(
                         &upload_progress_path,
                         &committed_index,
                         &committable,
-                        Some(&index),
+                        &ack_scan_referenced,
                         locally_held_fingerprints,
                         true,
                     )?;
@@ -7556,13 +7564,12 @@ fn finish_sync_source(
                 ) {
                     Ok(committable) => {
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
-                        // Release against the full scan before `index` becomes
-                        // the committable subset (#778 R2-2).
+                        // Release against the full scan's references (#778 R2-2).
                         upload_progress.release_acks_after_partial_index_save_with_scan(
                             &upload_progress_path,
                             &committed_index,
                             &committable,
-                            Some(&index),
+                            &ack_scan_referenced,
                             locally_held_fingerprints,
                             false,
                         )?;
@@ -7585,16 +7592,11 @@ fn finish_sync_source(
             // Distinguish local serializer drift, authorization failures, and
             // backend payload rejection. The resumable driver has already
             // checkpointed every accepted sibling before this terminal error.
-            let incomplete_census_stops = ack_retention::note_capacity_stop_census(
-                source,
-                error
-                    .downcast_ref::<ack_retention::AckSettlementRequired>()
-                    .is_some(),
-                scan_result.census_complete,
-            );
             let (state, context) = if let Some(settlement) =
                 error.downcast_ref::<ack_retention::AckSettlementRequired>()
             {
+                let incomplete_census_stops =
+                    census_wait.capacity_stop(scan_result.census_complete);
                 eprintln!(
                     "ottto-service: local snapshot upload deferred for {} — {} consecutive_incomplete_census_stops={}",
                     source.api_slug(),
@@ -7757,13 +7759,13 @@ fn finish_sync_source(
             upload_fully_settled = false;
         }
     }
-    upload_progress.stage_ack_retirement_handoff_with_census(
+    let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
         &committed_index,
         &mut index,
+        &ack_scan_referenced,
         locally_held_fingerprints,
         &census_absent_upload_acks,
     )?;
-    let mut retired_upload_acks = upload_progress.retired_ack_candidates(&committed_index, &index);
     // Every selected-state restoration above has finished. A non-current
     // comparison already revoked this lease locally and cannot mint a native
     // correction later in this finish. Retire only that Claude prior index
@@ -7885,7 +7887,6 @@ fn finish_sync_source(
     // durably committed its accepted siblings, but remains a source failure so
     // it returns to the retry cadence instead of advertising a clean terminal
     // scan. The sweep marker is stamped only for fully settled scans.
-    ack_retention::note_capacity_stop_census(source, false, scan_result.census_complete);
     with_source_cadence(source, |cadence| {
         let now = Instant::now();
         record_finished_snapshot_cadence(

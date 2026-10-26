@@ -112,6 +112,46 @@ pub(super) fn note_capacity_stop_census(
     }
 }
 
+#[cfg(test)]
+pub(super) fn incomplete_census_capacity_stops(source: SnapshotSource) -> u64 {
+    INCOMPLETE_CENSUS_CAPACITY_STOPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(source.api_slug())
+        .copied()
+        .unwrap_or_default()
+}
+
+/// One finish's census-wait accounting. Every exit that does not record a
+/// capacity stop (success, shed, disabled, bootstrap or transport failure,
+/// any early return) resets the count when this guard drops.
+pub(super) struct CapacityStopCensusCount {
+    source: SnapshotSource,
+    capacity_stop: bool,
+}
+
+impl CapacityStopCensusCount {
+    pub(super) fn begin(source: SnapshotSource) -> Self {
+        Self {
+            source,
+            capacity_stop: false,
+        }
+    }
+
+    pub(super) fn capacity_stop(&mut self, census_complete: bool) -> u64 {
+        self.capacity_stop = true;
+        note_capacity_stop_census(self.source, true, census_complete)
+    }
+}
+
+impl Drop for CapacityStopCensusCount {
+    fn drop(&mut self) {
+        if !self.capacity_stop {
+            note_capacity_stop_census(self.source, false, true);
+        }
+    }
+}
+
 impl SnapshotUploadProgress {
     pub(super) fn configure_ack_capacity(&mut self, committed: &ScanIndex) {
         // Only already-held live ACKs grant extra slots. Unindexed debt never
@@ -216,31 +256,27 @@ impl SnapshotUploadProgress {
             path,
             previous,
             saved,
-            None,
+            &BTreeSet::new(),
             locally_held,
             keep_adopted_for_retry,
         )
     }
 
-    /// `scanned` is the pre-selection scan index of this partial save. An
-    /// entity it still references stays live even when the committable subset
-    /// dropped its new, unsettled file (#778 R2-2).
+    /// `scan_referenced` comes from `ack_retirement_scan_references` on the
+    /// pre-selection scan. An entity it names stays live even when the
+    /// committable subset dropped its new, unsettled file (#778 R2-2).
     pub(super) fn release_acks_after_partial_index_save_with_scan(
         &mut self,
         path: &Path,
         previous: &ScanIndex,
         saved: &ScanIndex,
-        scanned: Option<&ScanIndex>,
+        scan_referenced: &BTreeSet<String>,
         locally_held: &BTreeSet<String>,
         keep_adopted_for_retry: bool,
     ) -> Result<()> {
         let mut retired = self.retired_ack_candidates(previous, saved);
         retired.extend(self.saved_retirement_candidates(saved));
-        if let Some(scanned) = scanned {
-            for fp in scanned.upload_progress_ack_incidence() {
-                retired.remove(fp);
-            }
-        }
+        retired.retain(|fp| !scan_referenced.contains(fp));
         let before = self.accepted_fingerprints.len();
         if keep_adopted_for_retry {
             // The retained retry driver still reads this resume ledger. Keep
@@ -335,6 +371,7 @@ impl SnapshotUploadProgress {
         absent
     }
 
+    #[cfg(test)]
     pub(super) fn stage_ack_retirement_handoff_with_census(
         &self,
         previous: &ScanIndex,
@@ -345,23 +382,59 @@ impl SnapshotUploadProgress {
         self.stage_ack_retirement_handoff_with_scan(
             previous,
             selected,
-            None,
+            &BTreeSet::new(),
             locally_held,
             census_absent,
         )
     }
 
-    /// A partial save passes its pre-selection scan index as `scanned`. Its
-    /// committable subset can omit a new, unsettled file that still contains a
-    /// candidate; such an obligation stays pending, never promoted (#778 R2-2).
-    pub(super) fn stage_ack_retirement_handoff_with_scan(
+    /// Retirement obligations the pre-selection scan still references. Every
+    /// selection that can omit a live file (partial checkpoint, local-hold
+    /// Completed/Deferred/Rejected subsets, selected-state restoration) must
+    /// keep these pending. Scratch is bounded by the obligations, which are
+    /// held ACKs; the scan's incidence is only borrowed.
+    pub(super) fn ack_retirement_scan_references(
+        &self,
+        previous: &ScanIndex,
+        scanned: &ScanIndex,
+    ) -> BTreeSet<String> {
+        let obligations = self.retirement_obligations(previous);
+        let mut referenced = BTreeSet::new();
+        for fp in scanned.upload_progress_ack_incidence() {
+            if obligations.contains(fp) {
+                referenced.insert(fp.to_owned());
+            }
+        }
+        referenced
+    }
+
+    /// The common selected save: stage the handoff and return the committed-
+    /// incidence retirement plan, neither naming a scan-referenced entity.
+    /// With no selection omitting a live file every reference is already in
+    /// the selected incidence, so both are unchanged from the plain staging.
+    pub(super) fn stage_selected_ack_retirement(
         &self,
         previous: &ScanIndex,
         selected: &mut ScanIndex,
-        scanned: Option<&ScanIndex>,
+        scan_referenced: &BTreeSet<String>,
         locally_held: &BTreeSet<String>,
         census_absent: &BTreeSet<String>,
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<String>> {
+        self.stage_ack_retirement_handoff_with_scan(
+            previous,
+            selected,
+            scan_referenced,
+            locally_held,
+            census_absent,
+        )?;
+        let mut retired = self.retired_ack_candidates(previous, selected);
+        retired.retain(|fp| !scan_referenced.contains(fp));
+        Ok(retired)
+    }
+
+    /// Exact-body obligations carried by `previous`'s handoff plus held ACKs
+    /// of its committed incidence. Bounded by this ACK ledger.
+    fn retirement_obligations(&self, previous: &ScanIndex) -> BTreeSet<String> {
         // Keep unresolved obligations across opaque/held saves instead of
         // forgetting them when the same save removes their last incidence.
         let mut candidates = previous
@@ -389,20 +462,26 @@ impl SnapshotUploadProgress {
                     .map(str::to_owned),
             );
         }
+        candidates
+    }
+
+    /// `scan_referenced` names obligations the pre-selection scan still
+    /// references. A selection can omit such an entity's new, unsettled file;
+    /// its obligation then stays pending, never promoted (#778 R2-2).
+    pub(super) fn stage_ack_retirement_handoff_with_scan(
+        &self,
+        previous: &ScanIndex,
+        selected: &mut ScanIndex,
+        scan_referenced: &BTreeSet<String>,
+        locally_held: &BTreeSet<String>,
+        census_absent: &BTreeSet<String>,
+    ) -> Result<()> {
+        let mut candidates = self.retirement_obligations(previous);
         candidates.extend(census_absent.iter().cloned());
         let mut live = BTreeSet::new();
         for fp in selected.upload_progress_ack_incidence() {
             if candidates.contains(fp) {
                 live.insert(fp.to_owned());
-            }
-        }
-        // Scratch is bounded by the candidate set, not a second index census.
-        let mut scan_live = BTreeSet::new();
-        if let Some(scanned) = scanned {
-            for fp in scanned.upload_progress_ack_incidence() {
-                if candidates.contains(fp) && !live.contains(fp) {
-                    scan_live.insert(fp.to_owned());
-                }
             }
         }
         let unknown = selected.upload_progress_ack_incidence_unknown();
@@ -415,7 +494,7 @@ impl SnapshotUploadProgress {
             if unknown
                 || locally_held.contains(&fp)
                 || selected.decode_holds_entity(&fp)
-                || scan_live.contains(&fp)
+                || (scan_referenced.contains(&fp) && !live.contains(&fp))
             {
                 pending_bodies.insert(fp, body.clone());
             } else if !live.contains(&fp) {

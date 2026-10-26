@@ -1612,12 +1612,13 @@ fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
     assert!(handoff
         .pending_bodies
         .contains_key(&f.item.snapshot_fingerprint));
+    let referenced = progress.ack_retirement_scan_references(&previous, &working);
     progress
         .release_acks_after_partial_index_save_with_scan(
             &f.progress_path,
             &previous,
             &saved,
-            Some(&working),
+            &referenced,
             &BTreeSet::new(),
             false,
         )
@@ -1699,12 +1700,13 @@ fn partial_save_never_retires_a_committed_entity_moved_into_an_unsettled_new_fil
         .upload_ack_retirement_handoff
         .as_ref()
         .is_some_and(|handoff| handoff.bodies.contains_key(&f.item.snapshot_fingerprint)));
+    let referenced = progress.ack_retirement_scan_references(&committed, &working);
     progress
         .release_acks_after_partial_index_save_with_scan(
             &f.progress_path,
             &committed,
             &saved,
-            Some(&working),
+            &referenced,
             &BTreeSet::new(),
             false,
         )
@@ -1811,12 +1813,13 @@ fn one_file_larger_than_the_unsettled_limit_converges_after_a_mid_file_page_fail
             .any(|fp| fp == items[0].snapshot_fingerprint),
         "an unsettled file is not committed"
     );
+    let referenced = progress.ack_retirement_scan_references(&committed, &working);
     progress
         .release_acks_after_partial_index_save_with_scan(
             &f.progress_path,
             &committed,
             &saved,
-            Some(&working),
+            &referenced,
             &BTreeSet::new(),
             false,
         )
@@ -1916,4 +1919,130 @@ fn incomplete_census_capacity_stops_count_consecutively_and_reset() {
         "counts are per source"
     );
     ack_retention::note_capacity_stop_census(SnapshotSource::Codex, false, true);
+}
+
+// #794 F1: a local hold on sibling H makes the Completed-with-holds and the
+// Deferred/Rejected-with-holds selections omit a new file that still holds
+// pending E. The common selected save must keep E's obligation pending and
+// its exact ACK suppressed until a valid absence proof (or adoption).
+#[test]
+fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_references() {
+    for outcome in ["completed", "deferred", "rejected"] {
+        let f = AckFixture::new(true);
+        let (committed, progress) = f.load();
+        let entry = committed.files.values().next().unwrap().clone();
+        let mut selected = committed.clone();
+        selected.files.clear();
+        selected.file_snapshot_fingerprints.clear();
+        progress
+            .stage_ack_retirement_handoff(
+                &committed,
+                &mut selected,
+                &BTreeSet::from([f.item.snapshot_fingerprint.clone()]),
+            )
+            .unwrap();
+        selected.save(&f.index_path).unwrap();
+        let (previous, mut progress) = f.load();
+        let held_sibling = "d".repeat(64);
+        let mut working = previous.clone();
+        working.files.insert("moved.jsonl".into(), entry);
+        working.file_snapshot_fingerprints.insert(
+            "moved.jsonl".into(),
+            BTreeSet::from([f.item.snapshot_fingerprint.clone(), held_sibling.clone()]),
+        );
+        let held = BTreeSet::from([held_sibling]);
+        let holds = LocalHoldSettlement {
+            held_entity_count: 1,
+            retry_pending_family_count: 0,
+            held_fingerprints: held.clone(),
+            account_deferred_fingerprints: BTreeSet::new(),
+            progress_blocking: true,
+        };
+        // Finish captures the references before any selection.
+        let referenced = progress.ack_retirement_scan_references(&previous, &working);
+        assert_eq!(
+            referenced,
+            BTreeSet::from([f.item.snapshot_fingerprint.clone()])
+        );
+        let settlement = match outcome {
+            "completed" => settle_completed_upload(working, &previous, &progress, &holds),
+            other => settle_checkpointed_upload(
+                working,
+                &previous,
+                &progress,
+                &holds,
+                other == "rejected",
+            ),
+        };
+        assert!(!settlement.fully_settled, "{outcome}");
+        let mut selected = settlement.index;
+        assert!(
+            !selected
+                .upload_progress_ack_incidence()
+                .any(|fp| fp == f.item.snapshot_fingerprint),
+            "{outcome}: the selection omits the still-live new file"
+        );
+        settle_index_after_upload(&mut selected, &previous, &progress);
+        let mut retired = progress
+            .stage_selected_ack_retirement(
+                &previous,
+                &mut selected,
+                &referenced,
+                &held,
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        let handoff = selected.upload_ack_retirement_handoff.as_ref().unwrap();
+        assert!(
+            !handoff.bodies.contains_key(&f.item.snapshot_fingerprint),
+            "{outcome}"
+        );
+        assert!(
+            handoff
+                .pending_bodies
+                .contains_key(&f.item.snapshot_fingerprint),
+            "{outcome}"
+        );
+        selected.save(&f.index_path).unwrap();
+        retired.extend(progress.saved_retirement_candidates(&selected));
+        assert!(!retired.contains(&f.item.snapshot_fingerprint), "{outcome}");
+        progress.retire_acks_after_index_save(&selected, &retired, &held);
+        progress.finish_cycle(&f.progress_path).unwrap();
+        f.assert_ack(&f.load().1);
+        let (mut reloaded, mut progress) = f.load();
+        progress
+            .recover_ack_retirement_handoff(&mut reloaded, &f.index_path, &f.progress_path)
+            .unwrap();
+        f.assert_ack(&f.load().1);
+
+        // The new file then vanishes before it ever settled. Only a complete
+        // census proves E's absence; that retires the exact ACK.
+        let (previous, mut progress) = f.load();
+        let mut clean = previous.clone();
+        assert!(progress
+            .complete_census_ack_retirements(&clean, false)
+            .is_empty());
+        let absent = progress.complete_census_ack_retirements(&clean, true);
+        assert!(absent.contains(&f.item.snapshot_fingerprint), "{outcome}");
+        let referenced = progress.ack_retirement_scan_references(&previous, &clean);
+        assert!(referenced.is_empty(), "{outcome}");
+        let mut retired = progress
+            .stage_selected_ack_retirement(
+                &previous,
+                &mut clean,
+                &referenced,
+                &BTreeSet::new(),
+                &absent,
+            )
+            .unwrap();
+        clean.save(&f.index_path).unwrap();
+        retired.extend(progress.saved_retirement_candidates(&clean));
+        assert!(retired.contains(&f.item.snapshot_fingerprint), "{outcome}");
+        progress.retire_acks_after_index_save(&clean, &retired, &BTreeSet::new());
+        progress.finish_cycle(&f.progress_path).unwrap();
+        assert!(
+            f.load().1.accepted_fingerprints.is_empty(),
+            "{outcome}: a valid absence proof retires the ACK"
+        );
+    }
 }
