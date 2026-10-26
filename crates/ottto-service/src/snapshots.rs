@@ -83,6 +83,8 @@ mod codex_parent_side_read_tests;
 #[cfg(test)]
 mod codex_parent_side_tests;
 #[cfg(test)]
+mod file_set_digest_tests;
+#[cfg(test)]
 pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::{counting_v2_fixture, native_join_fixture_root};
@@ -5217,18 +5219,9 @@ fn claude_stale_member_independently_accepted(
                     .is_some_and(|set| {
                         // The committed head is the canonical FILE entity-set
                         // digest used by finalization, not an entity fingerprint.
-                        let mut digest = Sha256::new();
-                        update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
-                        for fingerprint in set {
-                            update_length_prefixed(&mut digest, fingerprint.as_bytes());
-                        }
-                        let hex = b"0123456789abcdef";
-                        let bytes = head.as_bytes();
-                        bytes.len() == 64
-                            && digest.finalize().iter().enumerate().all(|(i, byte)| {
-                                bytes[2 * i] == hex[usize::from(byte >> 4)]
-                                    && bytes[2 * i + 1] == hex[usize::from(byte & 15)]
-                            })
+                        // Only its exact lowercase 64-hex rendering decodes, so
+                        // this matches the recorded String without allocating.
+                        codex_digest_from_hex(head) == Some(snapshot_file_entity_set_digest(set))
                     })
             })
         && !index.claude_family_listed(key)
@@ -6984,12 +6977,7 @@ impl SourceScanResult {
                     .iter()
                     .map(|snapshot| snapshot_fingerprint(SnapshotSource::Codex, snapshot))
                     .collect::<BTreeSet<_>>();
-                let mut digest = Sha256::new();
-                update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
-                for fingerprint in fingerprints {
-                    update_length_prefixed(&mut digest, fingerprint.as_bytes());
-                }
-                format!("{:x}", digest.finalize()) == baseline.expected
+                snapshot_file_entity_set_hex(fingerprints) == baseline.expected
             };
             if matches(&baseline.snapshots) {
                 continue;
@@ -7493,25 +7481,12 @@ pub fn finalize_scan_after_policy_with_body_witness(
             .get(&pending.source_file_fingerprint)
             .cloned()
             .unwrap_or_default();
-        let final_group_fingerprint = (!final_fingerprints.is_empty()).then(|| {
-            let mut digest = Sha256::new();
-            update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
-            for fingerprint in &final_fingerprints {
-                update_length_prefixed(&mut digest, fingerprint.as_bytes());
-            }
-            format!("{:x}", digest.finalize())
-        });
+        let final_group_fingerprint = (!final_fingerprints.is_empty())
+            .then(|| snapshot_file_entity_set_hex(&final_fingerprints));
         let final_upload_body_witness = by_source_file_body_witness
             .get(&pending.source_file_fingerprint)
             .filter(|witnesses| !witnesses.is_empty())
-            .map(|witnesses| {
-                let mut digest = Sha256::new();
-                update_length_prefixed(&mut digest, b"snapshot_file_upload_body_set:v1");
-                for witness in witnesses {
-                    update_length_prefixed(&mut digest, witness.as_bytes());
-                }
-                format!("{:x}", digest.finalize())
-            });
+            .map(snapshot_file_upload_body_set_hex);
         if pending.sampled_audit_verified {
             crate::local_resource_diagnostics::sampled_audit_comparison(
                 source.api_slug(),
@@ -41940,14 +41915,8 @@ impl ScanIndex {
                 // them, and a partial checkpoint keeps the entry (nothing
                 // in it awaits acceptance).
                 None => {
-                    let group = (!gated.local.is_empty()).then(|| {
-                        let mut digest = Sha256::new();
-                        update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
-                        for fingerprint in &gated.local {
-                            update_length_prefixed(&mut digest, fingerprint.as_bytes());
-                        }
-                        format!("{:x}", digest.finalize())
-                    });
+                    let group = (!gated.local.is_empty())
+                        .then(|| snapshot_file_entity_set_hex(&gated.local));
                     let empty = gated.local.is_empty();
                     (group, None, (!empty).then(BTreeSet::new), empty)
                 }
@@ -44455,12 +44424,11 @@ impl ScanIndex {
             witnesses.extend(members.iter().map(|fp| bodies[fp].as_str()));
             witnesses.sort_unstable();
             witnesses.dedup();
-            let mut digest = Sha256::new();
-            update_length_prefixed(&mut digest, b"snapshot_file_upload_body_set:v1");
-            for witness in witnesses {
-                update_length_prefixed(&mut digest, witness.as_bytes());
-            }
-            if format!("{:x}", digest.finalize()) == expected {
+            // Only the exact lowercase 64-hex rendering decodes, so this
+            // matches the recorded String without formatting one.
+            if codex_digest_from_hex(expected)
+                == Some(snapshot_file_upload_body_set_digest(witnesses))
+            {
                 adopted.extend(members.iter().cloned());
             }
         }
@@ -47416,6 +47384,81 @@ fn sha256_hex(parts: &[&str]) -> String {
 fn update_length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
     digest.update((bytes.len() as u32).to_be_bytes());
     digest.update(bytes);
+}
+
+/// The length-prefixed `domain`, then each member length-prefixed in the
+/// order given. Identity-bearing: the persisted file digests pin ascending,
+/// deduplicated member order (a `BTreeSet` walk or a sorted, deduplicated
+/// slice), so callers must feed exactly that.
+fn snapshot_file_set_hasher<I>(domain: &[u8], members: I) -> Sha256
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, domain);
+    let mut previous: Option<I::Item> = None;
+    for member in members {
+        if let Some(previous) = &previous {
+            debug_assert!(
+                previous.as_ref() < member.as_ref(),
+                "file-set digest members must be sorted and unique"
+            );
+        }
+        update_length_prefixed(&mut digest, member.as_ref().as_bytes());
+        previous = Some(member);
+    }
+    digest
+}
+
+/// Canonical FILE entity-set digest (`last_snapshot_fingerprint`) over the
+/// file's sorted, deduplicated entity fingerprints.
+fn snapshot_file_entity_set_digest<I>(fingerprints: I) -> PrefixDigest
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    snapshot_file_set_hasher(b"snapshot_file_entity_set:v1", fingerprints)
+        .finalize()
+        .into()
+}
+
+/// Lowercase hex of [`snapshot_file_entity_set_digest`], as finalization
+/// records it.
+fn snapshot_file_entity_set_hex<I>(fingerprints: I) -> String
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    format!(
+        "{:x}",
+        snapshot_file_set_hasher(b"snapshot_file_entity_set:v1", fingerprints).finalize()
+    )
+}
+
+/// Canonical FILE upload-body-set digest (`last_upload_body_witness`) over
+/// the file's sorted, deduplicated upload-body witnesses.
+fn snapshot_file_upload_body_set_digest<I>(witnesses: I) -> PrefixDigest
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    snapshot_file_set_hasher(b"snapshot_file_upload_body_set:v1", witnesses)
+        .finalize()
+        .into()
+}
+
+/// Lowercase hex of [`snapshot_file_upload_body_set_digest`], as
+/// finalization records it.
+fn snapshot_file_upload_body_set_hex<I>(witnesses: I) -> String
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    format!(
+        "{:x}",
+        snapshot_file_set_hasher(b"snapshot_file_upload_body_set:v1", witnesses).finalize()
+    )
 }
 
 /// U1a: the proof chain's seed, `d_0`.
