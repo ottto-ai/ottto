@@ -474,7 +474,7 @@ jobs:
               "reference_is_pre_e2_build": bool(arms["reference"]) and all(r["hook"] == "reference" for r in arms["reference"]),
               "full_m4_shape": bool(manifest["full_shape_counts"] and manifest["full_shape_bytes"]),
               "e2_counters_measured": bool(fold) and len(fold) == len(candidate) and bool(finalize_ms) and max(finalize_ms) > 0,
-              "counters_match_fixture": bool(candidate) and all(c[k] == expected[c["arm"]][k] for c in counters for k in ("responses", "copy_skipped", "disclosed")),
+              "counters_match_fixture": bool(candidate) and all(c[k] == v for c in counters for k, v in expected[c["arm"]].items()),
               "gate_effective": bool(arms["on"]) and all(r["uploads"]["literal_items"] > 0 for r in arms["on"])
                   and all(r["uploads"]["literal_items"] == 0 for r in arms["dark"] + arms["reference"]),
               # E2-added work only (see fold_us above).

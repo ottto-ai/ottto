@@ -1799,9 +1799,10 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
 /// trace read: `api`/`trace` hold only roots whose sidecars are complete.
 ///
 /// Returns the family roots whose side calls could not be decided (the
-/// census walk hit its deadline): the caller holds their owed history files
-/// through the unhealthy-telemetry seam, so a later page publishes the exact
-/// side-call money; their bodies stay telemetry-incomplete meanwhile.
+/// census walk hit its deadline, or a trace-named member's directory is still
+/// queued by the walk): the caller holds their owed history files through the
+/// unhealthy-telemetry seam, so a later page publishes the exact side-call
+/// money; their bodies stay telemetry-incomplete meanwhile.
 pub(crate) fn side_calls_page(
     items: &mut [SnapshotItem],
     api: &ClaudeLocalOtelLoadReport,
@@ -1894,6 +1895,8 @@ pub(crate) fn side_calls_page(
         })
     };
     drop(wanted);
+    // Session ids naming a directory the walk queued but has not listed.
+    let queued = std::cell::OnceCell::<BTreeSet<String>>::new();
     for (root, members) in &families {
         let first = members
             .iter()
@@ -1959,6 +1962,7 @@ pub(crate) fn side_calls_page(
         diag("side_invalid", disclosed);
         // Members this traversal saw but has not indexed yet: read later.
         let unread = std::cell::OnceCell::<BTreeSet<String>>::new();
+        let mut waiting = false;
         // Built once per distinct value: member ids per trace agent, and keys
         // per (model, speed, effort, hour), since a side call's placement
         // reads its clock only for the hour bucket (`claude_row_placement`).
@@ -1984,6 +1988,17 @@ pub(crate) fn side_calls_page(
                     .get_or_init(|| unread_members(index, root))
                     .contains(owner)
             {
+                // The walk has not listed the family's directory yet: the
+                // member's transcript may still turn up and count it, so the
+                // root counting it now would count it twice. Wait (held); once
+                // listed, a member still without a transcript falls back.
+                if queued
+                    .get_or_init(|| queued_directory_names(index))
+                    .contains(root.as_str())
+                {
+                    waiting = true;
+                    continue;
+                }
                 owner = root.as_str();
                 fallback = true;
             }
@@ -2051,9 +2066,18 @@ pub(crate) fn side_calls_page(
                 fold.root_fallbacks += 1;
             }
         }
-        for index in members {
-            if let Some(fold) = items[*index].claude_money.as_deref_mut() {
-                fold.telemetry.side_calls_done = true;
+        if waiting {
+            // The root's session is withheld (re-read on a later page, once
+            // the walk lists the directory) and its owed history waits too.
+            if let Some(&at) = targets.get(root.as_str()) {
+                hold_copies(&mut items[at], "held_side_call_undiscovered");
+            }
+            unresolved.insert(root.clone());
+        } else {
+            for index in members {
+                if let Some(fold) = items[*index].claude_money.as_deref_mut() {
+                    fold.telemetry.side_calls_done = true;
+                }
             }
         }
         if let Some(fold) = items[first].claude_money.as_deref_mut() {
@@ -2061,6 +2085,23 @@ pub(crate) fn side_calls_page(
         }
     }
     unresolved
+}
+
+/// Every path component of the directories the traversal queued but has not
+/// listed. A family's member transcripts live under `<root>/subagents/`; the
+/// root file being on a page means its own directory was listed, so the
+/// family's directory is still to be listed exactly when `<root>` is here.
+fn queued_directory_names(index: &ScanIndex) -> BTreeSet<String> {
+    index
+        .traversal
+        .iter()
+        .flat_map(|traversal| traversal.pending_directories.iter())
+        .flat_map(|directory| directory.path.components())
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The family members of `root` this traversal observed but has not indexed.

@@ -737,6 +737,65 @@ fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
 }
 
 #[test]
+fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory() {
+    // A trace-named member the walk has not discovered may still have a
+    // transcript that counts the row: the root holds rather than count it
+    // twice. Once the family directory is listed, a member still without a
+    // transcript falls back to the root (COST Q3).
+    with_enabled(|| {
+        let p = root_file("side-wait");
+        let family = p.parent().unwrap().join(ROOT);
+        let read = sidecar(&[row("r", 1, 10), row("named", 4, 40)]);
+        let trace = ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(
+                ROOT.to_owned(),
+                vec![complete_trace_row(ROOT, "named", "abc")],
+            )]),
+            ..Default::default()
+        };
+        for (queued, held) in [
+            (vec![family.clone()], true),
+            (vec![family.join("subagents")], true),
+            (vec![p.parent().unwrap().join("other-session")], false),
+            (vec![], false),
+        ] {
+            let mut index = ScanIndex::default();
+            index.traversal = Some(
+                serde_json::from_value(json!({
+                    "context_fingerprint": "side-wait",
+                    "census_window_end": "2026-01-01T00:00:00Z",
+                    "scan_roots": [],
+                    "pending_directories": queued
+                        .iter()
+                        .map(|path| json!({"scan_root": "/", "path": path}))
+                        .collect::<Vec<_>>(),
+                    "pending_candidates": [],
+                    "observed_index_keys": [],
+                    "reconciliation_upper_bound": null,
+                    "reconciliation_after": null,
+                    "reconciliation_started": false,
+                    "counts": {},
+                }))
+                .unwrap(),
+            );
+            let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
+            attach_page(&mut items, &read);
+            let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
+            let root = fold(&items[0]);
+            assert_eq!(unresolved.contains(ROOT), held, "{queued:?}");
+            assert_eq!(root.entity.held, held, "{queued:?}");
+            assert_eq!(root.telemetry.side_calls_done, !held, "{queued:?}");
+            assert_eq!(
+                (root.side_requests, root.root_fallbacks),
+                if held { (0, 0) } else { (1, 1) },
+                "{queued:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    });
+}
+
+#[test]
 fn e2_resolver_conflict_is_counted_and_emitted() {
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.

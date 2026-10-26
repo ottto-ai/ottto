@@ -840,6 +840,7 @@ fn prepare(base: &Path, scale: f64, bytes_scale: f64) -> serde_json::Value {
             }
         )
     });
+    let twin_lines = lines_of(&|p| matches!(p.kind, Kind::Twin { .. }));
     let sizes = family_sizes.values().copied().collect::<Vec<_>>();
     let histogram = [
         (1, 1),
@@ -884,10 +885,23 @@ fn prepare(base: &Path, scale: f64, bytes_scale: f64) -> serde_json::Value {
         "birth_controlled": birth_controlled,
         "staged_root_births": staged_births,
         // What a correct E2 fold reports over one traversal (each file once).
+        // Gate on: every copy is skipped, unknown-writer copies included
+        // (owner ruling 2: an all-copied cross-session file is skipped by its
+        // request ids, no writer certificate needed); disclosed is only the
+        // rows whose telemetry contradicts the transcript (resolver refused).
+        // No response total: gate on co-reads each twin's (large) source on
+        // the twin's page, so it folds those responses twice (work, not
+        // decisions; every decision counts once).
         "expected": {
+            "copy_skipped": allowlisted_copies + unknown_writer_lines,
+            "disclosed": mismatch_rows,
+        },
+        // Dark cannot co-read or stage path twins (gate-on only), so a twin's
+        // copied lines are unprovable there: counted and disclosed.
+        "expected_dark": {
             "responses": request_lines,
-            "copy_skipped": allowlisted_copies,
-            "disclosed": unknown_writer_lines as u64 + mismatch_rows,
+            "copy_skipped": allowlisted_copies + unknown_writer_lines - twin_lines,
+            "disclosed": mismatch_rows + twin_lines as u64,
         },
     })
 }
