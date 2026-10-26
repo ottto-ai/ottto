@@ -355,6 +355,8 @@ pub(crate) struct FileFold {
     copy: ClaudeEntityBody,
     /// Counted requests inheriting a possibly excluded marker. Sparse and
     /// bounded by the existing 64 marker runs, never by response count.
+    /// Boxed: one pointer on every fold, the map only when present.
+    #[allow(clippy::box_collection)]
     prefix_inherited: Option<Box<BTreeMap<u64, ClaudeEntityBody>>>,
     copied: u64,
     first_own: Option<u64>,

@@ -348,8 +348,8 @@ fn claude_path_twin_groups(
         .collect()
 }
 
-/// Test-only synthetic physical births for staged twin probes, matching the
-/// parser's birth setter: Linux has no portable set-creation-time API.
+// Test-only synthetic physical births for staged twin probes, matching the
+// parser's birth setter: Linux has no portable set-creation-time API.
 #[cfg(test)]
 thread_local! {
     static STAGED_BIRTHS_FOR_TEST: std::cell::RefCell<BTreeMap<String, u64>> =
@@ -481,6 +481,7 @@ pub(crate) struct HistoryPage {
     /// E2: this page's path-twin groups by member, built once on the page's
     /// first parsed candidate. Only members with two or more paths; a path
     /// observed but not indexed yet has no size.
+    #[allow(clippy::type_complexity)]
     twin_index: Option<BTreeMap<String, Vec<(String, Option<u64>)>>>,
 }
 

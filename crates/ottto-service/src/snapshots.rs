@@ -16064,7 +16064,7 @@ pub(crate) struct PlacedClaudeUsage {
     pub(in crate::snapshots) placement: Option<ClaudeRowPlacement>,
 }
 /// One owner for the native bucket/key and reduced selector, including fallback time.
-pub(crate) fn claude_row_placement(
+pub(in crate::snapshots) fn claude_row_placement(
     model: &str,
     base: &SelectorCapture,
     selector: SelectorCapture,
@@ -24952,7 +24952,7 @@ impl OwnedSourceScan {
                 identified_candidates
                     .iter()
                     .map(|candidate| candidate.path.as_path()),
-                &index,
+                index,
             ) {
                 if forced_claude_family_reparses.insert(root.clone()) {
                     claude_twin_only_family_reparses.insert(root);
@@ -27287,7 +27287,7 @@ impl OwnedSourceScan {
                         codex_page.note_committed();
                     }
                 }
-                let parsed_file = parsed_file.map(|parsed| {
+                if let Ok(parsed) = &parsed_file {
                     if source == SnapshotSource::ClaudeCode && !comparison_target {
                         for item in &parsed.snapshots {
                             if let Some(fold) = item.claude_money.as_deref() {
@@ -27299,8 +27299,7 @@ impl OwnedSourceScan {
                             }
                         }
                     }
-                    parsed
-                });
+                }
                 let mut parsed_file = match parsed_file {
                     Ok(parsed) => parsed,
                     // U1a-2a G17b: the side read's charged attempt.
