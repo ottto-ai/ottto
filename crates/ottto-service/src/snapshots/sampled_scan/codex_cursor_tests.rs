@@ -3337,8 +3337,8 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
         assert_eq!(flags(&processed), Some((!codex, true)), "{source:?}");
         assert_eq!(
             flags(&pending),
-            Some((true, false)),
-            "{source:?}: the pending census member keeps its entry"
+            Some((true, codex)),
+            "{source:?}: the pending census member keeps membership and remembers the hint"
         );
         assert_eq!(flags(&unobserved), Some((true, true)), "{source:?}");
         assert_eq!(traversal.pending_candidates.len(), before + 2);
@@ -3560,6 +3560,116 @@ fn growing_generation_with_large_file_closes_within_bounded_pages() {
     assert_eq!(latest, expected);
 }
 
+/// The production-shaped 2,800-member revalidation backlog must not spend
+/// the byte budget before a new session or an appended, processed session.
+/// A persisted yield then gives the census a whole ordinary page even when
+/// fresh data continues to arrive. No upload fingerprints or totals change.
+#[test]
+fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const NEW: &str = "019fa111-2222-7333-8444-888888888888";
+    let ids = (0..2800)
+        .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
+        .collect::<Vec<_>>();
+    let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
+    sessions.push((SESSION, 4));
+    let fixture = ScanRoot::with_sessions(&sessions);
+    let (mut index, warm) = page(&fixture, ScanIndex::default(), None);
+    assert_eq!(warm.snapshots.len(), 2801);
+    for id in &ids {
+        index
+            .files
+            .get_mut(&local_index_key(&fixture.file(id)))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    // SESSION already finished its census read; growth must not re-enroll it.
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_candidates
+        .retain(|candidate| candidate.path != fixture.file(SESSION));
+    let budget = fixture.len(SESSION) * 4;
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, budget, 64, || {
+        let (next, scan) = hinted_page(&fixture, index, &cache, NOW, &[]);
+        index = next;
+        assert!(scan.snapshots.is_empty(), "unchanged-output revalidation");
+        assert!(!scan.census_complete);
+        let window = scan.census_window_end.clone();
+        let old_pending = index.traversal.as_ref().unwrap().pending_candidates.len();
+        assert!(old_pending > 2700);
+
+        let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+            "type": "session_meta", "payload": {"id": NEW}}));
+        body.extend(token_line(1));
+        fs::write(fixture.file(NEW), body).unwrap();
+        fixture.append(SESSION, &token_line(5));
+        cache.clear();
+        // NEW deliberately has no watcher hint: retained-roster discovery
+        // must promote it too, even though refresh runs before hint enqueue.
+        let (next, fresh) = hinted_page(
+            &fixture,
+            index,
+            &cache,
+            &collected_at(1),
+            &[fixture.file(SESSION)],
+        );
+        index = next;
+        let published = fresh
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(published, BTreeSet::from([NEW, SESSION]));
+        assert_eq!(fresh.census_window_end, window);
+        assert!(!fresh.census_complete);
+        assert!(index.traversal.as_ref().unwrap().codex_freshness_yield);
+        assert_eq!(
+            index.traversal.as_ref().unwrap().pending_candidates.len(),
+            old_pending
+        );
+
+        // Restart preserves the owed ordinary turn. Another real append
+        // waits while that page makes census progress with the full budget.
+        index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        fixture.append(SESSION, &token_line(6));
+        let (next, ordinary) = hinted_page(
+            &fixture,
+            index,
+            &cache,
+            &collected_at(2),
+            &[fixture.file(SESSION)],
+        );
+        index = next;
+        assert!(!ordinary.census_complete);
+        assert!(!index.traversal.as_ref().unwrap().codex_freshness_yield);
+        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() < old_pending);
+        let (_, fresh) = hinted_page(&fixture, index, &cache, &collected_at(3), &[]);
+        assert!(fresh
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == SESSION));
+    });
+}
+
 /// G1 carry: a census that closes while a re-read is still waiting hands it
 /// to the next generation as a member instead of dropping it. Two small
 /// files, one full read per page. Page 0 reads one (X) and defers the other
@@ -3626,6 +3736,10 @@ fn census_close_carries_a_waiting_reread_into_the_next_generation() {
         assert_eq!(waiting(&index, &x_path), None, "X was read");
         let first = census_token(&index).expect("first generation");
 
+        // This test exercises ordinary-page carry. Freshness pages are
+        // covered separately; an ordinary page is owed after one of them.
+        let mut index = index;
+        index.traversal.as_mut().unwrap().codex_freshness_yield = true;
         fixture.append(x, &token_line(5));
         assert!(fixture.len(x) <= singleton);
         cache.clear();
@@ -3906,6 +4020,10 @@ fn unsettled_close_keeps_the_clean_follow_up_and_rereads_once() {
         let x_path = fixture.file(x);
         assert_eq!(pending_flags(&index, &fixture.file(y)), Some((true, false)));
 
+        // This test exercises ordinary-page carry. Freshness pages are
+        // covered separately; an ordinary page is owed after one of them.
+        let mut index = index;
+        index.traversal.as_mut().unwrap().codex_freshness_yield = true;
         fixture.append(x, &token_line(5));
         assert!(fixture.len(x) <= singleton);
         cache.clear();
