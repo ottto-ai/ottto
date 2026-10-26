@@ -236,11 +236,20 @@ impl ClaudeEntityBody {
     }
     /// Identity can collapse an undecidable session without changing money.
     pub(crate) fn repartition(&mut self, account: AccountPartition) {
+        self.map_accounts(|_| account.clone());
+    }
+    /// Resolve provisional Unknown shares without rewriting any own org run.
+    pub(crate) fn inherit_missing(&mut self, account: AccountPartition) {
+        if account.is_some() && self.grains.keys().any(|(_, _, key)| key.is_none()) {
+            self.map_accounts(|key| key.or_else(|| account.clone()));
+        }
+    }
+    fn map_accounts(&mut self, mut place: impl FnMut(AccountPartition) -> AccountPartition) {
         let grains = std::mem::take(&mut self.grains);
-        for ((key, origin, _), grain) in grains {
+        for ((key, origin, account), grain) in grains {
             Self::merge_grain(
                 self.grains
-                    .entry((key, origin, account.clone()))
+                    .entry((key, origin, place(account)))
                     .or_default(),
                 &grain,
             );
@@ -343,6 +352,9 @@ pub(crate) struct FileFold {
     skipped: Vec<(u64, u64)>,
     /// Pre-birth grains held until finish_native confirms the skip.
     copy: ClaudeEntityBody,
+    /// Counted requests inheriting a possibly excluded marker. Sparse and
+    /// bounded by the existing 64 marker runs, never by response count.
+    prefix_inherited: Option<Box<BTreeMap<u64, ClaudeEntityBody>>>,
     copied: u64,
     first_own: Option<u64>,
     /// Request hashes two responses of this file claim; filled on demand.
@@ -352,11 +364,11 @@ pub(crate) struct FileFold {
     responses: u64,
     root_fallbacks: u64,
     side: ClaudeMoneyTokens,
-    side_requests: u64,
+    pub(crate) side_requests: u64,
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
 }
-crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, copied, first_own, ambiguous, disclosed, fold_us, responses, root_fallbacks, side, side_requests, telemetry, accounts);
+crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, prefix_inherited, copied, first_own, ambiguous, disclosed, fold_us, responses, root_fallbacks, side, side_requests, telemetry, accounts);
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,
@@ -428,6 +440,7 @@ impl FileFold {
             model_fallbacks: BTreeMap::new(),
             skipped: Vec::new(),
             copy: Default::default(),
+            prefix_inherited: None,
             copied: 0,
             first_own: None,
             ambiguous: BTreeSet::new(),
@@ -463,6 +476,7 @@ impl FileFold {
             bound,
             first_sequence,
             subagent,
+            &[],
         )));
     }
 
@@ -560,8 +574,21 @@ impl FileFold {
         if copied.is_none() && self.money_birth.birth_nanos().is_some() {
             self.disclosed += 1; // untimed root record: counted, birth unproven
         }
-        self.entity
-            .add(key, &tokens, requests, None, None, at, account);
+        // Keep the original placement while copy ownership is undecided.
+        // Only requests inheriting a held marker need a temporary aggregate.
+        let prefix = self
+            .accounts
+            .as_deref()
+            .and_then(|accounts| accounts.copied_marker_position(response.sequence));
+        let into = match prefix {
+            Some(position) => self
+                .prefix_inherited
+                .get_or_insert_with(Box::default)
+                .entry(position)
+                .or_default(),
+            None => &mut self.entity,
+        };
+        into.add(key, &tokens, requests, None, None, at, account);
     }
 
     /// Confirm or undo the held pre-birth skip. A partial copy is skipped only
@@ -569,11 +596,16 @@ impl FileFold {
     /// all-pre-birth file also needs known response writers and a PROVEN
     /// earlier original (stored birth, deterministic equal-birth order), so twins never
     /// delete each other. Everything else counts and discloses.
-    pub(in crate::snapshots) fn finish_native(&mut self, context: Option<&ReadContext<'_>>) {
+    pub(in crate::snapshots) fn finish_native(
+        &mut self,
+        context: Option<&ReadContext<'_>>,
+        markers: Option<&claude_request_identity::OrgMarkers>,
+    ) {
         if self.money_birth.uncertain_root() {
             self.disclosed += self.responses; // unknown birth: counted, disclosed
         }
         if self.copied == 0 {
+            self.finish_identity_start(false, markers);
             return;
         }
         // The witness order is total over (effective birth, location), so of
@@ -592,6 +624,7 @@ impl FileFold {
         let keep = self.money_birth.writer_certified(self.first_own)
             && (!needs_original || self.original_witness(context));
         if keep {
+            self.finish_identity_start(true, markers);
             self.copy = Default::default();
             return;
         }
@@ -605,6 +638,25 @@ impl FileFold {
         self.skipped.clear();
         self.disclosed += self.copied;
         self.copied = 0;
+        self.finish_identity_start(false, markers);
+    }
+
+    fn finish_identity_start(
+        &mut self,
+        prefix_excluded: bool,
+        markers: Option<&claude_request_identity::OrgMarkers>,
+    ) {
+        if let Some(accounts) = self.accounts.as_deref_mut() {
+            accounts.finish_native(markers, prefix_excluded);
+            if let Some(inherited) = self.prefix_inherited.take() {
+                for (position, mut inherited) in *inherited {
+                    if prefix_excluded {
+                        inherited.repartition(accounts.account(position));
+                    }
+                    self.entity.absorb_grains(&inherited);
+                }
+            }
+        }
     }
 
     fn original_witness(&self, context: Option<&ReadContext<'_>>) -> bool {
