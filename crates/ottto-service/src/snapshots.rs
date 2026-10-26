@@ -60214,6 +60214,8 @@ mod tests {
 
     #[test]
     fn claude_local_otel_does_not_supply_missing_transcript_effort() {
+        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-local-otel-effort-unknown");
         fs::write(
             &path,
@@ -60266,6 +60268,8 @@ mod tests {
 
     #[test]
     fn claude_local_otel_does_not_split_unknown_cache_creation() {
+        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-effort-cache-ttl");
         fs::write(
             &path,
@@ -60971,6 +60975,8 @@ mod tests {
 
     #[test]
     fn claude_cache_split_new_family_proves_at_healthy_terminal() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, parent, mut items) = cache_split_fixture();
         let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([(parent.clone(), vec![cache_split_api_row(&parent, true)])]),
@@ -61337,6 +61343,8 @@ mod tests {
 
     #[test]
     fn exact_seven_entity_authority_demotion_cohort_reproves_before_upload() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let fixture: Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/claude-authority-demotion-cohort.v1.json"
         ))
@@ -61661,6 +61669,8 @@ mod tests {
 
     #[test]
     fn claude_invalid_family_can_hide_copy_from_provider_owned_session() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, parent, mut items) = claude_account_family_fixture();
         let hidden_copy_id = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
         let hidden_copy_path = root.join(format!("{hidden_copy_id}.jsonl"));
@@ -62397,6 +62407,8 @@ mod tests {
 
     #[test]
     fn claude_legacy_fork_prefix_is_excluded_only_with_exact_external_owner() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = temp_dir("claude-legacy-fork-prefix");
         let parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let child = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
@@ -62806,6 +62818,8 @@ mod tests {
 
     #[test]
     fn claude_d1_subagent_own_request_qualification() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
         let child = items[1].clone();
         let make_api = |request: &str, seq: u64, account: &str| {
@@ -63007,6 +63021,8 @@ mod tests {
 
     #[test]
     fn claude_d1_subagent_coverage_lifecycle_and_shapes() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
         // Positive request evidence needs no parent transcript or family census.
         fs::remove_file(dir.join(format!("{root}.jsonl"))).unwrap();
@@ -63204,6 +63220,8 @@ mod tests {
 
     #[test]
     fn claude_d1_fresh_reparse_retains_binding_refusal_until_exact_proof_returns() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
         let child_path = dir
             .join(&root)
@@ -66450,6 +66468,8 @@ mod tests {
 
     #[test]
     fn claude_code_parser_sums_message_usage_and_uses_summary_title() {
+        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude");
         fs::write(
             &path,
@@ -66747,6 +66767,8 @@ mod tests {
 
     #[test]
     fn claude_true_chronological_usage_regression_quarantines_the_file() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = temp_dir("claude-progressive-conflict");
         let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
         fs::write(
@@ -66778,6 +66800,8 @@ mod tests {
 
     #[test]
     fn claude_equal_provider_time_usage_conflict_quarantines_the_file() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = temp_dir("claude-progressive-equal-time-conflict");
         let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
         fs::write(
@@ -68128,6 +68152,8 @@ mod tests {
 
     #[test]
     fn claude_nonforked_owned_start_accepts_minimal_paired_request_evidence() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-nonforked-paired-owned-start");
         let source_session_id = path
             .file_stem()
@@ -75136,6 +75162,8 @@ mod tests {
 
     #[test]
     fn claude_code_zero_token_usage_events_drop_from_buckets() {
+        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-zero-token-activity");
         fs::write(
             &path,
@@ -75173,6 +75201,8 @@ mod tests {
 
     #[test]
     fn claude_code_parser_builds_distinct_hourly_usage_buckets() {
+        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-activity-buckets");
         fs::write(
             &path,
@@ -76609,6 +76639,8 @@ mod tests {
 
     #[test]
     fn claude_code_parser_splits_long_and_short_context_into_distinct_rows() {
+        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         // One first-party Anthropic session (same model, same gateway, same
         // hour) whose turns differ ONLY in prompt size. The daemon derives a
         // per-turn `context_bucket` from effective input volume (input +

@@ -23036,6 +23036,8 @@ mod tests {
     }
     #[test]
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         use crate::claude_local_otel::ClaudeIdentityDisposition;
         use sha2::{Digest, Sha256};
         let (dir, raw, api, trace) =
@@ -23195,6 +23197,8 @@ mod tests {
     // A shed page records RatelimitBackoff in the shared client_report counters.
     #[serial(client_report)]
     fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
+        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, mut prior, _, _) =
             crate::snapshots::claude_request_account_mixed_fixture(2, true);
         let (candidate_root, mut candidate, api, trace) =

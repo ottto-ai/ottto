@@ -27,6 +27,8 @@ pub(crate) fn output(name: &str, item: &SnapshotItem) {
 
 #[test]
 fn claude_p92_clock_qualification_and_all_bucket_coverage() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, items) = claude_account_family_fixture();
     let path = dir
         .join(&root)
@@ -299,6 +301,8 @@ pub(crate) fn claude_request_account_mixed_fixture(
 
 #[test]
 fn claude_p92_mixed_body_capability_and_restart_refusals() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, mut mixed, api, trace) = claude_request_account_mixed_fixture(4, true);
     let (prior_dir, mut prior, _, _) = claude_request_account_mixed_fixture(2, true);
     let before = serde_json::to_value(&mixed).unwrap();
@@ -702,6 +706,8 @@ fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
 
 #[test]
 fn claude_h296_root_production_enrichment_keeps_child_separate() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
     let digest = format!("{:x}", Sha256::digest(root.source_session_id.as_bytes()));
@@ -740,6 +746,8 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
 /// permitted cycle reaches contract 5.
 #[test]
 fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_identity as identity;
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
@@ -786,6 +794,8 @@ fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
 
 #[test]
 fn claude_h296_root_requires_original_clocks_in_every_hour_before_fold() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, _) = claude_account_family_fixture();
     let path = dir.join(format!("{root}.jsonl"));
     let first: Value = serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap()).unwrap();

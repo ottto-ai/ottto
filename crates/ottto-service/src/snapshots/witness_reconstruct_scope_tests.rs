@@ -161,6 +161,8 @@ fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
 
 #[test]
 fn rebuild_retains_no_copy_of_unrelated_family_rows() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let small = proven_families("witness-scope-small", 8);
     let large = proven_families("witness-scope-large", 32);
     let small_peak = rebuild_phase_peak(&small);

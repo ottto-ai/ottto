@@ -1796,6 +1796,8 @@ fn context_basis_counts_by_version_stay_bounded() {
 /// contract 5 rows and account tags are byte-identical to the clear.
 #[test]
 fn capture_on_bodies_match_the_clear_outside_context_scalars() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_identity as identity;
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");

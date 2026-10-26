@@ -498,10 +498,14 @@ fn observe_base_prelude(experimental_base_exit: bool) {
 }
 #[test]
 fn p12_member_change_base_control_reveals_unmet_original_prelude() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(false);
 }
 #[test]
 fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(true);
 }
 

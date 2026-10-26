@@ -906,6 +906,8 @@ fn unsettled_cause_is_named_on_the_claude_transition_lines() {
 #[test]
 #[serial(source_manifests)]
 fn replay_reset_terminal_authority_hold_keeps_the_claude_traversal_incomplete() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("claude-census-convergence-replay-terminal-hold");
     let baseline = fixture.baseline();
@@ -992,6 +994,8 @@ fn replay_reset_terminal_authority_hold_keeps_the_claude_traversal_incomplete() 
 #[test]
 #[serial(source_manifests)]
 fn restorable_terminal_authority_hold_lets_a_bounded_claude_traversal_converge() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("claude-census-convergence-restorable-terminal-hold");
     let baseline = fixture.baseline();
@@ -1541,6 +1545,8 @@ fn terminal_bound_hold_traversal(
 #[test]
 #[serial(source_manifests)]
 fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let settled_before = terminal_hold_settlement_count();
     let (_fixture, baseline, first, last) = terminal_bound_hold_traversal(
@@ -1640,6 +1646,8 @@ fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
 #[test]
 #[serial(source_manifests)]
 fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_census() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     for (name, upload, retry_pending) in [
         (
@@ -2215,6 +2223,8 @@ const BRIDGE_CYCLE: PipelineCycle<'static> = PipelineCycle {
 #[test]
 #[serial(source_manifests)]
 fn bound_retry_pending_hold_settles_without_marking_the_sweep() {
+    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     for upload in [PipelineUpload::Accept, PipelineUpload::ServerRejected] {
         let fixture = PipelineFixture::new("patha-bridge-bound-retry-pending-hold");
