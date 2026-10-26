@@ -51,7 +51,7 @@ evidence, no Linux job stands in for the macOS `Rust contracts` job, and a
 manually started (`workflow_dispatch`) run tests the branch head, not the merge
 with `main`.
 
-The guard also works when `main` has a merge queue: it enqueues the PR and waits for the merge.
+`main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it; a PR that fails there is removed (exit 4): fix it, push and rerun the guard.
 
 Authors with write access merge their own pull request once its review is
 complete, the four checks passed on the final head and it is mergeable. No

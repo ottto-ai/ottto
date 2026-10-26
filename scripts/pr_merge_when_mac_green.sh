@@ -14,8 +14,10 @@ CI_WORKFLOW=".github/workflows/ci.yml"
 REQUIRED_CHECKS='["Rust contracts","Public surface checks","Rust advisory audit","Dependency review"]'
 DEFAULT_INTERVAL=60
 MIN_INTERVAL=60
-DEFAULT_TIMEOUT=3600
-PR_FIELDS="state,isDraft,headRefOid,mergeable,baseRefName,headRefName,isCrossRepository,headRepository,headRepositoryOwner"
+# Two hours: a queued PR waits for its PR checks and then a full queue round
+# (Mac slot wait plus the Mac job) inside one shared budget.
+DEFAULT_TIMEOUT=7200
+PR_FIELDS="id,state,isDraft,headRefOid,mergeable,baseRefName,headRefName,isCrossRepository,headRepository,headRepositoryOwner"
 
 EXIT_USAGE=2
 EXIT_REFUSED=3
@@ -43,10 +45,12 @@ MERGEABLE it runs:
   gh pr merge <pr> --squash --match-head-commit <head-sha>
 
 If the base branch requires a merge queue, "Rust contracts" may also be skipped
-on the PR run; the three Linux checks must still succeed. The guard instead runs
-  gh pr merge <pr> --match-head-commit <head-sha>
-and waits until merged, removed from the queue, the head changes, or timeout.
+on the PR run; the three Linux checks must still succeed. The guard instead
+enqueues exactly <head-sha> with GitHub's enqueuePullRequest mutation
+(expectedHeadOid; independent of the repository's auto-merge setting) and waits
+until merged, removed from the queue, the head changes, or timeout.
 The queue's configured merge method applies; no administrator bypass is used.
+Rerunning the guard for a PR that is already queued resumes the wait.
 
 Not ready (keeps waiting): a required check run missing, still queued or in
 progress, skipped or neutral; mergeability UNKNOWN. A workflow_dispatch or push
@@ -57,7 +61,7 @@ Linux job stands in for the macOS "Rust contracts" job.
 Options:
   --repo      owner/name; default: the repository gh resolves (or GH_REPO)
   --interval  seconds between polls (default 60, minimum 60)
-  --timeout   total seconds to wait before giving up (default 3600)
+  --timeout   total seconds to wait before giving up (default 7200)
 
 Exit codes:
   0  merged
@@ -241,23 +245,63 @@ report_queue_failure() {
   fi
 }
 
+# gh pr merge enqueues through enablePullRequestAutoMerge, which depends on the
+# repository allowing auto-merge; the direct mutation does not.
+enqueue() {
+  local pr_id
+  pr_id="$(pr_field id)"
+  [ -n "$pr_id" ] || return 1
+  # GraphQL variables must reach GitHub literally.
+  # shellcheck disable=SC2016
+  gh api graphql -f pr_id="$pr_id" -f head="$head_sha" \
+    -f query='mutation($pr_id: ID!, $head: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $pr_id, expectedHeadOid: $head}) { mergeQueueEntry { state position } } }' \
+    >/dev/null
+}
+
+# The budget is spent by sleeping or by wall-clock time, whichever runs out
+# first: slow API calls and gh retries count too.
+elapsed() {
+  local wall=$((SECONDS - started_at))
+  if [ "$wall" -gt "$waited" ]; then echo "$wall"; else echo "$waited"; fi
+}
+
+out_of_time() {
+  [ "$(elapsed)" -ge "$timeout" ]
+}
+
+queue_query() {
+  # GraphQL variables must reach GitHub literally.
+  # shellcheck disable=SC2016
+  gh api graphql -F owner='{owner}' -F name='{repo}' -F number="$pr" \
+    -f query='query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          state headRefOid mergeCommit { oid } mergeQueueEntry { state position }
+          autoMergeRequest { enabledAt }
+        }
+      }
+    }'
+}
+
+# True when the PR's current head is queued or already merged. Any read error
+# or head mismatch is false, so the caller reports the enqueue failure.
+already_queued() {
+  local response
+  response="$(queue_query)" || return 1
+  printf '%s' "$response" | jq -e --arg sha "$head_sha" '
+    select((.errors // [] | length) == 0)
+    | .data.repository.pullRequest
+    | select(.headRefOid == $sha)
+    | select(.state == "MERGED" or .mergeQueueEntry != null)' >/dev/null
+}
+
 # A single small GraphQL read per queue poll supplies membership, PR state,
 # head-movement protection, and the resulting merge SHA. API errors are retried
 # within the original invocation's timeout, never treated as queue removal.
 wait_for_queue() {
   local response queued_pr state current_sha entry seen_queue=false absent=0
   while :; do
-    # GraphQL variables must reach GitHub literally.
-    # shellcheck disable=SC2016
-    if response="$(gh api graphql -F owner='{owner}' -F name='{repo}' -F number="$pr" \
-      -f query='query($owner: String!, $name: String!, $number: Int!) {
-        repository(owner: $owner, name: $name) {
-          pullRequest(number: $number) {
-            state headRefOid mergeCommit { oid } mergeQueueEntry { state position }
-            autoMergeRequest { enabledAt }
-          }
-        }
-      }')" && queued_pr="$(printf '%s' "$response" | jq -ce '
+    if response="$(queue_query)" && queued_pr="$(printf '%s' "$response" | jq -ce '
         select((.errors // [] | length) == 0)
         | .data.repository.pullRequest
         | select(.state != null and .headRefOid != null)')"; then
@@ -294,8 +338,8 @@ wait_for_queue() {
     else
       log "GitHub queue API read failed; continuing to wait"
     fi
-    if [ "$waited" -ge "$timeout" ]; then
-      die "$EXIT_TIMEOUT" "timed out after ${waited}s waiting for PR #$pr in the merge queue"
+    if out_of_time; then
+      die "$EXIT_TIMEOUT" "timed out after $(elapsed)s waiting for PR #$pr in the merge queue"
     fi
     sleep "$interval"
     waited=$((waited + interval))
@@ -320,6 +364,7 @@ fi
 
 log "PR #$pr head $head_sha: waiting for the required checks $REQUIRED_CHECKS (interval ${interval}s, timeout ${timeout}s)"
 waited=0
+started_at=$SECONDS
 while :; do
   read_pr
   refuse_unmergeable
@@ -336,8 +381,15 @@ while :; do
         if [ "$mergeable" = MERGEABLE ]; then
           if [ "$queue_mode" = true ]; then
             log "all required PR checks passed on $head_sha; enqueuing PR #$pr"
-            gh pr merge "$pr" --match-head-commit "$head_sha" \
-              || die "$EXIT_GH" "gh pr merge $pr failed"
+            if ! enqueue; then
+              # A rerun after a timeout finds the PR already queued (or just
+              # merged); resume waiting instead of reporting a gh failure.
+              if already_queued; then
+                log "PR #$pr is already in the merge queue or merged; resuming the wait"
+              else
+                die "$EXIT_GH" "enqueueing PR #$pr at $head_sha failed"
+              fi
+            fi
             wait_for_queue
           fi
           log "all required checks passed on $head_sha; merging PR #$pr"
@@ -359,8 +411,8 @@ while :; do
     log "GitHub API read failed; treating as not ready"
   fi
 
-  if [ "$waited" -ge "$timeout" ]; then
-    die "$EXIT_TIMEOUT" "timed out after ${waited}s waiting for the required checks on $head_sha; not merging"
+  if out_of_time; then
+    die "$EXIT_TIMEOUT" "timed out after $(elapsed)s waiting for the required checks on $head_sha; not merging"
   fi
   sleep "$interval"
   waited=$((waited + interval))
