@@ -11775,17 +11775,34 @@ fn claude_evidence_fingerprint_checks() -> (u64, u64) {
     CLAUDE_EVIDENCE_FINGERPRINT_CHECKS.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of API row fingerprints actually hashed on this thread
+    /// (a row's later checks reuse its kept result).
+    static CLAUDE_API_FINGERPRINT_HASHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn claude_api_fingerprint_hashes() -> u64 {
+    CLAUDE_API_FINGERPRINT_HASHES.with(std::cell::Cell::get)
+}
+
+/// Hashed once per row: the first caller fills the row's kept result.
 fn claude_api_evidence_fingerprint_is_valid(
     row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
 ) -> bool {
     #[cfg(test)]
     CLAUDE_EVIDENCE_FINGERPRINT_CHECKS.with(|cell| cell.set((cell.get().0 + 1, cell.get().1)));
-    let mut canonical = row.clone();
-    canonical.fingerprint.clear();
-    serialized_json_digest(&canonical, b"")
-        .map(|digest| format!("sha256:{:x}", digest.finalize()))
-        .as_deref()
-        == Some(row.fingerprint.as_str())
+    row.fingerprint_check.get_or_check(|| {
+        #[cfg(test)]
+        CLAUDE_API_FINGERPRINT_HASHES.with(|cell| cell.set(cell.get() + 1));
+        let mut canonical = row.clone();
+        canonical.fingerprint.clear();
+        serialized_json_digest(&canonical, b"")
+            .map(|digest| format!("sha256:{:x}", digest.finalize()))
+            .as_deref()
+            == Some(row.fingerprint.as_str())
+    })
 }
 
 fn claude_trace_evidence_fingerprint_is_valid(

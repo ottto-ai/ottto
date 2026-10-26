@@ -953,6 +953,68 @@ fn e2_membership_hash_collision_never_substitutes_for_exact_request_identity() {
 }
 
 #[test]
+fn e2_membership_view_lists_each_request_set_and_occurrence_id_once() {
+    let p = root_file("membership-union");
+    let index = ScanIndex::default();
+    let mut items = vec![parse(
+        &p,
+        Some(t0()),
+        &index,
+        &[line("b", &at(1), 10), line("d", &at(2), 10)],
+    )];
+    let occurrence = items[0].claude_usage_occurrences["b"].clone();
+    items[0].claude_usage_request_ids.insert("a".into());
+    items[0].claude_usage_request_ids.insert("e".into());
+    items[0]
+        .claude_usage_occurrences
+        .insert("c".into(), occurrence.clone());
+    items[0]
+        .claude_usage_occurrences
+        .insert("f".into(), occurrence);
+    let ids = item_request_ids(&items[0]).cloned().collect::<Vec<_>>();
+    assert_eq!(ids.len(), 6, "no id twice: {ids:?}");
+    assert_eq!(
+        ids.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from(["a", "b", "c", "d", "e", "f"].map(String::from))
+    );
+    let view = family_membership(&items, &[0]);
+    assert_eq!(view.entries.capacity(), 6);
+    for id in ["a", "b", "c", "d", "e", "f"] {
+        assert_eq!(matching_members(&view, id).collect::<Vec<_>>(), [0usize]);
+    }
+    cleanup(&[&p]);
+}
+
+/// Side calls reuse one key per (model, speed, effort, UTC hour): the
+/// placement reads the clock only for its hour bucket, offsets included.
+#[test]
+fn e2_side_call_key_reuse_is_exact_per_utc_hour() {
+    let clocks = [
+        "2026-08-02T07:00:00Z",
+        "2026-08-02T07:59:59.999999999Z",
+        "2026-08-02T09:30:00+02:00",
+        "2026-08-02T08:00:00Z",
+        "2026-08-02T03:15:00-05:00",
+    ];
+    let base = SelectorCapture::default();
+    for a in clocks {
+        for b in clocks {
+            let (mut x, mut y) = (row("x", 1, 10), row("y", 2, 10));
+            x.observed_at = a.into();
+            y.observed_at = b.into();
+            let hour = |clock: &str| rfc3339_unix_nanos(clock).unwrap().div_euclid(HOUR_NANOS);
+            let key = reported_key(&x, None, &base);
+            assert!(key.is_some());
+            assert_eq!(
+                key == reported_key(&y, None, &base),
+                hour(a) == hour(b),
+                "{a} vs {b}"
+            );
+        }
+    }
+}
+
+#[test]
 fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
     use crate::snapshots::claude_request_census::{
         record_claude_request_census, ClaudeRequestCensusParse,
@@ -1017,7 +1079,6 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         })
         .collect::<Vec<_>>();
     let read = sidecar(&rows); // canonical permissive reader, including health
-    let api = api_report(&read);
     let trace = ClaudeTraceOwnershipLoadReport {
         evidence: BTreeMap::from([(
             ROOT.to_owned(),
@@ -1069,14 +1130,39 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             .collect::<Vec<_>>()
     };
     let before = wire(&items);
+    let mut probe = None;
     for enabled in [false, true] {
+        // Wall clock without the allocation probe: its born-pointer table
+        // locks and walks on every allocation and free of every thread.
+        // Fresh row copies per pass: no fingerprint result carried over.
+        let api = api_report(&read);
         let mut page = items.clone();
+        take_stages();
         let start = Instant::now();
-        let (_, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
-            attach_page(&mut page, &read);
-            side_calls_page(&mut page, &api, &trace, &index);
-        });
+        attach_page(&mut page, &read);
+        side_calls_page(&mut page, &api, &trace, &index);
+        drop(api);
         let enrichment_time = start.elapsed();
+        let stages = take_stages();
+        // The same work on an identical page, for the born-in-scope peak only.
+        // Attach and side calls run outside the gate in both modes, so one
+        // probed pass is the receipt for both.
+        let (allocation, probed_time) = *probe.get_or_insert_with(|| {
+            let api = api_report(&read);
+            let mut probed = items.clone();
+            let probe_start = Instant::now();
+            let (_, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
+                attach_page(&mut probed, &read);
+                side_calls_page(&mut probed, &api, &trace, &index);
+            });
+            let probed_time = probe_start.elapsed();
+            take_stages();
+            assert!(page.iter().zip(&probed).all(|(a, b)| {
+                fold(a).entity.grains == fold(b).entity.grains
+                    && fold(a).side_requests == fold(b).side_requests
+            }));
+            (allocation, probed_time)
+        });
         assert!(page
             .iter()
             .all(|item| fold(item).telemetry.membership.entries.is_empty()));
@@ -1104,13 +1190,14 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             allocation.requested_peak_with_overlap <= 2 * 1024 * 1024,
             "attach+side-call born-in-scope allocation peak: {allocation:?}"
         );
+        let finish_start = Instant::now();
         let withheld = if enabled {
             with_enabled(|| finish_page(&mut page, &index, TelemetryRead::Loaded))
         } else {
             finish_page(&mut page, &index, TelemetryRead::Loaded)
         };
         assert!(withheld.is_empty());
-        let pipeline_time = start.elapsed();
+        let pipeline_time = enrichment_time + finish_start.elapsed();
         assert!(
             pipeline_time < Duration::from_secs(30),
             "real pipeline took {pipeline_time:?}"
@@ -1131,9 +1218,49 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
                 "dark mode preserves all bytes and fingerprints"
             );
         }
-        eprintln!("F3_PERF rows={ROWS} members={MEMBERS} off_page={OFF_PAGE} enabled={enabled} membership_join_us={} attach_side_us={} pipeline_us={} born_peak_bytes={} not_rss=true",
-            join_time.as_micros(), enrichment_time.as_micros(), pipeline_time.as_micros(), allocation.requested_peak_with_overlap);
+        eprintln!("F3_PERF rows={ROWS} members={MEMBERS} off_page={OFF_PAGE} enabled={enabled} membership_join_us={} attach_side_us={} attach_side_probed_us={} pipeline_us={} born_peak_bytes={} not_rss=true",
+            join_time.as_micros(), enrichment_time.as_micros(), probed_time.as_micros(), pipeline_time.as_micros(), allocation.requested_peak_with_overlap);
+        eprintln!(
+            "F3_PERF stages enabled={enabled} {}",
+            stages
+                .iter()
+                .map(|(stage, spent)| format!("{stage}_us={}", spent.as_micros()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
+    // Same-run comparison on fresh copies of the first 10,000 rows: the
+    // blanked-copy rule, the first check, and a second check that reuses
+    // each row's kept result. All three must agree.
+    let sample = read.evidence[ROOT][..10_000].to_vec();
+    let start = Instant::now();
+    let copy_rule = sample
+        .iter()
+        .map(|row| reference_fingerprint_ok(row, &row.fingerprint, |r| r.fingerprint.clear()))
+        .collect::<Vec<_>>();
+    let copy_rule_time = start.elapsed();
+    let start = Instant::now();
+    let first = sample
+        .iter()
+        .map(|row| validate_claude_api_row(row, ROOT))
+        .collect::<Vec<_>>();
+    let first_time = start.elapsed();
+    let start = Instant::now();
+    let again = sample
+        .iter()
+        .map(|row| validate_claude_api_row(row, ROOT))
+        .collect::<Vec<_>>();
+    let again_time = start.elapsed();
+    assert!(copy_rule.iter().all(|valid| *valid));
+    assert_eq!(first, copy_rule);
+    assert_eq!(again, copy_rule);
+    eprintln!(
+        "F3_PERF fingerprint rows={} copy_rule_us={} first_check_us={} kept_result_us={}",
+        sample.len(),
+        copy_rule_time.as_micros(),
+        first_time.as_micros(),
+        again_time.as_micros()
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -3760,4 +3887,107 @@ fn e2_twin_index_spells_root_and_subagent_members_once() {
     let _ = fs::remove_dir_all(fresh.ancestors().nth(3).unwrap());
     cleanup(&[&root_a, &root_b]);
     remove_agent_scratch(&[&agent_a, &agent_b, &solo]);
+}
+
+/// The sidecar fingerprint rule before F3b: hash the blanked clone's JSON
+/// and compare the formatted string.
+fn reference_fingerprint_ok<T: serde::Serialize + Clone>(
+    row: &T,
+    fingerprint: &str,
+    blank: impl FnOnce(&mut T),
+) -> bool {
+    let mut canonical = row.clone();
+    blank(&mut canonical);
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).unwrap())
+    ) == fingerprint
+}
+
+#[test]
+fn e2_fingerprint_check_matches_the_blanked_copy_rule_on_every_shape() {
+    use crate::snapshots::{
+        claude_api_evidence_fingerprint_is_valid, claude_trace_evidence_fingerprint_is_valid,
+    };
+    let valid = row("req-a", 1, 10);
+    let mut apis = vec![valid.clone(), identity_api_row("req-b", 2, 10, "org")];
+    let mut tampered = valid.clone();
+    tampered.input_tokens += 1;
+    apis.push(tampered);
+    let mut upper = valid.clone();
+    upper.fingerprint = upper
+        .fingerprint
+        .to_uppercase()
+        .replace("SHA256:", "sha256:");
+    apis.push(upper);
+    let mut short = valid.clone();
+    short.fingerprint.pop();
+    apis.push(short);
+    let mut bare = valid.clone();
+    bare.fingerprint = bare.fingerprint.replace("sha256:", "");
+    apis.push(bare);
+    // JSON escapes in the two leading fields must not shift the blanked value.
+    let mut escaped = valid.clone();
+    escaped.capture_revision = "claude_api_request:v2\"\\\u{1}".into();
+    apis.push(refingerprint(escaped.clone()));
+    escaped.fingerprint = "sha256:\"\\".into();
+    apis.push(escaped);
+    let mut empty = valid.clone();
+    empty.fingerprint.clear();
+    apis.push(empty);
+    let mut expected = Vec::new();
+    for api in &apis {
+        let want = reference_fingerprint_ok(api, &api.fingerprint, |r| r.fingerprint.clear());
+        expected.push(want);
+        assert_eq!(
+            claude_api_evidence_fingerprint_is_valid(api),
+            want,
+            "{api:?}"
+        );
+    }
+    assert_eq!(
+        expected,
+        [true, true, false, false, false, false, true, false, false]
+    );
+    let trace = complete_trace_row(ROOT, "req-a", "7");
+    let mut traces = vec![trace.clone()];
+    let mut moved = trace.clone();
+    moved.agent_id = "8".into();
+    traces.push(moved);
+    let mut quoted = trace;
+    quoted.capture_revision = "\"".into();
+    traces.push(quoted);
+    for trace in &traces {
+        let want = reference_fingerprint_ok(trace, &trace.fingerprint, |r| r.fingerprint.clear());
+        assert_eq!(claude_trace_evidence_fingerprint_is_valid(trace), want);
+    }
+}
+
+#[test]
+fn e2_api_fingerprint_is_hashed_once_per_row_and_never_leaves_memory() {
+    use crate::snapshots::{
+        claude_api_evidence_fingerprint_is_valid, claude_api_fingerprint_hashes,
+    };
+    let valid = row("req-a", 1, 10);
+    let bytes = serde_json::to_vec(&valid).unwrap();
+    let start = claude_api_fingerprint_hashes();
+    for _ in 0..3 {
+        assert!(claude_api_evidence_fingerprint_is_valid(&valid));
+    }
+    assert_eq!(claude_api_fingerprint_hashes() - start, 1);
+    assert_eq!(
+        serde_json::to_vec(&valid).unwrap(),
+        bytes,
+        "never serialized"
+    );
+    let decoded: ClaudeLocalOtelEvidence = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, valid, "ignored by ==");
+    // A copy is checked anew, so editing it cannot inherit the result.
+    let mut copy = valid.clone();
+    copy.input_tokens += 1;
+    assert!(!claude_api_evidence_fingerprint_is_valid(&copy));
+    assert!(!claude_api_evidence_fingerprint_is_valid(&copy));
+    assert_eq!(claude_api_fingerprint_hashes() - start, 2);
+    assert!(claude_api_evidence_fingerprint_is_valid(&valid));
+    assert_eq!(claude_api_fingerprint_hashes() - start, 2);
 }
