@@ -12735,6 +12735,14 @@ fn claude_account_evidence_covers_request_ids(
 }
 
 fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
+    // E2 (gate on): the fold holds the per-hour rows until emission, so the
+    // session rows are the body's only rows and the caller has tagged them.
+    if item.usage_buckets.is_empty()
+        && item.claude_money.is_some()
+        && claude_request_money::e2::enabled()
+    {
+        return;
+    }
     let account_hashes = item
         .usage_buckets
         .iter()

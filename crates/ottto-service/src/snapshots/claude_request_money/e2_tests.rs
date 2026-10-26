@@ -362,62 +362,70 @@ fn e2_failed_or_missing_telemetry_read_is_never_complete() {
 
 #[test]
 fn e2_oversized_sidecar_is_incomplete_and_attaches_nothing() {
-    let p = root_file("oversized");
-    let index = ScanIndex::default();
-    let support = scratch("oversized-support");
-    let dir = support.join(crate::claude_local_otel::STORE_DIR);
-    fs::create_dir_all(&dir).unwrap();
-    fs::File::create(dir.join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes()))))
-        .unwrap()
-        .set_len(64 * 1024 * 1024)
-        .unwrap();
-    let read = ClaudeApiEvidenceRead::load(&support, [ROOT.to_owned()]).unwrap();
-    let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
-    attach_page(&mut items, &read);
-    assert!(fold(&items[0]).telemetry.read);
-    assert!(!fold(&items[0]).telemetry.complete);
-    let got = publish(items, None, TelemetryRead::Loaded, &index);
-    assert_eq!(got[0].telemetry_owned_complete, Some(false));
-    assert!(got[0].cost.is_none());
-    assert_eq!(got[0].request_count, 1);
-    fs::remove_dir_all(support).unwrap();
-    cleanup(&[&p]);
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        let p = root_file("oversized");
+        let index = ScanIndex::default();
+        let support = scratch("oversized-support");
+        let dir = support.join(crate::claude_local_otel::STORE_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        fs::File::create(dir.join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes()))))
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let read = ClaudeApiEvidenceRead::load(&support, [ROOT.to_owned()]).unwrap();
+        let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
+        attach_page(&mut items, &read);
+        assert!(fold(&items[0]).telemetry.read);
+        assert!(!fold(&items[0]).telemetry.complete);
+        let got = publish(items, None, TelemetryRead::Loaded, &index);
+        assert_eq!(got[0].telemetry_owned_complete, Some(false));
+        assert!(got[0].cost.is_none());
+        assert_eq!(got[0].request_count, 1);
+        fs::remove_dir_all(support).unwrap();
+        cleanup(&[&p]);
+    })
 }
 
 #[test]
 fn e2_path_twins_attach_the_row_once() {
-    let first = root_file("twin-a");
-    let copy = root_file("twin-b");
-    let mut index = ScanIndex::default();
-    let own = parse_and_remember(&first, t0(), &mut index, &[line("r", &at(1), 10)]);
-    index.files.insert(local_index_key(&copy), entry());
-    stage_twins(
-        &mut index,
-        &[(&first, t0()), (&copy, t0() + 60_000_000_000)],
-    );
-    let twin = parse(
-        &copy,
-        Some(t0() + 60_000_000_000),
-        &index,
-        &[line("r", &at(1), 10), line("o", &at(61), 20)],
-    );
-    assert_eq!(fold(&twin).entity.removed_requests, 1, "the copy is held");
-    for order in [vec![own.clone(), twin.clone()], vec![twin, own]] {
-        let read = sidecar(&[row("r", 1, 10)]);
-        let mut items = order;
-        attach_page(&mut items, &read);
-        attach_page(&mut items, &read); // a second call moves nothing
-        assert_eq!(items.iter().map(|i| requests(i, MATCHED)).sum::<u64>(), 1);
-        let got = publish(items, None, TelemetryRead::Loaded, &index);
-        assert_eq!(got.len(), 1);
-        assert_eq!((got[0].request_count, got[0].input_tokens), (2, 30));
-        assert_eq!(got[0].removed_request_count, Some(1));
-        assert_eq!(
-            got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
-            Some("0.0001")
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        let first = root_file("twin-a");
+        let copy = root_file("twin-b");
+        let mut index = ScanIndex::default();
+        let own = parse_and_remember(&first, t0(), &mut index, &[line("r", &at(1), 10)]);
+        index.files.insert(local_index_key(&copy), entry());
+        stage_twins(
+            &mut index,
+            &[(&first, t0()), (&copy, t0() + 60_000_000_000)],
         );
-    }
-    cleanup(&[&first, &copy]);
+        let twin = parse(
+            &copy,
+            Some(t0() + 60_000_000_000),
+            &index,
+            &[line("r", &at(1), 10), line("o", &at(61), 20)],
+        );
+        assert_eq!(fold(&twin).entity.removed_requests, 1, "the copy is held");
+        for order in [vec![own.clone(), twin.clone()], vec![twin, own]] {
+            let read = sidecar(&[row("r", 1, 10)]);
+            let mut items = order;
+            attach_page(&mut items, &read);
+            attach_page(&mut items, &read); // a second call moves nothing
+            assert_eq!(items.iter().map(|i| requests(i, MATCHED)).sum::<u64>(), 1);
+            let got = publish(items, None, TelemetryRead::Loaded, &index);
+            assert_eq!(got.len(), 1);
+            assert_eq!((got[0].request_count, got[0].input_tokens), (2, 30));
+            assert_eq!(got[0].removed_request_count, Some(1));
+            assert_eq!(
+                got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                Some("0.0001")
+            );
+        }
+        cleanup(&[&first, &copy]);
+    })
 }
 
 #[test]
@@ -488,98 +496,106 @@ fn e2_priced_and_unpriced_rows_in_one_hour_stay_separate() {
 
 #[test]
 fn e2_move_then_copy_across_restart_counts_each_request_once() {
-    let a = root_file("move-a");
-    let b = root_file("move-b");
-    let c = root_file("move-c");
-    let history = [line("h1", &at(1), 1), line("h2", &at(2), 2)];
-    let mut index = ScanIndex::default();
-    parse_and_remember(&a, t0(), &mut index, &history);
-    let mut index = restart(&index);
-    // Move: A is gone, B is a new inode born later with A's history.
-    fs::remove_file(&a).unwrap();
-    index.files.remove(&local_index_key(&a));
-    let moved = [
-        history[0].clone(),
-        history[1].clone(),
-        line("h3", &at(70), 4),
-    ];
-    let b_moved = parse_and_remember(&b, t0() + 60_000_000_000, &mut index, &moved);
-    assert_eq!(
-        fold(&b_moved).entity.totals().1,
-        3,
-        "a move inherits the cutoff"
-    );
-    assert_eq!(fold(&b_moved).birth(), Some(t0()));
-    let mut index = restart(&index);
-    // Copy of the live B: its history is held, its own line counts.
-    let copied = [
-        moved[0].clone(),
-        moved[1].clone(),
-        moved[2].clone(),
-        line("h4", &at(130), 8),
-    ];
-    for _pass in 0..2 {
-        stage_twins(
-            &mut index,
-            &[(&b, t0() + 60_000_000_000), (&c, t0() + 120_000_000_000)],
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        let a = root_file("move-a");
+        let b = root_file("move-b");
+        let c = root_file("move-c");
+        let history = [line("h1", &at(1), 1), line("h2", &at(2), 2)];
+        let mut index = ScanIndex::default();
+        parse_and_remember(&a, t0(), &mut index, &history);
+        let mut index = restart(&index);
+        // Move: A is gone, B is a new inode born later with A's history.
+        fs::remove_file(&a).unwrap();
+        index.files.remove(&local_index_key(&a));
+        let moved = [
+            history[0].clone(),
+            history[1].clone(),
+            line("h3", &at(70), 4),
+        ];
+        let b_moved = parse_and_remember(&b, t0() + 60_000_000_000, &mut index, &moved);
+        assert_eq!(
+            fold(&b_moved).entity.totals().1,
+            3,
+            "a move inherits the cutoff"
         );
-        let b_item = parse(&b, Some(t0() + 60_000_000_000), &index, &moved);
-        let c_item = parse_and_remember(&c, t0() + 120_000_000_000, &mut index, &copied);
-        assert_eq!(fold(&c_item).entity.removed_requests, 3);
-        let got = publish(vec![b_item, c_item], None, TelemetryRead::Loaded, &index);
-        assert_eq!(got.len(), 1);
-        assert_eq!((got[0].request_count, got[0].input_tokens), (4, 15));
-        assert_eq!(got[0].removed_request_count, Some(3));
-        index = restart(&index);
-    }
-    cleanup(&[&a, &b, &c]);
+        assert_eq!(fold(&b_moved).birth(), Some(t0()));
+        let mut index = restart(&index);
+        // Copy of the live B: its history is held, its own line counts.
+        let copied = [
+            moved[0].clone(),
+            moved[1].clone(),
+            moved[2].clone(),
+            line("h4", &at(130), 8),
+        ];
+        for _pass in 0..2 {
+            stage_twins(
+                &mut index,
+                &[(&b, t0() + 60_000_000_000), (&c, t0() + 120_000_000_000)],
+            );
+            let b_item = parse(&b, Some(t0() + 60_000_000_000), &index, &moved);
+            let c_item = parse_and_remember(&c, t0() + 120_000_000_000, &mut index, &copied);
+            assert_eq!(fold(&c_item).entity.removed_requests, 3);
+            let got = publish(vec![b_item, c_item], None, TelemetryRead::Loaded, &index);
+            assert_eq!(got.len(), 1);
+            assert_eq!((got[0].request_count, got[0].input_tokens), (4, 15));
+            assert_eq!(got[0].removed_request_count, Some(3));
+            index = restart(&index);
+        }
+        cleanup(&[&a, &b, &c]);
+    })
 }
 
 #[test]
 fn e2_restored_twins_both_prebirth_skip_exactly_one_never_both() {
-    let history = [line("h1", &at(-100), 1), line("h2", &at(-90), 2)];
-    for (x_birth, y_birth) in [(0, 5), (5, 0), (0, 0)] {
-        let x = root_file("restored-x");
-        let y = root_file("restored-y");
-        let (x_birth, y_birth) = (
-            t0() + x_birth * 1_000_000_000,
-            t0() + y_birth * 1_000_000_000,
-        );
-        let mut index = ScanIndex::default();
-        parse_and_remember(&x, x_birth, &mut index, &history);
-        parse_and_remember(&y, y_birth, &mut index, &history);
-        let mut index = restart(&index);
-        stage_twins(&mut index, &[(&x, x_birth), (&y, y_birth)]);
-        let xs = parse(&x, Some(x_birth), &index, &history);
-        let ys = parse(&y, Some(y_birth), &index, &history);
-        let skipped = [&xs, &ys]
-            .iter()
-            .filter(|item| fold(item).entity.removed_requests == 2)
-            .count();
-        assert_eq!(skipped, 1, "births {x_birth} {y_birth}");
-        let got = publish(
-            vec![xs.clone(), ys.clone()],
-            None,
-            TelemetryRead::Loaded,
-            &index,
-        );
-        assert_eq!(
-            (got[0].request_count, got[0].removed_request_count),
-            (2, Some(2))
-        );
-        // The surviving original is deleted: the held copy counts again.
-        let (kept, held) = if fold(&xs).entity.removed_requests == 0 {
-            (&x, (&y, y_birth))
-        } else {
-            (&y, (&x, x_birth))
-        };
-        fs::remove_file(kept).unwrap();
-        stage_twins(&mut index, &[(&x, x_birth), (&y, y_birth)]);
-        let alone = parse(held.0, Some(held.1), &index, &history);
-        assert_eq!(fold(&alone).entity.removed_requests, 0);
-        assert_eq!(fold(&alone).entity.totals().1, 2);
-        cleanup(&[&x, &y]);
-    }
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        let history = [line("h1", &at(-100), 1), line("h2", &at(-90), 2)];
+        for (x_birth, y_birth) in [(0, 5), (5, 0), (0, 0)] {
+            let x = root_file("restored-x");
+            let y = root_file("restored-y");
+            let (x_birth, y_birth) = (
+                t0() + x_birth * 1_000_000_000,
+                t0() + y_birth * 1_000_000_000,
+            );
+            let mut index = ScanIndex::default();
+            parse_and_remember(&x, x_birth, &mut index, &history);
+            parse_and_remember(&y, y_birth, &mut index, &history);
+            let mut index = restart(&index);
+            stage_twins(&mut index, &[(&x, x_birth), (&y, y_birth)]);
+            let xs = parse(&x, Some(x_birth), &index, &history);
+            let ys = parse(&y, Some(y_birth), &index, &history);
+            let skipped = [&xs, &ys]
+                .iter()
+                .filter(|item| fold(item).entity.removed_requests == 2)
+                .count();
+            assert_eq!(skipped, 1, "births {x_birth} {y_birth}");
+            let got = publish(
+                vec![xs.clone(), ys.clone()],
+                None,
+                TelemetryRead::Loaded,
+                &index,
+            );
+            assert_eq!(
+                (got[0].request_count, got[0].removed_request_count),
+                (2, Some(2))
+            );
+            // The surviving original is deleted: the held copy counts again.
+            let (kept, held) = if fold(&xs).entity.removed_requests == 0 {
+                (&x, (&y, y_birth))
+            } else {
+                (&y, (&x, x_birth))
+            };
+            fs::remove_file(kept).unwrap();
+            stage_twins(&mut index, &[(&x, x_birth), (&y, y_birth)]);
+            let alone = parse(held.0, Some(held.1), &index, &history);
+            assert_eq!(fold(&alone).entity.removed_requests, 0);
+            assert_eq!(fold(&alone).entity.totals().1, 2);
+            cleanup(&[&x, &y]);
+        }
+    })
 }
 
 #[test]
@@ -612,35 +628,39 @@ fn e2_writer_certificate_refuses_mixed_versions_in_either_order() {
 
 #[test]
 fn e2_exact_removal_totals() {
-    let p = root_file("removal");
-    let index = ScanIndex::default();
-    let mut copy = line("c", &at(-100), 10);
-    copy["message"]["usage"]["output_tokens"] = json!(4);
-    copy["message"]["usage"]["cache_read_input_tokens"] = json!(7);
-    let got = publish(
-        vec![parse(
-            &p,
-            Some(t0()),
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        let p = root_file("removal");
+        let index = ScanIndex::default();
+        let mut copy = line("c", &at(-100), 10);
+        copy["message"]["usage"]["output_tokens"] = json!(4);
+        copy["message"]["usage"]["cache_read_input_tokens"] = json!(7);
+        let got = publish(
+            vec![parse(
+                &p,
+                Some(t0()),
+                &index,
+                &[copy, line("o1", &at(1), 20), line("o2", &at(2), 30)],
+            )],
+            None,
+            TelemetryRead::Loaded,
             &index,
-            &[copy, line("o1", &at(1), 20), line("o2", &at(2), 30)],
-        )],
-        None,
-        TelemetryRead::Loaded,
-        &index,
-    );
-    assert_eq!((got[0].request_count, got[0].input_tokens), (2, 50));
-    assert_eq!((got[0].output_tokens, got[0].cache_read_tokens), (2, 0));
-    assert_eq!(got[0].removed_request_count, Some(1));
-    assert_eq!(
-        got[0].removed_usage,
-        Some(ClaudeRemovedUsage {
-            input_tokens: 10,
-            output_tokens: 4,
-            cache_read_tokens: 7,
-            ..Default::default()
-        })
-    );
-    cleanup(&[&p]);
+        );
+        assert_eq!((got[0].request_count, got[0].input_tokens), (2, 50));
+        assert_eq!((got[0].output_tokens, got[0].cache_read_tokens), (2, 0));
+        assert_eq!(got[0].removed_request_count, Some(1));
+        assert_eq!(
+            got[0].removed_usage,
+            Some(ClaudeRemovedUsage {
+                input_tokens: 10,
+                output_tokens: 4,
+                cache_read_tokens: 7,
+                ..Default::default()
+            })
+        );
+        cleanup(&[&p]);
+    })
 }
 
 #[test]
@@ -736,48 +756,53 @@ fn e2_resolver_conflict_is_counted_and_emitted() {
 
 #[test]
 fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
-    let first = root_file("withheld-a");
-    let copy = root_file("withheld-b");
-    let index = ScanIndex::default();
-    let canonical = |items: &[SnapshotItem]| {
-        items
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        let first = root_file("withheld-a");
+        let copy = root_file("withheld-b");
+        let index = ScanIndex::default();
+        let canonical = |items: &[SnapshotItem]| {
+            items
+                .iter()
+                .map(|item| {
+                    crate::canonical_json::canonicalize(&serde_json::to_value(item).unwrap())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let page = || {
+            vec![
+                parse(&first, Some(t0()), &index, &[line("r", &at(1), 10)]),
+                parse(&copy, Some(t0()), &index, &[line("o", &at(2), 20)]),
+            ]
+        };
+        // Held (absent twin, uncertified, ...): both paths stay, untouched, and
+        // the session is returned so the caller holds it (owed, not settled).
+        let mut items = page();
+        items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
+        let before = canonical(&items);
+        let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+        assert_eq!(withheld, BTreeSet::from([ROOT.to_owned()]));
+        assert_eq!(items.len(), 2, "no path of a withheld session is dropped");
+        assert_eq!(canonical(&items), before);
+        assert!(items
             .iter()
-            .map(|item| {
-                crate::canonical_json::canonicalize(&serde_json::to_value(item).unwrap()).unwrap()
-            })
-            .collect::<Vec<_>>()
-    };
-    let page = || {
-        vec![
-            parse(&first, Some(t0()), &index, &[line("r", &at(1), 10)]),
-            parse(&copy, Some(t0()), &index, &[line("o", &at(2), 20)]),
-        ]
-    };
-    // Held (absent twin, uncertified, ...): both paths stay, untouched, and
-    // the session is returned so the caller holds it (owed, not settled).
-    let mut items = page();
-    items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
-    let before = canonical(&items);
-    let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
-    assert_eq!(withheld, BTreeSet::from([ROOT.to_owned()]));
-    assert_eq!(items.len(), 2, "no path of a withheld session is dropped");
-    assert_eq!(canonical(&items), before);
-    assert!(items
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
-    // Not held: one summed body, nothing withheld.
-    let mut items = page();
-    let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
-    assert!(withheld.is_empty());
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].request_count, 2);
-    // Gate off withholds nothing and changes nothing.
-    let mut items = page();
-    items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
-    let before = canonical(&items);
-    assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
-    assert_eq!(canonical(&items), before);
-    cleanup(&[&first, &copy]);
+            .all(|item| item.usage_accounting_contract.is_none()));
+        // Not held: one summed body, nothing withheld.
+        let mut items = page();
+        let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+        assert!(withheld.is_empty());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].request_count, 2);
+        // Gate off withholds nothing and changes nothing.
+        let mut items = page();
+        items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
+        let before = canonical(&items);
+        assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
+        assert_eq!(canonical(&items), before);
+        cleanup(&[&first, &copy]);
+    })
 }
 
 #[test]
@@ -890,72 +915,77 @@ fn e2_diagnostic_fields_are_nonzero_only() {
 
 #[test]
 fn e2_reported_selector_inputs_match_p1_with_legacy_output_kept() {
-    use super::super::body::reported_live_key;
-    use super::super::rows::ClaudeApiRow;
-    let p = root_file("selector-parity");
-    let index = ScanIndex::default();
-    for native_model in [true, false] {
-        for native_clock in [true, false] {
-            for native_effort in [None, Some("low")] {
-                for speed in ["", "fast"] {
-                    for effort in ["high", "unknown", ""] {
-                        let mut value = line("r", &at(1), 10);
-                        if !native_model {
-                            value["message"].as_object_mut().unwrap().remove("model");
-                        }
-                        if !native_clock {
-                            value.as_object_mut().unwrap().remove("timestamp");
-                        }
-                        let item = parse(&p, Some(t0()), &index, &[line("seed", &at(0), 1), value]);
-                        let mut occurrence = item.claude_usage_occurrences["r"].clone();
-                        occurrence.reasoning_effort = native_effort.map(str::to_owned);
-                        let mut api = row("r", 1, 10);
-                        api.speed = speed.to_owned();
-                        api.effort = effort.to_owned();
-                        api.observed_at = at(3601); // fallback clock is another hour
-                        let api_view = ClaudeApiRow {
-                            request_hash: claude_request_hash("r"),
-                            tokens: Default::default(),
-                            cost_micros: api.cost_usd_micros,
-                            clock: u64::try_from((t0() / 1_000_000_000) + 3601).unwrap(),
-                            model: &api.model,
-                            speed: &api.speed,
-                            effort: &api.effort,
-                        };
-                        for occurrence in [Some(&occurrence), None] {
-                            let legacy = reported_live_key(&api_view, occurrence).unwrap();
-                            let mut e2 =
-                                reported_key(&api, occurrence, &SelectorCapture::default())
-                                    .unwrap();
-                            let kept_effort = e2.2.remove("reasoning_effort");
-                            assert_eq!(e2, legacy, "same model, speed, selectors and hour");
-                            let expected_effort = occurrence
-                                .and_then(|o| o.reasoning_effort.as_deref())
-                                .or_else(|| {
-                                    crate::snapshots::CLAUDE_EFFORT_TIERS
-                                        .contains(&effort)
-                                        .then_some(effort)
-                                });
-                            assert_eq!(
-                                kept_effort.as_deref(),
-                                expected_effort,
-                                "E2 intentionally retains effort"
-                            );
-                            assert_eq!(
-                                legacy.0,
-                                if occurrence.is_some() && native_clock {
-                                    HOUR
-                                } else {
-                                    "2026-08-02T08:00:00Z"
-                                }
-                            );
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        use super::super::body::reported_live_key;
+        use super::super::rows::ClaudeApiRow;
+        let p = root_file("selector-parity");
+        let index = ScanIndex::default();
+        for native_model in [true, false] {
+            for native_clock in [true, false] {
+                for native_effort in [None, Some("low")] {
+                    for speed in ["", "fast"] {
+                        for effort in ["high", "unknown", ""] {
+                            let mut value = line("r", &at(1), 10);
+                            if !native_model {
+                                value["message"].as_object_mut().unwrap().remove("model");
+                            }
+                            if !native_clock {
+                                value.as_object_mut().unwrap().remove("timestamp");
+                            }
+                            let item =
+                                parse(&p, Some(t0()), &index, &[line("seed", &at(0), 1), value]);
+                            let mut occurrence = item.claude_usage_occurrences["r"].clone();
+                            occurrence.reasoning_effort = native_effort.map(str::to_owned);
+                            let mut api = row("r", 1, 10);
+                            api.speed = speed.to_owned();
+                            api.effort = effort.to_owned();
+                            api.observed_at = at(3601); // fallback clock is another hour
+                            let api_view = ClaudeApiRow {
+                                request_hash: claude_request_hash("r"),
+                                tokens: Default::default(),
+                                cost_micros: api.cost_usd_micros,
+                                clock: u64::try_from((t0() / 1_000_000_000) + 3601).unwrap(),
+                                model: &api.model,
+                                speed: &api.speed,
+                                effort: &api.effort,
+                            };
+                            for occurrence in [Some(&occurrence), None] {
+                                let legacy = reported_live_key(&api_view, occurrence).unwrap();
+                                let mut e2 =
+                                    reported_key(&api, occurrence, &SelectorCapture::default())
+                                        .unwrap();
+                                let kept_effort = e2.2.remove("reasoning_effort");
+                                assert_eq!(e2, legacy, "same model, speed, selectors and hour");
+                                let expected_effort = occurrence
+                                    .and_then(|o| o.reasoning_effort.as_deref())
+                                    .or_else(|| {
+                                        crate::snapshots::CLAUDE_EFFORT_TIERS
+                                            .contains(&effort)
+                                            .then_some(effort)
+                                    });
+                                assert_eq!(
+                                    kept_effort.as_deref(),
+                                    expected_effort,
+                                    "E2 intentionally retains effort"
+                                );
+                                assert_eq!(
+                                    legacy.0,
+                                    if occurrence.is_some() && native_clock {
+                                        HOUR
+                                    } else {
+                                        "2026-08-02T08:00:00Z"
+                                    }
+                                );
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    cleanup(&[&p]);
+        cleanup(&[&p]);
+    })
 }
 
 #[test]
@@ -1049,26 +1079,32 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
     fs::create_dir_all(&agents).unwrap();
     let mut index = ScanIndex::default();
     let id = |i: usize| format!("req-{i:06}");
-    let mut items = Vec::with_capacity(MEMBERS);
-    for member in 0..MEMBERS {
-        let path = if member == 0 {
-            root.clone()
-        } else {
-            agents.join(format!("agent-{member}.jsonl"))
-        };
-        let lines = (member..ROWS)
-            .step_by(MEMBERS)
-            .map(|i| {
-                let request = if i < MEMBERS {
-                    id(i)
-                } else {
-                    format!("native-{i:06}")
-                };
-                line(&request, &at(1), 10)
-            })
-            .collect::<Vec<_>>();
-        items.push(parse(&path, Some(t0()), &index, &lines));
-    }
+    // The gate is a build constant: each mode parses its own page.
+    let parse_page = |index: &ScanIndex| {
+        let mut items = Vec::with_capacity(MEMBERS);
+        for member in 0..MEMBERS {
+            let path = if member == 0 {
+                root.clone()
+            } else {
+                agents.join(format!("agent-{member}.jsonl"))
+            };
+            let lines = (member..ROWS)
+                .step_by(MEMBERS)
+                .map(|i| {
+                    let request = if i < MEMBERS {
+                        id(i)
+                    } else {
+                        format!("native-{i:06}")
+                    };
+                    line(&request, &at(1), 10)
+                })
+                .collect::<Vec<_>>();
+            items.push(parse(&path, Some(t0()), index, &lines));
+        }
+        items
+    };
+    let items = parse_page(&index);
+    let items_enabled = with_enabled(|| parse_page(&index));
     // An off-page member is parsed through the native resolver and recorded
     // through the actual census writer, rather than hand-feeding holder sets.
     let off_page_path = agents.join("agent-off-page.jsonl");
@@ -1151,52 +1187,85 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             .collect::<Vec<_>>()
     };
     let before = wire(&items);
-    let mut probe = None;
     for enabled in [false, true] {
+        let in_mode = |run: &mut dyn FnMut()| {
+            if enabled {
+                with_enabled(run)
+            } else {
+                run()
+            }
+        };
+        let parsed = if enabled { &items_enabled } else { &items };
         // Wall clock without the allocation probe: its born-pointer table
         // locks and walks on every allocation and free of every thread.
         // Fresh row copies per pass: no fingerprint result carried over.
         let api = api_report(&read);
-        let mut page = items.clone();
+        let mut page = parsed.clone();
         take_stages();
         let start = Instant::now();
-        attach_page(&mut page, &read);
-        side_calls_page(&mut page, &api, &trace, &index);
+        in_mode(&mut || {
+            attach_page(&mut page, &read);
+            side_calls_page(&mut page, &api, &trace, &index);
+        });
         drop(api);
         let enrichment_time = start.elapsed();
         let stages = take_stages();
         // The same work on an identical page, for the born-in-scope peak only.
-        // Attach and side calls run outside the gate in both modes, so one
-        // probed pass is the receipt for both.
-        let (allocation, probed_time) = *probe.get_or_insert_with(|| {
+        // Dark attach moves the tally, not grains: one probed pass per mode.
+        let (allocation, probed_time) = {
             let api = api_report(&read);
-            let mut probed = items.clone();
+            let mut probed = parsed.clone();
             let probe_start = Instant::now();
-            let (_, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
-                attach_page(&mut probed, &read);
-                side_calls_page(&mut probed, &api, &trace, &index);
+            let mut allocation = None;
+            in_mode(&mut || {
+                allocation = Some(
+                    crate::retry_allocation_probe::measure_caller_thread(|| {
+                        attach_page(&mut probed, &read);
+                        side_calls_page(&mut probed, &api, &trace, &index);
+                    })
+                    .1,
+                );
             });
             let probed_time = probe_start.elapsed();
             take_stages();
             assert!(page.iter().zip(&probed).all(|(a, b)| {
                 fold(a).entity.grains == fold(b).entity.grains
+                    && fold(a).entity.totals() == fold(b).entity.totals()
+                    && fold(a).entity.estimated_requests() == fold(b).entity.estimated_requests()
                     && fold(a).side_requests == fold(b).side_requests
             }));
-            (allocation, probed_time)
-        });
+            (allocation.unwrap(), probed_time)
+        };
         assert!(page
             .iter()
             .all(|item| fold(item).telemetry.membership.entries.is_empty()));
+        // Both modes: matched requests left the estimate, and the family
+        // counts every transcript request plus each unheld reported one.
         assert_eq!(
-            page.iter().map(|item| requests(item, MATCHED)).sum::<u64>(),
-            MEMBERS as u64
+            page.iter()
+                .map(|item| fold(item).entity.estimated_requests())
+                .sum::<u64>(),
+            (ROWS - MEMBERS) as u64
         );
         assert_eq!(
             page.iter()
-                .map(|item| requests(item, REPORTED))
+                .map(|item| fold(item).entity.totals().1)
                 .sum::<u64>(),
-            (ROWS - MEMBERS - OFF_PAGE) as u64
+            (2 * ROWS - MEMBERS - OFF_PAGE) as u64
         );
+        if enabled {
+            // Grain detail exists only with the gate on.
+            assert_eq!(
+                page.iter().map(|item| requests(item, MATCHED)).sum::<u64>(),
+                MEMBERS as u64
+            );
+            assert_eq!(
+                page.iter()
+                    .map(|item| requests(item, REPORTED))
+                    .sum::<u64>(),
+                (ROWS - MEMBERS - OFF_PAGE) as u64
+            );
+        }
         assert_eq!(
             fold(&page[MEMBERS - 1]).side_requests,
             ((ROWS - MEMBERS - OFF_PAGE) / 2) as u64
@@ -1312,41 +1381,46 @@ fn stage_twins(index: &mut ScanIndex, paths: &[(&Path, i128)]) {
 
 #[test]
 fn e2_first_ever_restored_root_twins_stage_before_either_fold() {
-    for reverse in [false, true] {
-        let early = root_file("first-early");
-        let later = root_file("first-later");
-        let history = [line("h1", &at(-100), 1), line("h2", &at(-90), 2)];
-        let mut index = ScanIndex::default();
-        index.files.insert(local_index_key(&early), entry());
-        index.files.insert(local_index_key(&later), entry());
-        assert!(index.claude_money_birth_store.is_empty());
-        let mut paths: Vec<(&Path, i128)> = vec![(&early, t0()), (&later, t0() + 5_000_000_000)];
-        if reverse {
-            paths.reverse();
-        }
-        stage_twins(&mut index, &paths);
-        // No seeded/discarded parse and no restart before these first results.
-        let items = paths
-            .iter()
-            .map(|(path, birth)| parse(path, Some(*birth), &index, &history))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            items.iter().map(|i| fold(i).entity.totals().1).sum::<u64>(),
-            2
-        );
-        assert_eq!(
-            items
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        for reverse in [false, true] {
+            let early = root_file("first-early");
+            let later = root_file("first-later");
+            let history = [line("h1", &at(-100), 1), line("h2", &at(-90), 2)];
+            let mut index = ScanIndex::default();
+            index.files.insert(local_index_key(&early), entry());
+            index.files.insert(local_index_key(&later), entry());
+            assert!(index.claude_money_birth_store.is_empty());
+            let mut paths: Vec<(&Path, i128)> =
+                vec![(&early, t0()), (&later, t0() + 5_000_000_000)];
+            if reverse {
+                paths.reverse();
+            }
+            stage_twins(&mut index, &paths);
+            // No seeded/discarded parse and no restart before these first results.
+            let items = paths
                 .iter()
-                .map(|i| fold(i).entity.removed_requests)
-                .sum::<u64>(),
-            2
-        );
-        let got = publish(items, None, TelemetryRead::Loaded, &index);
-        assert_eq!(got.len(), 1);
-        assert_eq!((got[0].request_count, got[0].input_tokens), (2, 3));
-        assert_eq!(got[0].removed_request_count, Some(2));
-        cleanup(&[&early, &later]);
-    }
+                .map(|(path, birth)| parse(path, Some(*birth), &index, &history))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                items.iter().map(|i| fold(i).entity.totals().1).sum::<u64>(),
+                2
+            );
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|i| fold(i).entity.removed_requests)
+                    .sum::<u64>(),
+                2
+            );
+            let got = publish(items, None, TelemetryRead::Loaded, &index);
+            assert_eq!(got.len(), 1);
+            assert_eq!((got[0].request_count, got[0].input_tokens), (2, 3));
+            assert_eq!(got[0].removed_request_count, Some(2));
+            cleanup(&[&early, &later]);
+        }
+    })
 }
 
 fn agent_file(name: &str) -> PathBuf {
@@ -1359,141 +1433,149 @@ fn agent_file(name: &str) -> PathBuf {
 
 #[test]
 fn e2_subagent_twins_identical_and_overlapping_count_once_in_both_orders() {
-    for overlap in [false, true] {
-        for reverse in [false, true] {
-            let early = agent_file("sub-early");
-            let later = agent_file("sub-later");
-            let own = |id, seconds, input| {
-                let mut value = line(id, &at(seconds), input);
-                value["agentId"] = json!("abc");
-                value["isSidechain"] = json!(true);
-                value
-            };
-            let history = vec![own("a", 1, 10), own("b", 2, 20)];
-            let mut later_lines = history.clone();
-            if overlap {
-                later_lines.push(own("c", 61, 30));
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        for overlap in [false, true] {
+            for reverse in [false, true] {
+                let early = agent_file("sub-early");
+                let later = agent_file("sub-later");
+                let own = |id, seconds, input| {
+                    let mut value = line(id, &at(seconds), input);
+                    value["agentId"] = json!("abc");
+                    value["isSidechain"] = json!(true);
+                    value
+                };
+                let history = vec![own("a", 1, 10), own("b", 2, 20)];
+                let mut later_lines = history.clone();
+                if overlap {
+                    later_lines.push(own("c", 61, 30));
+                }
+                let mut index = ScanIndex::default();
+                index.files.insert(local_index_key(&early), entry());
+                index.files.insert(local_index_key(&later), entry());
+                stage_twins(
+                    &mut index,
+                    &[(&early, t0()), (&later, t0() + 60_000_000_000)],
+                );
+                let first = parse(&early, Some(t0()), &index, &history);
+                let second = parse(&later, Some(t0() + 60_000_000_000), &index, &later_lines);
+                assert_eq!(
+                    fold(&first).entity.totals().1,
+                    2,
+                    "earliest subagent counts fully"
+                );
+                assert_eq!(fold(&second).entity.removed_requests, 2);
+                let mut items = vec![first, second];
+                if reverse {
+                    items.reverse();
+                }
+                let got = publish(
+                    items,
+                    Some(&sidecar(&[row("a", 1, 10), row("b", 2, 20)])),
+                    TelemetryRead::Loaded,
+                    &index,
+                );
+                assert_eq!(got.len(), 1);
+                assert_eq!(got[0].request_count, 2 + u64::from(overlap));
+                assert_eq!(got[0].input_tokens, if overlap { 60 } else { 30 });
+                assert_eq!(got[0].removed_request_count, Some(2));
+                assert_eq!(
+                    got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                    Some("0.0002")
+                );
+                fs::remove_dir_all(early.ancestors().nth(3).unwrap()).unwrap();
+                fs::remove_dir_all(later.ancestors().nth(3).unwrap()).unwrap();
             }
-            let mut index = ScanIndex::default();
-            index.files.insert(local_index_key(&early), entry());
-            index.files.insert(local_index_key(&later), entry());
-            stage_twins(
-                &mut index,
-                &[(&early, t0()), (&later, t0() + 60_000_000_000)],
-            );
-            let first = parse(&early, Some(t0()), &index, &history);
-            let second = parse(&later, Some(t0() + 60_000_000_000), &index, &later_lines);
-            assert_eq!(
-                fold(&first).entity.totals().1,
-                2,
-                "earliest subagent counts fully"
-            );
-            assert_eq!(fold(&second).entity.removed_requests, 2);
-            let mut items = vec![first, second];
-            if reverse {
-                items.reverse();
-            }
-            let got = publish(
-                items,
-                Some(&sidecar(&[row("a", 1, 10), row("b", 2, 20)])),
-                TelemetryRead::Loaded,
-                &index,
-            );
-            assert_eq!(got.len(), 1);
-            assert_eq!(got[0].request_count, 2 + u64::from(overlap));
-            assert_eq!(got[0].input_tokens, if overlap { 60 } else { 30 });
-            assert_eq!(got[0].removed_request_count, Some(2));
-            assert_eq!(
-                got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
-                Some("0.0002")
-            );
-            fs::remove_dir_all(early.ancestors().nth(3).unwrap()).unwrap();
-            fs::remove_dir_all(later.ancestors().nth(3).unwrap()).unwrap();
         }
-    }
+    })
 }
 
 #[test]
 fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
-    for (truncated, partial) in [(false, false), (false, true), (true, false), (true, true)] {
-        let early = root_file("stale-early");
-        let later = root_file("stale-later");
-        let mut historical = line("h", &at(-100), 10);
-        historical["fixture_padding"] = json!("h".repeat(512));
-        let history = [historical];
-        let original_bytes = serde_json::to_vec(&history[0]).unwrap();
-        fs::write(&early, &original_bytes).unwrap();
-        let old_handle = fs::File::open(&early).unwrap();
-        let mut index = ScanIndex::default();
-        parse_and_remember(&early, t0(), &mut index, &history);
-        index
-            .files
-            .get_mut(&local_index_key(&early))
-            .unwrap()
-            .size_bytes = original_bytes.len() as u64;
-        index.files.insert(local_index_key(&later), entry());
-        // Keep the old inode open, so unlink/create cannot recycle it.
-        if !truncated {
-            fs::remove_file(&early).unwrap();
-        }
-        let mut replacement = line("u", &at(121), 20);
-        if !truncated {
-            replacement["fixture_padding"] = json!("u".repeat(1024));
-        }
-        fs::write(&early, serde_json::to_vec(&replacement).unwrap()).unwrap();
-        let current = fs::metadata(&early).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        for (truncated, partial) in [(false, false), (false, true), (true, false), (true, true)] {
+            let early = root_file("stale-early");
+            let later = root_file("stale-later");
+            let mut historical = line("h", &at(-100), 10);
+            historical["fixture_padding"] = json!("h".repeat(512));
+            let history = [historical];
+            let original_bytes = serde_json::to_vec(&history[0]).unwrap();
+            fs::write(&early, &original_bytes).unwrap();
+            let old_handle = fs::File::open(&early).unwrap();
+            let mut index = ScanIndex::default();
+            parse_and_remember(&early, t0(), &mut index, &history);
+            index
+                .files
+                .get_mut(&local_index_key(&early))
+                .unwrap()
+                .size_bytes = original_bytes.len() as u64;
+            index.files.insert(local_index_key(&later), entry());
+            // Keep the old inode open, so unlink/create cannot recycle it.
+            if !truncated {
+                fs::remove_file(&early).unwrap();
+            }
+            let mut replacement = line("u", &at(121), 20);
+            if !truncated {
+                replacement["fixture_padding"] = json!("u".repeat(1024));
+            }
+            fs::write(&early, serde_json::to_vec(&replacement).unwrap()).unwrap();
+            let current = fs::metadata(&early).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    current.ino() == old_handle.metadata().unwrap().ino(),
+                    truncated
+                );
+            }
             assert_eq!(
-                current.ino() == old_handle.metadata().unwrap().ino(),
-                truncated
+                current.len() < original_bytes.len() as u64,
+                truncated,
+                "new-inode case grows, so identity alone must reject it; truncation case shrinks"
             );
+            let mut later_lines = history.to_vec();
+            if partial {
+                later_lines.push(line("own", &at(61), 40));
+            }
+            fs::write(
+                &later,
+                later_lines
+                    .iter()
+                    .map(|line| serde_json::to_string(line).unwrap() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let mut index = restart(&index); // generation/extent evidence survives restart
+            stage_twins(
+                &mut index,
+                &[
+                    (&early, t0() + 120_000_000_000),
+                    (&later, t0() + 60_000_000_000),
+                ],
+            );
+            let early_item = parse(&early, Some(t0() + 120_000_000_000), &index, &[replacement]);
+            let later_item = parse(&later, Some(t0() + 60_000_000_000), &index, &later_lines);
+            assert_eq!(fold(&later_item).entity.removed_requests, 0);
+            assert_eq!(fold(&later_item).entity.totals().1, 1 + u64::from(partial));
+            assert!(fold(&later_item).disclosed > 0);
+            let got = publish(
+                vec![early_item, later_item],
+                None,
+                TelemetryRead::Loaded,
+                &index,
+            );
+            assert_eq!(
+                (got[0].request_count, got[0].input_tokens),
+                (2 + u64::from(partial), if partial { 70 } else { 30 })
+            );
+            assert_eq!(got[0].removed_request_count, Some(0));
+            assert_eq!(got[0].removed_usage, Some(ClaudeRemovedUsage::default()));
+            cleanup(&[&early, &later]);
         }
-        assert_eq!(
-            current.len() < original_bytes.len() as u64,
-            truncated,
-            "new-inode case grows, so identity alone must reject it; truncation case shrinks"
-        );
-        let mut later_lines = history.to_vec();
-        if partial {
-            later_lines.push(line("own", &at(61), 40));
-        }
-        fs::write(
-            &later,
-            later_lines
-                .iter()
-                .map(|line| serde_json::to_string(line).unwrap() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        let mut index = restart(&index); // generation/extent evidence survives restart
-        stage_twins(
-            &mut index,
-            &[
-                (&early, t0() + 120_000_000_000),
-                (&later, t0() + 60_000_000_000),
-            ],
-        );
-        let early_item = parse(&early, Some(t0() + 120_000_000_000), &index, &[replacement]);
-        let later_item = parse(&later, Some(t0() + 60_000_000_000), &index, &later_lines);
-        assert_eq!(fold(&later_item).entity.removed_requests, 0);
-        assert_eq!(fold(&later_item).entity.totals().1, 1 + u64::from(partial));
-        assert!(fold(&later_item).disclosed > 0);
-        let got = publish(
-            vec![early_item, later_item],
-            None,
-            TelemetryRead::Loaded,
-            &index,
-        );
-        assert_eq!(
-            (got[0].request_count, got[0].input_tokens),
-            (2 + u64::from(partial), if partial { 70 } else { 30 })
-        );
-        assert_eq!(got[0].removed_request_count, Some(0));
-        assert_eq!(got[0].removed_usage, Some(ClaudeRemovedUsage::default()));
-        cleanup(&[&early, &later]);
-    }
+    })
 }
 
 fn without_version(mut value: Value) -> Value {
@@ -1503,68 +1585,76 @@ fn without_version(mut value: Value) -> Value {
 
 #[test]
 fn e2_missing_own_writer_invalidates_known_prefix_and_both_own_orders() {
-    let path = root_file("missing-writer");
-    let index = ScanIndex::default();
-    for order in [0, 1, 2, 3, 4] {
-        let prefix = line("prefix", &at(-100), 10);
-        let a = line("a", &at(1), 20);
-        let b = line("b", &at(2), 30);
-        let lines = match order {
-            0 => vec![prefix, without_version(a)],
-            1 => vec![prefix, without_version(a), b],
-            2 => vec![prefix, a, without_version(b)],
-            3 => {
-                let mut missing = without_version(a);
-                missing.as_object_mut().unwrap().remove("timestamp");
-                vec![prefix, missing, b]
-            }
-            _ => {
-                let mut missing = without_version(b);
-                missing.as_object_mut().unwrap().remove("timestamp");
-                vec![prefix, a, missing]
-            }
-        };
-        let item = parse(&path, Some(t0()), &index, &lines);
-        assert_eq!(fold(&item).entity.removed_requests, 0);
-        assert_eq!(fold(&item).entity.totals().1, lines.len() as u64);
-        assert!(fold(&item).disclosed > 0);
-        let got = publish(vec![item], None, TelemetryRead::Loaded, &index);
-        assert_eq!(got[0].request_count, lines.len() as u64);
-    }
-    cleanup(&[&path]);
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        let path = root_file("missing-writer");
+        let index = ScanIndex::default();
+        for order in [0, 1, 2, 3, 4] {
+            let prefix = line("prefix", &at(-100), 10);
+            let a = line("a", &at(1), 20);
+            let b = line("b", &at(2), 30);
+            let lines = match order {
+                0 => vec![prefix, without_version(a)],
+                1 => vec![prefix, without_version(a), b],
+                2 => vec![prefix, a, without_version(b)],
+                3 => {
+                    let mut missing = without_version(a);
+                    missing.as_object_mut().unwrap().remove("timestamp");
+                    vec![prefix, missing, b]
+                }
+                _ => {
+                    let mut missing = without_version(b);
+                    missing.as_object_mut().unwrap().remove("timestamp");
+                    vec![prefix, a, missing]
+                }
+            };
+            let item = parse(&path, Some(t0()), &index, &lines);
+            assert_eq!(fold(&item).entity.removed_requests, 0);
+            assert_eq!(fold(&item).entity.totals().1, lines.len() as u64);
+            assert!(fold(&item).disclosed > 0);
+            let got = publish(vec![item], None, TelemetryRead::Loaded, &index);
+            assert_eq!(got[0].request_count, lines.len() as u64);
+        }
+        cleanup(&[&path]);
+    })
 }
 
 #[test]
 fn e2_all_prebirth_twins_require_known_response_writers() {
-    for missing in [false, true] {
-        let early = root_file("unknown-early");
-        let later = root_file("unknown-later");
-        let mut index = ScanIndex::default();
-        index.files.insert(local_index_key(&early), entry());
-        index.files.insert(local_index_key(&later), entry());
-        stage_twins(
-            &mut index,
-            &[(&early, t0()), (&later, t0() + 60_000_000_000)],
-        );
-        let original = line("h", &at(-100), 10);
-        let copy = if missing {
-            without_version(original.clone())
-        } else {
-            versioned(original.clone(), "99.0.0")
-        };
-        let item = parse(&later, Some(t0() + 60_000_000_000), &index, &[copy]);
-        assert_eq!(fold(&item).entity.removed_requests, 0);
-        assert_eq!(fold(&item).entity.totals().1, 1);
-        assert!(fold(&item).disclosed > 0);
-        let got = publish(
-            vec![parse(&early, Some(t0()), &index, &[original]), item],
-            None,
-            TelemetryRead::Loaded,
-            &index,
-        );
-        assert_eq!((got[0].request_count, got[0].input_tokens), (2, 20));
-        cleanup(&[&early, &later]);
-    }
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        for missing in [false, true] {
+            let early = root_file("unknown-early");
+            let later = root_file("unknown-later");
+            let mut index = ScanIndex::default();
+            index.files.insert(local_index_key(&early), entry());
+            index.files.insert(local_index_key(&later), entry());
+            stage_twins(
+                &mut index,
+                &[(&early, t0()), (&later, t0() + 60_000_000_000)],
+            );
+            let original = line("h", &at(-100), 10);
+            let copy = if missing {
+                without_version(original.clone())
+            } else {
+                versioned(original.clone(), "99.0.0")
+            };
+            let item = parse(&later, Some(t0() + 60_000_000_000), &index, &[copy]);
+            assert_eq!(fold(&item).entity.removed_requests, 0);
+            assert_eq!(fold(&item).entity.totals().1, 1);
+            assert!(fold(&item).disclosed > 0);
+            let got = publish(
+                vec![parse(&early, Some(t0()), &index, &[original]), item],
+                None,
+                TelemetryRead::Loaded,
+                &index,
+            );
+            assert_eq!((got[0].request_count, got[0].input_tokens), (2, 20));
+            cleanup(&[&early, &later]);
+        }
+    })
 }
 
 const ORG_A: &str = "11111111-1111-4111-8111-111111111111";
@@ -3742,69 +3832,77 @@ fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
 
 #[test]
 fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
-    for reverse in [false, true] {
-        let early = agent_file("equal-sub-a");
-        let later = agent_file("equal-sub-b");
-        let birth = t0() + 60_000_000_000;
-        let history = vec![sub_line("a", 1, 10), sub_line("b", 2, 20)];
-        let mut index = ScanIndex::default();
-        index.files.insert(local_index_key(&early), entry());
-        index.files.insert(local_index_key(&later), entry());
-        let mut paths: Vec<(&Path, i128)> = vec![(&early, birth), (&later, birth)];
-        if reverse {
-            paths.reverse();
-        }
-        stage_twins(&mut index, &paths);
-        let items = paths
-            .iter()
-            .map(|(path, birth)| parse(path, Some(*birth), &index, &history))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            items
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        for reverse in [false, true] {
+            let early = agent_file("equal-sub-a");
+            let later = agent_file("equal-sub-b");
+            let birth = t0() + 60_000_000_000;
+            let history = vec![sub_line("a", 1, 10), sub_line("b", 2, 20)];
+            let mut index = ScanIndex::default();
+            index.files.insert(local_index_key(&early), entry());
+            index.files.insert(local_index_key(&later), entry());
+            let mut paths: Vec<(&Path, i128)> = vec![(&early, birth), (&later, birth)];
+            if reverse {
+                paths.reverse();
+            }
+            stage_twins(&mut index, &paths);
+            let items = paths
                 .iter()
-                .map(|i| fold(i).entity.removed_requests)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([0, 2]),
-            "the (birth, location) order names exactly one copy"
-        );
-        let got = publish(items, None, TelemetryRead::Loaded, &index);
-        assert_eq!(got.len(), 1);
-        assert_eq!((got[0].request_count, got[0].input_tokens), (2, 30));
-        assert_eq!(got[0].removed_request_count, Some(2));
-        remove_agent_scratch(&[&early, &later]);
-    }
+                .map(|(path, birth)| parse(path, Some(*birth), &index, &history))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|i| fold(i).entity.removed_requests)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([0, 2]),
+                "the (birth, location) order names exactly one copy"
+            );
+            let got = publish(items, None, TelemetryRead::Loaded, &index);
+            assert_eq!(got.len(), 1);
+            assert_eq!((got[0].request_count, got[0].input_tokens), (2, 30));
+            assert_eq!(got[0].removed_request_count, Some(2));
+            remove_agent_scratch(&[&early, &later]);
+        }
+    })
 }
 
 #[test]
 fn e2_absent_subagent_twin_holds_its_session() {
-    let early = agent_file("absent-sub-early");
-    let later = agent_file("absent-sub-later");
-    let mut index = ScanIndex::default();
-    let first = parse_and_remember(&early, t0(), &mut index, &[sub_line("a", 1, 10)]);
-    let page = |index: &ScanIndex| {
-        parse(
-            &later,
-            Some(t0() + 60_000_000_000),
-            index,
-            &[sub_line("b", 61, 20)],
-        )
-    };
-    let second = page(&index);
-    remember_birth(&mut index, &later, fold(&second));
-    index.files.insert(local_index_key(&later), entry());
-    let session = second.source_session_id.clone();
-    assert_eq!(session, format!("{ROOT}_agent-abc"));
-    // The earlier path is indexed and on disk but not on this page.
-    let mut items = vec![page(&index)];
-    let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
-    assert_eq!(withheld, BTreeSet::from([session]));
-    // Both paths on the page: one body, nothing withheld.
-    let mut items = vec![first, page(&index)];
-    let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
-    assert!(withheld.is_empty());
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].request_count, 2);
-    remove_agent_scratch(&[&early, &later]);
+    // Publication runs with the gate on, so the parse does too: dark
+    // keeps no grain map to publish.
+    with_enabled(|| {
+        let early = agent_file("absent-sub-early");
+        let later = agent_file("absent-sub-later");
+        let mut index = ScanIndex::default();
+        let first = parse_and_remember(&early, t0(), &mut index, &[sub_line("a", 1, 10)]);
+        let page = |index: &ScanIndex| {
+            parse(
+                &later,
+                Some(t0() + 60_000_000_000),
+                index,
+                &[sub_line("b", 61, 20)],
+            )
+        };
+        let second = page(&index);
+        remember_birth(&mut index, &later, fold(&second));
+        index.files.insert(local_index_key(&later), entry());
+        let session = second.source_session_id.clone();
+        assert_eq!(session, format!("{ROOT}_agent-abc"));
+        // The earlier path is indexed and on disk but not on this page.
+        let mut items = vec![page(&index)];
+        let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+        assert_eq!(withheld, BTreeSet::from([session]));
+        // Both paths on the page: one body, nothing withheld.
+        let mut items = vec![first, page(&index)];
+        let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+        assert!(withheld.is_empty());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].request_count, 2);
+        remove_agent_scratch(&[&early, &later]);
+    })
 }
 
 #[test]
