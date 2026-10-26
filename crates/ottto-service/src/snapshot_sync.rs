@@ -9096,6 +9096,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // qualification now own the final rows. Do not retain or clone the fold
     // alongside upload entities. A withheld entity still needs its original
     // fold for the hold; it has no request-owned emitted body.
+    #[cfg(test)]
+    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
+        &scan_result.snapshots,
+    );
     for item in &mut scan_result.snapshots {
         if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
             crate::snapshots::claude_request_money::e2::release_emitted_fold(item);

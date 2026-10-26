@@ -62,6 +62,23 @@ fn e2_page(
     index: &mut ScanIndex,
     permitted: bool,
 ) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition, bool) {
+    let (items, disposition, failed, _) = e2_page_counted(dirs, support, index, permitted);
+    (items, disposition, failed)
+}
+
+/// `e2_page` plus the page identity counters `finish_page` recorded (read
+/// before the emitted folds they derive from are released).
+fn e2_page_counted(
+    dirs: &[PathBuf],
+    support: &Path,
+    index: &mut ScanIndex,
+    permitted: bool,
+) -> (
+    Vec<SnapshotItem>,
+    ClaudeUsageAuthorityDisposition,
+    bool,
+    serde_json::Value,
+) {
     claude_request_money::e2::with_enabled(|| {
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -89,14 +106,17 @@ fn e2_page(
             index,
             "e2-identity-machine",
         );
-        let (disposition, _, stats) =
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
-                support, &mut scan, index, permit,
-            );
+        let ((disposition, _, stats), counts) =
+            claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
+                    support, &mut scan, index, permit,
+                )
+            });
         (
             scan.snapshots,
             disposition,
             stats.effort_evidence_load_failed,
+            counts,
         )
     })
 }
@@ -401,8 +421,8 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
                 },
             );
         }
-        let (items, disposition, failed) =
-            e2_page(std::slice::from_ref(&dir), &support, &mut index, true);
+        let (items, disposition, failed, counts) =
+            e2_page_counted(std::slice::from_ref(&dir), &support, &mut index, true);
         assert!(!failed);
         let item = items
             .iter()
@@ -418,8 +438,6 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
             item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
             Some(if partial { "0.0002" } else { "0.0004" })
         );
-        let counts =
-            serde_json::to_value(claude_request_identity::page_identity_counts(&items)).unwrap();
         if partial {
             assert_eq!(
                 counts["claude_inherited_org_requests"], 2,
@@ -469,7 +487,7 @@ fn e2_pipeline_exact_telemetry_over_cap_uses_the_existing_counted_start_fallback
         root,
         &trace,
     );
-    let (items, disposition, failed) = e2_page(
+    let (items, disposition, failed, counts) = e2_page_counted(
         std::slice::from_ref(&dir),
         &support,
         &mut ScanIndex::default(),
@@ -495,8 +513,6 @@ fn e2_pipeline_exact_telemetry_over_cap_uses_the_existing_counted_start_fallback
         display.current.account_identifier_hash,
         Some(format!("{:064x}", 1))
     );
-    let counts =
-        serde_json::to_value(claude_request_identity::page_identity_counts(&items)).unwrap();
     assert_eq!(counts["claude_identity_conflict_fallbacks"], 1);
     assert_eq!(disposition.quarantined_entity_count(), 0);
     fs::remove_dir_all(dir).unwrap();
