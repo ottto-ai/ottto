@@ -3777,3 +3777,5 @@ fn deferred_retry_resumes_after_transient_funding_refusal() {
         0
     );
 }
+
+include!("retry_admission_tests.rs");

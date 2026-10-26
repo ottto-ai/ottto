@@ -2123,6 +2123,18 @@ struct ClaudeRetryAdmission {
     complete: bool,
     progressed: bool,
     served_before: u64,
+    #[serde(default)]
+    due_through: u64,
+    #[serde(default)]
+    due_after_path: Option<String>,
+    #[serde(default)]
+    due_upper_path: Option<String>,
+    #[serde(default)]
+    due_complete: bool,
+    #[serde(default)]
+    oversized_root: Option<String>,
+    #[serde(default)]
+    oversized_after_path: Option<String>,
 }
 
 impl ClaudeStaleFamilyCarry {
@@ -5283,6 +5295,12 @@ fn claude_stream_accepted_retry_carry(
     .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     cost.add(path_bytes)
         .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
+    // Tests may refuse an otherwise priced multi-root start; the actual
+    // structural math above still runs unchanged before this scheduling seam.
+    #[cfg(test)]
+    if stale.len() > 1 && retry_admission_tests_refuse_multi() {
+        return Err(ClaudeRetryAdmissionRefusal::Structure);
+    }
     if !claude_family_carry_cancellation_admitted(
         0,
         0,
@@ -24750,6 +24768,9 @@ impl OwnedSourceScan {
                 codex_parent_identities.census(index),
             )))
         });
+        if source == SnapshotSource::ClaudeCode {
+            claude_retry_queue_due_families(index, collected_at);
+        }
         let traversal = index.traversal.as_mut().expect("traversal initialized");
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
@@ -24822,6 +24843,7 @@ impl OwnedSourceScan {
             &mut index.files,
             selection_limit,
         );
+        let retry_service_start = pending_paths.len();
         // Authority deadlines are serviced independently of history admission,
         // before audits can consume the existing per-page selection allowance.
         if source == SnapshotSource::ClaudeCode {
@@ -24831,16 +24853,15 @@ impl OwnedSourceScan {
                 .as_ref()
                 .and_then(|origin| origin.admission.as_ref())
             {
-                let now = rfc3339_unix_seconds(&census_window_end).unwrap_or_default();
+                let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
                 while pending_paths.len() < selection_limit {
                     let due = traversal.pending_candidates.front().is_some_and(|path| {
-                        claude_index_path_member_ref(&path.path)
-                            .and_then(|member| {
-                                index.claude_usage_authority_quarantine.get(member.root)
-                            })
-                            .is_some_and(|record| {
-                                claude_retry_record_due(record, now, state.served_before)
-                            })
+                        claude_retry_path_owed(
+                            state,
+                            &index.claude_usage_authority_quarantine,
+                            &local_index_key(&path.path),
+                            now,
+                        )
                     });
                     if !due {
                         break;
@@ -24851,6 +24872,7 @@ impl OwnedSourceScan {
                 }
             }
         }
+        let retry_service_end = pending_paths.len();
         let audit_now = sampled_scan::now_seconds();
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
@@ -24929,6 +24951,13 @@ impl OwnedSourceScan {
                 .partition(|candidate| candidate.census_member);
             pending_paths.extend(members);
             pending_paths.extend(rereads);
+        }
+        if source == SnapshotSource::ClaudeCode && retry_service_end > retry_service_start {
+            claude_retry_note_offered(
+                index,
+                &pending_paths[retry_service_start..retry_service_end],
+                collected_at,
+            );
         }
         index.resume_census_window_end = Some(census_window_end.clone());
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
@@ -38723,7 +38752,14 @@ fn ensure_bounded_traversal(
         let mut admission = None;
         let mut covered_roots = None;
         let carry = if streaming_carry {
-            match claude_stream_accepted_retry_carry(index, &stale_pending_roots) {
+            // Existing scheduling debt survives even if the whole set now fits.
+            // Re-price its batch, but do not discard unoffered service cursors.
+            let whole = if prior_admission.is_some() {
+                Err(ClaudeRetryAdmissionRefusal::Structure)
+            } else {
+                claude_stream_accepted_retry_carry(index, &stale_pending_roots)
+            };
+            match whole {
                 Ok(carry) => carry,
                 Err(refusal) => {
                     let due = claude_retry_due_family_exists(index, collected_at);
@@ -38735,7 +38771,7 @@ fn ensure_bounded_traversal(
                             index,
                             &stale_pending_roots,
                             prior_admission.as_ref(),
-                            refusal,
+                            collected_at,
                         );
                         covered_roots = Some(covered);
                         admission = Some(state);
@@ -85421,7 +85457,7 @@ crate::heap_layout_bound::fields!(ScanTraversalCounts; unchanged_reread_admitted
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
-crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, progressed, served_before);
+crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path);
 crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
