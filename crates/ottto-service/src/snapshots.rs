@@ -56301,17 +56301,16 @@ mod tests {
             "019e2700-4444-7000-9000-444444444443",
         ];
         let usage = "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n";
+        let fixture = |id: &str| {
+            format!(
+                "{{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n{usage}"
+            )
+        };
         let paths = ids
             .iter()
-            .map(|id| {
+            .map(|&id| {
                 let path = root.join(format!("rollout-2026-05-14T10-00-00-{id}.jsonl"));
-                fs::write(
-                    &path,
-                    format!(
-                        "{{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n{usage}"
-                    ),
-                )
-                .expect("write codex fixture");
+                fs::write(&path, fixture(id)).expect("write codex fixture");
                 path
             })
             .collect::<Vec<_>>();
@@ -56334,13 +56333,10 @@ mod tests {
             vec![line(true, &[("new_file", 3)])]
         );
 
-        let mut grown = fs::read_to_string(&paths[1]).expect("read fixture");
-        grown.push_str(
-            &usage
-                .replace("10:03:00", "10:04:00")
-                .replace(":40,", ":50,"),
-        );
-        fs::write(&paths[1], grown).expect("grow one fixture");
+        let grown = usage
+            .replace("10:03:00", "10:04:00")
+            .replace(":40,", ":50,");
+        fs::write(&paths[1], fixture(ids[1]) + &grown).expect("grow one fixture");
         assert_eq!(
             scan(&mut index, "2026-05-14T10:06:00Z"),
             vec![line(true, &[("transcript_changed", 1), ("skip", 2)])]
