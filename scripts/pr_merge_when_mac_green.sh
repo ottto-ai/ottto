@@ -17,7 +17,7 @@ MIN_INTERVAL=60
 # Two hours: a queued PR waits for its PR checks and then a full queue round
 # (Mac slot wait plus the Mac job) inside one shared budget.
 DEFAULT_TIMEOUT=7200
-PR_FIELDS="state,isDraft,headRefOid,mergeable,baseRefName,headRefName,isCrossRepository,headRepository,headRepositoryOwner"
+PR_FIELDS="id,state,isDraft,headRefOid,mergeable,baseRefName,headRefName,isCrossRepository,headRepository,headRepositoryOwner"
 
 EXIT_USAGE=2
 EXIT_REFUSED=3
@@ -45,9 +45,10 @@ MERGEABLE it runs:
   gh pr merge <pr> --squash --match-head-commit <head-sha>
 
 If the base branch requires a merge queue, "Rust contracts" may also be skipped
-on the PR run; the three Linux checks must still succeed. The guard instead runs
-  gh pr merge <pr> --match-head-commit <head-sha>
-and waits until merged, removed from the queue, the head changes, or timeout.
+on the PR run; the three Linux checks must still succeed. The guard instead
+enqueues exactly <head-sha> with GitHub's enqueuePullRequest mutation
+(expectedHeadOid; independent of the repository's auto-merge setting) and waits
+until merged, removed from the queue, the head changes, or timeout.
 The queue's configured merge method applies; no administrator bypass is used.
 Rerunning the guard for a PR that is already queued resumes the wait.
 
@@ -244,6 +245,19 @@ report_queue_failure() {
   fi
 }
 
+# gh pr merge enqueues through enablePullRequestAutoMerge, which depends on the
+# repository allowing auto-merge; the direct mutation does not.
+enqueue() {
+  local pr_id
+  pr_id="$(pr_field id)"
+  [ -n "$pr_id" ] || return 1
+  # GraphQL variables must reach GitHub literally.
+  # shellcheck disable=SC2016
+  gh api graphql -f pr_id="$pr_id" -f head="$head_sha" \
+    -f query='mutation($pr_id: ID!, $head: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $pr_id, expectedHeadOid: $head}) { mergeQueueEntry { state position } } }' \
+    >/dev/null
+}
+
 queue_query() {
   # GraphQL variables must reach GitHub literally.
   # shellcheck disable=SC2016
@@ -355,13 +369,13 @@ while :; do
         if [ "$mergeable" = MERGEABLE ]; then
           if [ "$queue_mode" = true ]; then
             log "all required PR checks passed on $head_sha; enqueuing PR #$pr"
-            if ! gh pr merge "$pr" --match-head-commit "$head_sha"; then
+            if ! enqueue; then
               # A rerun after a timeout finds the PR already queued (or just
               # merged); resume waiting instead of reporting a gh failure.
               if already_queued; then
                 log "PR #$pr is already in the merge queue or merged; resuming the wait"
               else
-                die "$EXIT_GH" "gh pr merge $pr failed"
+                die "$EXIT_GH" "enqueueing PR #$pr at $head_sha failed"
               fi
             fi
             wait_for_queue
