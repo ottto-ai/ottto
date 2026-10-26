@@ -116,7 +116,7 @@ fn e2_assert_identity_consistent(item: &SnapshotItem, label: &str) {
         assert!(
             row.account_identifier_hash
                 .as_deref()
-                .is_none_or(|hash| hash == account),
+                .map_or(true, |hash| hash == account),
             "{label}: facts never move to another account"
         );
         if let Some(evidence_ref) = row.evidence_ref {

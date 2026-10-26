@@ -322,6 +322,19 @@ jobs:
             if [ $((round % 2)) -eq 0 ]; then order="reference dark on"; else order="on dark reference"; fi
             for arm in $order; do run_arm "$arm" "$round"; done
           done
+      - name: Whole-history page (one per arm, fresh process each)
+        run: |
+          set -euo pipefail
+          test_name="$(cat "$RUNNER_TEMP/e2-test-name.txt")"
+          for arm in reference dark on; do
+            bin="$RUNNER_TEMP/bench-candidate"
+            [ "$arm" = reference ] && bin="$RUNNER_TEMP/bench-reference"
+            OTTTO_E2_BENCH_ROOT="$RUNNER_TEMP/e2-bench" OTTTO_E2_BENCH_MODE=history OTTTO_E2_BENCH_ARM="$arm" OTTTO_E2_BENCH_TAG="$arm" \
+              OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/e2-history-$arm.json" \
+              "$bin" "$test_name" --exact --ignored --nocapture --test-threads 1 2>&1 \
+              | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
+            rm -rf "$RUNNER_TEMP/e2-bench/runs/history-$arm"
+          done
       - name: Switch-on reread probe (revision 2 to 3)
         run: |
           set -euo pipefail
@@ -340,6 +353,7 @@ jobs:
           hook = (root / "e2-hook.txt").read_text().strip()
           arms = {a: [json.loads(p.read_text()) for p in sorted(root.glob(f"e2-arm-{a}-*.json"))] for a in ("reference", "dark", "on")}
           candidate = arms["dark"] + arms["on"]
+          history = {a: [json.loads(p.read_text()) for p in sorted(root.glob(f"e2-history-{a}.json"))] for a in ("reference", "dark", "on")}
           reread = read("e2-reread.json")
           MIB = 1 << 20
           med = lambda values: statistics.median(values) if values else None
@@ -352,6 +366,14 @@ jobs:
           rss = per_arm(lambda r: r["max_rss_bytes"])
           steady = per_arm(lambda r: r["phys_footprint_steady_bytes"])
           peak = per_arm(lambda r: r["phys_footprint_peak_bytes"])
+          # The memory gate is the PEAK physical footprint (+2 MiB): a
+          # transient addition freed before the steady sample still counts.
+          peak_valid = all(arms[a] and all(r["phys_footprint_peak_bytes"] > 0 for r in arms[a]) for a in arms)
+          hist = lambda f: {a: med([f(r) for r in runs]) for a, runs in history.items()}
+          history_peak = hist(lambda r: r["phys_footprint_peak_bytes"])
+          history_wall = hist(lambda r: r["page"]["wall_us"])
+          history_cpu = hist(lambda r: r["page"]["cpu_us"])
+          history_valid = all(len(history[a]) == 1 and history[a][0]["page"]["files"] > 0 and history[a][0]["phys_footprint_peak_bytes"] > 0 for a in history)
           index = per_arm(lambda r: r["index_bytes"] or 0)
           rss_ref = [r["max_rss_bytes"] for r in arms["reference"]]
           # Peak RSS of identical code moved ~6% between processes in the
@@ -387,6 +409,10 @@ jobs:
               "max_rss_tolerance_bytes": rss_tolerance,
               "phys_footprint_steady_bytes": steady,
               "phys_footprint_peak_bytes": peak,
+              "phys_footprint_peak_delta_bytes": {a: peak[a] - peak["reference"] for a in ("dark", "on") if peak[a] is not None and peak["reference"] is not None},
+              "history_page": {a: {k: runs[0][k] for k in ("hook", "stamped_files", "page", "phys_footprint_before_bytes", "phys_footprint_after_bytes", "phys_footprint_peak_bytes", "max_rss_bytes")} for a, runs in history.items() if runs},
+              "history_page_wall_ratio": {a: history_wall[a] / history_wall["reference"] if history_wall[a] is not None and history_wall["reference"] else None for a in ("dark", "on")},
+              "history_page_cpu_ratio": {a: history_cpu[a] / history_cpu["reference"] if history_cpu[a] is not None and history_cpu["reference"] else None for a in ("dark", "on")},
               "index_bytes": index,
               "index_bytes_delta": {a: index[a] - index["reference"] for a in ("dark", "on") if index[a] is not None and index["reference"] is not None},
               "fold_us_per_response": fold,
@@ -415,6 +441,10 @@ jobs:
               "page_cpu_le_5pct": all(within(ratio(cpu, a), 1.05) for a in ("dark", "on")),
               "peak_rss_not_worse": rss_tolerance is not None and all(within(rss[a], rss["reference"] + rss_tolerance) for a in ("dark", "on")),
               "phys_footprint_le_2mib": all(within(steady[a], steady["reference"] + 2 * MIB) for a in ("dark", "on") if steady["reference"] is not None) and steady["reference"] is not None,
+              "phys_footprint_peak_le_2mib": peak_valid and all(within(peak[a], peak["reference"] + 2 * MIB) for a in ("dark", "on")),
+              # One whole-history page (up to 2,000 files / 1 GiB) per arm.
+              "history_page_measured": history_valid and history["reference"][0]["page"]["files"] == history["dark"][0]["page"]["files"],
+              "history_page_peak_le_2mib": history_valid and all(within(history_peak[a], history_peak["reference"] + 2 * MIB) for a in ("dark", "on")),
               # Dark must not change what is uploaded: the same snapshot
               # fingerprints as the pre-E2 reference, stable across rounds.
               "dark_uploads_equal_reference": result["dark_uploads_equal_reference"],

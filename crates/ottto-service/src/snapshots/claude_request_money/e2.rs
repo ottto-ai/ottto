@@ -15,8 +15,8 @@ use super::super::{
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,
     claude_snapshot_family_root_ref, claude_trace_evidence_fingerprint_is_valid,
     claude_trace_owner_session_id, local_index_key, rfc3339_unix_nanos, validate_claude_api_row,
-    ClaudeTranscriptUsageOccurrence, ResolvedClaudeResponse, ScanIndex, SelectorCapture,
-    SnapshotItem,
+    ClaudeTranscriptUsageOccurrence, PlacedClaudeUsage, RowKey, ScanIndex, SelectorCapture,
+    SnapshotItem, UsageTotals,
 };
 use super::body::{reported_inputs, ClaudeGrainSide, ClaudeLiveKey, ClaudeRequestUsageOrigin};
 use super::ClaudeMoneyTokens;
@@ -227,6 +227,7 @@ impl Default for ClaudeEntityBody {
     }
 }
 impl ClaudeEntityBody {
+    #[allow(clippy::too_many_arguments)]
     fn add(
         &mut self,
         key: ClaudeLiveKey,
@@ -384,6 +385,8 @@ pub(crate) struct FileFold {
     proof: Option<CopyProof>,
     /// Counted requests inheriting a possibly excluded marker. Sparse and
     /// bounded by the existing 64 marker runs, never by response count.
+    /// Boxed: one pointer on every fold, the map only when present.
+    #[allow(clippy::box_collection)]
     prefix_inherited: Option<Box<BTreeMap<u64, ClaudeEntityBody>>>,
     copied: u64,
     first_own: Option<u64>,
@@ -514,7 +517,8 @@ impl FileFold {
         )));
     }
 
-    /// The effective cutoff (copy rule), for diagnostics and tests.
+    /// The effective cutoff (copy rule), for tests.
+    #[cfg(test)]
     pub(crate) fn birth(&self) -> Option<i128> {
         self.money_birth.birth_nanos()
     }
@@ -548,64 +552,62 @@ impl FileFold {
             .is_some_and(|(start, _)| *start <= sequence)
     }
 
+    /// `placed` is the native finalizer's own placement of this response
+    /// (None: zero usage, no native row), so the grain key equals the native
+    /// row's without placing twice.
     pub(in crate::snapshots) fn observe(
         &mut self,
-        response: &ResolvedClaudeResponse,
+        sequence: u64,
+        has_request_id: bool,
+        usage: &UsageTotals,
         at: Option<i128>,
-        latest_model: Option<&str>,
+        placed: Option<&PlacedClaudeUsage>,
+        effort: Option<&str>,
     ) {
         self.responses += 1;
         let copied = self.money_birth.copied_with_slack(at, SLACK);
         if copied == Some(false) {
-            self.first_own.get_or_insert(response.sequence);
+            self.first_own.get_or_insert(sequence);
         }
-        // Native placement adds no row for zero usage.
-        if response.usage.is_zero() {
+        let Some(placed) = placed else {
             return;
-        }
-        let model = match response.model.as_deref() {
-            Some(model) => model,
-            None => {
-                let fallback = latest_model.unwrap_or("unknown");
-                self.model_fallbacks
-                    .insert(response.sequence, fallback.to_owned());
-                fallback
-            }
         };
-        let Some(key) = grain_key(
-            model,
-            &self.base_selector,
-            response.selector.clone(),
-            response.reasoning_effort.as_deref(),
-            response.terminal_timestamp.as_deref(),
-            self.bucket_fallback.as_deref(),
-        ) else {
+        if placed.fell_back {
+            self.model_fallbacks.insert(sequence, placed.model.clone());
+        }
+        let Some(key) = placed.placement.as_ref().map(|placement| {
+            live_key(
+                &placed.model,
+                placement.bucket.clone(),
+                placement.reduced_context.clone(),
+                &placement.row_key,
+                effort,
+            )
+        }) else {
             // Native drops it as unplaceable usage; never publish over it.
             self.entity.certificate_ok = false;
             self.disclosed += 1;
             return;
         };
         let account = self.accounts.as_mut().and_then(|accounts| {
-            accounts.observe(response.sequence, copied == Some(true));
-            accounts.account(response.sequence)
+            accounts.observe(sequence, copied == Some(true));
+            accounts.account(sequence)
         });
-        let tokens = ClaudeMoneyTokens::from_usage(&response.usage);
-        let requests = response.usage.request_count;
+        let tokens = ClaudeMoneyTokens::from_usage(usage);
+        let requests = usage.request_count;
         if copied == Some(true) {
             self.copied += 1;
             self.entity.removed.add(&tokens);
             self.entity.removed_requests += requests;
-            if response.request_id.is_none() {
+            if !has_request_id {
                 self.idless_copy
                     .get_or_insert_with(Box::default)
                     .add(key, &tokens, requests, None, None, at, account);
                 return;
             }
             match self.skipped.last_mut() {
-                Some((_, end)) if *end == response.sequence => *end += 1,
-                _ => self
-                    .skipped
-                    .push((response.sequence, response.sequence + 1)),
+                Some((_, end)) if *end == sequence => *end += 1,
+                _ => self.skipped.push((sequence, sequence + 1)),
             }
             self.copy
                 .add(key, &tokens, requests, None, None, at, account);
@@ -619,7 +621,7 @@ impl FileFold {
         let prefix = self
             .accounts
             .as_deref()
-            .and_then(|accounts| accounts.copied_marker_position(response.sequence));
+            .and_then(|accounts| accounts.copied_marker_position(sequence));
         let into = match prefix {
             Some(position) => self
                 .prefix_inherited
@@ -905,8 +907,25 @@ fn grain_key(
     fallback: Option<&str>,
 ) -> Option<ClaudeLiveKey> {
     let placed = claude_row_placement(model, base, selector, effort, timestamp, fallback)?;
-    let mut context = placed.reduced_context;
-    for (field, value) in placed.row_key.billing_fields() {
+    Some(live_key(
+        model,
+        placed.bucket,
+        placed.reduced_context,
+        &placed.row_key,
+        effort,
+    ))
+}
+
+/// A native placement as the E2 grain key: its bucket and reduced context
+/// plus the billing fields and effort the literal emitter hoists.
+fn live_key(
+    model: &str,
+    bucket: String,
+    mut context: BTreeMap<String, String>,
+    row_key: &RowKey,
+    effort: Option<&str>,
+) -> ClaudeLiveKey {
+    for (field, value) in row_key.billing_fields() {
         if let Some(value) = value {
             context.insert(field.to_owned(), value.to_owned());
         }
@@ -914,7 +933,7 @@ fn grain_key(
     if let Some(effort) = effort {
         context.insert("reasoning_effort".into(), effort.into());
     }
-    Some((placed.bucket, model.to_owned(), context))
+    (bucket, model.to_owned(), context)
 }
 
 /// Matched and side-call grains keep today's reported-rebuild enrichment
@@ -1801,6 +1820,12 @@ pub(crate) fn finish_page(
         }
     }
     if !enabled() {
+        // Dark: nothing reads a fold after counting. Release them so the page
+        // neither keeps them nor clones them with every upload attempt.
+        drop(sessions);
+        for item in items.iter_mut() {
+            item.claude_money = None;
+        }
         return BTreeSet::new();
     }
     let locations = sessions

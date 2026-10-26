@@ -399,8 +399,8 @@ pub(super) fn probe_opened_birth(
     opened
 }
 
-/// Test-only synthetic physical births for staged twin probes, matching the
-/// parser's birth setter: Linux has no portable set-creation-time API.
+// Test-only synthetic physical births for staged twin probes, matching the
+// parser's birth setter: Linux has no portable set-creation-time API.
 #[cfg(test)]
 thread_local! {
     static STAGED_BIRTHS_FOR_TEST: std::cell::RefCell<BTreeMap<String, u64>> =

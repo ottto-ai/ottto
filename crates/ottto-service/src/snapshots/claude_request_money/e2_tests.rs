@@ -193,7 +193,7 @@ fn e2_thinking_300_matches_an_otel_zero_and_rejects_a_different_count() {
     assert_eq!(otel.reasoning_output_tokens, 0);
     let got = publish(
         vec![item],
-        Some(&sidecar(&[otel.clone()])),
+        Some(&sidecar(std::slice::from_ref(&otel))),
         TelemetryRead::Loaded,
         &index,
     );
@@ -793,6 +793,10 @@ fn e2_gate_off_keeps_canonical_bytes_and_fingerprint() {
         .collect::<Vec<_>>();
     assert_eq!(before, after);
     assert_eq!(items[0].snapshot_fingerprint, fingerprint);
+    assert!(
+        items.iter().all(|item| item.claude_money.is_none()),
+        "dark releases every fold once counted"
+    );
     assert!(items[0].removed_usage.is_none());
     assert!(items[0].resolver_conflict_count.is_none());
     cleanup(&[&p]);

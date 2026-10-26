@@ -424,8 +424,10 @@ mod tests {
     fn uncertified_entity_cannot_mutate_existing_body() {
         let mut item = crate::snapshots::tests::sample_session_artifact_item();
         let before = serde_json::to_vec(&item).unwrap();
-        let mut entity = ClaudeEntityBody::default();
-        entity.certificate_ok = false;
+        let entity = ClaudeEntityBody {
+            certificate_ok: false,
+            ..Default::default()
+        };
         assert!(!apply(&mut item, &entity));
         assert_eq!(serde_json::to_vec(&item).unwrap(), before);
     }

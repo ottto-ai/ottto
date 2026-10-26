@@ -668,7 +668,6 @@ impl ClaudeApiEvidenceRead {
     /// Missing/capped/malformed reads remain present but incomplete; a root
     /// outside this reader's cohort has no report. The reader owns the strict
     /// cap boundary and conflicting-id detection, including empty-row reads.
-    #[allow(dead_code)] // The optional attachment consumer is wired separately.
     pub(crate) fn session_report(
         &self,
         root: &str,

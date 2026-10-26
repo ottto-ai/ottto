@@ -1968,7 +1968,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let root = entry.get_mut();
                 let any_conflict = root.conflict || candidate.conflict;
-                if !root.known && candidate.known || (first < root.first && candidate.known) {
+                if candidate.known && (!root.known || first < root.first) {
                     *root = candidate;
                 } else if first == root.first {
                     if root.bound.is_some()
@@ -2048,6 +2048,9 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
 
 // Merge borrowed native request-id iterators. Counter dedup needs no set or
 // copy proportional to response count; id-less native usage remains counted.
+// The next request is the minimum over every member's peeked head; a
+// `while let` would hold that mutable walk across the body.
+#[allow(clippy::while_let_loop)]
 fn inherited_requests(members: &[&SnapshotItem]) -> u64 {
     let mut identified = 0u64;
     let mut total = 0u64;
