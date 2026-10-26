@@ -1394,10 +1394,23 @@ fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
             }
             sum
         });
+        let shape = branch
+            .scan
+            .snapshots
+            .iter()
+            .map(|s| {
+                (
+                    s.source_session_id == ROOT,
+                    s.request_count,
+                    s.removed_request_count,
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             totals,
             [1, 10, 10, 3, 5, 2, 0, 0],
-            "a /branch containing only copied history cannot duplicate original money"
+            "a /branch containing only copied history cannot duplicate original money; \
+             page (is_root, requests, removed) = {shape:?}"
         );
         assert!(
             branch
@@ -1407,7 +1420,7 @@ fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
                 .map(|s| s.removed_request_count.unwrap_or(0))
                 .sum::<u64>()
                 > 0,
-            "deliberate /branch must expose copy_skipped > 0"
+            "deliberate /branch must expose copy_skipped > 0; page (is_root, requests, removed) = {shape:?}"
         );
     });
 }
