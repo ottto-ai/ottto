@@ -1537,6 +1537,7 @@ mod bounded_tests {
     fn capture_plan_stops_at_expiry_and_installs_only_the_fallback() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-plan-deadline");
         let support = scratch.join("support");
+        let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
         let before = capture_reserved();
         let keys = (0..4096)
             .map(|at| super::super::family_key(&format!("root-{at}")))
@@ -1662,14 +1663,20 @@ mod bounded_tests {
             fallback_families.is_disjoint(&complete),
             "never the stale plan's eligibility"
         );
-        let plans = PLANS.lock().unwrap();
-        assert!(!plans[&support].allows(&keys[0]));
+        // An assertion must unwind after releasing the shared plan mutex.
+        let (first_allowed, other_allowed, unlisted_allowed) = {
+            let plans = PLANS.lock().unwrap();
+            (
+                plans[&support].allows(&keys[0]),
+                plans[&support].allows(&keys[200]),
+                plans[&support].allows(&super::super::family_key("unlisted")),
+            )
+        };
+        assert!(!first_allowed);
         assert!(
-            !plans[&support].allows(&keys[200])
-                && !plans[&support].allows(&super::super::family_key("unlisted")),
+            !other_allowed && !unlisted_allowed,
             "interruption never changes the next Full to all-eligible"
         );
-        drop(plans);
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
         println!("MONEY_P1B_PLAN entries=4096 expired_visited={} interrupted_checks={} eligible={NEXT_PAGE_FAMILIES} fallback_eligible={} plan_funds={funded} stale_plan_installed=0 carried_turn=300", visited.get(), checks.get(), fallback_families.len());
@@ -1994,11 +2001,13 @@ mod bounded_tests {
             );
             assert!(capture_reserved() > before);
             assert!(super::super::shadow_enabled(&support));
-            panic!("synthetic fixture assertion failure");
+            let entries = PLANS.lock().unwrap()[&support].entries.len();
+            assert_eq!(entries, 0, "synthetic fixture assertion failure");
         });
         assert!(failure.is_err());
         assert_eq!(capture_reserved(), before);
         assert!(!super::super::shadow_enabled(&support));
+        assert!(!PLANS.is_poisoned());
     }
 
     /// Each page updates the plan in place and reuses its funds, so a family
@@ -2073,17 +2082,24 @@ mod bounded_tests {
         let eligible = planned_families_for_test(&support).unwrap();
         assert_eq!(eligible.len(), NEXT_PAGE_FAMILIES);
         assert!(eligible.iter().all(|key| third.contains(key)));
+        // Keep the same checks without poisoning shared state on failure.
+        let (entry_count, first_allowed, other_allowed) = {
+            let plans = PLANS.lock().unwrap();
+            (
+                plans[&support].entries.len(),
+                plans[&support].allows(&keys[0]),
+                plans[&support].allows(&other[0]),
+            )
+        };
         assert_eq!(
-            PLANS.lock().unwrap()[&support].entries.len(),
+            entry_count,
             third.len(),
             "only the page's own families stay"
         );
-        let plans = PLANS.lock().unwrap();
         assert!(
-            !plans[&support].allows(&keys[0]) && !plans[&support].allows(&other[0]),
+            !first_allowed && !other_allowed,
             "a family whose entry made room is not eligible again before the loss expires"
         );
-        drop(plans);
         assert_eq!(capture_reserved(), before + plan_funds_for_test(&support));
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
