@@ -585,6 +585,8 @@ fn set_times(path: &Path, birth_ms: i64, modified_ms: i64) -> bool {
         use std::os::macos::fs::FileTimesExt;
         times.set_created(at(birth_ms))
     };
+    #[cfg(not(target_os = "macos"))]
+    let _ = birth_ms;
     file.set_times(times).unwrap();
     cfg!(target_os = "macos")
 }

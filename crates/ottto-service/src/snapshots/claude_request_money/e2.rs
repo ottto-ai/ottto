@@ -245,7 +245,7 @@ pub(crate) struct ClaudeEntityBody {
     pub(crate) activity_nanos: i128,
     /// Gate off: what the trial receipt and the counters read, in place of
     /// `grains` (which then stays empty).
-    dark: DarkTally,
+    pub(super) dark: DarkTally,
 }
 impl Default for ClaudeEntityBody {
     fn default() -> Self {
@@ -418,7 +418,7 @@ impl ClaudeEntityBody {
 /// totals; `unmatched_1h` reads the estimated requests per unix hour that
 /// telemetry attach has not moved. 8 bytes per hour with estimated usage.
 #[derive(Debug, Clone, Default)]
-struct DarkTally {
+pub(super) struct DarkTally {
     side: ClaudeGrainSide,
     /// (unix hour, estimated requests), sorted by hour.
     estimated: Vec<(u32, u32)>,
