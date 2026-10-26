@@ -665,6 +665,11 @@ fn frozen_whole_index_comparison_survives_an_hour_boundary() {
         assert_eq!(observe(), expected);
         panic!("synthetic comparison panic");
     });
-    assert!(result.is_err());
+    let panic = result.expect_err("the synthetic panic must unwind");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"synthetic comparison panic"),
+        "setup and equality assertions must not be mistaken for the expected panic"
+    );
     assert_eq!(now(), after, "unwinding also restores the advanced clock");
 }

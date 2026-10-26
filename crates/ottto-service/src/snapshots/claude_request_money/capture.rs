@@ -1991,7 +1991,12 @@ mod bounded_tests {
             assert!(super::super::shadow_enabled(&support));
             panic!("synthetic assertion panic before explicit cleanup");
         });
-        assert!(result.is_err());
+        let panic = result.expect_err("the synthetic panic must unwind");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"synthetic assertion panic before explicit cleanup"),
+            "setup and equality assertions must not be mistaken for the expected panic"
+        );
         assert!(!super::super::shadow_enabled(&support));
         assert_eq!(plan_funds_for_test(&support), 0);
         assert_eq!(capture_reserved(), before);
