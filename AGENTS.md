@@ -32,27 +32,30 @@
   takes several GB of memory and every core for minutes, and many agents may
   share one machine. For compile and test feedback, push a branch and run the
   free Linux lane on it: `gh workflow run linux-tests.yml --ref <branch>`, then
-  read `Rust tests (Linux)`. A branch without a PR uses no macOS runner; every
-  push to an open PR also starts the macOS `Rust contracts` job, so open the PR
-  (or push to it) when the change is ready for that run. Build locally only when
+  read `Rust tests (Linux)`. Pull-request runs use no macOS runner either: the
+  macOS `Rust contracts` job runs only in the merge queue, on `main` pushes and
+  on manual dispatch. Build locally only when
   no CI path works: one changed crate, one build at a time, on an idle machine,
   and say why in your report. A Linux green is fast feedback, not Mac evidence;
-  the macOS `Rust contracts` job stays the merge gate.
+  the macOS `Rust contracts` job in the merge queue stays the merge gate.
 - CI runs on pull requests. Push to the PR branch; do not also start Public CI by
   hand on a branch whose PR is open and mergeable. GitHub starts no pull-request
   run while a PR has merge conflicts (`gh pr view <n> --json mergeable`): rebase
   onto `main` and push. Start Public CI by hand (`workflow_dispatch`) only for a
   `main` commit with no push run, a branch with no PR (for example a red-test
-  proof), or a dispatch-only job the branch adds; one run per head, and never
+  proof), a dispatch-only job the branch adds, or macOS evidence before you
+  enqueue a change with macOS-only risk (native code, clippy `-D warnings`,
+  macOS-only tests): `gh workflow run ci.yml --ref <branch>`; one run per head, and never
   restart a run because it is queued. Do not put `[skip ci]` in PR commits. Merge
   only after a green pull-request run on the final head.
 - Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
-  ready, waits until the four `ci.yml` checks of the pull-request run on the PR's
-  head commit pass (macOS `Rust contracts`; Linux `Public surface checks`, `Rust
-  advisory audit`, `Dependency review`), and squash-merges exactly that head.
-  `main`'s ruleset also requires `Rust contracts`. `gh pr checks` exit 0 is not
-  evidence, and no Linux job stands in for the macOS `Rust contracts` job.
-- `main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it; a PR that fails there is removed (exit 4): fix it, push and rerun the guard.
+  ready, waits until the `ci.yml` checks of the pull-request run on the PR's head
+  commit pass (Linux `Public surface checks`, `Rust advisory audit`, `Dependency
+  review`; macOS `Rust contracts` is skipped on pull requests), and enqueues
+  exactly that head. `main`'s ruleset requires `Rust contracts`, `Public surface
+  checks` and `Rust advisory audit` in the merge queue. `gh pr checks` exit 0 is
+  not evidence, and no Linux job stands in for the macOS `Rust contracts` job.
+- `main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it, including the macOS `Rust contracts` job; a PR that fails there is removed (exit 4, with the failing run): fix it, push and rerun the guard.
 - The author merges its own reviewed, green, mergeable PR; no merge window, slot
   or extra approval is needed. Wait only for a real dependency or conflict, an
   explicit dated hold, or an announced release freeze.
