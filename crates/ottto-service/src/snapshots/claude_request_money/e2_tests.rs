@@ -1064,7 +1064,6 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         })
         .collect::<Vec<_>>();
     let read = sidecar(&rows); // canonical permissive reader, including health
-    let api = api_report(&read);
     let trace = ClaudeTraceOwnershipLoadReport {
         evidence: BTreeMap::from([(
             ROOT.to_owned(),
@@ -1118,17 +1117,21 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
     for enabled in [false, true] {
         // Wall clock without the allocation probe: its born-pointer table
         // locks and walks on every allocation and free of every thread.
+        // Fresh row copies per pass: no fingerprint result carried over.
+        let api = api_report(&read);
         let mut page = items.clone();
         take_stages();
         let start = Instant::now();
         attach_page(&mut page, &read);
         side_calls_page(&mut page, &api, &trace, &index);
+        drop(api);
         let enrichment_time = start.elapsed();
         let stages = take_stages();
         // The same work on an identical page, for the born-in-scope peak only.
         // Attach and side calls run outside the gate in both modes, so one
         // probed pass is the receipt for both.
         let (allocation, probed_time) = *probe.get_or_insert_with(|| {
+            let api = api_report(&read);
             let mut probed = items.clone();
             let probe_start = Instant::now();
             let (_, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
@@ -1209,6 +1212,38 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
                 .join(" ")
         );
     }
+    // Same-run comparison on fresh copies of the first 10,000 rows: the
+    // blanked-copy rule, the same-bytes check, and a second check that reuses
+    // each row's kept result. All three must agree.
+    let sample = read.evidence[ROOT][..10_000].to_vec();
+    let start = Instant::now();
+    let copy_rule = sample
+        .iter()
+        .map(|row| reference_fingerprint_ok(row, &row.fingerprint, |r| r.fingerprint.clear()))
+        .collect::<Vec<_>>();
+    let copy_rule_time = start.elapsed();
+    let start = Instant::now();
+    let first = sample
+        .iter()
+        .map(|row| validate_claude_api_row(row, ROOT))
+        .collect::<Vec<_>>();
+    let first_time = start.elapsed();
+    let start = Instant::now();
+    let again = sample
+        .iter()
+        .map(|row| validate_claude_api_row(row, ROOT))
+        .collect::<Vec<_>>();
+    let again_time = start.elapsed();
+    assert!(copy_rule.iter().all(|valid| *valid));
+    assert_eq!(first, copy_rule);
+    assert_eq!(again, copy_rule);
+    eprintln!(
+        "F3_PERF fingerprint rows={} copy_rule_us={} first_check_us={} kept_result_us={}",
+        sample.len(),
+        copy_rule_time.as_micros(),
+        first_time.as_micros(),
+        again_time.as_micros()
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
