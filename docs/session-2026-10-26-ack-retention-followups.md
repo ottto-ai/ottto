@@ -33,7 +33,8 @@ entity per parsed file, so no real transcript yields thousands of entities.
 The finish-level regression therefore multiplies the scanned item into a
 5,000-entity group of that file, as the first-install case does; the real
 finish finalization records the group's incidence and body-set witness. It
-runs with 4,096 debt ACKs and an incomplete census. A real 504 stops the
+runs with 4,096 debt ACKs, and each finished scan is marked
+census-incomplete so census cleanup cannot retire that debt. A real 504 stops the
 first finish after accepted pages; the second finish sends only the rest,
 settles the file and transfers every ACK, leaving exactly the debt. A
 lower-level test covers the same sequence directly against the ledger.

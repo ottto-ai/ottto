@@ -1258,9 +1258,9 @@ impl Drop for AckScriptedServer {
     }
 }
 
-/// Real prepare/finish for one synthetic Claude home whose second, damaged
-/// transcript keeps every census incomplete, so complete-census cleanup
-/// never retires the injected unrelated debt.
+/// Real prepare/finish for one synthetic Claude home. Each finished scan is
+/// marked census-incomplete (see `prepare`) so complete-census cleanup never
+/// retires the injected unrelated debt.
 struct AckFinishHome {
     fixture: IdentityPipelineHome,
     cadence: IdentityPipelineCadence,
@@ -1298,15 +1298,6 @@ impl AckFinishHome {
             "device-secret",
         )
         .unwrap();
-        // The same real parse loss the unclean-census finish case uses.
-        std::fs::write(
-            fixture
-                .home
-                .join(".claude/projects/-synthetic-repo")
-                .join("2448a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl"),
-            b"{\n",
-        )
-        .unwrap();
         Self {
             fixture,
             cadence,
@@ -1329,7 +1320,7 @@ impl AckFinishHome {
         }
     }
 
-    fn prepare(&mut self) -> (SourcePreparation, ScanIndex, SourceScanResult) {
+    fn prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
         self.cadence.next_due_cycle();
         let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
             prepare_sync_source(
@@ -1348,12 +1339,17 @@ impl AckFinishHome {
         })
         .unwrap()
         .expect("actual due source preparation");
-        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
-        assert!(
-            !scan.census_complete,
-            "the damaged transcript is a real loss"
+        let (preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
+        assert!(scan.census_complete, "{cycle}: the real scan is clean");
+        assert_eq!(
+            scan.snapshots.len(),
+            1,
+            "{cycle}: the never-committed transcript is read again"
         );
-        assert_eq!(scan.snapshots.len(), 1, "the healthy transcript is re-read");
+        // Finish reads this flag only for census-dependent decisions
+        // (complete-census ACK cleanup, backfill and manifest completion).
+        // Marking it incomplete keeps the injected debt unretired.
+        scan.census_complete = false;
         (preparation, index, scan)
     }
 
@@ -1430,7 +1426,7 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
     let debt = ack_followup_debt(5000);
     for (cycle, (with_debt, expected)) in [(true, 1), (false, 0), (true, 1)].into_iter().enumerate()
     {
-        let (mut preparation, index, scan) = home.prepare();
+        let (mut preparation, index, scan) = home.prepare(&format!("cycle {cycle}"));
         ack_followup_set_debt(&mut preparation, &debt, with_debt);
         if !with_debt {
             server
@@ -1501,7 +1497,7 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
         .map(|entity| format!("{:064x}", 1_000_000 + entity))
         .collect::<BTreeSet<_>>();
 
-    let (mut preparation, index, mut scan) = home.prepare();
+    let (mut preparation, index, mut scan) = home.prepare("first finish");
     group(&mut scan);
     ack_followup_set_debt(&mut preparation, &debt, true);
     let paths = (
@@ -1516,7 +1512,16 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
         }
         script.push_back(AckScriptedPost::GatewayTimeout);
     }
-    let error = home.finish(preparation, index, scan).unwrap_err();
+    let error = home
+        .finish(preparation, index, scan)
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "first finish settled: offered={} script_left={}",
+                server.offered.lock().unwrap().len(),
+                server.script.lock().unwrap().len()
+            )
+        });
     assert!(
         error
             .downcast_ref::<ack_retention::AckSettlementRequired>()
@@ -1545,7 +1550,7 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
     );
 
     server.offered.lock().unwrap().clear();
-    let (preparation, index, mut scan) = home.prepare();
+    let (preparation, index, mut scan) = home.prepare("second finish");
     group(&mut scan);
     home.finish(preparation, index, scan)
         .expect("second finish settles the file");
