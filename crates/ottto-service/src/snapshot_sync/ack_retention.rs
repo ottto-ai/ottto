@@ -152,6 +152,37 @@ impl Drop for CapacityStopCensusCount {
     }
 }
 
+/// Retirement obligations a pre-selection scan still references (#794 F1).
+///
+/// Structural guard: every production entry point that can stage, release or
+/// plan an ACK retirement (`stage_ack_retirement_handoff_with_scan`,
+/// `stage_selected_ack_retirement`,
+/// `release_acks_after_partial_index_save_with_scan`) takes this type, and
+/// outside this module the only constructor is
+/// `ack_retirement_scan_references`, which reads a scan index. A new save path
+/// therefore cannot reach retirement without a liveness set: it does not
+/// compile. The empty-set wrappers (`stage_ack_retirement_handoff`,
+/// `stage_ack_retirement_handoff_with_census`,
+/// `release_acks_after_partial_index_save`) and the raw committed-incidence
+/// planner `retired_ack_candidates` are `#[cfg(test)]` only.
+#[derive(Debug)]
+pub(super) struct AckScanReferences(BTreeSet<String>);
+
+impl std::ops::Deref for AckScanReferences {
+    type Target = BTreeSet<String>;
+
+    fn deref(&self) -> &BTreeSet<String> {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<BTreeSet<String>> for AckScanReferences {
+    fn eq(&self, other: &BTreeSet<String>) -> bool {
+        self.0 == *other
+    }
+}
+
 impl SnapshotUploadProgress {
     pub(super) fn configure_ack_capacity(&mut self, committed: &ScanIndex) {
         // Only already-held live ACKs grant extra slots. Unindexed debt never
@@ -256,7 +287,7 @@ impl SnapshotUploadProgress {
             path,
             previous,
             saved,
-            &BTreeSet::new(),
+            &AckScanReferences(BTreeSet::new()),
             locally_held,
             keep_adopted_for_retry,
         )
@@ -270,11 +301,11 @@ impl SnapshotUploadProgress {
         path: &Path,
         previous: &ScanIndex,
         saved: &ScanIndex,
-        scan_referenced: &BTreeSet<String>,
+        scan_referenced: &AckScanReferences,
         locally_held: &BTreeSet<String>,
         keep_adopted_for_retry: bool,
     ) -> Result<()> {
-        let mut retired = self.retired_ack_candidates(previous, saved);
+        let mut retired = self.committed_incidence_retirements(previous, saved);
         retired.extend(self.saved_retirement_candidates(saved));
         retired.retain(|fp| !scan_referenced.contains(fp));
         let before = self.accepted_fingerprints.len();
@@ -382,7 +413,7 @@ impl SnapshotUploadProgress {
         self.stage_ack_retirement_handoff_with_scan(
             previous,
             selected,
-            &BTreeSet::new(),
+            &AckScanReferences(BTreeSet::new()),
             locally_held,
             census_absent,
         )
@@ -397,7 +428,7 @@ impl SnapshotUploadProgress {
         &self,
         previous: &ScanIndex,
         scanned: &ScanIndex,
-    ) -> BTreeSet<String> {
+    ) -> AckScanReferences {
         let obligations = self.retirement_obligations(previous);
         let mut referenced = BTreeSet::new();
         for fp in scanned.upload_progress_ack_incidence() {
@@ -405,7 +436,7 @@ impl SnapshotUploadProgress {
                 referenced.insert(fp.to_owned());
             }
         }
-        referenced
+        AckScanReferences(referenced)
     }
 
     /// The common selected save: stage the handoff and return the committed-
@@ -416,7 +447,7 @@ impl SnapshotUploadProgress {
         &self,
         previous: &ScanIndex,
         selected: &mut ScanIndex,
-        scan_referenced: &BTreeSet<String>,
+        scan_referenced: &AckScanReferences,
         locally_held: &BTreeSet<String>,
         census_absent: &BTreeSet<String>,
     ) -> Result<BTreeSet<String>> {
@@ -427,7 +458,7 @@ impl SnapshotUploadProgress {
             locally_held,
             census_absent,
         )?;
-        let mut retired = self.retired_ack_candidates(previous, selected);
+        let mut retired = self.committed_incidence_retirements(previous, selected);
         retired.retain(|fp| !scan_referenced.contains(fp));
         Ok(retired)
     }
@@ -472,7 +503,7 @@ impl SnapshotUploadProgress {
         &self,
         previous: &ScanIndex,
         selected: &mut ScanIndex,
-        scan_referenced: &BTreeSet<String>,
+        scan_referenced: &AckScanReferences,
         locally_held: &BTreeSet<String>,
         census_absent: &BTreeSet<String>,
     ) -> Result<()> {
@@ -612,10 +643,21 @@ impl SnapshotUploadProgress {
         Ok(())
     }
 
+    /// Raw committed-incidence planner without a liveness set. Production uses
+    /// it only through the scan-reference entry points (`AckScanReferences`).
+    #[cfg(test)]
+    pub(super) fn retired_ack_candidates(
+        &self,
+        committed: &ScanIndex,
+        selected: &ScanIndex,
+    ) -> BTreeSet<String> {
+        self.committed_incidence_retirements(committed, selected)
+    }
+
     /// Prepare only positive retirement candidates from previously committed
     /// incidence. An unindexed ACK is not a retirement candidate. The selected
     /// index is tentative here: callers must not apply this plan before save.
-    pub(super) fn retired_ack_candidates(
+    fn committed_incidence_retirements(
         &self,
         committed: &ScanIndex,
         selected: &ScanIndex,

@@ -1642,6 +1642,73 @@ fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
         vec![sibling.snapshot_fingerprint.clone()],
         "the retained exact ACK is not re-sent"
     );
+
+    // SOURCE h843 item 2: "kept" alone would allow a forever-kept ACK. The
+    // pending obligation is persisted across recovery, and adopting the
+    // settled containing file then retires the exact ACK.
+    let (previous, mut progress) = f.load();
+    let handoff = previous
+        .upload_ack_retirement_handoff
+        .as_ref()
+        .expect("the pending retirement obligation is persisted");
+    assert_eq!(
+        handoff.pending_bodies.get(&f.item.snapshot_fingerprint),
+        Some(&snapshot_upload_body_witness(&f.item))
+    );
+    assert!(!handoff.bodies.contains_key(&f.item.snapshot_fingerprint));
+    let mut moved = working.files["moved.jsonl"].clone();
+    moved.last_upload_body_witness = Some(body_set_witness(&[
+        snapshot_upload_body_witness(&f.item),
+        snapshot_upload_body_witness(&sibling),
+    ]));
+    let mut settled = previous.clone();
+    settled.files.insert("moved.jsonl".into(), moved);
+    settled.file_snapshot_fingerprints.insert(
+        "moved.jsonl".into(),
+        BTreeSet::from([
+            f.item.snapshot_fingerprint.clone(),
+            sibling.snapshot_fingerprint.clone(),
+        ]),
+    );
+    let referenced = progress.ack_retirement_scan_references(&previous, &settled);
+    settle_index_after_upload(&mut settled, &previous, &progress);
+    let mut retired = progress
+        .stage_selected_ack_retirement(
+            &previous,
+            &mut settled,
+            &referenced,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+    settled.save(&f.index_path).unwrap();
+    let saved = ScanIndex::load(&f.index_path).unwrap();
+    retired.extend(progress.saved_retirement_candidates(&saved));
+    progress.retire_acks_after_index_save(&saved, &retired, &BTreeSet::new());
+    progress.finish_cycle(&f.progress_path).unwrap();
+    let (mut reloaded, mut progress) = f.load();
+    progress
+        .recover_ack_retirement_handoff(&mut reloaded, &f.index_path, &f.progress_path)
+        .unwrap();
+    let (saved, progress) = f.load();
+    assert!(saved.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
+    assert!(
+        !progress
+            .accepted_fingerprints
+            .contains(&f.item.snapshot_fingerprint),
+        "adopting the settled file retires the exact ACK"
+    );
+    assert!(
+        progress.accepted_fingerprints.is_empty(),
+        "the sibling ACK transfers with its file"
+    );
+    let still_pending = saved.upload_ack_retirement_handoff.as_ref().map(|handoff| {
+        handoff
+            .pending_bodies
+            .contains_key(&f.item.snapshot_fingerprint)
+    });
+    assert_ne!(still_pending, Some(true), "the obligation is discharged");
+    f.assert_identity(&saved);
 }
 
 // #778 R2-2, committed-incidence variant: E leaves its settled file for a new
@@ -1717,6 +1784,60 @@ fn partial_save_never_retires_a_committed_entity_moved_into_an_unsettled_new_fil
         .recover_ack_retirement_handoff(&mut reloaded, &f.index_path, &f.progress_path)
         .unwrap();
     f.assert_ack(&f.load().1);
+
+    // SOURCE h843 item 2: the pending obligation is persisted across
+    // recovery; when the new file vanishes before it settled, a complete
+    // census proves E absent and retires the exact ACK.
+    let (previous, mut progress) = f.load();
+    let handoff = previous
+        .upload_ack_retirement_handoff
+        .as_ref()
+        .expect("the pending retirement obligation is persisted");
+    assert_eq!(
+        handoff.pending_bodies.get(&f.item.snapshot_fingerprint),
+        Some(&snapshot_upload_body_witness(&f.item))
+    );
+    assert!(!handoff.bodies.contains_key(&f.item.snapshot_fingerprint));
+    let mut clean = previous.clone();
+    assert!(!progress
+        .complete_census_ack_retirements(&clean, false)
+        .contains(&f.item.snapshot_fingerprint));
+    let absent = progress.complete_census_ack_retirements(&clean, true);
+    assert!(absent.contains(&f.item.snapshot_fingerprint));
+    let referenced = progress.ack_retirement_scan_references(&previous, &clean);
+    assert!(!referenced.contains(&f.item.snapshot_fingerprint));
+    let mut retired = progress
+        .stage_selected_ack_retirement(
+            &previous,
+            &mut clean,
+            &referenced,
+            &BTreeSet::new(),
+            &absent,
+        )
+        .unwrap();
+    clean.save(&f.index_path).unwrap();
+    retired.extend(progress.saved_retirement_candidates(&clean));
+    assert!(retired.contains(&f.item.snapshot_fingerprint));
+    progress.retire_acks_after_index_save(&clean, &retired, &BTreeSet::new());
+    progress.finish_cycle(&f.progress_path).unwrap();
+    let (mut reloaded, mut progress) = f.load();
+    progress
+        .recover_ack_retirement_handoff(&mut reloaded, &f.index_path, &f.progress_path)
+        .unwrap();
+    let (saved, progress) = f.load();
+    assert!(
+        !progress
+            .accepted_fingerprints
+            .contains(&f.item.snapshot_fingerprint),
+        "a complete-census absence proof retires the exact ACK"
+    );
+    let still_pending = saved.upload_ack_retirement_handoff.as_ref().map(|handoff| {
+        handoff
+            .pending_bodies
+            .contains_key(&f.item.snapshot_fingerprint)
+    });
+    assert_ne!(still_pending, Some(true), "the obligation is discharged");
+    f.assert_identity(&saved);
 }
 
 fn body_set_witness(bodies: &[String]) -> String {

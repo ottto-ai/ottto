@@ -13,7 +13,15 @@ before any selection, which retirement obligations the full scan still
 references. Every save keeps those obligations pending and never retires
 their ACKs. The set is bounded by the obligations (held ACKs); the scan is
 only borrowed. When no selection omits a live file, every referenced entity
-is already in the saved incidence and nothing changes.
+is already in the saved incidence and nothing changes. The guard is
+structural: the reference set has its own type (`AckScanReferences`) that
+only the scan helper can build, and every production stage, release and
+selected-save entry point requires it, so a new save path without a
+liveness set does not compile. The empty-set wrappers and the raw
+committed-incidence planner are test-only. The partial-save tests also
+carry the obligation to its end: it stays pending across recovery, then
+adopting the settled file or a complete-census absence proof retires the
+ACK, so an ACK cannot be kept forever.
 
 Waiting for a complete census (SOURCE R2-3). When unindexed debt exceeds the
 unsettled limit, only a complete census can retire it. The capacity-stop log
