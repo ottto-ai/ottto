@@ -2677,9 +2677,12 @@ fn e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() 
     )
     .unwrap();
     with_e2_history(&fixture, || {
-        let failed = crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-            fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE)
-        });
+        // Only the side-call walk: these history files are all pre-birth on
+        // Linux (statx birth), so the copy-decision walk would hold them all.
+        let failed =
+            crate::snapshots::claude_request_census::with_side_call_walk_deadline_for_test(|| {
+                fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE)
+            });
         assert_eq!(failed.uploaded.len(), 2, "healthy siblings settle");
         assert!(
             !failed.uploaded.contains(root),

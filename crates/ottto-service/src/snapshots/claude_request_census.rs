@@ -761,18 +761,40 @@ fn held_candidates<'a>(
         .filter(move |hash| candidates.binary_search(hash).is_ok())
 }
 
-/// Test seam: every transcript holder walk on this thread hits its deadline.
+/// Test seam: transcript holder walks on this thread hit their deadline
+/// (bit 1: the copy-decision walk, bit 2: the side-call walk).
 #[cfg(test)]
 thread_local! {
-    static WALK_DEADLINE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WALK_DEADLINE_FOR_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
+#[cfg(test)]
+const MAIN_WALK: u8 = 1;
+#[cfg(test)]
+const FAMILY_WALK: u8 = 2;
 
 #[cfg(test)]
-pub(crate) fn with_walk_deadline_for_test<T>(run: impl FnOnce() -> T) -> T {
-    let previous = WALK_DEADLINE_FOR_TEST.with(|slot| slot.replace(true));
+fn walk_deadline_for_test<T>(walks: u8, run: impl FnOnce() -> T) -> T {
+    let previous = WALK_DEADLINE_FOR_TEST.with(|slot| slot.replace(walks));
     let value = run();
     WALK_DEADLINE_FOR_TEST.with(|slot| slot.set(previous));
     value
+}
+
+/// Every transcript holder walk on this thread hits its deadline.
+#[cfg(test)]
+pub(crate) fn with_walk_deadline_for_test<T>(run: impl FnOnce() -> T) -> T {
+    walk_deadline_for_test(MAIN_WALK | FAMILY_WALK, run)
+}
+
+/// Only the side-call (family) walk hits its deadline.
+#[cfg(test)]
+pub(crate) fn with_side_call_walk_deadline_for_test<T>(run: impl FnOnce() -> T) -> T {
+    walk_deadline_for_test(FAMILY_WALK, run)
+}
+
+#[cfg(test)]
+fn walk_deadline_forced(walk: u8) -> bool {
+    WALK_DEADLINE_FOR_TEST.with(std::cell::Cell::get) & walk != 0
 }
 
 /// Why an insert did not store the record as given.
@@ -892,6 +914,10 @@ impl ClaudeRequestCensus {
         if wanted.is_empty() {
             return Some(found);
         }
+        #[cfg(test)]
+        if walk_deadline_forced(FAMILY_WALK) {
+            return None;
+        }
         self.walk_transcript_holders(deadline, |_, member, record| {
             let Some(candidates) = wanted.get(member.root) else {
                 return;
@@ -923,6 +949,10 @@ impl ClaudeRequestCensus {
         if wanted.is_empty() {
             return Some(());
         }
+        #[cfg(test)]
+        if walk_deadline_forced(MAIN_WALK) {
+            return None;
+        }
         let mut hits = Vec::new();
         self.walk_transcript_holders(deadline, |key, member, record| {
             if member.subagent_stem.is_some() {
@@ -947,10 +977,6 @@ impl ClaudeRequestCensus {
             &'a ClaudeRequestCensusRecord,
         ),
     ) -> Option<()> {
-        #[cfg(test)]
-        if WALK_DEADLINE_FOR_TEST.with(std::cell::Cell::get) {
-            return None;
-        }
         for (position, (key, record)) in self.records().enumerate() {
             if position % 256 == 255 && std::time::Instant::now() >= deadline {
                 return None;
