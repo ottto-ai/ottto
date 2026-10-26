@@ -7967,8 +7967,8 @@ fn finish_sync_source(
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
     let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
-    retired_upload_acks.extend(upload_progress.saved_retirement_candidates(&index));
-    upload_progress.retire_acks_after_index_save(
+    upload_progress.add_saved_handoff_retirements(&mut retired_upload_acks, &index);
+    upload_progress.retire_planned_acks_after_index_save(
         &index,
         &retired_upload_acks,
         locally_held_fingerprints,

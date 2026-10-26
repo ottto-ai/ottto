@@ -2167,3 +2167,50 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
         );
     }
 }
+
+// #794 round 4 guard: production can reach the final ACK apply only with an
+// `AckRetirementPlan`, and no production code can make one from a plain set.
+// The compiler enforces this through the private field and `#[cfg(test)]`;
+// this pins those declarations so a refactor cannot quietly reopen the
+// raw-set bypass.
+#[test]
+fn production_ack_retirement_cannot_apply_a_plain_set() {
+    let module = include_str!("ack_retention.rs");
+    let parent = include_str!("../snapshot_sync.rs");
+    let production = &parent[..parent
+        .find("\n#[cfg(test)]\nmod tests {")
+        .expect("snapshot_sync test module")];
+    assert!(
+        module.contains("pub(super) struct AckRetirementPlan(BTreeSet<String>);"),
+        "the plan field stays private to ack_retention"
+    );
+    for raw in [
+        "retire_acks_after_index_save(",
+        "saved_retirement_candidates(",
+        "retired_ack_candidates(",
+    ] {
+        assert!(
+            module.contains(&format!("#[cfg(test)]\n    pub(super) fn {raw}")),
+            "{raw} stays test-only"
+        );
+        assert!(
+            !production.contains(&format!(".{raw}")),
+            "production never calls {raw}"
+        );
+    }
+    assert!(production.contains(".retire_planned_acks_after_index_save("));
+    // Inside the module, only the scan-reference planner mints a plan.
+    let mut minted_by = BTreeSet::new();
+    for (at, _) in module.match_indices("AckRetirementPlan(") {
+        if module[..at].ends_with("struct ") {
+            continue;
+        }
+        let enclosing = module[..at].rfind("fn ").expect("enclosing fn") + 3;
+        let name = module[enclosing..]
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .next()
+            .unwrap();
+        minted_by.insert(name);
+    }
+    assert_eq!(minted_by, BTreeSet::from(["stage_selected_ack_retirement"]));
+}

@@ -183,6 +183,33 @@ impl PartialEq<BTreeSet<String>> for AckScanReferences {
     }
 }
 
+/// The only production authority for the final ACK apply step
+/// (`retire_planned_acks_after_index_save`, #794 round 4). The field is
+/// private: outside this module a plan is minted only by
+/// `stage_selected_ack_retirement` (which requires `AckScanReferences`) and
+/// grows only by `add_saved_handoff_retirements` (the persisted handoff, whose
+/// bodies were staged with scan references). Nothing converts a plain set into
+/// a plan, so a save path cannot retire `{E}` it built itself. The raw-set
+/// `retire_acks_after_index_save` and `saved_retirement_candidates` are
+/// `#[cfg(test)]` only.
+#[derive(Debug)]
+pub(super) struct AckRetirementPlan(BTreeSet<String>);
+
+impl std::ops::Deref for AckRetirementPlan {
+    type Target = BTreeSet<String>;
+
+    fn deref(&self) -> &BTreeSet<String> {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AckRetirementPlan {
+    pub(super) fn extend(&mut self, fingerprints: impl IntoIterator<Item = String>) {
+        self.0.extend(fingerprints);
+    }
+}
+
 impl SnapshotUploadProgress {
     pub(super) fn configure_ack_capacity(&mut self, committed: &ScanIndex) {
         // Only already-held live ACKs grant extra slots. Unindexed debt never
@@ -306,7 +333,7 @@ impl SnapshotUploadProgress {
         keep_adopted_for_retry: bool,
     ) -> Result<()> {
         let mut retired = self.committed_incidence_retirements(previous, saved);
-        retired.extend(self.saved_retirement_candidates(saved));
+        retired.extend(self.saved_handoff_retirements(saved));
         retired.retain(|fp| !scan_referenced.contains(fp));
         let before = self.accepted_fingerprints.len();
         if keep_adopted_for_retry {
@@ -317,7 +344,7 @@ impl SnapshotUploadProgress {
             self.accepted_fingerprints
                 .retain(|fp| self.accepted_body_witnesses.contains_key(fp));
         } else {
-            self.retire_acks_after_index_save(saved, &retired, locally_held);
+            self.retire_listed_acks_after_index_save(saved, &retired, locally_held);
         }
         if self.accepted_fingerprints.len() != before {
             self.save(path)?;
@@ -450,7 +477,7 @@ impl SnapshotUploadProgress {
         scan_referenced: &AckScanReferences,
         locally_held: &BTreeSet<String>,
         census_absent: &BTreeSet<String>,
-    ) -> Result<BTreeSet<String>> {
+    ) -> Result<AckRetirementPlan> {
         self.stage_ack_retirement_handoff_with_scan(
             previous,
             selected,
@@ -460,7 +487,7 @@ impl SnapshotUploadProgress {
         )?;
         let mut retired = self.committed_incidence_retirements(previous, selected);
         retired.retain(|fp| !scan_referenced.contains(fp));
-        Ok(retired)
+        Ok(AckRetirementPlan(retired))
     }
 
     /// Exact-body obligations carried by `previous`'s handoff plus held ACKs
@@ -548,7 +575,22 @@ impl SnapshotUploadProgress {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn saved_retirement_candidates(&self, saved: &ScanIndex) -> BTreeSet<String> {
+        self.saved_handoff_retirements(saved)
+    }
+
+    /// Add the persisted handoff's exact bodies to a plan after the selected
+    /// index save. Those bodies were staged only with scan references.
+    pub(super) fn add_saved_handoff_retirements(
+        &self,
+        plan: &mut AckRetirementPlan,
+        saved: &ScanIndex,
+    ) {
+        plan.0.extend(self.saved_handoff_retirements(saved));
+    }
+
+    fn saved_handoff_retirements(&self, saved: &ScanIndex) -> BTreeSet<String> {
         let Some(handoff) = saved.upload_ack_retirement_handoff.as_ref().filter(|h| {
             h.destination_namespace_hash == self.destination_namespace_hash
                 && h.committed_generation > 0
@@ -583,7 +625,7 @@ impl SnapshotUploadProgress {
         index_path: &Path,
         progress_path: &Path,
     ) -> Result<()> {
-        let retired = self.saved_retirement_candidates(saved);
+        let retired = self.saved_handoff_retirements(saved);
         let mut removed = BTreeMap::new();
         for fp in retired {
             if let Some(body) = self.accepted_body_witnesses.remove(&fp) {
@@ -683,7 +725,28 @@ impl SnapshotUploadProgress {
     /// Index acceptance is the durable transfer; explicit committed-incidence
     /// retirement removes only that entity. Held/unknown acceptance stays here
     /// until settlement can adopt it. A default/missing index proves neither.
+    pub(super) fn retire_planned_acks_after_index_save(
+        &mut self,
+        saved: &ScanIndex,
+        plan: &AckRetirementPlan,
+        locally_held: &BTreeSet<String>,
+    ) {
+        self.retire_listed_acks_after_index_save(saved, &plan.0, locally_held);
+    }
+
+    /// Raw-set apply for tests only; production must hold an
+    /// `AckRetirementPlan`.
+    #[cfg(test)]
     pub(super) fn retire_acks_after_index_save(
+        &mut self,
+        saved: &ScanIndex,
+        retired: &BTreeSet<String>,
+        locally_held: &BTreeSet<String>,
+    ) {
+        self.retire_listed_acks_after_index_save(saved, retired, locally_held);
+    }
+
+    fn retire_listed_acks_after_index_save(
         &mut self,
         saved: &ScanIndex,
         retired: &BTreeSet<String>,

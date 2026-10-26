@@ -17,7 +17,10 @@ is already in the saved incidence and nothing changes. The guard is
 structural: the reference set has its own type (`AckScanReferences`) that
 only the scan helper can build, and every production stage, release and
 selected-save entry point requires it, so a new save path without a
-liveness set does not compile. The empty-set wrappers and the raw
+liveness set does not compile. The final apply step takes an opaque
+`AckRetirementPlan` that only that planner and the persisted handoff can
+fill, so a save path cannot retire a set it built itself; a source-contract
+test pins this. The empty-set wrappers, the raw-set apply and the raw
 committed-incidence planner are test-only. The partial-save tests also
 carry the obligation to its end: it stays pending across recovery, then
 adopting the settled file or a complete-census absence proof retires the
