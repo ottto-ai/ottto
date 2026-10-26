@@ -411,6 +411,7 @@ fn ready(
         scan: p.scan.clone(),
         modes: p.modes,
         disposition: p.disposition.clone(),
+        released: p.released,
     };
     send.finish();
     let (result, _, _) = upload(&send.scan.snapshots, &mut e2_progress(), ack);
