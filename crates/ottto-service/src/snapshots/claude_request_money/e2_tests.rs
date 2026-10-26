@@ -4353,3 +4353,40 @@ fn e2_virgin_live_maps_have_no_heap_and_initialized_empty_maps_stay_charged() {
         std::mem::size_of::<ClaudeEntityBody>()
     );
 }
+
+#[test]
+fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
+    with_enabled(|| {
+        for reverse in [false, true] {
+            let path_a = root_file("identity-clock-twin-a");
+            let path_b = root_file("identity-clock-twin-b");
+            let index = ScanIndex::default();
+            let a = parse(
+                &path_a,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_A), line("a", &at(1), 10)],
+            );
+            let mut b = parse(
+                &path_b,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_B), line("b", &at(2), 20)],
+            );
+            b.claude_usage_occurrences
+                .get_mut("b")
+                .unwrap()
+                .event_clock_complete = false;
+            let items = tag_owned(if reverse { vec![b, a] } else { vec![a, b] }, &index);
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].request_count, 2);
+            let display = items[0].claude_account_display.as_deref().unwrap();
+            assert_eq!(display.current.status, "unknown");
+            assert_eq!(
+                display.current.unknown_reason.as_deref(),
+                Some("request_order_unavailable")
+            );
+            cleanup(&[&path_a, &path_b]);
+        }
+    });
+}

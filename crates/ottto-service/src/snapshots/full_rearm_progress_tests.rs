@@ -1108,7 +1108,7 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
 /// before final identity application installs its refusal counter on the item.
 #[test]
 fn pipeline_new_auxiliary_bad_clock_keeps_the_due_rearm_enabled() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let mut rearm = Rearm::new();
     let mut index = rearm.index();

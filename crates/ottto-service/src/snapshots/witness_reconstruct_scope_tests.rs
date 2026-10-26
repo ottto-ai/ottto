@@ -143,7 +143,7 @@ fn rebuild_phase_peak(families: &Families) -> usize {
 
 #[test]
 fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let alone = proven_families("witness-scope-alone", 1);
     let crowded = proven_families("witness-scope-crowded", 9);
@@ -163,7 +163,7 @@ fn unrelated_witnessed_families_do_not_change_page_family_rebuild() {
 
 #[test]
 fn rebuild_retains_no_copy_of_unrelated_family_rows() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let small = proven_families("witness-scope-small", 8);
     let large = proven_families("witness-scope-large", 32);
@@ -198,7 +198,7 @@ fn rebuild_retains_no_copy_of_unrelated_family_rows() {
 /// removes unrelated witnesses or replaces N-family state with one family.
 #[test]
 fn terminal_proven_rows_preserve_identical_family_state_with_lower_peak() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     const FAMILIES: usize = 16;
     let families = proven_families("terminal-proven-row-scope", FAMILIES);

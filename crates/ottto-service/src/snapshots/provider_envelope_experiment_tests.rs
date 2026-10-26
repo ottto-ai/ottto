@@ -669,7 +669,7 @@ fn qualified_prior(
 
 #[test]
 fn envelope_experiment_frozen_old_proof_does_not_mask_new_native_request() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, parent, raw) = claude_account_family_fixture();
     let (api0, trace0) = reports(&parent, false);
@@ -755,7 +755,7 @@ impl ProcessPermit {
 
 #[test]
 fn envelope_experiment_native_save_bootstrap_restart_matches_base_owners() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, parent, raw) = claude_account_family_fixture();
     let scratch = crate::test_scratch::ScratchDir::new("envelope-bootstrap");
@@ -1681,7 +1681,7 @@ fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
 
 #[test]
 fn native_comparison_current_nonreported_member_withdraws_whole_family() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let fixture = NativePreparationFixture::new();
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));

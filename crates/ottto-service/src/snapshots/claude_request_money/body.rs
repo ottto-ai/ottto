@@ -181,6 +181,8 @@ pub(crate) struct ClaudeGrainSide {
     /// Contributions without a cost (the side's cost is then unknown).
     pub(crate) unpriced: u64,
     pub(crate) contributions: u64,
+    /// Local display only; newest own transcript clock, never serialized.
+    pub(crate) last_own_at: Option<i128>,
 }
 
 impl ClaudeGrainSide {

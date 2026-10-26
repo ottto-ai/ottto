@@ -906,7 +906,7 @@ fn unsettled_cause_is_named_on_the_claude_transition_lines() {
 #[test]
 #[serial(source_manifests)]
 fn replay_reset_terminal_authority_hold_keeps_the_claude_traversal_incomplete() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("claude-census-convergence-replay-terminal-hold");
@@ -994,7 +994,7 @@ fn replay_reset_terminal_authority_hold_keeps_the_claude_traversal_incomplete() 
 #[test]
 #[serial(source_manifests)]
 fn restorable_terminal_authority_hold_lets_a_bounded_claude_traversal_converge() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("claude-census-convergence-restorable-terminal-hold");
@@ -1215,7 +1215,7 @@ fn assert_held_bodies_never_delivered(
 #[test]
 #[serial(source_manifests)]
 fn terminal_family_never_committed_members_let_the_claude_census_complete() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let (fixture, baseline) =
@@ -1343,7 +1343,7 @@ fn terminal_family_never_committed_members_let_the_claude_census_complete() {
 #[test]
 #[serial(source_manifests)]
 fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
 
@@ -1549,7 +1549,7 @@ fn terminal_bound_hold_traversal(
 #[test]
 #[serial(source_manifests)]
 fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let settled_before = terminal_hold_settlement_count();
@@ -1650,7 +1650,7 @@ fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
 #[test]
 #[serial(source_manifests)]
 fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_census() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     for (name, upload, retry_pending) in [
@@ -1765,7 +1765,7 @@ fn mixed_rejected_fixture(name: &str, account_hold: bool) -> (PipelineFixture, S
 #[serial(source_manifests)]
 #[serial(client_report)]
 fn real_rejected_page_restores_terminal_hold_and_discloses_refusal_beside_accepted_sibling() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     for reason in ["invalid", "usage_accounting_authority_downgrade"] {
@@ -2013,7 +2013,7 @@ fn assert_real_rejected_hold(
 #[test]
 #[serial(source_manifests)]
 fn rejected_page_with_terminal_and_retry_pending_held_entities_blocks_without_counting() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("h1-two-held-terminal-retry");
@@ -2052,7 +2052,7 @@ fn rejected_page_with_terminal_and_retry_pending_held_entities_blocks_without_co
 #[test]
 #[serial(source_manifests)]
 fn rejected_page_with_unbound_authority_only_hold_blocks_without_counting() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("h1-unbound-authority-hold");
@@ -2142,7 +2142,7 @@ fn rejected_page_with_cap_refused_account_hold_blocks_without_counting() {
 #[test]
 #[serial(source_manifests)]
 fn eligible_rejected_hold_preserves_earlier_unsettled_traversal_debt() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let mut fixture = PipelineFixture::new("h1-earlier-unsettled-debt");
@@ -2235,7 +2235,7 @@ const BRIDGE_CYCLE: PipelineCycle<'static> = PipelineCycle {
 #[test]
 #[serial(source_manifests)]
 fn bound_retry_pending_hold_settles_without_marking_the_sweep() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     for upload in [PipelineUpload::Accept, PipelineUpload::ServerRejected] {
@@ -2347,7 +2347,7 @@ fn bound_retry_pending_hold_settles_without_marking_the_sweep() {
 #[test]
 #[serial(source_manifests)]
 fn retry_pending_hold_beside_a_second_cause_still_marks_the_sweep() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     for unbound in [false, true] {
@@ -3044,7 +3044,7 @@ fn absent_retry_pending_family_is_kept_on_an_index_loaded_fresh_in_this_process(
 #[test]
 #[serial(source_manifests)]
 fn returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let mut fixture = PipelineFixture::new("patha-tombstone-never-reproves");
@@ -3405,7 +3405,7 @@ fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
 #[test]
 #[serial(source_manifests)]
 fn full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let cap = crate::snapshots::MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES_FOR_TEST;
@@ -3556,7 +3556,7 @@ fn full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
 #[test]
 #[serial(source_manifests)]
 fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     for retry_pending in [false, true] {
@@ -3638,7 +3638,7 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
 #[test]
 #[serial(source_manifests)]
 fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("reoffer-bound-retry-pending");

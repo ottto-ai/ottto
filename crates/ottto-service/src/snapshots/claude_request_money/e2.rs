@@ -384,6 +384,8 @@ pub(crate) mod money_mark {
     pub(crate) const UNPRICED: u8 = 8;
     /// The native resolver dropped one of two incompatible records.
     pub(crate) const CONFLICT: u8 = 16;
+    /// This file was kept on ordinary money by the local list.
+    pub(crate) const LEGACY: u8 = 32;
 }
 /// Money-rule versions and the marks each one re-reads. Version 1 is the
 /// switch-on, whose revision 3 already re-reads every file. A later money
@@ -514,6 +516,8 @@ pub(crate) struct ClaudeEntityBody {
     pub(crate) resolver_conflicts: u64,
     pub(crate) held: bool,
     pub(crate) certificate_ok: bool,
+    /// Local-only uncertainty from every counted path twin.
+    pub(crate) clock_incomplete: bool,
     // False proves both live maps have never allocated. Empty live maps
     // retain their conservative root charge after a removal.
     pub(super) live_maps_initialized: bool,
@@ -534,6 +538,7 @@ impl Default for ClaudeEntityBody {
             resolver_conflicts: 0,
             held: false,
             certificate_ok: true,
+            clock_incomplete: false,
             live_maps_initialized: false,
             activity_unix: 0,
             activity_nanos: 0,
@@ -562,10 +567,9 @@ impl ClaudeEntityBody {
         if let Some(at) = at {
             self.note_activity(&key.0, at, at);
         }
-        self.grains
-            .entry((key, origin, account))
-            .or_default()
-            .add(tokens, requests, cost);
+        let grain = self.grains.entry((key, origin, account)).or_default();
+        grain.add(tokens, requests, cost);
+        grain.last_own_at = grain.last_own_at.max(at);
     }
     fn note_activity(&mut self, bucket: &str, first: i128, last: i128) {
         self.live_maps_initialized = true;
@@ -609,6 +613,7 @@ impl ClaudeEntityBody {
         into.cost_micros = into.cost_micros.saturating_add(grain.cost_micros);
         into.unpriced = into.unpriced.saturating_add(grain.unpriced);
         into.contributions = into.contributions.saturating_add(grain.contributions);
+        into.last_own_at = into.last_own_at.max(grain.last_own_at);
     }
 
     /// Grains and their activity only (a held copy moving back to counted).
@@ -633,6 +638,7 @@ impl ClaudeEntityBody {
             .saturating_add(other.resolver_conflicts);
         self.held |= other.held;
         self.certificate_ok &= other.certificate_ok;
+        self.clock_incomplete |= other.clock_incomplete;
         self.activity_unix = self.activity_unix.max(other.activity_unix);
         self.activity_nanos = self.activity_nanos.max(other.activity_nanos);
     }
@@ -807,6 +813,7 @@ macro_rules! entity_heap_method {
                 resolver_conflicts: _,
                 held: _,
                 certificate_ok: _,
+                clock_incomplete: _,
                 activity_unix: _,
                 activity_nanos: _,
             } = self;
@@ -838,6 +845,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeGrainSide {
             cost_micros: _,
             unpriced: _,
             contributions: _,
+            last_own_at: _,
         } = self;
         c.add(0)
     }
@@ -2096,7 +2104,7 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
     else {
         return false;
     };
-    let Some(occurrence) = claude_usage_occurrences.get(row.request_id.as_str()) else {
+    let Some(occurrence) = claude_usage_occurrences.get_mut(row.request_id.as_str()) else {
         return false;
     };
     let Some(estimated) = fold.occurrence_key(occurrence) else {
@@ -2115,7 +2123,9 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
     if !fold.entity.take_estimated(&slot, &tokens, requests) {
         return false;
     }
-    // Parse a clock only when the reported key landed in another hour.
+    // Keep the existing wire bucket activity clock. Identity independently
+    // folds own-request clocks after attachment; observer time never decides
+    // the local current account.
     let at = (reported.0 != slot.0 .0)
         .then(|| rfc3339_unix_nanos(&row.observed_at))
         .flatten();
@@ -2133,7 +2143,69 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
         at,
         account,
     );
+    occurrence.telemetry_attached = true;
     true
+}
+
+/// Re-place an already-counted native request after the identity owner has
+/// classified its exact telemetry. Reuse attachment's keys and exact money;
+/// no second resolver, token counter or row allocator participates.
+pub(crate) fn place_request_identity(
+    fold: &mut FileFold,
+    occurrence: &ClaudeTranscriptUsageOccurrence,
+    telemetry: Option<&ClaudeLocalOtelEvidence>,
+    from: AccountPartition,
+    to: AccountPartition,
+) {
+    let Some(estimated) = fold.occurrence_key(occurrence) else {
+        return;
+    };
+    let reported = telemetry
+        .filter(|_| occurrence.telemetry_attached)
+        .and_then(|row| {
+            let key = reported_key(row, Some(occurrence), &fold.base_selector)?;
+            let origin = if row.cost_usd_micros.is_some() {
+                ClaudeRequestUsageOrigin::TelemetryMatched
+            } else {
+                ClaudeRequestUsageOrigin::TelemetryUnpriced
+            };
+            fold.entity
+                .grains
+                .contains_key(&(key.clone(), Some(origin), from.clone()))
+                .then_some((key, Some(origin), row.cost_usd_micros))
+        });
+    let (key, origin, cost) = reported.unwrap_or((estimated, None, None));
+    let slot = (key.clone(), origin, from);
+    let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
+    let requests = occurrence.usage.request_count;
+    let at = occurrence.timestamp.as_deref().and_then(rfc3339_unix_nanos);
+    if slot.2 == to {
+        if let Some(grain) = fold.entity.grains.get_mut(&slot) {
+            grain.last_own_at = grain.last_own_at.max(at);
+        }
+        return;
+    }
+    // take_estimated owns exact token/request removal; reported contributions
+    // differ only in the cost and unpriced counters removed alongside them.
+    let Some(grain) = fold.entity.grains.get(&slot) else {
+        fold.entity.certificate_ok = false;
+        return;
+    };
+    let Some(left_cost) = grain.cost_micros.checked_sub(cost.unwrap_or(0)) else {
+        fold.entity.certificate_ok = false;
+        return;
+    };
+    let unpriced = grain.unpriced;
+    if !fold.entity.take_estimated(&slot, &tokens, requests) {
+        fold.entity.certificate_ok = false;
+        return;
+    }
+    if let Some(grain) = fold.entity.grains.get_mut(&slot) {
+        grain.cost_micros = left_cost;
+        grain.unpriced = unpriced.saturating_sub(u64::from(cost.is_none()));
+    }
+    fold.entity
+        .add(key, &tokens, requests, cost, origin, at, to);
 }
 
 /// Attach the page's already-decoded API rows (`ClaudeApiEvidenceRead`, the
@@ -2507,6 +2579,11 @@ pub(crate) fn side_calls_page(
             } else {
                 ClaudeRequestUsageOrigin::TelemetryUnpriced
             };
+            if enabled() {
+                if let Some(at) = at {
+                    fold.entity.note_activity(&key.0, at, at);
+                }
+            }
             timed("side.add", || {
                 fold.entity.add(
                     key,
@@ -2514,7 +2591,7 @@ pub(crate) fn side_calls_page(
                     1,
                     row.cost_usd_micros,
                     Some(origin),
-                    at,
+                    None,
                     fold.accounts.as_ref().and_then(|a| a.fallback.clone()),
                 )
             });
@@ -2719,6 +2796,17 @@ pub(crate) fn finish_page(
             fold.entity.resolver_conflicts,
         ]));
         session.entity.sum(&fold.entity);
+        session.entity.clock_incomplete |=
+            item.claude_usage_occurrences.values().any(|occurrence| {
+                !occurrence.usage.is_zero()
+                    && !fold.is_skipped(occurrence.sequence)
+                    && (!occurrence.event_clock_complete
+                        || occurrence
+                            .timestamp
+                            .as_deref()
+                            .and_then(rfc3339_unix_nanos)
+                            .is_none())
+            });
         session.complete &= fold.telemetry_complete();
         session
             .locations
@@ -2793,7 +2881,13 @@ fn record_decided(held: bool, counts: Counts) {
 /// Visit the exact final placement; account classification belongs to identity.
 pub(crate) fn visit_identity_rows(
     item: &SnapshotItem,
-    mut visit: impl FnMut(&str, super::super::SnapshotModelUsage, AccountPartition, Option<u64>),
+    mut visit: impl FnMut(
+        &str,
+        super::super::SnapshotModelUsage,
+        AccountPartition,
+        Option<u64>,
+        Option<i128>,
+    ),
 ) -> Option<()> {
     let fold = item.claude_money.as_deref()?;
     for ((key, origin, account), grain) in &fold.entity.grains {
@@ -2802,6 +2896,7 @@ pub(crate) fn visit_identity_rows(
             super::emit::grain_row(key, *origin, grain, None),
             account.clone(),
             grain.cost(),
+            grain.last_own_at,
         );
     }
     Some(())

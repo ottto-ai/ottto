@@ -6031,6 +6031,12 @@ fn prepare_sync_source(
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
+        // Identity adoption lowers paced revision debt. Capture it BEFORE
+        // the committed baseline, so an unaccepted/shed page cannot restore
+        // revision 3 while retaining the newly observed identity contract.
+        index.observe_claude_request_identity_contract(
+            cycle_request_identity_permit(source, &activity_hint).is_some(),
+        );
     }
     let committed_index = index.clone();
     let reoffer_paths =
@@ -23041,7 +23047,7 @@ mod tests {
     }
     #[test]
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         use crate::claude_local_otel::ClaudeIdentityDisposition;
         use sha2::{Digest, Sha256};
@@ -23202,7 +23208,7 @@ mod tests {
     // A shed page records RatelimitBackoff in the shared client_report counters.
     #[serial(client_report)]
     fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, mut prior, _, _) =
             crate::snapshots::claude_request_account_mixed_fixture(2, true);

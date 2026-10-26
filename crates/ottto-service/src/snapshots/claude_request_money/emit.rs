@@ -317,6 +317,7 @@ mod tests {
                     cost_micros: cost.unwrap_or(0),
                     unpriced: u64::from(cost.is_none()),
                     contributions: 1,
+                    last_own_at: None,
                 },
             );
         }
@@ -379,6 +380,7 @@ mod tests {
                 cost_micros: 0,
                 unpriced: 1,
                 contributions: 1,
+                last_own_at: None,
             },
         );
         entity.resolver_conflicts = conflicts;

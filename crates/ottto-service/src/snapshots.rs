@@ -6448,6 +6448,9 @@ const MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS: usize = 4_096;
 /// never a cycle contract, so a terminal of that traversal cannot clear the
 /// contract latch.
 const CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL: &str = "changed_within_traversal";
+// Existing contract field records that E2 already armed paced revision debt
+// during this traversal. It cannot clear the contract latch at its terminal.
+const CLAUDE_E2_IDENTITY_ADOPTION_PENDING: &str = "e2_identity_adoption_pending";
 // Full duplicate-fence re-arms back off while the fence stays closed. This
 // bounds replay cost only; reopening still requires current-window coverage.
 const CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS: u64 = 3_600;
@@ -9441,7 +9444,20 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // sweep, so the latch also requires that no such debt remains.
         let sweep_fully_settled = !index.bounded_sweep_had_unsettled_upload
             && index.claude_usage_authority_pending_count() == 0;
+        // E2's revision-3 adoption is the identity upgrade's ONE paced
+        // pass. The contract latch must not clear fingerprints and arm a
+        // second, unpaced full replay after that pass.
+        let e2_identity_upgrade = claude_request_money::e2::enabled()
+            && identity_contract == claude_request_identity::E2_GROUPING
+            && index.active_effective_upload_body_witness_revision == 3;
+        let e2_identity_owed = e2_identity_upgrade
+            && index.files.iter().any(|(key, entry)| {
+                claude_index_path_member_ref(Path::new(key)).is_some()
+                    && entry.effective_upload_body_witness_revision < 3
+                    && !index.claude_family_listed(key)
+            });
         let identity_contract_rearm = index.claude_request_identity_contract_changed
+            && !e2_identity_upgrade
             && fence_stays_closed
             && census_complete
             && identity_contract_recorded;
@@ -9470,7 +9486,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // or refused CAS) keeps the latch; so does a partial save of this one,
         // and so does any RetryPending authority family.
         if census_complete
-            && (full_rearm || identity_contract_rearm || fence_recovery_rearm)
+            && (full_rearm
+                || identity_contract_rearm
+                || fence_recovery_rearm
+                || (e2_identity_upgrade && !e2_identity_owed))
             && identity_contract_recorded
             && sweep_fully_settled
         {
@@ -14909,6 +14928,9 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
     event_clock_complete: bool,
     desktop_request: bool,
     effective_input_context: u64,
+    /// Page-local E2 outcomes; neither is persisted or sent.
+    telemetry_attached: bool,
+    e2_inherited: Option<bool>,
 }
 
 /// Why a retained Claude response has no resolution.
@@ -18447,6 +18469,8 @@ impl SnapshotAccumulator {
                     request_id.clone(),
                     ClaudeTranscriptUsageOccurrence {
                         sequence: response.sequence,
+                        telemetry_attached: false,
+                        e2_inherited: None,
                         usage: response.usage.clone(),
                         model: response.model.clone(),
                         selector,
@@ -41775,6 +41799,48 @@ impl ScanIndex {
             Some((member.root, member.subagent_stem?))
         }));
         self.claude_reemission_exclusions = exclusions;
+        if claude_request_money::e2::enabled() {
+            let mut families = BTreeSet::new();
+            let mut files = 0;
+            let mut unlisted = Vec::new();
+            for key in self.files.keys() {
+                if self.claude_family_listed(key) {
+                    if let Some(member) = claude_index_path_member_ref(Path::new(key)) {
+                        families.insert(member.root);
+                        files += 1;
+                        let location = claude_money_birth_store::location_key(key);
+                        let marks = self.claude_money_birth_store.money_marks(location);
+                        self.claude_money_birth_store.set_money_marks(
+                            key,
+                            marks | claude_request_money::e2::money_mark::LEGACY,
+                        );
+                    }
+                } else {
+                    let location = claude_money_birth_store::location_key(key);
+                    let marks = self.claude_money_birth_store.money_marks(location);
+                    if marks & claude_request_money::e2::money_mark::LEGACY != 0
+                        && !self.claude_reemission_exclusions.pauses_adoption()
+                        && self.active_effective_upload_body_witness_revision == 3
+                    {
+                        unlisted.push((
+                            key.clone(),
+                            marks & !claude_request_money::e2::money_mark::LEGACY,
+                        ));
+                    }
+                }
+            }
+            // The legacy money-rule mark converges even if the file had
+            // already reached revision 3 before it was listed. Clear it in
+            // the same save as re-owing, so the existing history gate owns
+            // the single paced read and retries remain owed.
+            let family_count = families.len() as u64;
+            drop(families);
+            for (key, marks) in unlisted {
+                self.re_owe_effective_upload_body_witness_revision(&key, 2);
+                self.claude_money_birth_store.set_money_marks(&key, marks);
+            }
+            claude_request_identity::record_listed_legacy_counts(family_count, files);
+        }
         if let Some(cause) = self.claude_reemission_exclusions.missing_cause() {
             crate::local_resource_diagnostics::claude_reemission_list_missing(cause.as_str());
         }
@@ -42450,8 +42516,34 @@ impl ScanIndex {
             return;
         }
         self.claude_request_identity_contract_changed = true;
+        let e2_adoption = claude_request_money::e2::enabled()
+            && contract == claude_request_identity::E2_GROUPING
+            && self.active_effective_upload_body_witness_revision == 3;
+        if e2_adoption
+            && self.claude_request_identity_contract.as_deref()
+                != Some(CLAUDE_E2_IDENTITY_ADOPTION_PENDING)
+        {
+            // A late cohort permit may arrive AFTER revision 3. Reuse its
+            // paced debt rather than clearing fingerprints at the terminal.
+            // At the normal flip these files already owe revision 3, so this
+            // adds no read. A mid-traversal marker prevents re-owing twice.
+            let exclusions = &self.claude_reemission_exclusions;
+            for (key, entry) in &mut self.files {
+                if claude_index_path_member_ref(Path::new(key))
+                    .is_some_and(|member| !exclusions.excludes(member.root, member.subagent_stem))
+                {
+                    claude_history_upgrade::re_owe(
+                        &mut entry.effective_upload_body_witness_revision,
+                        2,
+                        3,
+                    );
+                }
+            }
+        }
         let recorded = if self.traversal.is_none() {
             contract
+        } else if e2_adoption {
+            CLAUDE_E2_IDENTITY_ADOPTION_PENDING
         } else {
             CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL
         };
@@ -42740,6 +42832,14 @@ impl ScanIndex {
             .admission
             .as_ref()
             .map(|state| (state.after_root.as_deref(), state.complete))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claude_request_identity_contract_for_test(&self) -> (Option<&str>, bool) {
+        (
+            self.claude_request_identity_contract.as_deref(),
+            self.claude_request_identity_contract_changed,
+        )
     }
 
     #[cfg(test)]
@@ -61329,7 +61429,7 @@ mod tests {
 
     #[test]
     fn claude_cache_split_new_family_proves_at_healthy_terminal() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, parent, mut items) = cache_split_fixture();
         let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
@@ -61438,7 +61538,7 @@ mod tests {
 
     #[test]
     fn claude_reported_usage_union_assigns_aux_and_preserves_graph() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, parent, mut items) = claude_account_family_fixture();
         let occurrences = items[0]
@@ -61699,7 +61799,7 @@ mod tests {
 
     #[test]
     fn exact_seven_entity_authority_demotion_cohort_reproves_before_upload() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let fixture: Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/claude-authority-demotion-cohort.v1.json"
@@ -62025,7 +62125,7 @@ mod tests {
 
     #[test]
     fn claude_invalid_family_can_hide_copy_from_provider_owned_session() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, parent, mut items) = claude_account_family_fixture();
         let hidden_copy_id = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
@@ -62763,7 +62863,7 @@ mod tests {
 
     #[test]
     fn claude_legacy_fork_prefix_is_excluded_only_with_exact_external_owner() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = temp_dir("claude-legacy-fork-prefix");
         let parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -63174,7 +63274,7 @@ mod tests {
 
     #[test]
     fn claude_d1_subagent_own_request_qualification() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
         let child = items[1].clone();
@@ -63377,7 +63477,7 @@ mod tests {
 
     #[test]
     fn claude_d1_subagent_coverage_lifecycle_and_shapes() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
         // Positive request evidence needs no parent transcript or family census.
@@ -63494,7 +63594,7 @@ mod tests {
 
     #[test]
     fn claude_d1_multiple_requests_typed_identity_and_unreadable_import() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
         let path = dir
@@ -63578,7 +63678,7 @@ mod tests {
 
     #[test]
     fn claude_d1_fresh_reparse_retains_binding_refusal_until_exact_proof_returns() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (dir, root, items) = claude_account_family_fixture();
         let child_path = dir
@@ -67125,7 +67225,7 @@ mod tests {
 
     #[test]
     fn claude_true_chronological_usage_regression_quarantines_the_file() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = temp_dir("claude-progressive-conflict");
         let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
@@ -67158,7 +67258,7 @@ mod tests {
 
     #[test]
     fn claude_equal_provider_time_usage_conflict_quarantines_the_file() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = temp_dir("claude-progressive-equal-time-conflict");
         let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
@@ -68510,7 +68610,7 @@ mod tests {
 
     #[test]
     fn claude_nonforked_owned_start_accepts_minimal_paired_request_evidence() {
-        // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+        // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let path = temp_file("claude-nonforked-paired-owned-start");
         let source_session_id = path
@@ -86598,7 +86698,7 @@ crate::heap_layout_bound::fields!(ClaudeResponseRecord; cache_slot, physical_seq
 crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding_user_timestamp, records, record_limit_exceeded, desktop_request);
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
-crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context);
+crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached, e2_inherited);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
 crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds, proof_correction);
 crate::heap_layout_bound::fields!(ClaudeEmptyMapAdvance; root, member, key, revision, previous);

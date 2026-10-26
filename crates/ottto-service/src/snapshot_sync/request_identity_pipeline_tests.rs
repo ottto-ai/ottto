@@ -205,7 +205,7 @@ fn identity_pipeline_cycle(
 #[serial]
 #[serial(source_cadences, source_manifests)]
 fn native_comparison_real_source_preparation_stays_base_without_paired_evidence() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
@@ -237,7 +237,7 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
 #[serial]
 #[serial(source_cadences, source_manifests)]
 fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_identity as identity;
     let fixture = IdentityPipelineHome::new();

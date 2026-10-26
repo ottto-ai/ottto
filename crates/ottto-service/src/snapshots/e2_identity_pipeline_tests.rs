@@ -84,6 +84,11 @@ fn e2_page(
             })
             .flatten();
         assert_eq!(permit.is_some(), permitted);
+        claude_request_identity::retain_root_accounts(
+            &mut scan.snapshots,
+            index,
+            "e2-identity-machine",
+        );
         let (disposition, _, stats) =
             crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
                 support, &mut scan, index, permit,
@@ -158,6 +163,12 @@ fn e2_pipeline_tags_the_final_root_and_agent_rows() {
             assert!(e2_is_literal(item), "{label} (permitted={permitted})");
             assert_eq!(item.request_count, requests, "{label}: own requests only");
             e2_assert_identity_consistent(item, label);
+            if !permitted {
+                assert!(
+                    item.request_evidence.is_empty(),
+                    "no cohort permit, no contract-5 evidence"
+                );
+            }
             assert!(
                 e2_rows(item).all(|row| row.account_identifier_hash == Some(e2_account())),
                 "{label}: the one proven login tags every final row (permitted={permitted})"
@@ -290,4 +301,141 @@ fn e2_pipeline_telemetry_read_failure_is_never_complete_and_withholds_nothing() 
         "live bodies are not withheld"
     );
     fs::remove_dir_all(dir).unwrap();
+}
+
+fn e2_resign(row: &mut crate::claude_local_otel::ClaudeLocalOtelEvidence) {
+    row.fingerprint.clear();
+    row.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(row).unwrap())
+    );
+}
+
+fn e2_login_counts(item: &SnapshotItem) -> BTreeMap<Option<String>, u64> {
+    let mut counts = BTreeMap::new();
+    for row in item
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+    {
+        if let Some(parts) = &row.identity_parts {
+            for part in parts {
+                *counts
+                    .entry(part.account_identifier_hash.clone())
+                    .or_default() += part.request_count;
+            }
+        } else {
+            *counts
+                .entry(row.account_identifier_hash.clone())
+                .or_default() += row.request_count;
+        }
+    }
+    counts
+}
+
+#[test]
+fn e2_pipeline_root_and_child_keep_independent_own_telemetry_logins() {
+    let (dir, root, _) = claude_account_family_fixture();
+    let support = dir.join("support");
+    let (mut api, trace) = e2_family_evidence(&root);
+    api[4].account_identifier_hash = Some("b".repeat(64));
+    e2_resign(&mut api[4]);
+    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
+    let (items, disposition, failed) = e2_page(
+        std::slice::from_ref(&dir),
+        &support,
+        &mut ScanIndex::default(),
+        true,
+    );
+    assert!(!failed);
+    assert_eq!(items.len(), 2);
+    for item in &items {
+        assert!(e2_is_literal(item));
+        let (login, requests) = if item.source_session_id == root {
+            ("a", 4)
+        } else {
+            ("b", 1)
+        };
+        assert_eq!(
+            e2_login_counts(item),
+            BTreeMap::from([(Some(login.repeat(64)), requests)])
+        );
+    }
+    assert_eq!(disposition.quarantined_entity_count(), 0);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
+    for (bound, partial) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (dir, root, _) = claude_account_family_fixture();
+        let support = dir.join("support");
+        let (mut api, trace) = e2_family_evidence(&root);
+        for row in &mut api[2..4] {
+            row.account_identifier_hash = Some("b".repeat(64));
+            e2_resign(row);
+        }
+        if partial {
+            api.retain(|row| row.request_id != "req_2" && row.request_id != "req_4");
+        }
+        e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+        e2_write_rows(
+            &support,
+            "local-otel/claude-code-trace-ownership",
+            &root,
+            &trace,
+        );
+        let mut index = ScanIndex::default();
+        if bound {
+            index.session_account_bindings.insert(
+                sha256_hex(&["session_owner:v1", "e2-identity-machine", &root]),
+                SessionAccountBinding {
+                    account_identifier_hash: e2_account(),
+                    workspace_identifier_hash: None,
+                },
+            );
+        }
+        let (items, disposition, failed) =
+            e2_page(std::slice::from_ref(&dir), &support, &mut index, true);
+        assert!(!failed);
+        let item = items
+            .iter()
+            .find(|item| item.source_session_id == root)
+            .unwrap();
+        assert_eq!(
+            e2_login_counts(item),
+            BTreeMap::from([(Some(e2_account()), 2), (Some("b".repeat(64)), 2)]),
+            "bound={bound}"
+        );
+        assert_eq!(item.request_count, 4);
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some(if partial { "0.0002" } else { "0.0004" })
+        );
+        let counts =
+            serde_json::to_value(claude_request_identity::page_identity_counts(&items)).unwrap();
+        if partial {
+            assert_eq!(
+                counts["claude_inherited_org_requests"], 2,
+                "missing requests inherit A then B, counted"
+            );
+        } else {
+            assert!(
+                counts.get("claude_inherited_org_requests").is_none(),
+                "own evidence needs no fill: {counts}"
+            );
+        }
+        assert!(
+            counts.get("claude_identity_conflict_fallbacks").is_none(),
+            "no conflict: {counts}"
+        );
+        assert_eq!(disposition.quarantined_entity_count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -2427,7 +2427,7 @@ fn binding_family() -> (
 
 #[test]
 fn demotion_after_same_call_reproof_binds_current_witness() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (scratch, root, mut index, items, mut api, trace) = binding_family();
     let old = claude_usage_family_witness_fingerprint(&index.claude_usage_family_witnesses[&root]);
@@ -2484,7 +2484,7 @@ fn demotion_after_same_call_reproof_binds_current_witness() {
 
 #[test]
 fn witness_removed_while_member_demotes_does_not_quarantine_index() {
-    // Pre-flip path: E2 bodies skip the legacy reported rebuild (gate off).
+    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (scratch, root, mut index, mut items, api, trace) = binding_family();
     index.files.insert(
