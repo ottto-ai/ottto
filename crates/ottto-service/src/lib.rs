@@ -58,6 +58,7 @@ pub mod snapshot_sync;
 pub mod snapshot_watcher;
 pub mod snapshots;
 mod source_rotation;
+pub mod telemetry_attach;
 #[cfg(test)]
 mod test_scratch;
 mod transcript_acquisition;

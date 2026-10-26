@@ -145,6 +145,25 @@ impl<T: HeapLayoutBound> HeapLayoutBound for Option<T> {
         Some(())
     }
 }
+impl<T: HeapLayoutBound> HeapLayoutBound for std::cell::OnceCell<T> {
+    fn stable_heap(&self) -> bool {
+        self.get().map_or(true, HeapLayoutBound::stable_heap)
+    }
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(0)?;
+        if let Some(x) = self.get() {
+            x.heap_bound(c)?;
+        }
+        Some(())
+    }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(0)?;
+        if let Some(x) = self.get() {
+            x.completed_heap_bound(c)?;
+        }
+        Some(())
+    }
+}
 impl<T: HeapLayoutBound> HeapLayoutBound for Vec<T> {
     fn stable_heap(&self) -> bool {
         self.iter().all(HeapLayoutBound::stable_heap)

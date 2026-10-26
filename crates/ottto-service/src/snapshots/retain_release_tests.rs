@@ -1108,67 +1108,72 @@ fn x_out_coverage_witness_names_every_finished_field() {
             reasoning_output_tokens: _,                     // I
             unattributed_total_tokens: _,                   // I
             request_count: _,                               // I
-            usage_accounting_contract: _,                   // K (literal)
-            claude_usage_request_ids: _,                    // R
-            claude_usage_occurrences: _,                    // R
-            cache_observations: _,                          // K (None on Claude)
-            cache_observations_state: _,                    // K (None at into_items)
-            cache_base_head_etag: _,                        // K (None at into_items)
-            cache_requests: _,                              // R
-            cache_requests_complete: _,                     // I
-            avg_duration_ms: _,                             // I
-            avg_time_to_first_token_ms: _,                  // I
-            max_duration_ms: _,                             // I
-            max_time_to_first_token_ms: _,                  // I
-            peak_context_fill_tokens: _,                    // I
-            first_turn_context_tokens: _,                   // I
-            last_turn_context_tokens: _,                    // I
-            first_turn_context_window_tokens: _,            // I (Codex only; D1)
-            peak_context_fill_window_tokens: _,             // I (Codex only; D1)
-            last_turn_context_window_tokens: _,             // I (Codex only; D1)
-            compaction_count: _,                            // I
-            compaction_timestamps: _,                       // D
-            compaction_events: _,                           // K (empty on Claude)
-            local_context_points: _,                        // K (empty on Claude)
-            first_own_request_at: _,                        // K (None at finish; #698)
-            compaction_total_pre_tokens: _,                 // I
-            compaction_total_post_tokens: _,                // I
-            compaction_total_cumulative_dropped_tokens: _,  // I
-            compaction_total_duration_ms: _,                // I
-            context_curve: _,                               // K (unavailable_context_curve)
-            claude_context_curve_boundaries: _,             // M
-            claude_context_curve_identity_complete: _,      // I
+            removed_request_count: _,                       // inline optional wire counters
+            removed_usage: _,                               // inline optional wire counters
+            telemetry_owned_complete: _,                    // inline optional authority marker
+            resolver_conflict_count: _,                     // inline optional wire counter
+            claude_money: _, // E aggregate is covered by finish output reserve
+            usage_accounting_contract: _, // K (literal)
+            claude_usage_request_ids: _, // R
+            claude_usage_occurrences: _, // R
+            cache_observations: _, // K (None on Claude)
+            cache_observations_state: _, // K (None at into_items)
+            cache_base_head_etag: _, // K (None at into_items)
+            cache_requests: _, // R
+            cache_requests_complete: _, // I
+            avg_duration_ms: _, // I
+            avg_time_to_first_token_ms: _, // I
+            max_duration_ms: _, // I
+            max_time_to_first_token_ms: _, // I
+            peak_context_fill_tokens: _, // I
+            first_turn_context_tokens: _, // I
+            last_turn_context_tokens: _, // I
+            first_turn_context_window_tokens: _, // I (Codex only; D1)
+            peak_context_fill_window_tokens: _, // I (Codex only; D1)
+            last_turn_context_window_tokens: _, // I (Codex only; D1)
+            compaction_count: _, // I
+            compaction_timestamps: _, // D
+            compaction_events: _, // K (empty on Claude)
+            local_context_points: _, // K (empty on Claude)
+            first_own_request_at: _, // K (None at finish; #698)
+            compaction_total_pre_tokens: _, // I
+            compaction_total_post_tokens: _, // I
+            compaction_total_cumulative_dropped_tokens: _, // I
+            compaction_total_duration_ms: _, // I
+            context_curve: _, // K (unavailable_context_curve)
+            claude_context_curve_boundaries: _, // M
+            claude_context_curve_identity_complete: _, // I
             claude_context_curve_request_index_complete: _, // I
-            claude_context_curve_owned_start_proven: _,     // I
-            claude_file_birth: _,                           // M
-            claude_file_birth_verdict: _,                   // I (inline enum; None at finish)
-            activity_summary: _,                            // D
-            tool_usage: _,                                  // D (from R's tool names)
-            tool_usage_truncated: _,                        // I
-            session_start: _,                               // U
-            model_usage: _,                                 // D (rows from R)
-            usage_buckets: _,                               // D (rows from R)
-            cost: _,                                        // I
-            session_display_name: _,                        // D / U (title metadata)
-            session_display_name_source: _,                 // D / U (title metadata)
-            source_started_at: _,                           // D
-            source_ended_at: _,                             // D
-            source_last_activity_at: _,                     // D
-            collected_at: _,                                // K (RFC 3339)
-            workspace_hash: _,                              // D
-            workspace_display_label: _,                     // K (None)
-            workspace_label_source: _,                      // K (None)
-            repository_hash: _,                             // U (repository identity)
-            repository_label: _,                            // U
-            repository_label_source: _,                     // U
-            repository_identity_source: _,                  // U
-            workspace_kind: _,                              // U
-            source_file_fingerprint: _,                     // K
-            session_artifacts: _,                           // D
-            provenance: _,                                  // K
-            origin: _,                                      // D
-            originator: _,                                  // D
-            attribution_facts: _,                           // K (enforce_fact_limits caps)
+            claude_context_curve_owned_start_proven: _, // I
+            claude_file_birth: _, // M
+            claude_file_birth_verdict: _, // I (inline enum; None at finish)
+            activity_summary: _, // D
+            tool_usage: _,   // D (from R's tool names)
+            tool_usage_truncated: _, // I
+            session_start: _, // U
+            model_usage: _,  // D (rows from R)
+            usage_buckets: _, // D (rows from R)
+            cost: _,         // I
+            session_display_name: _, // D / U (title metadata)
+            session_display_name_source: _, // D / U (title metadata)
+            source_started_at: _, // D
+            source_ended_at: _, // D
+            source_last_activity_at: _, // D
+            collected_at: _, // K (RFC 3339)
+            workspace_hash: _, // D
+            workspace_display_label: _, // K (None)
+            workspace_label_source: _, // K (None)
+            repository_hash: _, // U (repository identity)
+            repository_label: _, // U
+            repository_label_source: _, // U
+            repository_identity_source: _, // U
+            workspace_kind: _, // U
+            source_file_fingerprint: _, // K
+            session_artifacts: _, // D
+            provenance: _,   // K
+            origin: _,       // D
+            originator: _,   // D
+            attribution_facts: _, // K (enforce_fact_limits caps)
             request_evidence: _, // K (empty at finish; filled post-scan, snapshot_sync)
             request_identity_refusals: _, // I
             claude_org_markers: _, // M

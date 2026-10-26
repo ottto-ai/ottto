@@ -392,6 +392,34 @@ const _: () = assert!(
         <= crate::snapshots::MAX_GATED_CLAUDE_REVISION
 );
 
+/// The revision a sync cycle activates: the compiled one. Test builds only:
+/// the Money E2 benchmark's switch-on arm activates the next Claude revision
+/// as its activation PR will compile it (`with_claude_cycle_revision`).
+fn cycle_body_witness_revision(source: SnapshotSource) -> u64 {
+    #[cfg(test)]
+    if source == SnapshotSource::ClaudeCode {
+        if let Some(revision) = CLAUDE_CYCLE_REVISION.with(std::cell::Cell::get) {
+            return revision;
+        }
+    }
+    effective_upload_body_witness_revision(source)
+}
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_CYCLE_REVISION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn with_claude_cycle_revision<T>(revision: u64, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CLAUDE_CYCLE_REVISION.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(CLAUDE_CYCLE_REVISION.with(|value| value.replace(Some(revision))));
+    f()
+}
+
 /// Where this destination's Claude prior history comes from (SOURCE
 /// F1a/F1b, StateMissing H1/N1). A fresh install is only a positively empty
 /// support state.
@@ -4346,6 +4374,11 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         unattributed_total_tokens: item.unattributed_total_tokens,
         request_count: item.request_count,
         usage_accounting_contract: item.usage_accounting_contract.clone(),
+        removed_request_count: item.removed_request_count,
+        removed_usage: item.removed_usage,
+        telemetry_owned_complete: item.telemetry_owned_complete,
+        resolver_conflict_count: item.resolver_conflict_count,
+        claude_money: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
         cache_observations: item.cache_observations.clone(),
@@ -6052,9 +6085,7 @@ fn prepare_sync_source(
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
-    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
-        source,
-    ));
+    index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(source));
     if source == SnapshotSource::ClaudeCode {
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
@@ -6462,9 +6493,7 @@ fn prepare_continuation_source(
     if !upload_progress.active_reason_reoffers.is_empty() {
         return Ok(Err(ContinuationRefusal::ReasonReoffer));
     }
-    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
-        source,
-    ));
+    index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(source));
     // K3: as the ordinary prepare, before the scan advances it. It is dropped
     // here unless the page commits, and crosses to the parent only by move.
     let committed_index = index.clone();
@@ -6764,6 +6793,11 @@ fn finish_sync_source(
     let mut actual_native_conjunction = false;
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
+        crate::snapshots::claude_request_identity::retain_root_accounts(
+            &mut scan_result.snapshots,
+            &index,
+            machine_id,
+        );
         let applied = try_apply_claude_local_evidence_to_scan_with_comparison(
             support_dir,
             &mut scan_result,
@@ -7225,7 +7259,7 @@ fn finish_sync_source(
     let upload_result = if let Some(error) = bootstrap_capacity_error {
         Err(error)
     } else {
-        upload_resumable_batches_with_body_witness_partitioned(
+        upload_resumable_batches_with_literal_families(
             &scan_result.snapshots,
             source.api_slug(),
             &mut upload_progress,
@@ -7234,6 +7268,7 @@ fn finish_sync_source(
             snapshot_upload_body_witness,
             |snapshot| Some(snapshot.source_session_id.as_str()),
             |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+            crate::snapshots::claude_request_money::request_owned_family_root,
             &mut inplace_retry,
             |snapshots| {
                 // A first Codex/Claude scan can spend several minutes parsing local
@@ -8660,6 +8695,14 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
 
+// Test-only file repair at the real attachment/strict-read boundary. It
+// changes no reader verdict or accumulator and has no production state.
+#[cfg(test)]
+thread_local! {
+    static E2_AFTER_API_ATTACH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn try_apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -8701,6 +8744,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 .map(|original| (item.source_session_id.clone(), original))
         })
         .collect();
+    let request_owned_originals =
+        crate::snapshots::claude_request_identity::capture_request_owned_originals(
+            &scan_result.snapshots,
+        );
     let mut session_ids = claude_evidence_session_ids(&scan_result.snapshots)
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -8711,6 +8758,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         requested_session_count: session_ids.len(),
         ..Default::default()
     };
+    // E2: every held copy skip is decided (or the session held) before
+    // telemetry attaches, so a copy that counts after all can be matched.
+    crate::snapshots::claude_request_money::e2::decide_page_copies(
+        &mut scan_result.snapshots,
+        index,
+    );
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
@@ -8719,6 +8772,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     };
     match api_load {
         Ok(evidence) => {
+            crate::snapshots::claude_request_money::e2::attach_page(
+                &mut scan_result.snapshots,
+                &evidence,
+            );
             let census_window_end = scan_result.census_window_end.clone();
             crate::snapshots::apply_claude_effort_evidence_with_index(
                 &mut scan_result.snapshots,
@@ -8734,6 +8791,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             full_rearm_evidence_complete = false;
         }
     }
+    #[cfg(test)]
+    E2_AFTER_API_ATTACH.with(|hook| {
+        if let Some(after_attach) = hook.borrow_mut().take() {
+            after_attach();
+        }
+    });
+    let telemetry_read_failed = stats.effort_evidence_load_failed;
     let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
         .chain(crate::snapshots::claude_pending_family_session_ids(index))
@@ -8741,6 +8805,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .into_iter()
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
+    let request_owned_enabled = crate::snapshots::claude_request_money::e2::enabled();
     let mut identity_unhealthy_roots = BTreeSet::new();
     let usage_roots = usage_roots
         .into_iter()
@@ -8755,11 +8820,23 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                     session_id,
                 )
                 .is_empty();
+            // Attachment already consumed the permissive read. A later strict
+            // reread may recover, but this page must not settle the earlier
+            // incomplete attachment as final history.
+            if request_owned_enabled
+                && paired
+                && api_read
+                    .session_report(session_id)
+                    .is_some_and(|read| !read.complete)
+            {
+                full_rearm_evidence_complete = false;
+                identity_unhealthy_roots.insert(session_id.clone());
+            }
             // Contract 5 must tell absent evidence from failed evidence.
             if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
                 full_rearm_evidence_complete = false;
-                if emission_permitted {
+                if emission_permitted || request_owned_enabled {
                     identity_unhealthy_roots.insert(session_id.clone());
                 }
             }
@@ -8792,6 +8869,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // that family unproven, not suppress an unrelated healthy family.
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    // E2: roots whose strict API and trace reads were both healthy. A healthy
+    // sidecar may hold no rows for the root, so evidence keys cannot say this.
+    let mut strict_healthy_roots = BTreeSet::new();
     for root_session_id in usage_roots {
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
         let mut trace = match prepared.as_mut() {
@@ -8812,12 +8892,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
-            if emission_permitted {
+            if emission_permitted || request_owned_enabled {
                 identity_unhealthy_roots.insert(root_session_id);
             }
             continue;
         }
         stats.complete_sidecar_root_count += 1;
+        if request_owned_enabled {
+            strict_healthy_roots.insert(root_session_id.clone());
+        }
         let api_request_ids = api
             .evidence
             .get(&root_session_id)
@@ -8849,6 +8932,22 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_evidence_row_count += rows.len();
             trace_report.evidence.insert(root_session_id, rows);
         }
+    }
+    // E2 side calls need the trace-named owner, so they follow the trace read.
+    let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
+        &mut scan_result.snapshots,
+        &api_report,
+        &trace_report,
+        index,
+    );
+    if request_owned_enabled {
+        // Reuse the per-root read verdict before identity consumes it. Missing
+        // sidecars are ordinary absence; partial pairs and failed strict reads
+        // hold only that root's permitted owed history through the existing seam.
+        index.hold_claude_history_for_unhealthy_telemetry_roots(&identity_unhealthy_roots);
+        // A side-call census walk past its deadline decided nothing for its
+        // families: the same seam keeps their owed history for a later page.
+        index.hold_claude_history_for_unhealthy_telemetry_roots(&side_calls_unresolved);
     }
     // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.
@@ -8891,6 +8990,60 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if let Some(comparison) = comparison {
         comparison.retire_native_fold_owner();
     }
+    if crate::snapshots::claude_request_money::e2::enabled() {
+        if let Some(evidence) = &identity_evidence {
+            crate::snapshots::claude_request_identity::reconcile_request_accounts(
+                &mut scan_result.snapshots,
+                evidence,
+            );
+        }
+    }
+    let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
+        let ownership =
+            crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
+                index,
+                &disposition,
+            );
+        crate::snapshots::claude_request_identity::stage_request_owned_activity(
+            &scan_result.snapshots,
+            evidence,
+            &ownership,
+            &request_owned_originals,
+        )
+    });
+    // E2 bodies are final before any identity owner runs: contract 5, D1 and
+    // the account hash then tag the rows that upload (donor #699 order).
+    // Gate off this only counts, so the page is unchanged.
+    // Withheld entities stay on the page and owed: delayed, never settled.
+    let withheld = crate::snapshots::claude_request_money::e2::finish_page(
+        &mut scan_result.snapshots,
+        index,
+        if telemetry_read_failed {
+            crate::snapshots::claude_request_money::e2::TelemetryRead::Failed
+        } else {
+            crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
+        },
+    );
+    disposition.hold_request_owned(withheld);
+    if request_owned_enabled {
+        for item in &mut scan_result.snapshots {
+            if let Some(root) =
+                crate::snapshots::claude_request_money::request_owned_family_root(item)
+            {
+                // API attachment alone cannot certify side-call coverage. A
+                // root is complete only after BOTH strict reads succeed.
+                if !strict_healthy_roots.contains(root) {
+                    item.telemetry_owned_complete = Some(false);
+                }
+            }
+        }
+    }
+    if telemetry_read_failed && crate::snapshots::claude_request_money::e2::enabled() {
+        // No owed history file settles on estimates because this page could
+        // not read telemetry: the emission seam drops its bodies, keeps its
+        // upload tuple, and it stays owed for a later page.
+        index.hold_claude_history_for_unread_telemetry();
+    }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
         // rebuild above has just settled this pass's duplicate census.
@@ -8906,6 +9059,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 std::mem::take(&mut disposition.request_groupings),
                 &ownership,
             );
+        if let Some(activity) = request_owned_activity {
+            crate::snapshots::claude_request_identity::publish_request_owned_activity(
+                &scan_result.snapshots,
+                activity,
+            );
+        }
     }
     let qualification = match &identity_evidence {
         Some(evidence) => crate::snapshots::claude_request_accounts::apply_with_shared_index(
@@ -9605,6 +9764,33 @@ fn snapshot_packing_json_length<T: Serialize + ?Sized>(item: &T) -> serde_json::
     Ok(length.bytes)
 }
 
+/// Cut one request-owned family (root first) into consecutive groups that
+/// each fit one batch: at most `SNAPSHOT_BATCH_LIMIT` bodies and
+/// `SNAPSHOT_BATCH_MAX_BYTES`, one batch class. A family that fits stays one
+/// group. A single body over the byte bound is its own group and meets the
+/// existing request preflight.
+fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, usize, bool)>> {
+    let mut groups = Vec::new();
+    let mut group = Vec::<(usize, usize, bool)>::new();
+    let mut bytes = 2usize;
+    for member in members {
+        if !group.is_empty()
+            && (group.len() == SNAPSHOT_BATCH_LIMIT
+                || bytes.saturating_add(member.1) > SNAPSHOT_BATCH_MAX_BYTES
+                || group[0].2 != member.2)
+        {
+            groups.push(std::mem::take(&mut group));
+            bytes = 2;
+        }
+        bytes = bytes.saturating_add(member.1);
+        group.push(member);
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    groups
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upload_resumable_batches_with_body_witness_partitioned<
     T,
@@ -9624,6 +9810,57 @@ fn upload_resumable_batches_with_body_witness_partitioned<
     session_id: SessionId,
     batch_class: BatchClass,
     inplace_retry: &mut InplaceRetryBudget,
+    upload: Upload,
+    persist: Persist,
+) -> Result<ResumableUploadResult>
+where
+    T: Clone + Serialize,
+    Fingerprint: Fn(&T) -> &str,
+    BodyWitness: Fn(&T) -> String,
+    SessionId: Fn(&T) -> Option<&str>,
+    BatchClass: Fn(&T) -> bool,
+    Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+{
+    upload_resumable_batches_with_literal_families(
+        items,
+        poison_scope,
+        progress,
+        accepted,
+        fingerprint,
+        body_witness,
+        session_id,
+        batch_class,
+        |_| None,
+        inplace_retry,
+        upload,
+        persist,
+    )
+}
+
+/// `literal_family` names the family root of a request-owned literal body
+/// (`None` for every other body); see `literal_family_groups`.
+#[allow(clippy::too_many_arguments)]
+fn upload_resumable_batches_with_literal_families<
+    T,
+    Fingerprint,
+    BodyWitness,
+    SessionId,
+    BatchClass,
+    LiteralFamily,
+    Upload,
+    Persist,
+>(
+    items: &[T],
+    poison_scope: &str,
+    progress: &mut SnapshotUploadProgress,
+    accepted: &mut u64,
+    fingerprint: Fingerprint,
+    body_witness: BodyWitness,
+    session_id: SessionId,
+    batch_class: BatchClass,
+    literal_family: LiteralFamily,
+    inplace_retry: &mut InplaceRetryBudget,
     mut upload: Upload,
     mut persist: Persist,
 ) -> Result<ResumableUploadResult>
@@ -9633,6 +9870,7 @@ where
     BodyWitness: Fn(&T) -> String,
     SessionId: Fn(&T) -> Option<&str>,
     BatchClass: Fn(&T) -> bool,
+    LiteralFamily: Fn(&T) -> Option<&str>,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
@@ -9741,23 +9979,61 @@ where
     }
     let mut deferred_validation_error = None;
     let mut batches = VecDeque::new();
+    // Request-owned literal bodies travel with their Claude family (early-t7
+    // Q1). A family that fits one batch is packed whole; a larger one is cut
+    // into consecutive batch-sized groups, root first, never refused. Each
+    // group still settles by its own exact entity ACKs. Units are kept as one
+    // ordered list plus end offsets; an ordinary body is a unit of one, so
+    // without literal items (gate off) packing is the previous order.
+    let mut order = Vec::<(usize, usize, bool)>::with_capacity(pending_by_fingerprint.len());
+    let mut unit_ends = Vec::<usize>::with_capacity(pending_by_fingerprint.len());
+    let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, bool)>>::new();
+    for (index, body_length, _) in pending_by_fingerprint.into_values() {
+        let item = (
+            index,
+            body_length.saturating_add(1),
+            batch_class(&items[index]),
+        );
+        match literal_family(&items[index]) {
+            Some(root) => literal_families.entry(root).or_default().push(item),
+            None => {
+                order.push(item);
+                unit_ends.push(order.len());
+            }
+        }
+    }
+    for (root, mut members) in literal_families {
+        members.sort_by_key(|(index, _, _)| {
+            let member = session_id(&items[*index]);
+            (member != Some(root), member)
+        });
+        for group in literal_family_groups(members) {
+            order.extend(group);
+            unit_ends.push(order.len());
+        }
+    }
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
     let mut current_batch_class = None;
-    for (index, body_length, _) in pending_by_fingerprint.into_values() {
-        let item_bytes = body_length.saturating_add(1);
-        let item_batch_class = batch_class(&items[index]);
+    let mut unit_start = 0;
+    for unit_end in unit_ends {
+        let unit = &order[unit_start..unit_end];
+        unit_start = unit_end;
+        let unit_bytes = unit
+            .iter()
+            .fold(0usize, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
+        let unit_class = unit[0].2;
         if !batch.is_empty()
-            && (batch.len() == SNAPSHOT_BATCH_LIMIT
-                || batch_bytes.saturating_add(item_bytes) > SNAPSHOT_BATCH_MAX_BYTES
-                || current_batch_class != Some(item_batch_class))
+            && (batch.len() + unit.len() > SNAPSHOT_BATCH_LIMIT
+                || batch_bytes.saturating_add(unit_bytes) > SNAPSHOT_BATCH_MAX_BYTES
+                || current_batch_class != Some(unit_class))
         {
             batches.push_back((std::mem::take(&mut batch), false));
             batch_bytes = 2;
         }
-        current_batch_class = Some(item_batch_class);
-        batch.push(index);
-        batch_bytes = batch_bytes.saturating_add(item_bytes);
+        current_batch_class = Some(unit_class);
+        batch.extend(unit.iter().map(|(index, _, _)| *index));
+        batch_bytes = batch_bytes.saturating_add(unit_bytes);
     }
     if !batch.is_empty() {
         batches.push_back((batch, false));
@@ -15280,6 +15556,11 @@ mod tests {
     mod packing_count_tests {
         use super::*;
         include!("snapshot_sync/packing_count_tests.rs");
+    }
+
+    mod e2_upload_tests {
+        use super::*;
+        include!("snapshot_sync/e2_upload_tests.rs");
     }
 
     #[derive(Clone, Serialize)]
@@ -21750,6 +22031,9 @@ mod tests {
     mod history_upgrade_pipeline_tests {
         include!("snapshot_sync/history_upgrade_pipeline_tests.rs");
     }
+    mod claude_money_e2_pipeline_tests {
+        include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
+    }
     mod claude_request_money_pipeline_tests {
         include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
     }
@@ -21773,6 +22057,9 @@ mod tests {
     }
 
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
+    mod money_e2_bench_tests {
+        include!("snapshot_sync/money_e2_bench_tests.rs");
+    }
     pub(super) mod permanent_finish_pipeline_tests {
         include!("snapshot_sync/permanent_finish_pipeline_tests.rs");
     }

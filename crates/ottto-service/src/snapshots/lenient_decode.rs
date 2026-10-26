@@ -80,6 +80,14 @@ impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
     }
 }
 impl Holds {
+    pub(super) fn file_keys(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .get("files")
+            .into_iter()
+            .flat_map(|slots| slots.keys())
+            .map(String::as_str)
+    }
+
     fn rebuild_scopes(&mut self) {
         if self.0.is_empty() {
             // Removing the final repaired slot can leave an allocated empty
@@ -316,6 +324,10 @@ impl Serialize for ScanIndex {
         );
         field!(upload_ack_retirement_handoff, Option::is_none);
         field!(held_audit_progress, Option::is_none);
+        field!(
+            claude_money_birth_store,
+            claude_money_birth_store::BirthStore::is_empty
+        );
         map.end()
     }
 }
@@ -406,6 +418,7 @@ pub(super) const FIELDS: &[&str] = &[
     "codex_counting_evicted_legacy",
     "upload_ack_retirement_handoff",
     "held_audit_progress",
+    "claude_money_birth_store",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -799,7 +812,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
                 reader.consume(1);
                 name
             };
-            let optional = optional_census(name);
+            let optional = optional_census(name) || name == Some("claude_money_birth_store");
             // CensusRead streams positional-array separator whitespace before
             // capture; object-field evidence starts immediately after ':'.
             if array {
@@ -807,8 +820,10 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
             }
             let value = lexical_span(reader, optional, 1)?;
             if optional {
-                resources[usize::from(name == Some("claude_request_census_shadow"))] |=
-                    value.resource;
+                if optional_census(name) {
+                    resources[usize::from(name == Some("claude_request_census_shadow"))] |=
+                        value.resource;
+                }
                 if !value.resource {
                     checked_grammar(reader, value)?;
                 }
@@ -1520,7 +1535,8 @@ impl<R: BufRead + Seek> Decoder<R> {
                 self.eat(b':')?;
                 name
             };
-            let value = self.span_optional(optional_census(name))?;
+            let value = self
+                .span_optional(optional_census(name) || name == Some("claude_money_birth_store"))?;
             if let Some(name) = name {
                 if matches!(
                     name,
@@ -1895,6 +1911,20 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.accepted_rebuild_last_alarm_unix_seconds =
                                 self.diagnostic_timestamp(value)?;
                         }
+                        "claude_money_birth_store" => {
+                            // Optional money hints cannot rebuild or pause an otherwise valid index.
+                            // Bound allocation before decoding; do not carry through identity repair.
+                            let decoded = if !value.resource && value.len <= 4 * 1024 * 1024 {
+                                self.typed::<claude_money_birth_store::BirthStore>(value)
+                                    .ok()
+                            } else {
+                                None
+                            };
+                            if decoded.is_none() {
+                                self.counts.drops.activity += 1;
+                            }
+                            index.claude_money_birth_store = decoded.unwrap_or_default();
+                        }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
                                 return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
@@ -2163,12 +2193,7 @@ impl ScanIndex {
                 .is_some_and(|member| self.decode_holds_family(member.root))
     }
     pub(crate) fn decode_held_file_keys(&self) -> impl Iterator<Item = &str> {
-        self.decode_holds
-            .0
-            .get("files")
-            .into_iter()
-            .flat_map(|slots| slots.keys())
-            .map(String::as_str)
+        self.decode_holds.file_keys()
     }
     // Missing incidence is UNKNOWN, not an empty set. Keep existing ACKs as
     // possible prior members without inventing membership for emission/manifests.

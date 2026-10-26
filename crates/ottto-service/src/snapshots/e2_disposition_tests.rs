@@ -1,0 +1,163 @@
+// E2 (T4): the authority disposition of request-owned bodies. A family whose
+// exclusive reported body was proven before E2 must reach upload with its
+// request-owned body; account and E2 withheld holds still apply.
+use super::*;
+
+const CHILD_AGENT: &str = "a4d1585d310070d0f";
+
+struct Proven {
+    parent: String,
+    api: crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace: crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: ScanIndex,
+}
+
+/// The family proven by today's reported fold (gate off), as on a Mac
+/// before the switch-on.
+fn proven_family() -> Proven {
+    let (root, parent, mut items) = claude_account_family_fixture();
+    let mut api_rows = (1..=4)
+        .map(|n| complete_api_row(&parent, &format!("req_{n}"), n, 10, 10, 0))
+        .collect::<Vec<_>>();
+    api_rows.push(complete_api_row(&parent, "req_5", 5, 10, 1, 0));
+    let mut trace_rows = (1..=4)
+        .map(|n| complete_trace_row(&parent, &format!("req_{n}"), ""))
+        .collect::<Vec<_>>();
+    trace_rows.push(complete_trace_row(&parent, "req_5", CHILD_AGENT));
+    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+        evidence: BTreeMap::from([(parent.clone(), api_rows)]),
+        health: Default::default(),
+    };
+    let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+        evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
+        ..Default::default()
+    };
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        local_index_key(&root.join(format!("{parent}.jsonl"))),
+        manifest_index_entry(None),
+    );
+    index.files.insert(
+        local_index_key(
+            &root
+                .join(&parent)
+                .join("subagents")
+                .join(format!("agent-{CHILD_AGENT}.jsonl")),
+        ),
+        manifest_index_entry(None),
+    );
+    apply_claude_reported_usage_with_index(
+        &mut items,
+        &api,
+        &trace,
+        &mut index,
+        true,
+        "2026-08-02T07:10:00Z",
+    );
+    assert!(index.claude_usage_family_witnesses.contains_key(&parent));
+    Proven {
+        parent,
+        api,
+        trace,
+        index,
+    }
+}
+
+fn child_page(
+    proven: &mut Proven,
+    healthy: bool,
+) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition) {
+    let (_, _, mut reparsed) = claude_account_family_fixture();
+    let mut child = vec![reparsed.remove(1)];
+    let mut trace = proven.trace.clone();
+    if !healthy {
+        trace.malformed_lines = 1;
+    }
+    let disposition = apply_claude_reported_usage_with_index(
+        &mut child,
+        &proven.api,
+        &trace,
+        &mut proven.index,
+        false,
+        "2026-08-02T07:11:00Z",
+    );
+    (child, disposition)
+}
+
+#[test]
+fn e2_body_of_previously_proven_family_is_not_a_demotion() {
+    for healthy in [true, false] {
+        // Today (gate off): an unreconstructable revision is a demotion and
+        // is held; a healthy one rebuilds the exclusive body.
+        let mut proven = proven_family();
+        let (child, disposition) = child_page(&mut proven, healthy);
+        assert_eq!(
+            disposition.quarantined_entity_count(),
+            usize::from(!healthy),
+            "gate off keeps today's disposition (healthy={healthy})"
+        );
+        assert_eq!(
+            child[0].usage_accounting_contract.is_some(),
+            healthy,
+            "gate off rebuilds the exclusive body only from healthy reports"
+        );
+
+        // Gate on: the same revision is a request-owned body. The old
+        // reported rebuild is skipped for it, and it is not a demotion: it
+        // reaches upload selection whatever the reports' health.
+        let mut proven = proven_family();
+        claude_request_money::e2::with_enabled(|| {
+            let (mut child, disposition) = child_page(&mut proven, healthy);
+            assert!(
+                child[0].claude_money.is_some(),
+                "the E2 fold rides on the item"
+            );
+            assert_eq!(
+                child[0].usage_accounting_contract, None,
+                "the literal is installed later by e2::finish_page"
+            );
+            assert_eq!(
+                disposition.quarantined_entity_count(),
+                0,
+                "healthy={healthy}"
+            );
+            assert!(
+                proven
+                    .index
+                    .claude_usage_family_witnesses
+                    .contains_key(&proven.parent),
+                "the proven witness is kept for the fence"
+            );
+            let session = child[0].source_session_id.clone();
+            let mut uploadable = child.clone();
+            disposition.retain_uploadable(&mut uploadable);
+            assert_eq!(uploadable.len(), 1, "it reaches upload (healthy={healthy})");
+
+            // An account deferral still holds it.
+            let mut deferred = disposition.clone();
+            deferred.defer_sessions(BTreeSet::from([session.clone()]));
+            let mut uploadable = child.clone();
+            deferred.retain_uploadable(&mut uploadable);
+            assert!(uploadable.is_empty(), "account hold survives");
+
+            // An E2 withheld entity (held twin, uncertified, unread
+            // telemetry) is held, not dropped: its body stays on the page,
+            // never uploads, and blocks progress so the file is read again.
+            let mut withheld = disposition;
+            withheld.hold_request_owned(BTreeSet::from([session]));
+            let fingerprint = child[0].snapshot_fingerprint.clone();
+            assert!(withheld
+                .quarantined_fingerprints(&child)
+                .contains(&fingerprint));
+            assert!(
+                withheld
+                    .progress_blocking_held_fingerprints(&child, &proven.index, true)
+                    .contains(&fingerprint),
+                "delayed, never settled without its body"
+            );
+            assert!(withheld.account_deferred_fingerprints(&child).is_empty());
+            withheld.retain_uploadable(&mut child);
+            assert!(child.is_empty());
+        });
+    }
+}

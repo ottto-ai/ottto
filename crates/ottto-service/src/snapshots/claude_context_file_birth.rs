@@ -40,6 +40,125 @@ const MAX_TELEMETRY_PARTITION_DOUBLINGS: usize = 4;
 const MAX_CONTEXT_BASIS_VERSION_KEYS: usize = 16;
 const MAX_CONTEXT_BASIS_VERSION_KEY_BYTES: usize = 24;
 
+/// Claude Code versions verified to keep every copied record's original
+/// timestamp when they write a copy (`/branch`, `/resume` copy, fork). Only
+/// such a writer lets the money birth rule skip pre-birth records; any other
+/// or mixed writer counts and discloses them.
+pub(in crate::snapshots) const KNOWN_COPY_WRITERS: &[&str] = &["2.1.309", "2.1.310"];
+
+/// Sticky response writer certificate. Zero = no responses, 255 = invalid.
+/// A missing/unknown version or two different known writers invalidates it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClaudeWriterRun(u8);
+impl ClaudeWriterRun {
+    fn observe(&mut self, version: Option<&str>) {
+        let id = version
+            .and_then(|v| KNOWN_COPY_WRITERS.iter().position(|k| *k == v))
+            .map_or(255, |i| i as u8 + 1);
+        self.0 = if self.0 == 0 || self.0 == id { id } else { 255 };
+    }
+    fn certified(self) -> bool {
+        self.0 != 0 && self.0 != 255
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeWriterRun {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// Money only: the writer certificate of the lines at or after a cutoff that
+/// finalize decides (the EFFECTIVE money birth, earlier than the physical
+/// birth after a proven move), not only the physical birth. `others[k]` is
+/// the latest line (untimed: `i64::MAX`) NOT written by
+/// `KNOWN_COPY_WRITERS[k]`, `latest` the latest line of any writer. Lines at
+/// or after T are certified by writer k iff `latest >= T && others[k] < T`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaudeOwnWriters {
+    latest: i64,
+    others: [i64; KNOWN_COPY_WRITERS.len()],
+}
+impl Default for ClaudeOwnWriters {
+    fn default() -> Self {
+        Self {
+            latest: i64::MIN,
+            others: [i64::MIN; KNOWN_COPY_WRITERS.len()],
+        }
+    }
+}
+impl ClaudeOwnWriters {
+    fn clamp(at: i128) -> i64 {
+        i64::try_from(at).unwrap_or(if at < 0 { i64::MIN } else { i64::MAX })
+    }
+    fn observe(&mut self, version: Option<&str>, at: Option<i128>) {
+        let at = at.map_or(i64::MAX, Self::clamp);
+        self.latest = self.latest.max(at);
+        for (other, known) in self.others.iter_mut().zip(KNOWN_COPY_WRITERS) {
+            if version != Some(*known) {
+                *other = (*other).max(at);
+            }
+        }
+    }
+    fn certified_from(self, cutoff: i128) -> bool {
+        let cutoff = Self::clamp(cutoff);
+        self.latest >= cutoff && self.others.iter().any(|other| *other < cutoff)
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeOwnWriters {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// Open-descriptor metadata, also used by the page's one metadata probe per twin.
+/// A zero inode means unavailable; no timestamp or file identity is invented.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::snapshots) struct ClaudeOpenedBirth {
+    pub(in crate::snapshots) birth: u64,
+    pub(in crate::snapshots) device: u64,
+    pub(in crate::snapshots) inode: u64,
+    pub(in crate::snapshots) size: u64,
+}
+impl ClaudeOpenedBirth {
+    pub(in crate::snapshots) fn from_metadata(metadata: &fs::Metadata) -> Self {
+        let birth = metadata
+            .created()
+            .ok()
+            .and_then(system_time_unix_nanos_i128)
+            .filter(|b| *b > CLAUDE_BIRTH_FLOOR_UNIX_NANOS)
+            .and_then(|b| u64::try_from(b).ok())
+            .unwrap_or(0);
+        #[cfg(unix)]
+        {
+            Self {
+                birth,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: metadata.len(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                birth,
+                size: metadata.len(),
+                ..Self::default()
+            }
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeOpenedBirth {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ClaudeBirthScope {
     /// Not read through the Claude transcript parser (synthetic items, other
@@ -85,10 +204,36 @@ pub(crate) struct ClaudeFileBirth {
     own_last_context: Option<u64>,
     /// A tagged response came before the first own response.
     tagged_before_first_own: bool,
+    /// Money only: the writer versions of the file's lines by time.
+    writer: ClaudeOwnWriters,
+    all_response_writers: ClaudeWriterRun,
+    opened: ClaudeOpenedBirth,
 }
-crate::heap_layout_bound::fields!(ClaudeFileBirth; scope, path_key_hash, tagged_in_opening,
-    tagged_responses, own_responses, untimed_records, first_own_sequence, own_first_context,
-    own_peak_context, own_last_context, tagged_before_first_own);
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeFileBirth {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        // This Copy witness owns no heap. Keep exhaustive coverage so a new
+        // field cannot silently enter native frame/cache accounting.
+        let Self {
+            scope: _,
+            path_key_hash: _,
+            tagged_in_opening: _,
+            tagged_responses: _,
+            own_responses: _,
+            untimed_records: _,
+            first_own_sequence: _,
+            own_first_context: _,
+            own_peak_context: _,
+            own_last_context: _,
+            tagged_before_first_own: _,
+            writer: _,
+            all_response_writers: _,
+            opened: _,
+        } = self;
+        c.add(0)
+    }
+}
 
 /// A reported birth at or before the floor is no evidence (F5).
 fn root_birth_scope(created_unix_nanos: Option<i128>) -> ClaudeBirthScope {
@@ -117,22 +262,131 @@ impl ClaudeFileBirth {
                     .and_then(system_time_unix_nanos_i128),
             ),
         };
-        Self {
+        let birth = Self {
             scope,
+            opened: metadata
+                .map(ClaudeOpenedBirth::from_metadata)
+                .unwrap_or_default(),
             path_key_hash: stable_hash(&local_index_key(path)),
             ..Self::default()
-        }
+        };
+        // A staged synthetic root birth (Linux has no set-creation-time API)
+        // stands in for the opened file's, as the parser fixtures set it.
+        #[cfg(test)]
+        let birth = {
+            let mut birth = birth;
+            if let Some(staged) =
+                super::claude_history_upgrade::staged_birth_for_test(&local_index_key(path))
+            {
+                if matches!(
+                    birth.scope,
+                    ClaudeBirthScope::Root(_) | ClaudeBirthScope::RootUnknownBirth
+                ) {
+                    birth.set_birth_for_test(i128::from(staged));
+                }
+            }
+            birth
+        };
+        birth
+    }
+
+    /// Acquisition proved the retained prefix belongs to this same object.
+    /// Refresh its current extent without replacing accumulated birth evidence.
+    pub(super) fn refresh_opened(&mut self, current: &Self) {
+        self.opened = current.opened;
     }
 
     /// `Some(true)` for a root record more than 60 s older than the file's
     /// birth, `Some(false)` for an owned root record, and `None` when the rule
     /// does not apply or the timestamp is unusable (never "owned" by default).
     fn copied(&self, timestamp: Option<&str>) -> Option<bool> {
+        self.copied_with_slack(
+            timestamp.and_then(rfc3339_unix_nanos),
+            CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS,
+        )
+    }
+
+    pub(in crate::snapshots) fn copied_with_slack(
+        &self,
+        at: Option<i128>,
+        slack: i128,
+    ) -> Option<bool> {
         let ClaudeBirthScope::Root(birth) = self.scope else {
             return None;
         };
-        let cutoff = birth.checked_sub(CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS)?;
-        timestamp.and_then(rfc3339_unix_nanos).map(|at| at < cutoff)
+        Some(at? < birth.checked_sub(slack)?)
+    }
+
+    pub(in crate::snapshots) fn birth_nanos(&self) -> Option<i128> {
+        match self.scope {
+            ClaudeBirthScope::Root(birth) => Some(birth),
+            _ => None,
+        }
+    }
+
+    pub(in crate::snapshots) fn with_minimum(mut self, minimum: Option<i128>) -> Self {
+        if matches!(
+            self.scope,
+            ClaudeBirthScope::Root(_) | ClaudeBirthScope::RootUnknownBirth
+        ) {
+            if let Some(minimum) = minimum {
+                self.scope = root_birth_scope(Some(
+                    self.birth_nanos()
+                        .map_or(minimum, |birth| birth.min(minimum)),
+                ));
+            }
+        }
+        self
+    }
+
+    /// E2-only cutoff for a subagent with a proven earlier path twin.
+    /// Context scalars keep their independent subagent exemption.
+    pub(in crate::snapshots) fn with_money_birth(mut self, birth: Option<i128>) -> Self {
+        self.scope = root_birth_scope(birth);
+        self
+    }
+
+    pub(in crate::snapshots) fn uncertain_root(&self) -> bool {
+        self.scope == ClaudeBirthScope::RootUnknownBirth
+    }
+
+    pub(in crate::snapshots) fn opened(&self) -> ClaudeOpenedBirth {
+        self.opened
+    }
+
+    pub(in crate::snapshots) fn physical_birth_nanos(&self) -> Option<i128> {
+        (self.opened.birth != 0)
+            .then_some(i128::from(self.opened.birth))
+            .or_else(|| self.birth_nanos())
+    }
+
+    /// Called only for usage-bearing response records, never headers/tool lines.
+    /// Copied prefix versions cannot certify a later response missing its own version.
+    pub(in crate::snapshots) fn observe_response_writer(
+        &mut self,
+        version: Option<&str>,
+        timestamp: Option<&str>,
+    ) {
+        self.all_response_writers.observe(version);
+        // An untimed response cannot prove it belongs to the copied prefix;
+        // it counts conservatively among the own responses of every cutoff.
+        self.writer
+            .observe(version, timestamp.and_then(rfc3339_unix_nanos));
+    }
+
+    /// Own lines are those at or after THIS birth's money cutoff (minus
+    /// slack), the same split `copied_with_slack` makes for money.
+    pub(in crate::snapshots) fn writer_certified(&self, first_own_sequence: Option<u64>) -> bool {
+        if first_own_sequence.is_some() {
+            self.birth_nanos().is_some_and(|birth| {
+                self.writer
+                    .certified_from(birth - super::claude_request_money::e2::SLACK)
+            })
+        } else {
+            // Restored all-pre-birth files have no own run. Require a known
+            // version on EVERY response, never a header or inherited version.
+            self.all_response_writers.certified()
+        }
     }
 
     /// Read through the Claude transcript parser.
@@ -157,13 +411,13 @@ impl ClaudeFileBirth {
 
     /// One resolved response, in transcript order. Today's naive scalars are
     /// computed beside this and stay untouched; the fold decides which ships.
-    pub(super) fn observe_response(
+    pub(super) fn observe_response_at(
         &mut self,
         sequence: u64,
-        timestamp: Option<&str>,
+        at: Option<i128>,
         effective_input_context: u64,
     ) {
-        let copied = match self.copied(timestamp) {
+        let copied = match self.copied_with_slack(at, CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS) {
             Some(copied) => copied,
             None => {
                 if self.root_with_birth() {
@@ -1023,6 +1277,10 @@ impl ClaudeFileBirth {
     /// A root file system that reports this creation time (Unix nanos),
     /// through the same floor as a real read.
     pub(crate) fn set_birth_for_test(&mut self, created_unix_nanos: i128) {
+        self.opened.birth = (created_unix_nanos > CLAUDE_BIRTH_FLOOR_UNIX_NANOS)
+            .then(|| u64::try_from(created_unix_nanos).ok())
+            .flatten()
+            .unwrap_or(0);
         if self.scope != ClaudeBirthScope::Subagent && self.scope != ClaudeBirthScope::NotObserved {
             self.scope = root_birth_scope(Some(created_unix_nanos));
         }
@@ -1032,6 +1290,7 @@ impl ClaudeFileBirth {
     pub(crate) fn forget_birth_for_test(&mut self) {
         if self.root_with_birth() {
             self.scope = ClaudeBirthScope::RootUnknownBirth;
+            self.opened.birth = 0;
         }
     }
 
