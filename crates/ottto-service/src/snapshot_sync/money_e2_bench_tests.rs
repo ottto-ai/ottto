@@ -15,6 +15,8 @@
 //   (OTTTO_E2_BENCH_ARM) is reference (the pre-E2 build), dark or on.
 // - reread: the switch-on lever on a stamped corpus: body-witness revision
 //   2 to 3, paced pages until every file carries revision 3.
+// - history: one whole-history page (up to 2,000 files / 1 GiB) per arm on
+//   a corpus stamped at revision 2, in a fresh process (peak footprint).
 use super::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -212,7 +214,7 @@ fn plan(scale: f64, bytes_scale: f64, start: i64) -> Vec<Plan> {
     let mut sizes = LARGE_FAMILIES.to_vec();
     sizes.extend((0..MID_FAMILIES).map(|k| 6 + k * 13 % 45));
     sizes.extend((0..SMALL_FAMILIES).map(|k| 3 + k % 3));
-    sizes.extend(std::iter::repeat_n(2, PAIR_FAMILIES));
+    sizes.extend(std::iter::repeat(2).take(PAIR_FAMILIES));
     let families = n(sizes.len());
     let mut bursts = 0;
     for size in sizes.into_iter().take(families) {
@@ -1342,7 +1344,8 @@ fn sum_field(pages: &[serde_json::Value], field: &str) -> u64 {
     pages.iter().filter_map(|p| p[field].as_u64()).sum()
 }
 
-fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Value {
+/// The reference arm runs the pre-E2 build; dark and on the candidate.
+fn check_arm(arm: &str) {
     match arm {
         "reference" => assert_eq!(
             e2_hook::STATE,
@@ -1356,6 +1359,10 @@ fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Valu
         ),
         other => panic!("OTTTO_E2_BENCH_ARM must be reference, dark or on, got {other:?}"),
     }
+}
+
+fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Value {
+    check_arm(arm);
     let tag = env("OTTTO_E2_BENCH_TAG").unwrap_or_else(|| arm.to_string());
     let p1_off = env("OTTTO_E2_BENCH_P1_OFF").as_deref() != Some("false");
     let largest = PathBuf::from(manifest["largest_path"].as_str().unwrap());
@@ -1454,92 +1461,135 @@ fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Valu
     })
 }
 
-/// The switch-on lever: stamp the corpus at revision 2, then raise it to 3
-/// (PR C's lever) and page until every file carries 3. Scan level: the
-/// production activation reads the compiled revision, which stays 2 here.
-fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
-    let root = projects(base);
-    let support = base.join("runs").join("reread-support");
-    assert!(!support.exists(), "the probe starts from an empty state");
-    std::fs::create_dir_all(support.join("snapshots")).unwrap();
-    let files = manifest["files"].as_u64().unwrap() as usize;
-    let collected_at = current_rfc3339();
-    let scan_at = |index: &mut ScanIndex, revision: u64| {
+/// Scan-level history pages (the production activation reads the compiled
+/// revision, 2 here), shared by `reread` and `history`.
+struct HistoryScan {
+    root: PathBuf,
+    collected_at: String,
+}
+
+impl HistoryScan {
+    fn new(base: &Path) -> Self {
+        Self {
+            root: projects(base),
+            collected_at: current_rfc3339(),
+        }
+    }
+
+    fn scan(&self, index: &mut ScanIndex, revision: u64) -> SourceScanResult {
         index.activate_upload_context("ctx-e2-bench".into());
         index.activate_effective_upload_body_witness_revision(revision);
         index.adopt_effective_upload_body_witness_revision_monotonically();
         crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&root),
+            std::slice::from_ref(&self.root),
             index,
-            &collected_at,
+            &self.collected_at,
             crate::snapshots::BACKFILL_WINDOW_DAYS,
             crate::snapshots::MAX_BACKFILL_FILES_PER_SOURCE,
             true,
         )
-        .expect("reread scan")
-    };
-    let settle = |scan: &mut SourceScanResult, index: &mut ScanIndex, previous: &ScanIndex| {
-        crate::snapshots::finalize_scan_after_policy(SnapshotSource::ClaudeCode, scan, index);
+        .expect("history scan")
+    }
+
+    /// One accepted page at `revision`.
+    fn page(&self, index: &mut ScanIndex, revision: u64) -> SourceScanResult {
+        let previous = index.clone();
+        let mut scan = self.scan(index, revision);
+        crate::snapshots::finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, index);
         let accepted = scan
             .snapshots
             .iter()
             .map(|item| item.snapshot_fingerprint.clone())
             .collect();
-        index.committable_subset(previous, &accepted, &BTreeMap::new())
-    };
-    let stamped = |index: &ScanIndex, revision: u64| {
+        *index = index.committable_subset(&previous, &accepted, &BTreeMap::new());
+        scan
+    }
+
+    fn stamped(index: &ScanIndex, revision: u64) -> usize {
         index
             .files
             .values()
             .filter(|entry| entry.effective_upload_body_witness_revision >= revision)
             .count()
-    };
+    }
+
+    /// History sent long ago at revision 2, then an installed, empty
+    /// protected list so owed history is paced. Returns the stamped files.
+    fn stamp(&self, index: &mut ScanIndex, support: &Path) -> usize {
+        let mut indexed = 0;
+        for _ in 0..MAX_PAGES {
+            drop(self.page(index, 2));
+            if Self::stamped(index, 2) == indexed {
+                break;
+            }
+            indexed = Self::stamped(index, 2);
+        }
+        assert!(indexed > 0, "the corpus is stamped at revision 2");
+        std::fs::create_dir_all(support.join("snapshots")).unwrap();
+        std::fs::write(
+            support.join("snapshots/claude_code-reemission-exclusions.txt"),
+            "",
+        )
+        .unwrap();
+        index.load_claude_reemission_exclusions(support);
+        indexed
+    }
+
+    /// One timed revision-3 page under the caller's raised policy table.
+    fn upgrade_page(&self, index: &mut ScanIndex) -> serde_json::Value {
+        let owed = index
+            .files
+            .iter()
+            .filter(|(_, entry)| entry.effective_upload_body_witness_revision < 3)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let before = Self::stamped(index, 3);
+        let (cpu_before, _) = rusage();
+        let started = Instant::now();
+        let scan = self.page(index, 3);
+        let wall_us = started.elapsed().as_micros() as u64;
+        let (cpu_after, _) = rusage();
+        let items = scan.snapshots.len();
+        drop(scan);
+        let upgraded = Self::stamped(index, 3) - before;
+        assert!(upgraded > 0, "every reread page makes progress");
+        let bytes = owed
+            .iter()
+            .filter_map(|key| index.files.get(key))
+            .filter(|entry| entry.effective_upload_body_witness_revision >= 3)
+            .map(|entry| entry.size_bytes)
+            .sum::<u64>();
+        serde_json::json!({
+            "files": upgraded,
+            "bytes": bytes,
+            "items": items,
+            "wall_us": wall_us,
+            "cpu_us": cpu_after - cpu_before,
+        })
+    }
+}
+
+/// The switch-on lever: stamp the corpus at revision 2, then raise it to 3
+/// (PR C's lever) and page until every file carries 3. Scan level: the
+/// production activation reads the compiled revision, which stays 2 here.
+fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
+    let support = base.join("runs").join("reread-support");
+    assert!(!support.exists(), "the probe starts from an empty state");
+    let files = manifest["files"].as_u64().unwrap() as usize;
+    let history = HistoryScan::new(base);
     e2_hook::with_gate(true, || {
         crate::snapshots::with_no_list_cutoff(u64::MAX, || {
-            // History sent long ago at revision 2.
             let mut index = ScanIndex::default();
-            let mut indexed = 0;
-            for _ in 0..MAX_PAGES {
-                let previous = index.clone();
-                let mut scan = scan_at(&mut index, 2);
-                index = settle(&mut scan, &mut index, &previous);
-                if stamped(&index, 2) == indexed {
-                    break;
-                }
-                indexed = stamped(&index, 2);
-            }
-            assert!(indexed > 0, "the corpus is stamped at revision 2");
-            // An installed, empty protected list: owed history is paced.
-            std::fs::write(
-                support.join("snapshots/claude_code-reemission-exclusions.txt"),
-                "",
-            )
-            .unwrap();
-            index.load_claude_reemission_exclusions(&support);
+            let indexed = history.stamp(&mut index, &support);
             crate::snapshots::with_max_gated_claude_revision(3, || {
                 let mut pages = Vec::new();
-                while stamped(&index, 3) < indexed {
+                while HistoryScan::stamped(&index, 3) < indexed {
                     assert!(
                         pages.len() < MAX_PAGES,
                         "the reread completes within {MAX_PAGES} pages"
                     );
-                    let before = stamped(&index, 3);
-                    let previous = index.clone();
-                    let (cpu_before, _) = rusage();
-                    let started = Instant::now();
-                    let mut scan = scan_at(&mut index, 3);
-                    index = settle(&mut scan, &mut index, &previous);
-                    let wall_us = started.elapsed().as_micros() as u64;
-                    let (cpu_after, _) = rusage();
-                    let upgraded = stamped(&index, 3) - before;
-                    assert!(upgraded > 0, "every reread page makes progress");
-                    pages.push(serde_json::json!({
-                        "files": upgraded,
-                        "items": scan.snapshots.len(),
-                        "wall_us": wall_us,
-                        "cpu_us": cpu_after - cpu_before,
-                    }));
+                    pages.push(history.upgrade_page(&mut index));
                 }
                 let (_, max_rss) = rusage();
                 serde_json::json!({
@@ -1556,6 +1606,45 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
                     "sync_interval_s": SNAPSHOT_SYNC_INTERVAL.as_secs(),
                     "max_rss_bytes": max_rss,
                 })
+            })
+        })
+    })
+}
+
+/// One whole-history page (the paced upgrade's largest page: up to 2,000
+/// files / 1 GiB) per arm, in a fresh process: stamp at revision 2, then one
+/// timed revision-3 page. Its folds are never released by a page finish here,
+/// so the peak footprint is the worst case of a history page.
+fn history(base: &Path, arm: &str) -> serde_json::Value {
+    check_arm(arm);
+    let tag = env("OTTTO_E2_BENCH_TAG").unwrap_or_else(|| arm.to_string());
+    let support = base.join("runs").join(format!("history-{tag}"));
+    assert!(!support.exists(), "every run starts from an empty state");
+    let scan = HistoryScan::new(base);
+    e2_hook::with_gate(arm == "on", || {
+        crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+            let mut index = ScanIndex::default();
+            let stamped = scan.stamp(&mut index, &support);
+            let (footprint_before, _) = footprint();
+            let _ = e2_hook::drain_counts();
+            let page = crate::snapshots::with_max_gated_claude_revision(3, || {
+                scan.upgrade_page(&mut index)
+            });
+            let e2 = e2_hook::drain_counts();
+            let (footprint_after, footprint_peak) = footprint();
+            let (_, max_rss) = rusage();
+            serde_json::json!({
+                "mode": "history",
+                "arm": arm,
+                "tag": tag,
+                "hook": e2_hook::STATE,
+                "stamped_files": stamped,
+                "page": page,
+                "e2": e2,
+                "phys_footprint_before_bytes": footprint_before,
+                "phys_footprint_after_bytes": footprint_after,
+                "phys_footprint_peak_bytes": footprint_peak,
+                "max_rss_bytes": max_rss,
             })
         })
     })
@@ -1594,18 +1683,15 @@ fn money_e2_bench_receipt() {
             .unwrap();
             manifest
         }
-        "arm" | "reread" => {
+        "arm" | "reread" | "history" => {
             let manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&manifest_path).expect("prepare first"))
                     .unwrap();
-            if mode == "arm" {
-                arm(
-                    &base,
-                    &manifest,
-                    &env("OTTTO_E2_BENCH_ARM").unwrap_or_default(),
-                )
-            } else {
-                reread(&base, &manifest)
+            let arm_name = env("OTTTO_E2_BENCH_ARM").unwrap_or_default();
+            match mode.as_str() {
+                "arm" => arm(&base, &manifest, &arm_name),
+                "history" => history(&base, &arm_name),
+                _ => reread(&base, &manifest),
             }
         }
         other => panic!("unknown OTTTO_E2_BENCH_MODE {other:?}"),

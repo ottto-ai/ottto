@@ -16056,6 +16056,13 @@ pub(crate) struct ClaudeRowPlacement {
     pub(in crate::snapshots) reduced_context: BTreeMap<String, String>,
     pub(in crate::snapshots) reduced_sources: BTreeMap<String, String>,
 }
+/// One native usage placement: the resolved model (`fell_back`: from the
+/// running model, the response named none) and its row, None when unplaceable.
+pub(crate) struct PlacedClaudeUsage {
+    pub(in crate::snapshots) model: String,
+    pub(in crate::snapshots) fell_back: bool,
+    pub(in crate::snapshots) placement: Option<ClaudeRowPlacement>,
+}
 /// One owner for the native bucket/key and reduced selector, including fallback time.
 pub(crate) fn claude_row_placement(
     model: &str,
@@ -17838,6 +17845,7 @@ impl SnapshotAccumulator {
 
     /// `capture` is the P1 money shadow's side capture: armed, funded and
     /// owned by the shadow. With None this is exactly the live finalizer.
+    #[cfg(test)]
     fn finalize_claude_responses_captured(
         &mut self,
         capture: Option<&mut claude_request_money::ClaudeResponseCapture>,
@@ -17929,7 +17937,6 @@ impl SnapshotAccumulator {
                     );
                 }
             }
-            money.observe(&response, at, self.latest_model.as_deref());
             if let Some(request_id) = response.request_id.take() {
                 let selector = match shared_selectors.get(&response.selector) {
                     Some(shared) => Arc::clone(shared),
@@ -18037,16 +18044,31 @@ impl SnapshotAccumulator {
             for name in response.tool_uses.into_values() {
                 self.note_tool_usage(name);
             }
-            self.add_usage_with_selector_placed(
+            // One native placement per response; the money fold reuses it.
+            let placed = self.place_usage(
                 response.model,
-                response.usage,
+                &response.usage,
                 response.selector,
                 response.terminal_timestamp.as_deref(),
-                response.reasoning_effort,
-                capture
-                    .as_deref_mut()
-                    .map(|capture| (capture, response.sequence)),
+                response.reasoning_effort.as_deref(),
             );
+            money.observe(
+                response.sequence,
+                &response.usage,
+                at,
+                placed.as_ref(),
+                response.reasoning_effort.as_deref(),
+            );
+            if let Some(placed) = placed {
+                self.add_placed_usage(
+                    placed,
+                    response.usage,
+                    response.reasoning_effort,
+                    capture
+                        .as_deref_mut()
+                        .map(|capture| (capture, response.sequence)),
+                );
+            }
         }
         money.finish_native(
             money_context.as_ref(),
@@ -18649,9 +18671,27 @@ impl SnapshotAccumulator {
         effort: Option<String>,
         placement: Option<(&mut claude_request_money::ClaudeResponseCapture, u64)>,
     ) {
-        if usage.is_zero() {
-            return;
+        if let Some(placed) =
+            self.place_usage(model, &usage, selector, timestamp, effort.as_deref())
+        {
+            self.add_placed_usage(placed, usage, effort, placement);
         }
+    }
+
+    /// The native model and row placement of one usage; None for zero usage,
+    /// which adds no row.
+    fn place_usage(
+        &mut self,
+        model: Option<String>,
+        usage: &UsageTotals,
+        selector: SelectorCapture,
+        timestamp: Option<&str>,
+        effort: Option<&str>,
+    ) -> Option<PlacedClaudeUsage> {
+        if usage.is_zero() {
+            return None;
+        }
+        let fell_back = model.is_none();
         let model = model
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
@@ -18661,20 +18701,40 @@ impl SnapshotAccumulator {
             .is_none()
             .then(|| self.fallback_bucket_timestamp(None))
             .flatten();
-        let Some(ClaudeRowPlacement {
-            bucket: bucket_start,
-            normalized_timestamp,
-            row_key,
-            reduced_context,
-            reduced_sources,
-        }) = claude_row_placement(
+        let placement = claude_row_placement(
             &model,
             &self.current_selector,
             selector,
-            effort.as_deref(),
+            effort,
             timestamp,
             fallback.as_deref(),
-        )
+        );
+        Some(PlacedClaudeUsage {
+            model,
+            fell_back,
+            placement,
+        })
+    }
+
+    fn add_placed_usage(
+        &mut self,
+        placed: PlacedClaudeUsage,
+        usage: UsageTotals,
+        effort: Option<String>,
+        placement: Option<(&mut claude_request_money::ClaudeResponseCapture, u64)>,
+    ) {
+        let PlacedClaudeUsage {
+            model,
+            placement:
+                Some(ClaudeRowPlacement {
+                    bucket: bucket_start,
+                    normalized_timestamp,
+                    row_key,
+                    reduced_context,
+                    reduced_sources,
+                }),
+            ..
+        } = placed
         else {
             self.note_dropped_usage();
             return;
@@ -28177,17 +28237,6 @@ impl OwnedSourceScan {
                         recorded.size_bytes = fragment.offset;
                     }
                     index.record(recorded, last_snapshot_fingerprint, outcome);
-                    if source == SnapshotSource::ClaudeCode && !comparison_target {
-                        for item in &parsed {
-                            if let Some(fold) = item.claude_money.as_deref() {
-                                claude_request_money::e2::remember_birth(
-                                    index,
-                                    Path::new(&index_key),
-                                    fold,
-                                );
-                            }
-                        }
-                    }
                     // The counting version travels in the same entry as the
                     // fingerprint it describes; no separate save can split them.
                     if let Some(entry) = index.files.get_mut(&index_key) {

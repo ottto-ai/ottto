@@ -281,7 +281,7 @@ impl ClaudeFileBirth {
         // include its writer conservatively among possible own responses.
         let at = timestamp.and_then(rfc3339_unix_nanos);
         let own = self.physical_birth_nanos().is_some_and(|birth| {
-            at.is_none_or(|at| at >= birth - super::claude_request_money::e2::SLACK)
+            !at.is_some_and(|at| at < birth - super::claude_request_money::e2::SLACK)
         });
         if own {
             self.writer.observe(version);

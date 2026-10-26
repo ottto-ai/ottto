@@ -469,10 +469,6 @@ crate::heap_layout_bound::fields!(OpeningFileState; ordinal, tool, repo_path, in
 crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
 
 impl SessionStartState {
-    pub(super) fn client_version(&self) -> Option<&str> {
-        self.client_version.as_deref()
-    }
-
     pub(super) fn note_user_turn(&mut self) {
         self.user_turns = (self.user_turns + 1).min(2);
     }
