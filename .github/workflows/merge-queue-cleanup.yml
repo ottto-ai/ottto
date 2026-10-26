@@ -5,10 +5,15 @@ name: Merge queue cleanup
 # going, so the macOS "Rust contracts" job holds one of the org's five hosted
 # Macs for its full ~25 minutes. Cancel every merge_group run whose queue
 # branch no longer exists. A run is cancelled only after a successful lookup
-# shows its branch is gone; an API error keeps the run.
+# shows its branch is gone; an API or parse error keeps the run.
+#
+# pull_request_target, not pull_request: GitHub runs no pull_request workflow
+# for a PR with merge conflicts (a common reason to be dequeued), and gives
+# fork PRs a read-only token. This job checks out nothing and reads nothing
+# from the PR, so running main's copy with a write token is safe.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [dequeued]
 
 concurrency:
@@ -43,10 +48,16 @@ jobs:
               echo "kept $id: could not look up $branch"
               continue
             fi
-            if printf '%s' "$refs" | jq -e --arg ref "refs/heads/$branch" 'any(.[]; .ref == $ref)' >/dev/null; then
-              echo "kept $id: $branch is still queued"
-            else
-              echo "cancelling $id: $branch left the queue"
-              gh run cancel "$id" || echo "could not cancel $id"
+            if ! present="$(printf '%s' "$refs" | jq -r --arg ref "refs/heads/$branch" \
+              'if type == "array" then any(.[]; .ref == $ref) else error("not a ref list") end')"; then
+              echo "kept $id: unexpected lookup reply for $branch"
+              continue
             fi
+            case "$present" in
+              false)
+                echo "cancelling $id: $branch left the queue"
+                gh run cancel "$id" || echo "could not cancel $id"
+                ;;
+              *) echo "kept $id: $branch is still queued" ;;
+            esac
           done

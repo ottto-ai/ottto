@@ -236,6 +236,7 @@ report_queue_failure() {
          | select(.event == "merge_group" and .path == $workflow)
          | select((.head_branch // "") | startswith($prefix))]
         | sort_by(.id) | last
+        | select(. != null)
         # A failed required job ejects the PR while the run is still going
         # (the macOS job runs on), so an unfinished run is reported too.
         | select(.conclusion != "success"
