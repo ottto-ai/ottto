@@ -835,6 +835,9 @@ impl<'de> Deserialize<'de> for State {
 pub(crate) struct TestClock(Option<u64>);
 #[cfg(test)]
 impl TestClock {
+    pub(crate) fn freeze() -> Self {
+        Self::at(now())
+    }
     pub(crate) fn at(wall: u64) -> Self {
         Self(TEST_CLOCK.with(|clock| clock.replace(Some(wall))))
     }

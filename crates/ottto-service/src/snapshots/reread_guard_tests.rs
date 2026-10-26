@@ -625,3 +625,51 @@ fn partial_save_keeps_the_negative_physical_witness_without_a_delivery_entry() {
         "detached metadata remains bounded by the read window"
     );
 }
+
+/// Separate parity arms keep every observer field, including witness hours.
+/// The outer clock models the real hour changing between those arms.
+#[test]
+fn frozen_whole_index_comparison_survives_an_hour_boundary() {
+    let before = WALL / 3600 * 3600 + 3599;
+    let after = before + 1;
+    let clock = TestClock::at(before);
+    let fixture = Fixture::new();
+    let observe = || {
+        let (mut index, candidate) = fixture.indexed();
+        let key = local_index_key(&candidate.path);
+        index.record_read_witness(&key, &candidate);
+        index.remember_replay_read_witnesses();
+        index.reread_guard.remember_entry(
+            "restored-entry",
+            &super::super::tests::manifest_index_entry(None),
+        );
+        assert_eq!(index.reread_guard.replay_witnesses.len(), 2);
+        for witness in index.reread_guard.replay_witnesses.values() {
+            assert_eq!(witness.removed_hour, hour(now()).unwrap());
+        }
+        serde_json::to_vec(&index).unwrap()
+    };
+    let expected = observe();
+    let compare = || {
+        let _frozen = TestClock::at(before);
+        assert_eq!(observe(), expected);
+    };
+    compare();
+    clock.set(after);
+    assert_ne!(hour(before), hour(now()));
+    assert_ne!(observe(), expected, "an unfrozen arm reproduces the flake");
+    compare();
+    assert_eq!(now(), after, "the nested guard restores the advanced clock");
+    let result = std::panic::catch_unwind(|| {
+        let _frozen = TestClock::at(before);
+        assert_eq!(observe(), expected);
+        panic!("synthetic comparison panic");
+    });
+    let panic = result.expect_err("the synthetic panic must unwind");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"synthetic comparison panic"),
+        "setup and equality assertions must not be mistaken for the expected panic"
+    );
+    assert_eq!(now(), after, "unwinding also restores the advanced clock");
+}
