@@ -360,6 +360,9 @@ fn upload(
 fn ack(batch: &[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let mut response = accepted_batch(0);
     response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+    // Head-CAS covers the whole request once any item carries cache
+    // observations (`validate_entity_ack`): every accepted entity gets a head.
+    let head_cas = batch.iter().any(|item| item.cache_observations.is_some());
     for item in batch {
         let mut reference = entity_ack_ref(&item.snapshot_fingerprint);
         reference.source_session_id = item.source_session_id.clone();
@@ -368,7 +371,7 @@ fn ack(batch: &[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchRe
         reference.body_witness_digest = reference
             .body_witness_version
             .map(|_| snapshot_upload_body_witness(item));
-        if item.cache_observations.is_some() {
+        if head_cas {
             reference.head_etag = Some("e".repeat(64));
         }
         response.accepted_entities.push(reference);
