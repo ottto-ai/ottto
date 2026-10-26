@@ -396,6 +396,7 @@ mod tests {
             let root = format!("family-{i:05}");
             let path = PathBuf::from(format!("/synthetic/{root}.jsonl"));
             let candidate = CandidateFile {
+                physical_identity: None,
                 scan_root: PathBuf::from("/synthetic"),
                 path: path.clone(),
                 size_bytes: 1,

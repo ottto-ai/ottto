@@ -9,7 +9,7 @@ use std::sync::Arc;
 // No parser-copy/census credit is consumed. Check before allocating raw bytes.
 const HOLD_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const HOLD_BYTES_MIN: u64 = 1024 * 1024;
-fn hold_bytes_limit(input_len: u64) -> u64 {
+pub(super) fn hold_bytes_limit(input_len: u64) -> u64 {
     (input_len / 8).clamp(HOLD_BYTES_MIN, HOLD_BYTES_MAX)
 }
 const HOLD_COUNT_MAX: usize = 4096;
@@ -123,6 +123,14 @@ impl Holds {
     }
     pub(super) fn contains(&self, field: &str, key: &str) -> bool {
         self.0.get(field).is_some_and(|map| map.contains_key(key))
+    }
+    // Admitted key/value/bookkeeping charge of every held slot.
+    pub(super) fn held_bytes(&self) -> u64 {
+        self.0
+            .values()
+            .flat_map(|slots| slots.values())
+            .map(|raw| raw.2)
+            .sum()
     }
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -273,7 +281,6 @@ impl Serialize for ScanIndex {
         field!(resume_after_path, Option::is_none);
         field!(resume_upper_bound_path, Option::is_none);
         field!(resume_census_window_end, Option::is_none);
-        field!(held_audit_progress, Option::is_none);
         field!(bounded_sweep_had_unsettled_upload);
         field!(bounded_sweep_unsettled_causes, is_zero_u16);
         field!(traversal, Option::is_none);
@@ -302,6 +309,13 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
         field!(codex_counting_tombstones, BTreeMap::is_empty);
+        field!(reread_guard, reread_guard::State::is_empty);
+        field!(
+            codex_counting_evicted_legacy,
+            codex_counting_version::EvictedLegacyOwners::is_empty
+        );
+        field!(upload_ack_retirement_handoff, Option::is_none);
+        field!(held_audit_progress, Option::is_none);
         map.end()
     }
 }
@@ -363,7 +377,6 @@ pub(super) const FIELDS: &[&str] = &[
     "resume_after_path",
     "resume_upper_bound_path",
     "resume_census_window_end",
-    "held_audit_progress",
     "bounded_sweep_had_unsettled_upload",
     "bounded_sweep_unsettled_causes",
     "traversal",
@@ -389,6 +402,10 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "codex_counting_tombstones",
+    "reread_guard",
+    "codex_counting_evicted_legacy",
+    "upload_ack_retirement_handoff",
+    "held_audit_progress",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -496,6 +513,39 @@ struct Span {
     start: u64,
     len: u64,
     resource: bool,
+}
+
+/// Replace one optional provenance token with null without retaining its
+/// bytes. The lexical pass already checked the original grammar and depth.
+struct AbsentMarkerReader<'a, R> {
+    reader: &'a mut R,
+    prefix: u64,
+    marker_end: u64,
+    suffix: u64,
+    replacement: &'static [u8],
+    skipped: bool,
+}
+impl<R: Read + Seek> Read for AbsentMarkerReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.prefix > 0 {
+            let n = self.reader.by_ref().take(self.prefix).read(buf)?;
+            self.prefix -= n as u64;
+            return Ok(n);
+        }
+        if !self.skipped {
+            self.reader.seek(SeekFrom::Start(self.marker_end))?;
+            self.skipped = true;
+        }
+        if !self.replacement.is_empty() {
+            return self.replacement.read(buf);
+        }
+        let n = self.reader.by_ref().take(self.suffix).read(buf)?;
+        self.suffix -= n as u64;
+        Ok(n)
+    }
 }
 
 // Constant-space gate over ORIGINAL bytes. No nesting tags/parent stack are
@@ -1193,6 +1243,75 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
         Ok(())
     }
+    // The revision marker has a fixed 32-byte payload. Inspect its lexical
+    // span before Serde sees it: from_reader buffers malformed strings and map
+    // keys even when a visitor discards them. Damage to this optional field
+    // removes only carry eligibility, never the surrounding negative record.
+    fn damaged_idless_marker(&mut self, record: Span) -> std::result::Result<Option<Span>, Error> {
+        self.reader.seek(SeekFrom::Start(record.start))?;
+        let close = match self.ws()? {
+            Some(b'{') => b'}',
+            Some(b'[') => b']',
+            _ => return Ok(None),
+        };
+        let mut damaged = None;
+        self.eat(if close == b'}' { b'{' } else { b'[' })?;
+        let mut position = 0usize;
+        while self.ws()? != Some(close) {
+            let marker = if close == b']' {
+                // Derive accepts the struct's positional representation too.
+                position == 4
+            } else {
+                let key = self.span()?;
+                let marker = if key.len <= ("idless_revision".len() * 6 + 2) as u64 {
+                    self.typed::<String>(key)? == "idless_revision"
+                } else {
+                    false
+                };
+                self.eat(b':')?;
+                marker
+            };
+            position = position.saturating_add(1);
+            let value = self.span()?;
+            // Includes ample space for our pretty-printed fixed array. Wider
+            // spellings are damage, never permission to allocate a token.
+            if marker
+                && (value.len > 4096 || self.typed::<Option<[u8; 32]>>(value).is_err())
+                && damaged.replace(value).is_some()
+            {
+                return Err(Error::Refused("duplicate idless marker"));
+            }
+            self.reader.seek(SeekFrom::Start(value.start + value.len))?;
+            if self.ws()? == Some(b',') {
+                self.eat(b',')?;
+            } else {
+                break;
+            }
+        }
+        self.eat(close)?;
+        Ok(damaged)
+    }
+    fn pending_typed<T: serde::de::DeserializeOwned>(
+        &mut self,
+        record: Span,
+    ) -> std::result::Result<T, Error> {
+        let Some(marker) = self.damaged_idless_marker(record)? else {
+            return self.typed(record);
+        };
+        self.reader.seek(SeekFrom::Start(record.start))?;
+        let masked = AbsentMarkerReader {
+            reader: &mut self.reader,
+            prefix: marker.start - record.start,
+            marker_end: marker.start + marker.len,
+            suffix: record.start + record.len - marker.start - marker.len,
+            replacement: b"null",
+            skipped: false,
+        };
+        let result = serde_json::from_reader(masked).map_err(|_| Error::Refused("record type"));
+        self.reader
+            .seek(SeekFrom::Start(record.start + record.len))?;
+        result
+    }
     fn records<T: serde::de::DeserializeOwned>(
         &mut self,
         field: &'static str,
@@ -1224,7 +1343,11 @@ impl<R: BufRead + Seek> Decoder<R> {
             let value = self.span()?;
             // Decode the value first: only actual opaque debt spends hold
             // admission. Its full charge is checked before allocating the key.
-            let decoded = self.typed(value);
+            let decoded = if field == "claude_usage_family_pending" {
+                self.pending_typed(value)
+            } else {
+                self.typed(value)
+            };
             if debt && decoded.is_err() {
                 self.check_hold_bytes(Self::hold_charge(key_span, value)?)?;
                 if self.held_count >= HOLD_COUNT_MAX {
@@ -1429,6 +1552,13 @@ impl<R: BufRead + Seek> Decoder<R> {
                         } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
+                        "reread_guard" => index.reread_guard = self.typed(value)?,
+                        "upload_ack_retirement_handoff" => {
+                            // Damaged cleanup authority delays retirement; it must
+                            // never discard identity custody or pause ingestion.
+                            index.upload_ack_retirement_handoff =
+                                self.history_scalar(value, None)?
+                        }
                         "upload_context_fingerprint" => {
                             index.upload_context_fingerprint = self.typed(value)?
                         }
@@ -1683,6 +1813,10 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "confirmed_empty_files" => {
                             index.confirmed_empty_files = self.typed(value)?
+                        }
+                        "codex_counting_evicted_legacy" => {
+                            index.codex_counting_evicted_legacy =
+                                self.history_scalar(value, Default::default())?
                         }
                         "codex_counting_tombstones" => {
                             // Counting-only memory: damage loses it like a
@@ -2350,13 +2484,24 @@ fn held_file_owner(raw: &RawValue) -> Option<std::ops::Range<usize>> {
     None
 }
 
-// Dropped optional/unknown input can make the next wire document much smaller.
-// Refuse before writing if that would turn an admitted hold into excess damage
-// on restart. This streams to a counter, never another encoded byte buffer.
-pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
+// The one scan-index file layout, used by the save and by the restart
+// admission check below. Compact JSON, except while decode holds exist: then
+// the earlier pretty layout stays, so a hold that an older pretty file's
+// whitespace funded is still funded by the bytes rewritten on every save.
+pub(super) fn write_index<W: std::io::Write>(
+    writer: W,
+    index: &ScanIndex,
+) -> serde_json::Result<()> {
     if index.decode_holds.is_empty() {
-        return Ok(());
+        serde_json::to_writer(writer, index)
+    } else {
+        serde_json::to_writer_pretty(writer, index)
     }
+}
+
+// Exactly the bytes write_index emits. This streams to a counter, never
+// another encoded byte buffer.
+pub(super) fn written_len(index: &ScanIndex) -> serde_json::Result<u64> {
     struct Count(u64);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -2370,16 +2515,19 @@ pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
             Ok(())
         }
     }
-    let held = index
-        .decode_holds
-        .0
-        .values()
-        .flat_map(|slots| slots.values())
-        .map(|raw| raw.2)
-        .sum::<u64>();
     let mut output = Count(0);
-    serde_json::to_writer_pretty(&mut output, index)?;
-    if held > hold_bytes_limit(output.0) {
+    write_index(&mut output, index)?;
+    Ok(output.0)
+}
+
+// Dropped optional/unknown input can make the next wire document much smaller.
+// Refuse before writing if that would turn an admitted hold into excess damage
+// on restart.
+pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
+    if index.decode_holds.is_empty() {
+        return Ok(());
+    }
+    if index.decode_holds.held_bytes() > hold_bytes_limit(written_len(index)?) {
         emit_scan_index_containment_line(
             "local snapshot scan index save: source=unattributed lenient_hold_budget_exceeded=1"
                 .into(),

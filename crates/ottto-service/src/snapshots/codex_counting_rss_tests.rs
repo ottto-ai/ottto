@@ -312,6 +312,13 @@ fn scan_now(root: &Path) -> String {
         NOW.to_string()
     }
 }
+/// Pages of one acquisition share a census window. A later acquisition
+/// needs a new window even when both rounds run within one wall-clock second.
+fn next_census_time(now: &str) -> String {
+    (OffsetDateTime::parse(now, &Rfc3339).unwrap() + time::Duration::seconds(1))
+        .format(&Rfc3339)
+        .unwrap()
+}
 fn reset(root: &Path, cold_len: u64) {
     fs::OpenOptions::new()
         .write(true)
@@ -337,10 +344,21 @@ fn money(item: &SnapshotItem) -> Value {
         "models":item.model_usage.iter().map(semantic_model_usage).collect::<Vec<_>>(),
         "buckets":semantic_usage_buckets(item)})
 }
+#[derive(Default, Serialize)]
+struct SelectionCounts {
+    full_files: usize,
+    tail_files: usize,
+    unchanged_files: usize,
+    // FullReason::slot() order; numeric counts only, no file identities.
+    full_reasons: [usize; 11],
+    scanned_files: usize,
+}
 #[derive(Default)]
 struct Observed {
     pages: u64,
     tails: usize,
+    selection: SelectionCounts,
+    max_priority_witnesses: usize,
     max_pending_rows: usize,
     maximal_rows_seen: bool,
     open_debt_seen: bool,
@@ -360,15 +378,17 @@ fn acquire(
     cache: Option<&Arc<sampled_scan::SharedCache>>,
     out: &mut Money,
     observed: &mut Observed,
+    now: &str,
 ) -> ScanIndex {
     let real = real_mode();
-    let now = scan_now(root);
+    // Keep read modes for this acquisition separately from the cold round.
+    observed.selection = SelectionCounts::default();
     for _ in 0..caps().pages {
         let mut scan = OwnedSourceScan::new(
             SnapshotSource::Codex,
             &[root.join("sessions")],
             index,
-            &now,
+            now,
             BACKFILL_WINDOW_DAYS,
             8,
             false,
@@ -380,7 +400,16 @@ fn acquire(
         if let Some(cache) = cache {
             scan = scan.with_sampled_acquisition(Arc::clone(cache), Scope("synthetic-rss".into()));
         }
+        let mut selected = SelectionCounts::default();
         loop {
+            if let Some(accumulator) = scan.active_file.as_deref().map(|a| &a.parser.accumulator) {
+                observed.max_priority_witnesses = observed.max_priority_witnesses.max(
+                    accumulator
+                        .codex_observed_priority_turns
+                        .as_ref()
+                        .map_or(0, BTreeMap::len),
+                );
+            }
             if let Some(counting) = scan
                 .active_file
                 .as_deref()
@@ -395,6 +424,10 @@ fn acquire(
             }
             if let Some(context) = scan.sampling.as_ref() {
                 observed.tails = observed.tails.max(context.tail_files);
+                selected.full_files = context.full_files;
+                selected.tail_files = context.tail_files;
+                selected.unchanged_files = context.unchanged_files;
+                selected.full_reasons = context.full_reasons;
             }
             match scan.step(None) {
                 OwnedSourceScanStep::Pending(next) => scan = next,
@@ -404,6 +437,18 @@ fn acquire(
                     ..
                 } => {
                     observed.pages += 1;
+                    observed.selection.full_files += selected.full_files;
+                    observed.selection.tail_files += selected.tail_files;
+                    observed.selection.unchanged_files += selected.unchanged_files;
+                    for (total, count) in observed
+                        .selection
+                        .full_reasons
+                        .iter_mut()
+                        .zip(selected.full_reasons)
+                    {
+                        *total += count;
+                    }
+                    observed.selection.scanned_files += scan.scanned_file_count;
                     observed.malformed_lines += scan.malformed_json_line_count;
                     observed.dropped_usage_records += scan.dropped_usage_record_count;
                     observed.ownership_incomplete_files += scan.ownership_incomplete_file_count;
@@ -438,6 +483,97 @@ fn acquire(
     }
     panic!("acquisition exceeded its fixed page cap");
 }
+/// Exercise the real-history fallback with a small, entirely synthetic file:
+/// more turn witnesses than the retained cache allows, and multiple cursor pages.
+#[test]
+fn grown_unretained_history_is_read_in_the_next_rss_round() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in ["legacy", "v2"] {
+        let _cutover = (case == "v2").then(|| codex_counting_version::TestCutover::set(0));
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "ottto-rss-tail-regression-{}-{}-{case}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        let root = &fixture.0;
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        let path = root.join("sessions/pending.jsonl");
+        let mut file = BufWriter::new(File::create(&path).unwrap());
+        let mut records = 0;
+        write_row(&mut file, &header(PENDING), &mut records);
+        let turns = sampled_jsonl::MAX_PRIORITY_WITNESSES as u64 + 1;
+        for n in 1..=turns {
+            let turn = format!("closed-{n}");
+            for value in [
+                event("task_started", &turn),
+                ui(n, "fixture-model"),
+                event("task_complete", &turn),
+            ] {
+                write_row(&mut file, &value, &mut records);
+            }
+        }
+        file.flush().unwrap();
+        drop(file);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut out = Money::new();
+        let mut observed = Observed::default();
+        sampled_scan::codex_cursor::with_test_limits(32 * 1024, 16 * 1024, 1024, || {
+            let index = acquire(
+                root,
+                ScanIndex::default(),
+                Some(&cache),
+                &mut out,
+                &mut observed,
+                NOW,
+            );
+            assert!(observed.max_priority_witnesses > sampled_jsonl::MAX_PRIORITY_WITNESSES);
+            assert!(cache
+                .retained_sealed_offset(&local_index_key(&path))
+                .is_none());
+            assert!(cache.counters_for_test().jobs_paused > 0);
+            let cold = out.clone();
+            let mut tail = BufWriter::new(File::create(root.join("tail.jsonl")).unwrap());
+            write_row(&mut tail, &ui(turns + 1, "fixture-model"), &mut records);
+            tail.flush().unwrap();
+            drop(tail);
+            append_tail(root);
+            acquire(
+                root,
+                index,
+                Some(&cache),
+                &mut out,
+                &mut observed,
+                &next_census_time(NOW),
+            );
+            // No retained copy: the appended round must be a real full re-read.
+            assert!(observed.selection.scanned_files > 0);
+            assert!(observed.selection.full_files > 0);
+            assert_eq!(observed.selection.tail_files, 0);
+            assert!(
+                observed.selection.full_reasons
+                    [crate::transcript_acquisition::FullReason::StateMissing.slot()]
+                    > 0
+            );
+            assert!(out != cold, "the appended usage must affect money");
+            let mut full = Money::new();
+            acquire(
+                root,
+                ScanIndex::default(),
+                None,
+                &mut full,
+                &mut Observed::default(),
+                NOW,
+            );
+            assert_eq!(
+                out, full,
+                "{case} appended money must match an unpaged full read"
+            );
+        });
+    }
+}
+
 fn process_sample() -> (u64, u64) {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: getrusage initializes the complete struct on success.
@@ -499,6 +635,8 @@ fn measured_child(root: &Path, case: &str) {
     let mut out = Money::new();
     let mut observed = Observed::default();
     let mut retained_after_cold = false;
+    let cold_now = scan_now(root);
+    let tail_now = next_census_time(&cold_now);
     let ((retained_prefill, retained_cold, retained_tail), counts) =
         cache_lifecycle::observe(|| {
             // Synthetic pressure entries are not mixed into real histories.
@@ -509,6 +647,7 @@ fn measured_child(root: &Path, case: &str) {
                 Some(&cache),
                 &mut out,
                 &mut observed,
+                &cold_now,
             );
             retained_after_cold = cache
                 .retained_sealed_offset(&local_index_key(&target(root)))
@@ -522,7 +661,14 @@ fn measured_child(root: &Path, case: &str) {
             }
             let retained_cold = crate::heap_layout_bound::bound(&*cache, usize::MAX).unwrap();
             append_tail(root);
-            acquire(root, index, Some(&cache), &mut out, &mut observed);
+            acquire(
+                root,
+                index,
+                Some(&cache),
+                &mut out,
+                &mut observed,
+                &tail_now,
+            );
             if !real {
                 assert_eq!(out, expected[1], "tail money differs from a full read");
             }
@@ -548,7 +694,10 @@ fn measured_child(root: &Path, case: &str) {
             "retained_after_cold":retained_after_cold,
             "cache_take_hit":counts.take_hit,"cache_insert_admitted":counts.insert_admitted,
             "cursor_paused":cursor.jobs_paused,"cursor_resumed":cursor.jobs_resumed,
-            "tail_files":observed.tails,"pages":observed.pages,"max_pending_rows":observed.max_pending_rows,
+            "tail_files":observed.tails,"tail_selected_reason":observed.selection,
+            "max_priority_witnesses":observed.max_priority_witnesses,
+            "priority_witness_cap":sampled_jsonl::MAX_PRIORITY_WITNESSES,
+            "pages":observed.pages,"max_pending_rows":observed.max_pending_rows,
             "open_debt_seen":observed.open_debt_seen,"overflow_seen":observed.overflow_seen,
             "scan_counts":{"malformed_lines":observed.malformed_lines,
                 "dropped_usage_records":observed.dropped_usage_records,
@@ -559,6 +708,10 @@ fn measured_child(root: &Path, case: &str) {
             "money_matches_full_read":matches,"cache_counts":counts})
         );
         assert!(rss <= caps.rss && cpu <= caps.cpu_us && start.elapsed() <= caps.wall);
+        assert!(
+            observed.selection.scanned_files > 0,
+            "real tail round must scan the grown file"
+        );
         assert!(matches, "real paged money differs from the full read");
         return;
     }
@@ -700,6 +853,7 @@ fn prepare_synthetic(root: &Path) -> u64 {
             None,
             &mut cold,
             &mut Observed::default(),
+            &scan_now(root),
         );
         assert_eq!(
             cold.len(),
@@ -714,6 +868,7 @@ fn prepare_synthetic(root: &Path) -> u64 {
             None,
             &mut tail,
             &mut Observed::default(),
+            &scan_now(root),
         );
         assert_eq!(tail.len(), 3);
         fs::write(
@@ -735,6 +890,7 @@ fn real_controls(root: &Path) {
             None,
             &mut full,
             &mut Observed::default(),
+            &scan_now(root),
         );
         fs::write(
             root.join(format!("{case}-expected.json")),

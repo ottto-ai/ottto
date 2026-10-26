@@ -620,3 +620,79 @@ fn the_continuation_pass_is_never_side_due() {
     assert_eq!(index.codex_parent_side_requests[&fixture.key()], worn);
     assert_eq!(cache.side_ledger().len(), 0);
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn due_side_read_preserves_future_exact_body_cooldown_and_settlement() {
+    let fixture = Root::new(3, b"");
+    let (mut settled, cache) = settled_page(&fixture);
+    let fingerprint = settled.file_snapshot_fingerprints[&fixture.key()]
+        .iter()
+        .next()
+        .unwrap()
+        .clone();
+    let body = "synthetic-refused-body";
+    let now = time::OffsetDateTime::parse(NOW, &time::format_description::well_known::Rfc3339)
+        .unwrap()
+        .unix_timestamp() as u64;
+    let deadline = now + 86_400;
+    let mut record = snapshot_quarantine_record(SnapshotSource::Codex);
+    record.retry_after_unix_seconds = 0; // ordinary retry is due; only the exact-body cooldown defers it
+    record.upload_body_witness = Some(body.into());
+    settled.accepted_snapshot_fingerprints.remove(&fingerprint);
+    settled
+        .quarantined_snapshot_fingerprints
+        .insert(fingerprint.clone(), record.clone());
+    settled.activate_quarantine_witness_for_test(SnapshotSource::Codex);
+    settled.activate_reason_reoffer_cooldowns(BTreeMap::from([(fingerprint.clone(), body.into())]));
+    assert!(settled.reason_reoffer_conflict_is_deferred(&fingerprint, body));
+    assert_eq!(settled.reason_reoffer_cooldown_deferred_count(), 1);
+    let mut treated = settled.clone();
+    treated
+        .codex_parent_side_requests
+        .insert(fixture.key(), request_for(&fixture, fixture.at().size));
+    let (control_index, control) = page(&fixture, settled, &cache, Some(pass(true)));
+    let ((treated_index, treated), counts) =
+        observe(|| page(&fixture, treated, &cache, Some(pass(true))));
+    assert_eq!(
+        counts.side_reads_started, 1,
+        "the due side request really ran"
+    );
+    assert!(
+        control.snapshots.is_empty(),
+        "ordinary selection skips the unchanged cooldown body"
+    );
+    assert_eq!(main_result(&treated), main_result(&control));
+    assert_eq!(main_state(&treated_index), main_state(&control_index));
+    for index in [&control_index, &treated_index] {
+        assert!(index.reason_reoffer_conflict_is_deferred(&fingerprint, body));
+        assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
+        assert!(
+            crate::snapshot_sync::retained_refusal_settles_for_test(
+                index,
+                &fingerprint,
+                record.clone(),
+                body,
+                now,
+                deadline
+            ),
+            "future reservation remains nonblocking for settlement"
+        );
+        assert!(
+            !crate::snapshot_sync::retained_refusal_settles_for_test(
+                index,
+                &fingerprint,
+                record.clone(),
+                body,
+                deadline,
+                deadline
+            ),
+            "the same retained refusal blocks at its actual deadline"
+        );
+    }
+    assert_eq!(
+        treated_index.codex_parent_side[&fixture.key()].verdict,
+        SideVerdict::Settled
+    );
+    assert!(treated_index.codex_parent_side_requests.is_empty());
+}

@@ -326,6 +326,7 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
     let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
     let path = PathBuf::from("/synthetic/archived_sessions/current.jsonl");
     let candidate = CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/archived_sessions"),
         path: path.clone(),
         size_bytes: 1,
@@ -403,6 +404,7 @@ fn archived_candidate() -> CandidateFile {
         "/synthetic/archived_sessions/rollout-2026-10-01T10-00-00-{SESSION}.jsonl"
     ));
     CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/archived_sessions"),
         path,
         size_bytes: 1,
@@ -795,6 +797,20 @@ fn tombstone_overflow_prefers_safe_classes_then_oldest_known_creation() {
             index.codex_counting_tombstones.contains_key(&owner_at(1)),
             "unknown creation most protected while inactive"
         );
+        let receipts = codex_counting_version::take_local_receipts(&mut index, None).unwrap();
+        assert_eq!(receipts.tombstone_evictions_v2_only, 1);
+        assert_eq!(
+            receipts.tombstone_evictions_pre_cutover_legacy,
+            u64::from(cutover.is_some())
+        );
+        assert_eq!(
+            receipts.tombstone_evictions_not_provably_pre_cutover_legacy,
+            if cutover.is_some() { 1 } else { 2 }
+        );
+        assert_eq!(
+            index.codex_counting_evictions, [0; 3],
+            "drained once per scan"
+        );
     }
 }
 
@@ -879,5 +895,266 @@ fn inventory_creation_timestamp_survives_tombstone_reload() {
         loaded.codex_counting_tombstones[&owner].created_unix_ms,
         Some(1_790_848_800_000)
     );
+    fs::remove_dir_all(acked.root).unwrap();
+}
+
+/// Fill the cap while making only the selected owner eligible for eviction.
+fn evict_counting_owner(index: &mut ScanIndex, owner: &str, created: Option<i64>) {
+    retirement_generation(index, "g2");
+    index.codex_counting_tombstones = (0..codex_counting_version::MAX_COUNTING_TOMBSTONES - 1)
+        .map(|n| {
+            (
+                format!("{n:064x}"),
+                codex_counting_version::CountingTombstone {
+                    evidence: AckEvidence::LegacyAcked,
+                    retired_in: "g2".into(),
+                    created_unix_ms: None,
+                },
+            )
+        })
+        .collect();
+    index.codex_counting_tombstones.insert(
+        owner.into(),
+        codex_counting_version::CountingTombstone {
+            evidence: AckEvidence::LegacyAcked,
+            retired_in: "g1".into(),
+            created_unix_ms: created,
+        },
+    );
+    let key = "/synthetic/sessions/new-retirement.jsonl";
+    index
+        .files
+        .insert(key.into(), acked_entry(false, Some("f".repeat(64))));
+    assert!(codex_counting_version::tombstone_before_retire(index, key));
+    index.files.remove(key);
+    assert!(!index.codex_counting_tombstones.contains_key(owner));
+}
+
+#[test]
+fn cap_eviction_receipts_correlate_a_later_v2_selection_after_selected_reload() {
+    for created in [
+        None,
+        Some(CUTOVER),
+        Some(1_790_848_800_000),
+        Some(CUTOVER - 1),
+    ] {
+        let acked = acked_original(false, true);
+        let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+        let owner = codex_protected_owner(SESSION);
+        let mut index = acked.previous.clone();
+        index.files.clear();
+        evict_counting_owner(&mut index, &owner, created);
+        let pre_cutover = created.is_some_and(|created| created < CUTOVER);
+        let receipts = codex_counting_version::take_local_receipts(&mut index, None).unwrap();
+        assert_eq!(receipts.tombstone_evictions_v2_only, 0);
+        assert_eq!(
+            receipts.tombstone_evictions_pre_cutover_legacy,
+            u64::from(pre_cutover)
+        );
+        assert_eq!(
+            receipts.tombstone_evictions_not_provably_pre_cutover_legacy,
+            u64::from(!pre_cutover)
+        );
+        assert_eq!(receipts.legacy_to_v2_after_tombstone_eviction, 0);
+        assert_eq!(receipts.tombstone_count, 1024);
+        assert_eq!(receipts.tombstone_cap, 1024);
+        assert_eq!(index.codex_counting_evicted_legacy.is_empty(), pre_cutover);
+
+        // Correlation follows the selected checkpoint even when no new file
+        // ACK from this page is selected. The carrier's removal is already
+        // committed by the prior page, before this cap eviction.
+        let mut prior_page = acked.previous.clone();
+        prior_page.files.clear();
+        let mut checkpoint =
+            index.committable_subset(&prior_page, &BTreeSet::new(), &BTreeMap::new());
+        checkpoint.save(&acked.index_path).unwrap();
+        let mut reloaded = ScanIndex::load(&acked.index_path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded.codex_counting_evicted_legacy).unwrap(),
+            serde_json::to_value(&index.codex_counting_evicted_legacy).unwrap()
+        );
+        let moved = acked.root.join("archived_sessions/moved.jsonl");
+        fs::rename(&acked.original, &moved).unwrap();
+        let mut changed = rows(200);
+        if pre_cutover {
+            changed[0] = header("2026-09-01T10:00:00Z");
+        }
+        write(&moved, &changed);
+        let mut result = scan_at(&acked.root, &mut reloaded, "2026-10-07T23:00:00Z");
+        let later = result.codex_counting_v2.as_deref().unwrap();
+        assert_eq!(
+            later.tombstone_evictions_not_provably_pre_cutover_legacy, 0,
+            "eviction event counters do not persist across scans"
+        );
+        assert_eq!(
+            later.legacy_to_v2_after_tombstone_eviction,
+            u64::from(!pre_cutover)
+        );
+        assert_eq!(later.v2_sessions, u64::from(!pre_cutover));
+        assert_eq!(
+            reloaded.codex_counting_evicted_legacy.is_empty(),
+            pre_cutover,
+            "selection alone must not consume correlation"
+        );
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut reloaded);
+        let owners = BTreeMap::from([(local_index_key(&moved), owner)]);
+        codex_counting_version::prepare_moved_evidence(&mut reloaded, &owners, false);
+        assert!(
+            reloaded.codex_counting_evicted_legacy.is_empty(),
+            "committed ACK absorbs correlation"
+        );
+        fs::remove_dir_all(acked.root).unwrap();
+    }
+}
+
+#[test]
+fn cap_eviction_with_a_live_legacy_carrier_does_not_report_a_flip() {
+    for bound in [true, false] {
+        let acked = acked_original(false, bound);
+        let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+        let owner = codex_protected_owner(SESSION);
+        let mut index = acked.previous.clone();
+        evict_counting_owner(&mut index, &owner, None);
+        assert_eq!(index.codex_counting_evictions, [0, 0, 1]);
+        assert!(
+            !index.codex_counting_evicted_legacy.is_empty(),
+            "record loss without an index walk per eviction"
+        );
+        write(&acked.original, &rows(200));
+        let result = scan_at(&acked.root, &mut index, "2026-10-07T23:00:00Z");
+        let receipts = result.codex_counting_v2.as_deref().unwrap();
+        assert_eq!(
+            receipts.tombstone_evictions_not_provably_pre_cutover_legacy,
+            1
+        );
+        assert_eq!(receipts.legacy_to_v2_after_tombstone_eviction, 0);
+        assert_eq!(
+            receipts.v2_sessions, 0,
+            "the remaining carrier keeps Legacy"
+        );
+        if bound {
+            assert!(
+                index.codex_counting_evicted_legacy.is_empty(),
+                "committed binding absorbs the record"
+            );
+        }
+        fs::remove_dir_all(acked.root).unwrap();
+    }
+}
+
+#[test]
+fn evicted_legacy_diagnostic_history_is_bounded_lenient_and_charged() {
+    let acked = acked_original(false, true);
+    let limit = codex_counting_version::MAX_EVICTED_LEGACY_OWNERS;
+    let mut owners = (0..limit + 10)
+        .map(|n| format!("{n:064x}"))
+        .collect::<Vec<_>>();
+    owners.push("private-invalid-owner".into());
+    owners.push(format!("{:064x}", limit + 9));
+    let mut value = serde_json::to_value(ScanIndex::default()).unwrap();
+    value["codex_counting_evicted_legacy"] = json!(owners
+        .iter()
+        .map(|owner| json!({"owner":owner,"selected_v2":false}))
+        .collect::<Vec<_>>());
+    let derived: ScanIndex = serde_json::from_value(value.clone()).unwrap();
+    let expected = (10..limit + 10)
+        .map(|n| json!({"owner":format!("{n:064x}"),"selected_v2":false}))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(&derived.codex_counting_evicted_legacy).unwrap(),
+        json!(expected)
+    );
+    if crate::heap_layout_bound::layout_supported() {
+        assert!(
+            crate::heap_layout_bound::bound(&derived.codex_counting_evicted_legacy, usize::MAX)
+                .unwrap()
+                > limit * 64
+        );
+    }
+    fs::write(&acked.index_path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let loaded = ScanIndex::load(&acked.index_path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.codex_counting_evicted_legacy).unwrap(),
+        json!(expected)
+    );
+    for damaged in [json!(null), json!({"future":true}), json!([7])] {
+        value["codex_counting_evicted_legacy"] = damaged;
+        let derived: ScanIndex = serde_json::from_value(value.clone()).unwrap();
+        assert!(derived.codex_counting_evicted_legacy.is_empty());
+        fs::write(&acked.index_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(ScanIndex::load(&acked.index_path)
+            .unwrap()
+            .codex_counting_evicted_legacy
+            .is_empty());
+    }
+    fs::remove_dir_all(acked.root).unwrap();
+}
+
+#[test]
+fn restored_tombstone_absorbs_old_eviction_correlation_before_absence_gc() {
+    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let owner = codex_protected_owner(SESSION);
+    let mut index = ScanIndex::default();
+    evict_counting_owner(&mut index, &owner, None);
+    assert!(!index.codex_counting_evicted_legacy.is_empty());
+    // Another carrier was later retired successfully, restoring Legacy
+    // evidence. A later healthy absence collection is a different loss cause.
+    index.codex_counting_tombstones.pop_first();
+    index.codex_counting_tombstones.insert(
+        owner.clone(),
+        codex_counting_version::CountingTombstone {
+            evidence: AckEvidence::LegacyAcked,
+            retired_in: "g1".into(),
+            created_unix_ms: None,
+        },
+    );
+    codex_counting_version::prepare_moved_evidence(&mut index, &BTreeMap::new(), true);
+    assert!(
+        !index.codex_counting_tombstones.contains_key(&owner),
+        "absence GC ran"
+    );
+    assert!(
+        index.codex_counting_evicted_legacy.is_empty(),
+        "restored carrier absorbed old loss before GC"
+    );
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+    codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+    apply_codex_line(&header(POST), &mut accumulator);
+    assert!(accumulator.codex_counting_v2());
+    assert!(!codex_counting_version::evicted_legacy_selected_v2(
+        &accumulator,
+        &index
+    ));
+}
+
+#[test]
+fn preexisting_v2_ack_does_not_absorb_an_unobserved_legacy_eviction_flip() {
+    let acked = acked_original(true, true);
+    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let owner = codex_protected_owner(SESSION);
+    let mut index = acked.previous.clone();
+    // A mixed owner view has a V2-marked live entry and a Legacy tombstone.
+    // Removing the latter loses its LAST Legacy carrier, despite the V2 ACK.
+    evict_counting_owner(&mut index, &owner, None);
+    write(&acked.original, &rows(200));
+    let result = scan_at(&acked.root, &mut index, "2026-10-07T23:00:00Z");
+    let receipts = result.codex_counting_v2.as_deref().unwrap();
+    assert_eq!(receipts.v2_sessions, 1);
+    assert_eq!(receipts.legacy_to_v2_after_tombstone_eviction, 1);
+    let record = serde_json::to_value(&index.codex_counting_evicted_legacy).unwrap();
+    assert_eq!(record[0]["selected_v2"], true);
+    // Persist the observation with a partial checkpoint retaining the old V2
+    // ACK. Only after that observation may the old ACK absorb correlation.
+    let mut checkpoint =
+        index.committable_subset(&acked.previous, &BTreeSet::new(), &BTreeMap::new());
+    checkpoint.save(&acked.index_path).unwrap();
+    let mut loaded = ScanIndex::load(&acked.index_path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.codex_counting_evicted_legacy).unwrap(),
+        record
+    );
+    let owners = BTreeMap::from([(local_index_key(&acked.original), owner)]);
+    codex_counting_version::prepare_moved_evidence(&mut loaded, &owners, false);
+    assert!(loaded.codex_counting_evicted_legacy.is_empty());
     fs::remove_dir_all(acked.root).unwrap();
 }

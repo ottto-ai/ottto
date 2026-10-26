@@ -903,6 +903,74 @@ pub struct ActiveSession {
     /// configured default standing in for observed evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_reasoning_effort: Option<String>,
+    /// The account handling this session NOW: the identity of the session's
+    /// newest own request, never the current login or a lifetime payer.
+    /// Absent when the daemon could not compute it (older daemon, source
+    /// without per-request identity); apps must not substitute the cumulative
+    /// account fields above for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_account: Option<ActiveSessionCurrentAccount>,
+    /// The session's usage per distinct (account, workspace, subscription),
+    /// compared on the full triple. Empty when not computed. When present the
+    /// entries' counters sum to the session's counted usage; an entry without
+    /// an account is usage no request evidence names. Local display only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_history: Vec<ActiveSessionAccountUse>,
+}
+
+/// The account of an active session's newest own request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionCurrentAccount {
+    /// `known` or `unknown`. Apps must treat any other value as `unknown`.
+    pub status: String,
+    /// Present exactly when `status` is `known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    /// The workspace that request's own evidence names; absent when it names
+    /// none. Never borrowed from the login or another request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    /// When the newest own request ran, known or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_request_at: Option<Rfc3339Timestamp>,
+    /// Content-free reason, only while `unknown`: `latest_request_unidentified`,
+    /// `conflicting_latest_requests`, `request_order_unavailable` or
+    /// `identity_withheld`. Apps must treat an unknown value as no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_reason: Option<String>,
+}
+
+/// One (account, workspace, subscription) an active session used, with its
+/// exact counted usage. No money: local display only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionAccountUse {
+    /// Absent: usage no request evidence names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    #[serde(default)]
+    pub request_count: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_5m_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_1h_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Newest own transcript request of this triple, when provable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<Rfc3339Timestamp>,
+    /// This triple is exactly `current_account`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub current: bool,
 }
 
 /// One compaction of an active session. Sizes are prompt sizes, never billed
@@ -8328,6 +8396,45 @@ mod tests {
     }
 
     #[test]
+    fn active_session_accounts_are_optional_and_round_trip() {
+        let old: ActiveSession = serde_json::from_value(serde_json::json!({
+            "source_session_id": "s",
+            "source_last_activity_at": "2026-07-19T18:00:00Z"
+        }))
+        .expect("older session");
+        assert_eq!(old.current_account, None);
+        assert!(old.account_history.is_empty());
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("current_account").is_none());
+        assert!(value.get("account_history").is_none());
+
+        let session: ActiveSession = serde_json::from_value(serde_json::json!({
+            "source_session_id": "s",
+            "source_last_activity_at": "2026-07-19T18:00:00Z",
+            "current_account": {"status": "unknown", "unknown_reason": "future_reason"},
+            "account_history": [
+                {"account_identifier_hash": "a", "subscription_product": "max",
+                 "request_count": 2, "input_tokens": 5, "current": true},
+                {"request_count": 1}
+            ]
+        }))
+        .expect("new session");
+        let current = session.current_account.as_ref().unwrap();
+        assert_eq!(current.status, "unknown");
+        assert_eq!(current.account_identifier_hash, None);
+        assert_eq!(session.account_history[1].account_identifier_hash, None);
+        assert_eq!(session.account_history[1].output_tokens, 0);
+        assert!(!session.account_history[1].current);
+        let value = serde_json::to_value(&session).unwrap();
+        assert_eq!(value["account_history"][0]["current"], true);
+        assert!(value["account_history"][1].get("current").is_none());
+        assert!(value["account_history"][1].get("last_used_at").is_none());
+        assert!(value["current_account"]
+            .get("account_identifier_hash")
+            .is_none());
+    }
+
+    #[test]
     fn old_active_session_reconciliation_without_scan_start_still_parses() {
         let reconciliation: ActiveSessionReconciliation =
             serde_json::from_value(serde_json::json!({
@@ -8395,6 +8502,8 @@ mod tests {
                 account_withheld_reason: None,
                 latest_model: Some("claude-opus-5".to_string()),
                 latest_reasoning_effort: Some("high".to_string()),
+                current_account: None,
+                account_history: Vec::new(),
             }],
         };
 

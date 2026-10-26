@@ -457,6 +457,7 @@ mod tests {
     }
     fn candidate() -> CandidateFile {
         CandidateFile {
+            physical_identity: None,
             scan_root: PathBuf::from("/synthetic"),
             path: PathBuf::from("/synthetic/session.jsonl"),
             size_bytes: 1,
@@ -862,6 +863,7 @@ mod provenance_tests {
     #[test]
     fn ordinary_record_never_mints_prefix_but_fe_mark_after_record_does() {
         let candidate = CandidateFile {
+            physical_identity: None,
             scan_root: PathBuf::from("/synthetic"),
             path: PathBuf::from("/synthetic/session.jsonl"),
             size_bytes: 1,

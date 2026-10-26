@@ -562,6 +562,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             .ok();
         let marker = org_disabled_marker_path(support_dir, snapshot_source);
         let mut labels_enabled = workspace_labels_allowed(None);
+        let mut details_enabled = false;
         if let Some(token) = relay_token.as_deref() {
             match client.get_activity_hint(token) {
                 Ok(hint) if !hint.context_footprint_harvest_enabled => {
@@ -572,6 +573,9 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
                 Ok(hint) => {
                     let _ = fs::remove_file(&marker);
                     labels_enabled = workspace_labels_allowed(Some(&hint));
+                    details_enabled = super::upload::details_enabled(
+                        hint.context_composition_details_contract.as_deref(),
+                    );
                 }
                 Err(_) if read_marker(&marker).as_deref() == Some(destination.as_str()) => {
                     health.remove(agent_source_label(snapshot_source));
@@ -592,6 +596,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             machine_id: &machine_id,
             destination: &destination,
             labels_enabled,
+            details_enabled,
         });
         let agent = agent_source_label(snapshot_source);
         health.set(HealthEntry::started(agent, OffsetDateTime::now_utc()));
@@ -2753,6 +2758,7 @@ fn upload_other_scopes(
             .filter(|ack| ack.destination == target.destination);
         let due = ack.as_ref().map_or(true, |ack| {
             ack.generation < generation
+                || ack.details_enabled != target.details_enabled
                 || run.now.unix_timestamp() - ack.posted_at >= super::UPLOAD_STALENESS_SECS
         });
         if !due {

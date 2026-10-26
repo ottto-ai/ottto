@@ -176,6 +176,7 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
     let mut file = File::open(&path).unwrap();
     let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
     let candidate = CandidateFile {
+        physical_identity: None,
         scan_root: root.clone(),
         path: path.clone(),
         size_bytes: text.len() as u64,
@@ -1013,6 +1014,7 @@ fn codex_counting_ack_bool_survives_twin_alias_and_rekeyed_entries() {
     // their acknowledged fingerprint.
     let path = PathBuf::from("/synthetic/sessions/rollout.jsonl");
     let candidate = || CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/sessions"),
         path: path.clone(),
         size_bytes: 2,
@@ -1191,5 +1193,14 @@ fn codex_v2_receipts_reach_local_diagnostics_with_open_turn_debt() {
         serde_json::to_value(fold(AckEvidence::LegacyAcked)).unwrap(),
         serde_json::to_value(CountingV2Receipts::default()).unwrap(),
         "a Legacy decision folds nothing"
+    );
+}
+
+/// Activation freezes one instant, 2026-10-26T12:00:00Z; it must never move.
+#[test]
+fn codex_counting_v2_compiled_cutover_is_frozen() {
+    assert_eq!(
+        codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
+        Some(1_793_016_000_000)
     );
 }

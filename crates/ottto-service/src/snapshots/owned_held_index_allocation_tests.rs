@@ -45,6 +45,7 @@ fn synthetic_index(roots: usize) -> ScanIndex {
             member_request_id_hashes: BTreeMap::new(),
             member_occurrences: BTreeMap::new(),
             invalid: false,
+            idless_revision: None,
         };
         let mut witness = ClaudeUsageFamilyWitness {
             evidence_fingerprint: digest(1, root),

@@ -376,6 +376,7 @@ mod tests {
             request_identity_refusals: 0,
             claude_org_markers: None,
             claude_account_withheld_reason: None,
+            claude_account_display: None,
             source_session_id: source_session_id.to_string(),
             snapshot_fingerprint: format!("fp-{source_session_id}"),
             status: "active".to_string(),
