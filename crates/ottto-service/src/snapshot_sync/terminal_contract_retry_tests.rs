@@ -1159,7 +1159,8 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
         assert_eq!(posts, usize::from(unrelated));
         assert_eq!(delta_accepted, u64::from(unrelated));
         progress.save(&fixture.retained.progress_path).unwrap();
-        // Crash again before index adoption: the ACK must still be in progress.
+        // Reload both durable checkpoints before index adoption: the ACK must
+        // still be in progress; keep the scanner's tentative index for settlement.
         let mut selected = index.clone();
         (index, progress) = fixture.retained.load();
         assert!(progress
@@ -1184,10 +1185,9 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
         assert!(!index
             .quarantined_snapshot_fingerprints
             .contains_key(&fixture.fingerprint));
-        assert!(progress
+        assert!(!progress
             .quarantined_fingerprints
-            .get(&fixture.fingerprint)
-            .is_none());
+            .contains_key(&fixture.fingerprint));
         for fp in &delta {
             assert!(index.accepted_snapshot_fingerprint_recorded(fp));
         }
