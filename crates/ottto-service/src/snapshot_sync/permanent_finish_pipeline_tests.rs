@@ -1472,9 +1472,11 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
 /// 5,000 entities next to 4,096 unrelated ACKs of debt. Current Claude and
 /// Codex parsers emit one file-backed entity per parsed file, so no real
 /// transcript yields 5,000; the scanned item is the template for the group,
-/// exactly as the first-install finish case does. A real transport failure
-/// stops the first finish after accepted pages; the second finish offers only
-/// the remainder and transfers every file ACK to the saved index.
+/// exactly as the first-install finish case does. The finish pipeline derives
+/// each entity fingerprint itself, so the file set is read back from what it
+/// offered and ACKed. A real HTTP failure stops the first finish after
+/// accepted pages; the second finish offers only the remainder and transfers
+/// every file ACK to the saved index.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
@@ -1483,6 +1485,7 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
     let server = AckScriptedServer::new();
     let mut home = AckFinishHome::new(&server);
     let debt = ack_followup_debt(4096);
+    let debt_set = debt.iter().cloned().collect::<BTreeSet<_>>();
     let group = |scan: &mut SourceScanResult| {
         let template = scan.snapshots[0].clone();
         scan.snapshots = (0..ENTITIES)
@@ -1494,9 +1497,6 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
             })
             .collect();
     };
-    let file_fingerprints = (0..ENTITIES)
-        .map(|entity| format!("{:064x}", 1_000_000 + entity))
-        .collect::<BTreeSet<_>>();
 
     let (mut preparation, index, mut scan) = home.prepare("first finish");
     group(&mut scan);
@@ -1508,9 +1508,7 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
     let index_path = preparation.index_path.clone();
     {
         let mut script = server.script.lock().unwrap();
-        for _ in 0..30 {
-            script.push_back(AckScriptedPost::Accept);
-        }
+        script.extend([AckScriptedPost::Accept; 30]);
         script.push_back(AckScriptedPost::UnretriedServerError);
     }
     let error = home
@@ -1530,46 +1528,44 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
         "the whole live file was admitted beside full debt: {error:#}"
     );
     assert!(server.script.lock().unwrap().is_empty(), "failure reached");
-    let first_offers = server.offered_fingerprints();
-    let progress = home.progress(&paths);
-    let retained = file_fingerprints
-        .iter()
-        .filter(|fp| progress.accepted_fingerprints.contains(*fp))
-        .count();
-    let saved = ScanIndex::load(&index_path).unwrap();
-    let progress_dir = paths.0.parent().unwrap();
-    assert!(
-        (1..ENTITIES).contains(&retained),
-        "retained={retained} ledger={} debt_kept={} offers={} saved_generation={} \
-         saved_recorded={} saved_current={} error={error:#} dir={:?}",
-        progress.accepted_fingerprints.len(),
-        debt.iter()
-            .filter(|fp| progress.accepted_fingerprints.contains(*fp))
-            .count(),
+    let first_offers = server
+        .offered_fingerprints()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
         first_offers.len(),
-        saved.generation,
-        file_fingerprints
-            .iter()
-            .filter(|fp| saved.accepted_snapshot_fingerprint_recorded(fp))
-            .count(),
-        saved
-            .current_snapshot_fingerprints()
-            .intersection(&file_fingerprints)
-            .count(),
-        std::fs::read_dir(progress_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>(),
+        server.offered.lock().unwrap().len(),
+        "distinct file entities"
     );
-    assert_eq!(progress.accepted_fingerprints.len(), debt.len() + retained);
+    assert!(first_offers.is_disjoint(&debt_set));
+    let progress = home.progress(&paths);
     assert!(
-        first_offers.len() > retained,
+        debt_set.is_subset(&progress.accepted_fingerprints),
+        "unrelated debt is kept"
+    );
+    let retained = progress
+        .accepted_fingerprints
+        .difference(&debt_set)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        (1..ENTITIES).contains(&retained.len()),
+        "{}",
+        retained.len()
+    );
+    assert!(
+        retained.is_subset(&first_offers),
+        "only accepted file pages are retained"
+    );
+    assert!(
+        first_offers.len() > retained.len(),
         "the failed page was offered but not acknowledged"
     );
+    let saved = ScanIndex::load(&index_path).unwrap();
     assert!(
         !saved
             .upload_progress_ack_incidence()
-            .any(|fp| file_fingerprints.contains(fp)),
+            .any(|fp| first_offers.contains(fp)),
         "an unsettled file is not committed"
     );
 
@@ -1577,16 +1573,24 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
     let (preparation, index, mut scan) = home.prepare("second finish");
     group(&mut scan);
     home.finish(preparation, index, scan)
-        .expect("second finish settles the file");
-    let second_offers = server.offered_fingerprints();
+        .unwrap_or_else(|error| panic!("second finish settles the file: {error:#}"));
+    let second_offers = server
+        .offered_fingerprints()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     assert_eq!(
         second_offers.len(),
-        ENTITIES - retained,
+        ENTITIES - retained.len(),
         "accepted pages are not re-sent"
     );
-    assert!(second_offers
-        .iter()
-        .all(|fp| file_fingerprints.contains(fp) && !progress.accepted_fingerprints.contains(fp)));
+    assert_eq!(server.offered.lock().unwrap().len(), second_offers.len());
+    assert!(second_offers.is_disjoint(&retained));
+    assert!(second_offers.is_disjoint(&debt_set));
+    let file_fingerprints = retained
+        .union(&second_offers)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(file_fingerprints.len(), ENTITIES);
     let saved = ScanIndex::load(&index_path).unwrap();
     assert!(file_fingerprints
         .iter()
@@ -1607,8 +1611,7 @@ fn ack_huge_file_real_finish_converges_after_transport_failure_with_full_debt() 
         "every file ACK transferred to the index"
     );
     assert_eq!(
-        progress.accepted_fingerprints,
-        debt.iter().cloned().collect::<BTreeSet<_>>(),
+        progress.accepted_fingerprints, debt_set,
         "only the unrelated debt remains"
     );
 }

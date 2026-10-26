@@ -32,8 +32,9 @@ member of a live file uses live slots, even when unrelated debt fills the
 entity per parsed file, so no real transcript yields thousands of entities.
 The finish-level regression therefore multiplies the scanned item into a
 5,000-entity group of that file, as the first-install case does; the real
-finish finalization records the group's incidence and body-set witness. It
-runs with 4,096 debt ACKs, and each finished scan is marked
+finish finalization records the group's incidence and body-set witness. The
+test reads the file's fingerprints back from what the pipeline offered and
+ACKed, not from the values it seeded. It runs with 4,096 debt ACKs, and each finished scan is marked
 census-incomplete so census cleanup cannot retire that debt. A real HTTP
 failure that the uploader neither resends nor splits stops the first finish
 after accepted pages; the second finish sends only the rest,
