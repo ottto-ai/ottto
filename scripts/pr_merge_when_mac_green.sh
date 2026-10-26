@@ -14,7 +14,9 @@ CI_WORKFLOW=".github/workflows/ci.yml"
 REQUIRED_CHECKS='["Rust contracts","Public surface checks","Rust advisory audit","Dependency review"]'
 DEFAULT_INTERVAL=60
 MIN_INTERVAL=60
-DEFAULT_TIMEOUT=3600
+# Two hours: a queued PR waits for its PR checks and then a full queue round
+# (Mac slot wait plus the Mac job) inside one shared budget.
+DEFAULT_TIMEOUT=7200
 PR_FIELDS="state,isDraft,headRefOid,mergeable,baseRefName,headRefName,isCrossRepository,headRepository,headRepositoryOwner"
 
 EXIT_USAGE=2
@@ -47,6 +49,7 @@ on the PR run; the three Linux checks must still succeed. The guard instead runs
   gh pr merge <pr> --match-head-commit <head-sha>
 and waits until merged, removed from the queue, the head changes, or timeout.
 The queue's configured merge method applies; no administrator bypass is used.
+Rerunning the guard for a PR that is already queued resumes the wait.
 
 Not ready (keeps waiting): a required check run missing, still queued or in
 progress, skipped or neutral; mergeability UNKNOWN. A workflow_dispatch or push
@@ -57,7 +60,7 @@ Linux job stands in for the macOS "Rust contracts" job.
 Options:
   --repo      owner/name; default: the repository gh resolves (or GH_REPO)
   --interval  seconds between polls (default 60, minimum 60)
-  --timeout   total seconds to wait before giving up (default 3600)
+  --timeout   total seconds to wait before giving up (default 7200)
 
 Exit codes:
   0  merged
@@ -241,23 +244,39 @@ report_queue_failure() {
   fi
 }
 
+queue_query() {
+  # GraphQL variables must reach GitHub literally.
+  # shellcheck disable=SC2016
+  gh api graphql -F owner='{owner}' -F name='{repo}' -F number="$pr" \
+    -f query='query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          state headRefOid mergeCommit { oid } mergeQueueEntry { state position }
+          autoMergeRequest { enabledAt }
+        }
+      }
+    }'
+}
+
+# True when the PR's current head is queued or already merged. Any read error
+# or head mismatch is false, so the caller reports the enqueue failure.
+already_queued() {
+  local response
+  response="$(queue_query)" || return 1
+  printf '%s' "$response" | jq -e --arg sha "$head_sha" '
+    select((.errors // [] | length) == 0)
+    | .data.repository.pullRequest
+    | select(.headRefOid == $sha)
+    | select(.state == "MERGED" or .mergeQueueEntry != null)' >/dev/null
+}
+
 # A single small GraphQL read per queue poll supplies membership, PR state,
 # head-movement protection, and the resulting merge SHA. API errors are retried
 # within the original invocation's timeout, never treated as queue removal.
 wait_for_queue() {
   local response queued_pr state current_sha entry seen_queue=false absent=0
   while :; do
-    # GraphQL variables must reach GitHub literally.
-    # shellcheck disable=SC2016
-    if response="$(gh api graphql -F owner='{owner}' -F name='{repo}' -F number="$pr" \
-      -f query='query($owner: String!, $name: String!, $number: Int!) {
-        repository(owner: $owner, name: $name) {
-          pullRequest(number: $number) {
-            state headRefOid mergeCommit { oid } mergeQueueEntry { state position }
-            autoMergeRequest { enabledAt }
-          }
-        }
-      }')" && queued_pr="$(printf '%s' "$response" | jq -ce '
+    if response="$(queue_query)" && queued_pr="$(printf '%s' "$response" | jq -ce '
         select((.errors // [] | length) == 0)
         | .data.repository.pullRequest
         | select(.state != null and .headRefOid != null)')"; then
@@ -336,8 +355,15 @@ while :; do
         if [ "$mergeable" = MERGEABLE ]; then
           if [ "$queue_mode" = true ]; then
             log "all required PR checks passed on $head_sha; enqueuing PR #$pr"
-            gh pr merge "$pr" --match-head-commit "$head_sha" \
-              || die "$EXIT_GH" "gh pr merge $pr failed"
+            if ! gh pr merge "$pr" --match-head-commit "$head_sha"; then
+              # A rerun after a timeout finds the PR already queued (or just
+              # merged); resume waiting instead of reporting a gh failure.
+              if already_queued; then
+                log "PR #$pr is already in the merge queue or merged; resuming the wait"
+              else
+                die "$EXIT_GH" "gh pr merge $pr failed"
+              fi
+            fi
             wait_for_queue
           fi
           log "all required checks passed on $head_sha; merging PR #$pr"

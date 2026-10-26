@@ -568,7 +568,31 @@ queue_case queue-enqueue-error
 printf '1' > "$case_dir/merge_exit"
 run_guard 7 7
 expect_log "$ENQUEUE_CALL"
-expect_no_log 'gh api graphql'
+expect_count 'gh api graphql' 1
+
+# A rerun after a timeout: gh refuses to enqueue a PR that is already queued.
+queue_case queue-rerun-already-queued
+printf '1' > "$case_dir/merge_exit"
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_count "$ENQUEUE_CALL" 1
+expect_output 'already in the merge queue or merged; resuming the wait'
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+queue_case queue-rerun-already-merged
+printf '1' > "$case_dir/merge_exit"
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+# A queue entry for another head is not this head's admission.
+queue_case queue-enqueue-error-other-head-queued
+printf '1' > "$case_dir/merge_exit"
+queue_json queue OPEN "$NEW_SHA" QUEUED
+run_guard 7 7
+expect_output "gh pr merge 7 failed"
+expect_count 'gh api graphql' 1
 
 new_case invalid-rules-refused
 pr_json pr OPEN false "$SHA" MERGEABLE
