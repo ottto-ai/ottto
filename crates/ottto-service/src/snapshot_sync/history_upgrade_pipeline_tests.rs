@@ -2548,7 +2548,8 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
         .values()
         .all(|entry| entry.effective_upload_body_witness_revision == 2));
     // Only the first session's telemetry is on disk: the others settle on
-    // token estimates and carry that mark.
+    // token estimates and carry that mark. Fixture files are created after
+    // their records, so every session is also a disclosed all-copied file.
     e2_history_reported(&fixture, HISTORY_SESSIONS[0], 0);
     with_e2_history(&fixture, || {
         crate::snapshots::with_body_witness_adoption_page_budget(1, || {
@@ -2572,10 +2573,11 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
             let index = &again.index;
             let store = &index.claude_money_birth_store;
             assert_eq!(store.money_rule_version(), 1);
+            let estimated = money_mark::DISCLOSED | money_mark::ESTIMATED;
             for (session, marks) in
                 HISTORY_SESSIONS
                     .iter()
-                    .zip([0, money_mark::ESTIMATED, money_mark::ESTIMATED])
+                    .zip([money_mark::DISCLOSED, estimated, estimated])
             {
                 let key = HistoryFixture::key(index, session);
                 assert_eq!(index.files[&key].effective_upload_body_witness_revision, 3);

@@ -84,6 +84,31 @@ pub(crate) fn with_enabled<T>(f: impl FnOnce() -> T) -> T {
 pub(crate) fn with_disabled<T>(f: impl FnOnce() -> T) -> T {
     with_gate_for_test(false, f)
 }
+// Synthetic transcripts are created when a test runs, after their records'
+// fixed timestamps, so E2 would read every record as copied in. A fixture
+// that models ordinary transcripts (written after their file's birth) sets
+// the physical birth E2 sees for every file read on this thread. Staged
+// per-file births still win.
+#[cfg(test)]
+thread_local! {
+    static FIXTURE_BIRTH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn with_fixture_birth<T>(unix_nanos: u64, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FIXTURE_BIRTH.with(|v| v.set(self.0));
+        }
+    }
+    let _reset = Reset(FIXTURE_BIRTH.with(|v| v.replace(Some(unix_nanos))));
+    f()
+}
+#[cfg(test)]
+pub(in crate::snapshots) fn fixture_birth() -> Option<u64> {
+    FIXTURE_BIRTH.with(std::cell::Cell::get)
+}
+
 // Per-stage wall clock for the F3 perf receipt. Test builds only: the
 // daemon build has no timer here, `timed` is just the call.
 #[cfg(test)]
@@ -776,6 +801,14 @@ impl FileFold {
         bucket_fallback: Option<String>,
     ) -> Self {
         let started = Instant::now();
+        #[cfg(test)]
+        let birth = {
+            let mut birth = birth;
+            if let Some(at) = fixture_birth() {
+                birth.set_birth_for_test(i128::from(at));
+            }
+            birth
+        };
         let physical = birth.physical_birth_nanos();
         let mut role = Role::Owner;
         let mut cutoff = None;

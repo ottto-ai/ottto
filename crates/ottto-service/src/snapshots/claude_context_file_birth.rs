@@ -26,13 +26,6 @@ const CLAUDE_COPIED_BY_BIRTH_SLACK_NANOS: i128 = 60 * 1_000_000_000;
 /// file counts as unknown birth and withholds.
 const CLAUDE_BIRTH_FLOOR_UNIX_NANOS: i128 = 1_577_836_800 * 1_000_000_000;
 
-/// Test builds: the physical birth of every opened file (2021-01-01T00:00Z).
-/// Synthetic transcripts are created when a test runs, after their records'
-/// fixed timestamps, while a real transcript exists before its records; a
-/// fixture that models a copy stages or sets its own birth.
-#[cfg(test)]
-const TEST_OPENED_BIRTH_UNIX_NANOS: u64 = 1_609_459_200 * 1_000_000_000;
-
 /// At most this many vetoed files are remembered for the process lifetime.
 /// Past it every later admission withholds (fail closed) until restart.
 const MAX_REMEMBERED_TRIPWIRE_FILES: usize = 4_096;
@@ -139,12 +132,6 @@ impl ClaudeOpenedBirth {
             .filter(|b| *b > CLAUDE_BIRTH_FLOOR_UNIX_NANOS)
             .and_then(|b| u64::try_from(b).ok())
             .unwrap_or(0);
-        #[cfg(test)]
-        let birth = if birth == 0 {
-            0
-        } else {
-            TEST_OPENED_BIRTH_UNIX_NANOS
-        };
         #[cfg(unix)]
         {
             Self {

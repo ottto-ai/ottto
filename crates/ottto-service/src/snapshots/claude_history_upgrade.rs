@@ -390,7 +390,9 @@ pub(super) fn probe_opened_birth(
         .map(|m| super::claude_context_file_birth::ClaudeOpenedBirth::from_metadata(&m));
     #[cfg(test)]
     let opened = opened.map(|mut opened| {
-        if let Some(birth) = STAGED_BIRTHS_FOR_TEST.with(|births| births.borrow().get(key).copied())
+        if let Some(birth) = STAGED_BIRTHS_FOR_TEST
+            .with(|births| births.borrow().get(key).copied())
+            .or_else(super::claude_request_money::e2::fixture_birth)
         {
             opened.birth = birth;
         }
