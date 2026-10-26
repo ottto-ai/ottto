@@ -19006,19 +19006,32 @@ impl SnapshotAccumulator {
             )?)?;
         // E keeps aggregate grains and the rare skipped/ambiguous sequence
         // sets; reserve their worst case before the finish releases input.
-        let money_output = size_of::<claude_request_money::e2::FileFold>()
-            .checked_add(current_selector)?
-            .checked_add(responses.checked_mul(2)?)?
-            .checked_add(resolved.checked_mul(per_response)?.checked_mul(2)?)?
-            .checked_add(resolved.checked_mul(
-                2 * tree_node_bytes::<
-                    (
-                        claude_request_money::body::ClaudeLiveKey,
-                        Option<claude_request_money::body::ClaudeRequestUsageOrigin>,
-                    ),
-                    claude_request_money::body::ClaudeGrainSide,
-                >()? + 2 * tree_node_bytes::<u64, ()>()?,
-            )?)?;
+        let money_output = if claude_request_money::e2::enabled() {
+            size_of::<claude_request_money::e2::FileFold>()
+                .checked_add(current_selector)?
+                .checked_add(responses.checked_mul(2)?)?
+                .checked_add(resolved.checked_mul(per_response)?.checked_mul(2)?)?
+                .checked_add(resolved.checked_mul(
+                    2 * tree_node_bytes::<
+                        (
+                            claude_request_money::body::ClaudeLiveKey,
+                            Option<claude_request_money::body::ClaudeRequestUsageOrigin>,
+                        ),
+                        claude_request_money::body::ClaudeGrainSide,
+                    >()? + 2 * tree_node_bytes::<u64, ()>()?,
+                )?)?
+        } else {
+            // Dark retains totals per hour, plus copy sequence ranges. It
+            // never builds live grain keys, selectors or per-response rows.
+            // Three tallies (own, copy, idless copy), Vec growth <= 2n + 4.
+            let slots = resolved.checked_mul(2)?.checked_add(4)?;
+            size_of::<claude_request_money::e2::FileFold>()
+                .checked_add(size_of::<claude_request_money::e2::ClaudeEntityBody>())?
+                .checked_add(RFC3339_TEXT_BYTES)?
+                .checked_add(
+                    slots.checked_mul(3 * size_of::<(u32, u32)>() + size_of::<(u64, u64)>())?,
+                )?
+        };
         let mut out = crate::heap_layout_bound::Counter::new(limit);
         for bytes in [
             money_output,

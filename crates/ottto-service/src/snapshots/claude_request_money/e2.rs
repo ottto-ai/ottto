@@ -582,6 +582,23 @@ struct FoldTelemetry {
 }
 crate::heap_layout_bound::fields!(FoldTelemetry; read, complete, start_bucket, side_candidates, side_calls_done, membership);
 
+/// Elapsed work is diagnostic, never part of native scan identity or parity.
+/// Keep Debug deterministic while retaining the measured value for receipts.
+#[derive(Clone, Default)]
+struct FoldNanos(u64);
+impl std::fmt::Debug for FoldNanos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FoldNanos")
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for FoldNanos {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct FileFold {
     pub(crate) entity: ClaudeEntityBody,
@@ -617,7 +634,7 @@ pub(crate) struct FileFold {
     ambiguous: BTreeSet<u64>,
     disclosed: u64,
     /// Wall time in this fold's E2-added work only (`fold_us`, see `spend`).
-    e2_nanos: u64,
+    e2_nanos: FoldNanos,
     responses: u64,
     root_fallbacks: u64,
     side: ClaudeMoneyTokens,
@@ -707,7 +724,7 @@ impl FileFold {
             first_own: None,
             ambiguous: BTreeSet::new(),
             disclosed: 0,
-            e2_nanos: 0,
+            e2_nanos: FoldNanos::default(),
             responses: 0,
             root_fallbacks: 0,
             side: Default::default(),
@@ -725,8 +742,9 @@ impl FileFold {
     /// and row add it shares are never in it; total page CPU against the
     /// pre-E2 reference is the cost gate for those.
     fn spend(&mut self, started: Instant) {
-        self.e2_nanos = self
+        self.e2_nanos.0 = self
             .e2_nanos
+            .0
             .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     }
 
@@ -2237,9 +2255,9 @@ pub(crate) fn finish_page(
             continue;
         };
         // Work counts on every read; decisions only when decided (below).
-        diag_max("max_file_fold_us", fold.e2_nanos / 1_000);
+        diag_max("max_file_fold_us", fold.e2_nanos.0 / 1_000);
         record_counts(Counts([
-            fold.e2_nanos / 1_000,
+            fold.e2_nanos.0 / 1_000,
             fold.responses,
             0,
             0,

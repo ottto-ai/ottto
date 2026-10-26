@@ -184,6 +184,9 @@ impl OwnedJsonlParser {
             // Known prior trace decisions were compared above; fresh suffixes
             // use this cycle's traces. Projected EOF advances with appends.
             let mut accumulator = accumulator;
+            accumulator
+                .claude_file_birth
+                .refresh_opened(&self.accumulator.claude_file_birth);
             accumulator.codex_turn_traces = self.accumulator.codex_turn_traces.take();
             accumulator.codex_parent_ownership_ledgers =
                 self.accumulator.codex_parent_ownership_ledgers.take();

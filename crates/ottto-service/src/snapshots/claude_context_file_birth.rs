@@ -268,6 +268,12 @@ impl ClaudeFileBirth {
         birth
     }
 
+    /// Acquisition proved the retained prefix belongs to this same object.
+    /// Refresh its current extent without replacing accumulated birth evidence.
+    pub(super) fn refresh_opened(&mut self, current: &Self) {
+        self.opened = current.opened;
+    }
+
     /// `Some(true)` for a root record more than 60 s older than the file's
     /// birth, `Some(false)` for an owned root record, and `None` when the rule
     /// does not apply or the timestamp is unusable (never "owned" by default).
