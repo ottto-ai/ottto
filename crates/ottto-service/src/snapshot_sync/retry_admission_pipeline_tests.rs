@@ -68,6 +68,10 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
         warm_done,
         "the real pipeline accepts and exhausts the synthetic history"
     );
+    // This regression targets the same-context non-Fix-2 retry. The seed's
+    // complete census opened a separate full-rearm window, whose BASE/refusal
+    // controls are intentionally unchanged and covered by existing tests.
+    c1b_without_full_rearm_window(&fixture);
     let mut index = ScanIndex::load(&fixture.index_path).unwrap();
     let members = RearmFixture::family_keys(&index)
         .into_iter()
@@ -87,6 +91,7 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
     index = serde_json::from_value(saved).unwrap();
     index.save(&fixture.index_path).unwrap();
     let baseline = c1a_saved(&fixture);
+    assert!(baseline["claude_full_rearm_progress"]["full_rearm_window"].is_null());
     let healthy_entries = baseline["files"]
         .as_object()
         .unwrap()
