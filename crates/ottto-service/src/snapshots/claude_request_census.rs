@@ -420,7 +420,7 @@ impl ClaudeRequestCensusRecord {
         self.window
     }
 
-    #[cfg(test)]
+    /// The file mtime (unix seconds) this record's parse saw.
     pub(crate) fn modified(&self) -> Option<u64> {
         self.modified
     }

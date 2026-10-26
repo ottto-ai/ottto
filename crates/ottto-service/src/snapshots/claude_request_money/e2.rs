@@ -582,7 +582,8 @@ impl ClaudeEntityBody {
 }
 
 /// Gate off (dark): no per-hour grain map. `unmatched_1h` reads the
-/// estimated requests per unix hour that telemetry attach has not moved. 8 bytes per hour with estimated usage.
+/// estimated requests per unix hour that telemetry attach has not moved.
+/// 8 bytes per hour with estimated usage.
 #[derive(Debug, Clone, Default)]
 pub(super) struct DarkTally {
     side: ClaudeGrainSide,
