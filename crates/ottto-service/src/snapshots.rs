@@ -24814,25 +24814,60 @@ impl OwnedSourceScan {
                 .pending_candidates
                 .iter()
                 .any(|candidate| codex_fresh_data_pending(candidate, &index.files));
+        let census_page = source == SnapshotSource::Codex
+            && continuation.is_none()
+            && selection_limit > 0
+            && traversal.codex_freshness_yield
+            && traversal
+                .pending_candidates
+                .iter()
+                .any(|candidate| candidate.census_member);
         if source == SnapshotSource::Codex && continuation.is_none() && selection_limit > 0 {
             traversal.codex_freshness_yield = freshness_page;
         }
-        if freshness_page {
-            let limit = selection_limit.min(MAX_WATCHER_HINTED_FILES_PER_TICK);
-            let mut remaining = VecDeque::with_capacity(traversal.pending_candidates.len());
-            while let Some(candidate) = traversal.pending_candidates.pop_front() {
-                if pending_paths.len() < limit && codex_fresh_data_pending(&candidate, &index.files)
-                {
+        if freshness_page || census_page {
+            let limit = if freshness_page {
+                selection_limit.min(MAX_WATCHER_HINTED_FILES_PER_TICK)
+            } else {
+                selection_limit
+            };
+            // Rotate the original queue once without allocating another
+            // backlog-sized container. Keep unselected paths in FIFO order.
+            for _ in 0..traversal.pending_candidates.len() {
+                let Some(candidate) = traversal.pending_candidates.pop_front() else {
+                    break;
+                };
+                let eligible = pending_paths.len() < limit
+                    && if freshness_page {
+                        codex_fresh_data_pending(&candidate, &index.files)
+                    } else {
+                        candidate.census_member
+                            && !codex_fresh_data_pending(&candidate, &index.files)
+                    };
+                if eligible {
                     pending_paths.push(candidate);
                 } else {
-                    remaining.push_back(candidate);
+                    traversal.pending_candidates.push_back(candidate);
                 }
             }
-            traversal.pending_candidates = remaining;
+            // If every remaining member has fresh bytes, service those
+            // members in FIFO order rather than wasting their census turn.
+            if census_page && pending_paths.is_empty() {
+                for _ in 0..traversal.pending_candidates.len() {
+                    let Some(candidate) = traversal.pending_candidates.pop_front() else {
+                        break;
+                    };
+                    if pending_paths.len() < limit && candidate.census_member {
+                        pending_paths.push(candidate);
+                    } else {
+                        traversal.pending_candidates.push_back(candidate);
+                    }
+                }
+            }
         }
-        // A freshness page selects only fresh work; normal selection below
-        // cannot let old groups or singletons spend its byte allowance first.
-        let selection_limit = if freshness_page {
+        // Dedicated turns select only their own work: new hinted members,
+        // audits or old groups cannot consume the other turn's allowance.
+        let selection_limit = if freshness_page || census_page {
             pending_paths.len()
         } else {
             selection_limit

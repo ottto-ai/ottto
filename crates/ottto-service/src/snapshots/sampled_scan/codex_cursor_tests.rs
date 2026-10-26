@@ -3595,6 +3595,7 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         return;
     }
     const NEW: &str = "019fa111-2222-7333-8444-888888888888";
+    const NEXT: &str = "019fa111-2222-7333-8444-888888888889";
     let ids = (0..2800)
         .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
         .collect::<Vec<_>>();
@@ -3713,17 +3714,31 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         // waits while that page makes census progress with the full budget.
         index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
         fixture.append(SESSION, &token_line(6));
-        let (next, ordinary) =
-            published_page(index, &collected_at(2), &[fixture.file(SESSION)], 10000);
+        let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:02Z",
+            "type": "session_meta", "payload": {"id": NEXT}}));
+        body.extend(token_line(1));
+        fs::write(fixture.file(NEXT), body).unwrap();
+        let (next, ordinary) = published_page(
+            index,
+            &collected_at(2),
+            &[fixture.file(SESSION), fixture.file(NEXT)],
+            10000,
+        );
         index = next;
         assert!(!ordinary.census_complete);
+        assert!(
+            ordinary.snapshots.is_empty(),
+            "the owed turn is for old census debt"
+        );
         assert!(!index.traversal.as_ref().unwrap().codex_freshness_yield);
         assert!(index.traversal.as_ref().unwrap().pending_candidates.len() < old_pending);
         let (_, fresh) = published_page(index, &collected_at(3), &[], 10000);
-        assert!(fresh
+        let published = fresh
             .snapshots
             .iter()
-            .any(|item| item.source_session_id == SESSION));
+            .map(|item| item.source_session_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(published, BTreeSet::from([NEXT, SESSION]));
     });
 }
 

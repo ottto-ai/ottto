@@ -14,7 +14,9 @@ whether anything uploads. Metadata-only changes do not create this priority.
 Same-size edits continue through ordinary scheduling.
 
 A persisted `codex_freshness_yield` checkpoint bit reserves the following
-ordinary scan page for baseline census scheduling. Missing bits default false;
+ordinary scan page for census work ahead of new hinted members. That page
+selects unchanged census debt first; if all remaining members have changed
+bytes, it selects census members in FIFO order. Missing bits default false;
 continuation pages never consume or create this turn. File and byte budgets,
 generation membership, large-file fences and next-generation carry keep their
 existing meanings. Under continuous fresh traffic, a finite original census
