@@ -24598,17 +24598,20 @@ pub(crate) enum OwnedSourceScanStep {
 fn finish_claude_retry_selection(
     index: &mut ScanIndex,
     pending_paths: &mut Vec<ScanTraversalPath>,
-    retry_service_selected: bool,
+    retry_service_end: usize,
     census_window_end: &str,
 ) {
-    if claude_request_money::e2::enabled() {
+    let offered = if claude_request_money::e2::enabled() {
         claude_request_money::e2::defer_roots_of_queued_families(
             pending_paths,
             index.traversal.as_mut().expect("traversal initialized"),
         );
-    }
-    if retry_service_selected {
-        claude_retry_note_offered(index, pending_paths, census_window_end);
+        pending_paths.as_slice()
+    } else {
+        &pending_paths[..retry_service_end]
+    };
+    if retry_service_end > 0 {
+        claude_retry_note_offered(index, offered, census_window_end);
     }
 }
 
@@ -25350,7 +25353,7 @@ impl OwnedSourceScan {
             finish_claude_retry_selection(
                 index,
                 &mut pending_paths,
-                retry_service_end > 0,
+                retry_service_end,
                 &census_window_end,
             );
         }
@@ -47878,7 +47881,7 @@ mod tests {
             // Both priority slots defer. The surviving audit suffix must not
             // be sliced using the old length or consume either owed cursor.
             let mut selected = vec![path(&root_path), path(&deferred_path), path(&healthy_path)];
-            finish_claude_retry_selection(&mut index, &mut selected, true, &at);
+            finish_claude_retry_selection(&mut index, &mut selected, 2, &at);
             assert_eq!(selected.len(), 1);
             let state = index
                 .claude_stale_family_carry
@@ -47896,7 +47899,7 @@ mod tests {
             }
             // Even a selected member cannot skip its deferred root's gap.
             let mut selected = vec![path(&root_path), path(&member_path), path(&healthy_path)];
-            finish_claude_retry_selection(&mut index, &mut selected, true, &at);
+            finish_claude_retry_selection(&mut index, &mut selected, 2, &at);
             assert_eq!(
                 index.files[&member_key].source_file_fingerprint,
                 fingerprints[&member_key]
@@ -47909,7 +47912,7 @@ mod tests {
                 .pending_directories
                 .clear();
             let mut selected = vec![path(&root_path), path(&member_path), path(&healthy_path)];
-            finish_claude_retry_selection(&mut index, &mut selected, true, &at);
+            finish_claude_retry_selection(&mut index, &mut selected, 2, &at);
             let state = index
                 .claude_stale_family_carry
                 .origin
