@@ -16,6 +16,11 @@ impl Drop for RetryMultiRefusal {
 // real strict save/load boundary. ACKs must therefore be canonical identities.
 fn retry_durable_fixture(held: usize, healthy: usize) -> ScopedRetryFixture {
     let mut fixture = scoped_retry_fixture(0, held + healthy, false);
+    // The initial empty start has no carry or scheduling obligation. Its
+    // origin is intentionally omitted by the normal writer; seed the same
+    // canonical empty shape before asserting exact durable custody below.
+    assert!(fixture.index.claude_stale_family_carry.is_empty());
+    fixture.index.claude_stale_family_carry = ClaudeStaleFamilyCarry::default();
     fixture.index.accepted_snapshot_fingerprints.clear();
     fixture.index.snapshot_activity_at.clear();
     let keys = fixture.index.files.keys().cloned().collect::<Vec<_>>();
