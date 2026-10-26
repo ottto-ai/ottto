@@ -26,7 +26,7 @@ fn synthetic_index(families: usize) -> ScanIndex {
             .insert(fingerprint.clone(), Some("2026-10-22T00:00:00Z".into()));
         index.accepted_snapshot_fingerprints.insert(fingerprint);
         let hashes = (0..8)
-            .map(|request| format!("{:064x}", 0x1_0000_0000 + n * 8 + request))
+            .map(|request| format!("{:x}", Sha256::digest(format!("{n}:{request}").as_bytes())))
             .collect::<BTreeSet<_>>();
         let occurrences = hashes
             .iter()
@@ -62,12 +62,22 @@ fn synthetic_index(families: usize) -> ScanIndex {
         index.claude_account_family_pending.insert(
             root.clone(),
             ClaudeAccountFamilyPending {
-                census_window_end: WINDOW_END.into(),
-                account_identifier_hash: "a".repeat(64),
-                evidence_request_count: 8,
-                members: BTreeMap::from([(root.clone(), 8)]),
-                member_request_id_hashes: BTreeMap::from([(root, hashes)]),
-                invalid: false,
+                current: ClaudeAccountFamilyPendingWindow {
+                    version: CLAUDE_ACCOUNT_REQUEST_SET_VERSION.into(),
+                    census_window_end: WINDOW_END.into(),
+                    account_identifier_hash: "a".repeat(64),
+                    evidence_request_count: 8,
+                    census_complete: false,
+                    members: BTreeMap::from([(root.clone(), 8)]),
+                    member_requests: BTreeMap::from([(
+                        root,
+                        ClaudeAccountRequestSet::from_full_hashes(&hashes)
+                            .expect("synthetic hashes have distinct prefixes"),
+                    )]),
+                    invalid: false,
+                },
+                previous_windows: Vec::new(),
+                confirmed_absent_members: BTreeSet::new(),
             },
         );
     }

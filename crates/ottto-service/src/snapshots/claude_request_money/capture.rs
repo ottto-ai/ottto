@@ -1474,7 +1474,7 @@ mod bounded_tests {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-turns");
         let support = scratch.join("support");
         let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
-        super::super::enable_shadow_for_test(&support);
+        let _shadow_support = super::super::enable_shadow_for_test(&support);
         let keys = (0..NEXT_PAGE_FAMILIES + 1)
             .map(|at| super::super::family_key(&format!("root-{at}")))
             .collect::<Vec<_>>();
@@ -1691,7 +1691,7 @@ mod bounded_tests {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-fallback");
         let support = scratch.join("support");
         let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
-        super::super::enable_shadow_for_test(&support);
+        let _shadow_support = super::super::enable_shadow_for_test(&support);
         let roots = (0..3 * NEXT_PAGE_FAMILIES)
             .map(|at| format!("root-{at}"))
             .collect::<Vec<_>>();
@@ -1752,7 +1752,7 @@ mod bounded_tests {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-closed");
         let support = scratch.join("support");
         let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
-        super::super::enable_shadow_for_test(&support);
+        let _shadow_support = super::super::enable_shadow_for_test(&support);
         let file = scratch.join("root-0.jsonl");
         let other = scratch.join("different-native-page.jsonl");
         assert_eq!(plan_allows_capture_for_test(&support), None);
@@ -1881,7 +1881,7 @@ mod bounded_tests {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-scope-wide");
         let support = scratch.join("support");
         let _shadow_cleanup = super::super::ShadowTestCleanup::new(&support);
-        super::super::enable_shadow_for_test(&support);
+        let _shadow_support = super::super::enable_shadow_for_test(&support);
         let before = capture_reserved();
         let page = |name: &str| {
             (0..3 * NEXT_PAGE_FAMILIES)
@@ -1983,13 +1983,45 @@ mod bounded_tests {
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
+    fn shadow_test_guard_refunds_the_plan_on_panic() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-shadow-panic-cleanup");
+        let support = scratch.join("support");
+        let before = capture_reserved();
+        let result = std::panic::catch_unwind(|| {
+            let _shadow = super::super::enable_shadow_for_test(&support);
+            assert_eq!(
+                plan_next_page(
+                    &support,
+                    [("synthetic-family", 0)].into_iter(),
+                    std::iter::empty(),
+                    Instant::now() + Duration::from_secs(1),
+                ),
+                PlanInstall::Complete
+            );
+            assert!(plan_funds_for_test(&support) > 0);
+            assert!(super::super::shadow_enabled(&support));
+            panic!("synthetic assertion panic before explicit cleanup");
+        });
+        let panic = result.expect_err("the synthetic panic must unwind");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"synthetic assertion panic before explicit cleanup"),
+            "setup and equality assertions must not be mistaken for the expected panic"
+        );
+        assert!(!super::super::shadow_enabled(&support));
+        assert_eq!(plan_funds_for_test(&support), 0);
+        assert_eq!(capture_reserved(), before);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
     fn shadow_cleanup_releases_plan_and_disables_scope_on_panic() {
         let scratch = crate::test_scratch::ScratchDir::new("money-plan-panic-cleanup");
         let support = scratch.join("support");
         let before = capture_reserved();
         let failure = std::panic::catch_unwind(|| {
             let _cleanup = super::super::ShadowTestCleanup::new(&support);
-            super::super::enable_shadow_for_test(&support);
+            let _shadow = super::super::enable_shadow_for_test(&support);
             assert_eq!(
                 plan_next_page(
                     &support,
@@ -2004,7 +2036,16 @@ mod bounded_tests {
             let entries = PLANS.lock().unwrap()[&support].entries.len();
             assert_eq!(entries, 0, "synthetic fixture assertion failure");
         });
-        assert!(failure.is_err());
+        let panic = failure.expect_err("the intentional fixture assertion must unwind");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("synthetic fixture assertion failure"),
+            "unexpected panic: {message}"
+        );
         assert_eq!(capture_reserved(), before);
         assert!(!super::super::shadow_enabled(&support));
         assert!(!PLANS.is_poisoned());
@@ -2162,7 +2203,7 @@ mod bounded_tests {
         let scope = scratch.join("support");
         let path = scratch.join("transcript.jsonl");
         let _shadow_cleanup = super::super::ShadowTestCleanup::new(&scope);
-        super::super::enable_shadow_for_test(&scope);
+        let _shadow_scope = super::super::enable_shadow_for_test(&scope);
         let mut capture = ClaudeResponseCapture::begin(&path).expect("armed capture");
         let pending_deposit = ClaudeResponseCapture::begin(&path).expect("second capture");
         let mut pending_finalizer = ClaudeResponseCapture::begin(&path).expect("third capture");

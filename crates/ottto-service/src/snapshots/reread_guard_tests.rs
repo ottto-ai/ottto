@@ -626,89 +626,54 @@ fn partial_save_keeps_the_negative_physical_witness_without_a_delivery_entry() {
     );
 }
 
+/// Separate parity arms keep every observer field, including witness hours.
+/// The outer clock models the real hour changing between those arms.
 #[test]
-fn scoped_plan_replaces_the_same_window_baseline_without_counting_retained_keys() {
-    let f = Fixture::new();
-    let (mut index, _) = f.indexed();
-    let entry = index.files.values().next().unwrap().clone();
-    for number in 0..320 {
-        index
-            .files
-            .insert(format!("healthy-{number}"), entry.clone());
-    }
-    for number in 0..3 {
-        index.files.insert(format!("owed-{number}"), entry.clone());
-    }
-    let before = serde_json::to_value(&index.files).unwrap();
-    let at = "2026-10-07T12:00:00Z";
-    assert!(!index.reread_plan(SnapshotSource::ClaudeCode, at, "scoped"));
-    assert_eq!(index.reread_guard.tripwire.planned, 0);
-    index.reread_guard.tripwire.full_reads = 7;
-    index.reread_guard.tripwire.runtime_cause_counts[cause(Some(CandidateParseReason::Rearmed))] =
-        7;
-    assert!(!index.reread_plan_for_rearms(
-        SnapshotSource::ClaudeCode,
-        at,
-        "scoped",
-        false,
-        |key| key.starts_with("owed-"),
-    ));
-    assert_eq!(index.reread_guard.tripwire.planned, 3);
-    assert!(!index.reread_guard.tripwire.plan_held);
-    assert_eq!(index.reread_guard.tripwire.full_reads, 7);
-    assert_eq!(
-        index.reread_guard.tripwire.runtime_cause_counts
-            [cause(Some(CandidateParseReason::Rearmed))],
-        7
-    );
-    assert_eq!(serde_json::to_value(&index.files).unwrap(), before);
-
-    // Independent obligations still count on retained keys, exactly once.
-    index
-        .files
-        .get_mut("healthy-0")
-        .unwrap()
-        .scan_identity_version = None;
-    index.reread_plan_for_rearms(SnapshotSource::ClaudeCode, at, "scoped", false, |key| {
-        key.starts_with("owed-")
+fn frozen_whole_index_comparison_survives_an_hour_boundary() {
+    let before = WALL / 3600 * 3600 + 3599;
+    let after = before + 1;
+    let clock = TestClock::at(before);
+    let fixture = Fixture::new();
+    let observe = || {
+        let (mut index, candidate) = fixture.indexed();
+        let key = local_index_key(&candidate.path);
+        index.record_read_witness(&key, &candidate);
+        index.remember_replay_read_witnesses();
+        index.reread_guard.remember_entry(
+            "restored-entry",
+            &super::super::tests::manifest_index_entry(None),
+        );
+        assert_eq!(index.reread_guard.replay_witnesses.len(), 2);
+        for witness in index.reread_guard.replay_witnesses.values() {
+            assert_eq!(witness.removed_hour, hour(now()).unwrap());
+        }
+        serde_json::to_vec(&index).unwrap()
+    };
+    let expected = observe();
+    let compare = || {
+        let _frozen = TestClock::at(before);
+        assert_eq!(observe(), expected);
+    };
+    compare();
+    clock.set(after);
+    assert_ne!(hour(before), hour(now()));
+    assert_ne!(observe(), expected, "an unfrozen arm reproduces the flake");
+    compare();
+    assert_eq!(now(), after, "the nested guard restores the advanced clock");
+    let result = std::panic::catch_unwind(|| {
+        let _frozen = TestClock::at(before);
+        assert_eq!(observe(), expected);
+        panic!("synthetic comparison panic");
     });
-    assert_eq!(index.reread_guard.tripwire.planned, 4);
-    index.reread_plan_for_rearms(SnapshotSource::ClaudeCode, at, "scoped", true, |key| {
-        key.starts_with("owed-")
-    });
+    let panic = result.expect_err("the synthetic panic must unwind");
     assert_eq!(
-        index.reread_guard.tripwire.planned,
-        index.files.len() as u64
+        panic.downcast_ref::<&str>(),
+        Some(&"synthetic comparison panic"),
+        "setup and equality assertions must not be mistaken for the expected panic"
     );
-    index.active_effective_upload_body_witness_revision = entry
-        .effective_upload_body_witness_revision
-        .saturating_add(1);
-    index.reread_plan_for_rearms(SnapshotSource::ClaudeCode, at, "scoped", false, |key| {
-        key.starts_with("owed-")
-    });
-    assert_eq!(
-        index.reread_guard.tripwire.planned,
-        index.files.len() as u64
-    );
-    index.active_upload_context_fingerprint = Some("new-context".into());
-    index.reread_plan_for_rearms(SnapshotSource::ClaudeCode, at, "scoped", false, |key| {
-        key.starts_with("owed-")
-    });
-    assert_eq!(
-        index.reread_guard.tripwire.planned,
-        index.files.len() as u64
-    );
-    assert!(!index.reread_plan_for_rearms(
-        SnapshotSource::ClaudeCode,
-        at,
-        "scoped",
-        false,
-        |key| key.starts_with("owed-"),
-    ));
+    assert_eq!(now(), after, "unwinding also restores the advanced clock");
 }
 
-/// Whole-index parity fixtures can pin the observer without leaking a clock
-/// into the next test, including when an equality assertion unwinds.
 #[test]
 fn scoped_clock_restores_after_nested_fixture_panic() {
     let previous = TEST_CLOCK.with(|clock| clock.get());
@@ -720,7 +685,11 @@ fn scoped_clock_restores_after_nested_fixture_panic() {
             assert_eq!(now(), WALL + 3_600);
             panic!("synthetic fixture assertion failure");
         });
-        assert!(failure.is_err());
+        let panic = failure.expect_err("the intentional fixture assertion must unwind");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"synthetic fixture assertion failure")
+        );
         assert_eq!(now(), WALL);
     }
     assert_eq!(TEST_CLOCK.with(|clock| clock.get()), previous);

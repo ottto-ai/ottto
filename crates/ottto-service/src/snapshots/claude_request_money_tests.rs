@@ -1771,7 +1771,7 @@ fn money_shadow_panics_are_contained_and_it_can_be_turned_off() {
     let support = scratch.join("support");
     std::fs::create_dir_all(&support).unwrap();
     let _shadow_cleanup = crate::snapshots::claude_request_money::ShadowTestCleanup::new(&support);
-    enable_shadow_for_test(&support);
+    let _shadow_support = enable_shadow_for_test(&support);
     let run = || {
         crate::snapshots::claude_request_money::shadow_page(
             &support,
@@ -2637,7 +2637,7 @@ fn money_m4_sized_ledger_and_page_are_measured() {
         .unwrap();
     }
     let _shadow_cleanup = crate::snapshots::claude_request_money::ShadowTestCleanup::new(&support);
-    enable_shadow_for_test(&support);
+    let _shadow_support = enable_shadow_for_test(&support);
     let mut index = ScanIndex::default();
     let scan = crate::snapshots::scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,

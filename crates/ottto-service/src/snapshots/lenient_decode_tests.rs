@@ -2018,6 +2018,9 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                 serde_json::json!({"a".repeat(64): 1})
             }
             "claude_full_rearm_progress" => serde_json::json!({"structural_rearm_owed":true}),
+            "codex_counting_evicted_legacy" => {
+                serde_json::json!([{"owner":"b".repeat(64),"selected_v2":false}])
+            }
             "codex_counting_tombstones" => {
                 serde_json::json!({"a".repeat(64):{"evidence":"legacy_acked","retired_in":"2026-10-22T00:00:00Z"}})
             }

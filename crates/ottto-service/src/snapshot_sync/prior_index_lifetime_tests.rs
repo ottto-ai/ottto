@@ -480,7 +480,7 @@ enum MoneyArm {
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
 fn money_shadow_real_caller_parity_at_tight_allowances() {
-    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(current_unix_seconds());
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -624,7 +624,7 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
 
     // Populate the money ledger with one armed cycle, save it and forget it;
     // then a new response, so the compared cycle has work.
-    money::enable_shadow_for_test(&support);
+    let _shadow_support = money::enable_shadow_for_test(&support);
     // The writer supplies durable quota asynchronously; prime the fixture
     // before requiring its first cycle to produce a persisted save.
     money::store::prime_credit_for_test(&support, 0);
@@ -682,14 +682,16 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
         }
-        if arm == MoneyArm::Unarmed {
+        let _shadow_support = if arm == MoneyArm::Unarmed {
             money::disable_shadow_for_test(&support);
             money::store::forget_for_test(&support);
+            None
         } else {
-            money::enable_shadow_for_test(&support);
+            let shadow = money::enable_shadow_for_test(&support);
             let records = money::store::reload_for_test(&support);
             assert!(records.is_some_and(|records| records > 0), "{records:?}");
-        }
+            Some(shadow)
+        };
         let _ = money::take_shadow_lines_for_test();
         let output = cycle(budget, conflict, arm, true);
         money::store::flush();
