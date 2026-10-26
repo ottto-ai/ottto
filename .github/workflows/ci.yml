@@ -26,7 +26,7 @@ on:
         type: string
         default: "3"
       money_e2_bench_reference:
-        description: Pre-E2 reference commit (default merge-base of the branch and origin/main)
+        description: Pre-E2 reference commit (default merge-base of the branch and origin/main; must predate E2)
         type: string
         default: ""
       money_e2_bench_structure_on_stub:
@@ -265,6 +265,12 @@ jobs:
           cd candidate
           ref="${BENCH_REFERENCE:-$(git merge-base HEAD origin/main)}"
           git rev-parse "$ref^{commit}" | tee "$RUNNER_TEMP/e2-reference-sha.txt"
+          # Swapping the hook only relabels a reference that already runs E2
+          # (e.g. the default merge-base once E2 is on main): refuse it.
+          if git cat-file -e "$ref:crates/ottto-service/src/snapshots/claude_request_money/e2.rs" 2>/dev/null; then
+            echo "::error::reference $ref already contains the E2 runtime; pass money_e2_bench_reference=<a pre-E2 commit>"
+            exit 1
+          fi
           git worktree add --detach "$RUNNER_TEMP/reference" "$ref"
           # The candidate's benchmark file, with the pre-E2 hook, in the
           # reference tree (included from snapshot_sync's tests if absent).

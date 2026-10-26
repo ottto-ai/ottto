@@ -443,7 +443,7 @@ impl ClaudeRequestCensusRecord {
         self.window
     }
 
-    #[cfg(test)]
+    /// Transcript records: the file's modification time at the parse.
     pub(crate) fn modified(&self) -> Option<u64> {
         self.modified
     }

@@ -1541,7 +1541,7 @@ fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &Sca
         None => index
             .claude_request_census
             .get(witness)
-            .filter(|record| scan_evidence(index, witness, record))
+            .filter(|record| scan_evidence(index, witness, record) == Evidence::Proves)
             .map(|record| {
                 skipped_ids(&items[at])
                     .filter(|id| !record.holds_hash(claude_request_hash(id)))
@@ -1555,29 +1555,56 @@ fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &Sca
     }
 }
 
+/// A census record's standing as copy evidence (`scan_evidence`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    Proves,
+    Stale,
+    Nothing,
+}
+
 /// What `key`'s census record proves about the file now (owner rule P2:
 /// holding a session withholds its UPLOAD only; its scan state stays
 /// evidence). The record of the settled revision (its index entry, same
 /// fingerprint) proves it; so does the record of a scan whose upload is held
-/// (entry absent or not advanced), while the file is still there. Retired,
-/// over-budget, twin and older-derivation records prove nothing.
+/// (entry absent or not advanced), while the file is still there. A file
+/// modified since its record was written is `Stale`: its next read decides,
+/// so a copy waits for it rather than trusting ids the file may no longer
+/// hold. Retired, over-budget, twin and older-derivation records prove
+/// nothing.
 fn scan_evidence(
     index: &ScanIndex,
     key: &str,
     record: &super::super::claude_request_census::ClaudeRequestCensusRecord,
-) -> bool {
-    record.proves_scan()
-        && (index
+) -> Evidence {
+    if !record.proves_scan() {
+        return Evidence::Nothing;
+    }
+    match std::fs::metadata(key) {
+        Ok(live) if live.is_file() => {
+            // The record's own clock, at the index fingerprint's granularity.
+            let now = live.modified().ok().and_then(super::super::unix_seconds);
+            match (record.modified(), now) {
+                (Some(read), Some(now)) if read != now => Evidence::Stale,
+                _ => Evidence::Proves,
+            }
+        }
+        _ if index
             .files
             .get(key)
-            .is_some_and(|entry| record.proves_current(&entry.source_file_fingerprint))
-            || Path::new(key).is_file())
+            .is_some_and(|entry| record.proves_current(&entry.source_file_fingerprint)) =>
+        {
+            Evidence::Proves
+        }
+        _ => Evidence::Nothing,
+    }
 }
 
 /// Another session's main file this traversal has not put on any page yet:
 /// queued, not indexed, and without scan state. Only these can make a copy
-/// wait. A scanned file, held or not, is evidence (`scan_evidence`), never a
-/// reason to wait, so held sessions never wait on each other; with the queue
+/// wait here. A scanned file, held or not, is evidence (`scan_evidence`),
+/// never a reason to wait, so held sessions never wait on each other (one
+/// modified since its read waits for that read instead); with the queue
 /// drained (traversal complete) nothing is pending and what exists decides.
 fn unscanned_main_roots(index: &ScanIndex) -> BTreeSet<String> {
     index
@@ -1601,8 +1628,9 @@ fn unscanned_main_roots(index: &ScanIndex) -> BTreeSet<String> {
 /// One census walk for every all-pre-birth main file of the page. A holder
 /// proves a request when it is another session's main file whose scan state
 /// holds it (`scan_evidence`) and earlier in (effective birth, location); a
-/// holder without a stored birth is probed once. Only the walk deadline and
-/// an unscanned other-session main file delay a decision.
+/// holder without a stored birth is probed once. Only the walk deadline, an
+/// unscanned other-session main file and an earlier holder modified since
+/// its read delay a decision.
 fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex) {
     struct Wanted {
         at: usize,
@@ -1610,6 +1638,8 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
         order: (i128, LocationKey),
         hashes: Vec<u64>,
         covered: BTreeSet<u64>,
+        /// Held by an earlier holder modified since its record: wait.
+        stale: BTreeSet<u64>,
     }
     let mut wanted = folds
         .iter()
@@ -1627,6 +1657,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                 order,
                 hashes,
                 covered: BTreeSet::new(),
+                stale: BTreeSet::new(),
             })
         })
         .collect::<Vec<_>>();
@@ -1647,7 +1678,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
         |key, root, record, hits| {
             // Per holder record, each at most once and only when another
             // session wants one of its ids: evidence, then (birth, location).
-            let mut holder = None::<Option<(i128, LocationKey)>>;
+            let mut holder = None::<Option<(Evidence, (i128, LocationKey))>>;
             for &hash in hits {
                 let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
                 for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
@@ -1656,7 +1687,8 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                         continue;
                     }
                     let holder = *holder.get_or_insert_with(|| {
-                        if !scan_evidence(index, key, record) {
+                        let evidence = scan_evidence(index, key, record);
+                        if evidence == Evidence::Nothing {
                             return None;
                         }
                         let birth = store.effective_cutoff(root, key).or_else(|| {
@@ -1664,10 +1696,16 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                                 .filter(|opened| opened.birth != 0)
                                 .map(|opened| i128::from(opened.birth))
                         })?;
-                        Some((birth, location_key(key)))
+                        Some((evidence, (birth, location_key(key))))
                     });
-                    if holder.is_some_and(|holder| holder < file.order) {
-                        file.covered.insert(hash);
+                    match holder {
+                        Some((Evidence::Proves, order)) if order < file.order => {
+                            file.covered.insert(hash);
+                        }
+                        Some((_, order)) if order < file.order => {
+                            file.stale.insert(hash);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1683,6 +1721,10 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
             .collect::<Vec<_>>();
         if walked.is_none() {
             hold_copies(&mut items[wanted.at], "held_copy_deadline");
+            continue;
+        }
+        if uncovered.iter().any(|hash| wanted.stale.contains(hash)) {
+            hold_copies(&mut items[wanted.at], "held_copy_stale_holder");
             continue;
         }
         if !uncovered.is_empty()
