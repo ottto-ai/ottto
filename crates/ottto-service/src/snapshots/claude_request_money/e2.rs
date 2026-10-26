@@ -104,6 +104,18 @@ fn diag(reason: &'static str, n: u64) {
     #[cfg(not(test))]
     let _ = (reason, n);
 }
+/// The largest `value` seen under `key` since the last take (test builds).
+#[inline(always)]
+fn diag_max(key: &'static str, value: u64) {
+    #[cfg(test)]
+    DIAG.with(|diag| {
+        let mut diag = diag.borrow_mut();
+        let max = diag.entry(key).or_default();
+        *max = (*max).max(value);
+    });
+    #[cfg(not(test))]
+    let _ = (key, value);
+}
 
 /// Benchmark seam (snapshot_sync money_e2_bench_tests). Test builds only.
 #[cfg(test)]
@@ -1509,35 +1521,45 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
             })
         })
         .collect::<Vec<_>>();
-    let mut union = wanted
+    // (hash, wanted file), sorted: each holder hit finds the files that want
+    // it directly, never a pass over every wanted file per holder record.
+    let mut wanting = wanted
         .iter()
-        .flat_map(|wanted| wanted.hashes.iter().copied())
+        .enumerate()
+        .flat_map(|(at, wanted)| wanted.hashes.iter().map(move |&hash| (hash, at)))
         .collect::<Vec<_>>();
-    union.sort_unstable();
+    wanting.sort_unstable();
+    let mut union = wanting.iter().map(|&(hash, _)| hash).collect::<Vec<_>>();
     union.dedup();
     let store = &index.claude_money_birth_store;
-    let mut births = BTreeMap::<&str, Option<i128>>::new();
     let walked = index.claude_request_census.main_transcript_holders(
         &union,
         Instant::now() + SIDE_CALL_DEADLINE,
         |key, root, record, hits| {
-            if !scan_evidence(index, key, record) {
-                return;
-            }
-            for wanted in wanted.iter_mut().filter(|wanted| wanted.session != root) {
-                let birth = *births.entry(key).or_insert_with(|| {
-                    store.effective_cutoff(root, key).or_else(|| {
-                        probe_opened_birth(key)
-                            .filter(|opened| opened.birth != 0)
-                            .map(|opened| i128::from(opened.birth))
-                    })
-                });
-                if birth.is_some_and(|birth| (birth, location_key(key)) < wanted.order) {
-                    wanted.covered.extend(
-                        hits.iter()
-                            .copied()
-                            .filter(|hash| wanted.hashes.binary_search(hash).is_ok()),
-                    );
+            // Per holder record, each at most once and only when another
+            // session wants one of its ids: evidence, then (birth, location).
+            let mut holder = None::<Option<(i128, LocationKey)>>;
+            for &hash in hits {
+                let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
+                for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
+                    let file = &mut wanted[at];
+                    if file.session == root {
+                        continue;
+                    }
+                    let holder = *holder.get_or_insert_with(|| {
+                        if !scan_evidence(index, key, record) {
+                            return None;
+                        }
+                        let birth = store.effective_cutoff(root, key).or_else(|| {
+                            probe_opened_birth(key)
+                                .filter(|opened| opened.birth != 0)
+                                .map(|opened| i128::from(opened.birth))
+                        })?;
+                        Some((birth, location_key(key)))
+                    });
+                    if holder.is_some_and(|holder| holder < file.order) {
+                        file.covered.insert(hash);
+                    }
                 }
             }
         },
@@ -2110,6 +2132,8 @@ pub(crate) fn finish_page(
         native: Option<(ClaudeMoneyTokens, u64)>,
         side: (ClaudeMoneyTokens, u64),
         locations: Vec<LocationKey>,
+        /// Decision counters, recorded once the session is decided.
+        decided: Counts,
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2133,14 +2157,16 @@ pub(crate) fn finish_page(
         let Some(fold) = item.claude_money.as_deref() else {
             continue;
         };
+        // Work counts on every read; decisions only when decided (below).
+        diag_max("max_file_fold_us", fold.e2_nanos / 1_000);
         record_counts(Counts([
             fold.e2_nanos / 1_000,
             fold.responses,
-            fold.entity.removed_requests,
-            fold.disclosed,
-            fold.unmatched_1h(&hour_ago),
-            fold.root_fallbacks,
-            fold.entity.resolver_conflicts,
+            0,
+            0,
+            0,
+            0,
+            0,
             0,
         ]));
         let session = sessions
@@ -2151,7 +2177,21 @@ pub(crate) fn finish_page(
                 native: Some(Default::default()),
                 side: Default::default(),
                 locations: Vec::new(),
+                decided: Counts::default(),
             });
+        diag("resolver_conflict", fold.entity.resolver_conflicts);
+        session.decided.add(&Counts([
+            0,
+            0,
+            fold.entity.removed_requests,
+            // disclosed: everything counted without proof, resolver
+            // conflicts included, once per decision.
+            fold.disclosed + fold.entity.resolver_conflicts,
+            fold.unmatched_1h(&hour_ago),
+            fold.root_fallbacks,
+            fold.entity.resolver_conflicts,
+            0,
+        ]));
         session.entity.sum(&fold.entity);
         session.complete &= fold.telemetry_complete();
         session.side.0.add(&fold.side);
@@ -2198,9 +2238,12 @@ pub(crate) fn finish_page(
         }
     }
     if !enabled() {
-        // Dark: nothing reads a fold after counting. Release them so the page
+        // Dark: a session the gate would hold is undecided, not disclosed.
+        for session in sessions.into_values() {
+            record_decided(session.entity.held, session.decided);
+        }
+        // Nothing reads a fold after counting. Release them so the page
         // neither keeps them nor clones them with every upload attempt.
-        drop(sessions);
         for item in items.iter_mut() {
             item.claude_money = None;
         }
@@ -2213,11 +2256,13 @@ pub(crate) fn finish_page(
     let held = absent_twins(&locations, index);
     diag("held_absent_twin", held.len() as u64);
     drop(locations);
+    let mut decided = Vec::with_capacity(sessions.len());
     let mut entities = sessions
         .into_iter()
         .map(|(session, mut state)| {
             state.entity.telemetry_owned_complete = state.complete;
             state.entity.held |= held.contains(session);
+            decided.push((session.to_owned(), state.decided));
             (session.to_owned(), state.entity)
         })
         .collect::<BTreeMap<_, _>>();
@@ -2241,7 +2286,21 @@ pub(crate) fn finish_page(
         true
     });
     diag("withheld_sessions", withheld.len() as u64);
+    // A withheld session is read again: its decisions count on that page.
+    for (session, counts) in decided {
+        record_decided(withheld.contains(&session), counts);
+    }
     withheld
+}
+
+/// Each decision counts once: a held (undecided) session records nothing
+/// here; the page that decides it does.
+fn record_decided(held: bool, counts: Counts) {
+    if held {
+        diag("undecided_sessions", 1);
+    } else {
+        record_counts(counts);
+    }
 }
 
 /// Visit the exact final placement; account classification belongs to identity.
@@ -2333,6 +2392,13 @@ pub(crate) fn take_counts() -> Counts {
 }
 #[derive(Debug, Default)]
 pub(crate) struct Counts([u64; 8]);
+impl Counts {
+    fn add(&mut self, other: &Self) {
+        for (sum, value) in self.0.iter_mut().zip(other.0) {
+            *sum = sum.saturating_add(value);
+        }
+    }
+}
 impl Serialize for Counts {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;

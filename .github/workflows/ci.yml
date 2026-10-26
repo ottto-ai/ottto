@@ -402,11 +402,30 @@ jobs:
           # stub proof run, so "not worse" allows max(2 MiB, twice the
           # reference spread, 5% of the reference median).
           rss_tolerance = max(2 * MIB, 2 * (max(rss_ref) - min(rss_ref)), 0.05 * statistics.median(rss_ref)) if rss_ref else None
+          # fold_us counts ONLY the work E2 adds (per file: FileFold new,
+          # set_identity, observe per response, finish_native; per page:
+          # copy decisions, attach, side calls, finish_page), never the
+          # native parse/resolve it shares. The native cost is gated by
+          # page_cpu_le_5pct against the pre-E2 reference.
           fold = [r["traversal"]["e2"].get("fold_us", 0) / r["traversal"]["e2"]["responses"]
                   for r in candidate if r["traversal"]["e2"].get("responses")]
-          finalize_ms = [f["e2"].get("fold_us", 0) / 1000 for r in candidate for f in r["finishes"] if f["e2"].get("responses")]
-          expected = manifest["expected"]
-          counters = [{k: r["traversal"]["e2"].get(k, 0) for k in ("responses", "copy_skipped", "disclosed", "unmatched_1h", "dark_unexplained")} | {"tag": r["tag"]} for r in candidate]
+          # The largest single file's E2 fold (max over every page read).
+          finalize_ms = [p.get("e2_diag", {}).get("max_file_fold_us", 0) / 1000
+                         for r in candidate for p in r["page_receipts"] + r["finishes"] if p["e2"].get("responses")]
+          # Dark keeps scan selection identical to the reference, so it never
+          # co-reads path twins: their copies are unprovable there (counted,
+          # disclosed). The gate-on arm decides them.
+          expected_for = lambda arm: manifest["expected"] if arm == "on" else manifest.get("expected_dark", manifest["expected"])
+          expected = {a: expected_for(a) for a in ("dark", "on")}
+          counters = [{k: r["traversal"]["e2"].get(k, 0) for k in ("responses", "copy_skipped", "disclosed", "unmatched_1h", "side_call_root_fallback", "resolver_conflicts", "dark_unexplained")} | {"tag": r["tag"], "arm": r["arm"]} for r in candidate]
+          # Test builds only: why each traversal disclosed or held, by reason.
+          def reasons(r):
+              total = {}
+              for p in r["page_receipts"]:
+                  for k, v in p.get("e2_diag", {}).items():
+                      if not k.startswith("max_"):
+                          total[k] = total.get(k, 0) + v
+              return total
           pages = {a: [p["wall_us"] for r in runs for p in r["page_receipts"]] for a, runs in arms.items()}
           def spread(values):
               values = sorted(values)
@@ -441,6 +460,7 @@ jobs:
               "largest_native_finalize_ms": finalize_ms,
               "counters": counters,
               "expected_counters": expected,
+              "traversal_reasons": {r["tag"]: reasons(r) for r in candidate},
               "uploads": {a: [r["uploads"] | {"tag": r["tag"]} for r in runs] for a, runs in arms.items()},
               "upload_fingerprint_digests": digests,
               "dark_uploads_equal_reference": digests["dark"] == digests["reference"] and len(digests["dark"]) == 1,
@@ -453,10 +473,11 @@ jobs:
               "hook_live": hook == "live" and bool(candidate) and all(r["hook"] == "live" for r in candidate),
               "reference_is_pre_e2_build": bool(arms["reference"]) and all(r["hook"] == "reference" for r in arms["reference"]),
               "full_m4_shape": bool(manifest["full_shape_counts"] and manifest["full_shape_bytes"]),
-              "e2_counters_measured": bool(fold) and len(fold) == len(candidate) and bool(finalize_ms),
-              "counters_match_fixture": bool(candidate) and all(c[k] == expected[k] for c in counters for k in ("responses", "copy_skipped", "disclosed")),
+              "e2_counters_measured": bool(fold) and len(fold) == len(candidate) and bool(finalize_ms) and max(finalize_ms) > 0,
+              "counters_match_fixture": bool(candidate) and all(c[k] == expected[c["arm"]][k] for c in counters for k in ("responses", "copy_skipped", "disclosed")),
               "gate_effective": bool(arms["on"]) and all(r["uploads"]["literal_items"] > 0 for r in arms["on"])
                   and all(r["uploads"]["literal_items"] == 0 for r in arms["dark"] + arms["reference"]),
+              # E2-added work only (see fold_us above).
               "fold_us_per_response_le_1": within(med(fold), 1.0),
               "largest_native_finalize_le_50ms": within(max(finalize_ms) if finalize_ms else None, 50.0),
               "page_wall_le_5pct": all(within(ratio(wall, a), 1.05) for a in ("dark", "on")),

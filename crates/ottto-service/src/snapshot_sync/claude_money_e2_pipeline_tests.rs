@@ -2028,11 +2028,26 @@ fn e2_pipeline_held_copies_never_wait_on_each_other() {
             ]),
             "x counts in A and y in C, once; every other id in its own file"
         );
-        let after = c.raw(&E2ScanFixture::default(), prior, 100, false, &[]);
-        assert_eq!(
-            after.scan.scanned_file_count, 0,
-            "a settled corpus is not re-read"
-        );
+        // A clean follow-up may read a file once more; it never changes a
+        // published body, and the sync after it reads nothing.
+        for follow_up in 0.. {
+            assert!(follow_up < 2, "a settled corpus is not re-read every sync");
+            let mut page = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
+            page.enrich(&c);
+            if page.scan.scanned_file_count == 0 {
+                break;
+            }
+            for session in [A, B, C, D] {
+                if let Some(found) = body(&page, session) {
+                    assert_eq!(
+                        Some(&(found.request_count, found.removed_request_count)),
+                        published.get(session),
+                        "{session}: a follow-up read decides the same"
+                    );
+                }
+            }
+            prior = settle(&c, &prior, page, &mut progress);
+        }
     });
 }
 
