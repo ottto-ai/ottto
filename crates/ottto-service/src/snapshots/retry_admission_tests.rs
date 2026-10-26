@@ -48,7 +48,7 @@ fn retry_durable_fixture(held: usize, healthy: usize) -> ScopedRetryFixture {
     fixture
 }
 
-fn retry_test_reload(index: &ScanIndex, path: &Path) -> ScanIndex {
+fn retry_test_reload(index: &mut ScanIndex, path: &Path) -> ScanIndex {
     let accepted = index.accepted_snapshot_fingerprints.clone();
     let authority = serde_json::to_value(&index.claude_usage_authority_quarantine).unwrap();
     let admission = serde_json::to_value(&index.claude_stale_family_carry.origin).unwrap();
@@ -256,7 +256,7 @@ fn oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
         .pending_candidates
         .clear();
     let path = fixture._scratch.join("oversized-index.json");
-    let loaded = retry_test_reload(&fixture.index, &path);
+    let loaded = retry_test_reload(&mut fixture.index, &path);
     let (mut index, scan, selected) = retry_test_page(loaded, &root, CARRY_RETRY, 1);
     assert_eq!(selected, vec![real.clone()]);
     assert_eq!(
@@ -278,7 +278,7 @@ fn oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
         !state.complete,
         "unoffered missing members still owe service"
     );
-    let mut loaded = retry_test_reload(&index, &path);
+    let mut loaded = retry_test_reload(&mut index, &path);
     // An exhausted/red ordinary checkpoint may leave unoffered fallback
     // members. The actual next start must advance siblings without dropping it.
     carry_red(&mut loaded, CARRY_RETRY, 7);
@@ -324,7 +324,7 @@ fn rotating_due_seed_services_over_64_paths_before_audits_across_reload() {
     let root = fixture._scratch.to_path_buf();
     retry_test_context(&mut fixture.index, &root);
     retry_test_corrections(&mut fixture);
-    fixture.index = retry_test_reload(&fixture.index, &root.join("initial-state.json"));
+    fixture.index = retry_test_reload(&mut fixture.index, &root.join("retry-state.json"));
     // A competing due audit remains available on every page, but cannot
     // consume the existing two slots ahead of runnable authority work.
     let audit = root.join(format!("{CARRY_OTHER}.jsonl"));
@@ -422,7 +422,7 @@ fn rotating_due_seed_services_over_64_paths_before_audits_across_reload() {
             // consume them en masse by advancing the traversal clock.
             carry_red(&mut index, CARRY_RETRY, 7);
         }
-        index = retry_test_reload(&index, &path);
+        index = retry_test_reload(&mut index, &path);
     }
     assert_eq!(seen, due_keys, "all70due paths reach actual selection within35two-file pages despite persistent prefix and audits");
     assert!(
@@ -495,7 +495,7 @@ fn completed_retry_admission_releases_to_whole_carry_when_history_fits() {
 fn retry_scheduling_fixtures_keep_ack_and_correction_custody_on_reload() {
     let mut fixture = retry_durable_fixture(70, 3);
     retry_test_corrections(&mut fixture);
-    fixture.index = retry_test_reload(&fixture.index, &fixture._scratch.join("custody.json"));
+    fixture.index = retry_test_reload(&mut fixture.index, &fixture._scratch.join("custody.json"));
     assert_eq!(fixture.index.accepted_snapshot_fingerprints.len(), 73);
     assert_eq!(fixture.index.claude_usage_authority_quarantine.len(), 70);
     assert_eq!(
@@ -547,7 +547,7 @@ fn retry_due_cursor_rotates_portably_across_reload_without_consuming_gaps() {
     let mut seen = BTreeSet::new();
     let path = root.join("portable-state.json");
     for tick in 0..35 {
-        fixture.index = retry_test_reload(&fixture.index, &path);
+        fixture.index = retry_test_reload(&mut fixture.index, &path);
         let traversal = fixture.index.traversal.as_mut().unwrap();
         traversal.pending_candidates.push_front(ScanTraversalPath {
             scan_root: root.clone(),
@@ -611,6 +611,6 @@ fn retry_due_cursor_rotates_portably_across_reload_without_consuming_gaps() {
         }
     }
     assert_eq!(seen, due, "all70 offered within35 pages on every platform");
-    fixture.index = retry_test_reload(&fixture.index, &path);
+    fixture.index = retry_test_reload(&mut fixture.index, &path);
     assert_eq!(fixture.index.claude_usage_authority_quarantine.len(), 70);
 }
