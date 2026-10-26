@@ -43,8 +43,13 @@ permissions:
 
 jobs:
   rust:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
     name: Rust contracts
+    # macOS runs only in the merge queue, on main pushes and on dispatch: GitHub
+    # Free allows five hosted Macs org-wide. On a PR the skipped job reports
+    # success for the required check; the ruleset's merge_queue rule makes every
+    # merge pass this job in the queue. Rollback: remove this line FIRST, and
+    # only then the queue rule; never leave the skip without the queue.
+    if: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
     timeout-minutes: 40
     runs-on: macos-15
     env:
