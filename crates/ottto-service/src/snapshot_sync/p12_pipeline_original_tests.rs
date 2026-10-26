@@ -163,6 +163,7 @@ struct RearmFixture {
     progress_path: PathBuf,
     request_identity: bool,
     native_file_limit: usize,
+    serial_active_frame: bool,
     owned_base_preparation: bool,
     body_trace: std::cell::RefCell<RearmBodyTrace>,
     native_lifecycle:
@@ -187,6 +188,7 @@ impl RearmFixture {
             case,
             request_identity: false,
             native_file_limit: REARM_PAGE_FILES,
+            serial_active_frame: false,
             owned_base_preparation: false,
             body_trace: Default::default(),
             native_lifecycle: std::sync::Arc::new(Default::default()),
@@ -318,7 +320,11 @@ impl RearmFixture {
         collected_at: &str,
     ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
         let frame = self.native_preparation(index, collected_at);
-        collect_native_preparation_with_rotation(frame, true)
+        if self.serial_active_frame {
+            collect_unparkable_preparation_with_rotation(frame)
+        } else {
+            collect_native_preparation_with_rotation(frame, true)
+        }
     }
 
     fn native_preparation(&self, index: ScanIndex, collected_at: &str) -> SourcePreparation {
@@ -1416,6 +1422,7 @@ fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture 
         case: "native-parity-independent-index",
         request_identity: source.request_identity,
         native_file_limit: source.native_file_limit,
+        serial_active_frame: source.serial_active_frame,
         owned_base_preparation: source.owned_base_preparation,
         body_trace: Default::default(),
         native_lifecycle: std::sync::Arc::new(Default::default()),

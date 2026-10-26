@@ -19,6 +19,10 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
     fixture.native_file_limit = 512;
     let closing = c1b_generation(&fixture, "seed", (8, 0));
     assert!(closing.census_complete && closing.full_rearm);
+    // source_rotation.rs:186-188,293-315 permits an unparkable ordinary active
+    // frame to continue serially. Require the real bound to refuse parking;
+    // small fixtures and this test's seed retain their original layout gate.
+    fixture.serial_active_frame = true;
     const HEALTHY: usize = 6356;
     let healthy = (0..HEALTHY)
         .map(|number| format!("0{number:07x}-1234-4234-8234-123456789abc"))
