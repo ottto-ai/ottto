@@ -1971,6 +1971,69 @@ fn e2_pipeline_branch_read_after_its_original_on_a_fresh_index_is_skipped() {
     branch_before_original(false);
 }
 
+/// An indexed original rewritten in place to drop H, then a new all-pre-birth
+/// branch holding H, read before the original's next page: the original's
+/// census record no longer describes its file, so the branch waits for that
+/// read instead of skipping H. H then counts once, from the branch.
+#[test]
+fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-branch-stale-holder");
+        let original = c.root(LATE, &line(LATE, "h", AT, 10));
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let first = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
+        assert_eq!(total(&first), 1);
+        let mut prior = settle(&c, &old, first, &mut progress);
+        // Same length: h becomes u in place; the clock moves on.
+        std::fs::write(&original, line(LATE, "u", AT, 10)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&original)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "h", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut page = c.raw(&scanner, prior.clone(), 1, false, &[]);
+        page.enrich(&c);
+        let opened = scanner.paths();
+        assert_eq!(opened.len(), 1, "one file per page");
+        assert!(
+            opened[0].ends_with(format!("{COPY}.jsonl")),
+            "fixture reads the branch before the modified original"
+        );
+        assert_withheld(&page, COPY, "the original changed since its read");
+        prior = settle(&c, &prior, page, &mut progress);
+        let mut original_body = None;
+        let mut copy_body = None;
+        for _ in 0..3 {
+            let page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+            for (session, slot) in [(LATE, &mut original_body), (COPY, &mut copy_body)] {
+                if let Some(found) = body(&page, session) {
+                    if crate::snapshots::claude_request_money::is_request_owned_literal(found) {
+                        *slot = Some((found.request_count, found.removed_request_count));
+                    }
+                }
+            }
+            prior = settle(&c, &prior, page, &mut progress);
+            if copy_body.is_some() {
+                break;
+            }
+        }
+        assert_eq!(original_body.map(|(count, _)| count), Some(1), "u only");
+        assert_eq!(
+            copy_body,
+            Some((1, Some(0))),
+            "h counts once, from the branch: nothing dropped"
+        );
+    });
+}
+
 /// Owner rule (P2): holding a session withholds its upload only; its scan
 /// state stays evidence. All-copied main files of four sessions share
 /// request ids (the Linux probe shape: every root a cross-session copy

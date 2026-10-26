@@ -3702,6 +3702,10 @@ pub struct ScanIndex {
     /// Appended persisted field: preserve every older positional index slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) upload_ack_retirement_handoff: Option<UploadAckRetirementHandoff>,
+    /// One paced native audit outside the sampled-marker slot pool. This is
+    /// scheduling only; the census hold remains the authority until Full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    held_audit_progress: Option<sampled_audit::HeldAuditProgress>,
     /// Runtime-only, Claude only: what owed history does this cycle where no
     /// list is intended, set with the cutoff before scanning.
     #[serde(skip)]
@@ -3924,6 +3928,7 @@ impl Default for ScanIndex {
             resume_after_path: None,
             resume_upper_bound_path: None,
             resume_census_window_end: None,
+            held_audit_progress: None,
             bounded_sweep_had_unsettled_upload: false,
             bounded_sweep_unsettled_causes: 0,
             traversal: None,
@@ -19055,19 +19060,32 @@ impl SnapshotAccumulator {
             )?)?;
         // E keeps aggregate grains and the rare skipped/ambiguous sequence
         // sets; reserve their worst case before the finish releases input.
-        let money_output = size_of::<claude_request_money::e2::FileFold>()
-            .checked_add(current_selector)?
-            .checked_add(responses.checked_mul(2)?)?
-            .checked_add(resolved.checked_mul(per_response)?.checked_mul(2)?)?
-            .checked_add(resolved.checked_mul(
-                2 * tree_node_bytes::<
-                    (
-                        claude_request_money::body::ClaudeLiveKey,
-                        Option<claude_request_money::body::ClaudeRequestUsageOrigin>,
-                    ),
-                    claude_request_money::body::ClaudeGrainSide,
-                >()? + 2 * tree_node_bytes::<u64, ()>()?,
-            )?)?;
+        let money_output = if claude_request_money::e2::enabled() {
+            size_of::<claude_request_money::e2::FileFold>()
+                .checked_add(current_selector)?
+                .checked_add(responses.checked_mul(2)?)?
+                .checked_add(resolved.checked_mul(per_response)?.checked_mul(2)?)?
+                .checked_add(resolved.checked_mul(
+                    2 * tree_node_bytes::<
+                        (
+                            claude_request_money::body::ClaudeLiveKey,
+                            Option<claude_request_money::body::ClaudeRequestUsageOrigin>,
+                        ),
+                        claude_request_money::body::ClaudeGrainSide,
+                    >()? + 2 * tree_node_bytes::<u64, ()>()?,
+                )?)?
+        } else {
+            // Dark retains totals per hour, plus copy sequence ranges. It
+            // never builds live grain keys, selectors or per-response rows.
+            // Three tallies (own, copy, idless copy), Vec growth <= 2n + 4.
+            let slots = resolved.checked_mul(2)?.checked_add(4)?;
+            size_of::<claude_request_money::e2::FileFold>()
+                .checked_add(size_of::<claude_request_money::e2::ClaudeEntityBody>())?
+                .checked_add(RFC3339_TEXT_BYTES)?
+                .checked_add(
+                    slots.checked_mul(3 * size_of::<(u32, u32)>() + size_of::<(u64, u64)>())?,
+                )?
+        };
         let mut out = crate::heap_layout_bound::Counter::new(limit);
         for bytes in [
             money_output,
@@ -26376,6 +26394,7 @@ impl OwnedSourceScan {
                             context.cache.cursor_unwait(&context.namespace, &boot.key);
                         }
                         semantic_noop_count += members;
+                        census.note_codex_group(CodexSelection::GroupUnchanged, members);
                         codex_join_completed.push(boot.group);
                         pending!();
                     }
@@ -26424,7 +26443,9 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     codex_file_join::Boot::Ready => match boot.admit_rereads(index) {
-                        reread_guard::GroupAdmission::Ready => {}
+                        reread_guard::GroupAdmission::Ready => {
+                            census.note_codex_group(CodexSelection::GroupSelected, members);
+                        }
                         reread_guard::GroupAdmission::AwaitSave => {
                             codex_join_active = Some(boot);
                             pending!();
@@ -27069,10 +27090,11 @@ impl OwnedSourceScan {
                         }
                     }
                     let acquisition = active.sampling.as_mut().expect("sampled acquisition");
-                    let debt = index
-                        .files
-                        .get(&acquisition.key)
-                        .and_then(|entry| entry.audit_obligation(sampled_scan::now_seconds()));
+                    let debt = sampled_audit::debt_for_key(
+                        index,
+                        &acquisition.key,
+                        sampled_scan::now_seconds(),
+                    );
                     parser.reread_ticket = active.parser.reread_ticket;
                     let Ok(mode) = parser.prepare_acquisition(
                         None,
@@ -27544,6 +27566,12 @@ impl OwnedSourceScan {
                             .filter(|scope| *scope == &acquisition.scope)
                             .filter(|_| {
                                 acquisition.audit_due.is_some()
+                                    && sampled_audit::progress_debt(
+                                        index,
+                                        &acquisition.key,
+                                        sampled_scan::now_seconds(),
+                                    )
+                                    .is_none()
                                     && sampling.as_ref().is_some_and(|context| {
                                         context.audit_metadata_supported
                                             && (context.audit_slots > 0
@@ -28570,6 +28598,9 @@ impl OwnedSourceScan {
                     }
                 }
                 // N2: a withheld final record is owed, never verified.
+                let held_progress_audit =
+                    sampled_audit::progress_debt(index, &index_key, sampled_scan::now_seconds())
+                        .is_some();
                 let source_verified = cursor_fragment.is_none()
                     && completed_acquisition
                         .as_ref()
@@ -28635,7 +28666,9 @@ impl OwnedSourceScan {
                             index,
                             &candidate.path,
                         );
-                    } else {
+                    } else if !held_progress_audit || (source_verified && parse_complete) {
+                        // An unsuccessful virtual audit keeps its old hold:
+                        // it has no sampled marker carrying the obligation.
                         claude_request_census::record_claude_request_census(
                             index,
                             claude_request_census::ClaudeRequestCensusParse {
@@ -28842,6 +28875,10 @@ impl OwnedSourceScan {
                     // Its sampled publication still owes the prepared deadline;
                     // losing a completion certificate must never erase that debt.
                     let obligation = match completed_acquisition.as_ref() {
+                        // Recovery debt stays in its bounded scheduling slot
+                        // and census hold, including terminal loss. Never
+                        // consume the last sampled slot on failed credit.
+                        _ if held_progress_audit => None,
                         Some(completed) => completed.checkpoint.audit_debt(),
                         None => file_sampling
                             .as_ref()
@@ -29081,8 +29118,19 @@ impl OwnedSourceScan {
                         .terminal_dropped_usage_record_count
                         .saturating_add(census.terminal_dropped_usage_record_count);
                 }
+                if source == SnapshotSource::Codex {
+                    // Count-only attribution of why Codex files were selected
+                    // on this page. No path, session, or identifier is named.
+                    if let Some(line) = census.codex_parse_reasons_line(
+                        index.upload_context_fingerprint == index.active_upload_context_fingerprint,
+                    ) {
+                        eprintln!("{line}");
+                        #[cfg(test)]
+                        CODEX_PARSE_REASON_LINES.with(|lines| lines.borrow_mut().push(line));
+                    }
+                }
                 if source == SnapshotSource::ClaudeCode
-                    && (census.claude_parse_reasons.iter().any(|count| *count > 0)
+                    && (census.parse_reasons.iter().any(|count| *count > 0)
                         || census.claude_compaction_unlinked_parent_count > 0
                         || history_upgrade.any()
                         || index.claude_reemission_exclusions.pauses_adoption()
@@ -29095,14 +29143,9 @@ impl OwnedSourceScan {
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={} identity_incomplete_holds_entered_process_total={} identity_incomplete_holds_cleared_process_total={} identity_incomplete_hold_deadlines_restored_process_total={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
-                        CANDIDATE_PARSE_REASON_NAMES
-                            .iter()
-                            .zip(census.claude_parse_reasons)
-                            .map(|(name, count)| format!("{name}={count}"))
-                            .collect::<Vec<_>>()
-                            .join(" "),
+                        census_count_fields(&CANDIDATE_PARSE_REASON_NAMES, &census.parse_reasons),
                         census.claude_compaction_unlinked_parent_count,
                         history_upgrade.denied_for(&[
                             HistoryHold::UngatedRevision,
@@ -29129,7 +29172,8 @@ impl OwnedSourceScan {
                         ),
                         history_upgrade.family_closure_root_absent_excluded,
                         claude_request_census::identity_incomplete_hold_totals().0,
-                        claude_request_census::identity_incomplete_hold_totals().1
+                        claude_request_census::identity_incomplete_hold_totals().1,
+                        claude_request_census::identity_incomplete_hold_deadlines_restored_total()
                     );
                     if history_upgrade.family_closure_root_absent_excluded > 0 {
                         crate::local_resource_diagnostics::claude_reemission_family_closure_root_absent_excluded(
@@ -29170,7 +29214,7 @@ impl OwnedSourceScan {
                         } else if source != SnapshotSource::Codex
                             || codex_counting_version::tombstone_before_retire(index, index_key)
                         {
-                            index.remove_file_entry(index_key);
+                            index.remove_file_entry_unless_held(index_key, vanished);
                         }
                         if census_record && index.claude_request_census.get(index_key).is_none() {
                             disappearance_diagnostics::vanished(
@@ -29835,13 +29879,20 @@ impl OwnedSourceScan {
                 &claude_title_metadata,
                 claude_effort_support_dir_ref,
             );
-            let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate(
+            let verification_rescue = sampled_audit::progress_debt(
+                index,
+                &local_index_key(&candidate.path),
+                sampled_scan::now_seconds(),
+            )
+            .is_some();
+            let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate_with_rescue(
                 source,
                 candidate,
                 &mut census,
                 census_unix_seconds,
                 backfill_window_days,
                 &index.files,
+                verification_rescue,
             ) else {
                 pending!();
             };
@@ -30014,7 +30065,7 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
-                    let count = &mut census.claude_parse_reasons[reason as usize];
+                    let count = &mut census.parse_reasons[reason as usize];
                     *count = count.saturating_add(1);
                 }
             }
@@ -30027,6 +30078,7 @@ impl OwnedSourceScan {
             // main write on its path is gated (G2–G17); it ends at the side
             // exit.
             let mut side_plan = None;
+            let mut codex_selected_by = None;
             if source == SnapshotSource::Codex && decision == CandidateDecision::Skip {
                 let shared = codex_parent_ownership_ledgers.as_ref();
                 let owed = codex_parent_reparse_owed_ids(index, shared, &candidate.path);
@@ -30075,6 +30127,7 @@ impl OwnedSourceScan {
                         ) {
                             side_plan = Some(at);
                             decision = CandidateDecision::Parse;
+                            codex_selected_by = Some(CodexSelection::SideRead);
                         }
                     }
                 } else if !owed.is_empty() && index.terminal_jsonl_loss(&candidate).is_none() {
@@ -30082,6 +30135,7 @@ impl OwnedSourceScan {
                     // its earlier page had already passed. Reparse only that
                     // parent to populate bounded structural evidence.
                     decision = CandidateDecision::Parse;
+                    codex_selected_by = Some(CodexSelection::OwedParent);
                 } else if let Some(context) = sampling.as_ref().filter(|_| !owed.is_empty()) {
                     // A terminal disposition at this exact file fingerprint and
                     // parser generation means the previous traversal already
@@ -30159,6 +30213,11 @@ impl OwnedSourceScan {
             } else {
                 None
             };
+            // Counted after reread admission, so a candidate requeued to wait
+            // for a save is counted once, when it is finally decided.
+            if source == SnapshotSource::Codex {
+                census.note_codex_selection(decision, parse_reason, codex_selected_by);
+            }
             // A parse of a carried family's member cancels that family's
             // carry, so the family is co-observed in this window as BASE's
             // re-arm would observe it. A re-armed member is no new change.
@@ -30684,10 +30743,8 @@ impl OwnedSourceScan {
                         .reduction_dependencies_available
                         .observe(reduction_sidecar.is_some());
                     if let Some(reduction_sidecar) = reduction_sidecar {
-                        let debt = index
-                            .files
-                            .get(&key)
-                            .and_then(|entry| entry.audit_obligation(sampled_scan::now_seconds()));
+                        let debt =
+                            sampled_audit::debt_for_key(index, &key, sampled_scan::now_seconds());
                         let protected_entry = index.files.get(&key);
                         context
                             .admission
@@ -36895,8 +36952,11 @@ struct ScanCensus {
     /// found absent beneath a still-present parent (N). Only these may drop
     /// their unverified audit debt with their entry at the page merge.
     claude_vanished_index_keys: BTreeSet<String>,
-    /// Count-only parse-selection reasons for Claude candidates on this page.
-    claude_parse_reasons: [usize; CANDIDATE_PARSE_REASON_COUNT],
+    /// Count-only parse-selection reasons for this page's candidates. A scan
+    /// object has one source; Claude and Codex count here, nothing else does.
+    parse_reasons: [usize; CANDIDATE_PARSE_REASON_COUNT],
+    /// Count-only Codex selections that carry no `CandidateParseReason`.
+    codex_selections: [usize; CODEX_SELECTION_COUNT],
     /// Local-only V2 counting receipts of this scan's finished parses. Boxed
     /// so the census moved through every scan step stays small; allocated
     /// only once a configured counting parse finishes.
@@ -36922,6 +36982,56 @@ fn sampled_revalidation_cause(
 }
 
 impl ScanCensus {
+    /// Count-only: one Codex selection outcome. An override names why a
+    /// skipped candidate was parsed; otherwise a parse counts its reason.
+    fn note_codex_selection(
+        &mut self,
+        decision: CandidateDecision,
+        reason: Option<CandidateParseReason>,
+        selected_by: Option<CodexSelection>,
+    ) {
+        let count = match (decision, selected_by, reason) {
+            (_, Some(selection), _) => &mut self.codex_selections[selection as usize],
+            (CandidateDecision::Parse, None, Some(reason)) => {
+                &mut self.parse_reasons[reason as usize]
+            }
+            (CandidateDecision::Parse, None, None) => {
+                &mut self.codex_selections[CodexSelection::ComparisonTarget as usize]
+            }
+            (CandidateDecision::Skip, None, _) => {
+                &mut self.codex_selections[CodexSelection::Skip as usize]
+            }
+            (CandidateDecision::Migrate, None, _) => {
+                &mut self.codex_selections[CodexSelection::Migrate as usize]
+            }
+            (CandidateDecision::ReconcileLegacy, None, _) => {
+                &mut self.codex_selections[CodexSelection::ReconcileLegacy as usize]
+            }
+        };
+        *count = count.saturating_add(1);
+    }
+
+    fn note_codex_group(&mut self, selection: CodexSelection, members: usize) {
+        let count = &mut self.codex_selections[selection as usize];
+        *count = count.saturating_add(members);
+    }
+
+    /// The local census line attributing this page's Codex selections, or
+    /// `None` when nothing was decided. Counts only: no path or identifier.
+    fn codex_parse_reasons_line(&self, upload_context_matches: bool) -> Option<String> {
+        if self.parse_reasons.iter().all(|count| *count == 0)
+            && self.codex_selections.iter().all(|count| *count == 0)
+        {
+            return None;
+        }
+        Some(format!(
+            "local snapshot census codex parse reasons: upload_context_matches={} {} {}",
+            upload_context_matches,
+            census_count_fields(&CANDIDATE_PARSE_REASON_NAMES, &self.parse_reasons),
+            census_count_fields(&CODEX_SELECTION_NAMES, &self.codex_selections),
+        ))
+    }
+
     fn record_unreadable(&mut self, cause: UnreadableCause, count: usize) {
         // Preserve the existing public count and operational predicates.
         self.unreadable_path_count += count;
@@ -40368,6 +40478,7 @@ fn reconcile_missing_index_entries_with_side(
                 .files
                 .get(key)
                 .is_some_and(ScanIndexEntry::retain_history_evidence)
+            && !sampled_audit::awaits_hold_deadline_restoration(index, key)
             && codex_counting_version::tombstone_before_retire(index, key)
         {
             index.remember_removed_read_witness(key);
@@ -40657,11 +40768,31 @@ fn open_candidate_file(
 
 fn open_and_identify_scan_candidate(
     source: SnapshotSource,
+    candidate: CandidateFile,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    files: &BTreeMap<String, ScanIndexEntry>,
+) -> Option<(CandidateFile, File)> {
+    open_and_identify_scan_candidate_with_rescue(
+        source,
+        candidate,
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        files,
+        false,
+    )
+}
+
+fn open_and_identify_scan_candidate_with_rescue(
+    source: SnapshotSource,
     mut candidate: CandidateFile,
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
     files: &BTreeMap<String, ScanIndexEntry>,
+    verification_rescue: bool,
 ) -> Option<(CandidateFile, File)> {
     let opened_file = match open_candidate_file(source, &mut candidate) {
         Ok(file) => file,
@@ -40698,7 +40829,8 @@ fn open_and_identify_scan_candidate(
             return None;
         }
     };
-    if !sampled_audit::path_requires_verification(files, &candidate.path)
+    if !verification_rescue
+        && !sampled_audit::path_requires_verification(files, &candidate.path)
         && !opened_candidate_is_within_frozen_window(
             &candidate,
             census_unix_seconds,
@@ -41171,6 +41303,54 @@ const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COUNT] = [
     "source_changed",
     "forced_family",
 ];
+
+/// Count-only diagnostic: a Codex selection outcome that carries no
+/// `CandidateParseReason` (final non-parse decisions, Skip-to-Parse
+/// overrides, and joined groups decided before the candidate loop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexSelection {
+    Skip,
+    Migrate,
+    ReconcileLegacy,
+    ComparisonTarget,
+    OwedParent,
+    SideRead,
+    GroupUnchanged,
+    GroupSelected,
+}
+
+const CODEX_SELECTION_COUNT: usize = 8;
+const CODEX_SELECTION_NAMES: [&str; CODEX_SELECTION_COUNT] = [
+    "skip",
+    "migrate",
+    "reconcile_legacy",
+    "comparison_target",
+    "owed_parent",
+    "side_read",
+    "group_unchanged",
+    "group_selected",
+];
+
+/// `name=count` pairs for a fixed counter array, in declaration order.
+fn census_count_fields(names: &[&str], counts: &[usize]) -> String {
+    names
+        .iter()
+        .zip(counts)
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+thread_local! {
+    static CODEX_PARSE_REASON_LINES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn take_codex_parse_reason_lines_for_test() -> Vec<String> {
+    CODEX_PARSE_REASON_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+}
 
 struct CheckpointLock {
     file: File,
@@ -45629,6 +45809,7 @@ impl ScanIndex {
             resume_after_path: self.resume_after_path.clone(),
             resume_upper_bound_path: self.resume_upper_bound_path.clone(),
             resume_census_window_end: self.resume_census_window_end.clone(),
+            held_audit_progress: self.held_audit_progress.clone(),
             bounded_sweep_had_unsettled_upload: self.bounded_sweep_had_unsettled_upload,
             bounded_sweep_unsettled_causes: self.bounded_sweep_unsettled_causes,
             traversal: self.traversal.clone(),
@@ -45815,6 +45996,16 @@ impl ScanIndex {
     }
 
     fn remove_file_entry(&mut self, key: &str) {
+        self.remove_file_entry_unless_held(key, false);
+    }
+
+    fn remove_file_entry_unless_held(&mut self, key: &str, vanished: bool) {
+        // Age rejection is not absence. Preserve a downgraded hold through
+        // both candidate-time and open-time revalidation until it can audit.
+        // Explicit vanished-file settlement keeps its approved retirement.
+        if !vanished && sampled_audit::awaits_hold_deadline_restoration(self, key) {
+            return;
+        }
         if self.decode_holds_file(key) {
             return;
         }
@@ -46200,7 +46391,8 @@ impl ScanIndex {
                 return (CandidateDecision::Skip, None);
             }
         }
-        if entry.audit_requires_full(now) {
+        if entry.audit_requires_full(now) || sampled_audit::progress_debt(self, &key, now).is_some()
+        {
             return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }
         // A locally held Claude family above keeps its existing bounded retry
@@ -56833,6 +57025,143 @@ mod tests {
         .expect("settled scan");
         assert_eq!(settled.snapshots.len(), 0);
         assert_eq!(settled.scanned_file_count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_census_line_counts_every_parse_reason_and_selection() {
+        let mut census = ScanCensus::default();
+        assert_eq!(census.codex_parse_reasons_line(true), None, "silent page");
+        for reason in [
+            CandidateParseReason::TerminalDisposition,
+            CandidateParseReason::NewFile,
+            CandidateParseReason::AuthorityQuarantine,
+            CandidateParseReason::Audit,
+            CandidateParseReason::BodyWitnessAdoption,
+            CandidateParseReason::UploadContext,
+            CandidateParseReason::ActivityOrQuarantineRetry,
+            CandidateParseReason::TranscriptChanged,
+            CandidateParseReason::CodexCapture,
+            CandidateParseReason::UnknownOutcome,
+            CandidateParseReason::LegacyActivity,
+            CandidateParseReason::LegacyIdentity,
+            CandidateParseReason::Rearmed,
+            CandidateParseReason::SourceChanged,
+            CandidateParseReason::ForcedFamily,
+        ] {
+            census.note_codex_selection(CandidateDecision::Parse, Some(reason), None);
+        }
+        census.note_codex_selection(CandidateDecision::Skip, None, None);
+        // A budget-held adoption-only candidate is skipped with its reason.
+        census.note_codex_selection(
+            CandidateDecision::Skip,
+            Some(CandidateParseReason::BodyWitnessAdoption),
+            None,
+        );
+        census.note_codex_selection(CandidateDecision::Migrate, None, None);
+        census.note_codex_selection(CandidateDecision::ReconcileLegacy, None, None);
+        // Only a comparison target parses without a reason or an override.
+        census.note_codex_selection(CandidateDecision::Parse, None, None);
+        // An override names the selection, never the skipped file's reason.
+        census.note_codex_selection(
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::BodyWitnessAdoption),
+            Some(CodexSelection::OwedParent),
+        );
+        census.note_codex_selection(
+            CandidateDecision::Parse,
+            None,
+            Some(CodexSelection::SideRead),
+        );
+        census.note_codex_group(CodexSelection::GroupUnchanged, 3);
+        census.note_codex_group(CodexSelection::GroupSelected, 2);
+        assert_eq!(
+            census.codex_parse_reasons_line(false).as_deref(),
+            Some(concat!(
+                "local snapshot census codex parse reasons: upload_context_matches=false ",
+                "terminal_disposition=1 new_file=1 authority_quarantine=1 audit=1 ",
+                "body_witness_adoption=1 upload_context=1 activity_or_quarantine_retry=1 ",
+                "transcript_changed=1 codex_capture=1 unknown_outcome=1 legacy_activity=1 ",
+                "legacy_identity=1 rearmed=1 source_changed=1 forced_family=1 ",
+                "skip=2 migrate=1 reconcile_legacy=1 comparison_target=1 owed_parent=1 ",
+                "side_read=1 group_unchanged=3 group_selected=2",
+            ))
+        );
+    }
+
+    #[test]
+    fn codex_scan_logs_selection_reasons_on_the_census_line() {
+        fn line(upload_context_matches: bool, counts: &[(&str, usize)]) -> String {
+            let field = |name: &str| {
+                counts
+                    .iter()
+                    .find(|(counted, _)| *counted == name)
+                    .map_or(0, |(_, count)| *count)
+            };
+            format!(
+                "local snapshot census codex parse reasons: upload_context_matches={upload_context_matches} {}",
+                CANDIDATE_PARSE_REASON_NAMES
+                    .iter()
+                    .chain(CODEX_SELECTION_NAMES.iter())
+                    .map(|name| format!("{name}={}", field(name)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        }
+        let root = temp_dir("codex-parse-reason-census");
+        let ids = [
+            "019e2700-4444-7000-9000-444444444441",
+            "019e2700-4444-7000-9000-444444444442",
+            "019e2700-4444-7000-9000-444444444443",
+        ];
+        let usage = "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n";
+        let fixture = |id: &str| {
+            format!(
+                "{{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n{usage}"
+            )
+        };
+        let paths = ids
+            .iter()
+            .map(|&id| {
+                let path = root.join(format!("rollout-2026-05-14T10-00-00-{id}.jsonl"));
+                fs::write(&path, fixture(id)).expect("write codex fixture");
+                path
+            })
+            .collect::<Vec<_>>();
+        let mut index = ScanIndex::default();
+        let scan = |index: &mut ScanIndex, collected_at: &str| {
+            let _ = take_codex_parse_reason_lines_for_test();
+            scan_source_roots(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                index,
+                collected_at,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("codex scan");
+            take_codex_parse_reason_lines_for_test()
+        };
+
+        assert_eq!(
+            scan(&mut index, "2026-05-14T10:05:00Z"),
+            vec![line(true, &[("new_file", 3)])]
+        );
+
+        let grown = usage
+            .replace("10:03:00", "10:04:00")
+            .replace(":40,", ":50,");
+        fs::write(&paths[1], fixture(ids[1]) + &grown).expect("grow one fixture");
+        assert_eq!(
+            scan(&mut index, "2026-05-14T10:06:00Z"),
+            vec![line(true, &[("transcript_changed", 1), ("skip", 2)])]
+        );
+
+        index.activate_upload_context("codex-parse-reason-context".to_string());
+        assert_eq!(
+            scan(&mut index, "2026-05-14T10:07:00Z"),
+            vec![line(false, &[("upload_context", 3)])]
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -86297,8 +86626,8 @@ crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_p
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
-crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; claude_money_birth_store, decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, reread_guard);
+crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
+crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, reread_guard, held_audit_progress,  claude_money_birth_store);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
@@ -86596,7 +86925,7 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            &BTreeMap::new()
+            &BTreeMap::new(),
         )
         .is_none());
         assert_eq!(

@@ -32,6 +32,39 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// Inline fields are paid by their containing slot and own no allocation.
+// Visit only owned heaps: scalar-by-scalar walks otherwise exhaust the
+// native frame's 4096-visit guard even when the frame uses under 1 MiB.
+// Destructuring is exhaustive; a field moved into the inline group must
+// prove INLINE_ONLY before the walk can succeed. Byte/visit caps stay native.
+macro_rules! money_heap_fields {
+    ($t:ty; inline: [$($inline:ident),*]; heap: [$($heap:ident),*]) => {
+        impl crate::heap_layout_bound::HeapLayoutBound for $t {
+            fn stable_heap(&self) -> bool {
+                let Self { $($inline,)* $($heap,)* } = self;
+                true $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($inline))*
+                    $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($heap))*
+            }
+            fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+                let Self { $($inline,)* $($heap,)* } = self;
+                $(require_inline($inline)?;)*
+                $(crate::heap_layout_bound::HeapLayoutBound::heap_bound($heap, c)?;)*
+                Some(())
+            }
+            fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+                let Self { $($inline,)* $($heap,)* } = self;
+                $(require_inline($inline)?;)*
+                $(crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound($heap, c)?;)*
+                Some(())
+            }
+        }
+    };
+}
+#[inline(always)]
+fn require_inline<T: crate::heap_layout_bound::HeapLayoutBound>(_: &T) -> Option<()> {
+    T::INLINE_ONLY.then_some(())
+}
+
 pub(crate) const GATE: bool = false;
 /// A record this much older than its file's effective birth was copied in.
 /// Copies written within it are counted (known residual, disclosed nowhere).
@@ -481,6 +514,9 @@ pub(crate) struct ClaudeEntityBody {
     pub(crate) resolver_conflicts: u64,
     pub(crate) held: bool,
     pub(crate) certificate_ok: bool,
+    // False proves both live maps have never allocated. Empty live maps
+    // retain their conservative root charge after a removal.
+    pub(super) live_maps_initialized: bool,
     pub(crate) activity_unix: u64,
     pub(crate) activity_nanos: i128,
     /// Gate off: what the counters read, in place of `grains` (which then
@@ -498,6 +534,7 @@ impl Default for ClaudeEntityBody {
             resolver_conflicts: 0,
             held: false,
             certificate_ok: true,
+            live_maps_initialized: false,
             activity_unix: 0,
             activity_nanos: 0,
             dark: DarkTally::default(),
@@ -521,6 +558,7 @@ impl ClaudeEntityBody {
             self.dark.add(hour, tokens, requests, cost);
             return;
         }
+        self.live_maps_initialized = true;
         if let Some(at) = at {
             self.note_activity(&key.0, at, at);
         }
@@ -530,6 +568,7 @@ impl ClaudeEntityBody {
             .add(tokens, requests, cost);
     }
     fn note_activity(&mut self, bucket: &str, first: i128, last: i128) {
+        self.live_maps_initialized = true;
         match self.bucket_activity.get_mut(bucket) {
             Some(bounds) => {
                 bounds.0 = bounds.0.min(first);
@@ -553,6 +592,7 @@ impl ClaudeEntityBody {
         }
     }
     fn map_accounts(&mut self, mut place: impl FnMut(AccountPartition) -> AccountPartition) {
+        self.live_maps_initialized |= !self.grains.is_empty();
         let grains = std::mem::take(&mut self.grains);
         for ((key, origin, account), grain) in grains {
             Self::merge_grain(
@@ -573,6 +613,7 @@ impl ClaudeEntityBody {
 
     /// Grains and their activity only (a held copy moving back to counted).
     fn absorb_grains(&mut self, other: &Self) {
+        self.live_maps_initialized |= !other.grains.is_empty() || !other.bucket_activity.is_empty();
         for (key, grain) in &other.grains {
             let into = self.grains.entry(key.clone()).or_default();
             Self::merge_grain(into, grain);
@@ -637,6 +678,7 @@ impl ClaudeEntityBody {
             return bucket_hour(&slot.0 .0)
                 .is_some_and(|hour| self.dark.take(hour, tokens, requests));
         };
+        self.live_maps_initialized = true;
         let (Some(left), Some(left_requests)) = (
             grain.tokens.checked_sub(tokens),
             grain.requests.checked_sub(requests),
@@ -663,7 +705,7 @@ pub(super) struct DarkTally {
     /// (unix hour, estimated requests), sorted by hour.
     estimated: Vec<(u32, u32)>,
 }
-crate::heap_layout_bound::fields!(DarkTally; side, estimated);
+money_heap_fields!(DarkTally; inline: [side]; heap: [estimated]);
 impl DarkTally {
     fn add(
         &mut self,
@@ -748,9 +790,58 @@ fn hour_key(timestamp: &str) -> Option<ClaudeLiveKey> {
     let (bucket, _) = super::super::activity_bucket_from_timestamp(timestamp)?;
     Some((bucket, String::new(), BTreeMap::new()))
 }
-crate::heap_layout_bound::fields!(ClaudeEntityBody; grains, bucket_activity, removed, removed_requests, telemetry_owned_complete, resolver_conflicts, held, certificate_ok, activity_unix, activity_nanos, dark);
+// A never-initialized live map cannot have a retained empty root. Charging
+// fictitious roots here makes a dark file exceed the native finish budget.
+// Initialized maps keep the ordinary conservative bound even after emptying.
+macro_rules! entity_heap_method {
+    ($method:ident) => {
+        fn $method(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+            let Self {
+                grains,
+                bucket_activity,
+                dark,
+                live_maps_initialized,
+                removed: _,
+                removed_requests: _,
+                telemetry_owned_complete: _,
+                resolver_conflicts: _,
+                held: _,
+                certificate_ok: _,
+                activity_unix: _,
+                activity_nanos: _,
+            } = self;
+            // Nonempty maps remain charged even for synthetic test entities
+            // whose fields were populated directly.
+            if *live_maps_initialized || !grains.is_empty() || !bucket_activity.is_empty() {
+                crate::heap_layout_bound::HeapLayoutBound::$method(grains, c)?;
+                crate::heap_layout_bound::HeapLayoutBound::$method(bucket_activity, c)?;
+            }
+            crate::heap_layout_bound::HeapLayoutBound::$method(dark, c)
+        }
+    };
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeEntityBody {
+    const STABLE_HEAP: bool = true;
+    entity_heap_method!(heap_bound);
+    entity_heap_method!(completed_heap_bound);
+}
 // Existing grain types were inline P1 values; E retains only the aggregate.
-crate::heap_layout_bound::fields!(ClaudeGrainSide; tokens, requests, cost_micros, unpriced, contributions);
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeGrainSide {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        // Exhaustive: every field is an inline token/counter, already paid
+        // by its containing slot. No per-token graph walk is needed.
+        let Self {
+            tokens: _,
+            requests: _,
+            cost_micros: _,
+            unpriced: _,
+            contributions: _,
+        } = self;
+        c.add(0)
+    }
+}
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestUsageOrigin {
     const INLINE_ONLY: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -776,7 +867,24 @@ struct FoldTelemetry {
     /// lookups; collisions are checked against the existing request sets.
     membership: FamilyMembership,
 }
-crate::heap_layout_bound::fields!(FoldTelemetry; read, complete, start_bucket, side_candidates, side_calls_done, membership);
+money_heap_fields!(FoldTelemetry; inline: [read, complete, side_candidates, side_calls_done]; heap: [start_bucket, membership]);
+
+/// Elapsed work is diagnostic, never part of native scan identity or parity.
+/// Keep Debug deterministic while retaining the measured value for receipts.
+#[derive(Clone, Default)]
+struct FoldNanos(u64);
+impl std::fmt::Debug for FoldNanos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FoldNanos")
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for FoldNanos {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileFold {
@@ -813,7 +921,7 @@ pub(crate) struct FileFold {
     ambiguous: BTreeSet<u64>,
     disclosed: u64,
     /// Wall time in this fold's E2-added work only (`fold_us`, see `spend`).
-    e2_nanos: u64,
+    e2_nanos: FoldNanos,
     responses: u64,
     root_fallbacks: u64,
     side: ClaudeMoneyTokens,
@@ -821,7 +929,7 @@ pub(crate) struct FileFold {
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
 }
-crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, copied, first_own, ambiguous, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, telemetry, accounts);
+money_heap_fields!(FileFold; inline: [money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, ambiguous, telemetry, accounts]);
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,
@@ -911,7 +1019,7 @@ impl FileFold {
             first_own: None,
             ambiguous: BTreeSet::new(),
             disclosed: 0,
-            e2_nanos: 0,
+            e2_nanos: FoldNanos::default(),
             responses: 0,
             root_fallbacks: 0,
             side: Default::default(),
@@ -929,8 +1037,9 @@ impl FileFold {
     /// and row add it shares are never in it; total page CPU against the
     /// pre-E2 reference is the cost gate for those.
     fn spend(&mut self, started: Instant) {
-        self.e2_nanos = self
+        self.e2_nanos.0 = self
             .e2_nanos
+            .0
             .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     }
 
@@ -1513,7 +1622,7 @@ struct FamilyMembership {
     entries: Vec<u64>,
     member_mask: u64,
 }
-crate::heap_layout_bound::fields!(FamilyMembership; entries, member_mask);
+money_heap_fields!(FamilyMembership; inline: [member_mask]; heap: [entries]);
 
 /// Attach and subtraction share this one view, consumed before candidate
 /// hashes and trace owners are allocated. Indices are into the unchanged page.
@@ -1669,6 +1778,8 @@ enum Evidence {
     /// The file changed since that scan and this traversal still queues it:
     /// the decision waits for the re-read (a stale holder never decides).
     Queued,
+    /// The live mtime changed since the census read, whether queued or not.
+    Stale,
     /// Nothing: retired, over budget, twin, older derivation, or a held
     /// scan whose file is gone.
     None,
@@ -1679,10 +1790,9 @@ enum Evidence {
 /// evidence). The record of the settled revision (its index entry, same
 /// fingerprint) proves it; so does the record of a scan whose upload is held
 /// (entry absent or not advanced), while the file is still there. A file
-/// that changed since (a size change for the settled revision, as history
-/// classification; an mtime change for a held scan) is decided by its
-/// re-read while this traversal queues it; once the queue is past it, what
-/// exists decides.
+/// modified since its recorded read is Stale until read again (PR A M2).
+/// A queued size change also waits, including changes within one mtime
+/// second (PR C). Unchanged held scans remain evidence, never upload proof.
 fn scan_evidence(
     index: &ScanIndex,
     key: &str,
@@ -1696,6 +1806,15 @@ fn scan_evidence(
         .get(key)
         .filter(|entry| record.proves_current(&entry.source_file_fingerprint));
     let metadata = std::fs::metadata(key).ok().filter(|m| m.is_file());
+    if let Some(metadata) = &metadata {
+        let now = metadata
+            .modified()
+            .ok()
+            .and_then(super::super::unix_seconds);
+        if matches!((record.modified(), now), (Some(read), Some(now)) if read != now) {
+            return Evidence::Stale;
+        }
+    }
     let changed = match (settled, &metadata) {
         (Some(entry), Some(metadata)) => metadata.len() != entry.size_bytes,
         (Some(_), None) => false,
@@ -1793,8 +1912,8 @@ fn parent_proves(
 /// One census walk for every all-pre-birth main file of the page. A holder
 /// proves a request when it is another session's main file whose scan state
 /// holds it (`scan_evidence`) and earlier in (effective birth, location).
-/// Only the walk deadline, a queued stale holder and an unscanned
-/// other-session main file delay a decision.
+/// The walk deadline, a queued size change, a holder modified since its
+/// census read, and an unscanned other-session main file delay a decision.
 fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex) {
     struct Wanted {
         at: usize,
@@ -1804,6 +1923,8 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
         covered: BTreeSet<u64>,
         /// A holder that would cover it changed and is still queued.
         waiting: bool,
+        /// Hashes held only by an earlier file modified since its census read.
+        stale: BTreeSet<u64>,
         /// The original its `fork-context-ref` line names.
         parent: Option<String>,
     }
@@ -1829,6 +1950,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                 hashes,
                 covered: BTreeSet::new(),
                 waiting: false,
+                stale: BTreeSet::new(),
                 parent,
             })
         })
@@ -1866,13 +1988,16 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                         Some((evidence, holder_order(store, root, key)?))
                     });
                     match holder {
-                        Some((evidence, holder)) if holder < file.order => {
-                            if evidence == Evidence::Queued {
-                                file.waiting = true;
-                            } else {
+                        Some((evidence, holder)) if holder < file.order => match evidence {
+                            Evidence::Queued => file.waiting = true,
+                            Evidence::Stale => {
+                                file.stale.insert(hash);
+                            }
+                            Evidence::Current => {
                                 file.covered.insert(hash);
                             }
-                        }
+                            Evidence::None => {}
+                        },
                         _ => {}
                     }
                 }
@@ -1891,7 +2016,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
             hold_copies(&mut items[wanted.at], "held_copy_deadline");
             continue;
         }
-        if wanted.waiting {
+        if wanted.waiting || uncovered.iter().any(|hash| wanted.stale.contains(hash)) {
             hold_copies(&mut items[wanted.at], "held_copy_stale_holder");
             continue;
         }
@@ -2563,9 +2688,9 @@ pub(crate) fn finish_page(
             continue;
         };
         // Work counts on every read; decisions only when decided (below).
-        diag_max("max_file_fold_us", fold.e2_nanos / 1_000);
+        diag_max("max_file_fold_us", fold.e2_nanos.0 / 1_000);
         record_counts(Counts([
-            fold.e2_nanos / 1_000,
+            fold.e2_nanos.0 / 1_000,
             fold.responses,
             0,
             0,
@@ -2779,7 +2904,22 @@ impl Serialize for Counts {
     }
 }
 
-crate::heap_layout_bound::fields!(ClaudeMoneyTokens; input, output, cache_read, cache_5m, cache_1h, unattributed, reasoning);
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeMoneyTokens {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            input: _,
+            output: _,
+            cache_read: _,
+            cache_5m: _,
+            cache_1h: _,
+            unattributed: _,
+            reasoning: _,
+        } = self;
+        c.add(0)
+    }
+}
 
 #[cfg(test)]
 #[path = "e2_tests.rs"]

@@ -4265,3 +4265,91 @@ fn e2_api_fingerprint_is_hashed_once_per_row_and_never_leaves_memory() {
     assert!(claude_api_evidence_fingerprint_is_valid(&valid));
     assert_eq!(claude_api_fingerprint_hashes() - start, 2);
 }
+
+/// The native frame walker must be able to account for a real fold even
+/// when optional inline metadata is absent. This runs on portable CI too;
+/// the platform gate belongs to the outer native frame, not its field walk.
+#[test]
+fn e2_native_heap_walk_admits_optional_metadata_in_both_modes() {
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    let path = root_file("heap-walk");
+    let check = || {
+        let item = parse(
+            &path,
+            Some(t0()),
+            &ScanIndex::default(),
+            &[line("heap-request", T0, 123)],
+        );
+        let fold = item.claude_money.as_deref().unwrap();
+        let mut counter = Counter::new(crate::source_rotation::PARKED_BUDGET);
+        assert!(
+            fold.heap_bound(&mut counter).is_some(),
+            "owned heaps must remain measurable"
+        );
+        assert!(counter.bytes > 0, "owned allocations must be charged");
+    };
+    check();
+    with_enabled(check);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// Virgin dark maps allocate nothing; an emptied live map must still keep
+/// the native map-root charge. The initialization bit must use existing
+/// padding, since this repair may not make the daemon state heavier.
+#[test]
+fn e2_virgin_live_maps_have_no_heap_and_initialized_empty_maps_stay_charged() {
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    #[allow(dead_code)]
+    struct BeforeInitializationBit {
+        grains: BTreeMap<
+            (
+                ClaudeLiveKey,
+                Option<ClaudeRequestUsageOrigin>,
+                AccountPartition,
+            ),
+            ClaudeGrainSide,
+        >,
+        bucket_activity: BTreeMap<String, (i128, i128)>,
+        removed: ClaudeMoneyTokens,
+        removed_requests: u64,
+        telemetry_owned_complete: bool,
+        resolver_conflicts: u64,
+        held: bool,
+        certificate_ok: bool,
+        activity_unix: u64,
+        activity_nanos: i128,
+        dark: DarkTally,
+    }
+    assert_eq!(
+        std::mem::size_of::<ClaudeEntityBody>(),
+        std::mem::size_of::<BeforeInitializationBit>()
+    );
+    let (dark, allocation) =
+        crate::retry_allocation_probe::measure_caller_thread(ClaudeEntityBody::default);
+    assert_eq!(allocation.requested_peak_with_overlap, 0);
+    let mut charge = Counter::new(usize::MAX);
+    dark.heap_bound(&mut charge).unwrap();
+    assert_eq!(charge.bytes, 0);
+    with_enabled(|| {
+        let mut live = ClaudeEntityBody::default();
+        let key = (HOUR.to_owned(), "model".to_owned(), BTreeMap::new());
+        let tokens = ClaudeMoneyTokens {
+            input: 1,
+            ..Default::default()
+        };
+        live.add(key.clone(), &tokens, 1, None, None, None, None);
+        assert!(live.take_estimated(&(key, None, None), &tokens, 1));
+        assert!(live.grains.is_empty());
+        let mut charge = Counter::new(usize::MAX);
+        live.heap_bound(&mut charge).unwrap();
+        assert!(
+            charge.bytes > 0,
+            "an initialized empty map keeps its root charge"
+        );
+    });
+    eprintln!(
+        "F4_ENTITY_LAYOUT before={} after={}",
+        std::mem::size_of::<BeforeInitializationBit>(),
+        std::mem::size_of::<ClaudeEntityBody>()
+    );
+}
