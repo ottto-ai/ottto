@@ -12078,7 +12078,6 @@ pub(crate) fn claude_api_matches_transcript_occurrence<'a>(
         .flatten();
     let speed_matches = occurrence
         .speed_mode
-        .as_deref()
         .zip(reported_speed.as_deref())
         .map_or(true, |(transcript, reported)| transcript == reported);
     let reported_effort = CLAUDE_EFFORT_TIERS
@@ -12086,7 +12085,6 @@ pub(crate) fn claude_api_matches_transcript_occurrence<'a>(
         .then_some(row.effort.as_str());
     let effort_matches = occurrence
         .reasoning_effort
-        .as_deref()
         .zip(reported_effort)
         .map_or(true, |(transcript, reported)| transcript == reported);
     row.input_tokens == occurrence.input_tokens
@@ -12097,10 +12095,7 @@ pub(crate) fn claude_api_matches_transcript_occurrence<'a>(
             occurrence.reasoning_output_tokens,
         )
         && Some(api_cache_creation) == transcript_cache_creation
-        && occurrence
-            .model
-            .as_deref()
-            .map_or(true, |model| model == row.model)
+        && occurrence.model.map_or(true, |model| model == row.model)
         && speed_matches
         && effort_matches
 }
@@ -44909,7 +44904,6 @@ impl ScanIndex {
     /// override for Codex (re-reading an oversized rollout every cycle) or
     /// silently drops that file's disclosed terminal loss for every source
     /// without one.
-
     fn prune_terminal_jsonl_dispositions(&mut self) {
         let files = &self.files;
         let holds = &self.decode_holds;
