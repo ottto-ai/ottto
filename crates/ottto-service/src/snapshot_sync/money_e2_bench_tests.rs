@@ -1689,7 +1689,9 @@ fn below(index: &ScanIndex, revision: u64) -> (u64, u64) {
 /// walk in flight and one whole walk after it complete, which must read no
 /// file (no second re-read). A whole walk that upgrades no file is a stall.
 /// Below full byte scale the history byte budget scales with the corpus, so
-/// the page count keeps the M4 shape.
+/// the page count keeps the M4 shape; request lines keep a minimum size, so
+/// the largest file shrinks less: below ~0.15 its path-twin pair (one group,
+/// 2 x 260 MB at full scale) no longer fits a page and never upgrades.
 fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
     let run = base.join("runs").join("reread");
     let support = run.join("support");
