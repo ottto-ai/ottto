@@ -3560,6 +3560,31 @@ fn growing_generation_with_large_file_closes_within_bounded_pages() {
     assert_eq!(latest, expected);
 }
 
+/// Scheduling consumes only path novelty and byte length. Metadata-only
+/// changes and an identical inode replacement cannot create a fresh turn.
+#[test]
+fn freshness_priority_ignores_metadata_and_identical_replacement() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = ScanRoot::new(4);
+    let (index, _) = page(&fixture, ScanIndex::default(), None);
+    let path = fixture.file(SESSION);
+    let candidate = ScanTraversalPath {
+        scan_root: fixture.root.clone(),
+        path: path.clone(),
+        census_member: false,
+        watcher_hint: true,
+    };
+    assert!(!codex_fresh_data_pending(&candidate, &index.files));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!codex_fresh_data_pending(&candidate, &index.files));
+    let replacement = path.with_extension("replacement");
+    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+    fs::rename(&replacement, &path).unwrap();
+    assert!(!codex_fresh_data_pending(&candidate, &index.files));
+    fixture.append(SESSION, &token_line(5));
+    assert!(codex_fresh_data_pending(&candidate, &index.files));
+}
+
 /// The production-shaped 2,800-member revalidation backlog must not spend
 /// the byte budget before a new session or an appended, processed session.
 /// A persisted yield then gives the census a whole ordinary page even when
@@ -3576,7 +3601,49 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
     let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
     sessions.push((SESSION, 4));
     let fixture = ScanRoot::with_sessions(&sessions);
-    let (mut index, warm) = page(&fixture, ScanIndex::default(), None);
+    let cache = Arc::new(SharedCache::default());
+    // Unlike the older cursor helpers, return the post-policy upload set.
+    let published_page = |index, collected_at: &str, hints: &[PathBuf], limit| {
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&fixture.root),
+            index,
+            collected_at,
+            BACKFILL_WINDOW_DAYS,
+            limit,
+            false,
+            None,
+            hints,
+            false,
+            true,
+        )
+        .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+        loop {
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete {
+                    mut index,
+                    mut scan,
+                    ..
+                } => {
+                    apply_upload_policy(
+                        SnapshotSource::Codex,
+                        &mut scan.snapshots,
+                        SnapshotUploadPolicy::default(),
+                    );
+                    finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                    let accepted = scan
+                        .snapshots
+                        .iter()
+                        .map(|item| item.snapshot_fingerprint.clone())
+                        .collect();
+                    index.record_accepted_snapshot_fingerprints(&accepted);
+                    break (index, scan);
+                }
+            }
+        }
+    };
+    let (mut index, warm) = published_page(ScanIndex::default(), NOW, &[], 10000);
     assert_eq!(warm.snapshots.len(), 2801);
     for id in &ids {
         index
@@ -3607,9 +3674,9 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         .pending_candidates
         .retain(|candidate| candidate.path != fixture.file(SESSION));
     let budget = fixture.len(SESSION) * 4;
-    let cache = Arc::new(SharedCache::default());
+    cache.clear();
     with_test_limits(2048, budget, 64, || {
-        let (next, scan) = hinted_page(&fixture, index, &cache, NOW, &[]);
+        let (next, scan) = published_page(index, NOW, &[], 10000);
         index = next;
         assert!(scan.snapshots.is_empty(), "unchanged-output revalidation");
         assert!(!scan.census_complete);
@@ -3625,13 +3692,8 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         cache.clear();
         // NEW deliberately has no watcher hint: retained-roster discovery
         // must promote it too, even though refresh runs before hint enqueue.
-        let (next, fresh) = hinted_page(
-            &fixture,
-            index,
-            &cache,
-            &collected_at(1),
-            &[fixture.file(SESSION)],
-        );
+        let (next, fresh) =
+            published_page(index, &collected_at(1), &[fixture.file(SESSION)], 10000);
         index = next;
         let published = fresh
             .snapshots
@@ -3651,18 +3713,13 @@ fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
         // waits while that page makes census progress with the full budget.
         index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
         fixture.append(SESSION, &token_line(6));
-        let (next, ordinary) = hinted_page(
-            &fixture,
-            index,
-            &cache,
-            &collected_at(2),
-            &[fixture.file(SESSION)],
-        );
+        let (next, ordinary) =
+            published_page(index, &collected_at(2), &[fixture.file(SESSION)], 10000);
         index = next;
         assert!(!ordinary.census_complete);
         assert!(!index.traversal.as_ref().unwrap().codex_freshness_yield);
         assert!(index.traversal.as_ref().unwrap().pending_candidates.len() < old_pending);
-        let (_, fresh) = hinted_page(&fixture, index, &cache, &collected_at(3), &[]);
+        let (_, fresh) = published_page(index, &collected_at(3), &[], 10000);
         assert!(fresh
             .snapshots
             .iter()

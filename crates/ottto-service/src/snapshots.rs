@@ -39189,23 +39189,22 @@ fn enqueue_watcher_hints(
     let mut pending = traversal
         .pending_candidates
         .iter()
-        .map(|candidate| candidate.path.clone())
-        .collect::<BTreeSet<_>>();
+        .enumerate()
+        .map(|(position, candidate)| (candidate.path.clone(), position))
+        .collect::<BTreeMap<_, _>>();
     for path in hinted_paths.iter().take(MAX_BACKFILL_FILES_PER_SOURCE) {
-        if source == SnapshotSource::Codex {
-            if let Some(candidate) = traversal
-                .pending_candidates
-                .iter_mut()
-                .find(|candidate| candidate.path == *path)
-            {
-                candidate.watcher_hint = true;
-            }
-        }
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
             || (source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(path))
-            || !pending.insert(path.clone())
         {
+            continue;
+        }
+        if let Some(&position) = pending.get(path) {
+            if source == SnapshotSource::Codex {
+                if let Some(candidate) = traversal.pending_candidates.get_mut(position) {
+                    candidate.watcher_hint = true;
+                }
+            }
             continue;
         }
         let Some(scan_root) = traversal
@@ -39228,6 +39227,7 @@ fn enqueue_watcher_hints(
         next_generation += u64::from(!census_member);
         // FIFO keeps an actively rewritten path from repeatedly jumping ahead
         // of an older remove/rename hint in a small bounded page.
+        pending.insert(path.clone(), traversal.pending_candidates.len());
         traversal.pending_candidates.push_back(ScanTraversalPath {
             scan_root,
             path: path.clone(),
