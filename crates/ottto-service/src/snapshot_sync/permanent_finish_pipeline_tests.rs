@@ -843,3 +843,284 @@ pub(crate) mod prior_index_lifetime_tests {
 pub(crate) mod reason_reoffer_pipeline_tests {
     include!("reason_reoffer_pipeline_tests.rs");
 }
+
+thread_local! {
+    static ACK_POST_SAVE_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    static ACK_CACHE_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The cache producer's ownership proof is covered separately. Supply a
+/// synthetic cache patch after that fold to isolate finish's bootstrap exit.
+pub(in crate::snapshot_sync) fn ack_cache_probe_for_test(items: &mut [SnapshotItem]) {
+    if ACK_CACHE_PROBE.with(|slot| slot.replace(false)) {
+        items
+            .first_mut()
+            .expect("fixture has a current body")
+            .cache_observations = pending_head_index_item().1.cache_observations;
+    }
+}
+
+pub(in crate::snapshot_sync) fn ack_post_save_failure(stage: &'static str) -> Result<()> {
+    if ACK_POST_SAVE_FAILURE.with(|slot| slot.get() == Some(stage)) {
+        ACK_POST_SAVE_FAILURE.with(|slot| slot.set(None));
+        return Err(anyhow!("synthetic post-index-save failure: {stage}"));
+    }
+    Ok(())
+}
+
+struct AckPostSaveFailure;
+impl Drop for AckPostSaveFailure {
+    fn drop(&mut self) {
+        ACK_POST_SAVE_FAILURE.with(|slot| slot.set(None));
+        ACK_CACHE_PROBE.with(|slot| slot.set(false));
+    }
+}
+
+fn ack_finish_pipeline_case(stage: &'static str) {
+    crate::client_report::reset_for_test();
+    let fixture = IdentityPipelineHome::new();
+    let _cadence = IdentityPipelineCadence::new();
+    let support = fixture.base.join("ack-post-save-support");
+    let secrets = fixture.base.join("ack-post-save-secrets");
+    std::fs::create_dir_all(&support).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+    let server = FinishServer::new(FinishOutcome::Accept);
+    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
+    let device = LocalDeviceBinding {
+        device_id: "ack-post-save-device".into(),
+        machine_id: Some("otm_test".into()),
+        sources: vec!["claude_code".into()],
+    };
+    FileDeviceStore::default().save(&device).unwrap();
+    std::fs::write(
+        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "device-secret",
+    )
+    .unwrap();
+    let client = SnapshotApiClient::new(server.url.clone());
+    let daemon = test_daemon("otm_test");
+    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+    let collection = || AgentStatusCollection {
+        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
+    };
+    let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+        prepare_sync_source(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::ClaudeCode,
+            "otm_test",
+            &fixture.home,
+            &support,
+            &daemon,
+            &mut transport,
+            daemon.snapshot_scan_account_witness().unwrap(),
+            false,
+        )
+    })
+    .unwrap()
+    .expect("actual due source preparation");
+    let (mut preparation, index, mut scan) = collect_native_preparation_with_rotation(frame, false);
+    assert!(scan.census_complete);
+    if stage == "bootstrap_capacity" {
+        preparation.cache_observations_enabled = true;
+        ACK_CACHE_PROBE.with(|slot| slot.set(true));
+    }
+    if stage == "first_install" {
+        let template = scan.snapshots[0].clone();
+        scan.snapshots = (0..4100)
+            .map(|entity| {
+                let mut item = template.clone();
+                item.source_session_id = format!("first-install-{entity}");
+                item.snapshot_fingerprint = format!("{entity:064x}");
+                item
+            })
+            .collect();
+        assert_eq!(
+            preparation
+                .committed_index
+                .current_snapshot_fingerprints()
+                .len(),
+            0
+        );
+    }
+    // Simulate accepted siblings whose source disappeared before adoption.
+    // Neither the current scanner delta nor the selected index contains it.
+    let stale = "f".repeat(64);
+    if stage != "first_install" {
+        preparation
+            .upload_progress
+            .record_body(&stale, &"e".repeat(64));
+    }
+    if matches!(stage, "capacity" | "bootstrap_capacity") {
+        for entity in 0..5000 {
+            let fp = format!("{entity:064x}");
+            preparation.upload_progress.record_body(&fp, &fp);
+        }
+    }
+    preparation
+        .upload_progress
+        .save(&preparation.upload_progress_path)
+        .unwrap();
+    let index_path = preparation.index_path.clone();
+    let progress_path = preparation.upload_progress_path.clone();
+    let namespace = preparation.upload_destination_namespace.clone();
+    ACK_POST_SAVE_FAILURE.with(|slot| {
+        slot.set(
+            (!matches!(stage, "capacity" | "bootstrap_capacity" | "first_install"))
+                .then_some(stage),
+        )
+    });
+    let _reset = AckPostSaveFailure;
+    let result = crate::agent_status_refresh::with_test_collection(collection(), || {
+        finish_sync_source(
+            preparation,
+            index,
+            scan,
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::ClaudeCode,
+            "otm_test",
+            &fixture.home,
+            &support,
+            &daemon,
+            &mut transport,
+            &mut retry,
+        )
+    });
+    if stage == "first_install" {
+        result.expect("actual first install over 4096 has no artificial capacity stop");
+        assert_eq!(server.offered.lock().unwrap().len(), 4100);
+        assert!(matches!(
+            source_cadences().lock().unwrap()["claude_code"].state(),
+            ottto_protocol::LocalCollectorState::Warm
+        ));
+        let saved = ScanIndex::load(&index_path).unwrap();
+        assert_eq!(saved.current_snapshot_fingerprints().len(), 4100);
+        let last = server.offered.lock().unwrap().last().unwrap()["snapshot_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(saved.accepted_snapshot_fingerprint_recorded(&last));
+        return;
+    }
+    let error = result.unwrap_err();
+    if matches!(stage, "capacity" | "bootstrap_capacity") {
+        let settlement = error
+            .downcast_ref::<ack_retention::AckSettlementRequired>()
+            .expect("actual finish preserves typed local capacity outcome");
+        if stage == "bootstrap_capacity" {
+            assert!(
+                error.chain().any(|cause| cause
+                    .to_string()
+                    .contains("cache-head bootstrap ACK settlement pending")),
+                "probe path actually stopped"
+            );
+        }
+        assert_eq!(settlement.retained_stale_ack_count, 5001);
+        assert!(settlement.deferred_entity_count > 0);
+        assert!(
+            server.offered.lock().unwrap().is_empty(),
+            "no HTTP upload attempt"
+        );
+        assert!(matches!(
+            source_cadences().lock().unwrap()["claude_code"].state(),
+            ottto_protocol::LocalCollectorState::Warm
+        ));
+        assert_eq!(
+            crate::client_report::observe()
+                .quantity(crate::client_report::ClientReportReason::NetworkError),
+            0
+        );
+        assert_eq!(
+            crate::client_report::observe()
+                .quantity(crate::client_report::ClientReportReason::RatelimitBackoff),
+            0
+        );
+        let terminal = server.terminal.lock().unwrap();
+        assert_eq!(terminal.last().unwrap()["last_error_code"], "scan_error");
+        assert_eq!(
+            terminal.last().unwrap()["last_error_message"],
+            "local snapshot ACK settlement pending"
+        );
+    } else {
+        assert!(error.to_string().contains(stage));
+    }
+    assert!(
+        ACK_POST_SAVE_FAILURE.with(|slot| slot.get().is_none()),
+        "actual exit reached"
+    );
+    let mut saved = ScanIndex::load(&index_path).unwrap();
+    assert!(saved
+        .upload_ack_retirement_handoff
+        .as_ref()
+        .unwrap()
+        .bodies
+        .contains_key(&stale));
+    let mut progress = SnapshotUploadProgress::load(
+        &progress_path,
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    assert_eq!(
+        progress.accepted_fingerprints.contains(&stale),
+        !matches!(stage, "capacity" | "bootstrap_capacity"),
+        "ordinary exit keeps ACK; capacity partial save may already clean it durably"
+    );
+    progress
+        .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
+        .unwrap();
+    let loaded = SnapshotUploadProgress::load(
+        &progress_path,
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    assert!(
+        !loaded.accepted_fingerprints.contains(&stale),
+        "{stage}: exact proof recovers cleanup"
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn ack_retirement_survives_each_real_finish_post_index_error_exit() {
+    for stage in [
+        "native_receipt",
+        "unverified_marker",
+        "backfill_completion",
+        "finish_cycle",
+    ] {
+        ack_finish_pipeline_case(stage);
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn ack_capacity_real_finish_has_no_upload_loss_or_failure_backoff() {
+    ack_finish_pipeline_case("capacity");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn ack_bootstrap_capacity_real_finish_commits_census_retirement() {
+    ack_finish_pipeline_case("bootstrap_capacity");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn ack_first_install_real_finish_uploads_4100_live_entities_without_a_capacity_stop() {
+    ack_finish_pipeline_case("first_install");
+}
