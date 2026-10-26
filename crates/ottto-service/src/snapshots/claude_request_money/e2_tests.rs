@@ -1045,8 +1045,8 @@ fn e2_native_resolver_owns_progressive_and_idless_decisions() {
 fn e2_diagnostic_fields_are_nonzero_only() {
     assert_eq!(serde_json::to_value(Counts::default()).unwrap(), json!({}));
     assert_eq!(
-        serde_json::to_value(Counts([1, 2, 0, 0, 0, 3, 0, 1])).unwrap(),
-        json!({"fold_us":1,"responses":2,"side_call_root_fallback":3,"dark_unexplained":1})
+        serde_json::to_value(Counts([1, 2, 0, 0, 0, 3, 0])).unwrap(),
+        json!({"fold_us":1,"responses":2,"side_call_root_fallback":3})
     );
 }
 

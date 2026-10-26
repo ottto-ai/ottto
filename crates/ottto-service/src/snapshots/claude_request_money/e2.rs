@@ -288,8 +288,8 @@ pub(crate) struct ClaudeEntityBody {
     pub(crate) certificate_ok: bool,
     pub(crate) activity_unix: u64,
     pub(crate) activity_nanos: i128,
-    /// Gate off: what the trial receipt and the counters read, in place of
-    /// `grains` (which then stays empty).
+    /// Gate off: what the counters read, in place of `grains` (which then
+    /// stays empty).
     pub(super) dark: DarkTally,
 }
 impl Default for ClaudeEntityBody {
@@ -459,9 +459,8 @@ impl ClaudeEntityBody {
     }
 }
 
-/// Gate off (dark): no per-hour grain map. The trial receipt reads the
-/// totals; `unmatched_1h` reads the estimated requests per unix hour that
-/// telemetry attach has not moved. 8 bytes per hour with estimated usage.
+/// Gate off (dark): no per-hour grain map. `unmatched_1h` reads the
+/// estimated requests per unix hour that telemetry attach has not moved. 8 bytes per hour with estimated usage.
 #[derive(Debug, Clone, Default)]
 pub(super) struct DarkTally {
     side: ClaudeGrainSide,
@@ -621,12 +620,11 @@ pub(crate) struct FileFold {
     e2_nanos: u64,
     responses: u64,
     root_fallbacks: u64,
-    side: ClaudeMoneyTokens,
     pub(crate) side_requests: u64,
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
 }
-crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, copied, first_own, ambiguous, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, telemetry, accounts);
+crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, copied, first_own, ambiguous, disclosed, e2_nanos, responses, root_fallbacks, side_requests, telemetry, accounts);
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,
@@ -2190,7 +2188,6 @@ pub(crate) fn side_calls_page(
                     fold.accounts.as_ref().and_then(|a| a.fallback.clone()),
                 )
             });
-            fold.side.add(&tokens);
             fold.side_requests += 1;
             if fallback {
                 fold.root_fallbacks += 1;
@@ -2333,9 +2330,6 @@ pub(crate) fn finish_page(
     struct Session {
         entity: ClaudeEntityBody,
         complete: bool,
-        /// Native transcript totals (None: a reported rebuild replaced them).
-        native: Option<(ClaudeMoneyTokens, u64)>,
-        side: (ClaudeMoneyTokens, u64),
         locations: Vec<LocationKey>,
         /// Decision counters, recorded once the session is decided.
         decided: Counts,
@@ -2372,15 +2366,12 @@ pub(crate) fn finish_page(
             0,
             0,
             0,
-            0,
         ]));
         let session = sessions
             .entry(item.source_session_id.as_str())
             .or_insert_with(|| Session {
                 entity: Default::default(),
                 complete: telemetry == TelemetryRead::Loaded,
-                native: Some(Default::default()),
-                side: Default::default(),
                 locations: Vec::new(),
                 decided: Counts::default(),
             });
@@ -2395,52 +2386,12 @@ pub(crate) fn finish_page(
             fold.unmatched_1h(&hour_ago),
             fold.root_fallbacks,
             fold.entity.resolver_conflicts,
-            0,
         ]));
         session.entity.sum(&fold.entity);
         session.complete &= fold.telemetry_complete();
-        session.side.0.add(&fold.side);
-        session.side.1 += fold.side_requests;
         session
             .locations
             .extend(fold.location.map(|located| located.0));
-        match (
-            &mut session.native,
-            item.usage_accounting_contract.is_none(),
-        ) {
-            (Some((tokens, requests)), true) => {
-                tokens.add(&ClaudeMoneyTokens {
-                    input: item.input_tokens,
-                    output: item.output_tokens,
-                    cache_read: item.cache_read_tokens,
-                    cache_5m: item.cache_creation_5m_tokens,
-                    cache_1h: item.cache_creation_1h_tokens,
-                    unattributed: item.unattributed_total_tokens,
-                    reasoning: item.reasoning_output_tokens,
-                });
-                *requests = requests.saturating_add(item.request_count);
-            }
-            (native, _) => *native = None,
-        }
-    }
-    // Trial receipt: transcript grains + removed copies == native totals.
-    for session in sessions.values() {
-        let Some((native, native_requests)) = &session.native else {
-            continue;
-        };
-        let (mut explained, requests) = session.entity.totals();
-        let Some(transcript) = explained.checked_sub(&session.side.0) else {
-            record_counts(Counts([0, 0, 0, 0, 0, 0, 0, 1]));
-            continue;
-        };
-        explained = transcript;
-        explained.add(&session.entity.removed);
-        let explained_requests = requests
-            .saturating_sub(session.side.1)
-            .saturating_add(session.entity.removed_requests);
-        if &explained != native || explained_requests != *native_requests {
-            record_counts(Counts([0, 0, 0, 0, 0, 0, 0, 1]));
-        }
     }
     if !enabled() {
         // Dark: a session the gate would hold is undecided, not disclosed.
@@ -2560,7 +2511,7 @@ fn absent_twins(sessions: &[(&str, &[LocationKey])], index: &ScanIndex) -> BTree
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; 8] = [
+const COUNT_NAMES: [&str; 7] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -2568,10 +2519,8 @@ const COUNT_NAMES: [&str; 8] = [
     "unmatched_1h",
     "side_call_root_fallback",
     "resolver_conflicts",
-    // Trial-only: transcript grains + removals differ from native totals.
-    "dark_unexplained",
 ];
-static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
 struct PageSpent(Instant, &'static str);
 impl PageSpent {
@@ -2583,7 +2532,7 @@ impl Drop for PageSpent {
     fn drop(&mut self) {
         let elapsed = self.0.elapsed();
         let spent = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        record_counts(Counts([spent, 0, 0, 0, 0, 0, 0, 0]));
+        record_counts(Counts([spent, 0, 0, 0, 0, 0, 0]));
         // The bench's fold_us breakdown: per page pass, the rest is per file.
         #[cfg(test)]
         STAGES.with(|stages| *stages.borrow_mut().entry(self.1).or_default() += elapsed);
@@ -2600,7 +2549,7 @@ pub(crate) fn take_counts() -> Counts {
     Counts(COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed)))
 }
 #[derive(Debug, Default)]
-pub(crate) struct Counts([u64; 8]);
+pub(crate) struct Counts([u64; 7]);
 impl Counts {
     fn add(&mut self, other: &Self) {
         for (sum, value) in self.0.iter_mut().zip(other.0) {

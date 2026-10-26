@@ -100,7 +100,7 @@ mod e2_hook {
 // MONEY_E2_BENCH_HOOK_END
 
 /// The E2 counters on the native_collection_page line (design-e2-final.md).
-const E2_KEYS: [&str; 8] = [
+const E2_KEYS: [&str; 7] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -108,7 +108,6 @@ const E2_KEYS: [&str; 8] = [
     "unmatched_1h",
     "side_call_root_fallback",
     "resolver_conflicts",
-    "dark_unexplained",
 ];
 
 // M4 shape (sizing-m4.md and report-d section 3; counts only, 2026-10-25).
