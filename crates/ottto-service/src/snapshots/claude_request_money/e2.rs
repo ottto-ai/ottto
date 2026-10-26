@@ -554,7 +554,22 @@ fn hour_key(timestamp: &str) -> Option<ClaudeLiveKey> {
 }
 crate::heap_layout_bound::fields!(ClaudeEntityBody; grains, bucket_activity, removed, removed_requests, telemetry_owned_complete, resolver_conflicts, held, certificate_ok, activity_unix, activity_nanos, dark);
 // Existing grain types were inline P1 values; E retains only the aggregate.
-crate::heap_layout_bound::fields!(ClaudeGrainSide; tokens, requests, cost_micros, unpriced, contributions);
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeGrainSide {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        // Exhaustive: every field is an inline token/counter, already paid
+        // by its containing slot. No per-token graph walk is needed.
+        let Self {
+            tokens: _,
+            requests: _,
+            cost_micros: _,
+            unpriced: _,
+            contributions: _,
+        } = self;
+        c.add(0)
+    }
+}
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestUsageOrigin {
     const INLINE_ONLY: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -2516,7 +2531,22 @@ impl Serialize for Counts {
     }
 }
 
-crate::heap_layout_bound::fields!(ClaudeMoneyTokens; input, output, cache_read, cache_5m, cache_1h, unattributed, reasoning);
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeMoneyTokens {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            input: _,
+            output: _,
+            cache_read: _,
+            cache_5m: _,
+            cache_1h: _,
+            unattributed: _,
+            reasoning: _,
+        } = self;
+        c.add(0)
+    }
+}
 
 #[cfg(test)]
 #[path = "e2_tests.rs"]
