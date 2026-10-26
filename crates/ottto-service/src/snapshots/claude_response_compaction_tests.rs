@@ -1580,6 +1580,7 @@ fn assert_x_out_covers_finish_with(
                 Some(title),
                 attribution.as_ref(),
                 identity,
+                None,
             )
             .unwrap()
     });
@@ -1804,6 +1805,51 @@ fn x_out_t1_bounds_the_finished_claude_file() {
         &with_cwd(realistic_rows(0..3, &[SHELL]), "/work/x-out-title"),
         &titled,
     );
+}
+
+/// Dark output admission must cover sparse hours and alternating copied/own
+/// sequence runs, including idless copies and the restoration peak when no
+/// census can prove their owner. Audit actual allocations, not a substitute
+/// bound or a larger cache budget.
+#[test]
+fn x_out_dark_covers_sparse_hours_and_copy_restoration() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    assert!(!claude_request_money::e2::enabled());
+    let birth = rfc3339_unix_nanos(NOW).unwrap();
+    let rows = edit_assistant(realistic_rows(0..128, &[SHELL]), |_, row| {
+        let request = row["requestId"].as_str().unwrap();
+        let ordinal = request[request.len() - 19..].parse::<i64>().unwrap();
+        let offset = if ordinal % 2 == 0 {
+            -(ordinal + 1) * 3600
+        } else {
+            ordinal * 3600
+        };
+        row["timestamp"] = json!(time::OffsetDateTime::from_unix_timestamp_nanos(
+            birth + i128::from(offset) * 1_000_000_000
+        )
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap());
+        if ordinal % 4 == 0 {
+            row.as_object_mut().unwrap().remove("requestId");
+        }
+    });
+    let prepare = |accumulator: &mut SnapshotAccumulator| {
+        accumulator.claude_file_birth.set_birth_for_test(birth);
+    };
+    let (items, _) = assert_x_out_covers_finish_with(
+        "dark-sparse-copy-restore",
+        &rows,
+        &ClaudeTitleMetadata::default(),
+        FinishCase {
+            prepare: Some(&prepare),
+            ..FinishCase::default()
+        },
+    );
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].request_count, 128);
 }
 
 /// X_out U3 and U1 controls (c22 amendment 2): a workspace whose identity is
@@ -2207,6 +2253,7 @@ fn x_out_charges_buffered_request_hashes_of_an_itemless_file() {
                 Some(&title),
                 None,
                 identity,
+                None,
             )
             .unwrap();
         (hashes, parsed)

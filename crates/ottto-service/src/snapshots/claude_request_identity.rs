@@ -9,8 +9,10 @@
 //!
 //! Tagging runs after rows are built and only when the per-request regrouping
 //! reproduces every row exactly; otherwise the item keeps today's path. It adds
-//! no transcript read, parse or retained state. Transcript markers never authorize
+//! no transcript read or parse. Legacy transcript markers never authorize
 //! emitted tags; login-only telemetry keeps its login without a marker org.
+//! E2 partitions counted requests using bounded native marker runs before
+//! aggregation, then feeds those exact final shares to this same tag installer.
 
 use super::claude_request_accounts::{local_subscription, normalize_activity};
 use super::{
@@ -31,6 +33,7 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
@@ -39,10 +42,18 @@ pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:
 /// token, which names its version, under a permit, and `""` without one.
 #[cfg(not(test))]
 pub(crate) const fn cycle_contract(permitted: bool) -> &'static str {
-    if permitted {
-        COLLECTOR
-    } else {
+    compiled_cycle_contract(permitted, super::claude_request_money::e2::GATE)
+}
+
+// Durable grouping version shares the existing identity-contract rearm. The
+// wire collector stays v1; gate-off contracts and uploads stay byte-identical.
+const fn compiled_cycle_contract(permitted: bool, request_owned: bool) -> &'static str {
+    if !permitted {
         ""
+    } else if request_owned {
+        "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1"
+    } else {
+        COLLECTOR
     }
 }
 
@@ -1362,6 +1373,7 @@ pub(crate) struct OrgMarker {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OrgMarkers {
     entries: Vec<OrgMarker>,
+    starting_marker: Option<OrgMarker>,
     overflowed: bool,
     context_digest: Option<String>,
     context_changed: bool,
@@ -1431,11 +1443,15 @@ pub(crate) fn note_marker_line(
                 }
             };
             state.context_changed = false;
-            state.entries.push(OrgMarker {
+            let marker = OrgMarker {
                 position: response_position,
                 org,
                 terminal_trusted,
-            });
+            };
+            if state.starting_marker.is_none() {
+                state.starting_marker = Some(marker.clone());
+            }
+            state.entries.push(marker);
         }
         _ => {}
     }
@@ -1490,6 +1506,705 @@ impl OrgMarkers {
             Some(org) => MarkerVerdict::Trusted(org),
         }
     }
+}
+
+// E2 consumes this compact, native-sequence-ordered placement before any
+// requests aggregate. Marker state is bounded independently of request count.
+pub(crate) type AccountPartition = Option<Arc<AuthorityKey>>;
+
+#[derive(Clone, Debug)]
+struct AccountRun {
+    position: u64,
+    account: AccountPartition,
+    /// E2's decision for the first resolved usage following this marker.
+    copied: Option<bool>,
+}
+crate::heap_layout_bound::fields!(AccountRun; position, account, copied);
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestAccounts {
+    pub(crate) starting: AccountPartition,
+    pub(crate) fallback: AccountPartition,
+    bound: AccountPartition,
+    retained_root: AccountPartition,
+    runs: Vec<AccountRun>,
+    pub(crate) mixed: bool,
+    pub(crate) conflict: bool,
+    pub(crate) subagent: bool,
+    pub(crate) inherited: u64,
+    skipped_inherited: u64,
+    first_retained: Option<u64>,
+}
+crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained);
+
+/// One account policy for E2. Never use a later marker for an earlier request.
+/// A conflict fills missing shares; trusted own/earlier org runs stay intact.
+/// Subagents are assigned their root's starting account at page finalization.
+pub(crate) fn request_accounts(
+    markers: Option<&OrgMarkers>,
+    bound: Option<&str>,
+    first_sequence: Option<u64>,
+    subagent: bool,
+    excluded: &[u64],
+) -> RequestAccounts {
+    let bound = bound.filter(|hash| wire_login_is_valid(hash)).map(|login| {
+        Arc::new(AuthorityKey {
+            login: Some(login.to_owned()),
+            org: None,
+            basis: TELEMETRY_LOGIN,
+        })
+    });
+    let mut accounts = RequestAccounts {
+        starting: bound.clone(),
+        fallback: bound.clone(),
+        bound,
+        subagent,
+        ..Default::default()
+    };
+    if subagent {
+        return accounts;
+    }
+    let Some(markers) = markers else {
+        // Unknown here is provisional until existing account evidence runs.
+        return accounts;
+    };
+    let Some(first) = first_sequence else {
+        return accounts;
+    };
+    // Only E2 can exclude a request. Marker timestamps never decide identity.
+    let own_marker = |marker: &&OrgMarker| excluded.binary_search(&marker.position).is_err();
+    if markers.overflowed {
+        if let Some(marker) = markers
+            .starting_marker
+            .as_ref()
+            .filter(own_marker)
+            .filter(|marker| marker.position <= first)
+        {
+            if let Some(org) = marker.org.as_deref().filter(|_| marker.terminal_trusted) {
+                accounts.starting = Some(Arc::new(AuthorityKey {
+                    login: None,
+                    org: Some(org.to_owned()),
+                    basis: TRANSCRIPT_ORG,
+                }));
+                accounts.runs.push(AccountRun {
+                    position: marker.position,
+                    account: accounts.starting.clone(),
+                    copied: None,
+                });
+            }
+        }
+    }
+    accounts.fallback = accounts.starting.clone();
+    accounts.conflict = markers.overflowed;
+    // Positions where one request carries two different orgs (R3-N2).
+    let mut contradicted = Vec::new();
+    for marker in markers.entries.iter().filter(own_marker) {
+        let Some(org) = marker.org.as_deref().filter(|_| {
+            marker.terminal_trusted
+                || accounts
+                    .runs
+                    .iter()
+                    .rev()
+                    .find_map(|run| run.account.as_ref())
+                    .map_or(true, |key| key.org.as_deref() == marker.org.as_deref())
+        }) else {
+            accounts.conflict = true;
+            if accounts
+                .runs
+                .last()
+                .map_or(true, |run| run.position != marker.position)
+            {
+                accounts.runs.push(AccountRun {
+                    position: marker.position,
+                    account: None,
+                    copied: None,
+                });
+            }
+            continue;
+        };
+        if let Some(previous) = accounts.runs.last() {
+            if previous.position == marker.position {
+                if previous.account.as_ref().and_then(|key| key.org.as_deref()) != Some(org) {
+                    accounts.conflict = true;
+                    contradicted.push(marker.position);
+                }
+                continue;
+            }
+        }
+        let key = accounts
+            .starting
+            .as_ref()
+            .filter(|key| key.org.as_deref() == Some(org))
+            .cloned()
+            .or_else(|| {
+                accounts.runs.iter().find_map(|run| {
+                    run.account
+                        .as_ref()
+                        .filter(|key| key.org.as_deref() == Some(org))
+                        .cloned()
+                })
+            })
+            .unwrap_or_else(|| {
+                Arc::new(AuthorityKey {
+                    login: None,
+                    org: Some(org.to_owned()),
+                    basis: TRANSCRIPT_ORG,
+                })
+            });
+        accounts.runs.push(AccountRun {
+            position: marker.position,
+            account: Some(key),
+            copied: None,
+        });
+    }
+    // Derive the first own request's start from the accepted own stream,
+    // preserving the first observation of a conflicting same-position pair.
+    if !markers.overflowed {
+        if let Some(key) = accounts
+            .runs
+            .iter()
+            .rev()
+            .filter(|run| run.position <= first)
+            .find_map(|run| run.account.as_ref())
+        {
+            accounts.starting = Some(key.clone());
+        }
+        accounts.fallback = accounts.starting.clone();
+    }
+    // R3-N2 (QUOTA): a later request carrying two different orgs is never
+    // guessed: it goes to the starting (or bound) account, counted as a
+    // conflict above. A pair at the session start is the start itself.
+    for run in &mut accounts.runs {
+        if run.position > first && contradicted.contains(&run.position) {
+            run.account = accounts.starting.clone();
+        }
+    }
+    if accounts
+        .runs
+        .iter()
+        .filter_map(|run| run.account.as_ref())
+        .collect::<BTreeSet<_>>()
+        .len()
+        > MAX_AUTHORITY_KEYS
+    {
+        accounts.conflict = true;
+    }
+    accounts.mixed = accounts
+        .runs
+        .iter()
+        .any(|run| run.account.is_some() && run.account != accounts.starting);
+    // Keep bounded runs through native copy adjudication so the first
+    // retained request can establish the real start even under a conflict.
+    accounts
+}
+
+impl RequestAccounts {
+    pub(crate) fn account(&self, sequence: u64) -> AccountPartition {
+        if self.subagent {
+            return self.starting.clone().or_else(|| self.fallback.clone());
+        }
+        let end = self.runs.partition_point(|run| run.position <= sequence);
+        self.runs[..end]
+            .iter()
+            .rev()
+            .find_map(|run| run.account.clone())
+            .or_else(|| self.starting.clone())
+            .or_else(|| self.fallback.clone())
+    }
+    fn is_inherited(&self, sequence: u64) -> bool {
+        !self.subagent
+            && ((self.starting.is_none() && self.runs.is_empty() && self.fallback.is_some())
+                || matches!(self.runs.binary_search_by_key(&sequence, |run| run.position), Err(at) if at > 0))
+    }
+    pub(crate) fn observe(&mut self, sequence: u64, copied: bool) {
+        let next = self.runs.partition_point(|run| run.copied.is_some());
+        for run in self.runs[next..]
+            .iter_mut()
+            .take_while(|run| run.position <= sequence)
+        {
+            run.copied = Some(copied);
+        }
+        if !copied {
+            self.first_retained.get_or_insert(sequence);
+        }
+        if self.is_inherited(sequence) {
+            let into = if copied {
+                &mut self.skipped_inherited
+            } else {
+                &mut self.inherited
+            };
+            *into = into.saturating_add(1);
+        }
+    }
+    /// The governing native marker run; E2 uses its own skipped ranges to
+    /// stage inherited usage until its copy decision is final.
+    pub(crate) fn copied_marker_position(&self, sequence: u64) -> Option<u64> {
+        let end = self.runs.partition_point(|run| run.position <= sequence);
+        let runs = &self.runs[..end];
+        // Keep every marker boundary, even a provisionally rejected flip:
+        // removing its copied predecessor can make that marker authoritative.
+        runs.iter()
+            .rev()
+            .find(|run| run.account.is_some())
+            .filter(|run| run.copied == Some(true))?;
+        runs.last().map(|run| run.position)
+    }
+
+    /// Rebuild only after the money owner confirms exclusion. Restored files
+    /// keep every marker; excluded requests cannot lend a marker to own usage.
+    pub(crate) fn finish_native(&mut self, markers: Option<&OrgMarkers>, prefix_excluded: bool) {
+        if prefix_excluded && !self.subagent {
+            let excluded = self
+                .runs
+                .iter()
+                .filter(|run| run.copied == Some(true))
+                .map(|run| run.position)
+                .collect::<Vec<_>>();
+            let mut own = request_accounts(
+                markers,
+                self.bound.as_ref().and_then(|key| key.login.as_deref()),
+                self.first_retained,
+                false,
+                &excluded,
+            );
+            own.inherited = self.inherited;
+            own.skipped_inherited = self.skipped_inherited;
+            own.first_retained = self.first_retained;
+            *self = own;
+        }
+    }
+    pub(crate) fn restore_copies(&mut self) {
+        self.inherited = self
+            .inherited
+            .saturating_add(std::mem::take(&mut self.skipped_inherited));
+    }
+}
+
+/// Stronger evidence can contradict a marker, but never relocates an E2
+/// request. Only missing shares fall back to the native starting account.
+pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
+    for item in items {
+        let root = super::claude_snapshot_family_root_ref(item).to_owned();
+        // The existing account owner already proved uniform request coverage.
+        // This is retained evidence, never today's login or a later marker.
+        let qualified = item
+            .claude_org_markers
+            .is_none()
+            .then(|| super::exact_session_account_hash(item))
+            .flatten();
+        let Some(fold) = item.claude_money.as_deref_mut() else {
+            continue;
+        };
+        let Some(accounts) = fold.accounts.as_deref_mut() else {
+            continue;
+        };
+        if accounts.subagent {
+            continue;
+        }
+        if accounts.starting.is_none()
+            && !accounts.mixed
+            && item.claude_usage_request_ids.iter().all(|request| {
+                !evidence
+                    .invalid_logins
+                    .contains(&(root.as_str(), request.as_str()))
+            })
+        {
+            if let Some(login) = qualified {
+                let key = Some(Arc::new(AuthorityKey {
+                    login: Some(login),
+                    org: None,
+                    basis: TELEMETRY_LOGIN,
+                }));
+                accounts.starting = key.clone();
+                accounts.fallback = key.clone();
+                accounts.bound = key.clone();
+                accounts.conflict = false;
+                fold.entity.repartition(key);
+            }
+        }
+        for (request, occurrence) in &item.claude_usage_occurrences {
+            match evidence.requests.get(&(root.as_str(), request.as_str())) {
+                Some(None) => accounts.conflict = true,
+                Some(Some(row)) => {
+                    if let Some(identity) = &row.request_identity {
+                        if matches!(
+                            identity.disposition,
+                            ClaudeIdentityDisposition::Conflict
+                                | ClaudeIdentityDisposition::Invalid
+                        ) || matches!(
+                            identity.account.disposition,
+                            ClaudeIdentityDisposition::Conflict
+                                | ClaudeIdentityDisposition::Invalid
+                        ) || (identity.account.disposition != ClaudeIdentityDisposition::Missing
+                            && evidence
+                                .invalid_logins
+                                .contains(&(root.as_str(), request.as_str())))
+                        {
+                            accounts.conflict = true;
+                        }
+                        match organization_hash(identity) {
+                            Err(()) => accounts.conflict = true,
+                            Ok(Some(org)) => {
+                                if accounts
+                                    .account(occurrence.sequence)
+                                    .as_ref()
+                                    .and_then(|key| key.org.as_deref())
+                                    .is_some_and(|own| own != org)
+                                {
+                                    accounts.conflict = true;
+                                }
+                            }
+                            Ok(None) => {}
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        if accounts.conflict {
+            fold.entity.inherit_missing(accounts.fallback.clone());
+        }
+    }
+}
+
+/// Read retained creator bindings using the same machine/session key as the
+/// account owner. No transcript read, new index field, or current-login guess.
+pub(crate) fn retain_root_accounts(items: &mut [SnapshotItem], index: &ScanIndex, machine: &str) {
+    if !super::claude_request_money::e2::enabled() {
+        return;
+    }
+    for item in items {
+        if item
+            .claude_money
+            .as_deref()
+            .and_then(|fold| fold.accounts.as_deref())
+            .is_none()
+        {
+            continue;
+        }
+        let root = super::claude_snapshot_family_root_ref(item);
+        let key = super::sha256_hex(&["session_owner:v1", machine, root]);
+        let retained = index
+            .session_account_bindings
+            .get(&key)
+            .filter(|binding| wire_login_is_valid(&binding.account_identifier_hash))
+            .map(|binding| {
+                Arc::new(AuthorityKey {
+                    login: Some(binding.account_identifier_hash.clone()),
+                    org: None,
+                    basis: TELEMETRY_LOGIN,
+                })
+            });
+        let fold = item.claude_money.as_deref_mut().expect("checked fold");
+        let accounts = fold.accounts.as_deref_mut().expect("checked accounts");
+        if accounts.subagent {
+            accounts.retained_root = retained;
+        } else if retained.is_some() {
+            // A native markerless file may not yet carry its persisted creator
+            // binding. Fill only missing shares, never a later own-org run.
+            if accounts.bound.is_none() {
+                accounts.bound = retained.clone();
+            }
+            if accounts.starting.is_none() {
+                accounts.starting = retained.clone();
+                accounts.fallback = retained.clone();
+                fold.entity.inherit_missing(retained);
+            }
+        }
+    }
+}
+
+/// Root placement is fixed before summing path twins. A missing/Unknown root
+/// stays Unknown; a subagent's own marker can never manufacture a root account.
+pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
+    // Select the root's earliest native start, independently of page/map order.
+    // Contradictory observations at the same start use the retained binding.
+    struct Root {
+        first: i128,
+        starting: AccountPartition,
+        bound: AccountPartition,
+        conflict: bool,
+        known: bool,
+        // Kind of the original start evidence, retained through fallback.
+        org_start: bool,
+        start_conflict: bool,
+        bound_conflict: bool,
+    }
+    let mut roots = BTreeMap::<String, Root>::new();
+    for item in items.iter() {
+        let Some(accounts) = item
+            .claude_money
+            .as_deref()
+            .and_then(|fold| fold.accounts.as_deref())
+        else {
+            continue;
+        };
+        if accounts.subagent {
+            continue;
+        }
+        let first = item
+            .source_started_at
+            .as_deref()
+            .and_then(super::rfc3339_unix_nanos)
+            .unwrap_or(i128::MAX);
+        let candidate = Root {
+            first,
+            starting: accounts.starting.clone(),
+            bound: accounts.bound.clone(),
+            conflict: accounts.conflict,
+            known: accounts.starting.is_some(),
+            org_start: accounts
+                .starting
+                .as_ref()
+                .is_some_and(|key| key.org.is_some()),
+            start_conflict: false,
+            bound_conflict: false,
+        };
+        match roots.entry(item.source_session_id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let root = entry.get_mut();
+                let any_conflict = root.conflict || candidate.conflict;
+                if candidate.known && (!root.known || first < root.first) {
+                    *root = candidate;
+                } else if first == root.first {
+                    if root.bound.is_some()
+                        && candidate.bound.is_some()
+                        && root.bound != candidate.bound
+                    {
+                        root.bound_conflict = true;
+                    }
+                    if root.bound_conflict {
+                        root.bound = None;
+                    } else if root.bound.is_none() {
+                        root.bound = candidate.bound.clone();
+                    }
+                    if root.known && candidate.known && root.starting != candidate.starting {
+                        if root.org_start != candidate.org_start {
+                            // Different kinds do not contradict each other.
+                            if candidate.org_start {
+                                root.starting = candidate.starting.clone();
+                                root.org_start = true;
+                                root.start_conflict = false;
+                            }
+                        } else {
+                            root.start_conflict = true;
+                            root.conflict = true;
+                        }
+                    }
+                    // A fallback is only as strong as the current binding.
+                    // A later contradictory binding invalidates it too.
+                    if root.start_conflict {
+                        root.starting = root.bound.clone();
+                    }
+                }
+                root.conflict |= any_conflict;
+            }
+        }
+    }
+    for item in items {
+        let root = super::claude_snapshot_family_root_ref(item).to_owned();
+        let Some(fold) = item.claude_money.as_deref_mut() else {
+            continue;
+        };
+        let Some(accounts) = fold.accounts.as_deref_mut() else {
+            continue;
+        };
+        if accounts.subagent {
+            accounts.starting = match roots.get(&root) {
+                Some(root) => root.starting.clone(),
+                None => accounts.retained_root.clone(),
+            };
+            accounts.fallback = accounts.starting.clone();
+            fold.entity.repartition(accounts.fallback.clone());
+        } else if let Some(root) = roots.get(&root) {
+            accounts.fallback = root.starting.clone();
+            if root.conflict {
+                accounts.conflict = true;
+            }
+            if settled {
+                // Markerless twins inherit the resolved session start, not a
+                // provisional Unknown partition from their native file.
+                fold.entity.inherit_missing(accounts.fallback.clone());
+                if accounts.starting.is_none()
+                    && accounts.runs.is_empty()
+                    && accounts.fallback.is_some()
+                {
+                    accounts.inherited = fold
+                        .entity
+                        .grains
+                        .values()
+                        .map(|grain| grain.requests)
+                        .sum::<u64>()
+                        .saturating_sub(fold.side_requests);
+                }
+            }
+        }
+    }
+}
+
+// Merge borrowed native request-id iterators. Counter dedup needs no set or
+// copy proportional to response count; id-less native usage remains counted.
+// The next request is the minimum over every member's peeked head; a
+// `while let` would hold that mutable walk across the body.
+#[allow(clippy::while_let_loop)]
+fn inherited_requests(members: &[&SnapshotItem]) -> u64 {
+    let mut identified = 0u64;
+    let mut total = 0u64;
+    for item in members {
+        let fold = item.claude_money.as_deref().expect("identity fold");
+        let accounts = fold.accounts.as_deref().expect("identity accounts");
+        total = total.saturating_add(accounts.inherited);
+        for occurrence in item.claude_usage_occurrences.values() {
+            if !fold.is_skipped(occurrence.sequence)
+                && !occurrence.usage.is_zero()
+                && accounts.is_inherited(occurrence.sequence)
+            {
+                identified = identified.saturating_add(occurrence.usage.request_count);
+            }
+        }
+    }
+    let mut merged = total.saturating_sub(identified);
+    let mut heads = members
+        .iter()
+        .map(|item| item.claude_usage_occurrences.iter().peekable())
+        .collect::<Vec<_>>();
+    loop {
+        let Some(request) = heads
+            .iter_mut()
+            .filter_map(|head| head.peek().map(|(request, _)| *request))
+            .min()
+        else {
+            break;
+        };
+        let mut counted = false;
+        let mut inherited = true;
+        let mut requests = 0;
+        for (head, item) in heads.iter_mut().zip(members) {
+            if head
+                .peek()
+                .is_some_and(|(candidate, _)| *candidate == request)
+            {
+                let (_, occurrence) = head.next().expect("peeked native request");
+                let fold = item.claude_money.as_deref().expect("identity fold");
+                let accounts = fold.accounts.as_deref().expect("identity accounts");
+                if !fold.is_skipped(occurrence.sequence) && !occurrence.usage.is_zero() {
+                    counted = true;
+                    inherited &= accounts.is_inherited(occurrence.sequence);
+                    requests = requests.max(occurrence.usage.request_count);
+                }
+            }
+        }
+        if counted && inherited {
+            merged = merged.saturating_add(requests);
+        }
+    }
+    merged
+}
+
+pub(crate) fn page_identity_counts(items: &[SnapshotItem]) -> IdentityCounts {
+    // Once per session, independent of which path twin the page lists first.
+    let mut sessions =
+        BTreeMap::<&str, (bool, bool, BTreeSet<&AccountPartition>, Vec<&SnapshotItem>)>::new();
+    for item in items {
+        let Some(fold) = item.claude_money.as_deref() else {
+            continue;
+        };
+        let Some(accounts) = fold.accounts.as_deref() else {
+            continue;
+        };
+        let session = sessions.entry(&item.source_session_id).or_default();
+        session.0 |= accounts.mixed;
+        session.1 |= accounts.conflict;
+        session
+            .2
+            .extend(fold.entity.grains.keys().map(|(_, _, account)| account));
+        session.3.push(item);
+    }
+    let mut counts = IdentityCounts::default();
+    for (mixed, conflict, partitions, members) in sessions.into_values() {
+        counts.claude_mixed_login_sessions += u64::from(mixed || partitions.len() > 1);
+        counts.claude_inherited_org_requests += inherited_requests(&members);
+        counts.claude_identity_conflict_fallbacks += u64::from(conflict);
+    }
+    counts
+}
+
+pub(crate) fn record_page_identity_counts(items: &[SnapshotItem]) {
+    let counts = page_identity_counts(items);
+    for (counter, value) in IDENTITY_COUNTS.iter().zip([
+        counts.claude_mixed_login_sessions,
+        counts.claude_inherited_org_requests,
+        counts.claude_identity_conflict_fallbacks,
+    ]) {
+        if value != 0 {
+            counter.fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+static IDENTITY_COUNTS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+#[derive(Default, serde::Serialize)]
+pub(crate) struct IdentityCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_mixed_login_sessions: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_inherited_org_requests: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_identity_conflict_fallbacks: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+pub(crate) fn take_identity_counts() -> IdentityCounts {
+    let [mixed, inherited, conflicts] = IDENTITY_COUNTS
+        .each_ref()
+        .map(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed));
+    IdentityCounts {
+        claude_mixed_login_sessions: mixed,
+        claude_inherited_org_requests: inherited,
+        claude_identity_conflict_fallbacks: conflicts,
+    }
+}
+
+/// Exact final E2 rows, including copied exclusions and telemetry side calls.
+/// E2 owns placement; this owner supplies contract-5 keys and evidence only.
+fn request_owned_grouping(
+    item: &SnapshotItem,
+    fallback: Option<&AccountPartition>,
+) -> Option<Grouping> {
+    let mut grouping = Grouping::new(bucket_row_count(item));
+    super::claude_request_money::e2::visit_identity_rows(item, |bucket, row, account, cost| {
+        let mut usage = super::usage_totals_from_model_usage(&row);
+        if let Some(cost) = cost {
+            usage.costs.observed = true;
+            usage.costs.reported = true;
+            usage.costs.total = Some(u128::from(cost) * 1_000_000);
+        }
+        let account = fallback.unwrap_or(&account);
+        let identity = match account.as_ref() {
+            Some(key) => IdentityRef::Tagged(KeyRef {
+                login: key.login.as_deref(),
+                org: key.org.as_deref(),
+                basis: key.basis,
+            }),
+            None => IdentityRef::Missing,
+        };
+        // E2 grains carry no per-request clock, so they never decide the
+        // local current account (#775); their totals still group exactly.
+        grouping.add_at(
+            bucket,
+            &row_key_from_model_usage(&row),
+            &usage,
+            identity,
+            None,
+        );
+    })?;
+    Some(grouping)
 }
 
 // --- Per-request classification -------------------------------------------
@@ -2159,6 +2874,13 @@ pub(super) struct Request<'r> {
     pub(super) usage: &'r UsageTotals,
 }
 
+#[derive(Clone, Copy)]
+struct ActivityRequest<'r> {
+    request_id: &'r str,
+    occurrence: Option<(u64, bool)>,
+    timestamp: &'r str,
+}
+
 /// Classifies one item's requests as the row builder produces them and folds
 /// each straight into a bounded `Grouping`; no request is retained.
 pub(crate) struct RequestSink<'s, 'a> {
@@ -2298,7 +3020,11 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 &mut self.grouping.desktop_recent,
                 item,
                 original,
-                &request,
+                ActivityRequest {
+                    request_id: request.request_id,
+                    occurrence: request.occurrence,
+                    timestamp: request.timestamp,
+                },
                 identity,
             );
         }
@@ -2325,7 +3051,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         activity: &mut crate::desktop_recent::RecentActivity,
         item: &SnapshotItem,
         original: Option<&super::SessionAccountEvidence>,
-        request: &Request<'_>,
+        request: ActivityRequest<'_>,
         identity: IdentityRef<'_>,
     ) {
         let Some(occurrence) = item.claude_usage_occurrences.get(request.request_id) else {
@@ -2348,11 +3074,25 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         let Some((sequence, _)) = request.occurrence else {
             return;
         };
-        let Some(markers) = item.claude_org_markers.as_deref() else {
-            return;
-        };
-        let MarkerVerdict::Trusted(org) = markers.verdict(sequence, true) else {
-            return;
+        let org = match item.claude_org_markers.as_deref() {
+            Some(markers) => match markers.verdict(sequence, true) {
+                MarkerVerdict::Trusted(org) => org,
+                _ => return,
+            },
+            None if super::claude_request_money::e2::enabled()
+                && keeps_markerless_account(item)
+                && super::exact_session_account_hash(item).as_deref() == Some(account) =>
+            {
+                let Some(org) = owner
+                    .provider_workspace_hash
+                    .as_deref()
+                    .filter(|hash| wire_login_is_valid(hash))
+                else {
+                    return;
+                };
+                org
+            }
+            None => return,
         };
         match identity {
             IdentityRef::Refused(Refusal::UntrustedFlip) | IdentityRef::Missing => {}
@@ -2533,12 +3273,12 @@ pub(crate) fn apply_scan(
     reported: BTreeMap<String, Grouping>,
 ) -> ScanOutcome {
     static NONE: Duplicates = BTreeMap::new();
-    apply_scan_with_ownership(
-        snapshots,
-        evidence,
-        reported,
-        &TranscriptOwnership { duplicates: &NONE },
-    )
+    let ownership = TranscriptOwnership { duplicates: &NONE };
+    let originals = capture_request_owned_originals(snapshots);
+    let activity = stage_request_owned_activity(snapshots, evidence, &ownership, &originals);
+    let outcome = apply_scan_with_ownership(snapshots, evidence, reported, &ownership);
+    publish_request_owned_activity(snapshots, activity);
+    outcome
 }
 
 /// Tag every eligible Claude item of this pass. Runs before D1, which leaves
@@ -2564,12 +3304,279 @@ pub(crate) fn apply_scan_with_ownership(
     outcome
 }
 
+/// Each physical source's pre-enrichment native original, not a session-keyed
+/// projection where path twins can overwrite one another's creator evidence.
+#[derive(Default)]
+pub(crate) struct RequestOwnedOriginals(
+    BTreeMap<(String, Option<String>), Option<super::SessionAccountEvidence>>,
+);
+
+pub(crate) fn capture_request_owned_originals(items: &[SnapshotItem]) -> RequestOwnedOriginals {
+    let mut originals = RequestOwnedOriginals::default();
+    if !super::claude_request_money::e2::enabled() {
+        return originals;
+    }
+    for item in items {
+        if item.claude_money.is_none()
+            || !item
+                .claude_usage_occurrences
+                .values()
+                .any(|occurrence| occurrence.desktop_request)
+        {
+            continue;
+        }
+        originals
+            .0
+            .entry((
+                item.source_session_id.clone(),
+                item.source_file_fingerprint.clone(),
+            ))
+            .and_modify(|original| {
+                if original.as_ref() != item.session_account_evidence.as_ref() {
+                    *original = None;
+                }
+            })
+            .or_insert_with(|| item.session_account_evidence.clone());
+    }
+    originals
+}
+
+/// Bounded validated activity, kept only across final twin removal/tagging.
+#[derive(Default)]
+pub(crate) struct RequestOwnedActivity(
+    BTreeMap<String, Vec<crate::desktop_recent::RecentActivity>>,
+);
+
+pub(crate) fn stage_request_owned_activity(
+    items: &[SnapshotItem],
+    evidence: &ScanEvidence<'_>,
+    ownership: &TranscriptOwnership<'_>,
+    originals: &RequestOwnedOriginals,
+) -> RequestOwnedActivity {
+    let mut page = RequestOwnedActivity::default();
+    if !super::claude_request_money::e2::enabled() {
+        return page;
+    }
+    for item in items {
+        if item.claude_money.is_none()
+            || !item
+                .claude_usage_occurrences
+                .values()
+                .any(|occurrence| occurrence.desktop_request)
+        {
+            continue;
+        }
+        if item
+            .model_usage
+            .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| &bucket.model_usage),
+            )
+            .any(|row| !local_subscription(row))
+        {
+            continue;
+        }
+        page.0
+            .entry(item.source_session_id.clone())
+            .or_default()
+            .push(collect_request_owned_activity(
+                item,
+                evidence,
+                ownership,
+                originals
+                    .0
+                    .get(&(
+                        item.source_session_id.clone(),
+                        item.source_file_fingerprint.clone(),
+                    ))
+                    .and_then(Option::as_ref),
+            ));
+    }
+    page
+}
+
+pub(crate) fn publish_request_owned_activity(
+    items: &[SnapshotItem],
+    mut page: RequestOwnedActivity,
+) {
+    if page.0.is_empty() {
+        return;
+    }
+    for item in items {
+        if !super::claude_history_upgrade::is_request_owned_literal(item) {
+            continue;
+        }
+        #[cfg(not(test))]
+        let collector = COLLECTOR;
+        #[cfg(test)]
+        let collector = cycle_contract(true);
+        if item.provenance.collector != collector && !keeps_markerless_account(item) {
+            continue;
+        }
+        for activity in page.0.remove(&item.source_session_id).into_iter().flatten() {
+            crate::desktop_recent::publish(activity);
+        }
+    }
+}
+
+fn collect_request_owned_activity(
+    item: &SnapshotItem,
+    evidence: &ScanEvidence<'_>,
+    ownership: &TranscriptOwnership<'_>,
+    original: Option<&super::SessionAccountEvidence>,
+) -> crate::desktop_recent::RecentActivity {
+    let Some(fold) = item.claude_money.as_deref() else {
+        return Default::default();
+    };
+    let Some(root) = owner_root(item) else {
+        return Default::default();
+    };
+    let mut activity = crate::desktop_recent::RecentActivity::default();
+    for (request_id, occurrence) in &item.claude_usage_occurrences {
+        if !occurrence.desktop_request
+            || occurrence.usage.is_zero()
+            || fold.is_skipped(occurrence.sequence)
+        {
+            continue;
+        }
+        let duplicated = !ownership.duplicates.is_empty()
+            && ownership.duplicates.contains_key(&format!(
+                "{:x}",
+                sha2::Sha256::digest(request_id.as_bytes())
+            ));
+        if duplicated {
+            continue;
+        }
+        let Some(timestamp) = occurrence.timestamp.as_deref() else {
+            continue;
+        };
+        let desktop = item
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.entrypoint.as_deref())
+            == Some("claude-desktop");
+        let facts = RequestFacts {
+            root,
+            source_session_id: &item.source_session_id,
+            request_id,
+            terminal_unix_seconds: rfc3339_unix_seconds(timestamp),
+            event_clock_complete: occurrence.event_clock_complete,
+            marker: item
+                .claude_org_markers
+                .as_deref()
+                .map_or(MarkerVerdict::None, |markers| {
+                    markers.verdict(occurrence.sequence, desktop)
+                }),
+            desktop,
+            scan_unix_seconds: rfc3339_unix_seconds(&item.collected_at),
+            email_home: item
+                .claude_org_markers
+                .as_deref()
+                .and_then(|markers| markers.email_home(occurrence.sequence)),
+            session_start_unix_seconds: item
+                .source_started_at
+                .as_deref()
+                .and_then(rfc3339_unix_seconds),
+            duplicated_elsewhere: false,
+        };
+        let identity = classify_ref(evidence, &facts);
+        RequestSink::note_desktop_activity(
+            &mut activity,
+            item,
+            original,
+            ActivityRequest {
+                request_id,
+                occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
+                timestamp,
+            },
+            identity,
+        );
+    }
+    activity
+}
+
+fn keeps_markerless_account(item: &SnapshotItem) -> bool {
+    item.claude_org_markers.is_none()
+        && super::exact_session_account_hash(item).is_some()
+        && item.claude_money.as_deref().is_some_and(|fold| {
+            let mut partitions = fold.entity.grains.keys().map(|(_, _, account)| account);
+            let first = partitions.next();
+            partitions.all(|account| Some(account) == first)
+        })
+        && item
+            .claude_money
+            .as_deref()
+            .and_then(|fold| fold.accounts.as_deref())
+            .is_some_and(|accounts| accounts.starting.is_some() && !accounts.conflict)
+}
+
 fn tag_item(
     item: &mut SnapshotItem,
     evidence: &ScanEvidence<'_>,
     reported: &mut BTreeMap<String, Grouping>,
     ownership: &TranscriptOwnership<'_>,
 ) -> Option<Result<Tagged, Ineligible>> {
+    if super::claude_request_money::e2::enabled()
+        && super::claude_history_upgrade::is_request_owned_literal(item)
+    {
+        if item
+            .model_usage
+            .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| &bucket.model_usage),
+            )
+            .any(|row| !local_subscription(row))
+        {
+            return None;
+        }
+        // Single-account markerless bodies keep their established D1 wire
+        // shape. The account owner already tagged their final usage uniformly.
+        if keeps_markerless_account(item) {
+            return None;
+        }
+        let grouping = request_owned_grouping(item, None)?;
+        let lifecycle = (
+            item.source_started_at.clone(),
+            item.source_ended_at.clone(),
+            item.source_last_activity_at.clone(),
+        );
+        let prior_refusals = item.request_identity_refusals;
+        normalize_activity(item);
+        let tagged = apply_grouped(item, grouping);
+        if tagged.is_err() {
+            (
+                item.source_started_at,
+                item.source_ended_at,
+                item.source_last_activity_at,
+            ) = lifecycle;
+            return Some(tagged);
+        }
+        if matches!(tagged, Ok(Tagged::Sent { .. })) {
+            return Some(tagged);
+        }
+        let fallback = item
+            .claude_money
+            .as_deref()?
+            .accounts
+            .as_deref()?
+            .fallback
+            .clone();
+        let grouping = request_owned_grouping(item, Some(&fallback))?;
+        item.request_identity_refusals = prior_refusals;
+        let tagged = apply_grouped(item, grouping);
+        if tagged.is_err() {
+            (
+                item.source_started_at,
+                item.source_ended_at,
+                item.source_last_activity_at,
+            ) = lifecycle;
+        }
+        return Some(tagged);
+    }
     let root = owner_root(item)?;
     let reported_usage = item.usage_accounting_contract.as_deref() == Some(REPORTED);
     if !item.claude_context_curve_request_index_complete
@@ -2634,9 +3641,26 @@ fn tag_item(
     Some(tagged)
 }
 
-crate::heap_layout_bound::fields!(OrgMarkers; entries, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
+crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
 crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_seconds, process_id, inventory);
 crate::heap_layout_bound::fields!(AccountDisplay; current, history);
 crate::heap_layout_bound::fields!(ActiveSessionCurrentAccount; status, account_identifier_hash, organization_identifier_hash, subscription_product, latest_request_at, unknown_reason);
 crate::heap_layout_bound::fields!(ActiveSessionAccountUse; account_identifier_hash, organization_identifier_hash, subscription_product, request_count, input_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, output_tokens, last_used_at, current);
+
+#[cfg(test)]
+mod request_owned_contract_tests {
+    use super::*;
+    #[test]
+    fn grouping_version_uses_existing_contract_rearm_and_gate_off_stays_identical() {
+        assert_eq!(compiled_cycle_contract(true, false), COLLECTOR);
+        assert_eq!(compiled_cycle_contract(false, true), "");
+        let first = compiled_cycle_contract(true, true);
+        assert_ne!(first, COLLECTOR);
+        assert_eq!(first, compiled_cycle_contract(true, true));
+        assert_eq!(
+            serde_json::to_value(IdentityCounts::default()).unwrap(),
+            json!({})
+        );
+    }
+}

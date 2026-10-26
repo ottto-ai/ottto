@@ -1941,8 +1941,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
     assert_eq!(scan_index_rebuild_manual_override_count(), 1);
 }
 
-#[test]
-fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
+fn every_persisted_field_fixture() -> ScanIndex {
     let mut seed = fixture();
     seed.insert_retry_pending_claude_authority_for_test("valid-family");
     seed.codex_parent_prefix_proofs.insert(
@@ -2046,6 +2045,11 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             "held_audit_progress" => serde_json::json!({
                 "key":"/synthetic/0.jsonl", "due":7, "attempted":true
             }),
+            "claude_money_birth_store" => {
+                let mut store = claude_money_birth_store::BirthStore::default();
+                store.record_observation("session", "/synthetic/0.jsonl", 1);
+                serde_json::to_value(store).unwrap()
+            }
             "traversal" => {
                 serde_json::json!({"context_fingerprint":"context","census_window_end":"2026-10-22T00:00:00Z","scan_roots":["/synthetic"],"pending_directories":[],"pending_candidates":[],"observed_index_keys":["file"],"reconciliation_upper_bound":"file","reconciliation_after":null,"reconciliation_started":true,"counts":{}})
             }
@@ -2096,7 +2100,12 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         };
         value[field] = replacement;
     }
-    let index: ScanIndex = serde_json::from_value(value).unwrap();
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
+    let index = every_persisted_field_fixture();
     let bytes = serde_json::to_vec_pretty(&index).unwrap();
     let encoded: BTreeMap<String, &serde_json::value::RawValue> =
         serde_json::from_slice(&bytes).unwrap();
@@ -2108,6 +2117,58 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
     assert!(decoded.decode_holds.is_empty());
     assert_eq!(serde_json::to_vec_pretty(&decoded).unwrap(), bytes);
+}
+
+#[test]
+fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
+    // Main shipped audit progress first. The earlier E2 writer saved a named
+    // map with birth storage but no audit progress. Neither may lose custody.
+    let seed = every_persisted_field_fixture();
+    let current = serde_json::to_value(&seed).unwrap();
+    let fields = lenient_decode::FIELDS;
+    assert_eq!(
+        &fields[fields.len() - 3..],
+        &[
+            "upload_ack_retirement_handoff",
+            "held_audit_progress",
+            "claude_money_birth_store",
+        ]
+    );
+    for earlier_e2 in [false, true] {
+        let mut legacy = current.clone();
+        legacy.as_object_mut().unwrap().remove(if earlier_e2 {
+            "held_audit_progress"
+        } else {
+            "claude_money_birth_store"
+        });
+        let mut forms = vec![legacy.clone()];
+        if !earlier_e2 {
+            // The main positional schema ends at audit progress; appending E2
+            // must leave every already-shipped position intact.
+            forms.push(Value::Array(
+                fields[..fields.len() - 1]
+                    .iter()
+                    .map(|name| legacy[*name].clone())
+                    .collect(),
+            ));
+        }
+        for form in forms {
+            let bytes = serde_json::to_vec(&form).unwrap();
+            let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+            let streaming =
+                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+            let bounded = lenient_decode::read_bounded(&bytes).unwrap();
+            for decoded in [native, streaming, bounded] {
+                assert!(decoded.decode_holds.is_empty());
+                assert_sibling(&decoded);
+                assert_eq!(
+                    serde_json::to_value(&decoded).unwrap(),
+                    legacy,
+                    "legacy writer earlier_e2={earlier_e2}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

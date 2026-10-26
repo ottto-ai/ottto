@@ -81,6 +81,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use store::{ClaudeLedger, ClaudeLedgerAcquire, PendingMemo, WriteJob};
 
+pub(crate) mod e2;
+mod emit;
+// One owner for the request-owned literal: the history gate.
+pub(crate) use super::claude_history_upgrade::{
+    is_request_owned_literal, request_owned_family_root,
+};
+
 pub(crate) const CLAUDE_REQUEST_COUNTING: &str = "claude_request_counting:v1";
 /// Row format of the JSONL (B1 reader `claude_money_shadow_report.py`).
 const JSONL_VERSION: u8 = 3;
@@ -456,7 +463,7 @@ fn shadow_enabled(support_dir: &Path) -> bool {
     #[cfg(not(test))]
     {
         let _ = support_dir;
-        true
+        false
     }
 }
 
