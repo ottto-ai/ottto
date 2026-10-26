@@ -88,6 +88,30 @@ pub(super) fn record_upload_error_cadence(
     }
 }
 
+/// #778 R2-3: over-capacity debt that only a complete census can retire.
+/// Counts consecutive capacity stops whose scan could not prove absence; any
+/// other finish outcome resets it. Process-local count, never uploaded.
+static INCOMPLETE_CENSUS_CAPACITY_STOPS: Mutex<BTreeMap<&'static str, u64>> =
+    Mutex::new(BTreeMap::new());
+
+pub(super) fn note_capacity_stop_census(
+    source: SnapshotSource,
+    capacity_stop: bool,
+    census_complete: bool,
+) -> u64 {
+    let mut stops = INCOMPLETE_CENSUS_CAPACITY_STOPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if capacity_stop && !census_complete {
+        let count = stops.entry(source.api_slug()).or_default();
+        *count = count.saturating_add(1);
+        *count
+    } else {
+        stops.remove(source.api_slug());
+        0
+    }
+}
+
 impl SnapshotUploadProgress {
     pub(super) fn configure_ack_capacity(&mut self, committed: &ScanIndex) {
         // Only already-held live ACKs grant extra slots. Unindexed debt never
@@ -179,6 +203,7 @@ impl SnapshotUploadProgress {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn release_acks_after_partial_index_save(
         &mut self,
         path: &Path,
@@ -187,8 +212,35 @@ impl SnapshotUploadProgress {
         locally_held: &BTreeSet<String>,
         keep_adopted_for_retry: bool,
     ) -> Result<()> {
+        self.release_acks_after_partial_index_save_with_scan(
+            path,
+            previous,
+            saved,
+            None,
+            locally_held,
+            keep_adopted_for_retry,
+        )
+    }
+
+    /// `scanned` is the pre-selection scan index of this partial save. An
+    /// entity it still references stays live even when the committable subset
+    /// dropped its new, unsettled file (#778 R2-2).
+    pub(super) fn release_acks_after_partial_index_save_with_scan(
+        &mut self,
+        path: &Path,
+        previous: &ScanIndex,
+        saved: &ScanIndex,
+        scanned: Option<&ScanIndex>,
+        locally_held: &BTreeSet<String>,
+        keep_adopted_for_retry: bool,
+    ) -> Result<()> {
         let mut retired = self.retired_ack_candidates(previous, saved);
         retired.extend(self.saved_retirement_candidates(saved));
+        if let Some(scanned) = scanned {
+            for fp in scanned.upload_progress_ack_incidence() {
+                retired.remove(fp);
+            }
+        }
         let before = self.accepted_fingerprints.len();
         if keep_adopted_for_retry {
             // The retained retry driver still reads this resume ledger. Keep
@@ -290,6 +342,26 @@ impl SnapshotUploadProgress {
         locally_held: &BTreeSet<String>,
         census_absent: &BTreeSet<String>,
     ) -> Result<()> {
+        self.stage_ack_retirement_handoff_with_scan(
+            previous,
+            selected,
+            None,
+            locally_held,
+            census_absent,
+        )
+    }
+
+    /// A partial save passes its pre-selection scan index as `scanned`. Its
+    /// committable subset can omit a new, unsettled file that still contains a
+    /// candidate; such an obligation stays pending, never promoted (#778 R2-2).
+    pub(super) fn stage_ack_retirement_handoff_with_scan(
+        &self,
+        previous: &ScanIndex,
+        selected: &mut ScanIndex,
+        scanned: Option<&ScanIndex>,
+        locally_held: &BTreeSet<String>,
+        census_absent: &BTreeSet<String>,
+    ) -> Result<()> {
         // Keep unresolved obligations across opaque/held saves instead of
         // forgetting them when the same save removes their last incidence.
         let mut candidates = previous
@@ -324,6 +396,15 @@ impl SnapshotUploadProgress {
                 live.insert(fp.to_owned());
             }
         }
+        // Scratch is bounded by the candidate set, not a second index census.
+        let mut scan_live = BTreeSet::new();
+        if let Some(scanned) = scanned {
+            for fp in scanned.upload_progress_ack_incidence() {
+                if candidates.contains(fp) && !live.contains(fp) {
+                    scan_live.insert(fp.to_owned());
+                }
+            }
+        }
         let unknown = selected.upload_progress_ack_incidence_unknown();
         let mut bodies = BTreeMap::new();
         let mut pending_bodies = BTreeMap::new();
@@ -331,7 +412,11 @@ impl SnapshotUploadProgress {
             let Some(body) = self.accepted_body_witnesses.get(&fp) else {
                 continue;
             };
-            if unknown || locally_held.contains(&fp) || selected.decode_holds_entity(&fp) {
+            if unknown
+                || locally_held.contains(&fp)
+                || selected.decode_holds_entity(&fp)
+                || scan_live.contains(&fp)
+            {
                 pending_bodies.insert(fp, body.clone());
             } else if !live.contains(&fp) {
                 bodies.insert(fp, body.clone());

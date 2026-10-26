@@ -2885,9 +2885,10 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         index,
         correction_scan.is_some_and(|scan| scan.census_complete),
     );
-    progress.stage_ack_retirement_handoff_with_census(
+    progress.stage_ack_retirement_handoff_with_scan(
         committed_index,
         &mut committable,
+        Some(index),
         locally_held,
         &census_absent,
     )?;
@@ -7427,10 +7428,11 @@ fn finish_sync_source(
             ) {
                 Ok(committable) => {
                     note_codex_side_saved(daemon, &index_path, false, side_mark);
-                    upload_progress.release_acks_after_partial_index_save(
+                    upload_progress.release_acks_after_partial_index_save_with_scan(
                         &upload_progress_path,
                         &committed_index,
                         &committable,
+                        Some(&index),
                         locally_held_fingerprints,
                         true,
                     )?;
@@ -7553,15 +7555,18 @@ fn finish_sync_source(
                     Some(UnsettledUploadCause::UploadError),
                 ) {
                     Ok(committable) => {
-                        index = committable;
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
-                        upload_progress.release_acks_after_partial_index_save(
+                        // Release against the full scan before `index` becomes
+                        // the committable subset (#778 R2-2).
+                        upload_progress.release_acks_after_partial_index_save_with_scan(
                             &upload_progress_path,
                             &committed_index,
-                            &index,
+                            &committable,
+                            Some(&index),
                             locally_held_fingerprints,
                             false,
                         )?;
+                        index = committable;
                     }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
@@ -7580,13 +7585,21 @@ fn finish_sync_source(
             // Distinguish local serializer drift, authorization failures, and
             // backend payload rejection. The resumable driver has already
             // checkpointed every accepted sibling before this terminal error.
+            let incomplete_census_stops = ack_retention::note_capacity_stop_census(
+                source,
+                error
+                    .downcast_ref::<ack_retention::AckSettlementRequired>()
+                    .is_some(),
+                scan_result.census_complete,
+            );
             let (state, context) = if let Some(settlement) =
                 error.downcast_ref::<ack_retention::AckSettlementRequired>()
             {
                 eprintln!(
-                    "ottto-service: local snapshot upload deferred for {} — {}",
+                    "ottto-service: local snapshot upload deferred for {} — {} consecutive_incomplete_census_stops={}",
                     source.api_slug(),
-                    upload_failure_diagnostic(&error)
+                    upload_failure_diagnostic(&error),
+                    incomplete_census_stops
                 );
                 (
                     settlement.collector_state(),
@@ -7872,6 +7885,7 @@ fn finish_sync_source(
     // durably committed its accepted siblings, but remains a source failure so
     // it returns to the retry cadence instead of advertising a clean terminal
     // scan. The sweep marker is stamped only for fully settled scans.
+    ack_retention::note_capacity_stop_census(source, false, scan_result.census_complete);
     with_source_cadence(source, |cadence| {
         let now = Instant::now();
         record_finished_snapshot_cadence(
