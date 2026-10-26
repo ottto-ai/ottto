@@ -31,6 +31,39 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// Inline fields are paid by their containing slot and own no allocation.
+// Visit only owned heaps: scalar-by-scalar walks otherwise exhaust the
+// native frame's 4096-visit guard even when the frame uses under 1 MiB.
+// Destructuring is exhaustive; a field moved into the inline group must
+// prove INLINE_ONLY before the walk can succeed. Byte/visit caps stay native.
+macro_rules! money_heap_fields {
+    ($t:ty; inline: [$($inline:ident),*]; heap: [$($heap:ident),*]) => {
+        impl crate::heap_layout_bound::HeapLayoutBound for $t {
+            fn stable_heap(&self) -> bool {
+                let Self { $($inline,)* $($heap,)* } = self;
+                true $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($inline))*
+                    $(&& crate::heap_layout_bound::HeapLayoutBound::stable_heap($heap))*
+            }
+            fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+                let Self { $($inline,)* $($heap,)* } = self;
+                $(require_inline($inline)?;)*
+                $(crate::heap_layout_bound::HeapLayoutBound::heap_bound($heap, c)?;)*
+                Some(())
+            }
+            fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+                let Self { $($inline,)* $($heap,)* } = self;
+                $(require_inline($inline)?;)*
+                $(crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound($heap, c)?;)*
+                Some(())
+            }
+        }
+    };
+}
+#[inline(always)]
+fn require_inline<T: crate::heap_layout_bound::HeapLayoutBound>(_: &T) -> Option<()> {
+    T::INLINE_ONLY.then_some(())
+}
+
 pub(crate) const GATE: bool = false;
 /// A record this much older than its file's effective birth was copied in.
 /// Copies written within it are counted (known residual, disclosed nowhere).
@@ -467,7 +500,7 @@ pub(super) struct DarkTally {
     /// (unix hour, estimated requests), sorted by hour.
     estimated: Vec<(u32, u32)>,
 }
-crate::heap_layout_bound::fields!(DarkTally; side, estimated);
+money_heap_fields!(DarkTally; inline: [side]; heap: [estimated]);
 impl DarkTally {
     fn add(
         &mut self,
@@ -552,7 +585,7 @@ fn hour_key(timestamp: &str) -> Option<ClaudeLiveKey> {
     let (bucket, _) = super::super::activity_bucket_from_timestamp(timestamp)?;
     Some((bucket, String::new(), BTreeMap::new()))
 }
-crate::heap_layout_bound::fields!(ClaudeEntityBody; grains, bucket_activity, removed, removed_requests, telemetry_owned_complete, resolver_conflicts, held, certificate_ok, activity_unix, activity_nanos, dark);
+money_heap_fields!(ClaudeEntityBody; inline: [removed, removed_requests, telemetry_owned_complete, resolver_conflicts, held, certificate_ok, activity_unix, activity_nanos]; heap: [grains, bucket_activity, dark]);
 // Existing grain types were inline P1 values; E retains only the aggregate.
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeGrainSide {
     const INLINE_ONLY: bool = true;
@@ -595,7 +628,7 @@ struct FoldTelemetry {
     /// lookups; collisions are checked against the existing request sets.
     membership: FamilyMembership,
 }
-crate::heap_layout_bound::fields!(FoldTelemetry; read, complete, start_bucket, side_candidates, side_calls_done, membership);
+money_heap_fields!(FoldTelemetry; inline: [read, complete, side_candidates, side_calls_done]; heap: [start_bucket, membership]);
 
 /// Elapsed work is diagnostic, never part of native scan identity or parity.
 /// Keep Debug deterministic while retaining the measured value for receipts.
@@ -657,7 +690,7 @@ pub(crate) struct FileFold {
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
 }
-crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, copied, first_own, ambiguous, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, telemetry, accounts);
+money_heap_fields!(FileFold; inline: [physical, role, location, copied, first_own, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests]; heap: [entity, money_birth, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, ambiguous, telemetry, accounts]);
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,
@@ -1331,7 +1364,7 @@ struct FamilyMembership {
     entries: Vec<u64>,
     member_mask: u64,
 }
-crate::heap_layout_bound::fields!(FamilyMembership; entries, member_mask);
+money_heap_fields!(FamilyMembership; inline: [member_mask]; heap: [entries]);
 
 /// Attach and subtraction share this one view, consumed before candidate
 /// hashes and trace owners are allocated. Indices are into the unchanged page.

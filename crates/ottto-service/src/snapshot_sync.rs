@@ -5457,11 +5457,8 @@ fn try_collect_native_preparation_with_rotation_observed(
             );
             frame.accept_native_rotation_turn(remaining);
             if self.require_bound {
-                let mut diagnostic = crate::heap_layout_bound::Counter::new(usize::MAX);
-                let measured =
-                    crate::heap_layout_bound::HeapLayoutBound::heap_bound(&frame, &mut diagnostic);
                 assert!(crate::heap_layout_bound::bound(&frame, crate::source_rotation::PARKED_BUDGET).is_some(),
-                    "the real source frame must pass its real existing requested-layout budget; no substitute bound; heap={:?} bytes={} visits={}", measured, diagnostic.bytes, diagnostic.visits_for_test());
+                    "the real source frame must pass its real existing requested-layout budget; no substitute bound");
             } else if self.require_parking_refusal && !self.parking_refused {
                 // Evaluate the real Owner::bound on the actual moving frame,
                 // including both indexes and the ordinary candidate queue.
