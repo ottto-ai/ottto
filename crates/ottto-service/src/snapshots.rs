@@ -13212,6 +13212,10 @@ fn rebuild_retagged_model_usage(item: &mut SnapshotItem) {
 }
 
 fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
+    rebuild_snapshot_model_usage_with(item, &mut SelectorHashes::default());
+}
+
+fn rebuild_snapshot_model_usage_with(item: &mut SnapshotItem, hashes: &mut SelectorHashes) {
     let account_hashes = item
         .usage_buckets
         .iter()
@@ -13230,7 +13234,7 @@ fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
     let mut session_rows: BTreeMap<RowKey, BucketRowAccumulator> = BTreeMap::new();
     for bucket in &item.usage_buckets {
         for row in &bucket.model_usage {
-            let key = row_key_from_model_usage(row);
+            let key = hashes.row_key(row);
             merge_session_row(
                 &mut session_rows,
                 key,
@@ -14853,13 +14857,44 @@ fn usage_totals_equal(left: &UsageTotals, right: &UsageTotals) -> bool {
 }
 
 fn row_key_from_model_usage(row: &SnapshotModelUsage) -> RowKey {
-    let selector_hash = if row.selector_context.is_empty() {
+    row_key_with_selector_hash(row, selector_hash(&row.selector_context))
+}
+
+fn selector_hash(selector_context: &BTreeMap<String, String>) -> String {
+    if selector_context.is_empty() {
         "base".to_string()
     } else {
-        let payload =
-            serde_json::to_string(&row.selector_context).unwrap_or_else(|_| "{}".to_string());
+        let payload = serde_json::to_string(selector_context).unwrap_or_else(|_| "{}".to_string());
         sha256_hex(&[payload.as_str()])[..16].to_string()
-    };
+    }
+}
+
+/// Call-local memo for one row rebuild: a session's rows share a handful of
+/// selector contexts, so each distinct context is serialized and hashed once.
+/// Bounded; dropped with the caller.
+#[derive(Default)]
+struct SelectorHashes(Vec<(BTreeMap<String, String>, String)>);
+
+impl SelectorHashes {
+    const CAP: usize = 16;
+
+    fn row_key(&mut self, row: &SnapshotModelUsage) -> RowKey {
+        let context = &row.selector_context;
+        let hash = match self.0.iter().find(|(known, _)| known == context) {
+            Some((_, hash)) => hash.clone(),
+            None => {
+                let hash = selector_hash(context);
+                if self.0.len() < Self::CAP {
+                    self.0.push((context.clone(), hash.clone()));
+                }
+                hash
+            }
+        };
+        row_key_with_selector_hash(row, hash)
+    }
+}
+
+fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -> RowKey {
     RowKey {
         model: row.model.clone(),
         selector_hash,

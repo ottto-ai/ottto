@@ -9092,6 +9092,19 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         ),
     };
     drop(identity_evidence);
+    // E2 grains have served their last consumer: contract 5 and account
+    // qualification now own the final rows. Do not retain or clone the fold
+    // alongside upload entities. A withheld entity still needs its original
+    // fold for the hold; it has no request-owned emitted body.
+    for item in &mut scan_result.snapshots {
+        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
+            #[cfg(test)]
+            if let Some(fold) = item.claude_money.as_deref() {
+                crate::snapshots::claude_request_money::e2::pipeline_test_observer::releasing(fold);
+            }
+            item.claude_money = None;
+        }
+    }
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {

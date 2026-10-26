@@ -19,7 +19,10 @@ use super::super::{
     ClaudeTranscriptUsageOccurrence, PlacedClaudeUsage, RowKey, ScanIndex, ScanTraversalCheckpoint,
     ScanTraversalPath, SelectorCapture, SnapshotItem, UsageTotals,
 };
-use super::body::{reported_inputs, ClaudeGrainSide, ClaudeLiveKey, ClaudeRequestUsageOrigin};
+use super::body::{
+    reported_inputs, reported_model_effort, ClaudeGrainSide, ClaudeLiveKey,
+    ClaudeRequestUsageOrigin,
+};
 use super::ClaudeMoneyTokens;
 use crate::claude_local_otel::{
     ClaudeApiEvidenceRead, ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport,
@@ -30,6 +33,7 @@ use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Inline fields are paid by their containing slot and own no allocation.
@@ -574,6 +578,31 @@ impl ClaudeEntityBody {
         grain.add(tokens, requests, cost);
         grain.last_own_at = grain.last_own_at.max(at);
     }
+    /// Gate on, `add` into an existing slot: the key is cloned only when
+    /// the slot is new.
+    fn add_slot(
+        &mut self,
+        slot: &(
+            ClaudeLiveKey,
+            Option<ClaudeRequestUsageOrigin>,
+            AccountPartition,
+        ),
+        tokens: &ClaudeMoneyTokens,
+        requests: u64,
+        cost: Option<u64>,
+        at: Option<i128>,
+    ) {
+        self.live_maps_initialized = true;
+        if let Some(at) = at {
+            self.note_activity(&slot.0 .0, at, at);
+        }
+        let grain = match self.grains.get_mut(slot) {
+            Some(grain) => grain,
+            None => self.grains.entry(slot.clone()).or_default(),
+        };
+        grain.add(tokens, requests, cost);
+        grain.last_own_at = grain.last_own_at.max(at);
+    }
     fn note_activity(&mut self, bucket: &str, first: i128, last: i128) {
         self.live_maps_initialized = true;
         match self.bucket_activity.get_mut(bucket) {
@@ -915,8 +944,9 @@ pub(crate) struct FileFold {
     model_fallbacks: BTreeMap<u64, String>,
     /// Held pre-birth responses, as half-open sequence ranges.
     skipped: Vec<(u64, u64)>,
-    /// Pre-birth grains held until finish_native confirms the skip.
-    copy: ClaudeEntityBody,
+    /// Pre-birth grains held until finish_native confirms the skip. Sparse:
+    /// most files have none, and finish_native drops them before page attach.
+    copy: Option<Box<ClaudeEntityBody>>,
     /// Held copies without a request id: no census can prove them, so a
     /// proof-checked skip counts them after all. Rare, so boxed.
     idless_copy: Option<Box<ClaudeEntityBody>>,
@@ -1163,22 +1193,23 @@ impl FileFold {
         if placed.fell_back && live {
             self.model_fallbacks.insert(sequence, placed.model.clone());
         }
-        let Some(key) = placed.placement.as_ref().map(|placement| {
-            if !live {
-                return (placement.bucket.clone(), String::new(), BTreeMap::new());
-            }
-            live_key(
+        let Some(placement) = placed.placement.as_ref() else {
+            // Native drops it as unplaceable usage; never publish over it.
+            self.entity.certificate_ok = false;
+            self.disclose("unplaceable", 1);
+            return;
+        };
+        // Gate off keeps only the hour tally: read the hour, build no key.
+        let key = if live {
+            Grain::Live(live_key(
                 &placed.model,
                 placement.bucket.clone(),
                 placement.reduced_context.clone(),
                 &placement.row_key,
                 effort,
-            )
-        }) else {
-            // Native drops it as unplaceable usage; never publish over it.
-            self.entity.certificate_ok = false;
-            self.disclose("unplaceable", 1);
-            return;
+            ))
+        } else {
+            Grain::Hour(bucket_hour(&placement.bucket))
         };
         let account = self.accounts.as_mut().and_then(|accounts| {
             accounts.observe(sequence, copied == Some(true));
@@ -1191,17 +1222,26 @@ impl FileFold {
             self.entity.removed.add(&tokens);
             self.entity.removed_requests += requests;
             if !has_request_id {
-                self.idless_copy
-                    .get_or_insert_with(Box::default)
-                    .add(key, &tokens, requests, None, None, at, account);
+                key.put(
+                    self.idless_copy.get_or_insert_with(Box::default),
+                    &tokens,
+                    requests,
+                    at,
+                    account,
+                );
                 return;
             }
             match self.skipped.last_mut() {
                 Some((_, end)) if *end == sequence => *end += 1,
                 _ => self.skipped.push((sequence, sequence + 1)),
             }
-            self.copy
-                .add(key, &tokens, requests, None, None, at, account);
+            key.put(
+                self.copy.get_or_insert_with(Box::default),
+                &tokens,
+                requests,
+                at,
+                account,
+            );
             return;
         }
         if copied.is_none() && self.money_birth.birth_nanos().is_some() {
@@ -1221,7 +1261,7 @@ impl FileFold {
                 .or_default(),
             None => &mut self.entity,
         };
-        into.add(key, &tokens, requests, None, None, at, account);
+        key.put(into, &tokens, requests, at, account);
     }
 
     /// Confirm, or undo, the held pre-birth skip. A partial copy (own lines
@@ -1302,8 +1342,9 @@ impl FileFold {
             self.keep_copies(false, markers);
             return;
         }
-        let copy = std::mem::take(&mut self.copy);
-        self.entity.absorb_grains(&copy);
+        if let Some(copy) = self.copy.take() {
+            self.entity.absorb_grains(&copy);
+        }
         if let Some(idless) = self.idless_copy.take() {
             self.entity.absorb_grains(&idless);
         }
@@ -1325,7 +1366,7 @@ impl FileFold {
         markers: Option<&claude_request_identity::OrgMarkers>,
     ) {
         self.finish_identity_start(prefix_excluded, markers);
-        self.copy = Default::default();
+        self.copy = None;
     }
 
     fn finish_identity_start(
@@ -1540,6 +1581,29 @@ fn grain_key(
         &placed.row_key,
         effort,
     ))
+}
+
+/// One observed response's slot: its grain key (gate on) or its estimated
+/// hour (gate off, what `ClaudeEntityBody::add` keeps of an origin-less key).
+enum Grain {
+    Live(ClaudeLiveKey),
+    Hour(Option<u32>),
+}
+
+impl Grain {
+    fn put(
+        self,
+        into: &mut ClaudeEntityBody,
+        tokens: &ClaudeMoneyTokens,
+        requests: u64,
+        at: Option<i128>,
+        account: AccountPartition,
+    ) {
+        match self {
+            Grain::Live(key) => into.add(key, tokens, requests, None, None, at, account),
+            Grain::Hour(hour) => into.dark.add(hour, tokens, requests, None),
+        }
+    }
 }
 
 /// A native placement as the E2 grain key: its bucket and reduced context
@@ -2100,7 +2164,12 @@ fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
 /// reported grain: priced => telemetry_matched, no cost => telemetry_unpriced
 /// (server rule). Counts never change. False when the estimated grain cannot
 /// give it back (then it stays estimated and is disclosed).
-fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
+fn attach_one(
+    item: &mut SnapshotItem,
+    holder: usize,
+    row: &ClaudeLocalOtelEvidence,
+    memo: &mut AttachMemo,
+) -> bool {
     let SnapshotItem {
         claude_money: Some(fold),
         claude_usage_occurrences,
@@ -2112,43 +2181,213 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
     let Some(occurrence) = claude_usage_occurrences.get_mut(row.request_id.as_str()) else {
         return false;
     };
-    let Some(estimated) = fold.occurrence_key(occurrence) else {
+    if !enabled() {
+        let attached = attach_dark(fold, occurrence, row);
+        occurrence.telemetry_attached |= attached;
+        return attached;
+    }
+    // The hour the estimated key is placed in (`occurrence_key`): its clock,
+    // else the file's fallback; none or unreadable places no key.
+    let clock = occurrence.timestamp.as_deref();
+    let Some(hour) = clock
+        .or(fold.bucket_fallback.as_deref())
+        .and_then(rfc3339_unix_nanos)
+        .map(|nanos| nanos.div_euclid(HOUR_NANOS))
+    else {
         return false;
     };
-    let Some(reported) = reported_key(row, Some(occurrence), &fold.base_selector) else {
-        return false;
-    };
-    let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
-    let requests = occurrence.usage.request_count;
     let account = fold
         .accounts
         .as_ref()
         .and_then(|a| a.account(occurrence.sequence));
-    let slot = (estimated, None, account.clone());
-    if !fold.entity.take_estimated(&slot, &tokens, requests) {
+    let shared = SlotInputs {
+        holder,
+        model: occurrence.model.as_deref().unwrap_or_else(|| {
+            fold.model_fallbacks
+                .get(&occurrence.sequence)
+                .map_or("unknown", String::as_str)
+        }),
+        selector: Arc::as_ptr(&occurrence.selector) as usize,
+        speed: "",
+        effort: occurrence.reasoning_effort.as_deref(),
+        hour,
+        account: account.as_ref().map_or(0, |key| Arc::as_ptr(key) as usize),
+        origin: None,
+    };
+    let Some(estimated) = memo.estimated.get(shared, || {
+        let key = fold.occurrence_key(occurrence)?;
+        Some((key, None, account.clone()))
+    }) else {
         return false;
-    }
-    // Keep the existing wire bucket activity clock. Identity independently
-    // folds own-request clocks after attachment; observer time never decides
-    // the local current account.
-    let at = (reported.0 != slot.0 .0)
-        .then(|| rfc3339_unix_nanos(&row.observed_at))
-        .flatten();
+    };
+    // `reported_key`'s inputs (`reported_inputs`): the transcript's clock
+    // wins, else the row's; the row's speed joins the selector.
+    let Some(reported_hour) = (match clock {
+        Some(_) => Some(hour),
+        None => rfc3339_unix_nanos(&row.observed_at).map(|nanos| nanos.div_euclid(HOUR_NANOS)),
+    }) else {
+        return false;
+    };
     let origin = if row.cost_usd_micros.is_some() {
         ClaudeRequestUsageOrigin::TelemetryMatched
     } else {
         ClaudeRequestUsageOrigin::TelemetryUnpriced
     };
-    fold.entity.add(
-        reported,
-        &tokens,
-        requests,
-        row.cost_usd_micros,
-        Some(origin),
-        at,
-        account,
-    );
+    let (model, effort) = reported_model_effort(&row.model, &row.effort, Some(occurrence));
+    let inputs = SlotInputs {
+        model,
+        speed: &row.speed,
+        effort,
+        hour: reported_hour,
+        origin: Some(origin),
+        ..shared
+    };
+    let Some(reported) = memo.reported.get(inputs, || {
+        let key = reported_key(row, Some(occurrence), &fold.base_selector)?;
+        Some((key, Some(origin), account.clone()))
+    }) else {
+        return false;
+    };
+    let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
+    let requests = occurrence.usage.request_count;
+    if !fold.entity.take_estimated(estimated, &tokens, requests) {
+        return false;
+    }
+    // Keep the existing wire bucket activity clock. Identity independently
+    // folds own-request clocks after attachment; observer time never decides
+    // the local current account.
+    let at = (reported.0 .0 != estimated.0 .0)
+        .then(|| rfc3339_unix_nanos(&row.observed_at))
+        .flatten();
+    fold.entity
+        .add_slot(reported, &tokens, requests, row.cost_usd_micros, at);
     occurrence.telemetry_attached = true;
+    true
+}
+
+/// A grain slot: its key, origin and account partition.
+type Slot = (
+    ClaudeLiveKey,
+    Option<ClaudeRequestUsageOrigin>,
+    AccountPartition,
+);
+
+/// What places a matched row's slot. Equal inputs place equal keys: the
+/// holder fixes the fold (base selector, fallback clock, model fallbacks),
+/// the selector is the occurrence's shared one (one per distinct value in a
+/// file) and the account its shared partition, so pointers identify them
+/// while the page holds them.
+#[derive(Clone, Copy)]
+struct SlotInputs<'a> {
+    holder: usize,
+    model: &'a str,
+    selector: usize,
+    speed: &'a str,
+    effort: Option<&'a str>,
+    hour: i128,
+    account: usize,
+    origin: Option<ClaudeRequestUsageOrigin>,
+}
+struct PlacedSlot {
+    holder: usize,
+    model: String,
+    selector: usize,
+    speed: String,
+    effort: Option<String>,
+    hour: i128,
+    account: usize,
+    origin: Option<ClaudeRequestUsageOrigin>,
+    slot: Option<Slot>,
+}
+impl PlacedSlot {
+    fn placed_by(&self, inputs: &SlotInputs<'_>) -> bool {
+        self.holder == inputs.holder
+            && self.hour == inputs.hour
+            && self.selector == inputs.selector
+            && self.account == inputs.account
+            && self.origin == inputs.origin
+            && self.model == inputs.model
+            && self.speed == inputs.speed
+            && self.effort.as_deref() == inputs.effort
+    }
+}
+
+/// A family's matched rows repeat a few slots (one holder, hour, model):
+/// each is placed once for its run of rows. Transient per family and bounded
+/// (`MEMO_SLOTS`, recycled in turn), so it never grows with the page.
+#[derive(Default)]
+struct SlotMemo {
+    placed: Vec<PlacedSlot>,
+    next: usize,
+}
+const MEMO_SLOTS: usize = 8;
+impl SlotMemo {
+    fn get(
+        &mut self,
+        inputs: SlotInputs<'_>,
+        place: impl FnOnce() -> Option<Slot>,
+    ) -> Option<&Slot> {
+        let at = match self
+            .placed
+            .iter()
+            .position(|placed| placed.placed_by(&inputs))
+        {
+            Some(at) => at,
+            None => {
+                let placed = PlacedSlot {
+                    holder: inputs.holder,
+                    model: inputs.model.to_owned(),
+                    selector: inputs.selector,
+                    speed: inputs.speed.to_owned(),
+                    effort: inputs.effort.map(str::to_owned),
+                    hour: inputs.hour,
+                    account: inputs.account,
+                    origin: inputs.origin,
+                    slot: place(),
+                };
+                if self.placed.len() < MEMO_SLOTS {
+                    self.placed.push(placed);
+                    self.placed.len() - 1
+                } else {
+                    let at = self.next;
+                    self.placed[at] = placed;
+                    self.next = (at + 1) % MEMO_SLOTS;
+                    at
+                }
+            }
+        };
+        self.placed[at].slot.as_ref()
+    }
+}
+#[derive(Default)]
+struct AttachMemo {
+    estimated: SlotMemo,
+    reported: SlotMemo,
+}
+
+/// Gate off, `attach_one` without a grain map: the same checks and the same
+/// tally moves. The estimated slot is its hour (`occurrence_key`, then
+/// `take_estimated`'s fallback); the reported key only has to exist, and
+/// with a transcript clock it is that clock's hour, already checked. The
+/// tally ignores the reported key and clock, so neither is built.
+fn attach_dark(
+    fold: &mut FileFold,
+    occurrence: &ClaudeTranscriptUsageOccurrence,
+    row: &ClaudeLocalOtelEvidence,
+) -> bool {
+    let Some(estimated) = fold.occurrence_key(occurrence) else {
+        return false;
+    };
+    if occurrence.timestamp.is_none() && hour_key(&row.observed_at).is_none() {
+        return false;
+    }
+    let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
+    let requests = occurrence.usage.request_count;
+    let tally = &mut fold.entity.dark;
+    if !bucket_hour(&estimated.0).is_some_and(|hour| tally.take(hour, &tokens, requests)) {
+        return false;
+    }
+    tally.add(None, &tokens, requests, row.cost_usd_micros);
     true
 }
 
@@ -2253,6 +2492,7 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
             family_membership(&items.borrow(), members)
         });
         let mut disclosed = 0u64;
+        let mut memo = AttachMemo::default();
         let counts = timed("attach.join", || {
             join(
                 report,
@@ -2275,7 +2515,7 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
                 |event| match event {
                     Attachment::Matched { row, holder } => timed("attach.attach_one", || {
                         let mut items = items.borrow_mut();
-                        if !attach_one(&mut items[holder], row) {
+                        if !attach_one(&mut items[holder], holder, row, &mut memo) {
                             disclosed += 1;
                             diag("attach_lost", 1);
                         }
@@ -2742,6 +2982,14 @@ pub(crate) fn finish_page(
     let _spent = PageSpent::start("page.finish");
     struct Session {
         entity: ClaudeEntityBody,
+        /// A single-path session's entity is moved out of its fold, not
+        /// cloned. A path twin's arrival keeps the first fold's own entity
+        /// here, so a withheld session's items stay unchanged.
+        first_original: Option<ClaudeEntityBody>,
+        /// The first fold's own (telemetry_owned_complete, held,
+        /// activity_nanos, clock_incomplete), restored on a withheld session.
+        first_undo: (bool, bool, i128, bool),
+        folds: usize,
         complete: bool,
         locations: Vec<LocationKey>,
         /// Decision counters, recorded once the session is decided.
@@ -2765,10 +3013,17 @@ pub(crate) fn finish_page(
         claude_request_identity::record_page_identity_counts(items);
     }
     let mut sessions = BTreeMap::<&str, Session>::new();
-    for item in items.iter() {
-        let Some(fold) = item.claude_money.as_deref() else {
+    for item in items.iter_mut() {
+        let SnapshotItem {
+            claude_money: Some(fold),
+            source_session_id,
+            claude_usage_occurrences,
+            ..
+        } = item
+        else {
             continue;
         };
+        let source_session_id: &String = source_session_id;
         // Work counts on every read; decisions only when decided (below).
         diag_max("max_file_fold_us", fold.e2_nanos.0 / 1_000);
         record_counts(Counts([
@@ -2781,9 +3036,12 @@ pub(crate) fn finish_page(
             0,
         ]));
         let session = sessions
-            .entry(item.source_session_id.as_str())
+            .entry(source_session_id.as_str())
             .or_insert_with(|| Session {
                 entity: Default::default(),
+                first_original: None,
+                first_undo: Default::default(),
+                folds: 0,
                 complete: telemetry == TelemetryRead::Loaded,
                 locations: Vec::new(),
                 decided: Counts::default(),
@@ -2800,19 +3058,36 @@ pub(crate) fn finish_page(
             fold.root_fallbacks,
             fold.entity.resolver_conflicts,
         ]));
-        session.entity.sum(&fold.entity);
-        session.entity.clock_incomplete |=
-            item.claude_usage_occurrences.values().any(|occurrence| {
-                !occurrence.usage.is_zero()
-                    && !fold.is_skipped(occurrence.sequence)
-                    && (!occurrence.event_clock_complete
-                        || occurrence
-                            .timestamp
-                            .as_deref()
-                            .and_then(rfc3339_unix_nanos)
-                            .is_none())
-            });
         session.complete &= fold.telemetry_complete();
+        session.folds += 1;
+        if session.folds == 1 {
+            // Exactly the sum of one fold into an empty body (activity never
+            // below the empty body's zero), without cloning its grains.
+            session.entity = std::mem::take(&mut fold.entity);
+            let entity = &mut session.entity;
+            session.first_undo = (
+                entity.telemetry_owned_complete,
+                entity.held,
+                entity.activity_nanos,
+                entity.clock_incomplete,
+            );
+            entity.activity_nanos = entity.activity_nanos.max(0);
+        } else {
+            if session.folds == 2 && enabled() {
+                session.first_original = Some(session.entity.clone());
+            }
+            session.entity.sum(&fold.entity);
+        }
+        session.entity.clock_incomplete |= claude_usage_occurrences.values().any(|occurrence| {
+            !occurrence.usage.is_zero()
+                && !fold.is_skipped(occurrence.sequence)
+                && (!occurrence.event_clock_complete
+                    || occurrence
+                        .timestamp
+                        .as_deref()
+                        .and_then(rfc3339_unix_nanos)
+                        .is_none())
+        });
         session
             .locations
             .extend(fold.location.map(|located| located.0));
@@ -2843,7 +3118,8 @@ pub(crate) fn finish_page(
             state.entity.telemetry_owned_complete = state.complete;
             state.entity.held |= held.contains(session);
             decided.push((session.to_owned(), state.decided));
-            (session.to_owned(), state.entity)
+            let first = (state.first_original, state.first_undo);
+            (session.to_owned(), (state.entity, first))
         })
         .collect::<BTreeMap<_, _>>();
     let mut withheld = BTreeSet::new();
@@ -2853,15 +3129,31 @@ pub(crate) fn finish_page(
         }
         // One body per session: the first item carries the summed entity.
         // A withheld session keeps every item (twins too) for the hold.
-        let Some(entity) = entities.remove(&item.source_session_id) else {
+        let Some((entity, (first_original, undo))) = entities.remove(&item.source_session_id)
+        else {
             return withheld.contains(&item.source_session_id);
         };
-        // apply refuses before mutating, so a withheld item is unchanged.
-        if !super::emit::apply(item, &entity) {
+        // apply refuses before mutating, so a withheld item is unchanged:
+        // its fold gets its own entity back (moved out above).
+        let emitted = super::emit::apply(item, &entity);
+        if !emitted {
             withheld.insert(item.source_session_id.clone());
-        } else if let Some(fold) = item.claude_money.as_deref_mut() {
-            // Keep the final summed placement for contract 5, not the first twin.
-            fold.entity = entity;
+        }
+        if let Some(fold) = item.claude_money.as_deref_mut() {
+            fold.entity = match (emitted, first_original) {
+                // Keep the final summed placement for contract 5, not the first twin.
+                (true, _) => entity,
+                (false, original) => {
+                    let mut original = original.unwrap_or(entity);
+                    (
+                        original.telemetry_owned_complete,
+                        original.held,
+                        original.activity_nanos,
+                        original.clock_incomplete,
+                    ) = undo;
+                    original
+                }
+            };
         }
         true
     });
