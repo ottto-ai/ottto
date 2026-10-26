@@ -422,7 +422,27 @@ impl RearmFixture {
         upload: RearmUpload,
         target: Option<&str>,
     ) -> RearmPage {
-        let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.page_with_input_index(collected_at, upload, target, None)
+    }
+
+    /// Scale-only adapter: retain ordinary settled state between the explicit
+    /// durable checkpoints, without repeatedly decoding the same large index.
+    fn scale_page(&self, index: ScanIndex, collected_at: &str) -> RearmPage {
+        assert!(self.serial_active_frame);
+        assert!(!crate::snapshots::claude_native_comparison::enabled());
+        self.page_with_input_index(collected_at, RearmUpload::Accept, None, Some(index))
+    }
+
+    fn page_with_input_index(
+        &self,
+        collected_at: &str,
+        upload: RearmUpload,
+        target: Option<&str>,
+        input: Option<ScanIndex>,
+    ) -> RearmPage {
+        let checkpoint = input.is_none();
+        let mut index =
+            input.unwrap_or_else(|| ScanIndex::load(&self.index_path).expect("load scan index"));
         index.activate_upload_context("upload-context-rearm".to_string());
         index.activate_effective_upload_body_witness_revision(
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
@@ -807,16 +827,18 @@ impl RearmFixture {
         );
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");
-        save_index_and_publish_manifest(
-            &mut index,
-            &self.index_path,
-            REARM_DESTINATION,
-            SnapshotSource::ClaudeCode,
-            census_complete,
-            &window_start,
-            &window_end,
-        )
-        .expect("save index and publish manifest");
+        if checkpoint {
+            save_index_and_publish_manifest(
+                &mut index,
+                &self.index_path,
+                REARM_DESTINATION,
+                SnapshotSource::ClaudeCode,
+                census_complete,
+                &window_start,
+                &window_end,
+            )
+            .expect("save index and publish manifest");
+        }
         let mut native_receipts = 0;
         if let Some(frame) = native_preparation.as_mut() {
             if fully_settled
@@ -887,7 +909,11 @@ impl RearmFixture {
             scan,
             duplicate_census,
             parsed,
-            index: ScanIndex::load(&self.index_path).expect("reload scan index"),
+            index: if checkpoint {
+                ScanIndex::load(&self.index_path).expect("reload scan index")
+            } else {
+                index
+            },
             fully_settled,
             held: holds.held_fingerprints,
             offered,

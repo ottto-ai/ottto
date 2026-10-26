@@ -41900,6 +41900,28 @@ impl ScanIndex {
     }
 
     #[cfg(test)]
+    pub(crate) fn claude_retry_admission_for_test(&self) -> Option<(Option<&str>, bool)> {
+        self.claude_stale_family_carry
+            .origin
+            .as_ref()?
+            .admission
+            .as_ref()
+            .map(|state| (state.after_root.as_deref(), state.complete))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claude_duplicate_fence_closed_for_test(&self) -> bool {
+        self.claude_duplicate_request_witness_overflowed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scan_traversal_exhausted_for_test(&self) -> bool {
+        self.traversal.as_ref().is_some_and(|traversal| {
+            traversal.pending_candidates.is_empty() && traversal.pending_directories.is_empty()
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn claude_authority_record_for_test(
         &self,
         root_session_id: &str,
