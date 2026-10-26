@@ -2528,17 +2528,26 @@ struct ScanTraversalCheckpoint {
     residue: ScanTraversalResidue,
 }
 
+// A candidate's scan root is not only where its no-follow open starts: it is
+// hashed into the `sampled_native_reduction:v1` scope (`sampled_scan`'s
+// `file_scope`), and a scope change makes `ReadPlan::select_mode` take
+// `Full(ScopeChanged)`. Under nested roots the two lookups below can differ,
+// so each call site keeps the rule it already had; switching one changes later
+// Full/Tail decisions. Without nesting at most one root matches and they agree.
 impl ScanTraversalCheckpoint {
     /// The deepest configured scan root containing `path`, independent of
-    /// `scan_roots` order. Without nesting at most one root matches. A nested
-    /// root's own walk lists its files before the outer walk descends to them
-    /// (every root is queued before any subdirectory), so its files normally
-    /// carry the nested root; re-queued paths take that same provenance.
+    /// `scan_roots` order.
     fn owning_scan_root(&self, path: &Path) -> Option<&PathBuf> {
         self.scan_roots
             .iter()
             .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.components().count())
+    }
+
+    /// The first configured scan root, in `scan_roots` order, containing
+    /// `path`. Kept by the retry due seed and held-audit progress.
+    fn first_matching_scan_root(&self, path: &Path) -> Option<&PathBuf> {
+        self.scan_roots.iter().find(|root| path.starts_with(root))
     }
 }
 
@@ -47694,31 +47703,39 @@ mod tests {
     }
 
     #[test]
-    fn owning_scan_root_takes_the_deepest_nested_root_in_any_root_order() {
+    fn scan_root_lookups_keep_deepest_and_first_match_rules_under_nested_roots() {
         let outer = PathBuf::from("/synthetic/projects");
         let nested = outer.join("team").join("projects");
         let sibling = PathBuf::from("/synthetic/projects-other");
         let nested_file = nested.join("p").join("session.jsonl");
         let outer_file = outer.join("p").join("session.jsonl");
-        for roots in [
-            vec![outer.clone(), nested.clone(), sibling.clone()],
-            vec![sibling.clone(), nested.clone(), outer.clone()],
+        let sibling_file = sibling.join("session.jsonl");
+        let elsewhere = Path::new("/elsewhere/s.jsonl");
+        for (roots, first_for_nested_file) in [
+            (vec![outer.clone(), nested.clone(), sibling.clone()], &outer),
+            (
+                vec![sibling.clone(), nested.clone(), outer.clone()],
+                &nested,
+            ),
         ] {
             let mut traversal = terminal_unhealthy_traversal(String::new());
             traversal.scan_roots = roots;
-            // A first match would give the nested file the outer root when
-            // the outer root is listed first; the walker's nested root wins.
+            // The two rules differ only for a file under a nested root: the
+            // deepest root regardless of order, or whichever is listed first.
             assert_eq!(traversal.owning_scan_root(&nested_file), Some(&nested));
-            assert_eq!(traversal.owning_scan_root(&outer_file), Some(&outer));
-            // Component prefixes, not string prefixes.
             assert_eq!(
-                traversal.owning_scan_root(&sibling.join("session.jsonl")),
-                Some(&sibling)
+                traversal.first_matching_scan_root(&nested_file),
+                Some(first_for_nested_file)
             );
-            assert_eq!(
-                traversal.owning_scan_root(Path::new("/elsewhere/s.jsonl")),
-                None
-            );
+            for lookup in [
+                ScanTraversalCheckpoint::owning_scan_root,
+                ScanTraversalCheckpoint::first_matching_scan_root,
+            ] {
+                assert_eq!(lookup(&traversal, &outer_file), Some(&outer));
+                // Component prefixes, not string prefixes.
+                assert_eq!(lookup(&traversal, &sibling_file), Some(&sibling));
+                assert_eq!(lookup(&traversal, elsewhere), None);
+            }
         }
     }
 

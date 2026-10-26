@@ -335,14 +335,13 @@ impl OwnedSourceScan {
         let previous = self.index.held_audit_progress.as_ref();
         // A held key the slot may serve: bounded, still awaiting restoration,
         // and owned by a scan root, so the Full below can be queued.
-        let eligible =
-            |key: &str| {
-                key.len() <= 4096
-                    && awaits_hold_deadline_restoration(&self.index, key)
-                    && self.index.traversal.as_ref().is_some_and(|traversal| {
-                        traversal.owning_scan_root(Path::new(key)).is_some()
-                    })
-            };
+        let eligible = |key: &str| {
+            key.len() <= 4096
+                && awaits_hold_deadline_restoration(&self.index, key)
+                && self.index.traversal.as_ref().is_some_and(|traversal| {
+                    traversal.first_matching_scan_root(Path::new(key)).is_some()
+                })
+        };
         let keep = previous.is_some_and(|slot| {
             !slot.attempted
                 && slot.due > 0
@@ -385,11 +384,12 @@ impl OwnedSourceScan {
             return;
         }
         let path = PathBuf::from(&slot.key);
+        // First match, not deepest: the root enters the sampled scope hash.
         let Some(root) = self
             .index
             .traversal
             .as_ref()
-            .and_then(|traversal| traversal.owning_scan_root(&path).cloned())
+            .and_then(|traversal| traversal.first_matching_scan_root(&path).cloned())
         else {
             return;
         };

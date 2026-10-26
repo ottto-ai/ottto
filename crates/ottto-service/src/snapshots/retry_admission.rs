@@ -359,7 +359,8 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
         if !claude_retry_path_owed(state, &index.claude_usage_authority_quarantine, key, now) {
             continue;
         }
-        let Some(root) = traversal.owning_scan_root(Path::new(key)) else {
+        // First match, not deepest: the root enters the sampled scope hash.
+        let Some(root) = traversal.first_matching_scan_root(Path::new(key)) else {
             continue;
         };
         if cost
