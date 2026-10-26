@@ -1697,7 +1697,7 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
     let files = manifest["files"].as_u64().unwrap() as usize;
     let bytes_scale = manifest["bytes_scale"].as_f64().unwrap_or(1.0);
     // HISTORY_UPGRADE_BYTES_PER_PAGE (1 GiB), scaled with the corpus bytes.
-    let byte_budget = (bytes_scale < 1.0).then(|| ((1u64 << 30) as f64 * bytes_scale) as u64);
+    let byte_budget = (bytes_scale < 1.0).then_some(((1u64 << 30) as f64 * bytes_scale) as u64);
     let mut harness = Harness::new(base, &run, true);
     let load = |harness: &Harness| {
         ScanIndex::load(
