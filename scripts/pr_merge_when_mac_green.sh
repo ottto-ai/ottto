@@ -258,6 +258,17 @@ enqueue() {
     >/dev/null
 }
 
+# The budget is spent by sleeping or by wall-clock time, whichever runs out
+# first: slow API calls and gh retries count too.
+elapsed() {
+  local wall=$((SECONDS - started_at))
+  if [ "$wall" -gt "$waited" ]; then echo "$wall"; else echo "$waited"; fi
+}
+
+out_of_time() {
+  [ "$(elapsed)" -ge "$timeout" ]
+}
+
 queue_query() {
   # GraphQL variables must reach GitHub literally.
   # shellcheck disable=SC2016
@@ -327,8 +338,8 @@ wait_for_queue() {
     else
       log "GitHub queue API read failed; continuing to wait"
     fi
-    if [ "$waited" -ge "$timeout" ]; then
-      die "$EXIT_TIMEOUT" "timed out after ${waited}s waiting for PR #$pr in the merge queue"
+    if out_of_time; then
+      die "$EXIT_TIMEOUT" "timed out after $(elapsed)s waiting for PR #$pr in the merge queue"
     fi
     sleep "$interval"
     waited=$((waited + interval))
@@ -353,6 +364,7 @@ fi
 
 log "PR #$pr head $head_sha: waiting for the required checks $REQUIRED_CHECKS (interval ${interval}s, timeout ${timeout}s)"
 waited=0
+started_at=$SECONDS
 while :; do
   read_pr
   refuse_unmergeable
@@ -399,8 +411,8 @@ while :; do
     log "GitHub API read failed; treating as not ready"
   fi
 
-  if [ "$waited" -ge "$timeout" ]; then
-    die "$EXIT_TIMEOUT" "timed out after ${waited}s waiting for the required checks on $head_sha; not merging"
+  if out_of_time; then
+    die "$EXIT_TIMEOUT" "timed out after $(elapsed)s waiting for the required checks on $head_sha; not merging"
   fi
   sleep "$interval"
   waited=$((waited + interval))
