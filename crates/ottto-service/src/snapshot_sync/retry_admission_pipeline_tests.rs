@@ -115,6 +115,8 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
     assert!(healthy_entries
         .values()
         .all(|entry| entry["last_upload_body_witness"].is_string()));
+    let healthy_digest =
+        index.healthy_custody_digest_for_test(healthy_entries.keys().map(String::as_str));
     fixture.native_file_limit = 64;
     let mut held_read = false;
     let mut held_settled = false;
@@ -122,6 +124,7 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
     let mut admission_complete = false;
     let mut checkpoints = BTreeSet::new();
     let mut custody_checks = 0;
+    let mut page_custody_checks = 0;
     retained = index;
     for tick in 0..160 {
         if tick > 0 {
@@ -139,11 +142,35 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
             !page.scan.census_complete,
             "partial admission never upgrades coverage"
         );
+        assert_eq!(
+            page.index
+                .healthy_custody_digest_for_test(healthy_entries.keys().map(String::as_str)),
+            healthy_digest,
+            "every-page fingerprints, accepted membership and bindings retained at tick {tick}"
+        );
+        page_custody_checks += 1;
         held_read |= page.parsed.contains(REARM_ROOT);
-        held_settled |= page
-            .index
-            .claude_authority_record_for_test(REARM_ROOT)
-            .is_none();
+        let held_now = page.index.claude_authority_record_for_test(REARM_ROOT);
+        if held_settled {
+            assert!(
+                held_now.is_none(),
+                "settled authority must not reappear at tick {tick}"
+            );
+        }
+        if let Some(record) = &held_now {
+            assert!(
+                !record.terminal
+                    && record.bound_to_retained_witness
+                    && record.family_pending_retained,
+                "bound RetryPending until the real fold settles it, tick {tick}"
+            );
+        } else {
+            assert!(
+                held_read,
+                "settlement follows an actual held-family read, tick {tick}"
+            );
+            held_settled = true;
+        }
         if tick == 7 {
             assert!(
                 held_read,
@@ -210,6 +237,10 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
     assert_eq!(checkpoints, BTreeSet::from(["held", "midpoint", "end"]));
     assert_eq!(custody_checks, 3);
     assert!(
+        page_custody_checks >= progressed.len(),
+        "every admitted group has an in-memory custody check"
+    );
+    assert!(
         progressed.len() > 1,
         "admission must progress over saved checkpoints"
     );
@@ -218,7 +249,7 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
         "large healthy history must finish bounded admission"
     );
     eprintln!(
-        "retry_admission_runtime: elapsed_ms={} healthy={HEALTHY} groups={} custody_checkpoints={custody_checks}",
+        "retry_admission_runtime: elapsed_ms={} healthy={HEALTHY} groups={} custody_checkpoints={custody_checks} page_custody_checks={page_custody_checks}",
         started.elapsed().as_millis(), progressed.len()
     );
 }

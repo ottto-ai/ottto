@@ -41,7 +41,13 @@ fn claude_retry_admit_batch(
     ClaudeRetryAdmission,
 ) {
     let mut state = previous
-        .filter(|state| !state.complete)
+        .filter(|state| {
+            !state.complete
+                && !(state.roots_complete
+                    && state.storage_deferred
+                    && state.oversized_root.is_none()
+                    && state.due_complete)
+        })
         .cloned()
         .unwrap_or_else(|| ClaudeRetryAdmission {
             after_root: None,
@@ -62,6 +68,7 @@ fn claude_retry_admit_batch(
             due_complete: false,
             oversized_root: None,
             oversized_after_path: None,
+            storage_deferred: false,
         });
     state.progressed = false;
     let lower = state
@@ -76,7 +83,8 @@ fn claude_retry_admit_batch(
     loop {
         if batch.is_empty() {
             state.roots_complete = true;
-            state.complete = state.oversized_root.is_none() && state.due_complete;
+            state.complete =
+                state.oversized_root.is_none() && state.due_complete && !state.storage_deferred;
             state.progressed = true;
             return (ClaudeStaleFamilyCarry::default(), batch, state);
         }
@@ -88,8 +96,10 @@ fn claude_retry_admit_batch(
                         .iter()
                         .any(|root| root > after && root <= &state.upper_root)
                 });
-                state.complete =
-                    state.roots_complete && state.oversized_root.is_none() && state.due_complete;
+                state.complete = state.roots_complete
+                    && state.oversized_root.is_none()
+                    && state.due_complete
+                    && !state.storage_deferred;
                 state.progressed = true;
                 eprintln!("local snapshot census advanced bounded Claude retry admission: covered_families={} carried_families={} complete={}; uncovered pending remains unchanged", batch.len(), carry.roots.len(), state.complete);
                 return (carry, batch, state);
@@ -105,6 +115,19 @@ fn claude_retry_admit_batch(
                 // can advance while it is served; another oversized root waits
                 // here instead of losing its obligation or growing a debt map.
                 let root = batch.first().expect("singleton");
+                if claude_retry_singleton_storage_only(index, root) {
+                    // Structural refusal alone is no read obligation. Retain
+                    // uncovered custody and let later roots make progress.
+                    // The boolean is scheduling debt, never carry eligibility.
+                    state.storage_deferred = true;
+                    state.after_root = Some(root.clone());
+                    state.roots_complete = !stale
+                        .iter()
+                        .any(|later| later > root && later <= &state.upper_root);
+                    state.complete = false;
+                    state.progressed = true;
+                    return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
+                }
                 if state
                     .oversized_root
                     .as_ref()
@@ -125,6 +148,106 @@ fn claude_retry_admit_batch(
             Err(_) => return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state),
         }
     }
+}
+
+// Recheck the existing accepted-family predicates without allocating its
+// all-member carry/cancellation buffers. A fixed 128-identity stack page sorts
+// borrowed identities, counts duplicate occurrences and validates pending keys.
+// Rescans are finite (ceil(members / 128)), with no heap growth or proof grant.
+fn claude_retry_singleton_storage_only(index: &ScanIndex, root: &str) -> bool {
+    let Some(pending) = index.claude_usage_family_pending.get(root) else {
+        return false;
+    };
+    if pending.invalid
+        || index.claude_usage_authority_quarantine.contains_key(root)
+        || index.decode_holds_family(root)
+    {
+        return false;
+    }
+    let mut count = 0usize;
+    let mut root_present = false;
+    for (key, entry) in &index.files {
+        let Some(member) = claude_index_path_member_ref(Path::new(key)).filter(|m| m.root == root)
+        else {
+            continue;
+        };
+        count += 1;
+        root_present |= member.subagent_stem.is_none();
+        if !claude_stale_member_accepted_retry_evidence(index, key, entry, pending) {
+            return false;
+        }
+    }
+    if count == 0 || !root_present {
+        return false;
+    }
+    let mut after = None;
+    let mut represented = 0usize;
+    loop {
+        let mut page = [None; CLAUDE_RETRY_ADMISSION_ROOTS];
+        let mut len = 0;
+        for key in index.files.keys() {
+            let Some(member) = claude_index_path_member_ref(Path::new(key))
+                .filter(|m| m.root == root && after.map_or(true, |last| *m > last))
+            else {
+                continue;
+            };
+            match page[..len].binary_search_by(
+                |slot: &Option<(ClaudeIndexPathMemberRef<'_>, usize)>| {
+                    slot.expect("filled slot").0.cmp(&member)
+                },
+            ) {
+                Ok(position) => page[position].as_mut().expect("filled slot").1 += 1,
+                Err(position) if position < page.len() => {
+                    let end = len.min(page.len() - 1);
+                    page.copy_within(position..end, position + 1);
+                    page[position] = Some((member, 1));
+                    len = (len + 1).min(page.len());
+                }
+                Err(_) => {}
+            }
+        }
+        if len == 0 {
+            break;
+        }
+        if page[..len]
+            .iter()
+            .any(|slot| slot.expect("filled slot").1 != 1)
+        {
+            return false;
+        }
+        let upper = page[len - 1].expect("last slot").0;
+        for name in pending
+            .member_request_id_hashes
+            .keys()
+            .chain(pending.member_occurrences.keys())
+        {
+            let subagent_stem = if name == root {
+                None
+            } else if let Some(stem) = name
+                .strip_prefix(root)
+                .and_then(|tail| tail.strip_prefix('_'))
+            {
+                Some(stem)
+            } else {
+                return false;
+            };
+            let member = ClaudeIndexPathMemberRef {
+                root,
+                subagent_stem,
+            };
+            if after.map_or(true, |last| member > last) && member <= upper {
+                if page[..len]
+                    .binary_search_by(|slot| slot.expect("filled slot").0.cmp(&member))
+                    .is_err()
+                {
+                    return false;
+                }
+                represented += 1;
+            }
+        }
+        after = Some(upper);
+    }
+    represented == pending.member_request_id_hashes.len() + pending.member_occurrences.len()
 }
 
 fn claude_retry_path_owed(
@@ -158,6 +281,13 @@ fn claude_retry_path_owed(
 
 fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
     let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
+    let became_storage_only = index
+        .claude_stale_family_carry
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.admission.as_ref())
+        .and_then(|state| state.oversized_root.as_deref())
+        .is_some_and(|root| claude_retry_singleton_storage_only(index, root));
     let Some(state) = index
         .claude_stale_family_carry
         .origin
@@ -166,6 +296,11 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
     else {
         return;
     };
+    if became_storage_only {
+        state.storage_deferred = true;
+        state.oversized_root = None;
+        state.oversized_after_path = None;
+    }
     let Some(traversal) = index.traversal.as_mut() else {
         return;
     };
@@ -204,7 +339,19 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
     }) {
         state.due_complete = true;
     }
-    state.complete = state.roots_complete && state.oversized_root.is_none() && state.due_complete;
+    state.complete = state.roots_complete
+        && state.oversized_root.is_none()
+        && state.due_complete
+        && !state.storage_deferred;
+    if state.roots_complete
+        && state.storage_deferred
+        && state.oversized_root.is_none()
+        && state.due_complete
+    {
+        // Finishing the root walk does not cover deferred custody, and does
+        // not earn another immediate start. Revisit it at ordinary backoff.
+        state.progressed = false;
+    }
     let mut cost = crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
     if cost
         .add(2 * CLAUDE_RETRY_DUE_PATHS * std::mem::size_of::<ScanTraversalPath>() + 128)

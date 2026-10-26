@@ -2137,6 +2137,10 @@ struct ClaudeRetryAdmission {
     oversized_root: Option<String>,
     #[serde(default)]
     oversized_after_path: Option<String>,
+    /// At least one complete accepted singleton could not fund carry storage.
+    /// It keeps custody, without a carry/proof grant or a runnable re-arm.
+    #[serde(default)]
+    storage_deferred: bool,
 }
 
 impl ClaudeStaleFamilyCarry {
@@ -41928,6 +41932,52 @@ impl ScanIndex {
     #[cfg(test)]
     pub(crate) fn scan_traversal_in_progress_for_test(&self) -> bool {
         self.traversal.is_some()
+    }
+
+    /// Cheap in-memory custody oracle. No JSON, index clone or disk IO.
+    #[cfg(test)]
+    pub(crate) fn healthy_custody_digest_for_test<'a>(
+        &self,
+        keys: impl Iterator<Item = &'a str>,
+    ) -> [u8; 32] {
+        fn option(digest: &mut Sha256, value: Option<&str>) {
+            digest.update([u8::from(value.is_some())]);
+            if let Some(value) = value {
+                update_length_prefixed(digest, value.as_bytes());
+            }
+        }
+        let mut digest = Sha256::new();
+        update_length_prefixed(&mut digest, b"test:healthy-committed-custody:v1");
+        for key in keys {
+            update_length_prefixed(&mut digest, key.as_bytes());
+            let entry = self.files.get(key).expect("healthy file retains custody");
+            assert!(
+                !entry.source_file_fingerprint.is_empty(),
+                "healthy fingerprint never cleared: {key}"
+            );
+            update_length_prefixed(&mut digest, entry.source_file_fingerprint.as_bytes());
+            option(&mut digest, entry.last_snapshot_fingerprint.as_deref());
+            option(&mut digest, entry.last_upload_body_witness.as_deref());
+            option(&mut digest, entry.scan_identity_version.as_deref());
+            let entities = self
+                .file_snapshot_fingerprints
+                .get(key)
+                .expect("healthy entity set retained");
+            digest.update((entities.len() as u64).to_le_bytes());
+            for entity in entities {
+                update_length_prefixed(&mut digest, entity.as_bytes());
+                let accepted = self.accepted_snapshot_fingerprint_recorded(entity);
+                assert!(accepted, "healthy ACK membership retained: {key}");
+                digest.update([u8::from(accepted)]);
+            }
+            let binding = self.session_account_bindings.get(key);
+            digest.update([u8::from(binding.is_some())]);
+            if let Some(binding) = binding {
+                update_length_prefixed(&mut digest, binding.account_identifier_hash.as_bytes());
+                option(&mut digest, binding.workspace_identifier_hash.as_deref());
+            }
+        }
+        digest.finalize().into()
     }
 
     #[cfg(test)]
@@ -85452,7 +85502,7 @@ crate::heap_layout_bound::fields!(ScanTraversalCounts; unchanged_reread_admitted
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
-crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path);
+crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
 crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
