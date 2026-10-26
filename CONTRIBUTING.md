@@ -41,20 +41,22 @@ them. Small prose, cosmetic or purely mechanical changes may skip with a reason.
 ## Merging
 
 Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
-ready, waits until the four Public CI (`ci.yml`) checks of the pull-request run
-on the PR's head commit passed (macOS `Rust contracts`; Linux `Public surface
-checks`, `Rust advisory audit` and `Dependency review`), and then squash-merges
-exactly that head (`--match-head-commit`); other checks are informational.
-`main`'s ruleset also requires `Rust contracts`. The script refuses a PR with
+ready, waits until the Public CI (`ci.yml`) checks of the pull-request run on the
+PR's head commit passed (Linux `Public surface checks`, `Rust advisory audit` and
+`Dependency review`; the macOS `Rust contracts` job is skipped on pull requests
+and runs in the merge queue), and then enqueues exactly that head; other checks
+are informational. `main`'s ruleset requires `Rust contracts`, `Public surface
+checks` and `Rust advisory audit` in the merge queue. For macOS evidence before
+enqueueing, run `gh workflow run ci.yml --ref <branch>` once. The script refuses a PR with
 merge conflicts: rebase onto `main` and push first. `gh pr checks` exit 0 is not
 evidence, no Linux job stands in for the macOS `Rust contracts` job, and a
 manually started (`workflow_dispatch`) run tests the branch head, not the merge
 with `main`.
 
-`main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it; a PR that fails there is removed (exit 4): fix it, push and rerun the guard.
+`main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it, including the macOS `Rust contracts` job; a PR that fails there is removed (exit 4, with the failing run): fix it, push and rerun the guard.
 
 Authors with write access merge their own pull request once its review is
-complete, the four checks passed on the final head and it is mergeable. No
+complete, its pull-request checks passed on the final head and it is mergeable. No
 separate merge window, merge slot or extra approval is required. Wait only for a
 real dependency or conflict with other open work, an explicit dated hold, or an
 announced release freeze.
