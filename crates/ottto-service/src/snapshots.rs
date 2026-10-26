@@ -2560,6 +2560,29 @@ struct ScanTraversalCheckpoint {
     residue: ScanTraversalResidue,
 }
 
+// A candidate's scan root is not only where its no-follow open starts: it is
+// hashed into the `sampled_native_reduction:v1` scope (`sampled_scan`'s
+// `file_scope`), and a scope change makes `ReadPlan::select_mode` take
+// `Full(ScopeChanged)`. Under nested roots the two lookups below can differ,
+// so each call site keeps the rule it already had; switching one changes later
+// Full/Tail decisions. Without nesting at most one root matches and they agree.
+impl ScanTraversalCheckpoint {
+    /// The deepest configured scan root containing `path`, independent of
+    /// `scan_roots` order.
+    fn owning_scan_root(&self, path: &Path) -> Option<&PathBuf> {
+        self.scan_roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+    }
+
+    /// The first configured scan root, in `scan_roots` order, containing
+    /// `path`. Kept by the retry due seed and held-audit progress.
+    fn first_matching_scan_root(&self, path: &Path) -> Option<&PathBuf> {
+        self.scan_roots.iter().find(|root| path.starts_with(root))
+    }
+}
+
 /// Per-generation bookkeeping behind `ScanTraversalCounts::settle_non_progressing_residue`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -5421,19 +5444,13 @@ fn claude_stream_accepted_retry_carry(
                 .keys()
                 .chain(pending.member_occurrences.keys())
                 .all(|member| {
-                    let suffix = if member == root {
-                        None
-                    } else if let Some(stem) = member
-                        .strip_prefix(root)
-                        .and_then(|tail| tail.strip_prefix('_'))
-                    {
-                        Some(stem)
-                    } else {
-                        return false;
-                    };
-                    family
-                        .binary_search_by(|(identity, _)| identity.subagent_stem.cmp(&suffix))
-                        .is_ok()
+                    ClaudeIndexPathMemberRef::of_family_member(root, member).is_some_and(|member| {
+                        family
+                            .binary_search_by(|(identity, _)| {
+                                identity.subagent_stem.cmp(&member.subagent_stem)
+                            })
+                            .is_ok()
+                    })
                 })
             || !family.iter().all(|(_, key)| {
                 claude_stale_member_accepted_retry_evidence(index, key, &index.files[*key], pending)
@@ -5518,35 +5535,31 @@ fn claude_fence_closed_retry_carry(
             || (!confirmed_empty && !claude_index_file_body_accepted(index, index_key, entry));
         let status = blocked.entry(root_session_id).or_default();
         status.0 |= refused;
-        status.1 |= refused || !claude_stale_member_independently_accepted(index, index_key, entry);
-        let idless = index
-            .claude_usage_family_pending
-            .get(root_session_id)
-            .is_some_and(|pending| {
-                pending.invalid
-                    && pending.idless_revision
-                        == Some(claude_idless_revision(&entry.source_file_fingerprint))
-            });
-        // Saved negative evidence still refuses loss/withheld identity. It
-        // is not required as an affirmative OTEL/request witness for a body.
-        status.1 |= index
-            .claude_request_census
-            .retry_carry_record(index_key)
-            .is_some_and(|record| {
-                !(record.current_for(&entry.source_file_fingerprint)
-                    || idless && record.idless_native_for(&entry.source_file_fingerprint))
-            });
-        if index
-            .claude_usage_family_pending
-            .get(root_session_id)
-            .is_some_and(|pending| pending.invalid)
-        {
-            status.1 |= !idless
-                || !index
-                    .claude_request_census
-                    .get(index_key)
-                    .is_some_and(|record| record.idless_native_for(&entry.source_file_fingerprint));
-        }
+        // The accepted refusal is the streaming/storage-only member predicate.
+        // Equivalence with the inline checks it replaced, per member, with
+        // pending present (fp = source fingerprint, idless as in the helper):
+        //   old = refused || !independently_accepted || census_record_stale
+        //         || (pending.invalid && (!idless || !idless_native))
+        //   new = refused || !accepted_retry_evidence
+        //       = refused || !independently_accepted || fp.is_empty()
+        //         || account_held || census_record_stale
+        //         || (pending.invalid && !(idless && idless_native))
+        // fp.is_empty() and account_held are disjuncts of `refused`, and its
+        // remaining disjunct (!confirmed_empty && !body_accepted) implies
+        // !independently_accepted, which requires body_accepted. So old ==
+        // new. Saved negative evidence (a retained invalidation stub) still
+        // refuses loss/withheld identity; it is not required as an affirmative
+        // OTEL/request witness for a body. No reader sees this flag without
+        // pending: the family filter refuses missing pending first, and the
+        // request-owner retain sees only carried roots. `refused ||` merely
+        // keeps the old short-circuit before the entity-set digest.
+        status.1 |= refused
+            || !index
+                .claude_usage_family_pending
+                .get(root_session_id)
+                .is_some_and(|pending| {
+                    claude_stale_member_accepted_retry_evidence(index, index_key, entry, pending)
+                });
     }
     let mut legacy_witnesses = Vec::with_capacity(legacy_witness_count);
     legacy_witnesses.extend(
@@ -6337,13 +6350,7 @@ fn claude_family_carry_passed_member<'t>(
     {
         return None;
     }
-    Some(
-        traversal
-            .scan_roots
-            .iter()
-            .filter(|root| path.starts_with(root))
-            .max_by_key(|root| root.components().count()),
-    )
+    Some(traversal.owning_scan_root(path))
 }
 
 /// Price queueing `requeues` members with `requeue_path_bytes` of owned paths
@@ -12874,17 +12881,24 @@ struct ClaudeIndexPathMemberRef<'a> {
     root: &'a str,
     subagent_stem: Option<&'a str>,
 }
-impl ClaudeIndexPathMemberRef<'_> {
+impl<'a> ClaudeIndexPathMemberRef<'a> {
+    /// The identity a pending member name of family `root` names: the root
+    /// itself, or `<root>_<stem>` for a subagent (the member `into_owned`
+    /// renders). `None` when the name belongs to no member of this family.
+    fn of_family_member(root: &'a str, member: &'a str) -> Option<Self> {
+        let subagent_stem = if member == root {
+            None
+        } else {
+            Some(member.strip_prefix(root)?.strip_prefix('_')?)
+        };
+        Some(Self {
+            root,
+            subagent_stem,
+        })
+    }
+
     fn matches_member(&self, member: &str) -> bool {
-        match self.subagent_stem {
-            Some(stem) => {
-                member
-                    .strip_prefix(self.root)
-                    .and_then(|tail| tail.strip_prefix('_'))
-                    == Some(stem)
-            }
-            None => member == self.root,
-        }
+        ClaudeIndexPathMemberRef::of_family_member(self.root, member) == Some(*self)
     }
 
     fn into_owned(self) -> (String, String) {
@@ -39949,13 +39963,7 @@ fn refresh_retained_codex_roster(
     let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
     let mut remaining = MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK;
     for directory in moved {
-        let Some(scan_root) = traversal
-            .scan_roots
-            .iter()
-            .filter(|root| directory.starts_with(root))
-            .max_by_key(|root| root.components().count())
-            .cloned()
-        else {
+        let Some(scan_root) = traversal.owning_scan_root(&directory).cloned() else {
             continue;
         };
         let census = traversal
@@ -40180,13 +40188,7 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
             continue;
         }
         let path = PathBuf::from(key);
-        let Some(scan_root) = traversal
-            .scan_roots
-            .iter()
-            .filter(|root| path.starts_with(root))
-            .max_by_key(|root| root.components().count())
-            .cloned()
-        else {
+        let Some(scan_root) = traversal.owning_scan_root(&path).cloned() else {
             continue;
         };
         traversal.pending_candidates.push_back(ScanTraversalPath {
@@ -48287,6 +48289,43 @@ mod tests {
                 ..ScanTraversalCounts::default()
             },
             residue: ScanTraversalResidue::default(),
+        }
+    }
+
+    #[test]
+    fn scan_root_lookups_keep_deepest_and_first_match_rules_under_nested_roots() {
+        let outer = PathBuf::from("/synthetic/projects");
+        let nested = outer.join("team").join("projects");
+        let sibling = PathBuf::from("/synthetic/projects-other");
+        let nested_file = nested.join("p").join("session.jsonl");
+        let outer_file = outer.join("p").join("session.jsonl");
+        let sibling_file = sibling.join("session.jsonl");
+        let elsewhere = Path::new("/elsewhere/s.jsonl");
+        for (roots, first_for_nested_file) in [
+            (vec![outer.clone(), nested.clone(), sibling.clone()], &outer),
+            (
+                vec![sibling.clone(), nested.clone(), outer.clone()],
+                &nested,
+            ),
+        ] {
+            let mut traversal = terminal_unhealthy_traversal(String::new());
+            traversal.scan_roots = roots;
+            // The two rules differ only for a file under a nested root: the
+            // deepest root regardless of order, or whichever is listed first.
+            assert_eq!(traversal.owning_scan_root(&nested_file), Some(&nested));
+            assert_eq!(
+                traversal.first_matching_scan_root(&nested_file),
+                Some(first_for_nested_file)
+            );
+            for lookup in [
+                ScanTraversalCheckpoint::owning_scan_root,
+                ScanTraversalCheckpoint::first_matching_scan_root,
+            ] {
+                assert_eq!(lookup(&traversal, &outer_file), Some(&outer));
+                // Component prefixes, not string prefixes.
+                assert_eq!(lookup(&traversal, &sibling_file), Some(&sibling));
+                assert_eq!(lookup(&traversal, elsewhere), None);
+            }
         }
     }
 
