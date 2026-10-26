@@ -867,22 +867,23 @@ impl FileFold {
         if placed.fell_back && live {
             self.model_fallbacks.insert(sequence, placed.model.clone());
         }
-        let Some(key) = placed.placement.as_ref().map(|placement| {
-            if !live {
-                return (placement.bucket.clone(), String::new(), BTreeMap::new());
-            }
-            live_key(
+        let Some(placement) = placed.placement.as_ref() else {
+            // Native drops it as unplaceable usage; never publish over it.
+            self.entity.certificate_ok = false;
+            self.disclose("unplaceable", 1);
+            return;
+        };
+        // Gate off keeps only the hour tally: read the hour, build no key.
+        let key = if live {
+            Grain::Live(live_key(
                 &placed.model,
                 placement.bucket.clone(),
                 placement.reduced_context.clone(),
                 &placement.row_key,
                 effort,
-            )
-        }) else {
-            // Native drops it as unplaceable usage; never publish over it.
-            self.entity.certificate_ok = false;
-            self.disclose("unplaceable", 1);
-            return;
+            ))
+        } else {
+            Grain::Hour(bucket_hour(&placement.bucket))
         };
         let account = self.accounts.as_mut().and_then(|accounts| {
             accounts.observe(sequence, copied == Some(true));
@@ -895,17 +896,20 @@ impl FileFold {
             self.entity.removed.add(&tokens);
             self.entity.removed_requests += requests;
             if !has_request_id {
-                self.idless_copy
-                    .get_or_insert_with(Box::default)
-                    .add(key, &tokens, requests, None, None, at, account);
+                key.put(
+                    self.idless_copy.get_or_insert_with(Box::default),
+                    &tokens,
+                    requests,
+                    at,
+                    account,
+                );
                 return;
             }
             match self.skipped.last_mut() {
                 Some((_, end)) if *end == sequence => *end += 1,
                 _ => self.skipped.push((sequence, sequence + 1)),
             }
-            self.copy
-                .add(key, &tokens, requests, None, None, at, account);
+            key.put(&mut self.copy, &tokens, requests, at, account);
             return;
         }
         if copied.is_none() && self.money_birth.birth_nanos().is_some() {
@@ -925,7 +929,7 @@ impl FileFold {
                 .or_default(),
             None => &mut self.entity,
         };
-        into.add(key, &tokens, requests, None, None, at, account);
+        key.put(into, &tokens, requests, at, account);
     }
 
     /// Confirm, or undo, the held pre-birth skip. A partial copy (own lines
@@ -1233,6 +1237,29 @@ fn grain_key(
         &placed.row_key,
         effort,
     ))
+}
+
+/// One observed response's slot: its grain key (gate on) or its estimated
+/// hour (gate off, what `ClaudeEntityBody::add` keeps of an origin-less key).
+enum Grain {
+    Live(ClaudeLiveKey),
+    Hour(Option<u32>),
+}
+
+impl Grain {
+    fn put(
+        self,
+        into: &mut ClaudeEntityBody,
+        tokens: &ClaudeMoneyTokens,
+        requests: u64,
+        at: Option<i128>,
+        account: AccountPartition,
+    ) {
+        match self {
+            Grain::Live(key) => into.add(key, tokens, requests, None, None, at, account),
+            Grain::Hour(hour) => into.dark.add(hour, tokens, requests, None),
+        }
+    }
 }
 
 /// A native placement as the E2 grain key: its bucket and reduced context
