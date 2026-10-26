@@ -60,6 +60,28 @@ pub(crate) fn with_enabled<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Per-stage wall clock for the F3 perf receipt. Test builds only: the
+/// daemon build has no timer here, `timed` is just the call.
+#[cfg(test)]
+thread_local! {
+    static STAGES: RefCell<BTreeMap<&'static str, Duration>> = const { RefCell::new(BTreeMap::new()) };
+}
+#[cfg(test)]
+pub(crate) fn take_stages() -> BTreeMap<&'static str, Duration> {
+    STAGES.with(|stages| std::mem::take(&mut *stages.borrow_mut()))
+}
+#[inline(always)]
+fn timed<T>(stage: &'static str, f: impl FnOnce() -> T) -> T {
+    #[cfg(test)]
+    let start = Instant::now();
+    let value = f();
+    #[cfg(test)]
+    STAGES.with(|stages| *stages.borrow_mut().entry(stage).or_default() += start.elapsed());
+    #[cfg(not(test))]
+    let _ = stage;
+    value
+}
+
 /// Benchmark seam (snapshot_sync money_e2_bench_tests). Test builds only.
 #[cfg(test)]
 pub(crate) mod bench_seam {
@@ -895,7 +917,7 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
 /// the existing owner `claude_api_matches_transcript_occurrence` (a sidecar
 /// thinking count of 0 matches). Row-driven: no per-row map is built.
 pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRead) {
-    let families = page_families(items);
+    let families = timed("attach.families", || page_families(items));
     let items = RefCell::new(items);
     for (root, members) in &families {
         let folds = members
@@ -924,31 +946,41 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
             .first()
             .and_then(|row| super::super::activity_bucket_from_timestamp(&row.observed_at))
             .map(|(bucket, _)| bucket);
-        let membership = family_membership(&items.borrow(), members);
+        let membership = timed("attach.membership", || {
+            family_membership(&items.borrow(), members)
+        });
         let mut disclosed = 0u64;
-        let counts = join(
-            report,
-            |request_id| holders(&items.borrow(), &membership, request_id),
-            |row, holder| {
-                validate_claude_api_row(row, root)
-                    && items.borrow()[*holder]
-                        .claude_usage_occurrences
-                        .get(row.request_id.as_str())
-                        .is_some_and(|occurrence| {
-                            claude_api_matches_transcript_occurrence(row, occurrence)
-                        })
-            },
-            |event| match event {
-                Attachment::Matched { row, holder } => {
-                    let mut items = items.borrow_mut();
-                    if !attach_one(&mut items[holder], row) {
-                        disclosed += 1;
-                    }
-                }
-                Attachment::Unheld(_) => {}
-                Attachment::Disclosed { .. } => disclosed += 1,
-            },
-        );
+        let counts = timed("attach.join", || {
+            join(
+                report,
+                |request_id| {
+                    timed("attach.holders", || {
+                        holders(&items.borrow(), &membership, request_id)
+                    })
+                },
+                |row, holder| {
+                    timed("attach.compatible", || {
+                        validate_claude_api_row(row, root)
+                            && items.borrow()[*holder]
+                                .claude_usage_occurrences
+                                .get(row.request_id.as_str())
+                                .is_some_and(|occurrence| {
+                                    claude_api_matches_transcript_occurrence(row, occurrence)
+                                })
+                    })
+                },
+                |event| match event {
+                    Attachment::Matched { row, holder } => timed("attach.attach_one", || {
+                        let mut items = items.borrow_mut();
+                        if !attach_one(&mut items[holder], row) {
+                            disclosed += 1;
+                        }
+                    }),
+                    Attachment::Unheld(_) => {}
+                    Attachment::Disclosed { .. } => disclosed += 1,
+                },
+            )
+        });
         let mut items = items.borrow_mut();
         for index in folds {
             if let Some(fold) = items[index].claude_money.as_deref_mut() {
@@ -989,7 +1021,9 @@ pub(crate) fn side_calls_page(
     index: &ScanIndex,
 ) {
     if enabled() {
-        claude_request_identity::inherit_root_accounts(items, false);
+        timed("side.inherit", || {
+            claude_request_identity::inherit_root_accounts(items, false)
+        });
     }
     let owing = |item: &SnapshotItem| {
         item.claude_money
@@ -999,10 +1033,12 @@ pub(crate) fn side_calls_page(
     if !items.iter().any(owing) {
         return;
     }
-    let families = page_families(items)
-        .into_iter()
-        .filter(|(_, members)| members.iter().any(|index| owing(&items[*index])))
-        .collect::<Vec<_>>();
+    let families = timed("side.families", || {
+        page_families(items)
+            .into_iter()
+            .filter(|(_, members)| members.iter().any(|index| owing(&items[*index])))
+            .collect::<Vec<_>>()
+    });
     let mut candidates = BTreeMap::<&str, Vec<&ClaudeLocalOtelEvidence>>::new();
     let mut wanted = BTreeMap::<&str, Vec<u64>>::new();
     let mut invalid = BTreeMap::<&str, u64>::new();
@@ -1025,33 +1061,43 @@ pub(crate) fn side_calls_page(
         };
         let mut family = Vec::with_capacity(rows.len());
         for row in rows {
-            if matching_members(&membership, &row.request_id).any(|index| {
-                items[index]
-                    .claude_usage_request_ids
-                    .contains(&row.request_id)
+            if timed("side.subtract", || {
+                matching_members(&membership, &row.request_id).any(|index| {
+                    items[index]
+                        .claude_usage_request_ids
+                        .contains(&row.request_id)
+                })
             }) {
                 continue;
             }
-            if !validate_claude_api_row(row, root) {
+            if !timed("side.validate", || validate_claude_api_row(row, root)) {
                 *invalid.entry(root.as_str()).or_default() += 1;
                 continue;
             }
             family.push(row);
         }
         drop(membership);
-        let mut hashes = family
-            .iter()
-            .map(|row| super::super::claude_request_census::claude_request_hash(&row.request_id))
-            .collect::<Vec<_>>();
-        hashes.sort_unstable();
-        hashes.dedup();
-        family.sort_unstable_by(|a, b| a.request_id.cmp(&b.request_id));
+        let mut hashes = timed("side.hash", || {
+            family
+                .iter()
+                .map(|row| {
+                    super::super::claude_request_census::claude_request_hash(&row.request_id)
+                })
+                .collect::<Vec<_>>()
+        });
+        timed("side.sort", || {
+            hashes.sort_unstable();
+            hashes.dedup();
+            family.sort_unstable_by(|a, b| a.request_id.cmp(&b.request_id));
+        });
         wanted.insert(root.as_str(), hashes);
         candidates.insert(root.as_str(), family);
     }
-    let mut census = index
-        .claude_request_census
-        .family_transcript_holders(&wanted, Instant::now() + SIDE_CALL_DEADLINE);
+    let mut census = timed("side.census", || {
+        index
+            .claude_request_census
+            .family_transcript_holders(&wanted, Instant::now() + SIDE_CALL_DEADLINE)
+    });
     drop(wanted);
     for (root, members) in &families {
         let first = members
@@ -1072,31 +1118,39 @@ pub(crate) fn side_calls_page(
         };
         let mut family_census = census.remove(root.as_str()).unwrap_or_default();
         let mut rows = rows;
-        rows.retain(|row| {
-            !family_census
-                .held
-                .contains(&claude_request_hash(&row.request_id))
+        timed("side.retain", || {
+            rows.retain(|row| {
+                !family_census
+                    .held
+                    .contains(&claude_request_hash(&row.request_id))
+            })
         });
         // Held candidates never allocate a trace-owner slot. Release the census
         // intersection before the borrowed owner vector is allocated.
         family_census.held.clear();
-        let owners = trace_owners(root, &rows, trace.evidence.get(root.as_str()));
-        let targets = members
-            .iter()
-            .filter_map(|&index| {
-                items[index]
-                    .claude_money
-                    .as_ref()
-                    .map(|_| (items[index].source_session_id.clone(), index))
-            })
-            .fold(BTreeMap::new(), |mut targets, (id, index)| {
-                targets.entry(id).or_insert(index); // first path twin, as attach
-                targets
-            });
+        let owners = timed("side.trace_owners", || {
+            trace_owners(root, &rows, trace.evidence.get(root.as_str()))
+        });
+        let targets = timed("side.targets", || {
+            members
+                .iter()
+                .filter_map(|&index| {
+                    items[index]
+                        .claude_money
+                        .as_ref()
+                        .map(|_| (items[index].source_session_id.clone(), index))
+                })
+                .fold(BTreeMap::new(), |mut targets, (id, index)| {
+                    targets.entry(id).or_insert(index); // first path twin, as attach
+                    targets
+                })
+        });
         let mut disclosed = invalid.get(root.as_str()).copied().unwrap_or(0);
         for (row, owner) in rows.iter().zip(owners) {
             let fallback = owner.is_none();
-            let owner = owner.map(|row| claude_trace_owner_session_id(root, &row.agent_id));
+            let owner = timed("side.owner_id", || {
+                owner.map(|row| claude_trace_owner_session_id(root, &row.agent_id))
+            });
             let owner = owner.as_deref().unwrap_or(root);
             let target = targets.get(owner).copied();
             let Some(target) = target else {
@@ -1107,7 +1161,9 @@ pub(crate) fn side_calls_page(
                 }
                 continue;
             };
-            let Some((cache_5m, cache_1h, unattributed)) = claude_api_cache_creation(row) else {
+            let Some((cache_5m, cache_1h, unattributed)) =
+                timed("side.cache_split", || claude_api_cache_creation(row))
+            else {
                 disclosed += 1; // contradictory cache split
                 continue;
             };
@@ -1123,7 +1179,9 @@ pub(crate) fn side_calls_page(
             let Some(fold) = items[target].claude_money.as_deref_mut() else {
                 continue;
             };
-            let Some(key) = reported_key(row, None, &SelectorCapture::default()) else {
+            let Some(key) = timed("side.reported_key", || {
+                reported_key(row, None, &SelectorCapture::default())
+            }) else {
                 disclosed += 1;
                 continue;
             };
@@ -1132,15 +1190,17 @@ pub(crate) fn side_calls_page(
             } else {
                 ClaudeRequestUsageOrigin::TelemetryUnpriced
             };
-            fold.entity.add(
-                key,
-                &tokens,
-                1,
-                row.cost_usd_micros,
-                Some(origin),
-                rfc3339_unix_nanos(&row.observed_at),
-                fold.accounts.as_ref().and_then(|a| a.fallback.clone()),
-            );
+            timed("side.add", || {
+                fold.entity.add(
+                    key,
+                    &tokens,
+                    1,
+                    row.cost_usd_micros,
+                    Some(origin),
+                    rfc3339_unix_nanos(&row.observed_at),
+                    fold.accounts.as_ref().and_then(|a| a.fallback.clone()),
+                )
+            });
             fold.side.add(&tokens);
             fold.side_requests += 1;
             if fallback {
@@ -1175,7 +1235,9 @@ fn trace_owners<'a>(
         };
         if row.capture_revision == "claude_llm_request_ownership:v1"
             && row.session_id == root
-            && claude_trace_evidence_fingerprint_is_valid(row)
+            && timed("side.trace_fingerprint", || {
+                claude_trace_evidence_fingerprint_is_valid(row)
+            })
         {
             owners[at] = Some(row);
         }

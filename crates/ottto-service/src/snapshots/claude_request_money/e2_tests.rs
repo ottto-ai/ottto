@@ -1053,13 +1053,29 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
     };
     let before = wire(&items);
     for enabled in [false, true] {
+        // Wall clock without the allocation probe: its born-pointer table
+        // locks and walks on every allocation and free of every thread.
         let mut page = items.clone();
+        take_stages();
         let start = Instant::now();
-        let (_, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
-            attach_page(&mut page, &read);
-            side_calls_page(&mut page, &api, &trace, &index);
-        });
+        attach_page(&mut page, &read);
+        side_calls_page(&mut page, &api, &trace, &index);
         let enrichment_time = start.elapsed();
+        let stages = take_stages();
+        // The same work on an identical page, for the born-in-scope peak only.
+        let mut probed = items.clone();
+        let probe_start = Instant::now();
+        let (_, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            attach_page(&mut probed, &read);
+            side_calls_page(&mut probed, &api, &trace, &index);
+        });
+        let probed_time = probe_start.elapsed();
+        take_stages();
+        assert!(page.iter().zip(&probed).all(|(a, b)| {
+            fold(a).entity.grains == fold(b).entity.grains
+                && fold(a).side_requests == fold(b).side_requests
+        }));
+        drop(probed);
         assert!(page
             .iter()
             .all(|item| fold(item).telemetry.membership.entries.is_empty()));
@@ -1087,13 +1103,14 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             allocation.requested_peak_with_overlap <= 2 * 1024 * 1024,
             "attach+side-call born-in-scope allocation peak: {allocation:?}"
         );
+        let finish_start = Instant::now();
         let withheld = if enabled {
             with_enabled(|| finish_page(&mut page, &index, TelemetryRead::Loaded))
         } else {
             finish_page(&mut page, &index, TelemetryRead::Loaded)
         };
         assert!(withheld.is_empty());
-        let pipeline_time = start.elapsed();
+        let pipeline_time = enrichment_time + finish_start.elapsed();
         assert!(
             pipeline_time < Duration::from_secs(30),
             "real pipeline took {pipeline_time:?}"
@@ -1114,8 +1131,16 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
                 "dark mode preserves all bytes and fingerprints"
             );
         }
-        eprintln!("F3_PERF rows={ROWS} members={MEMBERS} off_page={OFF_PAGE} enabled={enabled} membership_join_us={} attach_side_us={} pipeline_us={} born_peak_bytes={} not_rss=true",
-            join_time.as_micros(), enrichment_time.as_micros(), pipeline_time.as_micros(), allocation.requested_peak_with_overlap);
+        eprintln!("F3_PERF rows={ROWS} members={MEMBERS} off_page={OFF_PAGE} enabled={enabled} membership_join_us={} attach_side_us={} attach_side_probed_us={} pipeline_us={} born_peak_bytes={} not_rss=true",
+            join_time.as_micros(), enrichment_time.as_micros(), probed_time.as_micros(), pipeline_time.as_micros(), allocation.requested_peak_with_overlap);
+        eprintln!(
+            "F3_PERF stages enabled={enabled} {}",
+            stages
+                .iter()
+                .map(|(stage, spent)| format!("{stage}_us={}", spent.as_micros()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
     fs::remove_dir_all(dir).unwrap();
 }
