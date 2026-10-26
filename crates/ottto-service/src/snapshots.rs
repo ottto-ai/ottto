@@ -25059,28 +25059,54 @@ impl OwnedSourceScan {
         // shared with twin staging and the parse-time birth context.
         let claude_twin_groups = std::cell::OnceCell::new();
         if source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled() {
-            for root in claude_request_money::e2::selected_twin_roots(
-                identified_candidates
+            let twin_groups = claude_twin_groups.get_or_init(|| {
+                // A page file not known yet (a new copy) keeps its member's
+                // single known path as its twin.
+                let page_members = identified_candidates
                     .iter()
-                    // Only a twin this page reads pulls its family in: every
-                    // walk selects a settled twin too, and pulling its family
-                    // then would re-read it on every walk (R1 probe: the four
-                    // path twins and their sources, one batch per walk).
-                    .filter(|candidate| {
-                        index.candidate_decision(candidate) == CandidateDecision::Parse
-                    })
-                    .map(|candidate| candidate.path.as_path()),
-                claude_twin_groups.get_or_init(|| {
-                    // A page file not known yet (a new copy) keeps its
-                    // member's single known path as its twin.
-                    let page_members = identified_candidates
-                        .iter()
-                        .filter_map(|candidate| claude_index_path_family_member(&candidate.path))
-                        .map(|(_, member)| member)
-                        .collect::<BTreeSet<_>>();
-                    claude_history_upgrade::claude_path_twin_groups(index, &page_members)
-                }),
-            ) {
+                    .filter_map(|candidate| claude_index_path_family_member(&candidate.path))
+                    .map(|(_, member)| member)
+                    .collect::<BTreeSet<_>>();
+                claude_history_upgrade::claude_path_twin_groups(index, &page_members)
+            });
+            // Only a twin this page reads pulls its family in: every walk meets
+            // each settled twin too, and pulling its family then re-read the
+            // family on every walk (R1 probe: 8 files and one upload batch per
+            // walk). Outside the authority preflight a candidate still carries
+            // its sidecar digest in the scan fingerprint slot, so each twin is
+            // identified on a copy first: one more open per twin candidate. A
+            // twin that cannot be identified pulls its family in, as before.
+            let read_twins = identified_candidates
+                .iter()
+                .filter(|candidate| {
+                    !claude_request_money::e2::selected_twin_roots(
+                        std::iter::once(candidate.path.as_path()),
+                        twin_groups,
+                    )
+                    .is_empty()
+                })
+                .filter(|candidate| {
+                    let mut twin = (*candidate).clone();
+                    prepare_candidate_context(&mut twin);
+                    match open_and_identify_scan_candidate(
+                        source,
+                        twin,
+                        &mut ScanCensus::default(),
+                        census_unix_seconds,
+                        backfill_window_days,
+                        &index.files,
+                    ) {
+                        Some((twin, _)) => {
+                            index.candidate_decision(&twin) == CandidateDecision::Parse
+                        }
+                        None => true,
+                    }
+                })
+                .map(|candidate| candidate.path.as_path())
+                .collect::<Vec<_>>();
+            for root in
+                claude_request_money::e2::selected_twin_roots(read_twins.into_iter(), twin_groups)
+            {
                 if forced_claude_family_reparses.insert(root.clone()) {
                     claude_twin_only_family_reparses.insert(root);
                 }
