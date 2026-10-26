@@ -152,6 +152,7 @@ impl Corpus {
             scan,
             modes,
             disposition: Default::default(),
+            released: Default::default(),
         }
     }
     fn reload(&self, index: &mut ScanIndex) -> ScanIndex {
@@ -170,11 +171,19 @@ struct Page {
     scan: SourceScanResult,
     modes: (usize, usize, usize),
     disposition: crate::snapshots::ClaudeUsageAuthorityDisposition,
+    released: e2::pipeline_test_observer::Released,
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
-        let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan(&corpus.support, &mut self.scan, &mut self.index);
+        let ((mut disposition, _, _), released) =
+            e2::pipeline_test_observer::capture_released(|| {
+                apply_claude_local_evidence_to_scan(
+                    &corpus.support,
+                    &mut self.scan,
+                    &mut self.index,
+                )
+            });
+        self.released = released;
         self.index
             .veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut self.scan.snapshots);
         let deferred = self.index.bind_session_accounts_with_mixed(
@@ -937,7 +946,8 @@ fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
         assert_eq!((root.request_count, root.input_tokens), (2, 17));
         assert_eq!((agent.request_count, agent.input_tokens), (2, 25));
         assert_eq!(
-            e2::pipeline_test_observer::root_fallbacks(&p.scan.snapshots),
+            e2::pipeline_test_observer::root_fallbacks(&p.scan.snapshots)
+                + p.released.root_fallbacks,
             1,
             "exactly one side call used the counted root fallback"
         );
@@ -1477,7 +1487,7 @@ fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
         );
         assert_eq!(copy.removed_request_count, Some(0));
         assert!(
-            e2::pipeline_test_observer::disclosed(&p.scan.snapshots) > 0,
+            e2::pipeline_test_observer::disclosed(&p.scan.snapshots) + p.released.disclosed > 0,
             "an orphan copy is disclosed"
         );
     });
