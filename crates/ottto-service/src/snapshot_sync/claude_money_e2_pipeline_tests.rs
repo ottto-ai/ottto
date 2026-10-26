@@ -91,6 +91,14 @@ impl Corpus {
         rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
         traces: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
     ) {
+        self.evidence_for(ROOT, rows, traces);
+    }
+    fn evidence_for(
+        &self,
+        session: &str,
+        rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+        traces: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
+    ) {
         for (directory, values) in [
             (
                 "claude-code-effort",
@@ -110,7 +118,7 @@ impl Corpus {
                 .support
                 .join("local-otel")
                 .join(directory)
-                .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
+                .join(format!("{:x}.jsonl", Sha256::digest(session.as_bytes())));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(
                 path,
@@ -236,9 +244,17 @@ impl Page {
     }
 }
 fn api(request: &str, tokens: u64, cost: u64) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    api_for(ROOT, request, tokens, cost)
+}
+fn api_for(
+    session: &str,
+    request: &str,
+    tokens: u64,
+    cost: u64,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
     let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence {
         capture_revision: "claude_api_request:v2".into(),
-        session_id: ROOT.into(),
+        session_id: session.into(),
         request_id: request.into(),
         client_request_id: format!("client-{request}"),
         observed_at: AT.into(),
@@ -264,9 +280,16 @@ fn api(request: &str, tokens: u64, cost: u64) -> crate::claude_local_otel::Claud
     row
 }
 fn trace(request: &str, agent: &str) -> crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+    trace_for(ROOT, request, agent)
+}
+fn trace_for(
+    session: &str,
+    request: &str,
+    agent: &str,
+) -> crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
     let mut row = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
         capture_revision: "claude_llm_request_ownership:v1".into(),
-        session_id: ROOT.into(),
+        session_id: session.into(),
         request_id: request.into(),
         client_request_id: format!("client-{request}"),
         agent_id: agent.into(),
@@ -2081,6 +2104,64 @@ fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
             (copy.request_count, copy.removed_request_count),
             (0, Some(1))
         );
+    });
+}
+
+/// Design item 9 (PR C): the legacy fork-prefix exclusion and the E2 copy
+/// skip never both remove a copied request. A legacy fork child whose
+/// leading request telemetry assigns to its parent, with a divergent parent
+/// prefix (the exclusion's exact shape, derived on this page), publishes
+/// that request removed exactly once and counts every other request once.
+#[test]
+fn e2_pipeline_legacy_fork_prefix_is_removed_exactly_once() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-legacy-fork-prefix");
+        c.root(
+            ROOT,
+            &(line(ROOT, "shared", AT, 10) + &line(ROOT, "parent", "2026-08-02T07:01:00Z", 20)),
+        );
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(line(COPY, "shared", AT, 10) + &line(COPY, "child", "2026-08-02T07:04:00Z", 30)),
+            "2026-08-02T07:03:00Z",
+        );
+        c.evidence_for(
+            ROOT,
+            &[
+                api_for(ROOT, "shared", 10, 100),
+                api_for(ROOT, "parent", 20, 200),
+            ],
+            &[trace_for(ROOT, "shared", ""), trace_for(ROOT, "parent", "")],
+        );
+        c.evidence_for(
+            COPY,
+            &[api_for(COPY, "child", 30, 300)],
+            &[trace_for(COPY, "child", "")],
+        );
+        let p = ready(
+            &c,
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            false,
+        );
+        literal(&p);
+        assert_eq!(
+            e2::pipeline_test_observer::legacy_excluded(&p.index, COPY),
+            1,
+            "the legacy exclusion would remove the shared prefix from the child"
+        );
+        let copy = body(&p, COPY).expect("the child publishes");
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (1, Some(1)),
+            "the shared request is removed once, by the E2 copy rule only"
+        );
+        assert_eq!(
+            body(&p, ROOT).expect("the parent publishes").request_count,
+            2
+        );
+        assert_eq!(total(&p), 3, "every request counts exactly once");
     });
 }
 

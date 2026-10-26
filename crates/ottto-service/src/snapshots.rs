@@ -8170,6 +8170,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
 
     let mut request_groupings = BTreeMap::new();
     for item in snapshots.iter_mut() {
+        // Design item 9 ("None owners" for v1 bodies): an E2 body never
+        // reaches the legacy fork-prefix exclusion. Its copies are removed
+        // once, by the E2 copy rule. The owners still feed the fence and
+        // re-arm decisions below (StateMissing inputs), never a v1 body.
         if claude_request_money::e2::enabled() && item.claude_money.is_some() {
             continue;
         }
