@@ -303,6 +303,180 @@ fn installed_empty_list_paces_history_and_differs_from_a_missing_list() {
     let _ = fs::remove_dir_all(home_missing);
 }
 
+/// Design E2 item 8, the switch-on re-read: a revision bump (2 to 3) on an
+/// M4-shaped index (families of a root and 0-3 subagents, empty files, and a
+/// walk longer than one page, as 13,424 files are on the M4 against 10,000 per
+/// page) re-reads every stamped file once, paced by the byte budget, in
+/// ceil(bytes / budget) reading pages, and then a complete walk reads nothing.
+/// A budget hold queues the file again as a re-read for the next page of its
+/// walk, so pacing does not wait for the next walk. Each page commits as a
+/// fully accepted page without holds does (the upload context is adopted).
+#[test]
+fn revision_bump_rereads_every_stamped_file_paced_then_stops() {
+    const FAMILIES: usize = 20;
+    const EMPTY_FILES: usize = 3;
+    const FILE_BYTES: usize = 2_048;
+    const FILES_PER_BUDGET: u64 = 5;
+    const PAGE_FILES: usize = 40;
+    let home = crate::test_scratch::unique_path("ottto-history-gate-switch-on");
+    let root = home.join("project");
+    let mut nonempty = 0_u64;
+    for slot in 0..FAMILIES {
+        let session = session(slot);
+        let agents = (0..slot % 4).map(|n| Some(format!("{slot:08x}{n:08x}")));
+        for agent in std::iter::once(None).chain(agents) {
+            let path = match &agent {
+                Some(agent) => root
+                    .join(&session)
+                    .join("subagents")
+                    .join(format!("agent-{agent}.jsonl")),
+                None => root.join(format!("{session}.jsonl")),
+            };
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let request = agent.as_deref().unwrap_or("root");
+            let mut line = json!({
+                "timestamp": "2026-08-23T18:20:00Z",
+                "type": "assistant",
+                "sessionId": session,
+                "agentId": agent,
+                "isSidechain": agent.is_some(),
+                "requestId": format!("request-{slot}-{request}"),
+                "message": {
+                    "id": format!("message-{slot}-{request}"),
+                    "model": "claude-haiku-4-5",
+                    "usage": {"input_tokens": 10, "output_tokens": 1}
+                },
+                "pad": ""
+            });
+            let pad = FILE_BYTES - 1 - line.to_string().len();
+            line["pad"] = json!("x".repeat(pad));
+            let text = format!("{line}\n");
+            assert_eq!(text.len(), FILE_BYTES);
+            fs::write(&path, text).unwrap();
+            nonempty += 1;
+        }
+    }
+    for slot in FAMILIES..FAMILIES + EMPTY_FILES {
+        fs::write(root.join(format!("{}.jsonl", session(slot))), "").unwrap();
+    }
+    let at = |index: &ScanIndex, revision: u64| {
+        index
+            .files
+            .values()
+            .filter(|entry| entry.effective_upload_body_witness_revision >= revision)
+            .count()
+    };
+    let page = |index: &mut ScanIndex, revision: u64| {
+        index.activate_upload_context("ctx-1".into());
+        index.activate_effective_upload_body_witness_revision(revision);
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        let mut result = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            index,
+            COLLECTED_AT,
+            BACKFILL_WINDOW_DAYS,
+            PAGE_FILES,
+            true,
+        )
+        .unwrap();
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, index);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        index.record_accepted_snapshot_fingerprints(&accepted);
+        result
+    };
+    let mut index = ScanIndex::default();
+    with_max_gated_claude_revision(3, || {
+        // Sent and stamped at revision 2, then settled: whole walks until
+        // one reads no file.
+        let (mut stamp_pages, mut walk_reads) = (0, 0);
+        loop {
+            stamp_pages += 1;
+            assert!(stamp_pages <= 12, "the stamped corpus settles");
+            let result = page(&mut index, 2);
+            walk_reads += result.scanned_file_count;
+            if result.census_complete {
+                if walk_reads == 0 {
+                    break;
+                }
+                walk_reads = 0;
+            }
+        }
+        let files = index.files.len();
+        assert_eq!(files as u64, nonempty + EMPTY_FILES as u64);
+        assert_eq!(at(&index, 2), files);
+
+        // The switch-on: an installed, empty list and revision 3.
+        let list = support("history-gate-switch-on-list");
+        fs::write(ReemissionExclusions::path(&list), "").unwrap();
+        index.load_claude_reemission_exclusions(&list);
+        let budget = FILES_PER_BUDGET * FILE_BYTES as u64;
+        let bound = (nonempty * FILE_BYTES as u64).div_ceil(budget) as usize;
+        with_body_witness_adoption_byte_budget(budget, || {
+            let mut receipts = Vec::new();
+            let mut reads = 0;
+            while at(&index, 3) < files {
+                assert!(
+                    receipts.len() < 4 * bound,
+                    "every file upgrades: {receipts:?}"
+                );
+                let before = index.clone();
+                let result = page(&mut index, 3);
+                let bytes = index
+                    .files
+                    .iter()
+                    .filter(|(key, entry)| {
+                        entry.effective_upload_body_witness_revision >= 3
+                            && before.files[*key].effective_upload_body_witness_revision < 3
+                    })
+                    .map(|(_, entry)| entry.size_bytes)
+                    .sum::<u64>();
+                reads += result.scanned_file_count;
+                receipts.push((
+                    at(&index, 3) - at(&before, 3),
+                    bytes,
+                    result.scanned_file_count,
+                    result.census_complete,
+                ));
+                assert!(bytes <= budget, "paced by the byte budget: {receipts:?}");
+            }
+            let reading = receipts.iter().filter(|receipt| receipt.0 > 0).count();
+            assert_eq!(
+                reading, bound,
+                "ceil(bytes / budget) reading pages: {receipts:?}"
+            );
+            assert!(
+                receipts.len() <= bound + 1,
+                "pages without a read only close a walk: {receipts:?}"
+            );
+            assert_eq!(
+                reads, files,
+                "every stamped file is read once: {receipts:?}"
+            );
+            // Then nothing more: the walk in flight completes, and so does
+            // one whole walk after it, reading no file.
+            let mut complete = 0;
+            let mut after = Vec::new();
+            while complete < 2 {
+                assert!(after.len() < 8, "the walks complete: {after:?}");
+                let result = page(&mut index, 3);
+                complete += usize::from(result.census_complete);
+                after.push((result.scanned_file_count, result.snapshots.len()));
+            }
+            assert!(
+                after.iter().all(|&(read, sent)| read == 0 && sent == 0),
+                "no second re-read: {after:?}"
+            );
+            assert_eq!(at(&index, 3), files);
+        });
+    });
+    let _ = fs::remove_dir_all(home);
+}
+
 /// A fold that latches the stop after the candidate loop permitted an
 /// upgrade blocks its emission at the seam.
 #[test]
