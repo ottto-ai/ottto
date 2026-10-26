@@ -7110,6 +7110,7 @@ fn finish_sync_source(
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
+    let bootstrap_offer_finished = bootstrap_capacity_error.is_some();
     let upload_result = if let Some(error) = bootstrap_capacity_error {
         Err(error)
     } else {
@@ -7207,11 +7208,15 @@ fn finish_sync_source(
         })
     };
     // The logical offer ends here; normal bounded HTTP retries happened inside.
-    upload_progress.finish_reason_reoffers(
-        &attempted_reason_reoffers,
-        matches!(upload_result, Ok(ResumableUploadResult::Shed { .. })),
-        source.api_slug(),
-    );
+    if !bootstrap_offer_finished {
+        // Bootstrap already classified its failed logical offer. A routed
+        // capacity stop must not count unattempted leases a second time.
+        upload_progress.finish_reason_reoffers(
+            &attempted_reason_reoffers,
+            matches!(upload_result, Ok(ResumableUploadResult::Shed { .. })),
+            source.api_slug(),
+        );
+    }
 
     // Exact progress is durable before this seam. The same subsequent index
     // save carries settled file bodies and correction progress; local-state

@@ -96,7 +96,9 @@ A cache-head probe capacity stop follows this same partial-settlement path
 before returning; it cannot exit ahead of the durable retirement proof.
 Head-CAS re-offer capacity is checked before removing a saved ordinary probe
 ACK, including zero net-growth re-offers in an already overfull ledger. This
-keeps the durable-equality checkpoint guard usable after a resumed-probe stop. The
+keeps the durable-equality checkpoint guard usable after a resumed-probe stop.
+A routed bootstrap stop retains bootstrap's single lease-finalization count;
+the common finish does not classify the same unattempted offer twice. The
 actual finish regression covers both main/probe capacity stops and all 4,100
 first-install entities in one successful pass.
 
