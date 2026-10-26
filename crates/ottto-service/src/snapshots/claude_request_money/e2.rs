@@ -24,7 +24,7 @@ use crate::claude_local_otel::{
     ClaudeApiEvidenceRead, ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport,
     ClaudeTraceOwnershipLoadReport,
 };
-use crate::telemetry_attach::{join, Attachment, Holders};
+use crate::telemetry_attach::{join, Attachment, DisclosureReason, Holders};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -85,6 +85,26 @@ pub(in crate::snapshots) fn timed<T>(stage: &'static str, f: impl FnOnce() -> T)
     value
 }
 
+// Why folds disclosed and why sessions were held, per reason, for the bench
+// receipt. Test builds only: the daemon build keeps the totals only.
+#[cfg(test)]
+thread_local! {
+    static DIAG: RefCell<BTreeMap<&'static str, u64>> = const { RefCell::new(BTreeMap::new()) };
+}
+#[cfg(test)]
+pub(crate) fn take_diag() -> BTreeMap<&'static str, u64> {
+    DIAG.with(|diag| std::mem::take(&mut *diag.borrow_mut()))
+}
+#[inline(always)]
+fn diag(reason: &'static str, n: u64) {
+    #[cfg(test)]
+    if n > 0 {
+        DIAG.with(|diag| *diag.borrow_mut().entry(reason).or_default() += n);
+    }
+    #[cfg(not(test))]
+    let _ = (reason, n);
+}
+
 /// Benchmark seam (snapshot_sync money_e2_bench_tests). Test builds only.
 #[cfg(test)]
 pub(crate) mod bench_seam {
@@ -116,6 +136,18 @@ pub(crate) mod bench_seam {
             })
             .collect::<serde_json::Map<_, _>>()
             .into()
+    }
+    /// Disclosures and holds by reason since the last take, then zeroed.
+    pub(crate) fn take_diag() -> serde_json::Value {
+        serde_json::to_value(super::take_diag()).expect("E2 diag serializes")
+    }
+    /// Run `run` with synthetic root births (local index key -> unix
+    /// nanos) standing in for creation time, which Linux cannot set.
+    pub(crate) fn with_staged_births<T>(
+        births: std::collections::BTreeMap<String, u64>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        crate::snapshots::claude_history_upgrade::with_staged_births_for_test(births, run)
     }
 }
 
@@ -572,7 +604,8 @@ pub(crate) struct FileFold {
     /// Request hashes two responses of this file claim; filled on demand.
     ambiguous: BTreeSet<u64>,
     disclosed: u64,
-    pub(in crate::snapshots) fold_us: u64,
+    /// Wall time in this fold's E2-added work only (`fold_us`, see `spend`).
+    e2_nanos: u64,
     responses: u64,
     root_fallbacks: u64,
     side: ClaudeMoneyTokens,
@@ -580,7 +613,7 @@ pub(crate) struct FileFold {
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
 }
-crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, copied, first_own, ambiguous, disclosed, fold_us, responses, root_fallbacks, side, side_requests, telemetry, accounts);
+crate::heap_layout_bound::fields!(FileFold; entity, money_birth, physical, role, location, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, copied, first_own, ambiguous, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests, telemetry, accounts);
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,
@@ -588,6 +621,7 @@ impl FileFold {
         base_selector: SelectorCapture,
         bucket_fallback: Option<String>,
     ) -> Self {
+        let started = Instant::now();
         let physical = birth.physical_birth_nanos();
         let mut role = Role::Owner;
         let mut cutoff = None;
@@ -643,7 +677,7 @@ impl FileFold {
         } else {
             birth
         };
-        Self {
+        let mut fold = Self {
             entity: Default::default(),
             money_birth: money_birth.with_minimum(cutoff),
             physical,
@@ -661,14 +695,27 @@ impl FileFold {
             first_own: None,
             ambiguous: BTreeSet::new(),
             disclosed: 0,
-            fold_us: 0,
+            e2_nanos: 0,
             responses: 0,
             root_fallbacks: 0,
             side: Default::default(),
             side_requests: 0,
             telemetry: Default::default(),
             accounts: None,
-        }
+        };
+        fold.spend(started);
+        fold
+    }
+
+    /// `fold_us` (owner definition, P2) counts ONLY the work E2 adds: this
+    /// fold's new/set_identity, observe per response and finish_native, plus
+    /// the page passes (`PageSpent`). The native parse, resolve, placement
+    /// and row add it shares are never in it; total page CPU against the
+    /// pre-E2 reference is the cost gate for those.
+    fn spend(&mut self, started: Instant) {
+        self.e2_nanos = self
+            .e2_nanos
+            .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     }
 
     /// Native-finalizer input seam: identity policy stays with its owner.
@@ -683,6 +730,7 @@ impl FileFold {
         if !enabled() {
             return;
         }
+        let started = Instant::now();
         let subagent = context
             .and_then(|c| claude_index_path_member_ref(c.path))
             .is_some_and(|member| member.subagent_stem.is_some())
@@ -694,12 +742,20 @@ impl FileFold {
             subagent,
             &[],
         )));
+        self.spend(started);
     }
 
     /// The effective cutoff (copy rule), for tests.
     #[cfg(test)]
     pub(crate) fn birth(&self) -> Option<i128> {
         self.money_birth.birth_nanos()
+    }
+
+    /// Counted and disclosed, once per decision. `reason` names it in test
+    /// receipts only.
+    fn disclose(&mut self, reason: &'static str, responses: u64) {
+        self.disclosed += responses;
+        diag(reason, responses);
     }
 
     /// The native resolver dropped one of two incompatible records.
@@ -743,6 +799,20 @@ impl FileFold {
         placed: Option<&PlacedClaudeUsage>,
         effort: Option<&str>,
     ) {
+        let started = Instant::now();
+        self.observe_response(sequence, has_request_id, usage, at, placed, effort);
+        self.spend(started);
+    }
+
+    fn observe_response(
+        &mut self,
+        sequence: u64,
+        has_request_id: bool,
+        usage: &UsageTotals,
+        at: Option<i128>,
+        placed: Option<&PlacedClaudeUsage>,
+        effort: Option<&str>,
+    ) {
         self.responses += 1;
         let copied = self.money_birth.copied_with_slack(at, SLACK);
         if copied == Some(false) {
@@ -769,7 +839,7 @@ impl FileFold {
         }) else {
             // Native drops it as unplaceable usage; never publish over it.
             self.entity.certificate_ok = false;
-            self.disclosed += 1;
+            self.disclose("unplaceable", 1);
             return;
         };
         let account = self.accounts.as_mut().and_then(|accounts| {
@@ -797,7 +867,7 @@ impl FileFold {
             return;
         }
         if copied.is_none() && self.money_birth.birth_nanos().is_some() {
-            self.disclosed += 1; // untimed root record: counted, birth unproven
+            self.disclose("untimed_record", 1); // counted, birth unproven
         }
         // Keep the original placement while copy ownership is undecided.
         // Only requests inheriting a held marker need a temporary aggregate.
@@ -829,10 +899,12 @@ impl FileFold {
         context: Option<&ReadContext<'_>>,
         markers: Option<&claude_request_identity::OrgMarkers>,
     ) {
+        let started = Instant::now();
         self.decide_native(context, markers);
         // The fold lives until the page finishes: keep no parse-time slack.
         self.entity.dark.shrink();
         self.skipped.shrink_to_fit();
+        self.spend(started);
     }
 
     fn decide_native(
@@ -841,7 +913,7 @@ impl FileFold {
         markers: Option<&claude_request_identity::OrgMarkers>,
     ) {
         if self.money_birth.uncertain_root() {
-            self.disclosed += self.responses; // unknown birth: counted, disclosed
+            self.disclose("uncertain_birth", self.responses); // counted, disclosed
         }
         if self.copied == 0 {
             self.finish_identity_start(false, markers);
@@ -892,7 +964,7 @@ impl FileFold {
         self.entity.removed = Default::default();
         self.entity.removed_requests = 0;
         self.skipped.clear();
-        self.disclosed += self.copied;
+        self.disclose("copy_unproven", self.copied);
         self.copied = 0;
         self.finish_identity_start(false, markers);
     }
@@ -1023,7 +1095,7 @@ impl FileFold {
             .add(key, &tokens, requests, None, None, at, account);
         self.unskip(occurrence.sequence);
         self.copied = self.copied.saturating_sub(1);
-        self.disclosed += 1;
+        self.disclose("copy_uncovered", 1);
     }
 
     /// Held id-less copies count: no census can prove them.
@@ -1042,7 +1114,7 @@ impl FileFold {
                 self.entity.removed_requests = removed_requests;
                 self.entity.absorb_grains(&idless);
                 self.copied = self.copied.saturating_sub(responses);
-                self.disclosed += responses;
+                self.disclose("copy_idless", responses);
             }
             _ => self.entity.certificate_ok = false,
         }
@@ -1307,6 +1379,7 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// page's cross-session checks share ONE census walk. Runs in both gate
 /// modes; dark only counts.
 pub(crate) fn decide_page_copies(items: &mut [SnapshotItem], index: &ScanIndex) {
+    let _spent = PageSpent::start();
     let mut holders = Vec::new();
     for at in 0..items.len() {
         let Some(fold) = items[at].claude_money.as_deref_mut() else {
@@ -1345,11 +1418,10 @@ fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &Sca
                 .collect::<Vec<_>>(),
         ),
         None => index
-            .files
+            .claude_request_census
             .get(witness)
-            .zip(index.claude_request_census.get(witness))
-            .filter(|(entry, record)| record.proves_current(&entry.source_file_fingerprint))
-            .map(|(_, record)| {
+            .filter(|record| scan_evidence(index, witness, record))
+            .map(|record| {
                 skipped_ids(&items[at])
                     .filter(|id| !record.holds_hash(claude_request_hash(id)))
                     .cloned()
@@ -1358,14 +1430,58 @@ fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &Sca
     };
     match uncovered {
         Some(uncovered) => restore_uncovered(&mut items[at], &uncovered),
-        None => hold_copies(&mut items[at]),
+        None => hold_copies(&mut items[at], "held_twin_unproven"),
     }
 }
 
+/// What `key`'s census record proves about the file now (owner rule P2:
+/// holding a session withholds its UPLOAD only; its scan state stays
+/// evidence). The record of the settled revision (its index entry, same
+/// fingerprint) proves it; so does the record of a scan whose upload is held
+/// (entry absent or not advanced), while the file is still there. Retired,
+/// over-budget, twin and older-derivation records prove nothing.
+fn scan_evidence(
+    index: &ScanIndex,
+    key: &str,
+    record: &super::super::claude_request_census::ClaudeRequestCensusRecord,
+) -> bool {
+    record.proves_scan()
+        && (index
+            .files
+            .get(key)
+            .is_some_and(|entry| record.proves_current(&entry.source_file_fingerprint))
+            || Path::new(key).is_file())
+}
+
+/// Another session's main file this traversal has not put on any page yet:
+/// queued, not indexed, and without scan state. Only these can make a copy
+/// wait. A scanned file, held or not, is evidence (`scan_evidence`), never a
+/// reason to wait, so held sessions never wait on each other; with the queue
+/// drained (traversal complete) nothing is pending and what exists decides.
+fn unscanned_main_roots(index: &ScanIndex) -> BTreeSet<String> {
+    index
+        .traversal
+        .iter()
+        .flat_map(|traversal| traversal.pending_candidates.iter())
+        .map(|candidate| local_index_key(&candidate.path))
+        .filter(|key| {
+            !index.files.contains_key(key) && index.claude_request_census.get(key).is_none()
+        })
+        .filter_map(|key| {
+            let member = claude_index_path_member_ref(Path::new(&key))?;
+            member
+                .subagent_stem
+                .is_none()
+                .then(|| member.root.to_owned())
+        })
+        .collect()
+}
+
 /// One census walk for every all-pre-birth main file of the page. A holder
-/// proves a request when it is another session's main file, indexed at the
-/// revision its census record describes, and earlier in (effective birth,
-/// location); a holder without a stored birth is probed once.
+/// proves a request when it is another session's main file whose scan state
+/// holds it (`scan_evidence`) and earlier in (effective birth, location); a
+/// holder without a stored birth is probed once. Only the walk deadline and
+/// an unscanned other-session main file delay a decision.
 fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex) {
     struct Wanted {
         at: usize,
@@ -1373,7 +1489,6 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
         order: (i128, LocationKey),
         hashes: Vec<u64>,
         covered: BTreeSet<u64>,
-        unproven: BTreeSet<u64>,
     }
     let mut wanted = folds
         .iter()
@@ -1391,7 +1506,6 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                 order,
                 hashes,
                 covered: BTreeSet::new(),
-                unproven: BTreeSet::new(),
             })
         })
         .collect::<Vec<_>>();
@@ -1407,20 +1521,10 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
         &union,
         Instant::now() + SIDE_CALL_DEADLINE,
         |key, root, record, hits| {
-            let current = index
-                .files
-                .get(key)
-                .is_some_and(|entry| record.proves_current(&entry.source_file_fingerprint));
+            if !scan_evidence(index, key, record) {
+                return;
+            }
             for wanted in wanted.iter_mut().filter(|wanted| wanted.session != root) {
-                let mine = hits
-                    .iter()
-                    .copied()
-                    .filter(|hash| wanted.hashes.binary_search(hash).is_ok());
-                if !current {
-                    // Changed since its census: decided when it is read again.
-                    wanted.unproven.extend(mine);
-                    continue;
-                }
                 let birth = *births.entry(key).or_insert_with(|| {
                     store.effective_cutoff(root, key).or_else(|| {
                         probe_opened_birth(key)
@@ -1429,27 +1533,16 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                     })
                 });
                 if birth.is_some_and(|birth| (birth, location_key(key)) < wanted.order) {
-                    wanted.covered.extend(mine);
+                    wanted.covered.extend(
+                        hits.iter()
+                            .copied()
+                            .filter(|hash| wanted.hashes.binary_search(hash).is_ok()),
+                    );
                 }
             }
         },
     );
-    // Another session's main file seen by this traversal but not indexed yet
-    // is read later: an id no holder proves now may be proven then.
-    let pending_roots = std::cell::OnceCell::<BTreeSet<&str>>::new();
-    let pending = || {
-        pending_roots.get_or_init(|| {
-            index
-                .traversal
-                .iter()
-                .flat_map(|traversal| traversal.observed_index_keys.iter())
-                .filter(|key| !index.files.contains_key(*key))
-                .filter_map(|key| claude_index_path_member_ref(Path::new(key)))
-                .filter(|member| member.subagent_stem.is_none())
-                .map(|member| member.root)
-                .collect()
-        })
-    };
+    let pending = std::cell::OnceCell::<BTreeSet<String>>::new();
     for wanted in wanted {
         let uncovered = wanted
             .hashes
@@ -1457,14 +1550,17 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
             .copied()
             .filter(|hash| !wanted.covered.contains(hash))
             .collect::<Vec<_>>();
-        let undecided = walked.is_none()
-            || uncovered.iter().any(|hash| wanted.unproven.contains(hash))
-            || (!uncovered.is_empty()
-                && pending()
-                    .iter()
-                    .any(|root| *root != wanted.session.as_str()));
-        if undecided {
-            hold_copies(&mut items[wanted.at]);
+        if walked.is_none() {
+            hold_copies(&mut items[wanted.at], "held_copy_deadline");
+            continue;
+        }
+        if !uncovered.is_empty()
+            && pending
+                .get_or_init(|| unscanned_main_roots(index))
+                .iter()
+                .any(|root| *root != wanted.session)
+        {
+            hold_copies(&mut items[wanted.at], "held_copy_unscanned");
             continue;
         }
         let ids = skipped_ids(&items[wanted.at])
@@ -1476,9 +1572,10 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
 }
 
 /// The proof cannot be decided on this page: the session is withheld.
-fn hold_copies(item: &mut SnapshotItem) {
+fn hold_copies(item: &mut SnapshotItem, reason: &'static str) {
     if let Some(fold) = item.claude_money.as_deref_mut() {
         fold.entity.held = true;
+        diag(reason, 1);
     }
 }
 
@@ -1569,6 +1666,7 @@ fn attach_one(item: &mut SnapshotItem, row: &ClaudeLocalOtelEvidence) -> bool {
 /// the existing owner `claude_api_matches_transcript_occurrence` (a sidecar
 /// thinking count of 0 matches). Row-driven: no per-row map is built.
 pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRead) {
+    let _spent = PageSpent::start();
     let families = timed("attach.families", || page_families(items));
     let items = RefCell::new(items);
     for (root, members) in &families {
@@ -1626,10 +1724,21 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
                         let mut items = items.borrow_mut();
                         if !attach_one(&mut items[holder], row) {
                             disclosed += 1;
+                            diag("attach_lost", 1);
                         }
                     }),
                     Attachment::Unheld(_) => {}
-                    Attachment::Disclosed { .. } => disclosed += 1,
+                    Attachment::Disclosed { reason, .. } => {
+                        disclosed += 1;
+                        diag(
+                            match reason {
+                                DisclosureReason::DuplicateReport => "attach_duplicate",
+                                DisclosureReason::ManyHolders => "attach_many_holders",
+                                DisclosureReason::Incompatible => "attach_incompatible",
+                            },
+                            1,
+                        );
+                    }
                 },
             )
         });
@@ -1645,7 +1754,7 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
                     membership: FamilyMembership::default(),
                 };
                 if index == first {
-                    fold.disclosed += disclosed;
+                    fold.disclosed += disclosed; // per reason above
                 }
             }
         }
@@ -1677,6 +1786,7 @@ pub(crate) fn side_calls_page(
     trace: &ClaudeTraceOwnershipLoadReport,
     index: &ScanIndex,
 ) -> BTreeSet<String> {
+    let _spent = PageSpent::start();
     let mut unresolved = BTreeSet::new();
     if enabled() {
         timed("side.inherit", || {
@@ -1787,7 +1897,8 @@ pub(crate) fn side_calls_page(
             // The family stays telemetry-incomplete.
             if let Some(index) = first {
                 if let Some(fold) = items[index].claude_money.as_deref_mut() {
-                    fold.disclosed += fold.telemetry.side_candidates;
+                    let candidates = fold.telemetry.side_candidates;
+                    fold.disclose("side_undecided", candidates);
                 }
             }
             continue;
@@ -1823,6 +1934,7 @@ pub(crate) fn side_calls_page(
                 })
         });
         let mut disclosed = invalid.get(root.as_str()).copied().unwrap_or(0);
+        diag("side_invalid", disclosed);
         // Members this traversal saw but has not indexed yet: read later.
         let unread = std::cell::OnceCell::<BTreeSet<String>>::new();
         // Built once per distinct value: member ids per trace agent, and keys
@@ -1860,6 +1972,7 @@ pub(crate) fn side_calls_page(
                 timed("side.cache_split", || claude_api_cache_creation(row))
             else {
                 disclosed += 1; // contradictory cache split
+                diag("side_cache_split", 1);
                 continue;
             };
             let tokens = ClaudeMoneyTokens {
@@ -1891,6 +2004,7 @@ pub(crate) fn side_calls_page(
                 }
             }) else {
                 disclosed += 1;
+                diag("side_unplaceable", 1);
                 continue;
             };
             let origin = if row.cost_usd_micros.is_some() {
@@ -1921,7 +2035,7 @@ pub(crate) fn side_calls_page(
             }
         }
         if let Some(fold) = items[first].claude_money.as_deref_mut() {
-            fold.disclosed += disclosed;
+            fold.disclosed += disclosed; // per reason above
         }
     }
     unresolved
@@ -1988,6 +2102,7 @@ pub(crate) fn finish_page(
     index: &ScanIndex,
     telemetry: TelemetryRead,
 ) -> BTreeSet<String> {
+    let _spent = PageSpent::start();
     struct Session {
         entity: ClaudeEntityBody,
         complete: bool,
@@ -2019,7 +2134,7 @@ pub(crate) fn finish_page(
             continue;
         };
         record_counts(Counts([
-            fold.fold_us,
+            fold.e2_nanos / 1_000,
             fold.responses,
             fold.entity.removed_requests,
             fold.disclosed,
@@ -2096,6 +2211,7 @@ pub(crate) fn finish_page(
         .map(|(session, state)| (*session, state.locations.as_slice()))
         .collect::<Vec<_>>();
     let held = absent_twins(&locations, index);
+    diag("held_absent_twin", held.len() as u64);
     drop(locations);
     let mut entities = sessions
         .into_iter()
@@ -2124,6 +2240,7 @@ pub(crate) fn finish_page(
         }
         true
     });
+    diag("withheld_sessions", withheld.len() as u64);
     withheld
 }
 
@@ -2191,6 +2308,19 @@ const COUNT_NAMES: [&str; 8] = [
     "dark_unexplained",
 ];
 static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// A page pass's share of `fold_us` (see `FileFold::spend`), on drop.
+struct PageSpent(Instant);
+impl PageSpent {
+    fn start() -> Self {
+        Self(Instant::now())
+    }
+}
+impl Drop for PageSpent {
+    fn drop(&mut self) {
+        let spent = u64::try_from(self.0.elapsed().as_micros()).unwrap_or(u64::MAX);
+        record_counts(Counts([spent, 0, 0, 0, 0, 0, 0, 0]));
+    }
+}
 fn record_counts(counts: Counts) {
     for (counter, value) in COUNTS.iter().zip(counts.0) {
         if value != 0 {

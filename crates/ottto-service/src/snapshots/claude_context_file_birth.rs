@@ -240,14 +240,32 @@ impl ClaudeFileBirth {
                     .and_then(system_time_unix_nanos_i128),
             ),
         };
-        Self {
+        let birth = Self {
             scope,
             opened: metadata
                 .map(ClaudeOpenedBirth::from_metadata)
                 .unwrap_or_default(),
             path_key_hash: stable_hash(&local_index_key(path)),
             ..Self::default()
-        }
+        };
+        // A staged synthetic root birth (Linux has no set-creation-time API)
+        // stands in for the opened file's, as the parser fixtures set it.
+        #[cfg(test)]
+        let birth = {
+            let mut birth = birth;
+            if let Some(staged) =
+                super::claude_history_upgrade::staged_birth_for_test(&local_index_key(path))
+            {
+                if matches!(
+                    birth.scope,
+                    ClaudeBirthScope::Root(_) | ClaudeBirthScope::RootUnknownBirth
+                ) {
+                    birth.set_birth_for_test(i128::from(staged));
+                }
+            }
+            birth
+        };
+        birth
     }
 
     /// `Some(true)` for a root record more than 60 s older than the file's

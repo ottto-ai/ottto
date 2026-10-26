@@ -477,11 +477,18 @@ impl ClaudeRequestCensusRecord {
     /// still lists every request id it read. Retired and over-budget records
     /// dropped their hashes, so they prove nothing.
     pub(crate) fn proves_current(&self, entry_fingerprint: &str) -> bool {
+        self.proves_scan() && fingerprint_matches(self, entry_fingerprint)
+    }
+
+    /// E2 copy proof from a scan whose upload is withheld (its index entry
+    /// not advanced): the record of that scan still lists every request id
+    /// it read (current derivation, its own content, not retired or over
+    /// budget). The caller binds it to the file.
+    pub(crate) fn proves_scan(&self) -> bool {
         self.current_derivation()
             && !self.twin
             && self.retired.is_none()
             && self.shape != ClaudeRequestCensusShape::OverBudget
-            && fingerprint_matches(self, entry_fingerprint)
     }
 
     /// The record lists `hash` (`claude_request_hash`).

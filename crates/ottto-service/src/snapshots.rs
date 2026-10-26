@@ -17923,7 +17923,6 @@ impl SnapshotAccumulator {
         mut capture: Option<&mut claude_request_money::ClaudeResponseCapture>,
         money_context: Option<claude_request_money::e2::ReadContext<'_>>,
     ) {
-        let money_started = std::time::Instant::now();
         if let Some(capture) = capture.as_deref_mut() {
             capture.note_messages(self.claude_responses.message_keys());
         }
@@ -18160,7 +18159,6 @@ impl SnapshotAccumulator {
         claude_request_money::e2::timed("e2.finish_native", || {
             money.finish_native(money_context.as_ref(), self.claude_org_markers.as_deref())
         });
-        money.fold_us = money_started.elapsed().as_micros() as u64;
         self.claude_money = Some(Box::new(money));
     }
 

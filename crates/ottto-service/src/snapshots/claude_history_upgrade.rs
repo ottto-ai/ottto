@@ -407,6 +407,13 @@ thread_local! {
         const { std::cell::RefCell::new(BTreeMap::new()) };
 }
 
+/// The staged synthetic birth of `key`, if any: the parser's opened-birth
+/// read uses it too, so a Linux benchmark corpus has controlled births.
+#[cfg(test)]
+pub(super) fn staged_birth_for_test(key: &str) -> Option<u64> {
+    STAGED_BIRTHS_FOR_TEST.with(|births| births.borrow().get(key).copied())
+}
+
 #[cfg(test)]
 pub(crate) fn with_staged_births_for_test<T>(
     births: BTreeMap<String, u64>,

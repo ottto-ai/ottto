@@ -1941,6 +1941,101 @@ fn e2_pipeline_branch_read_after_its_original_on_a_fresh_index_is_skipped() {
     branch_before_original(false);
 }
 
+/// Owner rule (P2): holding a session withholds its upload only; its scan
+/// state stays evidence. All-copied main files of four sessions share
+/// request ids (the Linux probe shape: every root a cross-session copy
+/// candidate), read one per page. A file waits only for files no page has
+/// read yet, never for one that is merely held, so every session publishes
+/// within two traversal passes, each request counts exactly once, and
+/// nothing is re-read after.
+#[test]
+fn e2_pipeline_held_copies_never_wait_on_each_other() {
+    with_e2(|| {
+        const A: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        const B: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        const C: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        const D: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let mut c = Corpus::new("e2-pipeline-held-cycle");
+        // Every line predates its file's birth; the (birth, location) order
+        // decides who holds a shared id first: x in A, y in C.
+        for (session, requests, birth) in [
+            (A, &["x", "a"][..], "2026-08-02T07:03:00Z"),
+            (B, &["x", "b"][..], "2026-08-02T07:04:00Z"),
+            (C, &["x", "y", "c"][..], "2026-08-02T07:05:00Z"),
+            (D, &["y", "d"][..], "2026-08-02T07:06:00Z"),
+        ] {
+            let contents = requests
+                .iter()
+                .map(|request| line(session, request, AT, 10))
+                .collect::<String>();
+            c.write_at(&format!("{session}.jsonl"), &contents, birth);
+        }
+        let mut progress = e2_progress();
+        let mut prior = ScanIndex::default();
+        let mut published = BTreeMap::<&str, (u64, Option<u64>)>::new();
+        let mut reads = BTreeMap::<PathBuf, usize>::new();
+        let mut held = 0;
+        let mut pages = 0;
+        while published.len() < 4 {
+            assert!(
+                pages < 12,
+                "every session publishes: {published:?} after {pages} pages \
+                 ({held} holds, reads {reads:?})"
+            );
+            let scanner = E2ScanFixture::default();
+            let mut page = c.raw(&scanner, prior.clone(), 1, false, &[]);
+            page.enrich(&c);
+            pages += 1;
+            for path in scanner.paths() {
+                *reads.entry(path).or_default() += 1;
+            }
+            let quarantined = page
+                .disposition
+                .quarantined_fingerprints(&page.scan.snapshots);
+            for session in [A, B, C, D] {
+                let Some(found) = body(&page, session) else {
+                    continue;
+                };
+                if quarantined.contains(&found.snapshot_fingerprint) {
+                    held += 1;
+                    continue;
+                }
+                assert!(
+                    crate::snapshots::claude_request_money::is_request_owned_literal(found),
+                    "{session}: a decided session publishes its literal body"
+                );
+                assert!(
+                    published
+                        .insert(session, (found.request_count, found.removed_request_count))
+                        .is_none(),
+                    "{session}: published once"
+                );
+            }
+            prior = settle(&c, &prior, page, &mut progress);
+        }
+        assert!(held > 0, "the shape makes sessions wait: {published:?}");
+        assert!(
+            reads.values().all(|&count| count <= 2),
+            "settled within two traversal passes: no file read more than twice, {reads:?}"
+        );
+        assert_eq!(
+            published,
+            BTreeMap::from([
+                (A, (2, Some(0))),
+                (B, (1, Some(1))),
+                (C, (2, Some(1))),
+                (D, (1, Some(1))),
+            ]),
+            "x counts in A and y in C, once; every other id in its own file"
+        );
+        let after = c.raw(&E2ScanFixture::default(), prior, 100, false, &[]);
+        assert_eq!(
+            after.scan.scanned_file_count, 0,
+            "a settled corpus is not re-read"
+        );
+    });
+}
+
 /// Owner ruling 3: the census walk deadline decides nothing: the /branch is
 /// held, then the next page's walk skips it.
 #[test]

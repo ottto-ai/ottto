@@ -46,6 +46,17 @@ mod reference_hook {
         serde_json::Value::Object(Default::default())
     }
 
+    pub(super) fn take_diag() -> serde_json::Value {
+        serde_json::Value::Object(Default::default())
+    }
+
+    pub(super) fn with_staged_births<T>(
+        _births: std::collections::BTreeMap<String, u64>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        run()
+    }
+
     pub(super) fn with_switch_on<T>(
         on: bool,
         _support: &std::path::Path,
@@ -60,7 +71,7 @@ mod reference_hook {
 mod e2_hook {
     pub(super) const STATE: &str = "live";
     pub(super) use crate::snapshots::claude_request_money::e2::bench_seam::{
-        drain_counts, take_stages, with_gate,
+        drain_counts, take_diag, take_stages, with_gate, with_staged_births,
     };
 
     /// The gate-on arm as PR C ships it: revision 3 active (its policy row
@@ -89,12 +100,14 @@ mod e2_hook {
 // MONEY_E2_BENCH_HOOK_END
 
 /// The E2 counters on the native_collection_page line (design-e2-final.md).
-const E2_KEYS: [&str; 6] = [
+const E2_KEYS: [&str; 8] = [
     "fold_us",
     "responses",
     "copy_skipped",
     "disclosed",
     "unmatched_1h",
+    "side_call_root_fallback",
+    "resolver_conflicts",
     "dark_unexplained",
 ];
 
@@ -142,6 +155,8 @@ const UNKNOWN_WRITER: &str = "2.0.99";
 const SPAN_MS: i64 = 47 * 86_400_000;
 const PROJECT_GROUPS: usize = 1_261;
 const FINISHES: usize = 3;
+/// Root births a run stages when the file system could not take them.
+const STAGED_BIRTHS: &str = "staged-root-births.json";
 const MAX_PAGES: usize = 400;
 
 fn env(name: &str) -> Option<String> {
@@ -611,6 +626,7 @@ fn prepare(base: &Path, scale: f64, bytes_scale: f64) -> serde_json::Value {
     let mut request_lines = 0u64;
     let mut family_sizes = BTreeMap::<usize, usize>::new();
     let mut birth_controlled = false;
+    let mut root_births = BTreeMap::<String, u64>::new();
     for (file, plan) in plans.iter().enumerate() {
         let path = path_of(&root, file, &plans);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -681,10 +697,29 @@ fn prepare(base: &Path, scale: f64, bytes_scale: f64) -> serde_json::Value {
         drop(out);
         request_lines += plan.lines() as u64;
         birth_controlled = set_times(&path, plan.birth_ms, plan.end_ms());
+        if !matches!(plan.kind, Kind::Agent { .. }) {
+            root_births.insert(
+                path.to_string_lossy().into_owned(),
+                u64::try_from(i128::from(plan.birth_ms) * 1_000_000).unwrap(),
+            );
+        }
         // Path twins join their source's family; every other file but an
         // agent starts one.
         *family_sizes.entry(family_root(file, &plans)).or_default() += 1;
     }
+    // Linux cannot set creation time: the runs stage these root births in
+    // its place (test seam), so copy decisions see the planned births.
+    let staged_births = if birth_controlled {
+        0
+    } else {
+        std::fs::write(
+            base.join(STAGED_BIRTHS),
+            serde_json::to_vec(&root_births).unwrap(),
+        )
+        .unwrap();
+        root_births.len()
+    };
+    drop(root_births);
     // OTEL sidecars, one per OTEL family root: every member request (agent
     // requests with a trace row naming the agent), explicit mismatches, and
     // side calls with no transcript line.
@@ -847,6 +882,7 @@ fn prepare(base: &Path, scale: f64, bytes_scale: f64) -> serde_json::Value {
         "otel_mismatch_rows": mismatch_rows,
         "otel_side_call_rows": side_rows,
         "birth_controlled": birth_controlled,
+        "staged_root_births": staged_births,
         // What a correct E2 fold reports over one traversal (each file once).
         "expected": {
             "responses": request_lines,
@@ -1345,6 +1381,8 @@ impl Harness {
                 "snapshot_batch_call": stage(&records, "snapshot_batch_call"),
             },
             "e2": e2,
+            // Test builds only: disclosures and holds by reason.
+            "e2_diag": e2_hook::take_diag(),
             "phys_footprint_after_bytes": footprint_now,
             "index_bytes": std::fs::metadata(&index_path).map_or(0, |m| m.len()),
         })
@@ -1763,11 +1801,21 @@ fn money_e2_bench_receipt() {
                 serde_json::from_slice(&std::fs::read(&manifest_path).expect("prepare first"))
                     .unwrap();
             let arm_name = env("OTTTO_E2_BENCH_ARM").unwrap_or_default();
-            match mode.as_str() {
+            // OTTTO_E2_BENCH_STAGED_BIRTHS=0 keeps the file system's births
+            // (Linux: every root then looks all-copied, a stress shape).
+            let births = std::fs::read(base.join(STAGED_BIRTHS))
+                .ok()
+                .filter(|_| env("OTTTO_E2_BENCH_STAGED_BIRTHS").as_deref() != Some("0"))
+                .map(|bytes| serde_json::from_slice::<BTreeMap<String, u64>>(&bytes).unwrap())
+                .unwrap_or_default();
+            let staged = births.len();
+            let mut receipt = e2_hook::with_staged_births(births, || match mode.as_str() {
                 "arm" => arm(&base, &manifest, &arm_name),
                 "history" => history(&base, &arm_name),
                 _ => reread(&base, &manifest),
-            }
+            });
+            receipt["staged_root_births"] = serde_json::json!(staged);
+            receipt
         }
         other => panic!("unknown OTTTO_E2_BENCH_MODE {other:?}"),
     };
