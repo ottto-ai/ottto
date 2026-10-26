@@ -376,11 +376,12 @@ pub(crate) fn retained_refusal_settles_for_test(
 // Local index projection producer revision; independent of semantic/wire identity.
 // Each indexed file whose stored revision differs is re-read once; the stamp is
 // written only when its upload settles, so an interrupted pass resumes. Claude
-// Code 2 re-reads its history once so the newer context numbers fill in. Bump a
+// Code 2 re-reads its history once so the newer context numbers fill in; 3 (E2)
+// re-reads it once more for request-owned money, paced. Bump a
 // source at most once per release; Codex and Pi stay unchanged.
 pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
     match source {
-        SnapshotSource::ClaudeCode => 2,
+        SnapshotSource::ClaudeCode => 3,
         SnapshotSource::Codex | SnapshotSource::Pi => 1,
     }
 }

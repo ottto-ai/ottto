@@ -73424,7 +73424,7 @@ mod tests {
             crate::snapshot_sync::effective_upload_body_witness_revision(
                 SnapshotSource::ClaudeCode
             ),
-            2
+            3
         );
         let (home, root, index) =
             claude_context_backfill_fixture("claude-context-backfill-once", 2);
@@ -73468,7 +73468,7 @@ mod tests {
         assert!(loaded
             .files
             .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 2));
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
         let again = claude_context_backfill_scan(&root, &mut loaded, MAX_BACKFILL_FILES_PER_SOURCE);
         assert_eq!((again.scanned_file_count, again.snapshots.len()), (0, 0));
         let _ = fs::remove_dir_all(home);
@@ -73491,7 +73491,7 @@ mod tests {
                 index
                     .files
                     .values()
-                    .filter(|entry| entry.effective_upload_body_witness_revision == 2)
+                    .filter(|entry| entry.effective_upload_body_witness_revision == 3)
                     .count(),
                 page * 2
             );
@@ -73652,7 +73652,7 @@ mod tests {
         assert!(index
             .files
             .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 2));
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
         let _ = fs::remove_dir_all(home);
     }
 
@@ -73703,12 +73703,12 @@ mod tests {
         // A budget that holds any two files but no three spreads six files
         // over three pages, under a file budget that would admit all six.
         let (sizes, _, revisions) = pages(u64::MAX, "claude-context-backfill-bytes-sizes");
-        assert_eq!(revisions, BTreeSet::from([2]));
+        assert_eq!(revisions, BTreeSet::from([3]));
         let two = sizes[4] + sizes[5];
         assert!(sizes[0] + sizes[1] + sizes[2] > two, "{sizes:?}");
         let (_, paired, revisions) = pages(two, "claude-context-backfill-bytes-paired");
         assert_eq!(paired, vec![2, 2, 2, 0]);
-        assert_eq!(revisions, BTreeSet::from([2]));
+        assert_eq!(revisions, BTreeSet::from([3]));
     }
 
     #[test]
@@ -73892,8 +73892,8 @@ mod tests {
         assert_eq!(
             settled,
             vec![
-                (false, 2),
-                (false, 2),
+                (false, 3),
+                (false, 3),
                 (true, 1),
                 (true, 1),
                 (true, 1),
@@ -73917,7 +73917,7 @@ mod tests {
         assert!(index
             .files
             .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 2));
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
         let _ = fs::remove_dir_all(home);
     }
 
@@ -73980,7 +73980,7 @@ mod tests {
         });
         assert_eq!(fresh.scanned_file_count, 4, "newer entities proceed");
         let index = claude_context_backfill_settle(&home, &previous, &mut fresh, &mut index);
-        assert_eq!(stamps(&index), vec![2; 4]);
+        assert_eq!(stamps(&index), vec![3; 4]);
         assert!(!ReemissionExclusions::seen_marker_path(&support).exists());
         let _ = fs::remove_dir_all(home);
     }
@@ -74012,7 +74012,7 @@ mod tests {
         assert!(index
             .files
             .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 2));
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
         let _ = fs::remove_dir_all(home);
     }
 

@@ -48,15 +48,15 @@ pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
 /// Bytes of history one page may upgrade (1 GiB), for every revision. No
 /// file is admitted past it, including a page's first file.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
-/// Highest active Claude revision the gate is open for (SOURCE F2). The
-/// revision-3 row below exists, but this stays at the current revision until
-/// MONEY's activation PR (#699) raises it with the Claude revision constant
-/// (SOURCE h732 C1). Above it every owed upgrade and every listed change is
-/// held, no file is stamped, activation is refused at runtime
+/// Highest active Claude revision the gate is open for (SOURCE F2). MONEY's
+/// activation (#699, E2 PR C) raised it to the revision-3 row together with
+/// the Claude revision constant and the E2 gate (SOURCE h732 C1). Above it
+/// every owed upgrade and every listed change is held, no file is stamped,
+/// activation is refused at runtime
 /// (`activate_effective_upload_body_witness_revision`), and the Claude
 /// revision constant fails to compile. The release check reads the next
 /// line, so keep it free of comments and other digits.
-pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 2;
+pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 3;
 /// The request-owned usage literal of MONEY P2 (#699's
 /// `REQUEST_OWNED_CONTRACT`). Listed roots never emit it.
 pub(crate) const REQUEST_OWNED_USAGE_CONTRACT: &str = "claude_request_owned_usage:v1";
