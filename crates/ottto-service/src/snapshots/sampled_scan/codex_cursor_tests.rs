@@ -3337,8 +3337,8 @@ fn watcher_hint_for_a_processed_codex_path_is_next_generation_evidence() {
         assert_eq!(flags(&processed), Some((!codex, true)), "{source:?}");
         assert_eq!(
             flags(&pending),
-            Some((true, false)),
-            "{source:?}: the pending census member keeps its entry"
+            Some((true, codex)),
+            "{source:?}: the pending census member keeps membership and remembers the hint"
         );
         assert_eq!(flags(&unobserved), Some((true, true)), "{source:?}");
         assert_eq!(traversal.pending_candidates.len(), before + 2);
@@ -3560,6 +3560,450 @@ fn growing_generation_with_large_file_closes_within_bounded_pages() {
     assert_eq!(latest, expected);
 }
 
+/// Scheduling consumes only path novelty and byte length. Metadata-only
+/// changes and an identical inode replacement cannot create a fresh turn.
+#[test]
+fn freshness_priority_ignores_metadata_and_identical_replacement() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = ScanRoot::new(4);
+    let (index, _) = page(&fixture, ScanIndex::default(), None);
+    let path = fixture.file(SESSION);
+    let candidate = ScanTraversalPath {
+        scan_root: fixture.root.clone(),
+        path: path.clone(),
+        census_member: false,
+        watcher_hint: true,
+    };
+    assert!(!codex_fresh_data_pending(&candidate, &index.files));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!codex_fresh_data_pending(&candidate, &index.files));
+    let replacement = path.with_extension("replacement");
+    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+    fs::rename(&replacement, &path).unwrap();
+    assert!(!codex_fresh_data_pending(&candidate, &index.files));
+    fixture.append(SESSION, &token_line(5));
+    assert!(codex_fresh_data_pending(&candidate, &index.files));
+}
+
+/// An ordinary page that fits must still service both old revalidation and
+/// a new hinted session; fresh traffic must not create unnecessary pages.
+#[test]
+fn freshness_selection_keeps_a_fitting_census_page_together() {
+    let fixture = ScanRoot::new(4);
+    let (mut index, _) = page(&fixture, ScanIndex::default(), None);
+    index
+        .files
+        .get_mut(&local_index_key(&fixture.file(SESSION)))
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": SESSION_B}}));
+    body.extend(token_line(1));
+    fs::write(fixture.file(SESSION_B), body).unwrap();
+    let scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[fixture.file(SESSION_B)],
+        false,
+        true,
+    );
+    assert_eq!(scan.identified_candidates.len(), 2);
+    assert!(!scan.index.traversal.as_ref().unwrap().codex_freshness_yield);
+}
+
+/// The production-shaped 2,800-member revalidation backlog must not spend
+/// the byte budget before a new session or an appended, processed session.
+/// A persisted yield then gives the census a whole ordinary page even when
+/// fresh data continues to arrive. No upload fingerprints or totals change.
+#[test]
+fn fresh_sessions_bypass_2800_owed_rereads_within_two_pages() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const NEW: &str = "019fa111-2222-7333-8444-888888888888";
+    const NEXT: &str = "019fa111-2222-7333-8444-888888888889";
+    let ids = (0..2800)
+        .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
+        .collect::<Vec<_>>();
+    let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
+    sessions.push((SESSION, 4));
+    let fixture = ScanRoot::with_sessions(&sessions);
+    let cache = Arc::new(SharedCache::default());
+    // Unlike the older cursor helpers, return the post-policy upload set.
+    let published_page = |index, collected_at: &str, hints: &[PathBuf], limit| {
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&fixture.root),
+            index,
+            collected_at,
+            BACKFILL_WINDOW_DAYS,
+            limit,
+            false,
+            None,
+            hints,
+            false,
+            true,
+        )
+        .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+        loop {
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete {
+                    mut index,
+                    mut scan,
+                    ..
+                } => {
+                    apply_upload_policy(
+                        SnapshotSource::Codex,
+                        &mut scan.snapshots,
+                        SnapshotUploadPolicy::default(),
+                    );
+                    finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                    let accepted = scan
+                        .snapshots
+                        .iter()
+                        .map(|item| item.snapshot_fingerprint.clone())
+                        .collect();
+                    index.record_accepted_snapshot_fingerprints(&accepted);
+                    break (index, scan);
+                }
+            }
+        }
+    };
+    let (mut index, warm) = published_page(ScanIndex::default(), NOW, &[], 10000);
+    assert_eq!(warm.snapshots.len(), 2801);
+    for id in &ids {
+        index
+            .files
+            .get_mut(&local_index_key(&fixture.file(id)))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    // SESSION already finished its census read; growth must not re-enroll it.
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_candidates
+        .retain(|candidate| candidate.path != fixture.file(SESSION));
+    let budget = fixture.len(SESSION) * 4;
+    cache.clear();
+    with_test_limits(2048, budget, 64, || {
+        let (next, scan) = published_page(index, NOW, &[], 10000);
+        index = next;
+        assert!(scan.snapshots.is_empty(), "unchanged-output revalidation");
+        assert!(!scan.census_complete);
+        let window = scan.census_window_end.clone();
+        let old_pending = index.traversal.as_ref().unwrap().pending_candidates.len();
+        assert!(old_pending > 2700);
+
+        let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+            "type": "session_meta", "payload": {"id": NEW}}));
+        body.extend(token_line(1));
+        fs::write(fixture.file(NEW), body).unwrap();
+        fixture.append(SESSION, &token_line(5));
+        cache.clear();
+        // NEW deliberately has no watcher hint: retained-roster discovery
+        // must promote it too, even though refresh runs before hint enqueue.
+        let (next, fresh) =
+            published_page(index, &collected_at(1), &[fixture.file(SESSION)], 10000);
+        index = next;
+        let published = fresh
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(published, BTreeSet::from([NEW, SESSION]));
+        assert_eq!(fresh.census_window_end, window);
+        assert!(!fresh.census_complete);
+        assert!(index.traversal.as_ref().unwrap().codex_freshness_yield);
+        assert_eq!(
+            index.traversal.as_ref().unwrap().pending_candidates.len(),
+            old_pending
+        );
+
+        // Restart preserves the owed ordinary turn. Another real append
+        // waits while that page makes census progress with the full budget.
+        index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        fixture.append(SESSION, &token_line(6));
+        let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:02Z",
+            "type": "session_meta", "payload": {"id": NEXT}}));
+        body.extend(token_line(1));
+        fs::write(fixture.file(NEXT), body).unwrap();
+        let (next, ordinary) = published_page(
+            index,
+            &collected_at(2),
+            &[fixture.file(SESSION), fixture.file(NEXT)],
+            10000,
+        );
+        index = next;
+        assert!(!ordinary.census_complete);
+        assert!(
+            ordinary.snapshots.is_empty(),
+            "the owed turn is for old census debt"
+        );
+        assert!(!index.traversal.as_ref().unwrap().codex_freshness_yield);
+        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() < old_pending);
+        let (_, fresh) = published_page(index, &collected_at(3), &[], 10000);
+        let published = fresh
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(published, BTreeSet::from([NEXT, SESSION]));
+    });
+}
+
+/// One Codex page stepped to completion, returning the same post-policy
+/// upload set the collector would offer.
+fn published_scan(
+    fixture: &ScanRoot,
+    cache: &Arc<SharedCache>,
+    index: ScanIndex,
+    collected_at: &str,
+    hints: &[PathBuf],
+) -> (ScanIndex, SourceScanResult) {
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        index,
+        collected_at,
+        BACKFILL_WINDOW_DAYS,
+        10000,
+        false,
+        None,
+        hints,
+        false,
+        true,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
+    loop {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index,
+                mut scan,
+                ..
+            } => {
+                apply_upload_policy(
+                    SnapshotSource::Codex,
+                    &mut scan.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                let accepted = scan
+                    .snapshots
+                    .iter()
+                    .map(|item| item.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan);
+            }
+        }
+    }
+}
+
+/// Write a one-turn rollout in a day directory below the fixture root.
+fn write_dated_rollout(fixture: &ScanRoot, day: &str, session: &str) -> PathBuf {
+    let directory = fixture.root.join(day);
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("rollout-2026-10-07T10-00-00-{session}.jsonl"));
+    let mut body = codex_line(json!({"timestamp": "2026-10-07T10:00:00Z",
+        "type": "session_meta", "payload": {"id": session}}));
+    body.extend(token_line(1));
+    fs::write(&path, body).unwrap();
+    path
+}
+
+/// Only a directory found by retained-roster refresh carries freshness
+/// provenance, through its whole subtree. The initial walk of old nested day
+/// directories queues cold history unmarked, so it keeps FIFO census order.
+#[test]
+fn only_roster_discovered_directories_mark_their_sessions_fresh() {
+    const OLD: &str = "019fa111-2222-7333-8444-888888888891";
+    const NEW: &str = "019fa111-2222-7333-8444-888888888892";
+    let fixture = ScanRoot::new(4);
+    let old = write_dated_rollout(&fixture, "2026/10/01", OLD);
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    let flags = |index: &ScanIndex, path: &PathBuf| {
+        index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .find(|candidate| candidate.path == *path)
+            .map(|candidate| {
+                (
+                    candidate.census_member,
+                    candidate.watcher_hint,
+                    codex_fresh_data_pending(candidate, &index.files),
+                )
+            })
+    };
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+    assert_eq!(flags(&index, &old), Some((true, false, false)));
+    assert_eq!(
+        flags(&index, &fixture.file(SESSION)),
+        Some((true, false, false))
+    );
+
+    // A new month: `2026` moves, and both `11` and `11/01` are new. Wait
+    // past coarse directory timestamps so the move is visible everywhere.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let new = write_dated_rollout(&fixture, "2026/11/01", NEW);
+    refresh_retained_codex_roster(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    assert!(!index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    assert!(index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+    assert_eq!(flags(&index, &new), Some((true, true, true)));
+    assert_eq!(flags(&index, &old), Some((true, false, false)));
+}
+
+/// A new Codex day is a new date directory. Retained-roster refresh finds it
+/// with no watcher hint; its rollout must still reach the post-policy upload
+/// set within two ordinary pages instead of waiting behind 2,800 owed old
+/// census members.
+#[test]
+fn new_date_directory_session_bypasses_2800_owed_rereads_within_two_pages() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const NEW: &str = "019fa111-2222-7333-8444-888888888890";
+    let ids = (0..2800)
+        .map(|n| format!("019fa111-2222-7333-8444-{n:012}"))
+        .collect::<Vec<_>>();
+    let mut sessions = ids.iter().map(|id| (id.as_str(), 4)).collect::<Vec<_>>();
+    sessions.push((SESSION, 4));
+    let fixture = ScanRoot::with_sessions(&sessions);
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, warm) = published_scan(&fixture, &cache, ScanIndex::default(), NOW, &[]);
+    assert_eq!(warm.snapshots.len(), 2801);
+    for id in &ids {
+        index
+            .files
+            .get_mut(&local_index_key(&fixture.file(id)))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        &mut index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    advance_bounded_directory_traversal(
+        SnapshotSource::Codex,
+        index.traversal.as_mut().unwrap(),
+        BACKFILL_WINDOW_DAYS,
+        &index.files,
+    );
+    let budget = fixture.len(SESSION) * 4;
+    cache.clear();
+    with_test_limits(2048, budget, 64, || {
+        let (next, scan) = published_scan(&fixture, &cache, index, NOW, &[]);
+        index = next;
+        assert!(scan.snapshots.is_empty(), "unchanged-output revalidation");
+        assert!(!scan.census_complete);
+        let window = scan.census_window_end.clone();
+        assert!(index.traversal.as_ref().unwrap().pending_candidates.len() > 2700);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        write_dated_rollout(&fixture, "2026/10/08", NEW);
+        cache.clear();
+        let mut published = BTreeSet::new();
+        for page in 1..=2 {
+            let (next, scan) = published_scan(&fixture, &cache, index, &collected_at(page), &[]);
+            index = next;
+            assert_eq!(scan.census_window_end, window, "same open generation");
+            assert!(!scan.census_complete);
+            published.extend(
+                scan.snapshots
+                    .iter()
+                    .map(|item| item.source_session_id.clone()),
+            );
+            if published.contains(NEW) {
+                break;
+            }
+        }
+        assert_eq!(published, BTreeSet::from([NEW.to_string()]));
+    });
+}
+
 /// G1 carry: a census that closes while a re-read is still waiting hands it
 /// to the next generation as a member instead of dropping it. Two small
 /// files, one full read per page. Page 0 reads one (X) and defers the other
@@ -3626,6 +4070,10 @@ fn census_close_carries_a_waiting_reread_into_the_next_generation() {
         assert_eq!(waiting(&index, &x_path), None, "X was read");
         let first = census_token(&index).expect("first generation");
 
+        // This test exercises ordinary-page carry. Freshness pages are
+        // covered separately; an ordinary page is owed after one of them.
+        let mut index = index;
+        index.traversal.as_mut().unwrap().codex_freshness_yield = true;
         fixture.append(x, &token_line(5));
         assert!(fixture.len(x) <= singleton);
         cache.clear();
@@ -3906,10 +4354,13 @@ fn unsettled_close_keeps_the_clean_follow_up_and_rereads_once() {
         let x_path = fixture.file(x);
         assert_eq!(pending_flags(&index, &fixture.file(y)), Some((true, false)));
 
+        // This test exercises ordinary-page carry. Freshness pages are
+        // covered separately; an ordinary page is owed after one of them.
+        let mut index = index;
+        index.traversal.as_mut().unwrap().codex_freshness_yield = true;
         fixture.append(x, &token_line(5));
         assert!(fixture.len(x) <= singleton);
         cache.clear();
-        let mut index = index;
         // An earlier page of this sweep settled only partially.
         index.mark_bounded_sweep_unsettled();
         let (index, scan) = hinted_page(
