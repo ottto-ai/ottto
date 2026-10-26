@@ -418,6 +418,7 @@ impl<'a> ShadowTestCleanup<'a> {
 impl Drop for ShadowTestCleanup<'_> {
     fn drop(&mut self) {
         disable_shadow_for_test(self.0);
+        capture::purge_scope_for_test(self.0);
     }
 }
 
