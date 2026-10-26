@@ -72981,6 +72981,8 @@ mod tests {
 
     #[test]
     fn claude_original_carrier_source_generated_wire_corpus() {
+        // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let complete = claude_original_carrier_fixture(&claude_original_carrier_metadata(), "");
         assert!(complete
             .tool_usage
@@ -85961,6 +85963,8 @@ pub(crate) mod cache_adapter_tests {
     }
     #[test]
     fn cache_claude_owned_fixture_is_independent_of_curve_sampling() {
+        // Released pre-flip bytes built without e2::finish_page, which emits the hours gate on.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let session = "00000000-0000-7000-8000-000000000002";
         let mut parser = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
         parser.context_curve_enabled = false;
