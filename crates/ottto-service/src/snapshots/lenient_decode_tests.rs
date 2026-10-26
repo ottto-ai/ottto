@@ -2238,7 +2238,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
             let mut completed = None;
             for _ in 0..1000 {
                 assert_eq!(
-                    owned.census.claude_parse_reasons[CandidateParseReason::NewFile as usize],
+                    owned.census.parse_reasons[CandidateParseReason::NewFile as usize],
                     0
                 );
                 assert!(owned
