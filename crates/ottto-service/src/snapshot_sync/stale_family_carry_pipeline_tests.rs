@@ -1414,3 +1414,5 @@ fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_fami
     assert_eq!(run.head_after, run.head_before);
     assert!(run.retry.red && !run.retry.census_complete && run.retry.fence_after);
 }
+
+include!("retry_admission_pipeline_tests.rs");

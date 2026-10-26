@@ -3748,3 +3748,32 @@ fn scaled_retry_defers_without_clearing_when_cancellation_cannot_be_funded() {
         0
     );
 }
+
+#[test]
+fn deferred_retry_resumes_after_transient_funding_refusal() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = scoped_retry_fixture(0, 6356, false);
+    let before = serde_json::to_value(&fixture.index.files).unwrap();
+    {
+        let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut fixture.index,
+            CARRY_RETRY,
+            BACKFILL_WINDOW_DAYS,
+        );
+        assert_eq!(serde_json::to_value(&fixture.index.files).unwrap(), before);
+    }
+    let exclusions = fixture.index.claude_reemission_exclusions.clone();
+    fixture.index = carry_reload(fixture.index);
+    fixture.index.claude_reemission_exclusions = exclusions;
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 6356);
+    assert_eq!(
+        scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+        0
+    );
+}
