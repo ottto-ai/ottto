@@ -121,7 +121,7 @@ fn oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
     let before = fixture.index.files[&real].source_file_fingerprint.clone();
     ensure_bounded_traversal(
         SnapshotSource::ClaudeCode,
-        &[root.clone()],
+        std::slice::from_ref(&root),
         &mut fixture.index,
         CARRY_RETRY,
         BACKFILL_WINDOW_DAYS,

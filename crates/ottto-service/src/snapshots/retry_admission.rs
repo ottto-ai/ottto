@@ -140,12 +140,12 @@ fn claude_retry_path_owed(
         && state
             .oversized_after_path
             .as_deref()
-            .is_none_or(|after| key > after);
+            .map_or(true, |after| key > after);
     let due = !state.due_complete
         && state
             .due_after_path
             .as_deref()
-            .is_none_or(|after| key > after)
+            .map_or(true, |after| key > after)
         && state
             .due_upper_path
             .as_deref()
@@ -177,7 +177,7 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
             state
                 .oversized_after_path
                 .as_deref()
-                .is_none_or(|after| key.as_str() > after)
+                .map_or(true, |after| key.as_str() > after)
                 && claude_index_path_member_ref(Path::new(key))
                     .is_some_and(|member| member.root == root)
         })
@@ -191,7 +191,7 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
             && state
                 .due_after_path
                 .as_deref()
-                .is_none_or(|after| key.as_str() > after)
+                .map_or(true, |after| key.as_str() > after)
             && state
                 .due_upper_path
                 .as_deref()
@@ -290,7 +290,7 @@ fn claude_retry_note_offered(
             if !state
                 .due_after_path
                 .as_deref()
-                .is_none_or(|after| key.as_str() > after)
+                .map_or(true, |after| key.as_str() > after)
                 || !state
                     .due_upper_path
                     .as_deref()
@@ -312,7 +312,7 @@ fn claude_retry_note_offered(
         if !state
             .oversized_after_path
             .as_deref()
-            .is_none_or(|after| key.as_str() > after)
+            .map_or(true, |after| key.as_str() > after)
             || !claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| state.oversized_root.as_deref() == Some(member.root))
         {
@@ -340,7 +340,7 @@ fn claude_retry_note_offered(
             |key| {
                 oversized.as_deref().is_some_and(|root| {
                     claude_index_path_member_ref(Path::new(key)).is_some_and(|m| m.root == root)
-                }) && previous.as_deref().is_none_or(|after| key > after)
+                }) && previous.as_deref().map_or(true, |after| key > after)
                     && oversized_after.as_deref().is_some_and(|after| key <= after)
                     && offered(key)
             },
@@ -350,7 +350,9 @@ fn claude_retry_note_offered(
             let key = local_index_key(&path.path);
             if claude_index_path_member_ref(&path.path)
                 .is_some_and(|m| oversized.as_deref() == Some(m.root))
-                && previous.as_deref().is_none_or(|after| key.as_str() > after)
+                && previous
+                    .as_deref()
+                    .map_or(true, |after| key.as_str() > after)
                 && oversized_after
                     .as_deref()
                     .is_some_and(|after| key.as_str() <= after)
