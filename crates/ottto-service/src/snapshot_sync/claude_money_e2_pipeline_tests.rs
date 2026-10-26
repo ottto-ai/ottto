@@ -368,6 +368,34 @@ fn literal(page: &Page) {
         .iter()
         .all(crate::snapshots::claude_request_money::is_request_owned_literal));
 }
+/// Each indexed file still on disk: the body it last sent (snapshot
+/// fingerprint and upload body witness), as the index stores it.
+fn stored_bodies(
+    index: &ScanIndex,
+) -> std::collections::BTreeMap<String, (Option<String>, Option<String>)> {
+    index
+        .files
+        .iter()
+        .filter(|(key, _)| std::path::Path::new(key.as_str()).is_file())
+        .map(|(key, entry)| {
+            (
+                key.clone(),
+                (
+                    entry.last_snapshot_fingerprint.clone(),
+                    entry.last_upload_body_witness.clone(),
+                ),
+            )
+        })
+        .collect()
+}
+fn append(path: &Path, text: &str) {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+}
 fn assert_mode(actual: (usize, usize, usize), expected: (usize, usize, usize)) {
     let expected = if crate::heap_layout_bound::layout_supported() {
         expected
@@ -848,7 +876,7 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:00:00Z",
         );
-        c.write_at(
+        let survivor = c.write_at(
             &format!("z/{ROOT}.jsonl"),
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:03:00Z",
@@ -859,11 +887,27 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
         first.finish();
         let prior = c.reload(&mut first.index);
         std::fs::remove_file(original).unwrap();
-        let left = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&left);
+        let stored = stored_bodies(&prior);
+        let mut left = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        // R1 (owner-authorized): the unchanged survivor is not read again
+        // (latest wins); it re-emits on its next real change.
+        assert!(
+            left.scan.snapshots.is_empty(),
+            "an unchanged survivor emits nothing new"
+        );
+        left.finish();
         assert_eq!(
-            total(&left),
-            1,
+            stored_bodies(&left.index),
+            stored,
+            "the stored body stays byte-identical"
+        );
+        append(&survivor, &line(ROOT, "r2", "2026-08-02T07:04:00Z", 20));
+        let prior = c.reload(&mut left.index);
+        let changed = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&changed);
+        assert_eq!(
+            total(&changed),
+            2,
             "the sole surviving path keeps known original money"
         );
     });
@@ -1539,7 +1583,7 @@ fn restored_twins(reverse: bool, equal: bool) {
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:02:00Z",
         );
-        c.write_at(
+        let twin = c.write_at(
             &format!("{b}/{ROOT}.jsonl"),
             &line(ROOT, "r1", AT, 10),
             if equal {
@@ -1563,13 +1607,29 @@ fn restored_twins(reverse: bool, equal: bool) {
             "all-prebirth restored twins must count once on their first page"
         );
         first.finish();
+        let stored = stored_bodies(&first.index);
         let prior = c.reload(&mut first.index);
-        let again = ready(&c, &scanner, prior, 100, false);
-        literal(&again);
+        let mut again = ready(&c, &scanner, prior, 100, false);
+        // R1 (owner-authorized): an unchanged repeated page reads and sends
+        // nothing (latest wins); a real change re-emits the twin group.
+        assert!(
+            again.scan.snapshots.is_empty(),
+            "an unchanged repeated page emits nothing new"
+        );
+        again.finish();
         assert_eq!(
-            total(&again),
-            1,
-            "restart and repeated page cannot change the total"
+            stored_bodies(&again.index),
+            stored,
+            "the stored body stays byte-identical"
+        );
+        append(&twin, &line(ROOT, "r2", "2026-08-02T07:04:00Z", 20));
+        let prior = c.reload(&mut again.index);
+        let changed = ready(&c, &scanner, prior, 100, false);
+        literal(&changed);
+        assert_eq!(
+            total(&changed),
+            2,
+            "restart and repeated page cannot change the total; the new response counts once"
         );
     });
 }
