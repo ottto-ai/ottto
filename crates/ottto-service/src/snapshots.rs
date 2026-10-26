@@ -24929,8 +24929,16 @@ impl OwnedSourceScan {
                 identified_candidates
                     .iter()
                     .map(|candidate| candidate.path.as_path()),
-                claude_twin_groups
-                    .get_or_init(|| claude_history_upgrade::claude_path_twin_groups(&index)),
+                claude_twin_groups.get_or_init(|| {
+                    // A page file not known yet (a new copy) keeps its
+                    // member's single known path as its twin.
+                    let page_members = identified_candidates
+                        .iter()
+                        .filter_map(|candidate| claude_index_path_family_member(&candidate.path))
+                        .map(|(_, member)| member)
+                        .collect::<BTreeSet<_>>();
+                    claude_history_upgrade::claude_path_twin_groups(&index, &page_members)
+                }),
             ) {
                 if forced_claude_family_reparses.insert(root.clone()) {
                     claude_twin_only_family_reparses.insert(root);
@@ -65614,6 +65622,14 @@ mod tests {
             RequestSlot::default(),
         ));
         assert_eq!(response.records.len(), MAX_CLAUDE_RECORDS_PER_RESPONSE);
+        // A capped response is loss held for retry, never a resolver conflict.
+        assert_eq!(
+            response
+                .clone()
+                .resolve_classified(&ClaudeSelectorTable::default())
+                .err(),
+            Some(ClaudeResolveFailure::Capped)
+        );
         assert!(response.resolve().is_none());
 
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);

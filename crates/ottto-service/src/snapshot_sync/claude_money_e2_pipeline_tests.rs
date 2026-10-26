@@ -20,7 +20,11 @@ fn nanos(at: &str) -> i128 {
         .unix_timestamp_nanos()
 }
 fn line(session: &str, request: &str, at: &str, tokens: u64) -> String {
-    json!({"type":"assistant", "sessionId":session, "version":"2.1.309",
+    line_by(session, request, at, tokens, "2.1.309")
+}
+/// A response line written by Claude Code `version` (a copy keeps it).
+fn line_by(session: &str, request: &str, at: &str, tokens: u64, version: &str) -> String {
+    json!({"type":"assistant", "sessionId":session, "version":version,
         "timestamp":at, "requestId":request,
         "message":{"id":format!("msg-{request}"), "model":"claude-haiku-4-5",
             "usage":{"input_tokens":tokens,"output_tokens":tokens,
@@ -1652,4 +1656,386 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             "strict byte budget refuses the complete twin group before either file is read; opened={}", scanner.paths().len()
         );
     });
+}
+
+// ---- I4b: gate-ON copy proofs, delays, side-call holds, conflict carrier ----
+
+const LATE: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+
+/// Production Completed settlement of one page (holds included), then reload.
+fn settle(
+    c: &Corpus,
+    committed: &ScanIndex,
+    mut page: Page,
+    progress: &mut SnapshotUploadProgress,
+) -> ScanIndex {
+    page.finish();
+    upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    let holds = LocalHoldSettlement::classify(
+        SnapshotSource::ClaudeCode,
+        &mut page.index,
+        &mut page.scan,
+        &page.disposition,
+    );
+    let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
+    settle_index_after_upload(&mut settled.index, committed, progress);
+    c.reload(&mut settled.index)
+}
+fn body<'a>(page: &'a Page, session: &str) -> Option<&'a SnapshotItem> {
+    page.scan
+        .snapshots
+        .iter()
+        .find(|s| s.source_session_id == session)
+}
+/// The session's items on the page are withheld: none is a literal body,
+/// and the page quarantines them (delayed, never settled, never counted).
+fn assert_withheld(page: &Page, session: &str, why: &str) {
+    let items = page
+        .scan
+        .snapshots
+        .iter()
+        .filter(|s| s.source_session_id == session)
+        .collect::<Vec<_>>();
+    assert!(!items.is_empty(), "{why}: the held items stay on the page");
+    assert!(
+        items
+            .iter()
+            .all(|s| !crate::snapshots::claude_request_money::is_request_owned_literal(s)),
+        "{why}: no body publishes"
+    );
+    let held = page
+        .disposition
+        .quarantined_fingerprints(&page.scan.snapshots);
+    assert!(
+        items.iter().all(|s| held.contains(&s.snapshot_fingerprint)),
+        "{why}: the session is held"
+    );
+}
+
+/// Owner ruling 1 (Codex P1-1 case 1): an earlier twin rewritten IN PLACE
+/// (same inode, size kept) no longer holds H. Its stale identity cannot
+/// remove H from the later twin: H counts once, from the twin.
+fn rewritten_original(reverse: bool) {
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-pipeline-rewritten-original-{reverse}"));
+        let (old_dir, new_dir) = if reverse {
+            ("z-original", "a-copy")
+        } else {
+            ("a-original", "z-copy")
+        };
+        let original = c.write_at(
+            &format!("{old_dir}/{ROOT}.jsonl"),
+            &line(ROOT, "h1", AT, 10),
+            "2026-08-02T07:00:00Z",
+        );
+        c.write_at(
+            &format!("{new_dir}/{ROOT}.jsonl"),
+            &(line(ROOT, "h1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let first = ready(&c, &scanner, old.clone(), 100, false);
+        assert_eq!(total(&first), 2, "h1 once, r2 once");
+        let prior = settle(&c, &old, first, &mut progress);
+        let inode = |path: &Path| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).unwrap().ino()
+        };
+        let before = (
+            inode(&original),
+            std::fs::metadata(&original).unwrap().len(),
+        );
+        // Same length id, same inode: an in-place rewrite replacing h1 by u1.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&original)
+            .unwrap()
+            .write_all(line(ROOT, "u1", AT, 10).as_bytes())
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&original)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            (
+                inode(&original),
+                std::fs::metadata(&original).unwrap().len()
+            ),
+            before,
+            "fixture keeps the inode and the size"
+        );
+        let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&page);
+        assert_eq!(
+            total(&page),
+            3,
+            "u1 from the original, h1 and r2 from the twin: nothing dropped"
+        );
+        assert_eq!(page.scan.snapshots[0].removed_request_count, Some(0));
+    });
+}
+#[test]
+fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy() {
+    rewritten_original(false);
+}
+#[test]
+fn e2_pipeline_inplace_rewritten_original_cannot_remove_its_twin_copy_reverse() {
+    rewritten_original(true);
+}
+
+/// Owner ruling 1 (Codex P1-1 case 2): restored same-session histories H1
+/// and H1+H2, every line pre-birth: the union counts, H1 once, H2 once, on
+/// the first page in either discovery order and through settlement.
+fn overlapping_restored(reverse: bool) {
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-pipeline-overlap-restored-{reverse}"));
+        let (a, b) = if reverse {
+            ("z-original", "a-copy")
+        } else {
+            ("a-original", "z-copy")
+        };
+        c.write_at(
+            &format!("{a}/{ROOT}.jsonl"),
+            &line(ROOT, "h1", AT, 10),
+            "2026-08-02T07:02:00Z",
+        );
+        c.write_at(
+            &format!("{b}/{ROOT}.jsonl"),
+            &(line(ROOT, "h1", AT, 10) + &line(ROOT, "h2", "2026-08-02T07:00:20Z", 20)),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let first = ready(&c, &scanner, old.clone(), 100, false);
+        let opened = scanner.paths();
+        assert_eq!(opened.len(), 2);
+        assert!(
+            opened[0].ends_with(format!("{}/{ROOT}.jsonl", if reverse { b } else { a })),
+            "actual discovery order"
+        );
+        literal(&first);
+        assert_eq!(total(&first), 2, "the union of both histories, once");
+        assert_eq!(first.scan.snapshots[0].input_tokens, 30);
+        assert_eq!(first.scan.snapshots[0].removed_request_count, Some(1));
+        let prior = settle(&c, &old, first, &mut progress);
+        let again = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&again);
+        assert_eq!(total(&again), 2, "settled and re-read: unchanged");
+    });
+}
+#[test]
+fn e2_pipeline_overlapping_restored_histories_count_their_union_once() {
+    overlapping_restored(false);
+}
+#[test]
+fn e2_pipeline_overlapping_restored_histories_count_their_union_once_reverse() {
+    overlapping_restored(true);
+}
+
+/// Owner ruling 2: an all-copied /branch is skipped on the request ids its
+/// earlier other-session holder has, whatever version wrote the lines.
+fn branch_by(version: &str) {
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-pipeline-branch-by-{version}"));
+        c.root(ROOT, &line_by(ROOT, "original", AT, 10, version));
+        let scanner = E2ScanFixture::default();
+        let mut original = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        assert_eq!(total(&original), 1);
+        original.finish();
+        let prior = c.reload(&mut original.index);
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line_by(COPY, "original", AT, 10, version),
+            "2026-08-02T07:03:00Z",
+        );
+        let branch = ready(&c, &scanner, prior, 100, false);
+        literal(&branch);
+        let copy = body(&branch, COPY).expect("the branch publishes its (empty) body");
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (0, Some(1)),
+            "{version}: the copy never counts the original's request again"
+        );
+        assert!(body(&branch, ROOT).is_none(), "the original is unchanged");
+    });
+}
+#[test]
+fn e2_pipeline_branch_written_outside_the_writer_allowlist_is_skipped_by_request_ids() {
+    branch_by("2.0.99");
+}
+#[test]
+fn e2_pipeline_branch_written_by_the_current_m4_claude_code_is_skipped() {
+    // `claude --version` on the M4 on 2026-10-26: 2.1.310 (Claude Code).
+    branch_by("2.1.310");
+}
+
+/// Owner ruling 3: a /branch read before its original on a fresh index
+/// cannot decide: it is held (never counted), and a later page that reads
+/// the original skips it. Both discovery orders.
+fn branch_before_original(copy_first: bool) {
+    with_e2(|| {
+        let original = if copy_first { LATE } else { ROOT };
+        let mut c = Corpus::new(&format!("e2-pipeline-branch-fresh-{copy_first}"));
+        c.root(original, &line(original, "original", AT, 10));
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "original", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let mut first = c.raw(&scanner, old.clone(), 1, false, &[]);
+        first.enrich(&c);
+        let opened = scanner.paths();
+        assert_eq!(opened.len(), 1, "one file per page");
+        let read_first = if copy_first { COPY } else { original };
+        assert!(opened[0].ends_with(format!("{read_first}.jsonl")));
+        if copy_first {
+            assert_withheld(&first, COPY, "copy before its original");
+        } else {
+            literal(&first);
+            assert_eq!(total(&first), 1);
+        }
+        let mut prior = settle(&c, &old, first, &mut progress);
+        let mut copy_body = None;
+        let mut original_requests = if copy_first { 0 } else { 1 };
+        for _ in 0..3 {
+            let page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+            if let Some(found) = body(&page, original) {
+                if crate::snapshots::claude_request_money::is_request_owned_literal(found) {
+                    original_requests = found.request_count;
+                }
+            }
+            if let Some(found) = body(&page, COPY) {
+                assert!(
+                    crate::snapshots::claude_request_money::is_request_owned_literal(found),
+                    "decided once the original is indexed"
+                );
+                copy_body = Some((found.request_count, found.removed_request_count));
+            }
+            prior = settle(&c, &prior, page, &mut progress);
+            if copy_body.is_some() {
+                break;
+            }
+        }
+        assert_eq!(original_requests, 1, "the original counts once");
+        assert_eq!(
+            copy_body,
+            Some((0, Some(1))),
+            "the copy is skipped, never counted twice"
+        );
+    });
+}
+#[test]
+fn e2_pipeline_branch_read_before_its_original_waits_instead_of_counting() {
+    branch_before_original(true);
+}
+#[test]
+fn e2_pipeline_branch_read_after_its_original_on_a_fresh_index_is_skipped() {
+    branch_before_original(false);
+}
+
+/// Owner ruling 3: the census walk deadline decides nothing: the /branch is
+/// held, then the next page's walk skips it.
+#[test]
+fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-branch-deadline");
+        c.root(ROOT, &line(ROOT, "original", AT, 10));
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let original = ready(&c, &scanner, old.clone(), 100, false);
+        let prior = settle(&c, &old, original, &mut progress);
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "original", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let mut held = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
+        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+            held.enrich(&c);
+        });
+        assert_withheld(&held, COPY, "walk deadline");
+        let prior = settle(&c, &prior, held, &mut progress);
+        let decided = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        let copy = body(&decided, COPY).expect("the held copy is read again");
+        assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (0, Some(1))
+        );
+    });
+}
+
+/// Owner ruling 5 (Codex P1-2): a file whose every response conflicts keeps
+/// a zero-usage carrier that publishes its conflict disclosure through the
+/// literal, ACK and restart path, over an accepted prior body.
+fn conflict_only(subagent: bool) {
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-pipeline-conflict-only-{subagent}"));
+        let session = if subagent {
+            format!("{ROOT}_agent-000")
+        } else {
+            ROOT.to_owned()
+        };
+        let a = line(ROOT, "conflict", AT, 2);
+        let b = a.replace("claude-haiku-4-5", "claude-sonnet-4-5");
+        let path = if subagent {
+            c.root(ROOT, &line(ROOT, "root-own", AT, 5));
+            c.agent(0, &a)
+        } else {
+            c.root(ROOT, &a)
+        };
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let accepted = ready(&c, &scanner, old.clone(), 100, false);
+        let prior_body = body(&accepted, &session).expect("accepted prior body");
+        assert_eq!(prior_body.request_count, 1);
+        let prior = settle(&c, &old, accepted, &mut progress);
+        // A later revision makes its only response a resolver conflict.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b.as_bytes())
+            .unwrap();
+        let mut conflicted = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        let carrier = body(&conflicted, &session).expect("conflict-only file keeps a carrier");
+        assert!(crate::snapshots::claude_request_money::is_request_owned_literal(carrier));
+        assert_eq!(carrier.request_count, 0, "no invented tokens");
+        assert_eq!(
+            (carrier.input_tokens, carrier.output_tokens),
+            (0, 0),
+            "no invented tokens"
+        );
+        assert_eq!(carrier.resolver_conflict_count, Some(1));
+        conflicted.finish();
+        let bytes = canonical(&conflicted.scan.snapshots);
+        // A crash before the ACK: the restart reads the same committed state.
+        let mut restart = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        restart.finish();
+        assert_eq!(
+            canonical(&restart.scan.snapshots),
+            bytes,
+            "restart re-derives the same carrier bytes"
+        );
+        let (result, _, _) = upload(&restart.scan.snapshots, &mut progress, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    });
+}
+#[test]
+fn e2_pipeline_root_conflict_only_file_publishes_its_disclosure() {
+    conflict_only(false);
+}
+#[test]
+fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
+    conflict_only(true);
 }

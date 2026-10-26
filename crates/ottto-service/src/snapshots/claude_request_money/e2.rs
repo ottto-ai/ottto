@@ -5,7 +5,7 @@
 //! identity, parser scope or body witness.
 use super::super::claude_context_file_birth::ClaudeFileBirth;
 use super::super::claude_history_upgrade::{
-    claude_path_twin_groups, probe_opened_birth, ClaudeTwinGroups,
+    claude_path_twin_groups, path_twins, probe_opened_birth, ClaudeTwinGroups,
 };
 use super::super::claude_money_birth_store::{location_key, LocationKey};
 use super::super::claude_request_census::claude_request_hash;
@@ -107,7 +107,10 @@ impl ReadContext<'_> {
     /// path has no twin group: no OTHER location of it is indexed.
     fn twin_key(&self, member: &str, location: LocationKey) -> Option<&str> {
         self.twins
-            .get_or_init(|| claude_path_twin_groups(self.index))
+            .get_or_init(|| {
+                let own = session_member(self.path).map(std::borrow::Cow::into_owned);
+                claude_path_twin_groups(self.index, &own.into_iter().collect())
+            })
             .get(member)?
             .iter()
             .map(|(key, _)| key.as_str())
@@ -1858,9 +1861,9 @@ fn absent_twins(sessions: &[(&str, &[LocationKey])], index: &ScanIndex) -> BTree
     if suspects.is_empty() {
         return held;
     }
-    let groups = claude_path_twin_groups(index);
+    let groups = claude_path_twin_groups(index, &BTreeSet::new());
     for (session, here) in suspects {
-        let absent = groups.get(*session).is_some_and(|keys| {
+        let absent = path_twins(&groups, session).is_some_and(|keys| {
             keys.iter().any(|(key, size)| {
                 size.is_some() && !here.contains(&location_key(key)) && Path::new(key).is_file()
             })
@@ -1926,7 +1929,7 @@ pub(in crate::snapshots) fn selected_twin_roots<'a>(
 ) -> BTreeSet<String> {
     paths
         .filter_map(claude_index_path_family_member)
-        .filter(|(_, member)| twins.contains_key(member))
+        .filter(|(_, member)| path_twins(twins, member).is_some())
         .map(|(root, _)| root)
         .collect()
 }

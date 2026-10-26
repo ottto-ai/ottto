@@ -3500,3 +3500,260 @@ fn e2_identity_conflicting_twin_bindings_clear_root_fallback_in_every_order() {
         cleanup(&[&a, &b, &c]);
     });
 }
+
+// ---- I4b ----
+
+fn sub_line(id: &str, seconds: i64, input: u64) -> Value {
+    let mut value = line(id, &at(seconds), input);
+    value["agentId"] = json!("abc");
+    value["isSidechain"] = json!(true);
+    value
+}
+fn remove_agent_scratch(paths: &[&Path]) {
+    for path in paths {
+        let _ = fs::remove_dir_all(path.ancestors().nth(3).unwrap());
+    }
+}
+
+#[test]
+fn e2_side_call_named_member_without_transcript_falls_back_to_the_root() {
+    let p = root_file("side-ghost");
+    let agent = p
+        .parent()
+        .unwrap()
+        .join(ROOT)
+        .join("subagents/agent-abc.jsonl");
+    fs::create_dir_all(agent.parent().unwrap()).unwrap();
+    fs::write(&agent, b"fixture\n").unwrap();
+    let index = ScanIndex::default();
+    let mut items = vec![
+        parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)]),
+        parse(&agent, Some(t0()), &index, &[sub_line("s", 3, 30)]),
+    ];
+    let read = sidecar(&[row("r", 1, 10), row("s", 3, 30), row("ghost", 4, 40)]);
+    attach_page(&mut items, &read);
+    // The trace names agent `zzz`: no transcript of it exists anywhere.
+    let trace = ClaudeTraceOwnershipLoadReport {
+        evidence: BTreeMap::from([(
+            ROOT.to_owned(),
+            vec![complete_trace_row(ROOT, "ghost", "zzz")],
+        )]),
+        ..Default::default()
+    };
+    let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
+    assert!(unresolved.is_empty(), "the census walk decided");
+    let (root, sub) = (fold(&items[0]), fold(&items[1]));
+    assert_eq!((requests(&items[0], REPORTED), root.root_fallbacks), (1, 1));
+    assert_eq!((requests(&items[1], REPORTED), sub.root_fallbacks), (0, 0));
+    assert_eq!(root.side.input, 40, "counted once, on the root");
+    let _ = fs::remove_dir_all(p.parent().unwrap());
+}
+
+#[test]
+fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
+    let p = root_file("side-deadline");
+    let index = ScanIndex::default();
+    let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
+    let read = sidecar(&[row("r", 1, 10), row("side", 2, 20)]);
+    attach_page(&mut items, &read);
+    let unresolved = crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+        side_calls_page(
+            &mut items,
+            &api_report(&read),
+            &ClaudeTraceOwnershipLoadReport::default(),
+            &index,
+        )
+    });
+    assert_eq!(unresolved, BTreeSet::from([ROOT.to_owned()]));
+    assert_eq!(
+        fold(&items[0]).side_requests,
+        0,
+        "never counted on a deadline"
+    );
+    assert!(!fold(&items[0]).telemetry.side_calls_done);
+    // The next page's walk completes and counts the side call once.
+    let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
+    attach_page(&mut items, &read);
+    let unresolved = side_calls_page(
+        &mut items,
+        &api_report(&read),
+        &ClaudeTraceOwnershipLoadReport::default(),
+        &index,
+    );
+    assert!(unresolved.is_empty());
+    assert_eq!(fold(&items[0]).side_requests, 1);
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_equal_birth_subagent_twins_count_once_in_both_orders() {
+    for reverse in [false, true] {
+        let early = agent_file("equal-sub-a");
+        let later = agent_file("equal-sub-b");
+        let birth = t0() + 60_000_000_000;
+        let history = vec![sub_line("a", 1, 10), sub_line("b", 2, 20)];
+        let mut index = ScanIndex::default();
+        index.files.insert(local_index_key(&early), entry());
+        index.files.insert(local_index_key(&later), entry());
+        let mut paths: Vec<(&Path, i128)> = vec![(&early, birth), (&later, birth)];
+        if reverse {
+            paths.reverse();
+        }
+        stage_twins(&mut index, &paths);
+        let items = paths
+            .iter()
+            .map(|(path, birth)| parse(path, Some(*birth), &index, &history))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| fold(i).entity.removed_requests)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 2]),
+            "the (birth, location) order names exactly one copy"
+        );
+        let got = publish(items, None, TelemetryRead::Loaded, &index);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].request_count, got[0].input_tokens), (2, 30));
+        assert_eq!(got[0].removed_request_count, Some(2));
+        remove_agent_scratch(&[&early, &later]);
+    }
+}
+
+#[test]
+fn e2_absent_subagent_twin_holds_its_session() {
+    let early = agent_file("absent-sub-early");
+    let later = agent_file("absent-sub-later");
+    let mut index = ScanIndex::default();
+    let first = parse_and_remember(&early, t0(), &mut index, &[sub_line("a", 1, 10)]);
+    let page = |index: &ScanIndex| {
+        parse(
+            &later,
+            Some(t0() + 60_000_000_000),
+            index,
+            &[sub_line("b", 61, 20)],
+        )
+    };
+    let second = page(&index);
+    remember_birth(&mut index, &later, fold(&second));
+    index.files.insert(local_index_key(&later), entry());
+    let session = second.source_session_id.clone();
+    assert_eq!(session, format!("{ROOT}_agent-abc"));
+    // The earlier path is indexed and on disk but not on this page.
+    let mut items = vec![page(&index)];
+    let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+    assert_eq!(withheld, BTreeSet::from([session]));
+    // Both paths on the page: one body, nothing withheld.
+    let mut items = vec![first, page(&index)];
+    let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+    assert!(withheld.is_empty());
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].request_count, 2);
+    remove_agent_scratch(&[&early, &later]);
+}
+
+#[test]
+fn e2_moved_copy_partial_branch_certifies_writers_from_the_effective_cutoff() {
+    let p = root_file("moved-writer");
+    let opened = fs::metadata(&p).ok();
+    let physical = t0() + 120_000_000_000;
+    for (moved, own_version, certified) in [
+        // Moved by copy: its own run lies between the effective cutoff and
+        // the physical birth, by one known writer other than the prefix's.
+        (true, "2.1.310", true),
+        // The same run seen from the physical birth has no own line.
+        (false, "2.1.310", false),
+        // An unknown own writer never certifies.
+        (true, "2.0.99", false),
+    ] {
+        let mut birth = ClaudeFileBirth::observe(&p, opened.as_ref());
+        birth.set_birth_for_test(physical);
+        let mut birth = birth.with_minimum(moved.then(t0));
+        birth.observe_response_writer(Some("2.1.309"), Some(&at(-100)));
+        birth.observe_response_writer(Some(own_version), Some(&at(10)));
+        assert_eq!(
+            birth.writer_certified(Some(1)),
+            certified,
+            "moved={moved} own={own_version}"
+        );
+    }
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_twin_index_spells_root_and_subagent_members_once() {
+    let root_a = root_file("groups-a");
+    let root_b = root_file("groups-b");
+    let agent_a = agent_file("groups-c");
+    let agent_b = agent_file("groups-d");
+    let solo = scratch("groups-e")
+        .join(ROOT)
+        .join("subagents/agent-solo.jsonl");
+    fs::create_dir_all(solo.parent().unwrap()).unwrap();
+    fs::write(&solo, b"fixture\n").unwrap();
+    let mut index = ScanIndex::default();
+    for path in [&root_a, &root_b, &agent_a, &agent_b, &solo] {
+        index.files.insert(local_index_key(path), entry());
+    }
+    let groups =
+        crate::snapshots::claude_history_upgrade::claude_path_twin_groups(&index, &BTreeSet::new());
+    let sub = format!("{ROOT}_agent-abc");
+    assert_eq!(
+        groups.keys().cloned().collect::<Vec<_>>(),
+        vec![ROOT.to_owned(), sub.clone()]
+    );
+    for path in [&root_a, &root_b, &agent_a, &agent_b] {
+        let member = session_member(path).unwrap();
+        assert_eq!(groups[member.as_ref()].len(), 2, "one spelling per member");
+    }
+    assert!(!groups.contains_key(session_member(&solo).unwrap().as_ref()));
+    assert_eq!(
+        selected_twin_roots([agent_a.as_path(), solo.as_path()].into_iter(), &groups),
+        BTreeSet::from([ROOT.to_owned()])
+    );
+    let twins = std::cell::OnceCell::new();
+    let context = ReadContext {
+        index: &index,
+        path: &agent_b,
+        twins: &twins,
+    };
+    assert!(context.indexed(&sub, location_key(&local_index_key(&agent_a))));
+    assert!(!context.indexed(
+        session_member(&solo).unwrap().as_ref(),
+        location_key(&local_index_key(&solo))
+    ));
+    assert!(
+        twins
+            .get()
+            .unwrap()
+            .contains_key(session_member(&agent_b).unwrap().as_ref()),
+        "the page index is built once"
+    );
+    // A page member keeps its single known path (a new copy's original),
+    // which is never a twin group for selection or the absent-twin hold.
+    let solo_member = session_member(&solo).unwrap().into_owned();
+    let page = crate::snapshots::claude_history_upgrade::claude_path_twin_groups(
+        &index,
+        &BTreeSet::from([solo_member.clone()]),
+    );
+    assert_eq!(page[&solo_member].len(), 1);
+    assert_eq!(
+        selected_twin_roots([solo.as_path()].into_iter(), &page),
+        BTreeSet::new()
+    );
+    let fresh = scratch("groups-f")
+        .join(ROOT)
+        .join("subagents/agent-solo.jsonl");
+    let context = ReadContext {
+        index: &index,
+        path: &fresh,
+        twins: &Default::default(),
+    };
+    assert!(
+        context.indexed(&solo_member, location_key(&local_index_key(&solo))),
+        "an unindexed copy finds its member's only indexed path"
+    );
+    let _ = fs::remove_dir_all(fresh.ancestors().nth(3).unwrap());
+    cleanup(&[&root_a, &root_b]);
+    remove_agent_scratch(&[&agent_a, &agent_b, &solo]);
+}

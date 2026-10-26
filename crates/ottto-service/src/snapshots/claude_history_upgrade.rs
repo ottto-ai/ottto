@@ -310,15 +310,32 @@ pub(crate) enum HistoryDecision {
 /// Claude member files present under two or more paths (path twins), by
 /// member id (`root` or `root_agent-*`): indexed paths with their indexed
 /// sizes, plus paths this traversal observed that are not indexed yet
-/// (`None`: a first-seen twin or a new copy). Only twin groups are kept.
+/// (`None`: a first-seen twin or a new copy). Twin groups are kept, plus the
+/// single known path of a member this page reads: a page file not indexed
+/// or observed yet (a new copy) is that path's twin. `path_twins` is the
+/// twin-group view.
 pub(super) type ClaudeTwinGroups = BTreeMap<String, Vec<(String, Option<u64>)>>;
+
+/// The member's path twins: two or more known paths.
+pub(super) fn path_twins<'a>(
+    groups: &'a ClaudeTwinGroups,
+    member: &str,
+) -> Option<&'a [(String, Option<u64>)]> {
+    groups
+        .get(member)
+        .filter(|keys| keys.len() > 1)
+        .map(Vec::as_slice)
+}
 
 /// E2: the ONE path-twin rule and member spelling. Built once per scan page
 /// (`HistoryPage::twin_groups`) and shared by candidate selection, twin
 /// staging and the parse-time birth context; the page finish (after the
 /// scan) builds it again only when a session's birth table names a path the
 /// page does not hold. One sorted borrowed pass.
-pub(super) fn claude_path_twin_groups(index: &super::ScanIndex) -> ClaudeTwinGroups {
+pub(super) fn claude_path_twin_groups(
+    index: &super::ScanIndex,
+    page_members: &BTreeSet<String>,
+) -> ClaudeTwinGroups {
     let files = &index.files;
     let unindexed = index
         .traversal
@@ -340,7 +357,18 @@ pub(super) fn claude_path_twin_groups(index: &super::ScanIndex) -> ClaudeTwinGro
     members.sort_unstable_by(|left, right| (left.0, left.2).cmp(&(right.0, right.2)));
     members
         .chunk_by(|left, right| left.0 == right.0)
-        .filter(|group| group.len() > 1)
+        .filter(|group| {
+            let member = &group[0].1;
+            // Borrowed page lookup: the members sharing this root, then the stem.
+            group.len() > 1
+                || page_members
+                    .range::<str, _>((
+                        std::ops::Bound::Included(member.root),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .take_while(|page| page.starts_with(member.root))
+                    .any(|page| member.matches_member(page))
+        })
         .map(|group| {
             let keys = group
                 .iter()
@@ -753,11 +781,11 @@ impl super::ScanIndex {
         }
         let groups = page
             .twin_index
-            .get_or_init(|| claude_path_twin_groups(self));
+            .get_or_init(|| claude_path_twin_groups(self, &BTreeSet::new()));
         if let Some((_, member)) =
             super::claude_index_path_family_member(std::path::Path::new(index_key))
         {
-            if let Some(keys) = groups.get(&member) {
+            if let Some(keys) = path_twins(groups, &member) {
                 for (key, size) in keys {
                     if self.claude_money_birth_store.staged(key) {
                         continue;
@@ -774,7 +802,7 @@ impl super::ScanIndex {
             }
         }
         let twins = super::claude_index_path_family_member(std::path::Path::new(index_key))
-            .and_then(|(_, member)| groups.get(&member))
+            .and_then(|(_, member)| path_twins(groups, &member))
             .map(|keys| {
                 // Only indexed twins carry a size to reserve.
                 keys.iter()

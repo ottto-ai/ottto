@@ -2644,3 +2644,69 @@ fn e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page() {
         assert_eq!(body.telemetry_owned_complete, Some(true));
     });
 }
+
+#[test]
+fn e2_side_call_census_deadline_holds_root_history_then_counts_side_call_once() {
+    let fixture = HistoryFixture::new("e2-history-side-call-deadline");
+    let baseline = fixture.baseline();
+    let root = HISTORY_SESSIONS[0];
+    let held_key = HistoryFixture::key(&baseline, root);
+    for (number, session) in HISTORY_SESSIONS.iter().enumerate().skip(1) {
+        e2_history_reported(&fixture, session, number);
+    }
+    // The root's own request plus one side call no transcript holds.
+    let rows = [
+        e2_history_api(root, "req_0_1", 0),
+        e2_history_api(root, "side", 1),
+    ];
+    let api = e2_history_sidecar(&fixture.support, root, false);
+    let trace = e2_history_sidecar(&fixture.support, root, true);
+    for path in [&api, &trace] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    }
+    std::fs::write(
+        &api,
+        rows.iter()
+            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    std::fs::write(
+        &trace,
+        serde_json::to_string(&e2_history_trace(root, "req_0_1", "")).unwrap() + "\n",
+    )
+    .unwrap();
+    with_e2_history(&fixture, || {
+        let failed = crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+            fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE)
+        });
+        assert_eq!(failed.uploaded.len(), 2, "healthy siblings settle");
+        assert!(
+            !failed.uploaded.contains(root),
+            "a side-call census deadline holds the family, never counts or drops it"
+        );
+        e2_history_assert_prior_tuple(&baseline, &failed.index, &held_key);
+        let recovered = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
+        assert_eq!(recovered.uploaded, BTreeSet::from([root.to_owned()]));
+        let body = recovered
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == root)
+            .unwrap();
+        assert_eq!(
+            body.request_count, 2,
+            "the side call counts once, on the root"
+        );
+        assert_eq!(
+            body.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0002")
+        );
+        assert_eq!(
+            recovered.index.files[&held_key].effective_upload_body_witness_revision,
+            3
+        );
+        let again = fixture.cycle("2026-08-02T11:00:00Z", E2_HISTORY_UPGRADE);
+        assert!(again.uploaded.is_empty(), "settles exactly once");
+    });
+}
