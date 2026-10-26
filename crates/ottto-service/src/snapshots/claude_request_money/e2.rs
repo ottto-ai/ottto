@@ -458,6 +458,64 @@ pub(crate) fn money_marks(item: &SnapshotItem) -> u8 {
     .fold(0, |marks, (_, mark)| marks | mark)
 }
 
+/// A request-owned emitted body after its fold's last consumer (contract 5,
+/// account qualification): the final rows own its money now. `money_marks`
+/// still reads `disclosed` when the settled body is acknowledged, so a
+/// disclosing fold keeps its inline counters and frees every heap field;
+/// any other fold is dropped.
+pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
+    let Some(fold) = item.claude_money.as_deref_mut() else {
+        return;
+    };
+    if fold.disclosed == 0 {
+        #[cfg(test)]
+        pipeline_test_observer::releasing(fold);
+        item.claude_money = None;
+        return;
+    }
+    let FileFold {
+        entity,
+        money_birth: _,
+        physical,
+        role: _,
+        location,
+        base_selector,
+        bucket_fallback,
+        model_fallbacks,
+        skipped,
+        copy,
+        idless_copy,
+        proof,
+        prefix_inherited,
+        copied: _,
+        first_own,
+        ambiguous,
+        disclosed: _,
+        e2_nanos: _,
+        responses: _,
+        root_fallbacks: _,
+        side: _,
+        side_requests: _,
+        telemetry,
+        accounts,
+    } = fold;
+    *entity = Default::default();
+    *physical = None;
+    *location = None;
+    *base_selector = Default::default();
+    *bucket_fallback = None;
+    *model_fallbacks = BTreeMap::new();
+    *skipped = Vec::new();
+    *copy = None;
+    *idless_copy = None;
+    *proof = None;
+    *prefix_inherited = None;
+    *first_own = None;
+    *ambiguous = BTreeSet::new();
+    *telemetry = Default::default();
+    *accounts = None;
+}
+
 /// Once per money-rule version, after the revision activates: re-owe every
 /// indexed Claude file whose marks a newer rule names; the history gate
 /// paces them like any owed file. The version is recorded in the same index

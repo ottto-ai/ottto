@@ -403,10 +403,10 @@ fn literal(page: &Page) {
         .iter()
         .all(crate::snapshots::claude_request_money::is_request_owned_literal));
     assert!(
-        page.scan
-            .snapshots
-            .iter()
-            .all(|item| item.claude_money.is_none()),
+        page.scan.snapshots.iter().all(|item| item
+            .claude_money
+            .as_deref()
+            .map_or(true, e2::pipeline_test_observer::released_for_marks)),
         "final identity-tagged rows must not retain E2 fold storage for upload"
     );
 }

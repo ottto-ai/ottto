@@ -91,3 +91,17 @@ pub(crate) fn releasing(fold: &FileFold) {
         }
     });
 }
+
+/// A fold kept past release only for its settled money marks: a disclosure
+/// and no heap storage (no grains, activity, copies or accounts).
+pub(crate) fn released_for_marks(fold: &FileFold) -> bool {
+    fold.disclosed > 0
+        && fold.entity.grains.is_empty()
+        && fold.entity.bucket_activity.is_empty()
+        && fold.copy.is_none()
+        && fold.idless_copy.is_none()
+        && fold.prefix_inherited.is_none()
+        && fold.accounts.is_none()
+        && fold.model_fallbacks.is_empty()
+        && fold.skipped.is_empty()
+}
