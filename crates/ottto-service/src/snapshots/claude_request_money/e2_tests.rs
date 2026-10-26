@@ -1114,6 +1114,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             .collect::<Vec<_>>()
     };
     let before = wire(&items);
+    let mut probe = None;
     for enabled in [false, true] {
         // Wall clock without the allocation probe: its born-pointer table
         // locks and walks on every allocation and free of every thread.
@@ -1125,19 +1126,23 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         let enrichment_time = start.elapsed();
         let stages = take_stages();
         // The same work on an identical page, for the born-in-scope peak only.
-        let mut probed = items.clone();
-        let probe_start = Instant::now();
-        let (_, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
-            attach_page(&mut probed, &read);
-            side_calls_page(&mut probed, &api, &trace, &index);
+        // Attach and side calls run outside the gate in both modes, so one
+        // probed pass is the receipt for both.
+        let (allocation, probed_time) = *probe.get_or_insert_with(|| {
+            let mut probed = items.clone();
+            let probe_start = Instant::now();
+            let (_, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
+                attach_page(&mut probed, &read);
+                side_calls_page(&mut probed, &api, &trace, &index);
+            });
+            let probed_time = probe_start.elapsed();
+            take_stages();
+            assert!(page.iter().zip(&probed).all(|(a, b)| {
+                fold(a).entity.grains == fold(b).entity.grains
+                    && fold(a).side_requests == fold(b).side_requests
+            }));
+            (allocation, probed_time)
         });
-        let probed_time = probe_start.elapsed();
-        take_stages();
-        assert!(page.iter().zip(&probed).all(|(a, b)| {
-            fold(a).entity.grains == fold(b).entity.grains
-                && fold(a).side_requests == fold(b).side_requests
-        }));
-        drop(probed);
         assert!(page
             .iter()
             .all(|item| fold(item).telemetry.membership.entries.is_empty()));
