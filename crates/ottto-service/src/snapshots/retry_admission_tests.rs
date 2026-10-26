@@ -181,11 +181,20 @@ fn oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
         "unoffered missing members still owe service"
     );
     index.save(&path).unwrap();
-    let loaded = ScanIndex::load(&path).unwrap();
-    // The same real admission math must advance beyond the oversized root,
-    // even while its independent bounded member fallback remains runnable.
-    let stale = loaded.claude_usage_family_pending.keys().cloned().collect();
-    let previous = loaded
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    // An exhausted/red ordinary checkpoint may leave unoffered fallback
+    // members. The actual next start must advance siblings without dropping it.
+    carry_red(&mut loaded, CARRY_RETRY, 7);
+    loaded.claude_reemission_exclusions =
+        ReemissionExclusions::load(&fixture._scratch.join("support"));
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[root],
+        &mut loaded,
+        CARRY_SECOND_RETRY,
+        BACKFILL_WINDOW_DAYS,
+    );
+    let next = loaded
         .claude_stale_family_carry
         .origin
         .as_ref()
@@ -193,8 +202,11 @@ fn oversized_singleton_keeps_runnable_debt_and_later_siblings_after_reload() {
         .admission
         .as_ref()
         .unwrap();
-    let (_, covered, next) = claude_retry_admit_batch(&loaded, &stale, Some(previous), CARRY_RETRY);
-    assert!(covered.contains(&fixture.roots[1]) && covered.contains(&fixture.roots[2]));
+    assert_eq!(
+        next.after_root.as_deref(),
+        Some(fixture.roots[2].as_str()),
+        "the real next start covers both later siblings"
+    );
     assert_eq!(next.oversized_root.as_deref(), Some(owed.as_str()));
     assert!(
         !next.complete,

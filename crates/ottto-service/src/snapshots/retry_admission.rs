@@ -47,6 +47,7 @@ fn claude_retry_admit_batch(
             after_root: None,
             upper_root: stale.last().cloned().unwrap_or_default(),
             complete: false,
+            roots_complete: false,
             progressed: false,
             served_before: previous.map(|state| state.due_through).unwrap_or_else(|| {
                 index
@@ -74,6 +75,7 @@ fn claude_retry_admit_batch(
         .collect::<BTreeSet<_>>();
     loop {
         if batch.is_empty() {
+            state.roots_complete = true;
             state.complete = state.oversized_root.is_none() && state.due_complete;
             state.progressed = true;
             return (ClaudeStaleFamilyCarry::default(), batch, state);
@@ -81,13 +83,13 @@ fn claude_retry_admit_batch(
         match claude_stream_accepted_retry_carry(index, &batch) {
             Ok(carry) => {
                 state.after_root = batch.last().cloned();
-                state.complete = state.oversized_root.is_none()
-                    && state.due_complete
-                    && state.after_root.as_ref().is_some_and(|after| {
-                        !stale
-                            .iter()
-                            .any(|root| root > after && root <= &state.upper_root)
-                    });
+                state.roots_complete = state.after_root.as_ref().is_some_and(|after| {
+                    !stale
+                        .iter()
+                        .any(|root| root > after && root <= &state.upper_root)
+                });
+                state.complete =
+                    state.roots_complete && state.oversized_root.is_none() && state.due_complete;
                 state.progressed = true;
                 eprintln!("local snapshot census advanced bounded Claude retry admission: covered_families={} carried_families={} complete={}; uncovered pending remains unchanged", batch.len(), carry.roots.len(), state.complete);
                 return (carry, batch, state);
@@ -112,6 +114,9 @@ fn claude_retry_admit_batch(
                 }
                 state.oversized_root = Some(root.clone());
                 state.after_root = Some(root.clone());
+                state.roots_complete = !stale
+                    .iter()
+                    .any(|later| later > root && later <= &state.upper_root);
                 state.complete = false;
                 state.progressed = true;
                 eprintln!("local snapshot census retained one oversized Claude retry family for bounded ordinary service; coverage remains incomplete");
@@ -199,14 +204,7 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
     }) {
         state.due_complete = true;
     }
-    let roots_done = !index.claude_usage_family_pending.keys().any(|root| {
-        state
-            .after_root
-            .as_deref()
-            .is_none_or(|after| root.as_str() > after)
-            && root <= &state.upper_root
-    });
-    state.complete = roots_done && state.oversized_root.is_none() && state.due_complete;
+    state.complete = state.roots_complete && state.oversized_root.is_none() && state.due_complete;
     let mut cost = crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
     if cost
         .add(2 * CLAUDE_RETRY_DUE_PATHS * std::mem::size_of::<ScanTraversalPath>() + 128)
@@ -232,7 +230,7 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
         if cost
             .add(
                 key.len()
-                    .saturating_mul(2)
+                    .saturating_mul(4)
                     .saturating_add(std::mem::size_of::<ScanTraversalPath>()),
             )
             .is_none()

@@ -2121,6 +2121,8 @@ struct ClaudeRetryAdmission {
     after_root: Option<String>,
     upper_root: String,
     complete: bool,
+    #[serde(default)]
+    roots_complete: bool,
     progressed: bool,
     served_before: u64,
     #[serde(default)]
@@ -24956,7 +24958,7 @@ impl OwnedSourceScan {
             claude_retry_note_offered(
                 index,
                 &pending_paths[retry_service_start..retry_service_end],
-                collected_at,
+                &census_window_end,
             );
         }
         index.resume_census_window_end = Some(census_window_end.clone());
@@ -85457,7 +85459,7 @@ crate::heap_layout_bound::fields!(ScanTraversalCounts; unchanged_reread_admitted
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
-crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path);
+crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path);
 crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
