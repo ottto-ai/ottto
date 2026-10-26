@@ -165,6 +165,9 @@ fn bootstrap_cache_heads_with_budget(
             // A prior ordinary body ACK has no head proof. Force the exact probe
             // even when delivery of these bytes was previously acknowledged.
             if enforce_head_cas {
+                // Refusal must leave the in-memory ledger equal to its saved
+                // checkpoint so partial settlement can commit retirement proof.
+                progress.admit_ack_reoffers(probes)?;
                 for probe in probes {
                     progress
                         .accepted_fingerprints
@@ -1111,6 +1114,8 @@ struct PermanentSnapshotRejection {
     reoffer: Option<reason_reoffer::RefusalReoffer>,
 }
 
+mod ack_retention;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotUploadProgress {
     schema_version: u16,
@@ -1130,6 +1135,12 @@ struct SnapshotUploadProgress {
     /// fingerprint.
     #[serde(default)]
     accepted_body_witnesses: BTreeMap<String, String>,
+    /// Admission only: current live incidence plus bounded unsettled ACK debt.
+    #[serde(skip, default = "ack_retention::default_ack_capacity")]
+    ack_capacity: usize,
+    /// ACKs outside known live incidence; includes valid unindexed debt.
+    #[serde(skip)]
+    retained_stale_ack_count: usize,
     #[serde(default)]
     accepted_cache_states: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -1186,6 +1197,8 @@ impl SnapshotUploadProgress {
             historical_replay_generation: None,
             accepted_fingerprints: BTreeSet::new(),
             accepted_body_witnesses: BTreeMap::new(),
+            ack_capacity: ack_retention::default_ack_capacity(),
+            retained_stale_ack_count: 0,
             accepted_cache_states: BTreeMap::new(),
             accepted_cache_heads: BTreeMap::new(),
             pending_cache_heads: BTreeMap::new(),
@@ -2327,15 +2340,15 @@ impl SnapshotUploadProgress {
     }
 
     fn finish_cycle(&mut self, path: &Path) -> Result<()> {
-        if self.permanent_rejections.is_empty()
+        if self.accepted_fingerprints.is_empty()
+            && self.permanent_rejections.is_empty()
             && self.accepted_cache_states.is_empty()
             && self.accepted_cache_heads.is_empty()
             && self.pending_cache_heads.is_empty()
         {
             return self.clear(path);
         }
-        self.accepted_fingerprints.clear();
-        self.accepted_body_witnesses.clear();
+        // Unadopted ACKs survive until a successful index save transfers them.
         // A later conflict on the refused bytes is the stronger settlement
         // fact, even while the retained refusal gates its next daily offer.
         // Keep it in the same atomic ledger so an older index-only timer can
@@ -2754,6 +2767,8 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     durable.active_reason_reoffers = progress.active_reason_reoffers.clone();
     durable.attempted_reason_reoffers = progress.attempted_reason_reoffers.clone();
     durable.reason_reoffer_counts = progress.reason_reoffer_counts;
+    durable.ack_capacity = progress.ack_capacity;
+    durable.retained_stale_ack_count = progress.retained_stale_ack_count;
     if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
@@ -2810,6 +2825,16 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
         None => committable.mark_bounded_sweep_unsettled(),
     }
+    let census_absent = progress.complete_census_ack_retirements(
+        index,
+        correction_scan.is_some_and(|scan| scan.census_complete),
+    );
+    progress.stage_ack_retirement_handoff_with_census(
+        committed_index,
+        &mut committable,
+        locally_held,
+        &census_absent,
+    )?;
     validate_destination()?;
     if let Some(cap) = read_limit {
         committable.save_with_read_limit(index_path, cap)?;
@@ -5772,6 +5797,12 @@ fn prepare_sync_source(
     )?;
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
+    upload_progress.recover_ack_retirement_handoff(
+        &mut index,
+        &index_path,
+        &upload_progress_path,
+    )?;
+    upload_progress.configure_ack_capacity(&index);
     // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
     // and eager hydrate run against the index exactly as loaded, namespaced
     // by this index file. They touch only side requests and side records.
@@ -6237,6 +6268,12 @@ fn prepare_continuation_source(
     )?;
     let (mut index, _) =
         ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
+    upload_progress.recover_ack_retirement_handoff(
+        &mut index,
+        &inputs.index_path,
+        &inputs.upload_progress_path,
+    )?;
+    upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(
         source,
@@ -6901,6 +6938,8 @@ fn finish_sync_source(
         &claude_authority_disposition,
     );
     let locally_held_fingerprints = &local_holds.held_fingerprints;
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_cache_probe_for_test(&mut scan_result.snapshots);
 
     let cache_head_groups = if cache_observations_enabled
         && (activity_hint.snapshot_head_cas_required
@@ -6964,6 +7003,14 @@ fn finish_sync_source(
     // a producer-owned predecessor token. Probe the unchanged semantic body
     // through the existing CAS contract, omitting the additive cache patch.
     // Exact settled ACKs enter the same atomic progress ledger as normal pages.
+    // Bootstrap and main upload must drain the same admitted subset. A larger
+    // page stops through partial settlement only after those bodies can finish.
+    let census_absent_upload_acks =
+        upload_progress.complete_census_ack_retirements(&index, scan_result.census_complete);
+    // Current scanner incidence grants live slots on a first install, too.
+    // No absent ACK or unrelated entity borrows those slots.
+    let ack_admission_limited =
+        upload_progress.admit_upload_input(&mut scan_result.snapshots, &index);
     let probes = scan_result
         .snapshots
         .iter()
@@ -6971,6 +7018,7 @@ fn finish_sync_source(
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
+    let mut bootstrap_capacity_error = None;
     // One in-place resend budget for the whole source page: both bootstrap
     // stages and the main upload draw on it, so the page never waits more
     // than two resends and 10 s under the sync lock.
@@ -6993,7 +7041,7 @@ fn finish_sync_source(
             && probes
                 .iter()
                 .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
-        bootstrap_deferred = bootstrap_cache_heads_with_budget(
+        let bootstrap_result = bootstrap_cache_heads_with_budget(
             &probes,
             source.api_slug(),
             &mut upload_progress,
@@ -7024,21 +7072,37 @@ fn finish_sync_source(
             },
             |progress| progress.save(&upload_progress_path),
         )
-        .inspect_err(log_bootstrap_failure("probe"))?;
-        let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
-            .inspect_err(log_bootstrap_failure("apply"))
-            .inspect_err(|_| {
-                upload_progress.finish_reason_reoffers(
-                    &attempted_reason_reoffers,
-                    false,
-                    source.api_slug(),
-                );
-            })?;
-        if held > 0 {
-            eprintln!(
+        .inspect_err(log_bootstrap_failure("probe"));
+        match bootstrap_result {
+            Ok(deferred) => bootstrap_deferred = deferred,
+            Err(error)
+                if error
+                    .downcast_ref::<ack_retention::AckSettlementRequired>()
+                    .is_some() =>
+            {
+                // A local probe stop owes the same partial-index retirement
+                // and cadence handling as a stop in the main uploader.
+                bootstrap_capacity_error =
+                    Some(error.context("cache-head bootstrap ACK settlement pending"));
+            }
+            Err(error) => return Err(error),
+        }
+        if bootstrap_capacity_error.is_none() {
+            let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
+                .inspect_err(log_bootstrap_failure("apply"))
+                .inspect_err(|_| {
+                    upload_progress.finish_reason_reoffers(
+                        &attempted_reason_reoffers,
+                        false,
+                        source.api_slug(),
+                    );
+                })?;
+            if held > 0 {
+                eprintln!(
                 "local snapshot cache-head bootstrap carried {held} held probe(s) for {} as exact quarantined bodies; siblings continue",
                 source.api_slug()
             );
+            }
         }
     }
     // The same hook every resend path calls; nothing held is left by now.
@@ -7046,101 +7110,113 @@ fn finish_sync_source(
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
-    let upload_result = upload_resumable_batches_with_body_witness_partitioned(
-        &scan_result.snapshots,
-        source.api_slug(),
-        &mut upload_progress,
-        &mut accepted,
-        |snapshot| snapshot.snapshot_fingerprint.as_str(),
-        snapshot_upload_body_witness,
-        |snapshot| Some(snapshot.source_session_id.as_str()),
-        |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
-        &mut inplace_retry,
-        |snapshots| {
-            // A first Codex/Claude scan can spend several minutes parsing local
-            // history and retroactive backfill before the first upload. Relay
-            // tokens are intentionally short-lived, so mint them at the network
-            // boundary instead of reusing the pre-scan activity-hint token.
-            // Leased, not read: exactly one in-flight batch may claim the
-            // counters, and dropping the lease on any failure below leaves the
-            // losses owed instead of stranded.
-            let client_report = crate::client_report::lease();
-            let request = SnapshotBatchRequest {
-                schema_version: SNAPSHOT_SCHEMA_VERSION,
-                source: source.api_slug().to_string(),
-                machine_id: machine_id.to_string(),
-                collector_version: Some(collector_version()),
-                snapshots,
-                upload_policy,
-                client_report: client_report.report().clone(),
-            };
-            let reconcile_class = request.snapshots.iter().all(|snapshot| {
-                legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-            });
-            debug_assert!(
-                reconcile_class
-                    || request.snapshots.iter().all(|snapshot| {
-                        !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-                    }),
-                "legacy reconciliation must stay isolated at a batch boundary"
-            );
-            if let Err(reason) = validate_snapshot_batch_request(&request) {
-                return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
-                    reason,
-                }));
-            }
-            ensure_authority()?;
-            let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
-            ensure_authority()?;
-            validate_joined(&request.snapshots)?;
-            let response = client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
-            response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
-            let request_fingerprints = request
-                .snapshots
-                .iter()
-                .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                .collect::<BTreeSet<_>>();
-            require_normal_write_ack_for_legacy_reconciliation(
-                &response,
-                &request_fingerprints,
-                &legacy_reconciliation_pending,
-            )?;
-            // Clear only what this accepted request carried. A failed upload
-            // leaves the counters in place so the losses are reported on the
-            // next batch instead of vanishing with the request that died.
-            client_report.commit();
-            Ok(response)
-        },
-        |progress| progress.save(&upload_progress_path),
-    )
-    .and_then(|result| {
-        if matches!(
-            result,
-            ResumableUploadResult::Completed
-                | ResumableUploadResult::Deferred { .. }
-                | ResumableUploadResult::Rejected { .. }
-        ) {
-            // A setup/account switch can replace the relay binding while a
-            // long historical scan is uploading. Never commit destination A's
-            // delivery cursor after the machine has moved to destination B.
-            ensure_authority()?;
-        }
-        Ok(result)
-    })
-    .map(|result| {
-        with_retained_refusal_conflicts(
-            with_bootstrap_deferred(result, bootstrap_deferred),
-            &index,
-            &upload_progress,
-            reason_reoffer::now_unix_seconds(),
+    let bootstrap_offer_finished = bootstrap_capacity_error.is_some();
+    let upload_result = if let Some(error) = bootstrap_capacity_error {
+        Err(error)
+    } else {
+        upload_resumable_batches_with_body_witness_partitioned(
+            &scan_result.snapshots,
+            source.api_slug(),
+            &mut upload_progress,
+            &mut accepted,
+            |snapshot| snapshot.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |snapshot| Some(snapshot.source_session_id.as_str()),
+            |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+            &mut inplace_retry,
+            |snapshots| {
+                // A first Codex/Claude scan can spend several minutes parsing local
+                // history and retroactive backfill before the first upload. Relay
+                // tokens are intentionally short-lived, so mint them at the network
+                // boundary instead of reusing the pre-scan activity-hint token.
+                // Leased, not read: exactly one in-flight batch may claim the
+                // counters, and dropping the lease on any failure below leaves the
+                // losses owed instead of stranded.
+                let client_report = crate::client_report::lease();
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: source.api_slug().to_string(),
+                    machine_id: machine_id.to_string(),
+                    collector_version: Some(collector_version()),
+                    snapshots,
+                    upload_policy,
+                    client_report: client_report.report().clone(),
+                };
+                let reconcile_class = request.snapshots.iter().all(|snapshot| {
+                    legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+                });
+                debug_assert!(
+                    reconcile_class
+                        || request.snapshots.iter().all(|snapshot| {
+                            !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+                        }),
+                    "legacy reconciliation must stay isolated at a batch boundary"
+                );
+                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                    return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                        reason,
+                    }));
+                }
+                ensure_authority()?;
+                let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
+                ensure_authority()?;
+                validate_joined(&request.snapshots)?;
+                let response =
+                    client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
+                response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
+                let request_fingerprints = request
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect::<BTreeSet<_>>();
+                require_normal_write_ack_for_legacy_reconciliation(
+                    &response,
+                    &request_fingerprints,
+                    &legacy_reconciliation_pending,
+                )?;
+                // Clear only what this accepted request carried. A failed upload
+                // leaves the counters in place so the losses are reported on the
+                // next batch instead of vanishing with the request that died.
+                client_report.commit();
+                Ok(response)
+            },
+            |progress| progress.save(&upload_progress_path),
         )
-    });
+        .and_then(|result| {
+            if matches!(
+                result,
+                ResumableUploadResult::Completed
+                    | ResumableUploadResult::Deferred { .. }
+                    | ResumableUploadResult::Rejected { .. }
+            ) {
+                // A setup/account switch can replace the relay binding while a
+                // long historical scan is uploading. Never commit destination A's
+                // delivery cursor after the machine has moved to destination B.
+                ensure_authority()?;
+            }
+            // Never certify omitted files as a completed scan. Drain admitted
+            // bodies, then enter partial settlement with its typed local counts.
+            ack_retention::require_settlement(result, ack_admission_limited, &upload_progress)
+        })
+        .map(|result| {
+            with_retained_refusal_conflicts(
+                with_bootstrap_deferred(result, bootstrap_deferred),
+                &index,
+                &upload_progress,
+                reason_reoffer::now_unix_seconds(),
+            )
+        })
+    };
     // The logical offer ends here; normal bounded HTTP retries happened inside.
-    upload_progress.finish_reason_reoffers(
-        &attempted_reason_reoffers,
-        matches!(upload_result, Ok(ResumableUploadResult::Shed { .. })),
-        source.api_slug(),
-    );
+    if !bootstrap_offer_finished {
+        // Bootstrap already classified its failed logical offer. A routed
+        // capacity stop must not count unattempted leases a second time.
+        upload_progress.finish_reason_reoffers(
+            &attempted_reason_reoffers,
+            matches!(upload_result, Ok(ResumableUploadResult::Shed { .. })),
+            source.api_slug(),
+        );
+    }
 
     // Exact progress is durable before this seam. The same subsequent index
     // save carries settled file bodies and correction progress; local-state
@@ -7240,6 +7316,13 @@ fn finish_sync_source(
             ) {
                 Ok(committable) => {
                     note_codex_side_saved(daemon, &index_path, false, side_mark);
+                    upload_progress.release_acks_after_partial_index_save(
+                        &upload_progress_path,
+                        &committed_index,
+                        &committable,
+                        locally_held_fingerprints,
+                        true,
+                    )?;
                     committable
                 }
                 Err(error) => {
@@ -7334,8 +7417,8 @@ fn finish_sync_source(
         }
         Err(error) => {
             // Earlier pages may have durable exact ACKs even though this pass
-            // failed. Save their wholly settled files before a later upload
-            // delta can prune those ACKs. Local-state failures leave durability
+            // failed. Save their wholly settled files and release adopted ACK
+            // capacity. Local-state failures leave durability
             // uncertain and must not certify an in-memory mutated ledger.
             if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
                 let side_mark = codex_side_save_mark(daemon, source, &index_path);
@@ -7361,6 +7444,13 @@ fn finish_sync_source(
                     Ok(committable) => {
                         index = committable;
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
+                        upload_progress.release_acks_after_partial_index_save(
+                            &upload_progress_path,
+                            &committed_index,
+                            &index,
+                            locally_held_fingerprints,
+                            false,
+                        )?;
                     }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
@@ -7379,7 +7469,19 @@ fn finish_sync_source(
             // Distinguish local serializer drift, authorization failures, and
             // backend payload rejection. The resumable driver has already
             // checkpointed every accepted sibling before this terminal error.
-            let (state, context) = if snapshot_upload_error_class(&error)
+            let (state, context) = if let Some(settlement) =
+                error.downcast_ref::<ack_retention::AckSettlementRequired>()
+            {
+                eprintln!(
+                    "ottto-service: local snapshot upload deferred for {} — {}",
+                    source.api_slug(),
+                    upload_failure_diagnostic(&error)
+                );
+                (
+                    settlement.collector_state(),
+                    "local snapshot ACK settlement pending",
+                )
+            } else if snapshot_upload_error_class(&error)
                 == Some(SnapshotUploadErrorClass::LocalState)
             {
                 (
@@ -7457,14 +7559,7 @@ fn finish_sync_source(
                 // lives. The collector status code stays `network_error` — that
                 // string is a backend contract, and only the loss category is
                 // being classified here.
-                crate::client_report::record(
-                    if is_shed_failure(&error) {
-                        crate::client_report::ClientReportReason::RatelimitBackoff
-                    } else {
-                        crate::client_report::ClientReportReason::NetworkError
-                    },
-                    1,
-                );
+                ack_retention::record_upload_failure_loss(&error);
                 // Everything above this arm names its own cause. This arm is
                 // the catch-all, and it used to log the bare phrase "local
                 // snapshot upload failed" with no status code, endpoint, or
@@ -7489,7 +7584,12 @@ fn finish_sync_source(
                 )
             };
             with_source_cadence(source, |cadence| {
-                cadence.record_scan_failure(Instant::now())
+                ack_retention::record_upload_error_cadence(
+                    cadence,
+                    Instant::now(),
+                    accepted,
+                    &error,
+                )
             });
             let _ = report_status_with_fresh_relay_token(
                 client,
@@ -7533,6 +7633,13 @@ fn finish_sync_source(
             upload_fully_settled = false;
         }
     }
+    upload_progress.stage_ack_retirement_handoff_with_census(
+        &committed_index,
+        &mut index,
+        locally_held_fingerprints,
+        &census_absent_upload_acks,
+    )?;
+    let mut retired_upload_acks = upload_progress.retired_ack_candidates(&committed_index, &index);
     // Every selected-state restoration above has finished. A non-current
     // comparison already revoked this lease locally and cannot mint a native
     // correction later in this finish. Retire only that Claude prior index
@@ -7596,6 +7703,8 @@ fn finish_sync_source(
         &manifest_window_end,
     )?;
     note_codex_side_saved(daemon, &index_path, true, side_mark);
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("native_receipt")?;
     if upload_fully_settled
         && native_comparison_lease
             .as_ref()
@@ -7678,6 +7787,8 @@ fn finish_sync_source(
     // history gate clears the unverified marker. A fresh index recorded its
     // cutoff this cycle and an intact one keeps its entries, so the rebuilt
     // history stays gated; Claude's bootstrap and replays may then run.
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("unverified_marker")?;
     if claude_replay_suppressed(source, &backfill_state)
         && scan_result.census_complete
         && upload_fully_settled
@@ -7692,6 +7803,8 @@ fn finish_sync_source(
         }
     }
 
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("backfill_completion")?;
     if backfill_succeeded {
         // Keep completion's reload, mutation and save atomic with claims,
         // list intent and deliberate installation reset.
@@ -7728,6 +7841,14 @@ fn finish_sync_source(
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
     let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
+    retired_upload_acks.extend(upload_progress.saved_retirement_candidates(&index));
+    upload_progress.retire_acks_after_index_save(
+        &index,
+        &retired_upload_acks,
+        locally_held_fingerprints,
+    );
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("finish_cycle")?;
     upload_progress.finish_cycle(&upload_progress_path)?;
 
     if let Some(count) = deferred_entity_count {
@@ -9137,6 +9258,17 @@ where
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
+    // Reserve every possible ACK before any remote side effect, including the
+    // retained retry driver. Capacity stops use the partial-index save path.
+    let new_acks = indices
+        .iter()
+        .filter(|index| {
+            !progress
+                .accepted_fingerprints
+                .contains(fingerprint(&items[**index]))
+        })
+        .count();
+    progress.admit_ack_batch(new_acks)?;
     let batch = indices
         .iter()
         .map(|index| items[*index].clone())
@@ -9367,10 +9499,9 @@ where
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
-    // A permanently invalid snapshot can keep the final scan index uncommitted
-    // across many cycles while valid sessions continue changing. Retain only
-    // fingerprints present in this cycle's policy/cutoff-filtered work so the
-    // hash-only ledger stays O(current scan), not O(all historical revisions).
+    // Input is a page/delta, not a census. Only an explicitly changed body
+    // invalidates its previous ACK here. Index settlement owns retirement;
+    // bounded admission below prevents unindexed revisions growing forever.
     let mut current_body_witnesses = BTreeMap::new();
     for item in items {
         let item_fingerprint = fingerprint(item).to_string();
@@ -9391,7 +9522,11 @@ where
     let progress_len_before_prune = progress.accepted_fingerprints.len();
     progress
         .accepted_body_witnesses
-        .retain(|fingerprint, witness| current_body_witnesses.get(fingerprint) == Some(witness));
+        .retain(|fingerprint, witness| {
+            current_body_witnesses
+                .get(fingerprint)
+                .map_or(true, |current| current == witness)
+        });
     progress
         .accepted_fingerprints
         .retain(|value| progress.accepted_body_witnesses.contains_key(value));
@@ -10708,6 +10843,9 @@ fn rfc3339_after_minutes(minutes: i64) -> Option<String> {
 /// a URL or token) or one of this module's own compile-time reason literals —
 /// never raw error text, which can carry file paths.
 fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
+    if let Some(settlement) = error.downcast_ref::<ack_retention::AckSettlementRequired>() {
+        return settlement.to_string();
+    }
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
     }
@@ -10766,6 +10904,9 @@ fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
 }
 
 pub(crate) fn safe_error(error: &anyhow::Error) -> String {
+    if let Some(settlement) = error.downcast_ref::<ack_retention::AckSettlementRequired>() {
+        return settlement.to_string();
+    }
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
     }
@@ -10850,6 +10991,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod ack_retention_tests {
+        include!("snapshot_sync/ack_retention_tests.rs");
+    }
     use crate::snapshots::finalize_scan_after_policy;
     #[test]
     fn retry_copy_keeps_compaction_events_and_never_local_context_points() {
@@ -13666,6 +13810,24 @@ mod tests {
         let path = directory.join("progress.json");
         let _ = std::fs::remove_file(&path);
         restored.save(&path).unwrap();
+        let (mut settled_index, _) = pending_head_index_item();
+        settled_index.record_accepted_snapshot_fingerprints(&restored.accepted_fingerprints);
+        let mut digest = Sha256::new();
+        for bytes in [
+            b"snapshot_file_upload_body_set:v1".as_slice(),
+            snapshot_upload_body_witness(&item).as_bytes(),
+        ] {
+            digest.update((bytes.len() as u32).to_be_bytes());
+            digest.update(bytes);
+        }
+        settled_index
+            .files
+            .values_mut()
+            .next()
+            .unwrap()
+            .last_upload_body_witness = Some(format!("{:x}", digest.finalize()));
+        settled_index.save(&directory.join("index.json")).unwrap();
+        restored.retire_acks_after_index_save(&settled_index, &BTreeSet::new(), &BTreeSet::new());
         restored.finish_cycle(&path).unwrap();
         let mut restored = SnapshotUploadProgress::load(
             &path,
@@ -16310,9 +16472,26 @@ mod tests {
         let poison_scope = &unique_poison_scope();
         let poison = format!("{:064x}", 9000);
         let mut progress = test_upload_progress();
+        let scratch = crate::test_scratch::ScratchDir::new("poison-revision-retirement");
+        let index_path = scratch.join("index.json");
+        let progress_path = scratch.join("progress.json");
+        let mut index = ScanIndex::default();
+        index.save(&index_path).unwrap();
+        progress.save(&progress_path).unwrap();
 
         for revision in 0..20 {
             let valid = format!("{:064x}", 10_000 + revision);
+            // A committed replacement of this file's exact entity incidence
+            // retires the prior revision. Page omission itself proves nothing.
+            let previous = ScanIndex::load(&index_path).unwrap();
+            index
+                .file_snapshot_fingerprints
+                .insert("changing.jsonl".into(), BTreeSet::from([valid.clone()]));
+            let retired = progress.retired_ack_candidates(&previous, &index);
+            index.save(&index_path).unwrap();
+            index = ScanIndex::load(&index_path).unwrap();
+            progress.retire_acks_after_index_save(&index, &retired, &BTreeSet::new());
+            progress.save(&progress_path).unwrap();
             let items = vec![valid.clone(), poison.clone()];
             let mut accepted = 0;
             let error = upload_resumable_batches(
@@ -16334,10 +16513,16 @@ mod tests {
                         Ok(accepted_batch(batch.len()))
                     }
                 },
-                |_| Ok(()),
+                |state| state.save(&progress_path),
             )
             .expect_err("permanent poison keeps the cycle incomplete");
 
+            progress = SnapshotUploadProgress::load(
+                &progress_path,
+                &progress.destination_namespace_hash,
+                test_quarantine_witness(),
+            )
+            .unwrap();
             assert!(is_item_specific_validation_failure(&error));
             assert_eq!(accepted, 1);
             assert_eq!(progress.accepted_fingerprints.len(), 1);
@@ -22873,7 +23058,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
