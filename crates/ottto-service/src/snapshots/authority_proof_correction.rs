@@ -198,6 +198,7 @@ impl ScanIndex {
         if stage == "cas" {
             return;
         }
+        crate::local_resource_diagnostics::claude_reread::authority_normalization(rearmed as u64);
         CLAUDE_AUTHORITY_DROPS.fetch_add(unbound.len(), std::sync::atomic::Ordering::Relaxed);
         CLAUDE_AUTHORITY_DROP_REARMED_FILES
             .fetch_add(rearmed, std::sync::atomic::Ordering::Relaxed);
@@ -818,12 +819,7 @@ impl ScanIndex {
                 .iter()
                 .map(|item| item.body_witness.as_str())
                 .collect::<BTreeSet<_>>();
-            let mut digest = Sha256::new();
-            update_length_prefixed(&mut digest, b"snapshot_file_upload_body_set:v1");
-            for body in &bodies {
-                update_length_prefixed(&mut digest, body.as_bytes());
-            }
-            let body_set = format!("{:x}", digest.finalize());
+            let body_set = snapshot_file_upload_body_set_hex(bodies);
             if self
                 .files
                 .get(key)

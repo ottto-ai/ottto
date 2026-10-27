@@ -185,6 +185,9 @@ fn complete_ledger() -> BTreeMap<String, CodexParentOwnershipLedger> {
             scan_complete: true,
             opened_object_identity: String::new(),
             unresolvable: None,
+            opened_changed_nanos: 0,
+            opened_modified_nanos: 0,
+            opened_birth_nanos: 0,
         },
     )])
 }
@@ -465,6 +468,7 @@ impl Scene {
                 pending_directories: VecDeque::new(),
                 pending_candidates: VecDeque::new(),
                 observed_index_keys: BTreeSet::new(),
+                oversized_discovery: Default::default(),
                 codex_rollout_paths: BTreeSet::from([
                     local_index_key(&parent),
                     local_index_key(&child_path),
@@ -501,6 +505,8 @@ impl Scene {
                 legacy_source_file_fingerprint: String::new(),
                 legacy_config_reconciliation_required: false,
                 opened_object_identity: String::new(),
+                fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: 0,
             },
             index,
         };

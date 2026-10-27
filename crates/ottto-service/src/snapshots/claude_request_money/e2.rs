@@ -1,8 +1,8 @@
 //! E2 request-owned Claude money from the native resolved-response fold.
 //! Native resolution owns counts; this module only decides copies, attaches
 //! reported telemetry cost and side calls, and emits one literal body per
-//! session. The upload gate is OFF: DARK never changes an item, a scan
-//! identity, parser scope or body witness.
+//! session. The upload gate is ON; DARK test arms never change an item, a
+//! scan identity, parser scope or body witness.
 use super::super::claude_context_file_birth::ClaudeFileBirth;
 use super::super::claude_history_upgrade::{
     claude_path_twin_groups, path_twins, probe_opened_birth, ClaudeTwinGroups,

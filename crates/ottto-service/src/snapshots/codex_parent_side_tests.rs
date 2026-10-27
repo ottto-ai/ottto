@@ -624,6 +624,8 @@ fn file_entry() -> ScanIndexEntry {
         codex_captured_uncommitted: false,
         codex_counting_v2: false,
         codex_counting_owner: None,
+        opened_changed_nanos: 0,
+        opened_birth_nanos: 0,
     }
 }
 
@@ -1154,6 +1156,7 @@ fn census_of(key: &str) -> ScanTraversalCheckpoint {
         pending_directories: VecDeque::new(),
         pending_candidates: VecDeque::new(),
         observed_index_keys: BTreeSet::new(),
+        oversized_discovery: Default::default(),
         codex_rollout_paths: BTreeSet::from([key.to_owned()]),
         codex_join_directory_census: None,
         reconciliation_upper_bound: None,

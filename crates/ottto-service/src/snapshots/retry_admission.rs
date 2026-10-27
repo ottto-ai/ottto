@@ -30,6 +30,7 @@ fn claude_retry_due_family_exists(index: &ScanIndex, collected_at: &str) -> bool
         .any(|record| claude_retry_record_due(record, now, served))
 }
 
+#[cfg(test)]
 fn claude_retry_admit_batch(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
@@ -40,6 +41,27 @@ fn claude_retry_admit_batch(
     BTreeSet<String>,
     ClaudeRetryAdmission,
 ) {
+    claude_retry_admit_batch_observed(
+        index,
+        stale,
+        previous,
+        collected_at,
+        &mut Default::default(),
+    )
+}
+
+fn claude_retry_admit_batch_observed(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+    previous: Option<&ClaudeRetryAdmission>,
+    collected_at: &str,
+    diagnostics: &mut StaleCarryRejectionCounts,
+) -> (
+    ClaudeStaleFamilyCarry,
+    BTreeSet<String>,
+    ClaudeRetryAdmission,
+) {
+    *diagnostics = StaleCarryRejectionCounts::default();
     let mut state = previous
         .filter(|state| {
             !(state.complete
@@ -88,8 +110,10 @@ fn claude_retry_admit_batch(
             state.progressed = true;
             return (ClaudeStaleFamilyCarry::default(), batch, state);
         }
-        match claude_stream_accepted_retry_carry(index, &batch) {
+        let mut attempt = StaleCarryRejectionCounts::default();
+        match claude_stream_accepted_retry_carry_observed(index, &batch, &mut attempt) {
             Ok(carry) => {
+                *diagnostics = attempt;
                 state.after_root = batch.last().cloned();
                 state.roots_complete = state.after_root.as_ref().is_some_and(|after| {
                     !stale
@@ -111,6 +135,7 @@ fn claude_retry_admit_batch(
                 }
             }
             Err(ClaudeRetryAdmissionRefusal::Structure) => {
+                *diagnostics = attempt;
                 // One bounded, durable fallback at a time. Later fitting roots
                 // can advance while it is served; another oversized root waits
                 // here instead of losing its obligation or growing a debt map.
@@ -145,7 +170,10 @@ fn claude_retry_admit_batch(
                 eprintln!("local snapshot census retained one oversized Claude retry family for bounded ordinary service; coverage remains incomplete");
                 return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
             }
-            Err(_) => return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state),
+            Err(_) => {
+                *diagnostics = attempt;
+                return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
+            }
         }
     }
 }
@@ -221,19 +249,8 @@ fn claude_retry_singleton_storage_only(index: &ScanIndex, root: &str) -> bool {
             .keys()
             .chain(pending.member_occurrences.keys())
         {
-            let subagent_stem = if name == root {
-                None
-            } else if let Some(stem) = name
-                .strip_prefix(root)
-                .and_then(|tail| tail.strip_prefix('_'))
-            {
-                Some(stem)
-            } else {
+            let Some(member) = ClaudeIndexPathMemberRef::of_family_member(root, name) else {
                 return false;
-            };
-            let member = ClaudeIndexPathMemberRef {
-                root,
-                subagent_stem,
             };
             if after.map_or(true, |last| member > last) && member <= upper {
                 if page[..len]
@@ -250,6 +267,32 @@ fn claude_retry_singleton_storage_only(index: &ScanIndex, root: &str) -> bool {
     represented == pending.member_request_id_hashes.len() + pending.member_occurrences.len()
 }
 
+// The due arm of retry admission: an unfinished due walk, a path after the
+// served cursor and within the frozen upper path, whose family record is due by
+// the frozen horizon (`now` clamps to `due_through`, idempotently). The
+// oversized-root arm stays separate: it never completes the due walk.
+fn claude_retry_path_due(
+    state: &ClaudeRetryAdmission,
+    records: &BTreeMap<String, ClaudeUsageAuthorityQuarantineRecord>,
+    key: &str,
+    now: u64,
+) -> bool {
+    !state.due_complete
+        && state
+            .due_after_path
+            .as_deref()
+            .map_or(true, |after| key > after)
+        && state
+            .due_upper_path
+            .as_deref()
+            .is_some_and(|upper| key <= upper)
+        && claude_index_path_member_ref(Path::new(key))
+            .and_then(|member| records.get(member.root))
+            .is_some_and(|record| {
+                claude_retry_record_due(record, now.min(state.due_through), state.served_before)
+            })
+}
+
 fn claude_retry_path_owed(
     state: &ClaudeRetryAdmission,
     records: &BTreeMap<String, ClaudeUsageAuthorityQuarantineRecord>,
@@ -264,19 +307,7 @@ fn claude_retry_path_owed(
             .oversized_after_path
             .as_deref()
             .map_or(true, |after| key > after);
-    let due = !state.due_complete
-        && state
-            .due_after_path
-            .as_deref()
-            .map_or(true, |after| key > after)
-        && state
-            .due_upper_path
-            .as_deref()
-            .is_some_and(|upper| key <= upper)
-        && records.get(member.root).is_some_and(|record| {
-            claude_retry_record_due(record, now.min(state.due_through), state.served_before)
-        });
-    oversized || due
+    oversized || claude_retry_path_due(state, records, key, now)
 }
 
 fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
@@ -321,22 +352,11 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
         state.oversized_after_path = None;
         state.progressed = true;
     }
-    if !index.files.keys().any(|key| {
-        !state.due_complete
-            && state
-                .due_after_path
-                .as_deref()
-                .map_or(true, |after| key.as_str() > after)
-            && state
-                .due_upper_path
-                .as_deref()
-                .is_some_and(|upper| key.as_str() <= upper)
-            && claude_index_path_member_ref(Path::new(key))
-                .and_then(|member| index.claude_usage_authority_quarantine.get(member.root))
-                .is_some_and(|record| {
-                    claude_retry_record_due(record, now.min(state.due_through), state.served_before)
-                })
-    }) {
+    if !index
+        .files
+        .keys()
+        .any(|key| claude_retry_path_due(state, &index.claude_usage_authority_quarantine, key, now))
+    {
         state.due_complete = true;
     }
     state.complete = state.roots_complete
@@ -367,11 +387,8 @@ fn claude_retry_queue_due_families(index: &mut ScanIndex, collected_at: &str) {
         if !claude_retry_path_owed(state, &index.claude_usage_authority_quarantine, key, now) {
             continue;
         }
-        let Some(root) = traversal
-            .scan_roots
-            .iter()
-            .find(|root| Path::new(key).starts_with(root))
-        else {
+        // First match, not deepest: the root enters the sampled scope hash.
+        let Some(root) = traversal.first_matching_scan_root(Path::new(key)) else {
             continue;
         };
         if cost
@@ -457,18 +474,7 @@ fn claude_retry_note_offered(
     let mut due_after = None;
     if !state.due_complete {
         for key in index.files.keys() {
-            if !state
-                .due_after_path
-                .as_deref()
-                .map_or(true, |after| key.as_str() > after)
-                || !state
-                    .due_upper_path
-                    .as_deref()
-                    .is_some_and(|upper| key.as_str() <= upper)
-                || !claude_index_path_member_ref(Path::new(key))
-                    .and_then(|member| index.claude_usage_authority_quarantine.get(member.root))
-                    .is_some_and(|record| claude_retry_record_due(record, now, state.served_before))
-            {
+            if !claude_retry_path_due(state, &index.claude_usage_authority_quarantine, key, now) {
                 continue;
             }
             if !offered(key) {
@@ -491,6 +497,7 @@ fn claude_retry_note_offered(
         if !offered(key) {
             break;
         }
+        crate::local_resource_diagnostics::claude_reread::retry_offered();
         oversized_after = Some(key.clone());
     }
     let oversized = state.oversized_root.clone();
@@ -528,6 +535,10 @@ fn claude_retry_note_offered(
                     .is_some_and(|after| key.as_str() <= after)
             {
                 if let Some(entry) = index.files.get_mut(&key) {
+                    crate::local_resource_diagnostics::claude_reread::clear(
+                        crate::local_resource_diagnostics::claude_reread::ClearSite::RetryAdmission,
+                        !entry.source_file_fingerprint.is_empty(),
+                    );
                     entry.source_file_fingerprint.clear();
                 }
             }

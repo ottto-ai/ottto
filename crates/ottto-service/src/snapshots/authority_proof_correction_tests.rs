@@ -2587,8 +2587,16 @@ fn load_drops_unbound_authority_record_and_keeps_index() {
     let index = apc_unbound_fixture();
     let expected = apc_without_unbound_record(&index);
     let (drops, rearmed) = claude_authority_drops_for_test();
+    let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     let (loaded, quarantined) =
         apc_load_value(&scratch, "unbound", &serde_json::to_value(&index).unwrap());
+    assert_eq!(
+        diagnostics
+            .finish()
+            .claude_reread
+            .authority_normalization_cleared,
+        apc_keys().len() as u64
+    );
     assert!(
         !quarantined,
         "one unbound record cannot quarantine the whole index"
@@ -2637,9 +2645,17 @@ fn save_drops_existing_orphan_authority_record_and_succeeds() {
     let mut expected = apc_without_unbound_record(&index);
     expected["generation"] = json!(1);
     let (drops, rearmed) = claude_authority_drops_for_test();
+    let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     index
         .save(&path)
         .expect("an orphan record never fails the save");
+    assert_eq!(
+        diagnostics
+            .finish()
+            .claude_reread
+            .authority_normalization_cleared,
+        apc_keys().len() as u64
+    );
     assert_eq!(
         claude_authority_drops_for_test(),
         (drops + 1, rearmed + apc_keys().len())

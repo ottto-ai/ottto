@@ -8,12 +8,16 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
     let started = std::time::Instant::now();
     let _manifests = SourceManifestTestGuard::new();
     let mut fixture = c1a_fixture("persistent-retry-admission");
-    let long_root = fixture
-        .base
-        .join("long-history")
-        .join("p".repeat(200))
-        .join("q".repeat(200))
-        .join("r".repeat(200));
+    // Spend the real 8 MiB cancellation reserve on longer keys rather than
+    // excess families/pages. A 900-byte root leaves the nested seed paths
+    // below macOS PATH_MAX; each component stays below NAME_MAX.
+    let mut long_root = fixture.base.join("long-history");
+    while long_root.to_string_lossy().len() < 900 {
+        let padding = (900 - long_root.to_string_lossy().len())
+            .saturating_sub(1)
+            .clamp(1, 200);
+        long_root.push("p".repeat(padding));
+    }
     std::fs::create_dir_all(long_root.parent().unwrap()).unwrap();
     std::fs::rename(&fixture.root, &long_root).unwrap();
     fixture.root = long_root;
@@ -24,7 +28,10 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
     // frame to continue serially. Require the real bound to refuse parking;
     // small fixtures and this test's seed retain their original layout gate.
     fixture.serial_active_frame = true;
-    const HEALTHY: usize = 6356;
+    // 4608 * 2 * (900 + 1 + 36 + 6) = 8,690,688 > 8 MiB, before
+    // counting any container overhead. More than 36 real 128-root groups
+    // remain (the seed adds other families), including a partial final group.
+    const HEALTHY: usize = 4608;
     let healthy = (0..HEALTHY)
         .map(|number| format!("0{number:07x}-1234-4234-8234-123456789abc"))
         .collect::<BTreeSet<_>>();
@@ -185,7 +192,7 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
             }
             admission_complete = complete;
         }
-        // Keep all 6356-entry equality/value checks at the owner-approved
+        // Keep all healthy-entry equality/value checks at the owner-approved
         // checkpoints: first held settlement, midpoint and full completion.
         let first_settlement = held_settled && !checkpoints.contains("held");
         let midpoint = progressed.len() >= HEALTHY.div_ceil(128).div_ceil(2)

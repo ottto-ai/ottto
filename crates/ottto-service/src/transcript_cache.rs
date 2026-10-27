@@ -500,8 +500,12 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 record(Event::InsertNoVictimRefused);
                 return false;
             };
+            let count_pressure = self.entries.len() > self.count_limit;
             self.entries.remove(&victim);
             record(Event::InsertEntriesEvicted);
+            crate::local_resource_diagnostics::claude_reread::cache_capacity_eviction(
+                count_pressure,
+            );
             if victim == key {
                 // Even a rejected new entry must release enough older state
                 // for the caller's live allocation reservation.
@@ -573,6 +577,36 @@ mod tests {
             assert_eq!(counts.insert_disabled_or_layout_refused, 1);
             assert_eq!(counts.insert_admitted, 0);
         }
+    }
+
+    #[test]
+    fn claude_page_cache_evictions_partition_real_count_and_byte_pressure() {
+        use crate::local_resource_diagnostics::claude_reread::Scope;
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let scope = Scope::begin(true);
+        let mut count_limited = TranscriptCache::new(1024 * 1024, 128 * 1024, 1);
+        assert!(count_limited.insert("a".into(), retained("a".into())));
+        assert!(count_limited.insert("b".into(), retained("b".into())));
+        assert!(count_limited.take("a").is_none());
+        let counts = scope.finish().retained_cache_page_events;
+        assert_eq!(counts.events.insert_entries_evicted, 1);
+        assert_eq!(counts.insert_count_entries_evicted, 1);
+        assert_eq!(counts.insert_byte_entries_evicted, 0);
+        let scope = Scope::begin(true);
+        let mut byte_limited = TranscriptCache::new(80 * 1024, 40 * 1024, 256);
+        for n in 0..20 {
+            assert!(byte_limited.insert(n.to_string(), retained("x".repeat(16 * 1024))));
+        }
+        let counts = scope.finish().retained_cache_page_events;
+        assert!(counts.events.insert_entries_evicted > 0);
+        assert_eq!(counts.insert_count_entries_evicted, 0);
+        assert_eq!(
+            counts.insert_byte_entries_evicted,
+            counts.events.insert_entries_evicted
+        );
+        assert_eq!(counts.events.insert_admitted, 20);
     }
 
     // Test states use the same accounting as production native accumulator

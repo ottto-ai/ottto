@@ -1053,32 +1053,7 @@ impl ScanIndex {
             if entry.retain_history_evidence() {
                 continue;
             }
-            if !self
-                .reread_guard
-                .replay_witnesses
-                .contains_key(&KeyHash::of(key))
-                && self.reread_guard.replay_witnesses.len() >= MAX_TRACKED_KEYS
-            {
-                self.reread_guard.physical_tracking_dropped = self
-                    .reread_guard
-                    .physical_tracking_dropped
-                    .saturating_add(1);
-                continue;
-            }
-            self.reread_guard.replay_witnesses.insert(
-                KeyHash::of(key),
-                PhysicalWitness {
-                    removed_hour: hour(now()).unwrap_or(u32::MAX),
-                    size: entry.size_bytes,
-                    mtime_ns: entry.modified_unix_nanos,
-                    mtime_seconds: entry.modified_unix_seconds,
-                    object: self
-                        .reread_guard
-                        .replay_witnesses
-                        .get(&KeyHash::of(key))
-                        .and_then(|w| w.object),
-                },
-            );
+            self.reread_guard.remember_entry(key, entry);
         }
     }
     pub(super) fn record_read_witness(&mut self, key: &str, candidate: &CandidateFile) {

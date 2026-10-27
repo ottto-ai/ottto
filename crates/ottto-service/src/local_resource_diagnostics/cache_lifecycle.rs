@@ -8,6 +8,15 @@ macro_rules! counters {
     ($($field:ident: $event:ident),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
         pub(crate) struct Counts { $(pub(crate) $field: u64),+ }
+        pub(crate) struct Sparse(pub(crate) Counts);
+        impl Serialize for Sparse {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(None)?;
+                $(if self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
+                map.end()
+            }
+        }
         #[derive(Clone, Copy)]
         pub(crate) enum Event { $($event),+ }
         const COUNT: usize = [$(stringify!($field)),+].len();
@@ -15,6 +24,13 @@ macro_rules! counters {
         // allocations, additional locks, identifiers or retained history.
         static TOTALS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
         impl Counts {
+            pub(crate) fn add(&mut self, event: Event, amount: u64) {
+                match event { $(Event::$event => self.$field = self.$field.saturating_add(amount)),+ }
+            }
+            pub(crate) fn merge(&mut self, other: Self) {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            }
+            pub(crate) fn is_empty(&self) -> bool { $(self.$field == 0)&&+ }
             fn from_array(values: [u64; COUNT]) -> Self {
                 Self { $($field: values[Event::$event as usize]),+ }
             }
@@ -71,6 +87,7 @@ counters! {
 }
 
 pub(crate) fn add(event: Event, amount: u64) {
+    super::claude_reread::cache_event(event, amount);
     let _ = TOTALS[event as usize].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(amount))
     });

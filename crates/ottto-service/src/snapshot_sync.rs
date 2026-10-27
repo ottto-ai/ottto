@@ -659,6 +659,10 @@ fn exclude_held_effective_body_witness_revision(
 /// treat the still-present family as vanished. A never-committed member bound
 /// by its committed family's terminal quarantine settles with a delivery-free
 /// membership entry instead, so the family census stays complete.
+///
+/// `held_family_roots` names the Claude families of this page's held
+/// entities, when known. The mark is then scoped to them for the terminal
+/// unchanged-proof skip only; `None` keeps the sweep-wide mark.
 fn commit_completed_with_local_holds(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -666,6 +670,7 @@ fn commit_completed_with_local_holds(
     locally_held_fingerprints: &BTreeSet<String>,
     account_deferred_held_fingerprints: &BTreeSet<String>,
     progress_blocking: bool,
+    held_family_roots: Option<&BTreeSet<String>>,
 ) -> ScanIndex {
     if !progress_blocking
         && index.locally_held_keys_restorable(
@@ -684,9 +689,13 @@ fn commit_completed_with_local_holds(
     accepted_fingerprints.retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
     let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-    let mut index =
-        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
-    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
+    let mut index = index.committable_subset_with_local_holds(
+        committed_index,
+        &accepted_fingerprints,
+        &server_quarantine,
+        locally_held_fingerprints,
+    );
+    index.mark_bounded_sweep_held_by_families(held_family_roots);
     index
 }
 
@@ -702,6 +711,10 @@ struct LocalHoldSettlement {
     held_fingerprints: BTreeSet<String>,
     account_deferred_fingerprints: BTreeSet<String>,
     progress_blocking: bool,
+    /// Claude only: every family a held entity of this page could count
+    /// under (`held_family_roots`). `None` for other sources or when a held
+    /// session cannot be placed.
+    held_family_roots: Option<BTreeSet<String>>,
 }
 
 impl LocalHoldSettlement {
@@ -730,6 +743,11 @@ impl LocalHoldSettlement {
             index,
             account_holds_recorded,
         );
+        let held_family_roots = if source == SnapshotSource::ClaudeCode && held_entity_count > 0 {
+            disposition.held_family_roots(&scan_result.snapshots, index)
+        } else {
+            None
+        };
         disposition.retain_uploadable(&mut scan_result.snapshots);
         let retry_pending_family_count = index.claude_usage_authority_pending_count();
         Self {
@@ -738,6 +756,7 @@ impl LocalHoldSettlement {
             held_fingerprints,
             account_deferred_fingerprints,
             progress_blocking: !progress_blocking_held_fingerprints.is_empty(),
+            held_family_roots,
         }
     }
 
@@ -788,6 +807,7 @@ fn settle_completed_upload(
         &holds.held_fingerprints,
         &holds.account_deferred_fingerprints,
         holds.progress_blocking,
+        holds.held_family_roots.as_ref(),
     );
     eprintln!(
         "local snapshot sync retained {} Claude usage family/families and {} revised \
@@ -842,7 +862,12 @@ fn settle_checkpointed_upload(
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
         server_quarantine.retain(|fingerprint, _| !holds.held_fingerprints.contains(fingerprint));
-        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine)
+        index.committable_subset_with_local_holds(
+            committed_index,
+            &accepted_fingerprints,
+            &server_quarantine,
+            &holds.held_fingerprints,
+        )
     } else {
         index
     };
@@ -2892,7 +2917,12 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         })
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
-    let mut committable = index.committable_subset(committed_index, &accepted, &quarantined);
+    let mut committable = index.committable_subset_with_local_holds(
+        committed_index,
+        &accepted,
+        &quarantined,
+        locally_held,
+    );
     if let Some(scan) = correction_scan {
         // A2: settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
@@ -2914,9 +2944,11 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         index,
         correction_scan.is_some_and(|scan| scan.census_complete),
     );
-    progress.stage_ack_retirement_handoff_with_census(
+    let scan_referenced = progress.ack_retirement_scan_references(committed_index, index);
+    progress.stage_ack_retirement_handoff_with_scan(
         committed_index,
         &mut committable,
+        &scan_referenced,
         locally_held,
         &census_absent,
     )?;
@@ -5191,7 +5223,25 @@ impl SourcePreparation {
         Some(counter.bytes)
     }
 
-    fn step(mut self) -> SourcePreparationStep {
+    fn step(self) -> SourcePreparationStep {
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
+            self.source == SnapshotSource::ClaudeCode,
+        );
+        let result = self.step_inner();
+        let counts = diagnostics.finish();
+        let preparation = match &result {
+            SourcePreparationStep::Pending(preparation)
+            | SourcePreparationStep::Refused(preparation, _)
+            | SourcePreparationStep::Complete { preparation, .. } => preparation,
+        };
+        if let Some(lease) = preparation.native_comparison_lease.as_ref() {
+            lease.diagnostic.add_page_events(counts);
+        } else {
+            crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
+        }
+        result
+    }
+    fn step_inner(mut self) -> SourcePreparationStep {
         let mut state = self.scan.take().expect("active source preparation");
         if state.native_capture_active() {
             let initialize = self
@@ -5516,6 +5566,18 @@ fn try_collect_native_preparation_with_rotation_observed(
             );
             frame.accept_native_rotation_turn(remaining);
             if self.require_bound {
+                let mut receipt =
+                    crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+                let measured = receipt.add(std::mem::size_of_val(&frame)).and_then(|()| {
+                    crate::heap_layout_bound::HeapLayoutBound::heap_bound(&frame, &mut receipt)
+                });
+                eprintln!(
+                    "codex_wake_frame: step={} bytes={} visits={} bounded={}",
+                    self.steps,
+                    receipt.bytes,
+                    receipt.visits_for_test(),
+                    measured.is_some()
+                );
                 assert!(crate::heap_layout_bound::bound(&frame, crate::source_rotation::PARKED_BUDGET).is_some(),
                     "the real source frame must pass its real existing requested-layout budget; no substitute bound");
             } else if self.require_parking_refusal && !self.parking_refused {
@@ -5685,6 +5747,53 @@ fn cycle_sampled_scope(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_sync_source(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    home: &Path,
+    support_dir: &Path,
+    daemon: &LocalDaemon,
+    transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
+    account_witness: [u8; 32],
+    retry_enabled: bool,
+) -> Result<Option<SourcePreparation>> {
+    // The gate is fixed for this synchronous preparation. A lease reports
+    // errors while unwinding; without one, the wrapper must emit the counts.
+    let report_without_lease = source == SnapshotSource::ClaudeCode
+        && !crate::snapshots::claude_native_comparison::enabled();
+    let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
+        source == SnapshotSource::ClaudeCode,
+    );
+    let result = prepare_sync_source_inner(
+        client,
+        device,
+        device_secret,
+        source,
+        machine_id,
+        home,
+        support_dir,
+        daemon,
+        transport_cycle,
+        account_witness,
+        retry_enabled,
+    );
+    let counts = diagnostics.finish();
+    if let Ok(Some(preparation)) = &result {
+        if let Some(lease) = preparation.native_comparison_lease.as_ref() {
+            lease.diagnostic.add_page_events(counts);
+        } else {
+            crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
+        }
+    } else if report_without_lease {
+        crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_sync_source_inner(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
@@ -6669,6 +6778,10 @@ fn finish_sync_source(
     _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
     retry: &mut live_snapshot_retry::LiveRetryOwner,
 ) -> Result<()> {
+    let _diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::finish_decision(
+        preparation.source == SnapshotSource::ClaudeCode,
+        preparation.native_comparison_lease.is_some(),
+    );
     let SourcePreparation {
         mut native_comparison_reservation,
         mut native_comparison_lease,
@@ -6700,6 +6813,8 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    // Resets the census-wait count on every exit that is not a capacity stop.
+    let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     if let Some(lease) = native_comparison_lease.as_mut() {
         lease.observe_policy_page(
             &scan_result.census_window_end,
@@ -7397,6 +7512,11 @@ fn finish_sync_source(
     let mut upload_fully_settled = true;
     let mut deferred_entity_count = None;
     let mut resolved_permanent_rejections = false;
+    // Local-hold Completed/Deferred/Rejected subsets and selected-state
+    // restoration below can omit a still-live file. Capture which retirement
+    // obligations this full scan references before any selection (#794 F1).
+    let ack_scan_referenced =
+        upload_progress.ack_retirement_scan_references(&committed_index, &index);
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -7470,10 +7590,11 @@ fn finish_sync_source(
             ) {
                 Ok(committable) => {
                     note_codex_side_saved(daemon, &index_path, false, side_mark);
-                    upload_progress.release_acks_after_partial_index_save(
+                    upload_progress.release_acks_after_partial_index_save_with_scan(
                         &upload_progress_path,
                         &committed_index,
                         &committable,
+                        &ack_scan_referenced,
                         locally_held_fingerprints,
                         true,
                     )?;
@@ -7596,15 +7717,17 @@ fn finish_sync_source(
                     Some(UnsettledUploadCause::UploadError),
                 ) {
                     Ok(committable) => {
-                        index = committable;
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
-                        upload_progress.release_acks_after_partial_index_save(
+                        // Release against the full scan's references (#778 R2-2).
+                        upload_progress.release_acks_after_partial_index_save_with_scan(
                             &upload_progress_path,
                             &committed_index,
-                            &index,
+                            &committable,
+                            &ack_scan_referenced,
                             locally_held_fingerprints,
                             false,
                         )?;
+                        index = committable;
                     }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
@@ -7626,10 +7749,13 @@ fn finish_sync_source(
             let (state, context) = if let Some(settlement) =
                 error.downcast_ref::<ack_retention::AckSettlementRequired>()
             {
+                let incomplete_census_stops =
+                    census_wait.capacity_stop(scan_result.census_complete);
                 eprintln!(
-                    "ottto-service: local snapshot upload deferred for {} — {}",
+                    "ottto-service: local snapshot upload deferred for {} — {} consecutive_incomplete_census_stops={}",
                     source.api_slug(),
-                    upload_failure_diagnostic(&error)
+                    upload_failure_diagnostic(&error),
+                    incomplete_census_stops
                 );
                 (
                     settlement.collector_state(),
@@ -7787,13 +7913,13 @@ fn finish_sync_source(
             upload_fully_settled = false;
         }
     }
-    upload_progress.stage_ack_retirement_handoff_with_census(
+    let mut retired_upload_acks = upload_progress.stage_selected_ack_retirement(
         &committed_index,
         &mut index,
+        &ack_scan_referenced,
         locally_held_fingerprints,
         &census_absent_upload_acks,
     )?;
-    let mut retired_upload_acks = upload_progress.retired_ack_candidates(&committed_index, &index);
     // Every selected-state restoration above has finished. A non-current
     // comparison already revoked this lease locally and cannot mint a native
     // correction later in this finish. Retire only that Claude prior index
@@ -7995,8 +8121,8 @@ fn finish_sync_source(
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
     let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
-    retired_upload_acks.extend(upload_progress.saved_retirement_candidates(&index));
-    upload_progress.retire_acks_after_index_save(
+    upload_progress.add_saved_handoff_retirements(&mut retired_upload_acks, &index);
+    upload_progress.retire_planned_acks_after_index_save(
         &index,
         &retired_upload_acks,
         locally_held_fingerprints,
@@ -11644,6 +11770,8 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 effective_upload_body_witness_revision: 0,
+                opened_changed_nanos: 0,
+                opened_birth_nanos: 0,
             },
         );
         index.file_snapshot_fingerprints.insert(
@@ -19762,6 +19890,7 @@ mod tests {
             &held,
             &BTreeSet::new(),
             false,
+            None,
         );
         assert!(!settled.bounded_sweep_had_unsettled_upload());
         assert_eq!(
@@ -19791,6 +19920,7 @@ mod tests {
             &held,
             &held,
             false,
+            None,
         );
         assert!(!deferred.bounded_sweep_had_unsettled_upload());
         assert!(deferred.files["/opaque/held.jsonl"]
@@ -19804,6 +19934,7 @@ mod tests {
             &held,
             &BTreeSet::new(),
             true,
+            None,
         );
         assert!(blocked.bounded_sweep_had_unsettled_upload());
         assert_eq!(
@@ -19827,6 +19958,7 @@ mod tests {
             held_fingerprints: BTreeSet::new(),
             account_deferred_fingerprints: BTreeSet::new(),
             progress_blocking: false,
+            held_family_roots: None,
         };
         let progress = test_upload_progress();
         let completed =
@@ -19893,6 +20025,7 @@ mod tests {
             account_deferred_fingerprints: BTreeSet::new(),
             // Restorable non-blocking Rejected holds settle once H1 is composed.
             progress_blocking: !held_fingerprints.is_empty(),
+            held_family_roots: None,
         };
 
         let blocked = commit_completed_with_local_holds(
@@ -19902,6 +20035,7 @@ mod tests {
             &held,
             &BTreeSet::new(),
             true,
+            None,
         );
         assert!(blocked.bounded_sweep_had_unsettled_upload());
         assert_eq!(
@@ -19915,6 +20049,7 @@ mod tests {
             &held,
             &BTreeSet::new(),
             false,
+            None,
         );
         assert!(!restored.bounded_sweep_had_unsettled_upload());
         assert!(restored.bounded_sweep_unsettled_cause_names().is_empty());
@@ -20015,6 +20150,262 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    /// SOURCE 2026-10-27 (option A), conditions (2) and (3): a `Completed`
+    /// page's blocking holds scope the sweep marker to their own families for
+    /// the terminal unchanged-proof skip only. The flag and its cause names
+    /// are exactly as before. Scopes accumulate across the sweep's pages and
+    /// survive a reload. An unplaced hold, any other cause, an unscoped stamp
+    /// earlier in the sweep, or more families than the bound keeps the
+    /// sweep-wide veto.
+    #[test]
+    fn completed_blocking_holds_scope_the_unchanged_proof_veto_to_held_families() {
+        let entry = |source: &str, fingerprint: &str| {
+            serde_json::json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 2,
+                "source_file_fingerprint": source,
+                "last_snapshot_fingerprint": fingerprint,
+                "scan_identity_version": "semantic_sync:v2",
+            })
+        };
+        let committed = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
+        }));
+        let held = BTreeSet::from(["held-new".to_string()]);
+        let progress = test_upload_progress();
+        let families = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        let block = |index: ScanIndex, held_family_roots: Option<&BTreeSet<String>>| {
+            commit_completed_with_local_holds(
+                index,
+                &committed,
+                &progress,
+                &held,
+                &BTreeSet::new(),
+                true,
+                held_family_roots,
+            )
+        };
+        let scope = |index: &ScanIndex| {
+            index
+                .unchanged_proof_unsettled_families()
+                .map(|held| held.len())
+        };
+
+        assert_eq!(scope(&scanned), Some(0), "a settled sweep owes no family");
+        let first = block(scanned.clone(), Some(&families(&["held-family"])));
+        assert!(first.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            first.bounded_sweep_unsettled_cause_names(),
+            ["completed_blocking_holds"]
+        );
+        assert_eq!(scope(&first), Some(1));
+        let second = block(
+            first,
+            Some(&families(&["held-family", "other-held-family"])),
+        );
+        assert_eq!(
+            second.bounded_sweep_unsettled_cause_names(),
+            ["completed_blocking_holds"]
+        );
+        assert_eq!(scope(&second), Some(2), "a later page adds its families");
+        let root = test_dir("completed-blocking-holds-scope");
+        std::fs::create_dir_all(&root).expect("create scope fixture root");
+        let index_path = root.join("scan-index.json");
+        second.clone().save(&index_path).expect("save scan index");
+        let reloaded = ScanIndex::load(&index_path).expect("reload scan index");
+        assert_eq!(
+            reloaded.unchanged_proof_unsettled_families(),
+            second.unchanged_proof_unsettled_families(),
+            "the scope crosses the save/load boundary"
+        );
+        let _ = std::fs::remove_dir_all(root);
+
+        // Doubt keeps the sweep-wide veto.
+        assert_eq!(scope(&block(second.clone(), None)), None, "unplaced hold");
+        assert_eq!(
+            scope(&block(scanned.clone(), Some(&BTreeSet::new()))),
+            None,
+            "a hold that names no family"
+        );
+        assert_eq!(
+            scope(&block(
+                block(scanned.clone(), None),
+                Some(&families(&["held-family"]))
+            )),
+            None,
+            "a scoped page cannot rescope an unscoped sweep"
+        );
+        let mut shed = second.clone();
+        shed.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        assert_eq!(scope(&shed), None, "any other cause");
+        assert_eq!(
+            scope(&block(shed, Some(&families(&["held-family"])))),
+            None,
+            "a scoped page after another cause"
+        );
+        let numbered = |count: usize| {
+            (0..count)
+                .map(|n| format!("held-family-{n}"))
+                .collect::<BTreeSet<_>>()
+        };
+        let bound = crate::snapshots::MAX_SCOPED_HELD_FAMILY_ROOTS;
+        assert_eq!(
+            scope(&block(scanned.clone(), Some(&numbered(bound)))),
+            Some(bound)
+        );
+        assert_eq!(
+            scope(&block(scanned, Some(&numbered(bound + 1)))),
+            None,
+            "overflow"
+        );
+    }
+
+    /// Review 797 P2: a loaded scope is trusted only in the shape its writer
+    /// produces. A saved index whose sweep still carries the sole
+    /// `completed_blocking_holds` cause, but whose scope is empty, over the
+    /// bound, holds a non-canonical digest, is missing, or has the wrong type,
+    /// takes the sweep-wide unchanged-proof veto. The flag and cause stay.
+    /// Review 797 r2: that veto is sticky. A later held page of the same sweep
+    /// stamping a valid family cannot turn the unknown scope back into a
+    /// scoped exception; a healthy saved scope still accumulates.
+    #[test]
+    fn saved_held_family_scope_outside_the_writer_shape_keeps_the_sweep_wide_veto() {
+        let entry = |source: &str, fingerprint: &str| {
+            serde_json::json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 2,
+                "source_file_fingerprint": source,
+                "last_snapshot_fingerprint": fingerprint,
+                "scan_identity_version": "semantic_sync:v2",
+            })
+        };
+        let committed = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
+        }));
+        let mut scoped = commit_completed_with_local_holds(
+            scanned,
+            &committed,
+            &test_upload_progress(),
+            &BTreeSet::from(["held-new".to_string()]),
+            &BTreeSet::new(),
+            true,
+            Some(&BTreeSet::from(["held-family".to_string()])),
+        );
+        let root = test_dir("saved-held-family-scope-shape");
+        std::fs::create_dir_all(&root).expect("create scope fixture root");
+        let index_path = root.join("scan-index.json");
+        scoped.save(&index_path).expect("save scan index");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index_path).expect("read saved index"))
+                .expect("decode saved index");
+        let written = saved["claude_full_rearm_progress"]["held_family_roots"].clone();
+        let valid = written[0].as_str().expect("one written digest").to_owned();
+        assert_eq!(
+            ScanIndex::load(&index_path)
+                .expect("reload scan index")
+                .unchanged_proof_unsettled_families()
+                .map(|held| held.len()),
+            Some(1),
+            "control: the writer's own scope is trusted"
+        );
+        let later_held_page = |index: ScanIndex| {
+            commit_completed_with_local_holds(
+                index,
+                &committed,
+                &test_upload_progress(),
+                &BTreeSet::from(["held-new".to_string()]),
+                &BTreeSet::new(),
+                true,
+                Some(&BTreeSet::from(["later-held-family".to_string()])),
+            )
+        };
+        assert_eq!(
+            later_held_page(ScanIndex::load(&index_path).expect("reload scan index"))
+                .unchanged_proof_unsettled_families()
+                .map(|held| held.len()),
+            Some(2),
+            "control: a healthy saved scope accumulates the later page's family"
+        );
+        let over_bound = (0..=crate::snapshots::MAX_SCOPED_HELD_FAMILY_ROOTS)
+            .map(|n| format!("{n:032x}"))
+            .collect::<Vec<_>>();
+        let key = valid.clone();
+        let damaged: [(&str, Option<serde_json::Value>); 8] = [
+            ("empty", Some(serde_json::json!([]))),
+            ("over the bound", Some(serde_json::json!(over_bound))),
+            (
+                "not a digest",
+                Some(serde_json::json!([valid, "not-a-digest"])),
+            ),
+            (
+                "uppercase digest",
+                Some(serde_json::json!([valid.to_uppercase()])),
+            ),
+            ("short digest", Some(serde_json::json!([&valid[1..]]))),
+            ("missing", None),
+            ("wrong type: number", Some(serde_json::json!(7))),
+            ("wrong type: object", Some(serde_json::json!({ key: true }))),
+        ];
+        for (case, value) in damaged {
+            let mut edited = saved.clone();
+            let progress = edited["claude_full_rearm_progress"]
+                .as_object_mut()
+                .expect("the scope is saved in the re-arm progress");
+            match value {
+                Some(value) => {
+                    progress.insert("held_family_roots".to_owned(), value);
+                }
+                None => {
+                    progress.remove("held_family_roots");
+                }
+            }
+            std::fs::write(
+                &index_path,
+                serde_json::to_vec(&edited).expect("encode edited index"),
+            )
+            .expect("write edited index");
+            let loaded = ScanIndex::load(&index_path).expect("reload edited index");
+            assert!(loaded.bounded_sweep_had_unsettled_upload(), "{case}");
+            assert_eq!(
+                loaded.bounded_sweep_unsettled_cause_names(),
+                ["completed_blocking_holds"],
+                "{case}"
+            );
+            assert_eq!(
+                loaded.unchanged_proof_unsettled_families(),
+                None,
+                "{case}: the sweep-wide veto"
+            );
+            let advanced = later_held_page(loaded);
+            assert_eq!(
+                advanced.bounded_sweep_unsettled_cause_names(),
+                ["completed_blocking_holds"],
+                "{case}: advanced"
+            );
+            assert_eq!(
+                advanced.unchanged_proof_unsettled_families(),
+                None,
+                "{case}: a later scoped page keeps the sweep-wide veto"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The backend's error-code set is closed and its forward tolerance covers
@@ -22074,6 +22465,9 @@ mod tests {
                 include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
                 mod unhealthy_retry_reread_acceptance_tests {
                     include!("snapshot_sync/unhealthy_retry_reread_acceptance_tests.rs");
+                }
+                mod oversized_discovery_pipeline_tests {
+                    include!("snapshot_sync/oversized_discovery_pipeline_tests.rs");
                 }
                 mod structural_reread_guard_tests {
                     include!("snapshot_sync/structural_reread_guard_tests.rs");
