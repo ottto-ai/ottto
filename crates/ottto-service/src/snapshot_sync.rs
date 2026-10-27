@@ -4236,7 +4236,6 @@ fn sync_once_with_retry(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // The money shadow's kill switch, seen before this process's first parse.
-    crate::snapshots::claude_request_money::seed_shadow_off(support_dir);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -9149,7 +9148,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         )
     });
     // E2 bodies are final before any identity owner runs: contract 5, D1 and
-    // the account hash then tag the rows that upload (donor #699 order).
+    // the account hash then tag the rows that upload.
     // Gate off this only counts, so the page is unchanged.
     // Withheld entities stay on the page and owed: delayed, never settled.
     let withheld = crate::snapshots::claude_request_money::e2::finish_page(
@@ -9295,22 +9294,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
     }
-    // P1 per-request money, shadow only: reads this page's final items, the
-    // index and the rows loaded above; writes only its own ledger, through
-    // its writer thread after this page. Never fails or changes the page.
-    crate::snapshots::claude_request_money::shadow_page(
-        support_dir,
-        &scan_result.snapshots,
-        index,
-        &api_report,
-        &trace_report,
-        scan_result.census_complete,
-        &crate::snapshots::claude_request_money::coverage::InterimFamilyCoverage {
-            census_complete: scan_result.census_complete,
-            fence_invalid: disposition.duplicate_census.census_invalid,
-            authority_retry: index.claude_usage_authority_pending_count() > 0,
-        },
-    );
     Ok((disposition, census_withheld, stats))
 }
 
@@ -22450,9 +22433,6 @@ mod tests {
     }
     mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
-    }
-    mod claude_request_money_pipeline_tests {
-        include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
     }
     mod p12_base_exit_tests {
         include!("snapshot_sync/p12_base_exit_tests.rs");

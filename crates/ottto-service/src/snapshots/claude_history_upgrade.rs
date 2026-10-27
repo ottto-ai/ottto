@@ -49,7 +49,7 @@ pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
 /// file is admitted past it, including a page's first file.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
 /// Highest active Claude revision the gate is open for (SOURCE F2). MONEY's
-/// activation (#699, E2 PR C) raised it to the revision-3 row together with
+/// activation (E2) raised it to the revision-3 row together with
 /// the Claude revision constant and the E2 gate (SOURCE h732 C1). Above it
 /// every owed upgrade and every listed change is held, no file is stamped,
 /// activation is refused at runtime
@@ -57,7 +57,7 @@ pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
 /// revision constant fails to compile. The release check reads the next
 /// line, so keep it free of comments and other digits.
 pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 3;
-/// The request-owned usage literal of MONEY P2 (#699's
+/// The request-owned usage literal of E2 (the
 /// `REQUEST_OWNED_CONTRACT`). Listed roots never emit it.
 pub(crate) const REQUEST_OWNED_USAGE_CONTRACT: &str = "claude_request_owned_usage:v1";
 
@@ -1132,7 +1132,7 @@ fn take_activation_alarm_slot(now: std::time::Instant) -> bool {
 
 /// True when `revision` may be activated. Otherwise counts every refusal
 /// and raises a local alarm on the first, then at most hourly (SOURCE h732
-/// nit: #699 may retry each cycle); the caller keeps its active revision.
+/// retry may happen each cycle); the caller keeps its active revision.
 pub(super) fn admit_activation(revision: u64, kept_revision: u64) -> bool {
     admit_activation_at(revision, kept_revision, std::time::Instant::now())
 }
@@ -1431,7 +1431,7 @@ mod tests {
             revision_2.no_list_birth_cutoff_unix_seconds, 1_792_540_800,
             "revision 2 keeps 2026-10-21"
         );
-        // SOURCE h732 C1: revision 3's row opens only when #699 raises MAX.
+        // SOURCE h732 C1: revision 3's row opens only when E2 raises MAX.
         assert_eq!(revision_policy(MAX_GATED_CLAUDE_REVISION + 1), None);
         with_max_gated_claude_revision(3, || {
             let revision_3 = revision_policy(3).unwrap();

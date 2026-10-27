@@ -1288,18 +1288,13 @@ struct Harness {
 impl Harness {
     /// A fresh daemon state for one run: support, secrets and index start
     /// empty; the corpus is shared and read only.
-    fn new(base: &Path, run: &Path, p1_off: bool) -> Self {
+    fn new(base: &Path, run: &Path) -> Self {
         let support = run.join("support");
         let secrets = run.join("secrets");
         assert!(!run.exists(), "every run starts from an empty state");
         std::fs::create_dir_all(&support).unwrap();
         std::fs::create_dir_all(&secrets).unwrap();
         copy_tree(&base.join("otel"), &support);
-        if p1_off {
-            // The P1 shadow's kill switch, so every arm runs P1 off (PR A's
-            // default) and the arms differ only by E2.
-            std::fs::write(support.join("claude-request-money-shadow.off"), "").unwrap();
-        }
         let native = crate::snapshots::claude_native_comparison::enable_for_test();
         let cadence = IdentityPipelineCadence::new();
         let backend = Backend::start();
@@ -1471,7 +1466,6 @@ fn check_arm(arm: &str) {
 fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Value {
     check_arm(arm);
     let tag = env("OTTTO_E2_BENCH_TAG").unwrap_or_else(|| arm.to_string());
-    let p1_off = env("OTTTO_E2_BENCH_P1_OFF").as_deref() != Some("false");
     let largest = PathBuf::from(manifest["largest_path"].as_str().unwrap());
     let plans_end = manifest["corpus_end_unix_ms"].as_i64().unwrap();
     let restore = Restore {
@@ -1483,7 +1477,7 @@ fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Valu
     // Input reset: a previous run that died mid-append left extra bytes.
     restore.now();
     let footprint_start = footprint();
-    let mut harness = Harness::new(base, &base.join("runs").join(&tag), p1_off);
+    let mut harness = Harness::new(base, &base.join("runs").join(&tag));
     let support = base.join("runs").join(&tag).join("support");
     e2_hook::with_gate(arm == "on", || {
         e2_hook::with_switch_on(arm == "on", &support, || {
@@ -1543,7 +1537,6 @@ fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Valu
                 "arm": arm,
                 "tag": tag,
                 "hook": e2_hook::STATE,
-                "p1_kill_file": p1_off,
                 "pages": pages.len(),
                 "traversal": {
                     "wall_us": sum_field(&pages, "wall_us"),
@@ -1708,7 +1701,7 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
     let bytes_scale = manifest["bytes_scale"].as_f64().unwrap_or(1.0);
     // HISTORY_UPGRADE_BYTES_PER_PAGE (1 GiB), scaled with the corpus bytes.
     let byte_budget = (bytes_scale < 1.0).then_some(((1u64 << 30) as f64 * bytes_scale) as u64);
-    let mut harness = Harness::new(base, &run, true);
+    let mut harness = Harness::new(base, &run);
     let load = |harness: &Harness| {
         ScanIndex::load(
             harness

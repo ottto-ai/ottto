@@ -576,7 +576,6 @@ impl PipelineFixture {
 impl Drop for PipelineFixture {
     fn drop(&mut self) {
         // A failed money assertion must not retain process-global capture funds.
-        drop(crate::snapshots::claude_request_money::ShadowTestCleanup::new(&self.support));
         let _ = std::fs::remove_dir_all(&self.base);
     }
 }
