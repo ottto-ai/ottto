@@ -3244,3 +3244,95 @@ fn e2_late_identity_permit_reowes_revision_three_once_paced() {
         });
     }
 }
+
+/// Scheduling one large Full per pass cannot co-observe two large path
+/// twins. Preserve E2's existing complete-twin hold and the old upload tuple;
+/// this receipt exposes the owed-history conflict instead of granting partial
+/// money proof. Any scheduling exception requires an owner decision.
+#[test]
+fn large_full_pacing_preserves_e2_twin_hold_and_exposes_owed_history() {
+    let fixture = HistoryFixture::new("large-full-e2-history-twins");
+    let session = HISTORY_SESSIONS[0];
+    let original = fixture.root.join(format!("{session}.jsonl"));
+    let mut writer = std::io::BufWriter::new(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&original)
+            .unwrap(),
+    );
+    let mut row = serde_json::to_vec(&serde_json::json!({
+        "type":"user", "sessionId":session, "timestamp":"2026-08-02T07:00:01Z",
+        "message":{"role":"user","content":[{"type":"tool_result",
+            "tool_use_id":"synthetic", "content":"Synthetic tool output. ".repeat(49152)}]}
+    }))
+    .unwrap();
+    row.push(b'\n');
+    let mut bytes = std::fs::metadata(&original).unwrap().len();
+    while bytes <= 256 * 1024 * 1024 {
+        writer.write_all(&row).unwrap();
+        bytes += row.len() as u64;
+    }
+    writer.flush().unwrap();
+    drop(writer);
+    assert!(bytes > 256 * 1024 * 1024 && bytes < 258 * 1024 * 1024);
+    let project = fixture.root.join("other-project");
+    std::fs::create_dir_all(&project).unwrap();
+    let twin = project.join(format!("{session}.jsonl"));
+    std::fs::copy(&original, &twin).unwrap();
+    // The old gate-off daemon stamps both paths, across two admission passes.
+    let baseline_cycle = HistoryCycle {
+        revision: 2,
+        ..HISTORY_BASELINE
+    };
+    let first = fixture.cycle("2026-08-02T08:00:00Z", baseline_cycle);
+    assert_eq!(first.scan.scanned_file_count, 3, "one large and two small");
+    let baseline = fixture.cycle("2026-08-02T08:10:00Z", baseline_cycle).index;
+    let keys = baseline
+        .files
+        .keys()
+        .filter(|key| key.ends_with(&format!("{session}.jsonl")))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(keys.len(), 2);
+    assert!(keys
+        .iter()
+        .all(|key| baseline.files[key].effective_upload_body_witness_revision == 2));
+    with_e2_history(&fixture, || {
+        for pass in 0..3 {
+            let (outcome, reads) =
+                crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+                    fixture.cycle(
+                        &format!("2026-08-02T09:{:02}:00Z", pass * 10),
+                        E2_HISTORY_UPGRADE,
+                    )
+                });
+            assert_eq!(
+                reads.get(&original).copied().unwrap_or(0) + reads.get(&twin).copied().unwrap_or(0),
+                1,
+                "one large Full per pass"
+            );
+            assert!(
+                !outcome.uploaded.contains(session),
+                "never emit incomplete twin money"
+            );
+            for key in &keys {
+                e2_history_assert_prior_tuple(&baseline, &outcome.index, key);
+                assert_eq!(
+                    outcome.index.files[key].effective_upload_body_witness_revision,
+                    2
+                );
+            }
+            for small in &HISTORY_SESSIONS[1..] {
+                let key = HistoryFixture::key(&outcome.index, small);
+                assert_eq!(
+                    outcome.index.files[&key].effective_upload_body_witness_revision,
+                    3
+                );
+                if pass == 0 {
+                    assert!(outcome.uploaded_literal.contains(*small));
+                }
+            }
+            println!("claude_large_twin_history_conflict: pass={pass} large_fulls=1 twin_bytes={bytes} total_twin_bytes={} owed=2 small_upgraded=2 partial_money_emitted=false", bytes * 2);
+        }
+    });
+}
