@@ -2052,21 +2052,32 @@ fn allowance_bound_probe_order_joins_on_its_own_page() {
         + head_bytes(&root.join("sessions/d.jsonl"), 2);
     let singleton = 2 * 1024 + probes + 1024;
     // A two-member group that sorts first and charges its headers and
-    // probes to the shared page before `c`/`d` boot.
-    let filler = (0..64u64)
+    // probes to the shared page before `c`/`d` boot. Groups are read in key
+    // order and a key hashes the home path, which differs every run, so the
+    // owner is chosen by key: a fixed few candidates can all sort after.
+    let home = inventory_groups(&root)
+        .into_iter()
+        .find(|group| group.owner == OTHER)
+        .expect("the paged group")
+        .home;
+    let other_key = super::super::group_key(&home, OTHER);
+    let filler = (0..u64::from(u32::MAX))
         .map(|i| format!("aaaaaaaa-bbbb-4ccc-8ddd-{i:012x}"))
-        .find(|owner| {
-            write_rows(
-                &root.join("sessions/f1.jsonl"),
-                &member(owner, "f-1", 100, 100),
-            );
-            write_rows(
-                &root.join("sessions/f2.jsonl"),
-                &member(owner, "f-2", 200, 300),
-            );
-            first_group_owner(&root) == *owner
-        });
-    assert!(filler.is_some(), "a filler group that sorts first");
+        .find(|owner| super::super::group_key(&home, owner) < other_key)
+        .expect("an owner whose group sorts first");
+    write_rows(
+        &root.join("sessions/f1.jsonl"),
+        &member(&filler, "f-1", 100, 100),
+    );
+    write_rows(
+        &root.join("sessions/f2.jsonl"),
+        &member(&filler, "f-2", 200, 300),
+    );
+    assert_eq!(
+        first_group_owner(&root),
+        filler,
+        "a filler group that sorts first"
+    );
     // The group's physical aliases share one body fingerprint.
     let other = |scan: &SourceScanResult| {
         let snapshots = scan

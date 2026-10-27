@@ -1531,6 +1531,13 @@ fn assert_x_out_covers_finish_with(
         prepare(&mut parser.accumulator);
     }
     if let Some(workspace) = parser.accumulator.workspace_path.clone() {
+        // The cache is global: a warm identity under the shared fixture
+        // workspace would leak into every concurrent production scan of it.
+        assert_ne!(
+            workspace,
+            Path::new("/work/r1a-fixture"),
+            "{label}: give the case its own workspace (`with_cwd`)"
+        );
         repository_identity_cache()
             .lock()
             .unwrap()
@@ -1875,7 +1882,7 @@ fn x_out_dark_covers_sparse_hours_and_copy_restoration() {
     };
     let (items, _) = assert_x_out_covers_finish_with(
         "dark-sparse-copy-restore",
-        &rows,
+        &with_cwd(rows, "/work/x-out-dark-sparse-copy-restore"),
         &ClaudeTitleMetadata::default(),
         FinishCase {
             prepare: Some(&prepare),
