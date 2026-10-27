@@ -288,7 +288,14 @@ pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> u
         let due = index
             .held_audit_progress
             .as_ref()
-            .filter(|slot| slot.key == *key && index.claude_large_full_deferred.contains(key))
+            .filter(|slot| {
+                slot.key == *key
+                    && (index.claude_large_full_deferred.contains(key)
+                        || (index.claude_large_full_deferred.overflowing()
+                            && index.files.get(key).is_some_and(|entry| {
+                                entry.size_bytes > claude_large_full::LARGE_FULL_BYTES
+                            })))
+            })
             .map_or(due, |slot| due.min(slot.due));
         if let Some(entry) = index.files.get_mut(key) {
             entry.scan_identity_version = Some(provenance_marker(due, true));
@@ -631,6 +638,14 @@ mod tests {
                 .collect::<VecDeque<_>>(),
             VecDeque::from([old_key, held_key.clone()])
         );
+        let mut overflow_index = scan.index.clone();
+        overflow_index.claude_large_full_deferred = claude_large_full::Priority::fallback();
+        assert_eq!(restore_held_audit_deadlines(&mut overflow_index, 100), 1);
+        assert_eq!(
+            overflow_index.files[&held_key].unverified_deadline(),
+            Some(50),
+            "uncached overflow keeps the same original held deadline"
+        );
         assert_eq!(restore_held_audit_deadlines(&mut scan.index, 100), 1);
         assert_eq!(
             scan.index.files[&held_key].unverified_deadline(),
@@ -658,6 +673,9 @@ mod tests {
             seed.files
                 .insert(format!("/unavailable-held-audit/{n}"), pending);
         }
+        let mut overflow_value = serde_json::to_value(&seed).unwrap();
+        overflow_value["claude_large_full_deferred"]["overflow"] = serde_json::json!(true);
+        let overflow_seed: ScanIndex = serde_json::from_value(overflow_value).unwrap();
         let ordered = OwnedSourceScan::new(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&root),
@@ -699,6 +717,42 @@ mod tests {
         assert!(
             slot.attempted,
             "oldest held candidate is selected, not displaced"
+        );
+        let overflow_ordered = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            overflow_seed,
+            "2026-10-27T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            2,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(
+            Arc::new(sampled_scan::SharedCache::default()),
+            crate::transcript_acquisition::Scope("held-audit-overflow".into()),
+        );
+        assert_eq!(overflow_ordered.sampling.as_ref().unwrap().audit_slots, 1);
+        assert_eq!(
+            overflow_ordered
+                .identified_candidates
+                .iter()
+                .map(|candidate| local_index_key(&candidate.path))
+                .collect::<Vec<_>>(),
+            vec![held_key.clone(), local_index_key(&older)],
+            "overflow preserves existing held FIFO rank"
+        );
+        assert_eq!(
+            overflow_ordered
+                .index
+                .held_audit_progress
+                .as_ref()
+                .unwrap()
+                .due,
+            50
         );
     }
 

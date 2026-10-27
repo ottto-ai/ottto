@@ -817,7 +817,11 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
                 reader.consume(1);
                 name
             };
-            let optional = optional_census(name) || name == Some("claude_money_birth_store");
+            let optional = optional_census(name)
+                || matches!(
+                    name,
+                    Some("claude_money_birth_store" | "claude_large_full_deferred")
+                );
             // CensusRead streams positional-array separator whitespace before
             // capture; object-field evidence starts immediately after ':'.
             if array {
@@ -1540,8 +1544,13 @@ impl<R: BufRead + Seek> Decoder<R> {
                 self.eat(b':')?;
                 name
             };
-            let value = self
-                .span_optional(optional_census(name) || name == Some("claude_money_birth_store"))?;
+            let value = self.span_optional(
+                optional_census(name)
+                    || matches!(
+                        name,
+                        Some("claude_money_birth_store" | "claude_large_full_deferred")
+                    ),
+            )?;
             if let Some(name) = name {
                 if matches!(
                     name,
@@ -1756,28 +1765,29 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_large_full_deferred" => {
                             // Scheduling damage costs ordering only. Preserve
                             // every native proof, ACK and pending census path.
-                            index.claude_large_full_deferred =
-                                if value.len > claude_large_full::MAX_BYTES as u64 {
-                                    claude_large_full::Priority::fallback()
-                                } else {
-                                    // Raw span admitted before any key/escape buffer.
-                                    self.reader.seek(SeekFrom::Start(value.start))?;
-                                    let parsed =
-                                        serde_json::from_reader((&mut self.reader).take(value.len));
-                                    self.reader.seek(SeekFrom::Start(value.start + value.len))?;
-                                    match parsed {
-                                        Ok(priority) => priority,
-                                        Err(error) if error.is_io() => {
-                                            return Err(Error::Io(std::io::Error::new(
-                                                error
-                                                    .io_error_kind()
-                                                    .unwrap_or(std::io::ErrorKind::Other),
-                                                error,
-                                            )))
-                                        }
-                                        Err(_) => claude_large_full::Priority::fallback(),
+                            index.claude_large_full_deferred = if value.resource
+                                || value.len > claude_large_full::MAX_BYTES as u64
+                            {
+                                claude_large_full::Priority::fallback()
+                            } else {
+                                // Raw span admitted before any key/escape buffer.
+                                self.reader.seek(SeekFrom::Start(value.start))?;
+                                let parsed =
+                                    serde_json::from_reader((&mut self.reader).take(value.len));
+                                self.reader.seek(SeekFrom::Start(value.start + value.len))?;
+                                match parsed {
+                                    Ok(priority) => priority,
+                                    Err(error) if error.is_io() => {
+                                        return Err(Error::Io(std::io::Error::new(
+                                            error
+                                                .io_error_kind()
+                                                .unwrap_or(std::io::ErrorKind::Other),
+                                            error,
+                                        )))
                                     }
-                                };
+                                    Err(_) => claude_large_full::Priority::fallback(),
+                                }
+                            };
                         }
                         "claude_full_rearm_progress" => {
                             // #720 scheduling-only memory: malformed progress

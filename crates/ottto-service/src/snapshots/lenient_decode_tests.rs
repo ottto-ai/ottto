@@ -4536,10 +4536,7 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
 fn damaged_large_full_scheduling_leaf_preserves_native_custody() {
     let seed = every_persisted_field_fixture();
     let mut expected = serde_json::to_value(&seed).unwrap();
-    expected
-        .as_object_mut()
-        .unwrap()
-        .remove("claude_large_full_deferred");
+    expected["claude_large_full_deferred"] = serde_json::json!({"overflow":true});
     for damage in [
         serde_json::json!(null),
         serde_json::json!({"unknown":true}),
@@ -4558,13 +4555,9 @@ fn damaged_large_full_scheduling_leaf_preserves_native_custody() {
                 index.claude_large_full_deferred.overflowing(),
                 "fallback owes ordinary FIFO service"
             );
-            let mut actual = serde_json::to_value(&index).unwrap();
-            actual
-                .as_object_mut()
-                .unwrap()
-                .remove("claude_large_full_deferred");
             assert_eq!(
-                actual, expected,
+                serde_json::to_value(&index).unwrap(),
+                expected,
                 "scheduling damage changes no source proof, ACK, quarantine or pending census path"
             );
         }

@@ -3,7 +3,7 @@ use super::*;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::fmt;
 
-const LARGE_FULL_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const LARGE_FULL_BYTES: u64 = 256 * 1024 * 1024;
 // This leaf alone: no cache, scan, parser, visit or pin budget is enlarged.
 pub(super) const MAX_KEYS: usize = 256;
 pub(super) const MAX_BYTES: usize = 64 * 1024;
@@ -156,7 +156,6 @@ impl From<VecDeque<String>> for Priority {
 impl crate::heap_layout_bound::HeapLayoutBound for Priority {
     const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        use crate::heap_layout_bound::HeapLayoutBound;
         self.keys.heap_bound(c)?;
         self.scope.heap_bound(c)
     }
@@ -488,6 +487,40 @@ mod tests {
                     .unwrap()
                     .remove("claude_large_full_deferred");
                 assert_eq!(actual, expected, "decode repair changes no native custody");
+            }
+        }
+    }
+    #[test]
+    fn production_decode_preflights_deep_wide_and_nonfinite_tokens() {
+        let expected = serde_json::to_value(ScanIndex::default()).unwrap();
+        for raw in [
+            format!("{}0{}", "[".repeat(300), "]".repeat(300)),
+            "1e400".to_owned(),
+            format!("[{}]", " ".repeat(MAX_BYTES + 1)),
+        ] {
+            let mut bytes = serde_json::to_string(&expected).unwrap();
+            bytes.pop();
+            bytes.push_str(",\"claude_large_full_deferred\":");
+            bytes.push_str(&raw);
+            bytes.push('}');
+            let before = DECODE_DROPS.with(std::cell::Cell::get);
+            let native = claude_request_census::decode_index(bytes.as_bytes()).unwrap();
+            let streamed = lenient_decode::read(
+                std::io::Cursor::new(bytes.as_bytes()),
+                "load",
+                "claude_code",
+            )
+            .unwrap();
+            assert_eq!(DECODE_DROPS.with(std::cell::Cell::get), before + 2);
+            for index in [native, streamed] {
+                assert!(index.claude_large_full_deferred.overflowing());
+                assert!(index.claude_large_full_deferred.keys.is_empty());
+                let mut actual = serde_json::to_value(index).unwrap();
+                actual
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("claude_large_full_deferred");
+                assert_eq!(actual, expected);
             }
         }
     }
