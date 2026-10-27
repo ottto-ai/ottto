@@ -1478,13 +1478,14 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
                 published: false,
             }),
         );
-        // These are indexed records outside this scan root. Keep the side
-        // sweep from legitimately deleting an orphan, and use a completed
-        // proof so the proof job has no new work to perform in this control.
+        // These are retained historical records outside this scan root.
+        // Census reconciliation must keep them; this control has no new
+        // disappearance or proof work to perform on the sentinel records.
         for record_key in ["unrelated-parent-key", "unrelated-child-key"] {
-            loaded
-                .files
-                .insert(record_key.into(), loaded.files[&key].clone());
+            let mut historical = loaded.files[&key].clone();
+            historical.codex_protected_owner = Some(sha256_hex(&["unrelated-history-owner"]));
+            assert!(historical.retain_history_evidence());
+            loaded.files.insert(record_key.into(), historical);
         }
         let parent_records = |index: &ScanIndex| {
             (
