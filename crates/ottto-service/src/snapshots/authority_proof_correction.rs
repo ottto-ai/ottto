@@ -569,8 +569,12 @@ impl ScanIndex {
             .collect::<BTreeMap<_, _>>();
         let mut candidates = Vec::new();
         for snapshot in &mut result.snapshots {
-            if snapshot.usage_accounting_contract.as_deref()
-                != Some("session_exclusive_reported_usage:v1")
+            // E2 (gate on): an owed member's request-owned literal settles
+            // its correction on the same exact ACK as a reported body.
+            let settles = snapshot.usage_accounting_contract.as_deref()
+                == Some("session_exclusive_reported_usage:v1")
+                || claude_history_upgrade::is_request_owned_literal(snapshot);
+            if !settles
                 || disposition
                     .quarantined_source_session_ids
                     .contains(&snapshot.source_session_id)

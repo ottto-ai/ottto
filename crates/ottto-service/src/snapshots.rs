@@ -9660,6 +9660,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         index.retire_absent_claude_proof_corrections(&complete_families);
     }
 
+    // E2 (gate on): a request-owned body settles its family's authority like
+    // a reported one (it is not a demotion, above), so a legacy record or
+    // tombstone clears on the family's first E2 page, never staying red.
     let current_authority_by_root = snapshots.iter().fold(
         BTreeMap::<String, BTreeMap<String, bool>>::new(),
         |mut by_root, item| {
@@ -9669,7 +9672,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 .insert(
                     item.source_session_id.clone(),
                     item.usage_accounting_contract.as_deref()
-                        == Some("session_exclusive_reported_usage:v1"),
+                        == Some("session_exclusive_reported_usage:v1")
+                        || (claude_request_money::e2::enabled() && item.claude_money.is_some()),
                 );
             by_root
         },

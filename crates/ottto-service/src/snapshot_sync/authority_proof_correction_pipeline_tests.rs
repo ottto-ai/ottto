@@ -2916,3 +2916,182 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
     assert!(last.record().is_none());
     assert_eq!(ApcFixture::family_keys(&last.index).len(), family.len());
 }
+
+/// E2 flip (T8 round 2): a correction owed before the flip settles on its
+/// owed members' first request-owned bodies, through the same exact-ACK
+/// settlement, with one read each; once clear nothing is re-offered.
+#[test]
+#[serial(source_manifests)]
+fn e2_pre_flip_correction_settles_on_the_first_request_owned_bodies() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("claude-authority-proof-correction-e2-flip", false);
+    let grant = {
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+        fixture.reach_grant().1
+    };
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let mut reads = BTreeMap::<String, usize>::new();
+    let mut acked = BTreeSet::new();
+    let mut cleared_hour = None;
+    for hour in grant.hour + 1..grant.hour + 4 {
+        let pages = fixture.generation(hour, |_| ApcUpload::Accept);
+        for page in &pages {
+            for member in page.parsed.intersection(&grant.owed) {
+                *reads.entry(member.clone()).or_default() += 1;
+            }
+            for item in page
+                .scan
+                .snapshots
+                .iter()
+                .filter(|item| grant.owed.contains(&item.source_session_id))
+            {
+                assert_eq!(
+                    item.usage_accounting_contract.as_deref(),
+                    Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+                    "hour {hour}: an owed member's body is request-owned after the flip"
+                );
+                if page.uploaded.contains(&item.snapshot_fingerprint) {
+                    acked.insert(item.source_session_id.clone());
+                }
+            }
+        }
+        if pages.last().unwrap().record().is_none() {
+            cleared_hour = Some(hour);
+            break;
+        }
+    }
+    let cleared_hour = cleared_hour.expect("the pre-flip correction clears after the flip");
+    assert_eq!(
+        acked, grant.owed,
+        "every owed member settles on its own request-owned ACK"
+    );
+    assert!(
+        reads.values().all(|reads| *reads == 1),
+        "one read per owed member, no extra: {reads:?}"
+    );
+    for page in &fixture.generation(cleared_hour + 1, |_| ApcUpload::Accept) {
+        assert!(page.record().is_none());
+        assert!(
+            page.offered_bodies
+                .keys()
+                .all(|session| !grant.owed.contains(session)),
+            "nothing is re-offered once settled"
+        );
+    }
+}
+
+/// E2 flip (T8 round 2), returning tombstoned family (the tombstone formed
+/// before the flip). Gate on, each returning member's request-owned body
+/// replaces its session: offered and ACKed exactly once (no double count),
+/// the tombstone clears with that publication and no authority record is
+/// left; a quiet generation offers nothing again.
+#[test]
+#[serial(source_manifests)]
+fn e2_returning_tombstoned_family_publishes_once_and_clears_its_tombstone() {
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("e2-tombstone-returns", false);
+    let family = apc_family_sessions();
+    let api = fixture.sidecar_path("claude-code-effort");
+    let mut hour = 10;
+    let mut pages_until = |label: &str, done: &dyn Fn(&ApcPage) -> bool| -> Vec<ApcPage> {
+        let mut pages = Vec::new();
+        for number in 0..2 * APC_MAX_PAGES {
+            let page = fixture.page(
+                &format!("2026-08-02T{hour:02}:{number:02}:00Z"),
+                ApcUpload::Accept,
+            );
+            assert_eq!(fixture.quarantined_index_count(), 0, "{label}");
+            let finished = done(&page);
+            pages.push(page);
+            if finished {
+                hour += 1;
+                return pages;
+            }
+        }
+        panic!("PRECONDITION_NOT_REACHED: {label}");
+    };
+
+    // Before the flip: a held family is removed and retired as absent.
+    let gate_off = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    fixture.establish();
+    crate::snapshots::forget_claude_unverified_history_indexes_for_test();
+    crate::snapshots::restart_claude_reemission_stop_for_test();
+    fixture.page_files.set(16);
+    let healthy_api = std::fs::read(&api).expect("read the healthy API sidecar");
+    fixture.corrupt_api_sidecar();
+    ApcFixture::append(&fixture.member_path(None), &apc_note_line(APC_ROOT, 0));
+    pages_until("a RetryPending hold", &|page| {
+        page.record()
+            .is_some_and(|record| !record.terminal && record.bound_to_retained_witness)
+    });
+    let members = std::iter::once(None)
+        .chain(APC_AGENTS.iter().map(|agent| Some(*agent)))
+        .map(|agent| {
+            let path = fixture.member_path(agent);
+            let bytes = std::fs::read(&path).expect("read the member transcript");
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    for (path, _) in &members {
+        std::fs::remove_file(path).expect("remove the family member");
+    }
+    pages_until("the absent family retires", &|page| {
+        page.record().is_none() && page.index.claude_family_tombstoned_for_test(APC_ROOT)
+    });
+    drop(gate_off);
+
+    // After the flip: the family returns.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    std::fs::write(&api, &healthy_api).expect("repair the API sidecar");
+    for (path, bytes) in &members {
+        std::fs::write(path, bytes).expect("restore the family member");
+    }
+    let returned = pages_until("the tombstone clears", &|page| {
+        !page.index.claude_family_tombstoned_for_test(APC_ROOT)
+    });
+    let mut offers = BTreeMap::<String, usize>::new();
+    for page in &returned {
+        for item in page
+            .scan
+            .snapshots
+            .iter()
+            .filter(|item| family.contains(&item.source_session_id))
+        {
+            assert_eq!(
+                item.usage_accounting_contract.as_deref(),
+                Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT),
+                "a returning body is request-owned"
+            );
+        }
+        for session in page.offered_bodies.keys().filter(|s| family.contains(*s)) {
+            *offers.entry(session.clone()).or_default() += 1;
+        }
+    }
+    assert_eq!(
+        offers,
+        family.iter().map(|session| (session.clone(), 1)).collect(),
+        "each returning member is offered exactly once"
+    );
+    let last = returned.last().unwrap();
+    assert!(last.record().is_none(), "no authority record is left");
+    for item in last
+        .scan
+        .snapshots
+        .iter()
+        .filter(|item| family.contains(&item.source_session_id))
+    {
+        assert!(last.uploaded.contains(&item.snapshot_fingerprint));
+    }
+    assert_eq!(ApcFixture::family_keys(&last.index).len(), family.len());
+    let quiet = pages_until("a quiet traversal ends", &|page| {
+        !page.index.scan_traversal_in_progress_for_test()
+    });
+    for page in &quiet {
+        assert!(!page.index.claude_family_tombstoned_for_test(APC_ROOT));
+        assert!(page.record().is_none());
+        assert!(
+            page.offered_bodies.keys().all(|s| !family.contains(s)),
+            "nothing is offered again"
+        );
+    }
+}
