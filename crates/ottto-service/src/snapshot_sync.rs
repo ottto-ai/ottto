@@ -683,8 +683,12 @@ fn commit_completed_with_local_holds(
     accepted_fingerprints.retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
     let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-    let mut index =
-        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
+    let mut index = index.committable_subset_with_local_holds(
+        committed_index,
+        &accepted_fingerprints,
+        &server_quarantine,
+        locally_held_fingerprints,
+    );
     index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
     index
 }
@@ -841,7 +845,12 @@ fn settle_checkpointed_upload(
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
         server_quarantine.retain(|fingerprint, _| !holds.held_fingerprints.contains(fingerprint));
-        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine)
+        index.committable_subset_with_local_holds(
+            committed_index,
+            &accepted_fingerprints,
+            &server_quarantine,
+            &holds.held_fingerprints,
+        )
     } else {
         index
     };
@@ -2891,7 +2900,12 @@ fn checkpoint_partial_snapshot_index_with_comparison(
         })
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
-    let mut committable = index.committable_subset(committed_index, &accepted, &quarantined);
+    let mut committable = index.committable_subset_with_local_holds(
+        committed_index,
+        &accepted,
+        &quarantined,
+        locally_held,
+    );
     if let Some(scan) = correction_scan {
         // A2: settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
@@ -5698,6 +5712,47 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
+    let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
+        source == SnapshotSource::ClaudeCode,
+    );
+    let result = prepare_sync_source_inner(
+        client,
+        device,
+        device_secret,
+        source,
+        machine_id,
+        home,
+        support_dir,
+        daemon,
+        transport_cycle,
+        account_witness,
+        retry_enabled,
+    );
+    let counts = diagnostics.finish();
+    if let Ok(Some(preparation)) = &result {
+        if let Some(lease) = preparation.native_comparison_lease.as_ref() {
+            lease.diagnostic.add_page_events(counts);
+        } else {
+            crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_sync_source_inner(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    home: &Path,
+    support_dir: &Path,
+    daemon: &LocalDaemon,
+    transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
+    account_witness: [u8; 32],
+    retry_enabled: bool,
+) -> Result<Option<SourcePreparation>> {
     if let Some(remaining) = source_upload_backoff_remaining(source) {
         // The server asked for room and we said yes. Re-running the cycle now
         // would scan, re-derive and re-POST the same pages it just shed, which is
@@ -6663,6 +6718,10 @@ fn finish_sync_source(
     _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
     retry: &mut live_snapshot_retry::LiveRetryOwner,
 ) -> Result<()> {
+    let _diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::finish_decision(
+        preparation.source == SnapshotSource::ClaudeCode,
+        preparation.native_comparison_lease.is_some(),
+    );
     let SourcePreparation {
         mut native_comparison_reservation,
         mut native_comparison_lease,

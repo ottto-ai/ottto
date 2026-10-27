@@ -469,6 +469,7 @@ fn claude_retry_note_offered(
         if !offered(key) {
             break;
         }
+        crate::local_resource_diagnostics::claude_reread::retry_offered();
         oversized_after = Some(key.clone());
     }
     let oversized = state.oversized_root.clone();
@@ -506,6 +507,10 @@ fn claude_retry_note_offered(
                     .is_some_and(|after| key.as_str() <= after)
             {
                 if let Some(entry) = index.files.get_mut(&key) {
+                    crate::local_resource_diagnostics::claude_reread::clear(
+                        crate::local_resource_diagnostics::claude_reread::ClearSite::RetryAdmission,
+                        !entry.source_file_fingerprint.is_empty(),
+                    );
                     entry.source_file_fingerprint.clear();
                 }
             }

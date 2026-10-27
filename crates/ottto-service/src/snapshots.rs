@@ -7825,6 +7825,10 @@ pub fn apply_claude_effort_evidence_with_index(
             if claude_index_path_family_member(Path::new(key))
                 .is_some_and(|(root, _)| reprove_roots.contains(&root))
             {
+                crate::local_resource_diagnostics::claude_reread::clear(
+                    crate::local_resource_diagnostics::claude_reread::ClearSite::AccountReproof,
+                    !entry.source_file_fingerprint.is_empty(),
+                );
                 entry.source_file_fingerprint.clear();
             }
         }
@@ -9024,6 +9028,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             if claude_index_path_family_member(Path::new(index_key)).is_some_and(
                 |(_, source_session_id)| owned_start_reparse_ids.contains(&source_session_id),
             ) {
+                crate::local_resource_diagnostics::claude_reread::clear(
+                    crate::local_resource_diagnostics::claude_reread::ClearSite::OwnedStart,
+                    !entry.source_file_fingerprint.is_empty(),
+                );
                 entry.source_file_fingerprint.clear();
             }
         }
@@ -25130,8 +25138,11 @@ impl OwnedSourceScan {
         recovery_priority: &[PathBuf],
         continuation: Option<&BTreeSet<String>>,
     ) -> Self {
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
+            source == SnapshotSource::ClaudeCode,
+        );
         let continuation = continuation.filter(|_| source == SnapshotSource::Codex);
-        let resource_probe = crate::local_resource_diagnostics::Probe::start();
+        let mut resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
         index.reread_guard.begin_selection();
         index.activate_quarantine_witness(source);
@@ -25717,6 +25728,7 @@ impl OwnedSourceScan {
                 inventory.complete &= traversal.pending_directories.is_empty();
                 inventory
             });
+        resource_probe.page_events.merge(diagnostics.finish());
         Self {
             native_comparison: None,
             resource_probe,
@@ -25794,6 +25806,22 @@ impl OwnedSourceScan {
     }
 
     fn step_with_capture_credit(
+        self,
+        attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+        capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
+    ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
+            self.source == SnapshotSource::ClaudeCode,
+        );
+        let mut result = self.step_with_capture_credit_inner(attribution_context, capture_credit);
+        let counts = diagnostics.finish();
+        if let Ok(OwnedSourceScanStep::Pending(scan)) = &mut result {
+            scan.resource_probe.page_events.merge(counts);
+        }
+        result
+    }
+
+    fn step_with_capture_credit_inner(
         mut self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         mut capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
@@ -28999,9 +29027,16 @@ impl OwnedSourceScan {
                             debug_assert!(file_sampling
                                 .as_ref()
                                 .map_or(true, |sampled| sampled.key.len() == key.len()));
-                            context
-                                .cache
-                                .insert(key, completed, finalization_charge.unwrap_or(0));
+                            let admitted = context.cache.insert(
+                                key,
+                                completed,
+                                finalization_charge.unwrap_or(0),
+                            );
+                            if admitted {
+                                if let Some(active) = file_sampling.as_ref() {
+                                    active.reinsertion.admitted();
+                                }
+                            }
                         }
                     }
                     for key in joined_keys {
@@ -30729,6 +30764,7 @@ impl OwnedSourceScan {
                             retained_hint: None,
                             retained_finalization_charge: 0,
                             retained_usage: None,
+                            reinsertion: Default::default(),
                         });
                     }
                     Err(_) => {
@@ -30751,6 +30787,10 @@ impl OwnedSourceScan {
                 });
                 let retained = taken.map(|taken| taken.retained);
                 let retained_present = retained.is_some();
+                let reinsertion =
+                    crate::local_resource_diagnostics::claude_reread::Reinsertion::new(
+                        retained_present,
+                    );
                 context.admission.attempts = context.admission.attempts.saturating_add(1);
                 context.admission.retained_entry.observe(retained_present);
                 if !retained_present {
@@ -30939,6 +30979,7 @@ impl OwnedSourceScan {
                             retained_finalization_charge: continued
                                 .map_or(0, |(_, charge, _)| charge),
                             retained_usage: continued.map(|(_, _, usage)| usage),
+                            reinsertion,
                         });
                     }
                 } else if source == SnapshotSource::Codex
@@ -31008,6 +31049,7 @@ impl OwnedSourceScan {
                             retained_hint: None,
                             retained_finalization_charge: 0,
                             retained_usage: None,
+                            reinsertion: Default::default(),
                         });
                     }
                 }
@@ -45669,6 +45711,16 @@ impl ScanIndex {
         accepted: &BTreeSet<String>,
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
     ) -> ScanIndex {
+        self.committable_subset_with_local_holds(previous, accepted, quarantined, &BTreeSet::new())
+    }
+
+    pub(crate) fn committable_subset_with_local_holds(
+        &self,
+        previous: &ScanIndex,
+        accepted: &BTreeSet<String>,
+        quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
+        locally_held: &BTreeSet<String>,
+    ) -> ScanIndex {
         let empty_advances = self.claude_empty_map_advances(previous);
         let settled = |fingerprint: &str| {
             !self.decode_holds_entity(fingerprint)
@@ -45724,6 +45776,39 @@ impl ScanIndex {
                 files.insert(key.clone(), entry.clone());
                 safe_keys.insert(key.clone());
             } else if let Some(committed) = previous.files.get(key) {
+                if !entry.source_file_fingerprint.is_empty()
+                    && crate::local_resource_diagnostics::claude_reread::active()
+                {
+                    let held = self.decode_holds_file(key)
+                        || entry
+                            .last_snapshot_fingerprint
+                            .as_ref()
+                            .is_some_and(|fp| locally_held.contains(fp))
+                        || self
+                            .file_snapshot_fingerprints
+                            .get(key)
+                            .is_some_and(|fps| !fps.is_disjoint(locally_held));
+                    // Exactly the early exact-incidence branch, and the legacy
+                    // head/equality fallback would have admitted this sibling.
+                    let exact_only = !held
+                        && !self.confirmed_empty_files.contains(key)
+                        && self
+                            .file_snapshot_fingerprints
+                            .get(key)
+                            .is_some_and(|fps| !fps.iter().all(|fp| settled(fp)))
+                        && entry
+                            .last_snapshot_fingerprint
+                            .as_deref()
+                            .map_or(true, |fp| {
+                                settled(fp)
+                                    || committed.last_snapshot_fingerprint.as_deref() == Some(fp)
+                            });
+                    crate::local_resource_diagnostics::claude_reread::restored(
+                        committed.source_file_fingerprint.is_empty(),
+                        held,
+                        exact_only,
+                    );
+                }
                 files.insert(key.clone(), committed.clone());
             } else if fence_drained_here && !drops_exempted_member {
                 drops_exempted_member =
@@ -85182,6 +85267,84 @@ mod tests {
         let committable =
             fresh.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
         assert!(committable.files.is_empty());
+    }
+
+    #[test]
+    fn partial_commit_diagnostics_split_restoration_without_changing_saved_entries() {
+        use crate::local_resource_diagnostics::claude_reread::{Counts, Scope};
+        let mut previous = ScanIndex::default();
+        for (key, empty) in [
+            ("empty-held", true),
+            ("nonempty-held", false),
+            ("empty-sibling", true),
+            ("nonempty-sibling", false),
+            ("unsettled-sibling", true),
+        ] {
+            let mut entry = manifest_index_entry(Some(key));
+            if empty {
+                entry.source_file_fingerprint.clear();
+            }
+            previous.files.insert(key.into(), entry);
+        }
+        let mut scanned = previous.clone();
+        for (key, entry) in &mut scanned.files {
+            entry.source_file_fingerprint = "parsed-source".into();
+            scanned
+                .file_snapshot_fingerprints
+                .insert(key.clone(), BTreeSet::from([key.clone()]));
+        }
+        scanned
+            .files
+            .get_mut("unsettled-sibling")
+            .unwrap()
+            .last_snapshot_fingerprint = Some("changed-head".into());
+        let held = BTreeSet::from(["empty-held".into(), "nonempty-held".into()]);
+        let scope = Scope::begin(true);
+        let saved = scanned.committable_subset_with_local_holds(
+            &previous,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &held,
+        );
+        let counts = scope.finish().claude_reread;
+        assert_eq!(counts.restored_empty_held, 1);
+        assert_eq!(counts.restored_nonempty_held, 1);
+        assert_eq!(counts.restored_empty_sibling, 2);
+        assert_eq!(counts.restored_nonempty_sibling, 1);
+        assert_eq!(counts.sibling_exact_incidence_only, 2);
+        for key in previous.files.keys() {
+            assert_eq!(
+                serde_json::to_value(&saved.files[key]).unwrap(),
+                serde_json::to_value(&previous.files[key]).unwrap()
+            );
+        }
+        // An empty working fingerprint is existing debt, not a parsed restoration.
+        scanned
+            .files
+            .get_mut("empty-sibling")
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let other = Scope::begin(false);
+        let unobserved = scanned.committable_subset_with_local_holds(
+            &previous,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &held,
+        );
+        assert_eq!(other.finish(), Counts::default());
+        assert_eq!(
+            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(unobserved).unwrap()
+        );
+        let scope = Scope::begin(true);
+        let _ = scanned.committable_subset_with_local_holds(
+            &previous,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &held,
+        );
+        assert_eq!(scope.finish().claude_reread.restored_empty_sibling, 1);
     }
 
     #[test]

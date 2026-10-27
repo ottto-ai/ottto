@@ -500,8 +500,12 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 record(Event::InsertNoVictimRefused);
                 return false;
             };
+            let count_pressure = self.entries.len() > self.count_limit;
             self.entries.remove(&victim);
             record(Event::InsertEntriesEvicted);
+            crate::local_resource_diagnostics::claude_reread::cache_capacity_eviction(
+                count_pressure,
+            );
             if victim == key {
                 // Even a rejected new entry must release enough older state
                 // for the caller's live allocation reservation.

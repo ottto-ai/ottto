@@ -5,6 +5,7 @@ use std::io::Write;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod cache_lifecycle;
+pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 #[cfg_attr(not(test), allow(dead_code))] // first production callers are the side rows
 pub(crate) mod codex_side_lifecycle;
@@ -201,12 +202,14 @@ fn process_sample() -> Option<ProcessSample> {
 pub(crate) struct Probe {
     started: Instant,
     process: Option<ProcessSample>,
+    pub(crate) page_events: claude_reread::Counts,
 }
 impl Probe {
     pub(crate) fn start() -> Self {
         Self {
             started: Instant::now(),
             process: process_sample(),
+            page_events: Default::default(),
         }
     }
     fn observation(&self) -> Observation {
@@ -238,9 +241,16 @@ impl Probe {
             caps: ClaudeRecordCaps,
             #[serde(flatten)]
             identity: crate::snapshots::claude_request_identity::IdentityCounts,
+            #[serde(flatten)]
+            reread: claude_reread::Counts,
         }
         let claude = source == "claude_code";
         let counts = Counts {
+            reread: if claude {
+                self.page_events.with_current()
+            } else {
+                Default::default()
+            },
             collection: counts,
             pending,
             identity: if claude {
@@ -589,21 +599,46 @@ pub(crate) struct NativeMint {
 }
 /// Inline Cell permits the final read-only negative view to report decisions.
 /// It owns no graph and is included in its lease's existing layout charge.
-pub(crate) struct NativeDecision(pub(crate) std::cell::Cell<NativeComparisonDecision>);
+pub(crate) struct NativeDecision(
+    pub(crate) std::cell::Cell<NativeComparisonDecision>,
+    std::cell::Cell<claude_reread::Counts>,
+);
 impl NativeDecision {
     pub(crate) fn new() -> Self {
-        Self(std::cell::Cell::new(NativeComparisonDecision {
-            layout_supported: crate::heap_layout_bound::layout_supported(),
-            ..Default::default()
-        }))
+        Self(
+            std::cell::Cell::new(NativeComparisonDecision {
+                layout_supported: crate::heap_layout_bound::layout_supported(),
+                ..Default::default()
+            }),
+            std::cell::Cell::new(Default::default()),
+        )
     }
     pub(crate) fn update(&self, update: impl FnOnce(&mut NativeComparisonDecision)) {
         let mut value = self.0.get();
         update(&mut value);
         self.0.set(value);
     }
+    pub(crate) fn add_page_events(&self, counts: claude_reread::Counts) {
+        let mut value = self.1.get();
+        value.merge(counts);
+        self.1.set(value);
+    }
     pub(crate) fn emit(&self) {
-        traversal_point("native_comparison_decision", "claude_code", &self.0.get());
+        #[derive(Serialize)]
+        struct Counts {
+            #[serde(flatten)]
+            decision: NativeComparisonDecision,
+            #[serde(flatten)]
+            events: claude_reread::Counts,
+        }
+        traversal_point(
+            "native_comparison_decision",
+            "claude_code",
+            &Counts {
+                decision: self.0.get(),
+                events: self.1.get().with_current(),
+            },
+        );
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
@@ -1446,6 +1481,57 @@ mod tests {
                 "unsupported_identity"
             ]
         );
+    }
+
+    #[test]
+    fn claude_page_events_use_existing_carriers_without_source_leakage() {
+        let (_, rows) = capture(|| {
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            let mut probe = Probe::start();
+            probe.page_events.merge(scope.finish());
+            probe.collection(
+                "claude_code",
+                CollectionCounts {
+                    scanned_files: 1,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                },
+            );
+            probe.collection(
+                "codex",
+                CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                },
+            );
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::restored(true, false, true);
+            NativeDecision::new().emit();
+            drop(scope);
+        });
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["source"], "claude_code");
+        assert_eq!(rows[0]["counts"]["claude_reread"]["owned_start_cleared"], 1);
+        assert_eq!(
+            rows[0]["counts"]["retained_cache_page_events"]["take_hit"],
+            1
+        );
+        assert!(rows[1]["counts"].get("claude_reread").is_none());
+        assert!(rows[1]["counts"]
+            .get("retained_cache_page_events")
+            .is_none());
+        assert_eq!(rows[2]["stage"], "native_comparison_decision");
+        assert_eq!(
+            rows[2]["counts"]["claude_reread"]["restored_empty_sibling"],
+            1
+        );
+        for row in rows {
+            assert_eq!(row["schema_version"], 2);
+            assert!(serde_json::to_string(&row).unwrap().len() < 4096);
+        }
     }
 
     #[test]

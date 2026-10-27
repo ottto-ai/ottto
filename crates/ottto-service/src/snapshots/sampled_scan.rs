@@ -287,7 +287,7 @@ impl SharedCache {
         key: String,
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
-    ) {
+    ) -> bool {
         if let Some(state) = completed.reduction {
             if let Ok(mut cache) = self.retained() {
                 // The whole cursor state (paused job, memo, parked and rotation
@@ -311,7 +311,7 @@ impl SharedCache {
                 let reserved = live_bytes
                     .saturating_add(self.cursor_resident_for_main())
                     .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
-                cache.insert_reserving_at_rank(
+                let admitted = cache.insert_reserving_at_rank(
                     key,
                     crate::transcript_cache::Retained {
                         checkpoint: completed.checkpoint,
@@ -322,10 +322,12 @@ impl SharedCache {
                     completed.released,
                 );
                 self.drop_suspended_proof_if_over(&cache, live_bytes_in);
+                return admitted;
             } else {
                 record(Event::InsertPoisonedLock);
             }
         }
+        false
     }
 }
 
@@ -369,9 +371,10 @@ pub(super) struct Active {
     /// (`SnapshotAccumulator::usage_witness`); `None` without one. Q-PR15's
     /// guard compares it at completion.
     pub(super) retained_usage: Option<u64>,
+    pub(super) reinsertion: crate::local_resource_diagnostics::claude_reread::Reinsertion,
 }
 crate::heap_layout_bound::fields!(Active; key, scope, mode, audit_due, retained_hint,
-    retained_finalization_charge, retained_usage);
+    retained_finalization_charge, retained_usage, reinsertion);
 
 impl Context {
     pub(super) fn file_scope(
