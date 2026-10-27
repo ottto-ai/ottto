@@ -2248,6 +2248,14 @@ struct ClaudeFullRearmProgress {
     /// skip stays vetoed until one runs or the fence opens.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     first_proof_hold_since_full_rearm: bool,
+    /// Option A (SOURCE 2026-10-27): root digests of the families whose local
+    /// holds stamped `CompletedBlockingHolds` in this sweep, at most
+    /// `MAX_SCOPED_HELD_FAMILY_ROOTS`. `Some` only while every stamp of the
+    /// sweep flag named its held families; read only through
+    /// `ScanIndex::unchanged_proof_unsettled_families`. Lost or malformed, it
+    /// loads `None`, which keeps the sweep-wide unchanged-proof veto.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    held_family_roots: Option<BTreeSet<String>>,
 }
 
 impl ClaudeFullRearmProgress {
@@ -3524,9 +3532,12 @@ pub struct ScanIndex {
     /// can advance.
     #[serde(default)]
     bounded_sweep_had_unsettled_upload: bool,
-    /// Diagnostics only: the `UnsettledUploadCause` bits of the paths that
-    /// set `bounded_sweep_had_unsettled_upload` in this sweep. The traversal
-    /// transition lines name them; no gate reads them. Reset with the flag.
+    /// The `UnsettledUploadCause` bits of the paths that set
+    /// `bounded_sweep_had_unsettled_upload` in this sweep. The traversal
+    /// transition lines name them. The only gate that reads them is the
+    /// terminal unchanged-proof skip, to scope a sweep whose sole cause is
+    /// `CompletedBlockingHolds` (`unchanged_proof_unsettled_families`). Reset
+    /// with the flag.
     /// Read through `unsettled_cause_bits`, which reports none without the
     /// flag and `Unattributed` for a flag with no recorded cause.
     #[serde(
@@ -3767,8 +3778,9 @@ pub struct ScanIndex {
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
-/// Diagnostic only: the traversal transition lines name them, and no gate
-/// reads them.
+/// The traversal transition lines name them. Only the terminal
+/// unchanged-proof skip reads them, to scope `CompletedBlockingHolds` alone
+/// to its held families; every other gate reads the flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnsettledUploadCause {
     /// A 429/503 shed left a partial checkpoint.
@@ -4887,6 +4899,63 @@ impl ClaudeUsageAuthorityDisposition {
             })
             .map(|snapshot| snapshot.snapshot_fingerprint.clone())
             .collect()
+    }
+
+    /// Option A: every Claude family a held entity of this page could count
+    /// under, as raw roots: the entity's own root, the path root of each index
+    /// key that names its revision, and the root of every authority record
+    /// that already binds it as a member. A family named here only keeps its
+    /// proof re-arm; nothing is credited, settled or moved. `None` when a held
+    /// session has no item on this page, so doubt keeps the sweep-wide marker.
+    pub(crate) fn held_family_roots(
+        &self,
+        snapshots: &[SnapshotItem],
+        index: &ScanIndex,
+    ) -> Option<BTreeSet<String>> {
+        let held_items = snapshots
+            .iter()
+            .filter(|snapshot| {
+                self.quarantined_source_session_ids
+                    .contains(&snapshot.source_session_id)
+            })
+            .collect::<Vec<_>>();
+        let held_sessions = held_items
+            .iter()
+            .map(|snapshot| snapshot.source_session_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if held_sessions.len() != self.quarantined_source_session_ids.len() {
+            return None;
+        }
+        let mut roots = held_items
+            .iter()
+            .copied()
+            .map(claude_snapshot_family_root)
+            .collect::<BTreeSet<_>>();
+        let held_fingerprints = held_items
+            .iter()
+            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+            .collect();
+        roots.extend(
+            index
+                .locally_held_keys(&held_fingerprints)
+                .iter()
+                .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+                .map(|(root_session_id, _)| root_session_id),
+        );
+        roots.extend(
+            index
+                .claude_usage_authority_quarantine
+                .iter()
+                .filter(|(_, record)| {
+                    held_sessions.iter().any(|session| {
+                        record
+                            .member_source_file_fingerprints
+                            .contains_key(*session)
+                    })
+                })
+                .map(|(root_session_id, _)| root_session_id.clone()),
+        );
+        Some(roots)
     }
 
     pub(crate) fn retain_uploadable(&self, snapshots: &mut Vec<SnapshotItem>) {
@@ -6546,6 +6615,30 @@ fn claude_full_rearm_root_digest(root_session_id: &str) -> String {
     claude_full_rearm_digest(b"claude_full_rearm_root:v1", &[root_session_id.as_bytes()])
 }
 
+/// The shape of `claude_full_rearm_digest`: 32 lowercase hex characters.
+fn claude_full_rearm_digest_is_canonical(digest: &str) -> bool {
+    digest.len() == 32
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A non-empty held-family scope of at most `MAX_SCOPED_HELD_FAMILY_ROOTS`
+/// canonical root digests: the only shape `mark_bounded_sweep_held_by_families`
+/// writes. Readers and later stamps treat anything else as unknown.
+fn held_family_scope_has_writer_shape(scope: &BTreeSet<String>) -> bool {
+    !scope.is_empty()
+        && scope.len() <= MAX_SCOPED_HELD_FAMILY_ROOTS
+        && scope
+            .iter()
+            .map(String::as_str)
+            .all(claude_full_rearm_digest_is_canonical)
+}
+
+/// Held families one sweep may scope its `CompletedBlockingHolds` marker to.
+/// More fall back to the sweep-wide unchanged-proof veto.
+pub(crate) const MAX_SCOPED_HELD_FAMILY_ROOTS: usize = 64;
+
 /// The record basis: everything outside the member bytes that the
 /// classification depends on. A D1 derivation, scan identity, record version
 /// or identity contract change re-arms once.
@@ -7744,6 +7837,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
         }
         index.bounded_sweep_had_unsettled_upload = false;
         index.bounded_sweep_unsettled_causes = 0;
+        index.claude_full_rearm_progress.held_family_roots = None;
     }
     index.note_carried_ack_census(source, result.census_complete, SystemTime::now());
     let current_fingerprints = index
@@ -9468,11 +9562,16 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // and the accepted ledger is current and not being rebuilt. Authority
         // debt alone does not unsettle the sweep; `claude_unchanged_proof_roots`
         // still excludes every quarantined or demoting root.
+        // Option A: when the sweep's only unsettled cause is scoped
+        // `CompletedBlockingHolds`, only the held families lose the skip below;
+        // they stay held, re-offered and unproven residue. Any other cause, or
+        // a stamp that could not name its families, keeps the sweep-wide veto.
+        let unsettled_families = index.unchanged_proof_unsettled_families();
         let unchanged_proof_gate = fence_stays_closed
             && !full_rearm
             && !index.claude_request_identity_contract_changed
             && identity_contract_recorded
-            && !index.bounded_sweep_had_unsettled_upload
+            && unsettled_families.is_some()
             && claude_accepted_ledger_is_current(index)
             && index.upload_context_fingerprint == index.active_upload_context_fingerprint;
         // A partially settled page earlier in this traversal (shed, lost ACK
@@ -9485,7 +9584,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         {
             index.claude_request_identity_contract_changed = false;
         }
-        let unchanged_proof_roots = if unchanged_proof_gate && !proven.is_empty() {
+        let mut unchanged_proof_roots = if unchanged_proof_gate && !proven.is_empty() {
             claude_unchanged_proof_roots(
                 index,
                 &proven,
@@ -9505,6 +9604,25 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         } else {
             None
         };
+        if let (Some(roots), Some(held)) = (
+            unchanged_proof_roots.as_mut(),
+            unsettled_families.as_ref().filter(|held| !held.is_empty()),
+        ) {
+            let mut held_with_retained_witness = 0_usize;
+            for (root_session_id, unchanged) in roots.iter_mut() {
+                if held.contains(&claude_full_rearm_root_digest(root_session_id)) {
+                    *unchanged = false;
+                    held_with_retained_witness += 1;
+                }
+            }
+            eprintln!(
+                "local snapshot census kept the proof re-arm of {} held Claude family/families \
+                 ({held_with_retained_witness} with a retained witness, none settled) as \
+                 unsettled residue; other settled unchanged families keep their \
+                 unchanged-proof skip",
+                held.len()
+            );
+        }
         if let Some(first_proof_hold) = first_proof_hold {
             disposition.first_proof_hold = first_proof_hold;
         }
@@ -39532,6 +39650,7 @@ fn ensure_bounded_traversal(
     // new partial settlement stamps the marker again before persistence.
     let prior_unsettled_upload = index.bounded_sweep_had_unsettled_upload;
     let prior_unsettled_causes = index.bounded_sweep_unsettled_causes;
+    let prior_held_family_roots = index.claude_full_rearm_progress.held_family_roots.take();
     index.bounded_sweep_had_unsettled_upload = plan_held && prior_unsettled_upload;
     index.bounded_sweep_unsettled_causes = 0;
     // A carry belongs to the traversal that started it; this start replaces it.
@@ -39661,6 +39780,8 @@ fn ensure_bounded_traversal(
                     } else {
                         index.bounded_sweep_had_unsettled_upload = prior_unsettled_upload;
                         index.bounded_sweep_unsettled_causes = prior_unsettled_causes;
+                        index.claude_full_rearm_progress.held_family_roots =
+                            prior_held_family_roots;
                         eprintln!("local snapshot census deferred a stale Claude retry: {} pending families exceed bounded carry/cancellation scratch; no fingerprints cleared", stale_pending_roots.len());
                         return;
                     }
@@ -42220,6 +42341,64 @@ impl ScanIndex {
     pub(crate) fn mark_bounded_sweep_unsettled_by(&mut self, cause: UnsettledUploadCause) {
         self.bounded_sweep_unsettled_causes = self.unsettled_cause_bits() | cause.bit();
         self.bounded_sweep_had_unsettled_upload = true;
+        // A stamp that names no held family makes the sweep unsettled as a
+        // whole for the unchanged-proof skip.
+        self.claude_full_rearm_progress.held_family_roots = None;
+    }
+
+    /// Mark the sweep unsettled by a `Completed` page's blocking local holds,
+    /// scoped to the held entities' Claude families (`held_family_roots`, raw
+    /// roots). The scope survives only while every earlier stamp of this
+    /// sweep was scoped too; `None`, no family or overflow drops it. A prior
+    /// scope outside the writer's shape (as loaded from a damaged index) is
+    /// unknown and stays sweep-wide until the next sweep resets the flag. The
+    /// flag, census withhold and every other reader of the flag are unchanged.
+    pub(crate) fn mark_bounded_sweep_held_by_families(
+        &mut self,
+        held_family_roots: Option<&BTreeSet<String>>,
+    ) {
+        let prior = if self.bounded_sweep_had_unsettled_upload {
+            self.claude_full_rearm_progress
+                .held_family_roots
+                .take()
+                .filter(held_family_scope_has_writer_shape)
+        } else {
+            Some(BTreeSet::new())
+        };
+        self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
+        self.claude_full_rearm_progress.held_family_roots = prior
+            .zip(held_family_roots.filter(|roots| !roots.is_empty()))
+            .map(|(mut scope, roots)| {
+                scope.extend(
+                    roots
+                        .iter()
+                        .map(String::as_str)
+                        .map(claude_full_rearm_root_digest),
+                );
+                scope
+            })
+            .filter(|scope| scope.len() <= MAX_SCOPED_HELD_FAMILY_ROOTS);
+    }
+
+    /// Root digests of the families whose unsettled uploads this sweep owes:
+    /// none while the sweep is settled, the held families while scoped
+    /// `CompletedBlockingHolds` is its only cause, and `None` (every family
+    /// keeps its proof re-arm) for any other cause or an unscoped stamp.
+    /// A loaded scope is trusted only in the shape the writer produces: not
+    /// empty, at most `MAX_SCOPED_HELD_FAMILY_ROOTS`, every entry a canonical
+    /// root digest. Anything else keeps the sweep-wide veto.
+    pub(crate) fn unchanged_proof_unsettled_families(&self) -> Option<BTreeSet<String>> {
+        if !self.bounded_sweep_had_unsettled_upload {
+            return Some(BTreeSet::new());
+        }
+        if self.bounded_sweep_unsettled_causes != UnsettledUploadCause::CompletedBlockingHolds.bit()
+        {
+            return None;
+        }
+        self.claude_full_rearm_progress
+            .held_family_roots
+            .clone()
+            .filter(held_family_scope_has_writer_shape)
     }
 
     /// Diagnostics only. The flag is authoritative: no cause without it, and
@@ -44059,6 +44238,7 @@ impl ScanIndex {
         self.resume_census_window_end = None;
         self.bounded_sweep_had_unsettled_upload = false;
         self.bounded_sweep_unsettled_causes = 0;
+        self.claude_full_rearm_progress.held_family_roots = None;
         self.traversal = None;
         self.scan_residue_witness = None;
         self.confirmed_empty_files.clear();
@@ -87252,7 +87432,7 @@ crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_mem
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
 crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
-crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm);
+crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);
