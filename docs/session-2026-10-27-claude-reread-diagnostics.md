@@ -19,3 +19,14 @@ encoding, saturation, real subset restoration and unchanged saved entries, plus
 existing native pipeline/layout and resource budget contracts in CI. Validation
 runs and exact head are recorded in the PR. No local Rust build/test/clippy,
 installation, runtime collection, release or production action was performed.
+
+Round 2 adds `stale_carry_rejection_counts` as a fixed JSON suffix to the existing
+stale Claude start re-arm text line, captured before fingerprint clears. It
+separates start admission, window/ordinary scratch, member/evidence, cancellation
+funding and actual reservation failures, plus qualified and final carried roots.
+Failed streaming probes are discarded when a fallback rescues them; capped
+roots cannot acquire a second failure. Existing structured transition rows,
+layout prices, source walks, decisions and assertions stay unchanged. New
+fixtures exercise first-stage precedence, scratch paths, funding/reservation,
+streaming rescue and bounded-batch probe isolation; all existing traversal-start
+fixtures also assert the complete root partition through a test-only observer.

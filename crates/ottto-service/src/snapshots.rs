@@ -116,9 +116,13 @@ mod pi_retry_inputs;
 mod sampled_audit;
 mod sampled_jsonl;
 pub(crate) mod sampled_scan;
+mod stale_carry_diagnostics;
 #[cfg(test)]
 mod transcript_acquisition_tests;
 mod traversal_transition;
+use stale_carry_diagnostics::{
+    Counts as StaleCarryRejectionCounts, Rejection as StaleCarryRejection,
+};
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
@@ -5349,9 +5353,35 @@ enum ClaudeRetryAdmissionRefusal {
 /// root set, this one vector and the entire worst-case cancellation reserve
 /// together under the unchanged parked budget before allocating any of them.
 /// Refusal defers the start without clearing uncovered pending families.
+#[cfg(test)]
 fn claude_stream_accepted_retry_carry(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
+) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
+    claude_stream_accepted_retry_carry_observed(index, stale, &mut Default::default())
+}
+
+fn claude_stream_accepted_retry_carry_observed(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+    diagnostics: &mut StaleCarryRejectionCounts,
+) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
+    let result = claude_stream_accepted_retry_carry_inner(index, stale, diagnostics);
+    if let Err(refusal) = result.as_ref() {
+        // Early capacity refusals precede member qualification. A late replay
+        // reserve refusal rejects only the roots that passed that qualification.
+        diagnostics.reject(
+            (*refusal).into(),
+            stale.len().saturating_sub(diagnostics.rejected() as usize),
+        );
+    }
+    result
+}
+
+fn claude_stream_accepted_retry_carry_inner(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+    diagnostics: &mut StaleCarryRejectionCounts,
 ) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
     use crate::heap_layout_bound::{tree_nodes, Counter};
     if !crate::heap_layout_bound::layout_supported() {
@@ -5413,8 +5443,7 @@ fn claude_stream_accepted_retry_carry(
         return Err(ClaudeRetryAdmissionRefusal::Funding);
     }
     let mut members = Vec::new();
-    members
-        .try_reserve_exact(paths)
+    stale_carry_diagnostics::reserve(&mut members, paths)
         .map_err(|_| ClaudeRetryAdmissionRefusal::Allocation)?;
     for key in index.files.keys() {
         if let Some(member) =
@@ -5463,9 +5492,13 @@ fn claude_stream_accepted_retry_carry(
             .checked_add(family.len())
             .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     }
+    diagnostics.reject(
+        StaleCarryRejection::MemberEvidence,
+        stale.len().saturating_sub(carried.len()),
+    );
+    diagnostics.eligible_before_funding = carried.len() as u64;
     let mut replay = Vec::new();
-    replay
-        .try_reserve_exact(requeues)
+    stale_carry_diagnostics::reserve(&mut replay, requeues)
         .map_err(|_| ClaudeRetryAdmissionRefusal::Allocation)?;
     Ok(ClaudeStaleFamilyCarry {
         origin: None,
@@ -5480,6 +5513,7 @@ fn claude_stream_accepted_retry_carry(
 /// C1b/Fix 2's legacy gates. Every carry is scratch-priced and cancellation
 /// funded. Invalid pending stays BASE except the revision-bound id-less case;
 /// that pending remains invalid and supplies no current-window evidence.
+#[cfg(test)]
 fn claude_fence_closed_retry_carry(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
@@ -5487,8 +5521,27 @@ fn claude_fence_closed_retry_carry(
     prior_unsettled_upload: bool,
     scoped_retry_allowed: bool,
 ) -> ClaudeStaleFamilyCarry {
+    claude_fence_closed_retry_carry_observed(
+        index,
+        stale,
+        same_context_retry,
+        prior_unsettled_upload,
+        scoped_retry_allowed,
+        &mut Default::default(),
+    )
+}
+
+fn claude_fence_closed_retry_carry_observed(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+    same_context_retry: bool,
+    prior_unsettled_upload: bool,
+    scoped_retry_allowed: bool,
+    diagnostics: &mut StaleCarryRejectionCounts,
+) -> ClaudeStaleFamilyCarry {
     #[cfg(test)]
     if KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get) {
+        diagnostics.reject(StaleCarryRejection::MemberEvidence, stale.len());
         return ClaudeStaleFamilyCarry::default();
     }
     let needs_independent_acceptance =
@@ -5500,6 +5553,10 @@ fn claude_fence_closed_retry_carry(
         && claude_accepted_ledger_is_current(index)
         && index.upload_context_fingerprint == index.active_upload_context_fingerprint;
     if !same_context_retry || stale.is_empty() || (!legacy_admitted && !accepted_admitted) {
+        diagnostics.reject(
+            StaleCarryRejectionCounts::start_gate(index, same_context_retry),
+            stale.len(),
+        );
         return ClaudeStaleFamilyCarry::default();
     }
     let legacy_witness_count = index
@@ -5508,6 +5565,7 @@ fn claude_fence_closed_retry_carry(
         .filter(|witness| !claude_usage_family_witness_legacy_free(witness))
         .count();
     if !claude_stale_family_carry_scratch_admitted(index, stale, legacy_witness_count) {
+        diagnostics.reject(StaleCarryRejection::OrdinaryScratch, stale.len());
         CLAUDE_STALE_FAMILY_CARRY_BUDGET_FALLBACKS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
@@ -5674,7 +5732,14 @@ fn claude_fence_closed_retry_carry(
                 .is_some_and(|(_, refused)| !refused))
             || !shared_owners.contains(root_session_id)
     });
-    let replay = fund_claude_family_carry_cancellations(index, &mut carried);
+    diagnostics.reject(
+        StaleCarryRejection::MemberEvidence,
+        stale.len().saturating_sub(carried.len()),
+    );
+    diagnostics.eligible_before_funding = carried.len() as u64;
+    let replay = fund_claude_family_carry_cancellations(index, &mut carried, |_, stage| {
+        diagnostics.reject(stage, 1)
+    });
     ClaudeStaleFamilyCarry {
         origin: None, // The traversal start binds the retained carry.
         roots: carried,
@@ -5871,6 +5936,7 @@ pub(crate) fn claude_stale_family_carry_unfunded_families_for_test() -> usize {
 fn fund_claude_family_carry_cancellations(
     index: &ScanIndex,
     carried: &mut BTreeSet<String>,
+    mut rejected: impl FnMut(&str, StaleCarryRejection),
 ) -> Vec<ScanTraversalPath> {
     let mut replay = Vec::<ScanTraversalPath>::new();
     if carried.is_empty() {
@@ -5904,6 +5970,7 @@ fn fund_claude_family_carry_cancellations(
                 })
             });
         let Some((requeues, path_bytes)) = funded else {
+            rejected(root_session_id, StaleCarryRejection::CancellationFunding);
             unfunded += 1;
             return false;
         };
@@ -5911,7 +5978,12 @@ fn fund_claude_family_carry_cancellations(
         funded_path_bytes = path_bytes;
         true
     });
-    if !carried.is_empty() && replay.try_reserve_exact(funded_requeues).is_err() {
+    if !carried.is_empty()
+        && stale_carry_diagnostics::reserve(&mut replay, funded_requeues).is_err()
+    {
+        for root in carried.iter() {
+            rejected(root, StaleCarryRejection::ReserveAllocation);
+        }
         unfunded = unfunded.saturating_add(carried.len());
         carried.clear();
     }
@@ -39482,6 +39554,7 @@ fn ensure_bounded_traversal(
             && !REFUSE_CLAUDE_STALE_FAMILY_CARRY_BUDGET_FOR_TEST.with(std::cell::Cell::get);
         let mut admission = None;
         let mut covered_roots = None;
+        let mut stale_carry_rejection_counts = StaleCarryRejectionCounts::default();
         let carry = if streaming_carry {
             // Existing scheduling debt survives even if the whole set now fits.
             // Re-price its batch, but do not discard unoffered service cursors.
@@ -39491,7 +39564,11 @@ fn ensure_bounded_traversal(
             {
                 Err(ClaudeRetryAdmissionRefusal::Structure)
             } else {
-                claude_stream_accepted_retry_carry(index, &stale_pending_roots)
+                claude_stream_accepted_retry_carry_observed(
+                    index,
+                    &stale_pending_roots,
+                    &mut stale_carry_rejection_counts,
+                )
             };
             match whole {
                 Ok(carry) => carry,
@@ -39501,11 +39578,22 @@ fn ensure_bounded_traversal(
                         || due
                         || prior_admission.is_some()
                     {
-                        let (carry, covered, state) = claude_retry_admit_batch(
+                        let (carry, covered, state) = claude_retry_admit_batch_observed(
                             index,
                             &stale_pending_roots,
                             prior_admission.as_ref(),
                             collected_at,
+                            &mut stale_carry_rejection_counts,
+                        );
+                        // Discard failed speculative whole/batch attempts. Roots
+                        // outside the selected batch retain its first whole-set
+                        // capacity refusal, never a fabricated evidence failure.
+                        let accounted = stale_carry_rejection_counts
+                            .rejected()
+                            .saturating_add(carry.roots.len() as u64);
+                        stale_carry_rejection_counts.reject(
+                            refusal.into(),
+                            stale_pending_roots.len().saturating_sub(accounted as usize),
                         );
                         covered_roots = Some(covered);
                         admission = Some(state);
@@ -39519,19 +39607,41 @@ fn ensure_bounded_traversal(
                 }
             }
         } else if !window_scratch_admitted {
+            stale_carry_rejection_counts.reject(
+                StaleCarryRejection::WindowScratch,
+                stale_pending_roots.len(),
+            );
             ClaudeStaleFamilyCarry::default()
         } else if scoped_retry_allowed || full_rearm_window_roots.is_empty() {
-            claude_fence_closed_retry_carry(
+            claude_fence_closed_retry_carry_observed(
                 index,
                 &stale_pending_roots,
                 prior_traversal_context_matches,
                 prior_unsettled_upload,
                 scoped_retry_allowed,
+                &mut stale_carry_rejection_counts,
             )
         } else if retry_can_reopen {
+            stale_carry_rejection_counts.reject(
+                StaleCarryRejection::ProvenanceOrContext,
+                stale_pending_roots.len(),
+            );
             ClaudeStaleFamilyCarry::default()
         } else {
-            claude_fence_closed_retry_carry(index, &full_rearm_window_roots, true, false, false)
+            stale_carry_rejection_counts.reject(
+                StaleCarryRejection::ProvenanceOrContext,
+                stale_pending_roots
+                    .len()
+                    .saturating_sub(full_rearm_window_roots.len()),
+            );
+            claude_fence_closed_retry_carry_observed(
+                index,
+                &full_rearm_window_roots,
+                true,
+                false,
+                false,
+                &mut stale_carry_rejection_counts,
+            )
         };
         let ClaudeStaleFamilyCarry {
             roots: mut carried_roots,
@@ -39555,7 +39665,17 @@ fn ensure_bounded_traversal(
             replay
         } else {
             let mut retained_roots = carried_roots.union(&capped_roots).cloned().collect();
-            let replay = fund_claude_family_carry_cancellations(index, &mut retained_roots);
+            let replay = fund_claude_family_carry_cancellations(
+                index,
+                &mut retained_roots,
+                |root, stage| {
+                    // Capped roots already failed carry qualification, so never
+                    // count their cancellation loss as a second rejection.
+                    if carried_roots.contains(root) {
+                        stale_carry_rejection_counts.reject(stage, 1);
+                    }
+                },
+            );
             carried_roots.retain(|root| retained_roots.contains(root));
             capped_roots.retain(|root| retained_roots.contains(root));
             replay
@@ -39593,6 +39713,10 @@ fn ensure_bounded_traversal(
                 })
             },
         );
+        // Freeze counts before the stale-start clear. No counter is an input
+        // to carry, capping, tripwire admission, proof or fingerprint mutation.
+        stale_carry_rejection_counts.final_carried = carried_roots.len() as u64;
+        stale_carry_rejection_counts.record_before_clear(stale_pending_roots.len());
         let mut rearmed_file_count = 0_usize;
         let mut carried_file_count = 0_usize;
         let mut capped_file_count = 0_usize;
@@ -39648,7 +39772,7 @@ fn ensure_bounded_traversal(
             eprintln!(
                 "local snapshot census re-armed stale Claude request evidence: {} pending \
                  family/families, {} indexed file(s); carried_families={} rearmed_families={}; \
-                 bounded scan counters include this work",
+                 bounded scan counters include this work; stale_carry_rejection_counts={}",
                 stale_pending_roots.len(),
                 rearmed_file_count,
                 carried_roots.len(),
@@ -39660,6 +39784,7 @@ fn ensure_bounded_traversal(
                             .as_ref()
                             .map_or(true, |covered| covered.contains(*root)))
                     .count(),
+                stale_carry_rejection_counts.json(),
             );
         }
         if !carried_roots.is_empty() {

@@ -395,3 +395,52 @@ All diagnostics are best-effort local stderr observations. Their counters never
 feed collection, proof, save, memory admission, account attribution or upload
 decisions. Scopes and counters use fixed integers and inline storage, with no
 new locks, heap allocations, event history, lookups or background work.
+
+### Stale-start carry rejection histogram
+
+The existing local text line beginning `local snapshot census re-armed stale
+Claude request evidence:` appends `stale_carry_rejection_counts={...}`. This is
+**a text-line suffix**, not a new `local_resources` field or a wire field. The
+JSON object has eleven fixed `u64` keys, including explicit zeros:
+
+- `provenance_or_context`: retained provenance rewind or missing same-context
+  admission prevents this carry route. Valid legacy full-rearm-window carry
+  remains eligible through its existing separate route.
+- `contract`: missing identity contract or its changed latch.
+- `accepted_ledger`: accepted ledger version/reconciliation is not current.
+- `upload_context`: retained and active upload context differ.
+- `window_scratch`: active full-rearm window's combined Fix 2/C1b scratch price
+  refused, selecting the existing empty-carry fallback.
+- `ordinary_scratch`: selected ordinary carry scratch or streaming structural
+  admission refused.
+- `member_evidence`: membership, body/ACK, pending, legacy/fence or evidence
+  qualification refused after earlier route admission.
+- `cancellation_funding`: the selected cancellation price refused.
+- `reserve_allocation`: an actual member/replay vector reservation failed.
+- `eligible_before_funding`: roots that passed member/evidence qualification
+  before the selected route's cancellation reservation. Streaming pre-prices
+  cancellation before member qualification, so an early refusal can have zero
+  observed eligible roots; this is not a claim that no root could qualify.
+- `final_carried`: final carried roots after both cancellation funding passes.
+
+Counts are captured immediately before the existing stale-start fingerprint
+clear and appended where the existing re-arm text line is emitted. A resumed
+page, cadence wait, or start that emits no such line adds no log write or JSON
+serialization. These fixed counters add no retained graph, root history or
+extra source walks. Structured traversal-transition rows and their size budgets
+are unchanged. Integers saturate; no tokens, paths, sessions, hashes or content
+are included.
+
+Each stale root has one first rejection on its selected route or a final carry:
+the nine rejection buckets plus `final_carried` sum to the line's pending-family
+count. Window scratch is checked before entering ordinary carry; within an
+ordinary start-admission refusal, precedence is context, contract, ledger,
+upload context, then remaining legacy/member admission. A successful streaming
+alternate rescues ordinary scratch refusal. Failed whole-set/batch probes are
+discarded when a smaller batch succeeds; uncovered/deferred roots retain the
+first whole-set capacity refusal, while selected roots use their actual outcome.
+An existing admission cursor's whole-set deferral counts as structural scratch
+refusal. This describes carry admission, not unique families over multiple
+starts, proof completeness, actual rereads, or permission to change checkpoints.
+Capped roots retain their earlier carry rejection and cannot be counted again
+if the final combined cancellation funding refuses them.
