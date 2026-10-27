@@ -3642,7 +3642,22 @@ fn tag_item(
 }
 
 crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
+crate::durable_tail_codec::durable_struct!(OrgMarkers {
+    U entries: Vec<OrgMarker>,
+    U starting_marker: Option<OrgMarker>,
+    N overflowed: bool,
+    H context_digest: Option<String>,
+    N context_changed: bool,
+    N context_position: Option<u64>,
+    N context_flip_position: Option<u64>,
+    E home: Option<crate::claude_status_coverage::HomeKey>,
+});
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
+crate::durable_tail_codec::durable_struct!(OrgMarker {
+    N position: u64,
+    U org: Option<String>,
+    N terminal_trusted: bool,
+});
 crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_seconds, process_id, inventory);
 crate::heap_layout_bound::fields!(AccountDisplay; current, history);
 crate::heap_layout_bound::fields!(ActiveSessionCurrentAccount; status, account_identifier_hash, organization_identifier_hash, subscription_product, latest_request_at, unknown_reason);

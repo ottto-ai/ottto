@@ -74,6 +74,11 @@ pub(super) enum ClaudeCompactionTrigger {
     Manual,
     Idle,
 }
+crate::durable_tail_codec::durable_enum!(ClaudeCompactionTrigger {
+    0 => Auto,
+    1 => Manual,
+    2 => Idle,
+});
 
 impl ClaudeCompactionTrigger {
     pub(super) fn from_marker(value: Option<&str>) -> Option<Self> {
@@ -288,6 +293,10 @@ struct CodexCompactionSize {
     before: Option<NonZeroU64>,
     after: Option<NonZeroU64>,
 }
+crate::durable_tail_codec::durable_struct!(CodexCompactionSize {
+    N before: Option<NonZeroU64>,
+    N after: Option<NonZeroU64>,
+});
 
 /// Sizes for the newest distinct Codex marker timestamps, sorted by the same
 /// string order as `bounded_compaction_timestamps`. Pruned during parsing:
@@ -298,6 +307,10 @@ pub(super) struct CodexCompactionSizes {
     entries: Vec<(String, CodexCompactionSize)>,
     pending_after: bool,
 }
+crate::durable_tail_codec::durable_struct!(CodexCompactionSizes {
+    N entries: Vec<(String, CodexCompactionSize)>,
+    N pending_after: bool,
+});
 
 impl CodexCompactionSizes {
     /// Keep the first marker at each timestamp. Once a timestamp falls below

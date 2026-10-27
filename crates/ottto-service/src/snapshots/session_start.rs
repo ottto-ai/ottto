@@ -459,14 +459,84 @@ pub(super) struct SessionStartState {
     shell_moved: bool,
     /// An opening Claude response spanned several requests.
     collapsed_requests: bool,
+    /// End offset of the line that froze the window, when the reader knew it.
+    /// The re-derived opening content (M1 durable warm-cache) is final there.
+    frozen_at: Option<u64>,
 }
 
 crate::heap_layout_bound::fields!(OpeningRequest; context_tokens, uncached_input_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, parts_reconcile, output_tokens);
+crate::durable_tail_codec::durable_struct!(OpeningRequest {
+    N context_tokens: u64,
+    N uncached_input_tokens: u64,
+    N cache_read_tokens: u64,
+    N cache_write_5m_tokens: Option<u64>,
+    N cache_write_1h_tokens: Option<u64>,
+    N parts_reconcile: bool,
+    N output_tokens: u64,
+});
 crate::heap_layout_bound::fields!(ClaudeBlob; parts, unmeasurable, config_digest);
+crate::durable_tail_codec::durable_struct!(ClaudeBlob {
+    N parts: [u64; PARTS],
+    N unmeasurable: bool,
+    H config_digest: Option<ConfigDigest>,
+});
 crate::heap_layout_bound::fields!(ConfigDigest; a, b, len);
+crate::durable_tail_codec::durable_struct!(ConfigDigest {
+    H a: u64,
+    H b: u64,
+    N len: u64,
+});
 crate::heap_layout_bound::fields!(OpeningCall; response, tool, candidates, files, answered, truncated);
+crate::durable_tail_codec::durable_struct!(OpeningCall {
+    N response: u8,
+    U tool: String,
+    N candidates: u64,
+    E files: Vec<String>,
+    N answered: bool,
+    N truncated: bool,
+});
 crate::heap_layout_bound::fields!(OpeningFileState; ordinal, tool, repo_path, instruction_segments, reads, chars, client_loaded, truncated);
-crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
+crate::durable_tail_codec::durable_struct!(OpeningFileState {
+    N ordinal: u64,
+    U tool: String,
+    X repo_path: Option<String>,
+    N instruction_segments: u8,
+    N reads: [u64; 2],
+    N chars: [u64; 2],
+    N client_loaded: [bool; 2],
+    N truncated: [bool; 2],
+});
+crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests, frozen_at);
+crate::durable_tail_codec::durable_struct!(SessionStartState {
+    U client_version: Option<String>,
+    N user_turns: u8,
+    N inherited_prefix: bool,
+    N frozen: bool,
+    N requests: [Option<OpeningRequest>; WINDOW_REQUESTS],
+    N codex_requests: u8,
+    N response_tool_calls: [u64; 2],
+    N truncated_outputs: [u64; 2],
+    N parts: [u64; PARTS],
+    N parts_closed: bool,
+    N parts_unmeasurable: bool,
+    N codex_tools_logged: bool,
+    H config_digest: Option<ConfigDigest>,
+    L claude_shape: Option<(String, u64, u64)>,
+    L claude_blobs: BTreeMap<String, ClaudeBlob>,
+    N memory_units: Option<u64>,
+    N instruction_load_cut: Option<bool>,
+    X instructions: Option<String>,
+    N instructions_capped: bool,
+    X codex_prelude: Option<Box<CodexPreludeParser>>,
+    L calls: BTreeMap<String, OpeningCall>,
+    L last_codex_call: Option<String>,
+    X files: BTreeMap<String, OpeningFileState>,
+    N files_untracked: [u64; 2],
+    N held_bytes: usize,
+    N shell_moved: bool,
+    N collapsed_requests: bool,
+    N frozen_at: Option<u64>,
+});
 
 impl SessionStartState {
     pub(super) fn note_user_turn(&mut self) {
@@ -486,6 +556,8 @@ impl SessionStartState {
 
     fn freeze(&mut self) {
         self.frozen = true;
+        self.frozen_at = crate::durable_tail_codec::current_line()
+            .map(|(offset, len)| offset.saturating_add(len));
         if !self.parts_closed {
             self.parts_closed = true;
             self.parts_unmeasurable = true;
@@ -499,6 +571,42 @@ impl SessionStartState {
         self.claude_shape = None;
         self.last_codex_call = None;
         self.recount_held();
+    }
+
+    /// M1 durable warm-cache reuse: the digest of the opening content a
+    /// record never carries (instruction text, the Codex prelude with its cwd
+    /// and AGENTS.md, opening file paths), or `None` when there is none.
+    /// Content is re-derived from the file head, so it must be final: the
+    /// window froze on a known line within `bound`.
+    pub(super) fn durable_content_digest(
+        &self,
+        bound: u64,
+    ) -> Result<Option<([u8; 32], u64)>, crate::durable_tail_codec::Refuse> {
+        use crate::durable_tail_codec::{Durable, Enc, Refuse};
+        if self.instructions.is_none() && self.codex_prelude.is_none() && self.files.is_empty() {
+            return Ok(None);
+        }
+        let end = self
+            .frozen_at
+            .filter(|end| self.frozen && *end <= bound)
+            .ok_or(Refuse::NotRederivable("SessionStartState.frozen_at"))?;
+        let mut e = Enc::hash("ottto-dt-rederive:session_start:v1");
+        self.instructions.put(&mut e)?;
+        self.codex_prelude.put(&mut e)?;
+        self.files.put(&mut e)?;
+        Ok(Some((e.finish_hash(), end)))
+    }
+
+    /// Moves the re-derived opening content from a head re-parse.
+    pub(super) fn adopt_durable_content(&mut self, from: &mut Self) {
+        self.instructions = from.instructions.take();
+        self.codex_prelude = from.codex_prelude.take();
+        self.files = std::mem::take(&mut from.files);
+    }
+
+    /// End of the line that froze the window, when known.
+    pub(super) fn durable_content_end(&self) -> Option<u64> {
+        self.frozen_at
     }
 
     fn charge(&mut self, bytes: usize) -> bool {

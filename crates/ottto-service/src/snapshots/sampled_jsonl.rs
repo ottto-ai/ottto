@@ -31,6 +31,17 @@ pub(crate) struct CachedJsonlReduction {
 }
 crate::heap_layout_bound::fields!(CachedJsonlReduction; accumulator, report,
     recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
+crate::durable_tail_codec::durable_struct!(CachedJsonlReduction {
+    D accumulator: SnapshotAccumulator,
+    D report: JsonlReadReport,
+    N recognized_usage_drop_count: usize,
+    N positive_recognized_usage_count: usize,
+    N positive_usage_evidence: bool,
+});
+
+/// M1 durable warm-cache reuse: the record body and its re-derivation.
+#[cfg(unix)]
+pub(super) mod durable;
 impl CachedJsonlReduction {
     /// The copy's usage witness (`SnapshotAccumulator::usage_witness`), kept
     /// beside a taken copy for P1-RETAIN R0's Q-PR15 guard.

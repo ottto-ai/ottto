@@ -499,8 +499,38 @@ pub(crate) fn char_count(text: &str) -> u64 {
 }
 
 crate::heap_layout_bound::fields!(LoadedAgentsMd; directory, text);
+crate::durable_tail_codec::durable_struct!(LoadedAgentsMd {
+    X directory: Option<String>,
+    X text: String,
+});
 crate::heap_layout_bound::fields!(CodexPrelude; cwd, started_at, is_fork, complete, model, context_window, first_input_tokens, base_instructions_chars, other_harness_chars, hook_chars, block_chars, blocks_incomplete, input_closed, world_state_seen, agents_md, agents_md_capped, skills_body);
+crate::durable_tail_codec::durable_struct!(CodexPrelude {
+    X cwd: Option<String>,
+    N started_at: Option<i64>,
+    N is_fork: bool,
+    N complete: bool,
+    U model: Option<String>,
+    N context_window: Option<u64>,
+    N first_input_tokens: Option<u64>,
+    N base_instructions_chars: u64,
+    N other_harness_chars: u64,
+    N hook_chars: u64,
+    N block_chars: [u64; BLOCK_KINDS],
+    N blocks_incomplete: bool,
+    N input_closed: bool,
+    N world_state_seen: bool,
+    X agents_md: Option<LoadedAgentsMd>,
+    N agents_md_capped: bool,
+    E skills_body: Option<String>,
+});
 crate::heap_layout_bound::fields!(CodexPreludeParser; prelude, session_id, rows_after_first_request, agents_md_cap, keep_skills_body);
+crate::durable_tail_codec::durable_struct!(CodexPreludeParser {
+    X prelude: CodexPrelude,
+    U session_id: Option<String>,
+    N rows_after_first_request: usize,
+    N agents_md_cap: usize,
+    N keep_skills_body: bool,
+});
 
 // -------------------------------------------------------------------------
 // AGENTS.md chain -> per-file items.

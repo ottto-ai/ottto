@@ -50,6 +50,7 @@ pub(in crate::snapshots) const KNOWN_COPY_WRITERS: &[&str] = &["2.1.309", "2.1.3
 /// A missing/unknown version or two different known writers invalidates it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ClaudeWriterRun(u8);
+crate::durable_tail_codec::durable_struct!(ClaudeWriterRun(N x0: u8));
 impl ClaudeWriterRun {
     fn observe(&mut self, version: Option<&str>) {
         let id = version
@@ -80,6 +81,10 @@ struct ClaudeOwnWriters {
     latest: i64,
     others: [i64; KNOWN_COPY_WRITERS.len()],
 }
+crate::durable_tail_codec::durable_struct!(ClaudeOwnWriters {
+    N latest: i64,
+    N others: [i64; KNOWN_COPY_WRITERS.len()],
+});
 impl Default for ClaudeOwnWriters {
     fn default() -> Self {
         Self {
@@ -123,6 +128,12 @@ pub(in crate::snapshots) struct ClaudeOpenedBirth {
     pub(in crate::snapshots) inode: u64,
     pub(in crate::snapshots) size: u64,
 }
+crate::durable_tail_codec::durable_struct!(ClaudeOpenedBirth {
+    N birth: u64,
+    N device: u64,
+    N inode: u64,
+    N size: u64,
+});
 impl ClaudeOpenedBirth {
     pub(in crate::snapshots) fn from_metadata(metadata: &fs::Metadata) -> Self {
         let birth = metadata
@@ -174,6 +185,12 @@ pub(crate) enum ClaudeBirthScope {
     /// the opened file, never from a later path lookup.
     Root(i128),
 }
+crate::durable_tail_codec::durable_enum!(ClaudeBirthScope {
+    0 => NotObserved,
+    1 => Subagent,
+    2 => RootUnknownBirth,
+    3 => Root(N x0: i128),
+});
 
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeBirthScope {
     const INLINE_ONLY: bool = true;
@@ -209,6 +226,22 @@ pub(crate) struct ClaudeFileBirth {
     all_response_writers: ClaudeWriterRun,
     opened: ClaudeOpenedBirth,
 }
+crate::durable_tail_codec::durable_struct!(ClaudeFileBirth {
+    N scope: ClaudeBirthScope,
+    I path_key_hash: u64,
+    N tagged_in_opening: bool,
+    N tagged_responses: u64,
+    N own_responses: u64,
+    N untimed_records: u64,
+    N first_own_sequence: Option<u64>,
+    N own_first_context: Option<u64>,
+    N own_peak_context: u64,
+    N own_last_context: Option<u64>,
+    N tagged_before_first_own: bool,
+    N writer: ClaudeOwnWriters,
+    N all_response_writers: ClaudeWriterRun,
+    I opened: ClaudeOpenedBirth,
+});
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeFileBirth {
     const INLINE_ONLY: bool = true;
     const STABLE_HEAP: bool = true;
@@ -294,6 +327,9 @@ impl ClaudeFileBirth {
     /// Refresh its current extent without replacing accumulated birth evidence.
     pub(super) fn refresh_opened(&mut self, current: &Self) {
         self.opened = current.opened;
+        // Same path, same key for a RAM copy; a durable-restored copy never
+        // carries this path-derived key (M1) and takes it from the live parse.
+        self.path_key_hash = current.path_key_hash;
     }
 
     /// `Some(true)` for a root record more than 60 s older than the file's

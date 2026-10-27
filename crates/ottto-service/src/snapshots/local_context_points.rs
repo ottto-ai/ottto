@@ -121,6 +121,10 @@ pub(crate) struct LocalContextPoint {
     pub(crate) at_unix_seconds: u32,
     pub(crate) prompt_tokens: u32,
 }
+crate::durable_tail_codec::durable_struct!(LocalContextPoint {
+    N at_unix_seconds: u32,
+    N prompt_tokens: u32,
+});
 
 impl crate::heap_layout_bound::HeapLayoutBound for LocalContextPoint {
     const INLINE_ONLY: bool = true;
@@ -136,6 +140,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for LocalContextPoint {
 pub(super) struct LocalContextPoints {
     points: Vec<LocalContextPoint>,
 }
+crate::durable_tail_codec::durable_struct!(LocalContextPoints {
+    N points: Vec<LocalContextPoint>,
+});
 
 impl LocalContextPoints {
     pub(super) fn push(&mut self, at: Option<&str>, prompt_tokens: u64) {

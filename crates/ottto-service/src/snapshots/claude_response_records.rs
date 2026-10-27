@@ -414,6 +414,10 @@ pub(super) enum CompactClaudeSelector {
     Interned(u32),
     Inline(Box<SelectorCapture>),
 }
+crate::durable_tail_codec::durable_enum!(CompactClaudeSelector {
+    0 => Interned(N x0: u32),
+    1 => Inline(U x0: Box<SelectorCapture>),
+});
 
 impl From<SelectorCapture> for CompactClaudeSelector {
     fn from(selector: SelectorCapture) -> Self {
@@ -427,6 +431,10 @@ enum ClaudeRecordText {
     SameAsFirstRecord,
     Own(Option<String>),
 }
+crate::durable_tail_codec::durable_enum!(ClaudeRecordText {
+    0 => SameAsFirstRecord,
+    1 => Own(L x0: Option<String>),
+});
 
 impl ClaudeRecordText {
     fn encode(value: Option<String>, first: Option<&Self>) -> Self {
@@ -540,6 +548,10 @@ enum ClaudeSlot {
     Derived(ClaudeSlotTokens),
     Explicit(Box<RequestSlot>),
 }
+crate::durable_tail_codec::durable_enum!(ClaudeSlot {
+    0 => Derived(N x0: ClaudeSlotTokens),
+    1 => Explicit(L x0: Box<RequestSlot>),
+});
 
 impl ClaudeSlot {
     fn encode(
@@ -981,10 +993,48 @@ impl HeapLayoutBound for ClaudeSlot {
     }
 }
 crate::heap_layout_bound::fields!(ClaudeResponseBook; index, responses, selectors);
+crate::durable_tail_codec::durable_struct!(ClaudeResponseBook {
+    L index: OwnedMap<String, u32>,
+    L responses: OwnedVec<ClaudeResponseObservation>,
+    U selectors: ClaudeSelectorTable,
+});
 crate::heap_layout_bound::fields!(ClaudeSelectorTable; selectors);
+crate::durable_tail_codec::durable_struct!(ClaudeSelectorTable {
+    U selectors: OwnedVec<SelectorCapture>,
+});
 crate::heap_layout_bound::fields!(CompactClaudeUsage; input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, costs);
+crate::durable_tail_codec::durable_struct!(CompactClaudeUsage {
+    N input_tokens: u64,
+    N output_tokens: u64,
+    N cache_read_tokens: u64,
+    N cache_creation_5m_tokens: u64,
+    N cache_creation_1h_tokens: u64,
+    N reasoning_output_tokens: u64,
+    N unattributed_total_tokens: u64,
+    N request_count: u64,
+    N costs: Option<Box<UsageCosts>>,
+});
 crate::heap_layout_bound::fields!(ClaudeSlotTokens; prompt_tokens, cache_read_tokens, cache_creation_tokens, uncached_tokens, output_tokens);
+crate::durable_tail_codec::durable_struct!(ClaudeSlotTokens {
+    N prompt_tokens: Option<u64>,
+    N cache_read_tokens: Option<u64>,
+    N cache_creation_tokens: Option<u64>,
+    N uncached_tokens: Option<u64>,
+    N output_tokens: Option<u64>,
+});
 crate::heap_layout_bound::fields!(CompactClaudeResponseRecord; usage, slot, physical_sequence, model, reasoning_effort, request_id, timestamp, computed_effective_input_context, selector, tool_uses);
+crate::durable_tail_codec::durable_struct!(CompactClaudeResponseRecord {
+    N usage: CompactClaudeUsage,
+    L slot: ClaudeSlot,
+    N physical_sequence: u16,
+    U model: ClaudeRecordText,
+    U reasoning_effort: ClaudeRecordText,
+    L request_id: ClaudeRecordText,
+    N timestamp: Option<String>,
+    N computed_effective_input_context: Option<u64>,
+    U selector: CompactClaudeSelector,
+    L tool_uses: Vec<(String, String)>,
+});
 
 /// R1a R8 (T3): main's (`bc77deb9`) decode-peak preflight, verbatim except that
 /// the two book methods take the book as an argument. T3 pins the peak, the
