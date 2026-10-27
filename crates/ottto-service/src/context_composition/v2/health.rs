@@ -57,6 +57,10 @@ pub(super) struct HealthEntry {
     /// Unix seconds: the end of the agent's run (its start until then).
     pub(super) scan_completed_at: i64,
     pub(super) files_checked: u64,
+    /// The backend requires this field. Runs from collectors that include
+    /// the audit's removal (#820) always send 0, meaning "not audited", never
+    /// "audited and equal": it is no evidence of composition equality.
+    /// Pending records from older collectors keep their stored value.
     pub(super) audit_differences: u64,
     pub(super) full_read_waiting_files: u64,
     pub(super) full_read_backlog_bytes: u64,
