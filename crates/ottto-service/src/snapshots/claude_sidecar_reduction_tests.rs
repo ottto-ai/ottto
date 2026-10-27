@@ -909,6 +909,9 @@ mod durable_restart {
             restored(&second),
             u64::from(crate::heap_layout_bound::layout_supported())
         );
+        if let Some((counters, store)) = second.durable_counters(SOURCE) {
+            println!("{}", counters.summary(SOURCE, &store));
+        }
         assert_oracle(&f, &cached, prior);
     }
 

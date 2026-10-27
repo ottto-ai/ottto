@@ -669,3 +669,39 @@ fn budget_bounds_hold() {
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
 }
+
+/// Budget receipt (measured) on the synthetic transcripts: body and record
+/// bytes, the encode buffer, and one restore's re-derivation I/O.
+#[test]
+fn codec_budget_receipt() {
+    for case in cases() {
+        let scratch = Scratch::new("receipt");
+        let path = scratch.write("t.jsonl", &case.lines);
+        let (reduction, _) = full_read(&path, case.source);
+        let mut e = Enc::bytes(crate::durable_tail_store::RECORD_BYTES);
+        reduction.put(&mut e).unwrap();
+        let encode_buffer = e.into_bytes().capacity();
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
+        let (_, receipt) = restore(&path, &body, case.source).unwrap();
+        println!(
+            "dt_codec_budget: source={} file_bytes={} body_bytes={} record_bytes={} \
+             encode_buffer_bytes={} rederive_head_bytes={} rederive_named_lines={} \
+             rederive_line_bytes={}",
+            case.source.api_slug(),
+            fs::metadata(&path).unwrap().len(),
+            body.len(),
+            body.len() + 356,
+            encode_buffer,
+            receipt.head_bytes,
+            receipt.named_lines,
+            receipt.line_bytes,
+        );
+        assert!(body.len() <= crate::durable_tail_store::RECORD_BYTES);
+        assert!(receipt.head_bytes <= HEAD_BOUND);
+    }
+}

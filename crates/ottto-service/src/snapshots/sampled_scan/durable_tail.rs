@@ -88,7 +88,8 @@ impl Counters {
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
-             bytes_read={} gc_records_deleted={} peak_codec_bytes={}",
+             bytes_read={} refused{{corrupt:{},newer:{},older:{},allowlist:{},unusable:{}}} \
+             gc_records_deleted={} peak_codec_bytes={}",
             source.api_slug(),
             self.restore_attempts,
             self.restored,
@@ -112,6 +113,11 @@ impl Counters {
             store.records_clean,
             store.budget_refused,
             store.bytes_read,
+            store.refused_corrupt,
+            store.refused_newer,
+            store.refused_older,
+            store.refused_allowlist,
+            store.refused_unusable,
             store.gc_records_deleted,
             store.peak_codec_bytes,
         )

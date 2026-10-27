@@ -472,6 +472,25 @@ impl ReofferPipeline {
         (cycle, parsed, bytes)
     }
 
+    /// M1: deletes every durable warm-cache store under the support
+    /// directory, so the next restart also loses the store and reads cold.
+    fn drop_durable_stores(&self) {
+        fn walk(dir: &std::path::Path) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if path.extension().is_some_and(|ext| ext == "durable-tail") {
+                    std::fs::remove_dir_all(&path).unwrap();
+                } else {
+                    walk(&path);
+                }
+            }
+        }
+        walk(&self.support);
+    }
+
     fn transcript(&self) -> PathBuf {
         self.fixture
             .home
@@ -1466,8 +1485,12 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
         );
     }
 
-    // The reserved day arrives: exactly one re-read and one offer.
+    // The reserved day arrives: exactly one re-read and one offer. With the
+    // M1 durable warm cache a restart would restore this file and read no
+    // bytes; this cycle measures the cold reconstruction, so the restart
+    // also loses the store.
     let due = deadline.as_u64().unwrap() + 60;
+    pipeline.drop_durable_stores();
     let (day2, parsed, bytes) = pipeline.measured_cycle(due, true);
     assert_eq!(day2.leased_offers, 1);
     assert_eq!(parsed, 1, "one reconstruction at the due time");
