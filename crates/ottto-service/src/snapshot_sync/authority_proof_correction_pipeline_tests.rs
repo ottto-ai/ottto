@@ -816,6 +816,12 @@ impl ApcFixture {
             &cutoff_candidates,
             settlement.fully_settled,
         );
+        index.settle_upload_contexts(
+            &scan,
+            &progress.accepted_fingerprints,
+            &progress.accepted_body_witnesses,
+            &holds.held_fingerprints,
+        );
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,
@@ -2355,6 +2361,12 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
                 &[],
                 &[],
                 selected.fully_settled,
+            );
+            index.settle_upload_contexts(
+                &scan,
+                &progress.accepted_fingerprints,
+                &progress.accepted_body_witnesses,
+                &holds.held_fingerprints,
             );
             assert_eq!(
                 settled,

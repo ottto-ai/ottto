@@ -521,9 +521,21 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
     assert_eq!(canonical(&a), canonical(&b));
     dark.index
         .record_accepted_snapshot_fingerprints(&a.accepted_fingerprints);
+    dark.index.settle_upload_contexts(
+        &dark.scan,
+        &a.accepted_fingerprints,
+        &a.accepted_body_witnesses,
+        &BTreeSet::new(),
+    );
     reference
         .index
         .record_accepted_snapshot_fingerprints(&b.accepted_fingerprints);
+    reference.index.settle_upload_contexts(
+        &reference.scan,
+        &b.accepted_fingerprints,
+        &b.accepted_body_witnesses,
+        &BTreeSet::new(),
+    );
     assert_eq!(canonical(&dark.index), canonical(&reference.index));
     let next_a = c.raw(&scanner, dark.index, 100, false, &[]);
     let next_b = c.raw(&scanner, reference.index, 100, false, &[]);
@@ -842,6 +854,12 @@ fn e2_pipeline_settled_twins_are_not_read_again() {
                 assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
                 page.index
                     .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+                page.index.settle_upload_contexts(
+                    &page.scan,
+                    &progress.accepted_fingerprints,
+                    &progress.accepted_body_witnesses,
+                    &BTreeSet::new(),
+                );
             }
             pages.push((
                 page.scan.scanned_file_count,
@@ -887,6 +905,12 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
         complete
             .index
             .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        complete.index.settle_upload_contexts(
+            &complete.scan,
+            &progress.accepted_fingerprints,
+            &progress.accepted_body_witnesses,
+            &BTreeSet::new(),
+        );
         let prior = c.reload(&mut complete.index);
         std::fs::OpenOptions::new()
             .append(true)
@@ -1097,6 +1121,12 @@ fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
         first
             .index
             .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        first.index.settle_upload_contexts(
+            &first.scan,
+            &progress.accepted_fingerprints,
+            &progress.accepted_body_witnesses,
+            &BTreeSet::new(),
+        );
         let prior = c.reload(&mut first.index);
         let metadata = std::fs::metadata(&path).unwrap();
         c.evidence(&[api("root", 10, 100)], &[]);
@@ -1158,6 +1188,12 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
         baseline
             .index
             .record_accepted_snapshot_fingerprints(&baseline_progress.accepted_fingerprints);
+        baseline.index.settle_upload_contexts(
+            &baseline.scan,
+            &baseline_progress.accepted_fingerprints,
+            &baseline_progress.accepted_body_witnesses,
+            &BTreeSet::new(),
+        );
         let prior = c.reload(&mut baseline.index);
         c.evidence(
             &[
@@ -1758,6 +1794,12 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             );
             let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
             settle_index_after_upload(&mut settled.index, committed, progress);
+            settled.index.settle_upload_contexts(
+                &page.scan,
+                &progress.accepted_fingerprints,
+                &progress.accepted_body_witnesses,
+                &holds.held_fingerprints,
+            );
             c.reload(&mut settled.index)
         };
         let old = ScanIndex::default();
@@ -1803,6 +1845,12 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
         );
         let mut settlement = settle_completed_upload(held.index, &committed, &progress, &holds);
         settle_index_after_upload(&mut settlement.index, &committed, &progress);
+        settlement.index.settle_upload_contexts(
+            &held.scan,
+            &progress.accepted_fingerprints,
+            &progress.accepted_body_witnesses,
+            &holds.held_fingerprints,
+        );
         let restored = c.reload(&mut settlement.index);
         assert_eq!(
             restored.current_snapshot_fingerprints(),
@@ -1837,6 +1885,12 @@ fn settle(
     );
     let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
     settle_index_after_upload(&mut settled.index, committed, progress);
+    settled.index.settle_upload_contexts(
+        &page.scan,
+        &progress.accepted_fingerprints,
+        &progress.accepted_body_witnesses,
+        &holds.held_fingerprints,
+    );
     c.reload(&mut settled.index)
 }
 fn body<'a>(page: &'a Page, session: &str) -> Option<&'a SnapshotItem> {

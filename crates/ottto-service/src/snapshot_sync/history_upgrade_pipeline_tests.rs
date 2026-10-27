@@ -414,6 +414,12 @@ impl HistoryFixture {
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
+        index.settle_upload_contexts(
+            &scan,
+            &progress.accepted_fingerprints,
+            &progress.accepted_body_witnesses,
+            &holds.held_fingerprints,
+        );
         index.save(&index_path).expect("save scan index");
         HistoryOutcome {
             scan,
