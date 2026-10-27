@@ -1450,6 +1450,7 @@ fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture 
         base,
         case: "native-parity-independent-index",
         request_identity: source.request_identity,
+        hinted_paths: source.hinted_paths.clone(),
         native_file_limit: source.native_file_limit,
         serial_active_frame: source.serial_active_frame,
         owned_base_preparation: source.owned_base_preparation,
