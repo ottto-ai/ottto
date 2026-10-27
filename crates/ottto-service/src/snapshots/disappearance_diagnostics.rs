@@ -1542,8 +1542,10 @@ mod tests {
 }
 
 #[cfg(test)]
+type AbsenceParentProbeHook = Box<dyn FnOnce()>;
+#[cfg(test)]
 thread_local! {
-    static ABSENCE_PARENT_PROBE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static ABSENCE_PARENT_PROBE_HOOK: std::cell::RefCell<Option<AbsenceParentProbeHook>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
 pub(super) fn before_absence_parent_probe() {

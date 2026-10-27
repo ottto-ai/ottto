@@ -41161,8 +41161,8 @@ fn advance_bounded_directory_traversal_with_budget(
 /// so the census settles it as a removal, the same as a watcher remove hint.
 /// A missing, renamed or unmounted parent is not evidence of removal and keeps
 /// the NotFound as loss.
-fn claude_absence_parent(path: &Path) -> local_resource_diagnostics::claude_absence::Parent {
-    use local_resource_diagnostics::claude_absence::Parent;
+fn claude_absence_parent(path: &Path) -> crate::local_resource_diagnostics::claude_absence::Parent {
+    use crate::local_resource_diagnostics::claude_absence::Parent;
     #[cfg(test)]
     disappearance_diagnostics::before_absence_parent_probe();
     match path.parent().map(fs::symlink_metadata) {
