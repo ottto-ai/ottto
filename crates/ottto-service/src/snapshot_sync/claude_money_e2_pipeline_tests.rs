@@ -2583,3 +2583,41 @@ fn e2_pipeline_root_conflict_only_file_publishes_its_disclosure() {
 fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
     conflict_only(true);
 }
+
+/// A cold walk knows both paths before either is indexed. A one-file
+/// selection must consume their complete family once, rather than read the
+/// original alone and then force it back when the queued twin arrives.
+#[test]
+fn e2_pipeline_cold_known_twins_read_once_across_page_boundary() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-cold-known-twins-once");
+        c.write_at(
+            &format!("a/{ROOT}.jsonl"),
+            &line(ROOT, "r1", AT, 10),
+            "2026-08-02T07:00:00Z",
+        );
+        c.write_at(
+            &format!("z/{ROOT}.jsonl"),
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let prior = ScanIndex::default();
+        let page = ready(&c, &scanner, prior.clone(), 1, false);
+        literal(&page);
+        assert_eq!(page.scan.scanned_file_count, 2, "known family is complete");
+        assert_eq!(total(&page), 2, "copy skipped; own new request preserved");
+        let prior = settle(&c, &prior, page, &mut progress);
+        let stored = stored_bodies(&prior);
+        let page = ready(&c, &scanner, prior.clone(), 1, false);
+        assert_eq!(
+            page.scan.scanned_file_count, 0,
+            "queued sibling was consumed once"
+        );
+        assert!(page.scan.snapshots.is_empty());
+        let prior = settle(&c, &prior, page, &mut progress);
+        assert_eq!(stored_bodies(&prior), stored);
+        assert_eq!(scanner.paths().len(), 2, "two acquisitions over both pages");
+    });
+}

@@ -25851,11 +25851,24 @@ impl OwnedSourceScan {
                 .iter()
                 .map(|candidate| local_index_key(&candidate.path))
                 .collect::<BTreeSet<_>>();
-            let family_index_keys = if claude_family_membership_is_authoritative {
+            // A known twin can still be unindexed on a cold walk. Pull its
+            // discovered family from the same traversal queue now, before any
+            // original is parsed alone and then pulled back on a later page.
+            // Other forced retries keep their existing membership boundary.
+            let family_index_keys = if claude_family_membership_is_authoritative
+                || !claude_twin_only_family_reparses.is_empty()
+            {
                 index
                     .traversal
                     .as_ref()
-                    .map(|traversal| traversal.observed_index_keys.clone())
+                    .map(|traversal| {
+                        let mut keys = traversal.observed_index_keys.clone();
+                        if !claude_family_membership_is_authoritative {
+                            // Indexed siblings can be outside the walk frontier.
+                            keys.extend(index.files.keys().cloned());
+                        }
+                        keys
+                    })
                     .unwrap_or_default()
             } else {
                 index.files.keys().cloned().collect()
