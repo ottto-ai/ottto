@@ -1448,7 +1448,7 @@ fn latch_contract_generation(fixture: &RearmFixture, minute: usize) -> Vec<Rearm
         index.load_claude_reemission_exclusions(&fixture.support);
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
         index.observe_claude_request_identity_contract(fixture.request_identity);
-        let page = fixture.page_with_input_index(
+        let mut page = fixture.page_with_input_index(
             &format!("2026-08-02T08:{:02}:00Z", minute + number),
             RearmUpload::Accept,
             None,
@@ -1495,10 +1495,9 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
                     if case == "held" {
                         fixture.local_holds.insert(session.to_owned());
                     }
-                    let list =
-                        crate::snapshots::claude_reemission_exclusions::ReemissionExclusions::path(
-                            &fixture.support,
-                        );
+                    let list = fixture
+                        .support
+                        .join("snapshots/claude_code-reemission-exclusions.txt");
                     std::fs::create_dir_all(list.parent().unwrap()).unwrap();
                     let listed = if case == "listed" {
                         format!("{:x}\n", sha2::Sha256::digest(session.as_bytes()))

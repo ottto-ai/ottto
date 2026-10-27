@@ -3214,50 +3214,56 @@ fn scoped_unhealthy_retry_changed_member_cancels_only_its_funded_family() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let mut index = carry_index();
-    index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
-    index.claude_duplicate_fence_next_full_rearm_unix_seconds =
-        rfc3339_unix_seconds(CARRY_FAILED).map(|now| now + 86_400);
-    let [root_key, agent_key] = carry_family_keys();
-    let mut changed = scoped_retry_accept_member(&mut index, &root_key);
-    scoped_retry_accept_member(&mut index, &agent_key);
-    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
-    let before = index.clone();
-    let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
-    assert_eq!(row["carried_pending_families"], 1);
-    let traversal = index.traversal.as_mut().unwrap();
-    traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
-    traversal.observed_index_keys.extend(carry_family_keys());
-    carry_fill_queue(&mut index);
-    // New evidence changes the existing scan identity, independently of
-    // mtime. Normal candidate selection reaches the existing cancellation.
-    changed.source_file_fingerprint = "e".repeat(64);
-    assert_eq!(
-        index.candidate_decision_with_reason_at(&changed, 0),
-        (
-            CandidateDecision::Parse,
-            Some(CandidateParseReason::SourceChanged)
-        )
-    );
-    carry_cancel(&mut index);
-    assert!(!index.claude_stale_family_carry.contains(CARRY_ROOT));
-    assert!(index.files[&agent_key].source_file_fingerprint.is_empty());
-    assert_eq!(
-        index.claude_stale_family_carry.replay,
-        vec![carry_replayed(&agent_key)]
-    );
-    assert_eq!(
-        index.claude_usage_family_witnesses,
-        before.claude_usage_family_witnesses
-    );
-    assert_eq!(
-        index.session_account_bindings,
-        before.session_account_bindings
-    );
-    assert_eq!(
-        serde_json::to_value(&index.files[&carry_key(CARRY_OTHER, None)]).unwrap(),
-        serde_json::to_value(&before.files[&carry_key(CARRY_OTHER, None)]).unwrap()
-    );
+    for debt in [false, true] {
+        let mut index = carry_index();
+        index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds =
+            rfc3339_unix_seconds(CARRY_FAILED).map(|now| now + 86_400);
+        let [root_key, agent_key] = carry_family_keys();
+        let mut changed = scoped_retry_accept_member(&mut index, &root_key);
+        scoped_retry_accept_member(&mut index, &agent_key);
+        if debt {
+            index.claude_request_identity_contract_changed = true;
+        } else {
+            index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+        }
+        let before = index.clone();
+        let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["carried_pending_families"], 1);
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
+        traversal.observed_index_keys.extend(carry_family_keys());
+        carry_fill_queue(&mut index);
+        // New evidence changes the existing scan identity, independently of
+        // mtime. Normal candidate selection reaches the existing cancellation.
+        changed.source_file_fingerprint = "e".repeat(64);
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&changed, 0),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::SourceChanged)
+            )
+        );
+        carry_cancel(&mut index);
+        assert!(!index.claude_stale_family_carry.contains(CARRY_ROOT));
+        assert!(index.files[&agent_key].source_file_fingerprint.is_empty());
+        assert_eq!(
+            index.claude_stale_family_carry.replay,
+            vec![carry_replayed(&agent_key)]
+        );
+        assert_eq!(
+            index.claude_usage_family_witnesses,
+            before.claude_usage_family_witnesses
+        );
+        assert_eq!(
+            index.session_account_bindings,
+            before.session_account_bindings
+        );
+        assert_eq!(
+            serde_json::to_value(&index.files[&carry_key(CARRY_OTHER, None)]).unwrap(),
+            serde_json::to_value(&before.files[&carry_key(CARRY_OTHER, None)]).unwrap()
+        );
+    }
 }
 
 #[test]

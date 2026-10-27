@@ -30538,20 +30538,13 @@ impl OwnedSourceScan {
                 // next page starts, and that walk re-reads the stale files.
                 if !carried_next_generation.is_empty() && !index.bounded_sweep_had_unsettled_upload
                 {
-                    let progress = ensure_bounded_traversal(
+                    ensure_bounded_traversal(
                         source,
                         &roots,
                         index,
                         &collected_at,
                         backfill_window_days,
                     );
-                    if source == SnapshotSource::ClaudeCode
-                        && progress == TraversalProgress::Started
-                    {
-                        index.record_started_claude_request_identity_contract(
-                            claude_request_identity_capture,
-                        );
-                    }
                     if let Some(next) = index.traversal.as_mut() {
                         enqueue_watcher_hints(source, next, &carried_next_generation, false);
                     }
