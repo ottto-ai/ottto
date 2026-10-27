@@ -550,14 +550,16 @@ impl ServiceCommand {
 const HELD_STATE_LAUNCHD_BACKOFF: Duration = Duration::from_secs(10);
 
 /// Takes the single-writer lock on the local state directory before
-/// anything in `serve` or `serve-xpc` can read or write it, and returns it
-/// to be held for the life of the process. When another daemon holds it, or
-/// it cannot be taken, prints why and exits without writing any state.
+/// anything in `serve` or `serve-xpc` can read or write it, and holds it
+/// for the life of the process: an error return from `main` or a panic
+/// never frees it while relays, the snapshot worker or a listener thread
+/// still write. When another daemon holds it, or it cannot be taken,
+/// prints why and exits without writing any state.
 #[cfg(unix)]
-fn hold_local_state_or_exit() -> ottto_service::state_dir_lock::StateDirLock {
+fn hold_local_state_or_exit() -> &'static ottto_service::state_dir_lock::StateDirLock {
     use ottto_service::state_dir_lock::{StateDirLock, StateDirLockError};
     match StateDirLock::acquire(&ottto_core::default_support_dir()) {
-        Ok(lock) => lock,
+        Ok(lock) => lock.hold_until_exit(),
         Err(error) => {
             eprintln!("ottto-service: {error}; exiting without touching it");
             // launchd is the parent of every job it starts.
@@ -1140,6 +1142,11 @@ mod tests {
                 .count(),
             2
         );
+        // Held until the process exits, through any error return or unwind.
+        assert!(source.contains(
+            "fn hold_local_state_or_exit() -> &'static ottto_service::state_dir_lock::StateDirLock {"
+        ));
+        assert!(source.contains("Ok(lock) => lock.hold_until_exit(),"));
     }
 
     /// `status` is a diagnostic: it reads the token and machine binding the
