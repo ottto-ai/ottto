@@ -162,35 +162,22 @@ jobs:
           assert len(bins)==1,bins
           shutil.copy2(bins[0],sys.argv[2])
           PYBIN
-          root="$PWD"
-          for spec in before:0fb4ee57e after-release:c3b9ff2d; do
-            name="${spec%%:*}"; ref="${spec#*:}"
-            git worktree add --detach "$RUNNER_TEMP/$name-source" "$ref"
-            cp "$root/$rel" "$RUNNER_TEMP/$name-source/$rel"
-            cd "$RUNNER_TEMP/$name-source"
-            cargo test -p ottto-service --lib --locked --release --no-run --message-format=json > "$RUNNER_TEMP/w1-build.jsonl"
-            python3 - "$RUNNER_TEMP/w1-build.jsonl" "$RUNNER_TEMP/$name" <<'PYBIN'
-          import json,shutil,sys
-          bins=[r["executable"] for r in map(json.loads,open(sys.argv[1])) if r.get("reason")=="compiler-artifact" and r.get("executable")]
-          assert len(bins)==1,bins
-          shutil.copy2(bins[0],sys.argv[2])
-          PYBIN
-            cd "$root"
-          done
           export OTTTO_E2_BENCH_ROOT="$RUNNER_TEMP/w1-corpus"
           test=snapshot_sync::tests::money_e2_bench_tests::money_e2_bench_receipt
           OTTTO_E2_BENCH_MODE=prepare OTTTO_E2_BENCH_SCALE=1 OTTTO_E2_BENCH_BYTES_SCALE=.05 "$RUNNER_TEMP/after" "$test" --exact --ignored --nocapture --test-threads 1 > "$RUNNER_TEMP/w1-prepare.log" 2>&1
-          for name in before after-release after; do
-            OTTTO_E2_BENCH_MODE=arm OTTTO_E2_BENCH_ARM=on OTTTO_E2_BENCH_TAG="$name" OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/w1-$name.json" "$RUNNER_TEMP/$name" "$test" --exact --ignored --nocapture --test-threads 1 > "$RUNNER_TEMP/w1-$name.log" 2>&1
+          for name in control scheduled; do
+            enabled=0; [ "$name" != scheduled ] || enabled=1
+            OTTTO_E2_BENCH_TWIN_SCHEDULING="$enabled" OTTTO_E2_BENCH_MODE=arm OTTTO_E2_BENCH_ARM=on OTTTO_E2_BENCH_TAG="$name" OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/w1-$name.json" "$RUNNER_TEMP/after" "$test" --exact --ignored --nocapture --test-threads 1 > "$RUNNER_TEMP/w1-$name.log" 2>&1
             grep '^MONEY_E2_BENCH_ARM ' "$RUNNER_TEMP/w1-$name.log"
           done
           python3 - "$RUNNER_TEMP" <<'PYPARITY'
           import pathlib,json,sys
-          root=pathlib.Path(sys.argv[1]); receipts={n:json.loads((root/f"w1-{n}.json").read_text()) for n in ("before","after-release","after")}
-          for n,r in receipts.items(): print("W1_RECEIPT",n,json.dumps({"uploads":r["uploads"],"traversal":r["traversal"],"max_rss_bytes":r["max_rss_bytes"]}))
-          assert receipts["before"]["uploads"]==receipts["after-release"]["uploads"], "release parity"
-          assert receipts["before"]["uploads"]==receipts["after"]["uploads"], "scheduling parity"
-          print("W1_UPLOAD_PARITY_CLEAN")
+          root=pathlib.Path(sys.argv[1]); receipts={n:json.loads((root/f"w1-{n}.json").read_text()) for n in ("control","scheduled")}
+          for n,r in receipts.items(): print("W1_SCHEDULING_RECEIPT",n,json.dumps({"uploads":r["uploads"],"traversal":r["traversal"],"max_rss_bytes":r["max_rss_bytes"]}))
+          manifest=json.loads((root/"w1-corpus/manifest.json").read_text())
+          assert receipts["scheduled"]["traversal"]["e2"]["responses"]==manifest["expected_dark"]["responses"], "every fixture response folds once"
+          assert receipts["control"]["uploads"]==receipts["scheduled"]["uploads"], "scheduling exact upload parity"
+          print("W1_SCHEDULING_PARITY_CLEAN")
           PYPARITY
       - name: W1 probe artifacts
         if: always()

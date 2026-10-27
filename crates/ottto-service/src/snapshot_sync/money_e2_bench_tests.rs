@@ -34,6 +34,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 #[allow(dead_code)]
 mod reference_hook {
     pub(super) const STATE: &str = "reference";
+    pub(super) fn with_twin_scheduling<T>(_enabled: bool, run: impl FnOnce() -> T) -> T {
+        run()
+    }
 
     pub(super) fn with_gate<T>(on: bool, run: impl FnOnce() -> T) -> T {
         assert!(!on, "the reference build has no E2 gate");
@@ -88,6 +91,7 @@ mod e2_hook {
     pub(super) use crate::snapshots::claude_request_money::e2::bench_seam::{
         drain_counts, take_diag, take_stages, with_gate, with_staged_births,
     };
+    pub(super) use crate::snapshots::claude_request_money::e2::with_twin_scheduling_for_test as with_twin_scheduling;
 
     pub(super) fn with_revision<T>(revision: u64, run: impl FnOnce() -> T) -> T {
         crate::snapshots::with_max_gated_claude_revision(revision, || {
@@ -2213,10 +2217,15 @@ fn money_e2_bench_receipt() {
                 }
             }
             let staged = births.len();
-            let mut receipt = e2_hook::with_staged_births(births, || match mode.as_str() {
-                "arm" | "attribution" => arm(&base, &manifest, &arm_name),
-                "history" => history(&base, &arm_name),
-                _ => reread(&base, &manifest),
+            let mut receipt = e2_hook::with_staged_births(births, || {
+                e2_hook::with_twin_scheduling(
+                    env("OTTTO_E2_BENCH_TWIN_SCHEDULING").as_deref() != Some("0"),
+                    || match mode.as_str() {
+                        "arm" | "attribution" => arm(&base, &manifest, &arm_name),
+                        "history" => history(&base, &arm_name),
+                        _ => reread(&base, &manifest),
+                    },
+                )
             });
             receipt["staged_root_births"] = serde_json::json!(staged);
             receipt

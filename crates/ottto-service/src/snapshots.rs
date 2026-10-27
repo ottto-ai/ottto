@@ -25856,7 +25856,8 @@ impl OwnedSourceScan {
             // original is parsed alone and then pulled back on a later page.
             // Other forced retries keep their existing membership boundary.
             let family_index_keys = if claude_family_membership_is_authoritative
-                || !claude_twin_only_family_reparses.is_empty()
+                || (claude_request_money::e2::twin_scheduling_enabled()
+                    && !claude_twin_only_family_reparses.is_empty())
             {
                 index
                     .traversal
@@ -25887,7 +25888,8 @@ impl OwnedSourceScan {
                     (forced_claude_family_reparses.contains(&root_session_id)
                         && (claude_family_membership_is_authoritative
                             || index.files.contains_key(&index_key)
-                            || claude_twin_only_family_reparses.contains(&root_session_id)))
+                            || (claude_request_money::e2::twin_scheduling_enabled()
+                                && claude_twin_only_family_reparses.contains(&root_session_id))))
                     .then_some(path)
                 })
                 .collect::<BTreeSet<_>>();
