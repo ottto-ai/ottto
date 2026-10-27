@@ -4325,3 +4325,143 @@ fn contract_observation_counts_empty_transitions_without_prepare_scan_duplicates
     assert_eq!(counts.identity_contract_latch.set, 1);
     assert_eq!(counts.identity_contract_latch.cleared, 0);
 }
+
+#[test]
+fn contract_debt_storage_recheck_cannot_forget_prior_scoped_hold() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for debt in [false, true] {
+        let mut fixture = contract_debt_fixture(1);
+        fixture.index.claude_request_identity_contract_changed = debt;
+        let root = fixture.roots[0].clone();
+        fixture
+            .index
+            .mark_bounded_sweep_held_by_families(Some(&BTreeSet::from([root.clone()])));
+        let prior = claude_contract_debt_scope(&fixture.index);
+        assert_eq!(
+            claude_retry_singleton_storage_only_scoped(&fixture.index, &root, prior),
+            !debt
+        );
+        let (_, _, mut state) = claude_retry_admit_batch(
+            &fixture.index,
+            &BTreeSet::from([root.clone()]),
+            None,
+            CARRY_RETRY,
+        );
+        // Seed the already admitted Structure-refused read obligation. This
+        // regression concerns its later recheck, not the existing byte price.
+        state.oversized_root = Some(root.clone());
+        state.oversized_after_path = None;
+        state.storage_deferred = false;
+        state.complete = false;
+        fixture.index.claude_stale_family_carry = ClaudeStaleFamilyCarry {
+            origin: Some(ClaudeStaleFamilyCarryOrigin {
+                context_fingerprint: fixture
+                    .index
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .context_fingerprint
+                    .clone(),
+                process: claude_full_rearm_process(),
+                full_rearm_window: false,
+                admission: Some(state),
+            }),
+            ..Default::default()
+        };
+        fixture.index.traversal.as_mut().unwrap().scan_roots = vec![fixture._scratch.to_path_buf()];
+        fixture.index.claude_full_rearm_progress.held_family_roots = None;
+        fixture.index.bounded_sweep_had_unsettled_upload = false;
+        fixture.index.bounded_sweep_unsettled_causes = 0;
+        claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
+        let state = fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        assert_eq!(state.oversized_root.as_ref(), debt.then_some(&root));
+        assert_eq!(state.storage_deferred, !debt);
+        assert_eq!(
+            fixture
+                .index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .len(),
+            usize::from(debt),
+            "debt keeps the held read obligation runnable"
+        );
+    }
+}
+
+#[test]
+fn scanner_records_actual_contract_only_when_its_traversal_starts() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = contract_debt_fixture(1);
+    fixture.index.claude_request_identity_contract =
+        Some(CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL.to_owned());
+    let scan = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        &[],
+        fixture.index,
+        CARRY_RETRY,
+        BACKFILL_WINDOW_DAYS,
+        1,
+        false,
+        None,
+        &[],
+        false,
+        false,
+        true,
+    );
+    assert_eq!(
+        scan.index.claude_request_identity_contract.as_deref(),
+        Some(claude_request_identity::cycle_contract(true))
+    );
+    assert!(
+        scan.index.claude_request_identity_contract_changed,
+        "a real red-retry start records without clearing"
+    );
+    let mut index = scan.index;
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_directories
+        .push_back(ScanTraversalPath {
+            path: fixture._scratch.join("missing"),
+            scan_root: fixture._scratch.to_path_buf(),
+            census_member: true,
+            watcher_hint: false,
+        });
+    let scan = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        &[],
+        index,
+        CARRY_SECOND_RETRY,
+        BACKFILL_WINDOW_DAYS,
+        1,
+        false,
+        None,
+        &[],
+        false,
+        false,
+        false,
+    );
+    assert_eq!(
+        scan.index.claude_request_identity_contract.as_deref(),
+        Some(CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL)
+    );
+    assert!(
+        scan.index.claude_request_identity_contract_changed,
+        "a real resumed page retains the placeholder"
+    );
+}

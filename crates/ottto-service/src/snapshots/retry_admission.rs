@@ -146,6 +146,9 @@ fn claude_retry_admit_batch_observed(
                     // Structural refusal alone is no read obligation. Retain
                     // uncovered custody and let later roots make progress.
                     // The boolean is scheduling debt, never carry eligibility.
+                    if index.claude_request_identity_contract_changed {
+                        claude_contract::note(|counts| counts.deferred_by_contract_debt += 1);
+                    }
                     state.storage_deferred = true;
                     state.after_root = Some(root.clone());
                     state.roots_complete = !stale
@@ -185,7 +188,7 @@ fn claude_retry_admit_batch_observed(
 // borrowed identities, counts duplicate occurrences and validates pending keys.
 // Rescans are finite (ceil(members / 128)), with no heap growth or proof grant.
 fn claude_retry_singleton_storage_only(index: &ScanIndex, root: &str) -> bool {
-    claude_retry_singleton_storage_only_scoped(index, root, claude_contract_debt_scope(index))
+    claude_retry_singleton_storage_only_scoped(index, root, None)
 }
 fn claude_retry_singleton_storage_only_scoped(
     index: &ScanIndex,

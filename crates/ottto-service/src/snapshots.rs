@@ -5530,13 +5530,10 @@ fn claude_stale_member_accepted_retry_evidence(
         && (pending.invalid
             || !debt_scope.is_some_and(|roots| {
                 claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
-                    !roots.contains(&claude_full_rearm_root_digest(member.root))
+                    roots.is_empty() || !roots.contains(&claude_full_rearm_root_digest(member.root))
                 })
             })
-            || index.effective_upload_body_witness_revision_requires_adoption(key)
-            || index
-                .claude_history_emission_held(&entry.source_file_fingerprint)
-                .is_some())
+            || index.effective_upload_body_witness_revision_requires_adoption(key))
     {
         return false;
     }

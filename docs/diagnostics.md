@@ -502,3 +502,13 @@ same-count replacement or reorder counts. `root_count` is the most recent
 comparison's gauge, including zero. These process-local observations do not
 persist or affect decisions; no roots, paths, keys, namespaces, hashes, token
 values or body contents are emitted.
+
+The deferral count includes newly classified storage-only singleton deferrals;
+those retain custody without granting carry or proof. Under contract debt the
+existing stale-carry `contract` rejection bucket also includes member-evidence
+refusals. With no comparison lease, per-cycle permit counts use the existing
+prepare decision line once per attempted Claude cycle. A malformed hint window
+counts as `hint_failed`, before any contract observation. While a placeholder
+is stored, permit flaps remain visible in permit outcomes but cannot be
+classified into `from_empty`, `to_empty` or `collector_e2_grouping` from that
+unknown prior contract.
