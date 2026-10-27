@@ -290,11 +290,7 @@ pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> u
             .as_ref()
             .filter(|slot| {
                 slot.key == *key
-                    && (index.claude_large_full_deferred.contains(key)
-                        || (index.claude_large_full_deferred.overflowing()
-                            && index.files.get(key).is_some_and(|entry| {
-                                entry.size_bytes > claude_large_full::LARGE_FULL_BYTES
-                            })))
+                    && (index.claude_large_full_deferred.contains(key) || slot.large_full_deferred)
             })
             .map_or(due, |slot| due.min(slot.due));
         if let Some(entry) = index.files.get_mut(key) {
@@ -320,8 +316,12 @@ pub(super) struct HeldAuditProgress {
     pub(super) key: String,
     pub(super) due: u64,
     pub(super) attempted: bool,
+    /// Negative scheduling evidence: this actual large Full was delayed.
+    /// Independent of cached priority and the last committed file size.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) large_full_deferred: bool,
 }
-crate::heap_layout_bound::fields!(HeldAuditProgress; key, due, attempted);
+crate::heap_layout_bound::fields!(HeldAuditProgress; key, due, attempted, large_full_deferred);
 
 pub(super) fn progress_debt(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
     let slot = index.held_audit_progress.as_ref()?;
@@ -390,6 +390,7 @@ impl OwnedSourceScan {
                         key,
                         due,
                         attempted: false,
+                        large_full_deferred: false,
                     });
         }
         let Some(slot) = self.index.held_audit_progress.as_ref() else {
@@ -412,7 +413,7 @@ impl OwnedSourceScan {
         let Some(entry) = self.index.files.get(&key) else {
             return;
         };
-        let candidate = CandidateFile {
+        let mut candidate = CandidateFile {
             physical_identity: None,
             scan_root: root,
             path,
@@ -436,6 +437,18 @@ impl OwnedSourceScan {
             .identified_candidates
             .iter()
             .position(|candidate| local_index_key(&candidate.path) == key);
+        // A held file may have grown since its committed entry. Use native
+        // selection metadata (or one stat), so a newly large held audit cannot
+        // jump ahead of older debt by masquerading as its old small size.
+        candidate.size_bytes = prior_position
+            .map(|at| self.identified_candidates[at].size_bytes)
+            .or_else(|| {
+                fs::symlink_metadata(&candidate.path)
+                    .ok()
+                    .filter(|meta| meta.is_file())
+                    .map(|meta| meta.len())
+            })
+            .unwrap_or(candidate.size_bytes);
         self.identified_candidates
             .retain(|candidate| local_index_key(&candidate.path) != key);
         let large = claude_large_full::is_large(&candidate);
@@ -580,6 +593,7 @@ mod tests {
             key: held_key.clone(),
             due: 50,
             attempted: false,
+            large_full_deferred: false,
         });
         let mut seed = index.clone();
         let mut scan = OwnedSourceScan::new(
@@ -622,6 +636,8 @@ mod tests {
         candidate.scan_root = scratch.as_ref().to_path_buf();
         candidate.size_bytes = 257 * 1024 * 1024;
         scan.index.held_audit_progress.as_mut().unwrap().attempted = true;
+        // The actual file grew, while committed metadata is still small.
+        scan.index.files.get_mut(&held_key).unwrap().size_bytes = 1;
         let mut full_spent = true;
         assert!(!claude_large_full::admit(
             &mut scan.index,
@@ -638,7 +654,18 @@ mod tests {
                 .collect::<VecDeque<_>>(),
             VecDeque::from([old_key, held_key.clone()])
         );
+        assert!(
+            scan.index
+                .held_audit_progress
+                .as_ref()
+                .unwrap()
+                .large_full_deferred
+        );
         let mut overflow_index = scan.index.clone();
+        overflow_index.held_audit_progress = serde_json::from_slice(
+            &serde_json::to_vec(&overflow_index.held_audit_progress).unwrap(),
+        )
+        .unwrap();
         overflow_index.claude_large_full_deferred = claude_large_full::Priority::fallback();
         assert_eq!(restore_held_audit_deadlines(&mut overflow_index, 100), 1);
         assert_eq!(
@@ -658,10 +685,28 @@ mod tests {
             "source"
         );
 
+        let mut fresh_allowance = false;
+        assert!(claude_large_full::admit(
+            &mut scan.index,
+            &candidate,
+            true,
+            &mut fresh_allowance
+        ));
+        assert!(
+            !scan
+                .index
+                .held_audit_progress
+                .as_ref()
+                .unwrap()
+                .large_full_deferred,
+            "an admitted attempt resumes the original failure/rotation policy"
+        );
+
         // Already-deferred held debt must keep its earlier rank. Saturate
         // the existing restoration slots so production with_sampled cannot
         // convert the plain-v2 hold before its rotating slot is scheduled.
         let newer_key = local_index_key(&older);
+        seed.files.get_mut(&held_key).unwrap().size_bytes = 1;
         seed.claude_large_full_deferred.clear();
         seed.claude_large_full_deferred
             .begin(&context, std::slice::from_ref(&root));

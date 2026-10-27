@@ -2340,6 +2340,7 @@ fn fe_n1_option_b_saturated_non_draining_debts_do_not_starve_many_readable_holds
         key: old_root_key.into(),
         due: start + INTERVAL,
         attempted: false,
+        large_full_deferred: false,
     });
     index.save(&hold.index_path).unwrap();
     index = ScanIndex::load(&hold.index_path).unwrap();

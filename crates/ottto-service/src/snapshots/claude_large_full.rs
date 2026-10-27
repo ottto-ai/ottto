@@ -396,6 +396,7 @@ pub(super) fn admit(
                 // Queueing was not an audit attempt. Keep its original turn
                 // and deadline until native acquisition can actually start.
                 slot.attempted = false;
+                slot.large_full_deferred = true;
             }
             if !index.claude_large_full_deferred.contains(&key) {
                 index.claude_large_full_deferred.push_back(key);
@@ -405,6 +406,15 @@ pub(super) fn admit(
         *started = true;
     }
     index.claude_large_full_deferred.remove(&key);
+    if let Some(slot) = index
+        .held_audit_progress
+        .as_mut()
+        .filter(|slot| slot.key == key)
+    {
+        // An actual admitted attempt resumes the existing failure/rotation
+        // policy. This bit records scheduling deferral, never read success.
+        slot.large_full_deferred = false;
+    }
     true
 }
 
