@@ -58,6 +58,8 @@ pub mod snapshot_sync;
 pub mod snapshot_watcher;
 pub mod snapshots;
 mod source_rotation;
+#[cfg(unix)]
+pub mod state_dir_lock;
 pub mod telemetry_attach;
 #[cfg(test)]
 mod test_scratch;

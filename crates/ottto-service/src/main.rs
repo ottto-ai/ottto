@@ -298,6 +298,7 @@ fn main() -> Result<()> {
         Command::Serve { socket, once } => {
             #[cfg(unix)]
             {
+                let _local_state = hold_local_state_or_exit();
                 // Before the relays start, so the first check-in already
                 // reports the transport.
                 ottto_service::control_plane_health::mark_serving(
@@ -333,6 +334,8 @@ fn main() -> Result<()> {
             mach_service,
             socket,
         } => {
+            #[cfg(unix)]
+            let _local_state = hold_local_state_or_exit();
             // Before the relays start, so the first check-in already reports
             // the transport. Off macOS there is no XPC and only the socket
             // serves.
@@ -528,6 +531,33 @@ impl ServiceCommand {
             | ServiceCommand::InstallPlan { json, .. }
             | ServiceCommand::WriteLaunchAgent { json, .. }
             | ServiceCommand::Bootstrap { json, .. } => *json,
+        }
+    }
+}
+
+/// How long a daemon launchd started waits before it exits on a held state
+/// directory. A `KeepAlive` job (the Homebrew service) is restarted as soon
+/// as it exits, and an on-demand Mach service on its next connection; this
+/// keeps either from respawning faster than once per interval.
+#[cfg(unix)]
+const HELD_STATE_LAUNCHD_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Takes the single-writer lock on the local state directory before
+/// anything in `serve` or `serve-xpc` can read or write it, and returns it
+/// to be held for the life of the process. When another daemon holds it, or
+/// it cannot be taken, prints why and exits without writing any state.
+#[cfg(unix)]
+fn hold_local_state_or_exit() -> ottto_service::state_dir_lock::StateDirLock {
+    use ottto_service::state_dir_lock::{StateDirLock, StateDirLockError};
+    match StateDirLock::acquire(&ottto_core::default_support_dir()) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("ottto-service: {error}");
+            // launchd is the parent of every job it starts.
+            if matches!(error, StateDirLockError::Held { .. }) && unsafe { libc::getppid() } == 1 {
+                std::thread::sleep(HELD_STATE_LAUNCHD_BACKOFF);
+            }
+            std::process::exit(error.exit_code());
         }
     }
 }
@@ -1010,6 +1040,41 @@ mod tests {
             assert!(at(prepare) < at("start_builtin_relays(&daemon)"), "{arm}");
             assert!(!arm.contains("sweep_local_state_at_startup"), "{arm}");
         }
+    }
+
+    /// Every daemon entry point takes the state-directory lock before it
+    /// marks itself serving, runs a startup step or touches any state.
+    #[test]
+    fn state_dir_lock_is_the_first_step_of_serve_commands() {
+        let source = include_str!("main.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let arm = |start: &str, end: &str| {
+            let from = source.find(start).expect("command arm");
+            &source[from..from + source[from..].find(end).expect("next arm")]
+        };
+        for arm in [
+            arm("Command::Serve { socket, once } =>", "Command::ServeXpc {"),
+            arm("Command::ServeXpc {", "Command::Service { command } =>"),
+        ] {
+            let at = |needle: &str| arm.find(needle).unwrap_or_else(|| panic!("{needle}"));
+            assert_eq!(
+                arm.matches("hold_local_state_or_exit()").count(),
+                1,
+                "{arm}"
+            );
+            let lock = at("let _local_state = hold_local_state_or_exit();");
+            assert!(lock < at("mark_serving("), "{arm}");
+            assert!(lock < at("prepare_to_serve("), "{arm}");
+            assert!(lock < at("load_or_create_control_token()"), "{arm}");
+            assert!(lock < at("LocalDaemon::new("), "{arm}");
+        }
+        // One binding per arm and no other caller.
+        assert_eq!(
+            source
+                .matches("let _local_state = hold_local_state_or_exit();")
+                .count(),
+            2
+        );
     }
 
     #[test]
