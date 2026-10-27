@@ -243,18 +243,10 @@ fn claude_case(name: &str) {
                 let mut failed = claude_pages(&c, &scanner, [prior.clone(), prior], (0, 0, 1));
                 for page in &mut failed {
                     assert_eq!(page.scan.snapshots.len(), 1, "must scan the held session");
-                    let fingerprint = page.scan.snapshots[0]
-                        .source_file_fingerprint
-                        .clone()
-                        .expect("held session must name its source file");
                     page.enrich(&c);
-                    assert_eq!(
-                        page.index
-                            .claude_history_emission_held(&fingerprint)
-                            .map(|hold| hold.as_str()),
-                        Some("telemetry_unread"),
-                        "failed telemetry must hold this session"
-                    );
+                    // This is a live E2 session, so its withheld body uses
+                    // request-owned quarantine, not the history-upgrade hold.
+                    assert_withheld(page, ROOT, "failed telemetry must hold this session");
                     page.finish();
                     assert!(page.scan.snapshots.is_empty(), "held session emits no body");
                     let (result, wire, _) = upload(&page.scan.snapshots, &mut e2_progress(), ack);
