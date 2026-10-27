@@ -3448,6 +3448,8 @@ impl Drop for PageSpent {
     }
 }
 fn record_counts(counts: Counts) {
+    #[cfg(test)]
+    pipeline_test_observer::recording_counts(&counts);
     for (counter, value) in COUNTS.iter().zip(counts.0) {
         if value != 0 {
             counter.fetch_add(value, Ordering::Relaxed);
