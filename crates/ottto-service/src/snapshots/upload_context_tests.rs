@@ -109,6 +109,22 @@ fn acks(scan: &SourceScanResult) -> (BTreeSet<String>, BTreeMap<String, String>)
     (bodies.keys().cloned().collect(), bodies)
 }
 
+pub(crate) fn accept_fixture(index: &mut ScanIndex, scan: &SourceScanResult) {
+    let bodies = scan
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(item),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let accepted = bodies.keys().cloned().collect();
+    index.record_accepted_snapshot_fingerprints(&accepted);
+    index.settle_upload_contexts(scan, &accepted, &bodies, &BTreeSet::new());
+}
+
 pub(crate) fn assert_context(index: &ScanIndex, key: &str, expected: Option<&str>) {
     assert_eq!(
         index.settled_upload_context(&index.files[key]),
@@ -315,6 +331,22 @@ fn legacy_context_inherits_persisted_acceptance_once_and_prunes_at_save() {
         "/synthetic/never.jsonl".into(),
         BTreeSet::from(["unaccepted".into()]),
     );
+    let singleton = "/synthetic/singleton.jsonl";
+    let scan = project(&mut index, SnapshotSource::Codex, singleton, false);
+    let (accepted, _) = acks(&scan);
+    index.record_accepted_snapshot_fingerprints(&accepted);
+    index
+        .files
+        .get_mut(singleton)
+        .unwrap()
+        .last_snapshot_fingerprint = accepted.first().cloned();
+    index.file_snapshot_fingerprints.remove(singleton);
+    project(
+        &mut index,
+        SnapshotSource::Codex,
+        "/synthetic/empty.jsonl",
+        true,
+    );
     index.upload_context_fingerprint = Some("A".into());
     let mut legacy = serde_json::to_value(&index).unwrap();
     legacy.as_object_mut().unwrap().remove("upload_contexts");
@@ -328,6 +360,8 @@ fn legacy_context_inherits_persisted_acceptance_once_and_prunes_at_save() {
     ] {
         assert_context(&loaded, key, None);
     }
+    assert_context(&loaded, singleton, Some("A"));
+    assert_context(&loaded, "/synthetic/empty.jsonl", Some("A"));
     loaded.activate_upload_context("B".into());
     loaded.upload_context_fingerprint = Some("B".into());
     loaded.intern_upload_context([9; 32]);

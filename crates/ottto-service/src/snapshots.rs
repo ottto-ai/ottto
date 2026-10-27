@@ -43005,6 +43005,10 @@ impl ScanIndex {
             return;
         };
         let context = Sha256::digest(global.as_bytes()).into();
+        let accepted = |fp: &String| {
+            self.accepted_snapshot_fingerprints.contains(fp)
+                && !self.quarantined_snapshot_fingerprints.contains_key(fp)
+        };
         let eligible = self
             .files
             .iter()
@@ -43012,19 +43016,22 @@ impl ScanIndex {
                 !entry.source_file_fingerprint.is_empty()
                     && !entry.codex_recovery_is_pending()
                     && !self.upload_context_held(key, &entry.source_file_fingerprint)
-                    && (self.confirmed_empty_files.contains(*key)
-                        || self
+                    && ((self.confirmed_empty_files.contains(*key)
+                        && entry.last_snapshot_fingerprint.is_none()
+                        && self
                             .file_snapshot_fingerprints
                             .get(*key)
-                            .is_some_and(|fps| {
-                                !fps.is_empty()
-                                    && fps.iter().all(|fp| {
-                                        self.accepted_snapshot_fingerprints.contains(fp)
-                                            && !self
-                                                .quarantined_snapshot_fingerprints
-                                                .contains_key(fp)
-                                    })
-                            }))
+                            .map_or(true, BTreeSet::is_empty))
+                        || (entry.last_snapshot_fingerprint.is_some()
+                            && self.file_snapshot_fingerprints.get(*key).map_or_else(
+                                || {
+                                    entry
+                                        .last_snapshot_fingerprint
+                                        .as_ref()
+                                        .is_some_and(accepted)
+                                },
+                                |fps| !fps.is_empty() && fps.iter().all(accepted),
+                            )))
             })
             .map(|(key, _)| key.clone())
             .collect::<BTreeSet<_>>();
@@ -52489,6 +52496,7 @@ mod tests {
             )
             .expect("scan");
             finalize_scan_after_policy(SnapshotSource::Pi, &mut result, &mut index);
+            upload_context_tests::accept_fixture(&mut index, &result);
             result
         };
 
@@ -72870,6 +72878,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(baseline.snapshots.len(), count);
+        upload_context_tests::accept_fixture(&mut index, &baseline);
         index.record_accepted_snapshot_fingerprints(
             &baseline
                 .snapshots
