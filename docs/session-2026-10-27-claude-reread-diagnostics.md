@@ -30,3 +30,10 @@ layout prices, source walks, decisions and assertions stay unchanged. New
 fixtures exercise first-stage precedence, scratch paths, funding/reservation,
 streaming rescue and bounded-batch probe isolation; all existing traversal-start
 fixtures also assert the complete root partition through a test-only observer.
+
+Round 3 merges the current main branch, preserving the family-scoped hold veto
+and deferred-return state restoration together with diagnostic-aware settlement,
+and retaining the ctime/birth and parent-ledger metadata checks. The histogram's
+plain stderr carrier is intentional and documented. Existing assertions, census
+entry size pin and visit/memory budgets remain unchanged; final Linux and native
+Rust contract receipts are recorded in the PR.

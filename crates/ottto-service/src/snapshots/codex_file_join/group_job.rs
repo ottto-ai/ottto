@@ -307,7 +307,7 @@ impl GroupBoot {
     ) -> Boot {
         let n = self.group.members.len();
         if self.identified < n {
-            return self.identify(attribution);
+            return self.identify(attribution, index);
         }
         if !self.admitted {
             if self.unchanged_joined(index) {
@@ -371,6 +371,7 @@ impl GroupBoot {
     fn identify(
         &mut self,
         attribution: Option<&crate::session_attribution::SessionAttributionContext>,
+        index: &ScanIndex,
     ) -> Boot {
         let i = self.identified;
         let mut candidate = self.group.members[i].clone();
@@ -396,7 +397,9 @@ impl GroupBoot {
             &mut census,
             None,
             0,
-            &BTreeMap::new(),
+            // The entry's stored ctime lets a ctime-only change keep the
+            // stored fingerprint (fresh samples hashed, no re-read).
+            &index.files,
         ) else {
             return Boot::Strict;
         };

@@ -408,6 +408,8 @@ impl OwnedSourceScan {
             legacy_source_file_fingerprint: String::new(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: String::new(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         };
         // Mirror candidate conversion's census observation. An old queued
         // age rejection must not delete a successful recovery at settlement.
@@ -460,6 +462,8 @@ mod tests {
             legacy_source_file_fingerprint: "legacy".into(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: "opened".into(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         }
     }
     fn index() -> ScanIndex {
@@ -866,6 +870,8 @@ mod provenance_tests {
             legacy_source_file_fingerprint: "legacy".into(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: "opened".into(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         };
         let key = local_index_key(&candidate.path);
         for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {

@@ -2078,6 +2078,7 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
             held_fingerprints: held.clone(),
             account_deferred_fingerprints: BTreeSet::new(),
             progress_blocking: true,
+            held_family_roots: None,
         };
         // Finish captures the references before any selection.
         let referenced = progress.ack_retirement_scan_references(&previous, &working);

@@ -398,6 +398,9 @@ new locks, heap allocations, event history, lookups or background work.
 
 ### Stale-start carry rejection histogram
 
+By design, `stale_carry_rejection_counts` rides the plain census re-arm stderr
+line, separate from the `local_resources` records.
+
 The existing local text line beginning `local snapshot census re-armed stale
 Claude request evidence:` appends `stale_carry_rejection_counts={...}`. This is
 **a text-line suffix**, not a new `local_resources` field or a wire field. The

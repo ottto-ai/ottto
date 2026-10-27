@@ -790,6 +790,8 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
         codex_counting_v2: false,
         codex_counting_owner: None,
         effective_upload_body_witness_revision: 0,
+        opened_changed_nanos: 0,
+        opened_birth_nanos: 0,
     }
 }
 
@@ -1907,6 +1909,7 @@ fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
         held_fingerprints: BTreeSet::from(["f".repeat(64)]),
         account_deferred_fingerprints: BTreeSet::new(),
         progress_blocking: false,
+        held_family_roots: None,
     };
     let settlement = settle_checkpointed_upload(
         ScanIndex::default(),
