@@ -363,6 +363,10 @@ fn harvest_recent_workspaces(
     let mut workspaces = discover_recent_claude_workspaces(home, now, &mut counts);
     workspaces.truncate(MAX_WORKSPACES_PER_CYCLE);
     if workspaces.is_empty() {
+        eprintln!(
+            "context_footprint_harvest_metrics discovered=0 uploaded=0 skipped=0 failed=0 discovery_files_total={} discovery_files_read={} discovery_bytes_selected={}",
+            counts.files_total, counts.files_read, counts.bytes_selected
+        );
         return Ok(ContextHarvestOutcome::default());
     }
 
@@ -417,14 +421,14 @@ fn harvest_recent_workspaces(
         }
     }
     eprintln!(
-        "context_footprint_harvest_metrics discovered={} uploaded={} skipped={} failed={} discovery_files_total={} discovery_files_read={} discovery_bytes_read={}",
+        "context_footprint_harvest_metrics discovered={} uploaded={} skipped={} failed={} discovery_files_total={} discovery_files_read={} discovery_bytes_selected={}",
         uploaded + skipped + failed,
         uploaded,
         skipped,
         failed,
         counts.files_total,
         counts.files_read,
-        counts.bytes_read
+        counts.bytes_selected
     );
     if failed > 0 && uploaded == 0 && skipped == 0 {
         return Err(anyhow!(
@@ -1238,12 +1242,13 @@ pub(crate) fn safe_text(raw: &str, max_len: usize) -> Option<String> {
     Some(normalized.chars().take(max_len).collect())
 }
 
-/// Transcript reads by one discovery pass, for the cycle metrics line.
+/// Transcripts opened by one discovery pass, for the cycle metrics line.
+/// `bytes_selected` is the opened files' sizes, not bytes actually parsed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct DiscoveryCounts {
     files_total: usize,
     files_read: usize,
-    bytes_read: u64,
+    bytes_selected: u64,
 }
 
 fn discover_recent_claude_workspaces(
@@ -1264,7 +1269,9 @@ fn discover_recent_claude_workspaces(
         // by the first file naming them. Once a full cycle of scopes is known
         // and every unread file is strictly older, no unread file can enter,
         // reorder or re-represent the truncated list. Equal mtimes are read to
-        // the end so boundary ties keep today's order.
+        // the end so boundary ties keep today's order. This holds for the
+        // captured mtimes and stable is_dir/repository answers; a scope probe
+        // that fails before git succeeds can still split one repository.
         if scopes.len() >= MAX_WORKSPACES_PER_CYCLE
             && previous_mtime.is_some_and(|previous| mtime < previous)
         {
@@ -1272,7 +1279,7 @@ fn discover_recent_claude_workspaces(
         }
         previous_mtime = Some(mtime);
         counts.files_read += 1;
-        counts.bytes_read += fs::metadata(&file).map_or(0, |metadata| metadata.len());
+        counts.bytes_selected += fs::metadata(&file).map_or(0, |metadata| metadata.len());
         for cwd in cwd_values_from_jsonl(&file) {
             let path = PathBuf::from(&cwd);
             if !path.is_dir() {
@@ -2737,7 +2744,7 @@ mod tests {
         );
         assert_eq!(counts.files_total, 15);
         assert_eq!(counts.files_read, MAX_WORKSPACES_PER_CYCLE);
-        assert!(counts.bytes_read > 0);
+        assert!(counts.bytes_selected > 0);
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2824,6 +2831,83 @@ mod tests {
         for dir in others {
             let _ = fs::remove_dir_all(dir);
         }
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn discovery_reads_everything_when_fewer_than_a_cycle_of_scopes_exist() {
+        let home = temp_dir("early-stop-few");
+        let now = SystemTime::now();
+        let dirs: Vec<PathBuf> = (0..5)
+            .map(|index| {
+                let dir = home.join("work").join(format!("few-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let files: Vec<(u64, Vec<&Path>)> = (0..9)
+            .map(|index| (60 * (index as u64 + 1), vec![dirs[index % 5].as_path()]))
+            .collect();
+        write_discovery_transcripts(&home, now, &files);
+
+        let (found, counts) = discover_with_counts(&home, now);
+
+        assert_eq!(found, discover_all_files_oracle(&home, now));
+        assert_eq!(found.len(), 5);
+        assert_eq!((counts.files_read, counts.files_total), (9, 9));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn discovery_keeps_tied_representatives_and_future_mtimes_in_order() {
+        let repo = init_git_repo("early-stop-representative");
+        let now = SystemTime::now();
+        let alpha = repo.join("alpha");
+        let beta = repo.join("beta");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+        let home = temp_dir("early-stop-representative-home");
+        let plain: Vec<PathBuf> = (0..12)
+            .map(|index| {
+                let dir = home.join("work").join(format!("plain-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let future = home.join("work").join("future");
+        fs::create_dir_all(&future).unwrap();
+        // Two tied files of one repository name its directories in opposite
+        // line orders; the path-ordered representative must win either way.
+        let mut files: Vec<(u64, Vec<&Path>)> = vec![
+            (300, vec![beta.as_path(), alpha.as_path()]),
+            (300, vec![alpha.as_path(), beta.as_path()]),
+        ];
+        for (index, dir) in plain.iter().enumerate() {
+            files.push((600 + 60 * index as u64, vec![dir.as_path()]));
+        }
+        write_discovery_transcripts(&home, now, &files);
+        // A clock-skewed future mtime is still inside the window and newest.
+        let future_file = home
+            .join(".claude")
+            .join("projects")
+            .join("-early-stop")
+            .join("session-future.jsonl");
+        fs::write(&future_file, format!("{}\n", json!({"cwd": future}))).unwrap();
+        File::options()
+            .write(true)
+            .open(&future_file)
+            .unwrap()
+            .set_modified(now + Duration::from_secs(3_600))
+            .unwrap();
+
+        let (found, counts) = discover_with_counts(&home, now);
+
+        assert_eq!(found, discover_all_files_oracle(&home, now));
+        assert_eq!(found[0].path, future);
+        assert_eq!(found[1].path, alpha);
+        assert_eq!(counts.files_read, 1 + 2 + 10);
+        assert_eq!(counts.files_total, 1 + 2 + 12);
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&home);
     }
