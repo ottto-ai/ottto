@@ -184,10 +184,6 @@ pub(crate) struct RederiveReceipt {
 }
 
 impl Decoded {
-    pub(crate) fn source(&self) -> SnapshotSource {
-        self.reduction.accumulator.source
-    }
-
     /// How far the head re-parse must read: the latest mark of a field to
     /// re-derive. 0 when nothing needs the head.
     pub(crate) fn head_end(&self) -> Result<u64, Refuse> {

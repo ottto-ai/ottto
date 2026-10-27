@@ -3100,6 +3100,9 @@ pub(crate) fn durable_after_save(
     let writer = sampled_scan::durable_tail::StateDirWriter(support_dir);
     let _ = cache.durable_write_after_save(&writer, source, index);
     let _ = cache.durable_gc(&writer, source, index);
+    if let Some((counters, store)) = cache.durable_counters(source) {
+        eprintln!("{}", counters.summary(source, &store));
+    }
 }
 
 /// U1a-2a (C14), Codex only: open the pass's side-ledger gate, then prune
@@ -36739,7 +36742,8 @@ fn codex_model_context_window(value: &Value) -> Option<u64> {
 }
 
 fn codex_usage_event_identity(value: &Value) -> Option<String> {
-    // The digest never leaves this file accumulator. Hash the complete
+    // The digest is never uploaded; it is persisted only in the local
+    // durable-tail store (M1). Hash the complete
     // content-free token_count record so an exact duplicated physical line is
     // idempotent without pretending that equal cumulative counters identify a
     // provider response. Native ordinals naturally participate when present.

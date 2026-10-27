@@ -71,6 +71,51 @@ impl Counters {
     fn bump(map: &mut BTreeMap<&'static str, u64>, class: &'static str) {
         *map.entry(class).or_default() += 1;
     }
+
+    /// One content-free log line: counts by static class name only, never an
+    /// id, path or value. Process-lifetime totals.
+    pub(crate) fn summary(&self, source: SnapshotSource, store: &store::StoreCounters) -> String {
+        let classes = |map: &BTreeMap<&'static str, u64>| {
+            map.iter()
+                .map(|(class, count)| format!("{class}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "ottto-service: durable_tail source={} restore_attempts={} restored={} missing={} \
+             refused_record={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
+             not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
+             rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
+             write_deferred={} peak_body_bytes={} disk_records={} disk_bytes={} \
+             bytes_written={} records_written={} records_clean={} store_budget_refused={} \
+             bytes_read={} gc_records_deleted={} peak_codec_bytes={}",
+            source.api_slug(),
+            self.restore_attempts,
+            self.restored,
+            self.missing,
+            self.refused_record,
+            classes(&self.ineligible),
+            classes(&self.certificate_refused),
+            self.corrupt_body,
+            classes(&self.not_rederived),
+            self.budget_refused,
+            self.rederive_head_bytes,
+            self.rederive_named_lines,
+            self.rederive_line_bytes,
+            classes(&self.not_persisted),
+            self.write_deferred,
+            self.peak_body_bytes,
+            store.disk_records,
+            store.disk_bytes,
+            store.bytes_written,
+            store.records_written,
+            store.records_clean,
+            store.budget_refused,
+            store.bytes_read,
+            store.gc_records_deleted,
+            store.peak_codec_bytes,
+        )
+    }
 }
 
 struct Slot {

@@ -540,8 +540,14 @@ fn edits_after_the_checkpoint_refuse_restore() {
 /// The allowlist digests, pinned: any field, class or type change in a
 /// persisted type moves them. Review the classes with SOURCE, then repin.
 const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
-    (SnapshotSource::ClaudeCode, "unpinned"),
-    (SnapshotSource::Codex, "unpinned"),
+    (
+        SnapshotSource::ClaudeCode,
+        "548f2ff0578f541b8a73259b1696b92acb0aa7b8e7b6a1f2478b39e4fd34db5d",
+    ),
+    (
+        SnapshotSource::Codex,
+        "53842bff8d3ced02e1c492eeba23ea86680a77b3eb065539750b9bcd91240ebc",
+    ),
 ];
 
 fn hex(digest: [u8; 32]) -> String {
@@ -654,7 +660,12 @@ fn budget_bounds_hold() {
     // Per restore: one record read, two 4 KiB sample windows, a head
     // re-parse of at most 1 MiB and at most NAMED_LINES capped lines.
     assert_eq!(HEAD_BOUND, 1024 * 1024);
-    assert!(NAMED_LINES <= 4);
+    assert_eq!(NAMED_LINES, 4);
+    // Beside the cache, outside its state budget: both stores' digest maps.
+    assert_eq!(
+        crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
+        64 * 1024
+    );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
 }
