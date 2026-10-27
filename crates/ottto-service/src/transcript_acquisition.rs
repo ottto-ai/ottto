@@ -232,7 +232,6 @@ impl Checkpoint {
     }
 
     /// `seal_as` under this checkpoint's own scope.
-    #[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-2.
     pub(crate) fn seal(&self, now: u64) -> PrefixSeal {
         self.seal_as(now, &self.scope)
     }
@@ -252,7 +251,6 @@ impl Checkpoint {
     /// edit at the checkpoint's length, or a shrink to a length above `s`, is
     /// growth to the seal and is not refused (see `PrefixSeal::admits`).
     /// `commit_sealed_prefix` checkpoints already store `length = s`.
-    #[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-2.
     pub(crate) fn seal_as(&self, now: u64, scope: &Scope) -> PrefixSeal {
         let mut stamp = self.stamp.clone();
         stamp.length = self.samples.sealed_offset;
@@ -280,7 +278,6 @@ impl Checkpoint {
 /// file's decision depends on: the stamp (length = sealed `s`), scope and
 /// verification time, with both samples kept only as SHA-256. Minted only by
 /// `Checkpoint::seal_as`, so only from a committed checkpoint.
-#[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-2.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrefixSeal {
     stamp: FileStamp,
@@ -296,11 +293,11 @@ pub(crate) struct PrefixSeal {
     audit_debt_unix_seconds: Option<u64>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // U1a: first production caller is U1a-2.
 impl PrefixSeal {
     pub(crate) fn sealed_offset(&self) -> u64 {
         self.stamp.length
     }
+    #[cfg(test)]
     pub(crate) fn has_debt(&self) -> bool {
         self.audit_debt_unix_seconds.is_some()
     }

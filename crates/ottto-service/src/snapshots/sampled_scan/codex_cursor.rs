@@ -1263,7 +1263,6 @@ fn retire_holder(cursor: &mut CursorState) {
 /// U1a-2a (cc row 1): the one suspended proof job, process-wide. A running
 /// job is out of the holder, in the step's `ProofLease` (charged 0 here);
 /// `Suspended` is charged its walked bound, measured once at suspend.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 #[derive(Default)]
 pub(in crate::snapshots) enum ProofHolder {
     #[default]
@@ -1420,7 +1419,6 @@ fn record_proof_drop() {
 }
 
 /// U1a-2a (cc row 2; rev 10 §5.4, rev 11): who asks for cursor room.
-#[cfg_attr(not(test), allow(dead_code))] // first production caller is the proof hook (s row 31)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum Admitter {
     /// Every one of main's admissions. It decides as if no proof existed
