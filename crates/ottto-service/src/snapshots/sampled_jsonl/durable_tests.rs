@@ -1010,11 +1010,11 @@ fn edits_after_the_checkpoint_refuse_restore() {
 const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
     (
         SnapshotSource::ClaudeCode,
-        "1d22fd3753c5f21d4e4fe99b87a956955f3d12b2d2685f3fbab7adcdc0bd3108",
+        "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
     ),
     (
         SnapshotSource::Codex,
-        "99914949cd94b9fdb9c36861658b41ded453998a3d4c2f5721bb1e211f2c8e1d",
+        "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
     ),
 ];
 

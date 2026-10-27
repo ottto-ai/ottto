@@ -88742,7 +88742,6 @@ impl crate::durable_tail_codec::Durable for SelectorCapture {
         &self,
         e: &mut crate::durable_tail_codec::Enc,
     ) -> Result<(), crate::durable_tail_codec::Refuse> {
-        use crate::durable_tail_codec::Durable as _;
         let Self { context, sources } = self;
         if context
             .keys()
