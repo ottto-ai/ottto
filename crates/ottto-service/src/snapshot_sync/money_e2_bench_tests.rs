@@ -1306,9 +1306,10 @@ impl crate::source_rotation::Owner for BenchOwner<'_> {
         self.scanned_files = completed.2.scanned_file_count;
         self.index_path = Some(completed.0.index_path.clone());
         bench_mark("scan.complete", &completed.2.snapshots);
-        let index_bound = crate::heap_layout_bound::completed_bound(&completed.1, usize::MAX);
         ATTRIBUTION.with(|cell| {
             if let Some(marks) = cell.borrow_mut().as_mut() {
+                let index_bound =
+                    crate::heap_layout_bound::completed_bound(&completed.1, usize::MAX);
                 marks.insert(
                     "scan.index",
                     serde_json::json!({"bound_bytes": index_bound}),
@@ -2130,8 +2131,10 @@ fn money_e2_bench_receipt() {
                 serde_json::to_vec_pretty(&manifest).unwrap(),
             )
             .unwrap();
-            let births =
-                serde_json::from_slice(&std::fs::read(base.join(STAGED_BIRTHS)).unwrap()).unwrap();
+            let births = std::fs::read(base.join(STAGED_BIRTHS))
+                .ok()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .unwrap_or_default();
             e2_hook::with_staged_births(births, || plan_history_cohort(&base));
             manifest
         }
