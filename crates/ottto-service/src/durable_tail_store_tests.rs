@@ -25,11 +25,9 @@ fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
 use crate::locked_state_dir::LockedStateDir;
 use crate::state_dir_lock::StateDirLockError;
 
-/// Takes the lock after its previous holder was dropped. #801's lock is
-/// close-only (no `LOCK_UN`): the kernel releases it when every copy of its
-/// descriptor is closed, and a concurrently forked child can hold a copy
-/// until it execs. So this waits, bounded, instead of relying on the
-/// release happening at drop.
+/// Takes the lock after its previous holder was dropped. Dropping #801's
+/// lock unlocks it (#812), so the first try normally succeeds; the bounded
+/// wait only tolerates a release that is not yet visible.
 fn acquire_released(dir: &Path) -> LockedStateDir {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {

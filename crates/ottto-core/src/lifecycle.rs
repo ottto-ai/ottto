@@ -1061,7 +1061,7 @@ identifier:                 net.ottto.Companion
         );
 
         drop(old_daemon);
-        let restarted = crate::state_dir_lock::acquire_released(&support);
+        let restarted = StateDirLock::acquire(&support).expect("released at drop");
         assert_eq!(identity(&lock_path), lock_identity);
         drop(restarted);
         let _ = fs::remove_dir_all(root);
@@ -1105,7 +1105,7 @@ identifier:                 net.ottto.Companion
             "{restart:?}"
         );
         drop(claim);
-        drop(crate::state_dir_lock::acquire_released(&support));
+        drop(StateDirLock::acquire(&support).expect("released at drop"));
         let _ = fs::remove_dir_all(root);
     }
 

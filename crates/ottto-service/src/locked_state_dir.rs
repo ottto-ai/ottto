@@ -6,10 +6,10 @@
 //! durable-tail store) ask for it with [`held_for`]; a process that does not
 //! hold it (a CLI command, a test) gets `None` and writes nothing.
 //!
-//! #801's lock is close-only: it never calls `LOCK_UN`, and the kernel
-//! releases it when its descriptor closes. Nothing here relies on when that
-//! happens. The holder is a process static, never dropped, so the lock is
-//! released at process exit (or crash) and not before.
+//! Dropping #801's lock unlocks it (#812). The holder here is a process
+//! static, never dropped (like `StateDirLock::hold_until_exit`), so the lock
+//! is released at process exit (or crash) and not before. Nothing here
+//! relies on when that happens.
 
 use crate::state_dir_lock::{StateDirLock, StateDirLockError};
 use std::path::{Path, PathBuf};

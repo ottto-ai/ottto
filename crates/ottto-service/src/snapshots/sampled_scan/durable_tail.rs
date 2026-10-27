@@ -191,8 +191,8 @@ impl Stores {
 /// The single-writer proof for the daemon's state directory: #801's
 /// `StateDirLock`, held for the life of the daemon process. M1 adds no lock.
 /// The store's writes, GC and removal take it; restore only reads and takes
-/// nothing. #801's lock is close-only (released when its descriptor closes,
-/// no `LOCK_UN`); nothing here relies on when it is released.
+/// nothing. Dropping #801's lock unlocks it (#812); nothing here relies on
+/// when it is released.
 impl SingleWriter for crate::locked_state_dir::LockedStateDir {
     fn state_dir(&self) -> &Path {
         self.dir()
