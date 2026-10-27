@@ -9,6 +9,14 @@ on:
       - main
   workflow_dispatch:
     inputs:
+      money_equivalence:
+        description: Compare emitted retained Tail/Unchanged money with cold Full (synthetic inputs)
+        type: boolean
+        default: false
+      money_equivalence_base:
+        description: Comparison ref (empty uses this branch PR base, otherwise main)
+        type: string
+        default: ""
       money_e2_bench:
         description: Run the MONEY Design E2 benchmark (M4-sized fixture; reference, dark and gate-on arms)
         type: boolean
@@ -35,7 +43,7 @@ on:
         default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.money_equivalence && '-money-equivalence' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -49,7 +57,7 @@ jobs:
     # success for the required check; the ruleset's merge_queue rule makes every
     # merge pass this job in the queue. Rollback: remove this line FIRST, and
     # only then the queue rule; never leave the skip without the queue.
-    if: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
+    if: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence)) }}
     # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
     # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
     timeout-minutes: 55
@@ -127,7 +135,7 @@ jobs:
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
 
   public-surface:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence)) }}
     name: Public surface checks
     timeout-minutes: 30
     runs-on: ubuntu-24.04
@@ -159,7 +167,7 @@ jobs:
 
   dependency-review:
     name: Dependency review
-    if: ${{ github.event_name == 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
+    if: ${{ github.event_name == 'pull_request' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence)) }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
@@ -177,7 +185,7 @@ jobs:
           fail-on-severity: moderate
 
   rust-advisories:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence)) }}
     name: Rust advisory audit
     timeout-minutes: 10
     runs-on: ubuntu-24.04
@@ -207,7 +215,7 @@ jobs:
     # on a pull request or push. Public repository, standard runner, no cache
     # save. Fails closed: green only with the live E2 hook, the full M4 shape
     # and every target met. Expected ~2-2.5 h at full shape.
-    if: github.event_name == 'workflow_dispatch' && inputs.money_e2_bench
+    if: github.event_name == 'workflow_dispatch' && inputs.money_e2_bench && !inputs.money_equivalence
     timeout-minutes: 300
     runs-on: macos-15
     env:
@@ -530,3 +538,33 @@ jobs:
             ${{ runner.temp }}/e2-*.txt
             ${{ runner.temp }}/e2-*.log
             ${{ runner.temp }}/e2-bench/manifest.json
+
+  money-equivalence:
+    name: Money equivalence (emitted bodies)
+    # Opt-in only: no added macOS minutes on pushes/PRs. One standard Mac,
+    # two independent builds, no matrix/retry or cache writes. Never run the
+    # expensive benchmark or ordinary Mac jobs alongside this dispatch.
+    if: github.event_name == 'workflow_dispatch' && inputs.money_equivalence
+    timeout-minutes: 55
+    runs-on: macos-15
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      MONEY_EQUIVALENCE_BASE: ${{ inputs.money_equivalence_base }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Compare identical synthetic inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/money_equivalence.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: money-equivalence-receipts
+          retention-days: 14
+          if-no-files-found: error
+          path: ${{ runner.temp }}/money-equivalence/receipts

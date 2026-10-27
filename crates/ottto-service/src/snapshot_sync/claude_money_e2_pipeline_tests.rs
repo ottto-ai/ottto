@@ -2575,3 +2575,8 @@ fn e2_pipeline_root_conflict_only_file_publishes_its_disclosure() {
 fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
     conflict_only(true);
 }
+
+// Shared helpers above remain the real scan/evidence/finish/upload callers.
+mod money_equivalence_tests {
+    include!("money_equivalence_tests.rs");
+}
