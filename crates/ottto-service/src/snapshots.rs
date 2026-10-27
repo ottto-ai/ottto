@@ -36977,18 +36977,22 @@ struct CandidateFile {
     opened_witness: Option<OpenedObjectWitness>,
 }
 
-/// The non-content inputs of one opened-object identity (device, inode,
-/// ctime) and a digest of the content it sampled (length, head and tail
-/// samples). Stored with the scan fingerprint it produced so that a later
-/// open whose content samples still match reuses these inputs: a ctime,
-/// xattr, mode or mtime flip, or the same bytes under a new inode, is then
-/// re-validated by content and never triggers a re-read on its own.
+/// The object inputs of one opened-object identity (device, inode, ctime),
+/// the file birth time and a digest of the content it sampled (length, head
+/// and tail samples). Stored with the scan fingerprint it produced so that a
+/// later open of the same object whose content samples still match reuses
+/// the stored ctime and mtime: a ctime, xattr, mode, hard-link or mtime flip
+/// is then re-validated by content and never triggers a re-read on its own.
+/// Device, inode and birth stay triggers: the parse consumes them (Claude
+/// request births and money birth cutoffs, Codex created-thread matching).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OpenedObjectWitness {
     device: u64,
     inode: u64,
     changed_seconds: i64,
     changed_nanos: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    birth_nanos: Option<u64>,
     content: String,
 }
 
@@ -41179,6 +41183,7 @@ fn opened_object_identity_and_witness(
         inode: metadata.ino(),
         changed_seconds: metadata.ctime(),
         changed_nanos: metadata.ctime_nsec(),
+        birth_nanos: metadata.created().ok().and_then(unix_nanos),
         content: opened_content_digest(len, &samples),
     });
     #[cfg(not(unix))]
@@ -41189,13 +41194,14 @@ fn opened_object_identity_and_witness(
 }
 
 /// Ron's re-read rule: only content (size, sampled bytes) or output-relevant
-/// inputs may trigger a re-read; ctime, xattr, mode and mtime flips and a
-/// same-bytes copy under a new inode never do. When this path's stored
-/// witness sampled the same length and head/tail bytes, the fingerprint
-/// reuses the stored device, inode, ctime and mtime, so it equals the stored
-/// fingerprint and the candidate gate skips. A mismatch of those non-content
-/// inputs therefore only costs this bounded sample re-read, never a Full
-/// read; any size or sampled-byte change keeps the live identity and reads.
+/// inputs may trigger a re-read; ctime, xattr, mode, hard-link and mtime
+/// flips never do. When this path's stored witness describes the same object
+/// (device, inode, birth) and sampled the same length and head/tail bytes,
+/// the fingerprint reuses the stored ctime and mtime, so it equals the
+/// stored fingerprint and the candidate gate skips. A ctime or mtime
+/// mismatch therefore only costs this bounded sample re-read, never a Full
+/// read. A size or sampled-byte change, or a new object (whose device,
+/// inode and birth the parse consumes), keeps the live identity and reads.
 /// Returns the opened-object identity to fingerprint with, if adopted.
 fn adopt_unchanged_content_witness(
     source: SnapshotSource,
@@ -41216,7 +41222,10 @@ fn adopt_unchanged_content_witness(
     ) else {
         return Ok(None);
     };
-    if entry.size_bytes != candidate.size_bytes || stored.content != current.content {
+    let same_object = (stored.device, stored.inode, stored.birth_nanos)
+        == (current.device, current.inode, current.birth_nanos);
+    if !same_object || entry.size_bytes != candidate.size_bytes || stored.content != current.content
+    {
         return Ok(None);
     }
     if stored == current
@@ -87000,7 +87009,7 @@ pub(crate) mod cache_adapter_tests {
 // Closed owned-field inventory for optional scan overlap admission.
 crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, selector_sources, usage, reasoning_effort);
 crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity, opened_witness);
-crate::heap_layout_bound::fields!(OpenedObjectWitness; device, inode, changed_seconds, changed_nanos, content);
+crate::heap_layout_bound::fields!(OpenedObjectWitness; device, inode, changed_seconds, changed_nanos, birth_nanos, content);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; current, previous_windows, confirmed_absent_members);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPendingWindow; version, census_window_end, account_identifier_hash, evidence_request_count, census_complete, members, member_requests, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountRequestSet; prefixes, fingerprint, identity_revision);

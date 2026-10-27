@@ -1,8 +1,9 @@
 // Ron's re-read rule at the real scan seam, for Claude and Codex: only
-// content (size, sampled bytes) may trigger a re-read. ctime, xattr, mode,
-// hard-link and mtime flips, and the same bytes under a new inode, are
-// cross-checks that re-validate the bounded content samples and never read
-// the file again on their own. All fixtures are synthetic and content-free.
+// content (size, sampled bytes) or output-relevant inputs may trigger a
+// re-read. ctime, xattr, mode, hard-link and mtime flips are cross-checks
+// that re-validate the bounded content samples and never read the file
+// again on their own. A new object (device, inode, birth) is output-relevant:
+// the parse consumes it. All fixtures are synthetic and content-free.
 use super::*;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -223,8 +224,13 @@ fn metadata_only_changes_never_trigger_a_reread() {
     }
 }
 
+/// Same bytes under a new inode: the samples re-validate, but the object's
+/// device, inode and birth time are parse inputs (Claude request births and
+/// money birth cutoffs, Codex created-thread matching; see
+/// `e2_pipeline_inode_replacement_matches_full`), so it is read exactly once
+/// and then settles. Never a loop.
 #[test]
-fn same_bytes_under_a_new_inode_are_revalidated_by_content() {
+fn same_bytes_under_a_new_inode_read_once_for_its_object_inputs() {
     for (source, name, body) in sources() {
         for preserve_mtime in [false, true] {
             let mut fixture =
@@ -252,34 +258,20 @@ fn same_bytes_under_a_new_inode_are_revalidated_by_content() {
             );
             assert_eq!(
                 fixture.rescan(),
-                0,
-                "{name} (preserve mtime {preserve_mtime}): same bytes are not re-read"
+                1,
+                "{name} (preserve mtime {preserve_mtime}): new object is read once"
             );
-            assert_eq!(fixture.fingerprint(), stored, "{name}: new inode");
-            // The stored witness keeps the first open's object inputs.
-            assert_eq!(
-                fixture.entry().opened_witness.as_ref().map(|w| w.inode),
-                Some(original.ino()),
-                "{name}: adopted witness"
-            );
-            // A later real append to the new inode is still read.
-            tick();
-            fs::OpenOptions::new()
-                .append(true)
-                .open(&fixture.path)
-                .and_then(|mut file| {
-                    file.write_all(match source {
-                        SnapshotSource::Codex => CODEX_APPEND.as_bytes(),
-                        _ => CLAUDE_APPEND.as_bytes(),
-                    })
-                })
-                .expect("append");
-            assert_eq!(fixture.rescan(), 1, "{name}: append after replace");
+            assert_ne!(fixture.fingerprint(), stored, "{name}: new object");
             assert_eq!(
                 fixture.entry().opened_witness.as_ref().map(|w| w.inode),
                 Some(replaced.ino()),
-                "{name}: a read stores the live witness"
+                "{name}: the read stores the live witness"
             );
+            assert_eq!(fixture.rescan(), 0, "{name}: then settled, no loop");
+            // A metadata-only change on the new object reads nothing.
+            tick();
+            fixture.set_modified(SystemTime::now() + std::time::Duration::from_secs(5));
+            assert_eq!(fixture.rescan(), 0, "{name}: touch after replace");
         }
     }
 }
