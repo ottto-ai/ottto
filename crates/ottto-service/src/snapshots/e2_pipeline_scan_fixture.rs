@@ -18,7 +18,7 @@ impl E2ScanFixture {
 
     pub(crate) fn evict_for_pressure(&self) {
         let mut retained = self.cache.retained().unwrap();
-        let empty = crate::transcript_cache::TranscriptCache::<String>::default();
+        let empty = sampled_scan::RetainedCache::default();
         let limit = crate::heap_layout_bound::bound(&empty, usize::MAX).unwrap_or(0);
         assert!(retained.release_until(limit) || !crate::heap_layout_bound::layout_supported());
     }
