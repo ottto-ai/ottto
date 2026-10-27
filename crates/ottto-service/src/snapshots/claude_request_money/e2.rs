@@ -2114,7 +2114,8 @@ struct HolderEvidence {
     route: Evidence,
     /// Strict partial mode: a positive "this file holds the id NOW" claim.
     /// Unlike `route`, a settled entry whose file is gone proves nothing
-    /// (R3 L3), and neither does a scan that is not source-verified (R3 L2).
+    /// (R3 L3), neither does a scan that is not source-verified (R3 L2), and
+    /// a settled file at another size is stale even when no longer queued.
     /// A holder that only grew is current behind `GROWN_HOLDER_CURRENT`.
     strict: Evidence,
 }
@@ -2138,15 +2139,23 @@ fn holder_evidence(
         .filter(|entry| record.proves_current(&entry.source_file_fingerprint));
     let metadata = std::fs::metadata(key).ok().filter(|m| m.is_file());
     let route = route_evidence(index, key, record, settled, metadata.as_ref());
+    // A settled holder no longer at its indexed size changed within its
+    // read's mtime second. The routes accept it once it leaves the queue;
+    // a positive membership claim does not.
+    let resized = settled
+        .zip(metadata.as_ref())
+        .is_some_and(|(entry, metadata)| metadata.len() != entry.size_bytes);
     // TODO(SOURCE ask g): drop `unverified` here if SOURCE rules that an
     // unverified scan may prove membership.
     let strict = if metadata.is_none() || record.unverified_or_twin() {
         Evidence::None
-    } else if route != Evidence::Current
+    } else if (route != Evidence::Current || resized)
         && grown_holder_current()
         && grown(index, key, holder, settled, metadata.as_ref())
     {
         Evidence::Current
+    } else if route == Evidence::Current && resized {
+        Evidence::Stale
     } else {
         route
     };

@@ -4687,6 +4687,45 @@ fn e2_strict_partial_copy_counts_on_a_stale_holder_unless_it_only_grew() {
 }
 
 #[test]
+fn e2_strict_partial_copy_counts_on_a_holder_resized_within_its_read_second() {
+    with_enabled(|| {
+        // Same mtime second as the census read (no `modified` to differ),
+        // not queued: only the indexed extent shows the change.
+        for (grown_rule, change, removed) in [
+            (false, "append", 0),
+            (true, "append", 1),
+            (false, "truncate", 0),
+            (true, "truncate", 0),
+        ] {
+            let copy = root_file("strict-resized");
+            let mut index = ScanIndex::default();
+            let holder = holder_in(
+                copy.parent().unwrap(),
+                &["c1"],
+                HolderCensus::Current,
+                &mut index,
+            );
+            if change == "append" {
+                append_bytes(&holder, b"more holder lines\n");
+            } else {
+                fs::write(&holder, b"h\n").unwrap();
+            }
+            let lines = [
+                line("c1", &at(-100), 10),
+                versioned(line("o1", &at(1), 100), "2.1.311"),
+            ];
+            let item =
+                with_grown_holder_current(grown_rule, || parse(&copy, Some(t0()), &index, &lines));
+            let case = format!("rule={grown_rule} {change}");
+            assert!(!fold(&item).entity.held, "{case}");
+            assert_eq!(fold(&item).entity.removed_requests, removed, "{case}");
+            assert_eq!(fold(&item).entity.totals().1, 2 - removed, "{case}");
+            cleanup(&[&copy]);
+        }
+    })
+}
+
+#[test]
 fn e2_strict_partial_copy_keeps_the_bounded_queued_and_unscanned_holds() {
     with_enabled(|| {
         // A queued holder whose size changed within its read's mtime second.

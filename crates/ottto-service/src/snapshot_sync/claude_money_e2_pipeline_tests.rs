@@ -2937,7 +2937,9 @@ fn e2_pipeline_strict_copy_census_walk_receipt() {
     const PAD_HASHES: u64 = 2_000;
     const APPENDS: usize = 6;
     let pad = |c: &Corpus, index: &mut ScanIndex| {
-        if index.claude_request_census.totals_for_test().0 >= (PAD_RECORDS * PAD_HASHES) as usize {
+        if index.claude_request_census_for_test().totals_for_test().0
+            >= (PAD_RECORDS * PAD_HASHES) as usize
+        {
             return;
         }
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
@@ -2956,7 +2958,7 @@ fn e2_pipeline_strict_copy_census_walk_receipt() {
             let key = c.base.join(format!(
                 "pad/{record:08x}-0000-4000-8000-000000000000.jsonl"
             ));
-            let inserted = index.claude_request_census.insert_for_test(
+            let inserted = index.claude_request_census_mut_for_test().insert_for_test(
                 &key.to_string_lossy(),
                 ClaudeRequestCensusRecord::synthetic_for_test(
                     &format!("{record:064x}"),
@@ -3002,7 +3004,11 @@ fn e2_pipeline_strict_copy_census_walk_receipt() {
                 // before the page's copy decisions.
                 let mut page = c.raw(&E2ScanFixture::default(), prior, 100, false, &[]);
                 pad(&c, &mut page.index);
-                census = page.index.claude_request_census.totals_for_test().0;
+                census = page
+                    .index
+                    .claude_request_census_for_test()
+                    .totals_for_test()
+                    .0;
                 e2::take_stages();
                 page.enrich(&c);
                 let spent = e2::take_stages()
