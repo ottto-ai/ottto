@@ -1434,3 +1434,148 @@ fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_fami
 }
 
 include!("retry_admission_pipeline_tests.rs");
+
+// Mirror prepare's existing baseline ordering, then use the shared full pipeline
+// and save/reload every synthetic page. No fixture alters acquisition policy.
+fn latch_contract_generation(fixture: &RearmFixture, minute: usize) -> Vec<RearmPage> {
+    let mut pages = Vec::new();
+    for number in 0..C1B_MAX_PAGES {
+        let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+        index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(
+            SnapshotSource::ClaudeCode,
+        ));
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        index.load_claude_reemission_exclusions(&fixture.support);
+        crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
+        index.observe_claude_request_identity_contract(fixture.request_identity);
+        let page = fixture.page_with_input_index(
+            &format!("2026-08-02T08:{:02}:00Z", minute + number),
+            RearmUpload::Accept,
+            None,
+            Some(index),
+        );
+        page.index.save(&fixture.index_path).unwrap();
+        let ended = c1b_traversal_ended(&page.index).0;
+        pages.push(page);
+        if ended {
+            return pages;
+        }
+    }
+    panic!("bounded fixture ends");
+}
+
+#[test]
+#[serial(source_manifests)]
+fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies() {
+    if !c1a_layout_supported("latch-contract-money") {
+        return;
+    }
+    let _manifests = SourceManifestTestGuard::new();
+    for e2 in [false, true] {
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(e2);
+        let contract = if e2 {
+            crate::snapshots::claude_request_identity::E2_GROUPING
+        } else {
+            crate::snapshots::claude_request_identity::COLLECTOR
+        };
+        crate::snapshots::claude_request_identity::with_cycle_contract_for_test(contract, || {
+            for case in ["accepted", "held", "listed"] {
+                for base in [false, true] {
+                    let _base = base.then(crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new);
+                    let mut fixture = c1a_fixture("e3-latch-contract-money");
+                    fixture.owned_base_preparation = true;
+                    fixture.native_file_limit = 100;
+                    let session = "e7000000-0000-4000-8000-000000000007";
+                    let path = fixture.root.join(format!("{session}.jsonl"));
+                    std::fs::write(
+                        &path,
+                        rearm_transcript_line(session, None, "req_latch_1", 0),
+                    )
+                    .unwrap();
+                    if case == "held" {
+                        fixture.local_holds.insert(session.to_owned());
+                    }
+                    let list =
+                        crate::snapshots::claude_reemission_exclusions::ReemissionExclusions::path(
+                            &fixture.support,
+                        );
+                    std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+                    let listed = if case == "listed" {
+                        format!("{:x}\n", sha2::Sha256::digest(session.as_bytes()))
+                    } else {
+                        String::new()
+                    };
+                    std::fs::write(list, listed).unwrap();
+                    latch_contract_generation(&fixture, 0);
+                    RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+                    c1a_edit_index(&fixture, |saved| {
+                        for entry in saved["files"].as_object_mut().unwrap().values_mut() {
+                            entry["source_file_fingerprint"] = serde_json::json!("");
+                        }
+                    });
+                    latch_contract_generation(&fixture, 10);
+                    let accepted = fixture.body_trace.borrow().finalizer_bodies[session].clone();
+                    assert_eq!(accepted["input_tokens"], 10, "{case}/{base}/{e2}");
+                    assert_eq!(accepted["output_tokens"], 10);
+                    assert_eq!(accepted["request_count"], 1);
+                    c1a_edit_index(&fixture, |saved| {
+                        saved.insert(
+                            "claude_request_identity_contract_changed".into(),
+                            serde_json::json!(true),
+                        );
+                    });
+                    let retry = latch_contract_generation(&fixture, 20);
+                    let reads = rearm_parsed(&retry).contains(session);
+                    if case == "accepted" {
+                        assert_eq!(reads, base, "exact-ACK unchanged {base}/{e2}");
+                        if !base {
+                            assert_eq!(
+                                fixture.body_trace.borrow().finalizer_bodies[session],
+                                accepted
+                            );
+                        }
+                    } else if case == "held" {
+                        assert!(reads, "held keeps today's path {base}/{e2}");
+                        assert!(retry.iter().all(|page| !page
+                            .uploaded
+                            .contains(accepted["snapshot_fingerprint"].as_str().unwrap())));
+                    } else {
+                        assert_eq!(
+                            fixture.body_trace.borrow().finalizer_bodies[session]["input_tokens"],
+                            10
+                        );
+                        assert_ne!(
+                            fixture.body_trace.borrow().finalizer_bodies[session]
+                                ["usage_accounting_contract"],
+                            crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT
+                        );
+                    }
+                    let saved = c1a_saved(&fixture);
+                    assert_eq!(saved["claude_request_identity_contract_changed"], true);
+                    assert_eq!(saved["claude_duplicate_request_witness_overflowed"], true);
+                    assert!(retry.iter().all(|page| !page.scan.census_complete));
+                    if case == "accepted" {
+                        RearmFixture::append(
+                            &path,
+                            &rearm_transcript_line(session, None, "req_latch_2", 1),
+                        );
+                        let grown = latch_contract_generation(&fixture, 30);
+                        assert!(rearm_parsed(&grown).contains(session));
+                        let body = fixture.body_trace.borrow().finalizer_bodies[session].clone();
+                        let cold = native_comparison_independent_history(&fixture);
+                        let full = latch_contract_generation(&cold, 30);
+                        assert!(rearm_parsed(&full).contains(session));
+                        let expected = cold.body_trace.borrow().finalizer_bodies[session].clone();
+                        assert_eq!(body["input_tokens"], 20);
+                        assert_eq!(body["output_tokens"], 20);
+                        assert_eq!(body["request_count"], 2);
+                        assert_eq!(
+                            body, expected,
+                            "grown accepted body equals cold Full {base}/{e2}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+}

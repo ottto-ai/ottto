@@ -3877,3 +3877,360 @@ fn stale_carry_rejection_histogram_separates_qualification_funding_and_reserve()
         assert_eq!(row["carried_pending_families"], counts.final_carried);
     }
 }
+
+// E3 PR1: exact accepted bodies may wait on global contract correction only.
+fn contract_debt_fixture(healthy: usize) -> ScopedRetryFixture {
+    let mut fixture = retry_durable_fixture(0, healthy);
+    fixture.index.bounded_sweep_had_unsettled_upload = false;
+    fixture.index.bounded_sweep_unsettled_causes = 0;
+    fixture.index.claude_request_identity_contract_changed = true;
+    fixture.index.active_effective_upload_body_witness_revision = 3;
+    fixture
+        .index
+        .active_effective_upload_body_witness_revision_monotone = true;
+    for entry in fixture.index.files.values_mut() {
+        entry.effective_upload_body_witness_revision = 3;
+    }
+    fixture
+}
+
+#[test]
+fn contract_debt_defers_exact_acks_on_ordinary_streaming_and_batch_routes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for route in ["ordinary", "streaming", "batch"] {
+        let mut fixture = contract_debt_fixture(3);
+        let stale = fixture.roots.iter().cloned().collect();
+        let before = serde_json::to_value(&fixture.index.files).unwrap();
+        let accepted = fixture.index.accepted_snapshot_fingerprints.clone();
+        let carry = match route {
+            "ordinary" => {
+                claude_fence_closed_retry_carry(&fixture.index, &stale, true, false, true)
+            }
+            "streaming" => claude_stream_accepted_retry_carry(&fixture.index, &stale).unwrap(),
+            _ => claude_retry_admit_batch(&fixture.index, &stale, None, CARRY_RETRY).0,
+        };
+        assert_eq!(carry.roots, stale, "{route}");
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(scope.finish().contract.deferred_by_contract_debt, 3);
+        assert_eq!(serde_json::to_value(&fixture.index.files).unwrap(), before);
+        assert_eq!(fixture.index.accepted_snapshot_fingerprints, accepted);
+        assert_eq!(
+            scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+            0
+        );
+        assert!(fixture.index.claude_request_identity_contract_changed);
+        assert!(fixture.index.claude_duplicate_request_witness_overflowed);
+        for pending in fixture.index.claude_usage_family_pending.values() {
+            assert_eq!(pending.census_window_end, CARRY_FAILED);
+            assert!(pending.member_occurrences.is_empty());
+            assert!(pending
+                .member_request_id_hashes
+                .values()
+                .all(BTreeSet::is_empty));
+        }
+        let previous = fixture.index.clone();
+        let partial =
+            fixture
+                .index
+                .committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        assert!(partial.claude_request_identity_contract_changed);
+        let exclusions = fixture.index.claude_reemission_exclusions.clone();
+        fixture.index = carry_reload(fixture.index);
+        fixture.index.claude_reemission_exclusions = exclusions;
+        fixture.index.active_effective_upload_body_witness_revision = 3;
+        carry_red(&mut fixture.index, CARRY_RETRY, 1);
+        carry_start(&mut fixture.index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(
+            scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+            0
+        );
+        assert!(fixture.index.claude_request_identity_contract_changed);
+    }
+}
+
+#[test]
+fn contract_debt_refuses_every_other_obligation_on_all_carry_routes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in [
+        "missing_ack",
+        "partial_ack",
+        "account_hold",
+        "authority_retry",
+        "identity_hold",
+        "owed_revision",
+        "money_rule",
+        "unsettled",
+        "held_scope",
+        "withheld",
+        "listed",
+    ] {
+        let mut fixture = contract_debt_fixture(1);
+        let root = fixture.roots[0].clone();
+        let key = local_index_key(&fixture.candidates[0].path);
+        match case {
+            "missing_ack" => fixture.index.accepted_snapshot_fingerprints.clear(),
+            "partial_ack" => {
+                fixture
+                    .index
+                    .file_snapshot_fingerprints
+                    .get_mut(&key)
+                    .unwrap()
+                    .insert("9".repeat(64));
+                scoped_retry_accept_member(&mut fixture.index, &key);
+            }
+            "account_hold" => {
+                fixture
+                    .index
+                    .claude_account_deferred_holds
+                    .insert(key.clone(), "held".into());
+            }
+            "authority_retry" => fixture.index.bind_retry_pending_claude_authority_for_test(
+                &root,
+                BTreeMap::from([(
+                    root.clone(),
+                    fixture.index.files[&key].source_file_fingerprint.clone(),
+                )]),
+            ),
+            "identity_hold" => {
+                fixture
+                    .index
+                    .claude_usage_family_pending
+                    .get_mut(&root)
+                    .unwrap()
+                    .invalid = true
+            }
+            "owed_revision" => {
+                fixture
+                    .index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .effective_upload_body_witness_revision = 2
+            }
+            "money_rule" => {
+                assert!(fixture
+                    .index
+                    .re_owe_effective_upload_body_witness_revision(&key, 2));
+            }
+            "unsettled" => fixture
+                .index
+                .mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds),
+            "held_scope" => fixture
+                .index
+                .mark_bounded_sweep_held_by_families(Some(&BTreeSet::from([root.clone()]))),
+            "withheld" => fixture
+                .index
+                .claude_request_census
+                .invalidate_keeping_birth(&key),
+            "listed" => {
+                fixture.index.claude_reemission_exclusions = ReemissionExclusions::parse(
+                    format!("{:x}\n", Sha256::digest(root.as_bytes())).as_bytes(),
+                )
+            }
+            _ => unreachable!(),
+        }
+        let stale = BTreeSet::from([root.clone()]);
+        assert!(
+            claude_fence_closed_retry_carry(&fixture.index, &stale, true, true, true)
+                .roots
+                .is_empty(),
+            "ordinary: {case}"
+        );
+        assert!(
+            claude_stream_accepted_retry_carry(&fixture.index, &stale)
+                .unwrap()
+                .roots
+                .is_empty(),
+            "streaming: {case}"
+        );
+        assert!(
+            claude_retry_admit_batch(&fixture.index, &stale, None, CARRY_RETRY)
+                .0
+                .roots
+                .is_empty(),
+            "batch: {case}"
+        );
+        assert!(
+            fixture.index.claude_request_identity_contract_changed,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in [
+        "ledger",
+        "upload_context",
+        "content",
+        "sidecar",
+        "account",
+        "scratch",
+    ] {
+        let mut fixture = contract_debt_fixture(2);
+        let before = fixture.index.accepted_snapshot_fingerprints.clone();
+        let _scratch = (case == "scratch").then(RefuseClaudeStaleFamilyCarryBudgetForTest::new);
+        match case {
+            "ledger" => fixture.index.accepted_snapshot_fingerprint_ledger_version = 0,
+            "upload_context" => {
+                fixture.index.active_upload_context_fingerprint = Some("changed".into())
+            }
+            _ => (),
+        }
+        carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        let candidate = &mut fixture.candidates[0];
+        match case {
+            "content" => candidate.size_bytes += 1,
+            "sidecar" | "account" => candidate.source_file_fingerprint = "e".repeat(64),
+            _ => assert!(
+                fixture.index.claude_stale_family_carry.roots.is_empty(),
+                "{case}"
+            ),
+        }
+        assert_eq!(
+            fixture.index.candidate_decision_at(candidate, 1),
+            CandidateDecision::Parse,
+            "{case}"
+        );
+        if matches!(case, "content" | "sidecar" | "account") {
+            let root = claude_index_path_member_ref(&candidate.path)
+                .unwrap()
+                .root
+                .to_owned();
+            cancel_claude_family_carry_for_member_parse(
+                &mut fixture.index,
+                CARRY_RETRY,
+                &candidate.path,
+                &[],
+                &VecDeque::new(),
+            );
+            assert!(!fixture.index.claude_stale_family_carry.contains(&root));
+        }
+        assert_eq!(fixture.index.accepted_snapshot_fingerprints, before);
+        assert!(fixture.index.claude_request_identity_contract_changed);
+        assert!(fixture.index.claude_duplicate_request_witness_overflowed);
+    }
+}
+
+#[test]
+fn contract_start_status_preserves_resume_placeholder_and_reowes_only_once() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    claude_request_identity::with_cycle_contract_for_test(
+        claude_request_identity::E2_GROUPING,
+        || {
+            let mut fixture = contract_debt_fixture(1);
+            fixture.index.claude_request_identity_contract_changed = false;
+            let key = local_index_key(&fixture.candidates[0].path);
+            fixture
+                .index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .pending_directories
+                .push_back(ScanTraversalPath {
+                    path: PathBuf::from("/synthetic"),
+                    scan_root: PathBuf::from("/synthetic"),
+                    census_member: true,
+                    watcher_hint: false,
+                });
+            fixture.index.observe_claude_request_identity_contract(true);
+            assert_eq!(
+                fixture.index.files[&key].effective_upload_body_witness_revision,
+                2
+            );
+            fixture
+                .index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .effective_upload_body_witness_revision = 3;
+            fixture.index.observe_claude_request_identity_contract(true);
+            assert_eq!(
+                fixture.index.files[&key].effective_upload_body_witness_revision, 3,
+                "adoption re-owes only once"
+            );
+            let placeholder = fixture.index.claude_request_identity_contract.clone();
+            assert_eq!(
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    &[],
+                    &mut fixture.index,
+                    CARRY_RETRY,
+                    BACKFILL_WINDOW_DAYS
+                ),
+                TraversalProgress::Resumed
+            );
+            assert_eq!(fixture.index.claude_request_identity_contract, placeholder);
+            carry_red(&mut fixture.index, CARRY_FAILED, 1);
+            assert_eq!(
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    &[],
+                    &mut fixture.index,
+                    CARRY_RETRY,
+                    BACKFILL_WINDOW_DAYS
+                ),
+                TraversalProgress::Started
+            );
+            fixture
+                .index
+                .record_started_claude_request_identity_contract(true);
+            assert_eq!(
+                fixture.index.claude_request_identity_contract.as_deref(),
+                Some(claude_request_identity::E2_GROUPING)
+            );
+            assert!(fixture.index.claude_request_identity_contract_changed);
+            assert_eq!(
+                fixture.index.files[&key].effective_upload_body_witness_revision,
+                3
+            );
+            fixture
+                .index
+                .observe_claude_request_identity_contract(false);
+            assert_eq!(
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    &[PathBuf::from("/new-context")],
+                    &mut fixture.index,
+                    CARRY_SECOND_RETRY,
+                    BACKFILL_WINDOW_DAYS
+                ),
+                TraversalProgress::Started
+            );
+            fixture
+                .index
+                .record_started_claude_request_identity_contract(false);
+            assert_eq!(
+                fixture.index.claude_request_identity_contract.as_deref(),
+                Some("")
+            );
+            assert!(
+                fixture.index.claude_request_identity_contract_changed,
+                "denial with incomplete census cannot clear"
+            );
+        },
+    );
+    let counts = scope.finish().contract;
+    assert_eq!(counts.identity_contract_latch.set, 1);
+    assert_eq!(counts.identity_contract_latch.cleared, 0);
+    assert_eq!(counts.identity_contract_transition.collector_e2_grouping, 1);
+    assert_eq!(counts.identity_contract_transition.to_empty, 1);
+    assert_eq!(
+        counts
+            .identity_contract_transition
+            .mid_traversal_placeholder,
+        4
+    );
+}

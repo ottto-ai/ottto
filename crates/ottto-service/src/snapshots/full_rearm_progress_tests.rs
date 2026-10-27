@@ -454,6 +454,7 @@ fn non_structural_invalidation_rearms() {
 /// full re-arm runs and clears the latch as before, and the skip resumes.
 #[test]
 fn identity_contract_latch_or_unrecorded_contract_rearms() {
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     let rearm = Rearm::new();
     let mut index = rearm.index();
     rearm.establish(&mut index, &rearm.items);
@@ -471,6 +472,7 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
     assert!(!index.claude_request_identity_contract_changed);
     let skipped = rearm.terminal(&mut index, &rearm.items);
     assert!(skipped.suppression.full_rearm_suppressed, "{skipped:?}");
+    assert_eq!(scope.finish().contract.identity_contract_latch.cleared, 1);
 }
 
 /// A record written under another basis (a D1 derivation, scan identity or
