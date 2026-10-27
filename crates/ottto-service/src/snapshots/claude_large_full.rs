@@ -429,8 +429,15 @@ pub(super) fn admit(
     page: &mut HistoryPage,
 ) -> bool {
     let key = local_index_key(&candidate.path);
+    let mut rotate_held = false;
     let admitted = match twin_group(index, candidate, page) {
-        Err(()) => false,
+        Err(()) => {
+            // Intrinsic size/metadata refusal cannot clear merely by starting
+            // another pass. Keep its debt, but let the failed audit slot rotate
+            // as it does for an unavailable or oversized native open.
+            rotate_held = true;
+            false
+        }
         Ok(Some(Group { member, twins })) => {
             if unit.as_ref().is_some_and(|current| current != &member) {
                 false
@@ -477,9 +484,10 @@ pub(super) fn admit(
             .as_mut()
             .filter(|slot| slot.key == key)
         {
-            // Queueing was not an audit attempt. Keep its original turn
-            // and deadline until native acquisition can actually start.
-            slot.attempted = false;
+            // Spent allowance/page funds keep the original overdue turn.
+            // An intrinsically inadmissible group rotates the scheduling
+            // cursor; this flag grants neither a native read nor proof.
+            slot.attempted = rotate_held;
             slot.large_full_deferred = true;
         }
         if !index.claude_large_full_deferred.contains(&key) {

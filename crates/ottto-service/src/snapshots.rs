@@ -25780,12 +25780,19 @@ impl OwnedSourceScan {
         if source == SnapshotSource::ClaudeCode {
             index.observe_claude_request_identity_contract(claude_request_identity_capture);
         }
+        ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
         if source == SnapshotSource::ClaudeCode {
             let scope =
                 scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
-            index.claude_large_full_deferred.begin(&scope, roots);
+            // Candidates use resolved traversal paths, including configured
+            // symlink roots. GC must use that same containment authority.
+            let resolved = &index
+                .traversal
+                .as_ref()
+                .expect("traversal initialized")
+                .scan_roots;
+            index.claude_large_full_deferred.begin(&scope, resolved);
         }
-        ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
         let next_generation_hints;
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");

@@ -592,8 +592,25 @@ fn write_pi_progress(root: &Path, pass: usize) -> PathBuf {
 
 #[test]
 fn large_claude_fulls_rotate_with_sibling_and_audits() {
+    assert_large_full_rotation(false);
+}
+
+#[test]
+fn symlink_root_keeps_large_full_fifo_against_repeated_hints_and_audits() {
+    assert_large_full_rotation(true);
+}
+
+fn assert_large_full_rotation(symlink_root: bool) {
     use crate::transcript_acquisition::{FullReason, ReadMode};
     let claude = Fixture::new();
+    let links = Fixture::new();
+    let configured_root = if symlink_root {
+        let path = links.0.join("configured-claude");
+        std::os::unix::fs::symlink(&claude.0, &path).unwrap();
+        path
+    } else {
+        claude.0.clone()
+    };
     let pi = Fixture::new();
     let large = (0..3)
         .map(|n| {
@@ -647,7 +664,7 @@ fn large_claude_fulls_rotate_with_sibling_and_audits() {
                     SnapshotSource::ClaudeCode,
                     rotation_scan(
                         SnapshotSource::ClaudeCode,
-                        &claude.0,
+                        &configured_root,
                         std::mem::take(&mut index),
                         &cache,
                         &hints,
@@ -777,7 +794,15 @@ fn large_claude_fulls_rotate_with_sibling_and_audits() {
                 .unwrap()
                 .set_unverified_deadline(1);
         }
-        println!("claude_large_full_scheduler_receipt: pass={pass} large_fulls=1 pi_reads=1 parking_refused={}", owner.refusals.get() > 0);
+        let receipt = if symlink_root {
+            "claude_large_full_symlink_receipt"
+        } else {
+            "claude_large_full_scheduler_receipt"
+        };
+        println!(
+            "{receipt}: pass={pass} large_fulls=1 pi_reads=1 parking_refused={}",
+            owner.refusals.get() > 0
+        );
     }
 }
 
@@ -1224,4 +1249,153 @@ fn deferred_large_full_keeps_census_family_and_no_skip_credit() {
         );
     }
     println!("claude_large_full_source_receipt: deferred=2 census_complete=false absence_retirements=0 membership_retractions=0 unchanged_skip_credit=0");
+}
+
+#[test]
+fn over_budget_twin_audit_rotates_to_small_hold_with_saturated_slots() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+    };
+    let fixture = Fixture::new();
+    let small_session = "019e2700-9999-7000-9000-000000000001";
+    let twins = ["a", "b"].map(|dir| {
+        let root = fixture.0.join(dir);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("{SESSION}.jsonl"));
+        fs::write(&path, format!("{}\n", usage(0))).unwrap();
+        path
+    });
+    let small = fixture.0.join(format!("{small_session}.jsonl"));
+    let mut row = usage(1);
+    row["sessionId"] = json!(small_session);
+    fs::write(&small, format!("{row}\n")).unwrap();
+    let mut index = ScanIndex::default();
+    let mut baseline = fixture.scan(SnapshotSource::ClaudeCode, &mut index, 9);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut baseline, &mut index);
+    assert_eq!(index.files.len(), 3);
+    for path in &twins {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(513 * MIB)
+            .unwrap();
+    }
+    let held_key = local_index_key(&twins[0]);
+    let small_key = local_index_key(&small);
+    // This fixture has two rotating holds; the indexed twin still belongs
+    // to the whole-group fence without owning another rotating hold.
+    index
+        .claude_request_census_mut_for_test()
+        .remove(&local_index_key(&twins[1]));
+    for key in [&held_key, &small_key] {
+        index.files.get_mut(key).unwrap().scan_identity_version =
+            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        index.claude_request_census_mut_for_test().insert_for_test(
+            key,
+            Record::synthetic_for_test(&"a".repeat(64), 1, Shape::IdentityIncomplete, vec![1])
+                .with_unverified_for_test(true),
+        );
+    }
+    // Keep ordinary restoration saturated: only the existing rotating slot
+    // can restore the small plain-v2 identity hold's Full obligation.
+    for n in 0..crate::transcript_cache::CACHE_ENTRIES - 1 {
+        let mut entry = index.files[&small_key].clone();
+        entry.set_unverified_deadline(1);
+        index
+            .files
+            .insert(format!("/unavailable-twin-audit/{n}"), entry);
+    }
+    index.held_audit_progress = Some(sampled_audit::HeldAuditProgress {
+        key: held_key.clone(),
+        due: 1,
+        attempted: false,
+        large_full_deferred: false,
+    });
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut scan = rotation_scan(SnapshotSource::ClaudeCode, &fixture.0, index, &cache, &[]);
+    assert_eq!(scan.sampling.as_ref().unwrap().audit_slots, 1);
+    assert!(sampled_audit::awaits_hold_deadline_restoration(
+        &scan.index,
+        &small_key
+    ));
+    assert_eq!(
+        sampled_audit::restore_held_audit_deadlines(&mut scan.index, sampled_scan::now_seconds()),
+        0,
+        "ordinary sampled restoration remains saturated"
+    );
+    let candidate = scan
+        .identified_candidates
+        .iter()
+        .find(|candidate| candidate.path == twins[0])
+        .unwrap()
+        .clone();
+    assert!(!claude_large_full::admit(
+        &mut scan.index,
+        &candidate,
+        true,
+        &mut None,
+        &mut scan.history_upgrade,
+    ));
+    let slot = scan.index.held_audit_progress.as_ref().unwrap();
+    assert!(
+        slot.attempted,
+        "failed admission rotates the scheduling cursor"
+    );
+    assert!(slot.large_full_deferred);
+    assert_eq!(slot.due, 1, "refusal retains the original overdue deadline");
+    assert!(scan.index.claude_large_full_deferred.contains(&held_key));
+    // The next production scheduling call selects the readable small hold.
+    // Its fresh interval is the existing held-audit policy, unchanged here.
+    let now = sampled_scan::now_seconds();
+    scan.prepare_held_audit_progress(now);
+    let slot = scan.index.held_audit_progress.as_mut().unwrap();
+    assert_eq!(slot.key, small_key);
+    assert_eq!(
+        slot.due,
+        now + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS
+    );
+    assert!(!slot.attempted);
+    slot.due = 1; // Advance this fixture's new slot to its scheduled due time.
+    scan.prepare_held_audit_progress(now);
+    assert_eq!(
+        local_index_key(&scan.identified_candidates[0].path),
+        small_key
+    );
+    let mut owner = Rotation {
+        ready: vec![(SnapshotSource::ClaudeCode, scan)],
+        completed: Vec::new(),
+        starts: Vec::new(),
+        refuse_parking: false,
+        refusals: std::cell::Cell::new(0),
+        deferred_revocations: 0,
+        history_receipt: None,
+        started: std::time::Instant::now(),
+    };
+    let (_, reads) = terminal_contract_retry::source_acquisitions(|| {
+        crate::source_rotation::run(
+            &mut owner,
+            &[SnapshotSource::ClaudeCode],
+            crate::source_rotation::PARKED_BUDGET,
+        );
+    });
+    assert_eq!(reads.get(&small), Some(&1));
+    assert!(twins.iter().all(|path| !reads.contains_key(path)));
+    assert!(owner.starts.iter().any(|(path, mode)| {
+        path == &small
+            && *mode
+                == Some(crate::transcript_acquisition::ReadMode::Full(
+                    crate::transcript_acquisition::FullReason::AuditDue,
+                ))
+    }));
+    let (_, next, result) = owner.completed.pop().unwrap();
+    assert!(!result.census_complete);
+    assert!(result.skipped_file_count_due_to_limit >= 2);
+    for path in &twins {
+        assert!(next
+            .claude_large_full_deferred
+            .contains(&local_index_key(path)));
+        assert!(next.files[&local_index_key(path)].size_bytes < 256 * MIB);
+    }
+    println!("claude_large_twin_audit_rotation_receipt: group_fulls=0 small_audit_fulls=1 saturated=true census_complete=false");
 }
