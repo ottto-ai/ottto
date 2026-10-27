@@ -434,9 +434,14 @@ impl OwnedSourceScan {
             self.identified_candidates
                 .iter()
                 .take_while(|candidate| {
+                    let candidate_key = local_index_key(&candidate.path);
                     self.index
                         .claude_large_full_deferred
-                        .contains(&local_index_key(&candidate.path))
+                        .iter()
+                        // Preserve this key's rank when it is already debt;
+                        // a newly scheduled key follows all existing debt.
+                        .take_while(|deferred| deferred.as_str() != key.as_str())
+                        .any(|deferred| deferred == &candidate_key)
                 })
                 .count()
         } else {
@@ -519,6 +524,14 @@ mod tests {
         let held = root.join("b-held.jsonl");
         fs::write(&older, "{}\n").unwrap();
         fs::write(&held, "{}\n").unwrap();
+        for path in [&older, &held] {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(257 * 1024 * 1024)
+                .unwrap();
+        }
         let old_key = local_index_key(&older);
         let held_key = local_index_key(&held);
         let mut index = ScanIndex {
@@ -542,9 +555,10 @@ mod tests {
             due: 50,
             attempted: false,
         });
+        let mut seed = index.clone();
         let mut scan = OwnedSourceScan::new(
             SnapshotSource::ClaudeCode,
-            &[root],
+            std::slice::from_ref(&root),
             index,
             "2026-10-27T12:00:00Z",
             BACKFILL_WINDOW_DAYS,
@@ -604,6 +618,60 @@ mod tests {
         assert_eq!(
             scan.index.files[&held_key].source_file_fingerprint,
             "source"
+        );
+
+        // Already-deferred held debt must keep its earlier rank. Saturate
+        // the existing restoration slots so production with_sampled cannot
+        // convert the plain-v2 hold before its rotating slot is scheduled.
+        let newer_key = local_index_key(&older);
+        seed.claude_large_full_deferred = VecDeque::from([held_key.clone(), newer_key.clone()]);
+        for n in 0..CACHE_ENTRIES - 1 {
+            let mut pending = entry();
+            pending.set_unverified_deadline(50);
+            seed.files
+                .insert(format!("/unavailable-held-audit/{n}"), pending);
+        }
+        let ordered = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            seed,
+            "2026-10-27T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            2,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(
+            Arc::new(sampled_scan::SharedCache::default()),
+            crate::transcript_acquisition::Scope("held-audit-fifo".into()),
+        );
+        assert_eq!(
+            ordered.sampling.as_ref().unwrap().audit_slots,
+            1,
+            "existing final sampled slot remains free"
+        );
+        assert!(ordered
+            .identified_candidates
+            .iter()
+            .all(claude_large_full::is_large));
+        assert_eq!(
+            ordered
+                .identified_candidates
+                .iter()
+                .map(|candidate| local_index_key(&candidate.path))
+                .collect::<Vec<_>>(),
+            vec![held_key.clone(), newer_key],
+            "held debt keeps the oldest Full turn"
+        );
+        let slot = ordered.index.held_audit_progress.as_ref().unwrap();
+        assert_eq!(slot.key, held_key);
+        assert_eq!(slot.due, 50);
+        assert!(
+            slot.attempted,
+            "oldest held candidate is selected, not displaced"
         );
     }
 
