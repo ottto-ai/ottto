@@ -5533,6 +5533,17 @@ fn try_collect_native_preparation_with_rotation_observed(
             );
             frame.accept_native_rotation_turn(remaining);
             if self.require_bound {
+                let mut receipt =
+                    crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+                let measured =
+                    crate::heap_layout_bound::HeapLayoutBound::heap_bound(&frame, &mut receipt);
+                eprintln!(
+                    "codex_wake_frame: step={} bytes={} visits={} bounded={}",
+                    self.steps,
+                    receipt.bytes,
+                    receipt.visits_for_test(),
+                    measured.is_some()
+                );
                 assert!(crate::heap_layout_bound::bound(&frame, crate::source_rotation::PARKED_BUDGET).is_some(),
                     "the real source frame must pass its real existing requested-layout budget; no substitute bound");
             } else if self.require_parking_refusal && !self.parking_refused {

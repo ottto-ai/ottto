@@ -198,6 +198,7 @@ pub(in crate::snapshots) struct GroupBoot {
     pub(in crate::snapshots) key: String,
     identified: usize,
     stamps: Vec<OpenStamp>,
+    wake_identities: BTreeMap<String, String>,
     headers: Vec<MemberHeader>,
     plan: Option<GroupPlan>,
     probes: Vec<Option<Tokens>>,
@@ -220,7 +221,7 @@ pub(in crate::snapshots) struct GroupBoot {
     legacy_expected: BTreeMap<String, String>,
     evidence: codex_counting_version::AckEvidence,
 }
-crate::heap_layout_bound::fields!(GroupBoot; reread_tickets, reread_members_admitted, group, key, identified, stamps, headers, plan,
+crate::heap_layout_bound::fields!(GroupBoot; reread_tickets, reread_members_admitted, group, key, identified, stamps, wake_identities, headers, plan,
     probes, probed, ordered, admitted, probe_bound, probe_limit_bound, own_page, probe_allowance,
     charge, previous_receipts, receipt_scope, legacy_expected, evidence);
 
@@ -255,6 +256,7 @@ impl GroupBoot {
             group,
             identified: 0,
             stamps: Vec::new(),
+            wake_identities: BTreeMap::new(),
             headers: Vec::new(),
             plan: None,
             probes: Vec::new(),
@@ -300,14 +302,24 @@ impl GroupBoot {
             .fold(0u64, |sum, member| sum.saturating_add(member.size_bytes))
     }
 
+    #[cfg(test)]
     pub(in crate::snapshots) fn step(
         &mut self,
         attribution: Option<&crate::session_attribution::SessionAttributionContext>,
         index: &ScanIndex,
     ) -> Boot {
+        self.step_with_cache(attribution, index, None)
+    }
+
+    pub(in crate::snapshots) fn step_with_cache(
+        &mut self,
+        attribution: Option<&crate::session_attribution::SessionAttributionContext>,
+        index: &ScanIndex,
+        cache: Option<&sampled_scan::SharedCache>,
+    ) -> Boot {
         let n = self.group.members.len();
         if self.identified < n {
-            return self.identify(attribution, index);
+            return self.identify(attribution, index, cache);
         }
         if !self.admitted {
             if self.unchanged_joined(index) {
@@ -372,6 +384,7 @@ impl GroupBoot {
         &mut self,
         attribution: Option<&crate::session_attribution::SessionAttributionContext>,
         index: &ScanIndex,
+        cache: Option<&sampled_scan::SharedCache>,
     ) -> Boot {
         let i = self.identified;
         let mut candidate = self.group.members[i].clone();
@@ -406,6 +419,14 @@ impl GroupBoot {
         let Ok(stamp) = OpenStamp::capture(&file) else {
             return Boot::Strict;
         };
+        let identity = cache
+            .and_then(|cache| cache.retained_open(&opened.path, &file))
+            .map_or_else(
+                || opened.opened_object_identity.clone(),
+                |(_, identity, _)| identity,
+            );
+        self.wake_identities
+            .insert(local_index_key(&opened.path), identity);
         self.group.members[i] = opened;
         self.stamps.push(stamp);
         self.identified += 1;
@@ -502,6 +523,7 @@ impl GroupBoot {
             &self.group.members,
             &live.path,
             codex,
+            |member| self.wake_identity(member),
         ))
     }
 
@@ -527,7 +549,15 @@ impl GroupBoot {
             index,
             codex,
             &self.receipt_scope,
+            |member| self.wake_identity(member),
         ))
+    }
+
+    fn wake_identity(&self, member: &CandidateFile) -> String {
+        self.wake_identities
+            .get(&local_index_key(&member.path))
+            .unwrap_or(&member.opened_object_identity)
+            .clone()
     }
 
     /// Open the first canonical member and build the job.
@@ -747,7 +777,7 @@ pub(in crate::snapshots) struct GroupJob {
     own_page: bool,
     /// `GroupBoot::dependencies`: a parked `ProbeBudgetOrder` record's wake
     /// inputs (round 3).
-    dependencies: Option<String>,
+    pub(in crate::snapshots) dependencies: Option<String>,
     pub(in crate::snapshots) memo_digest: Option<String>,
     /// `cursor::group_scope` at job start (§p, R1-M1): every resume and the
     /// emission compare it with the current index.
@@ -1248,7 +1278,10 @@ pub(in crate::snapshots) fn end_group(
                     if let Some(stamp) = group.stamps.last() {
                         context.cache.park_group(
                             &group.key,
-                            stamp.clone(),
+                            context.cache.retained_stamp(
+                                &group.members.last().expect("live member").path,
+                                stamp.clone(),
+                            ),
                             group.dependencies.clone(),
                             probe_order_disclosure(&group.owner),
                             reason.append_curable() && position + 1 == group.members.len(),
@@ -1309,7 +1342,10 @@ pub(in crate::snapshots) fn end_group(
                             cursor::MemoEntry::new_group(
                                 digest,
                                 live,
-                                stamp,
+                                context.cache.retained_stamp(
+                                    &group.members.last().expect("live member").path,
+                                    stamp,
+                                ),
                                 None,
                                 None,
                                 disclosure.clone(),

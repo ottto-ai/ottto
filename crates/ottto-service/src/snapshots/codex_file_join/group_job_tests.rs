@@ -2732,3 +2732,69 @@ fn join_release_skips_a_missing_traversal() {
     assert!(held_owner(&index, OWNER));
     assert_eq!(cache.cursor_reserved(), 0);
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    for change in [
+        "chmod_live",
+        "chmod_sealed",
+        "append_sealed",
+        "replace_sealed",
+    ] {
+        let root = paged_corpus("wake-content");
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(2048, 1024, 64, || {
+            let (index, _) =
+                with_test_state_budget(1, || sampled(&root, ScanIndex::default(), 10, &cache));
+            assert_eq!(counters(&cache).jobs_state_bound, 1);
+            let (index, _) = next_generation(&root, index, &cache, 1);
+            assert_eq!(counters(&cache).parked_hits, 1);
+            let path = root.join(if change == "chmod_live" {
+                "sessions/b.jsonl"
+            } else {
+                "sessions/a.jsonl"
+            });
+            match change {
+                "append_sealed" => {
+                    append_rows(&path, &[turn("66666666-aaaa-4aaa-8aaa-666666666666")])
+                }
+                "replace_sealed" => {
+                    let replacement = path.with_extension("replacement");
+                    fs::copy(&path, &replacement).unwrap();
+                    assert_ne!(
+                        fs::metadata(&path).unwrap().ino(),
+                        fs::metadata(&replacement).unwrap().ino()
+                    );
+                    fs::rename(replacement, &path).unwrap();
+                }
+                _ => {
+                    let before = fs::metadata(&path).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    fs::set_permissions(
+                        &path,
+                        fs::Permissions::from_mode(before.permissions().mode() ^ 0o004),
+                    )
+                    .unwrap();
+                    let after = fs::metadata(&path).unwrap();
+                    assert_ne!(
+                        (before.ctime(), before.ctime_nsec()),
+                        (after.ctime(), after.ctime_nsec())
+                    );
+                    assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+                }
+            }
+            let _ = next_generation(&root, index, &cache, 2);
+            let after = counters(&cache);
+            if change.starts_with("chmod") {
+                assert_eq!(after.groups_started, 1, "{change}: zero wakes: {after:?}");
+                assert_eq!(after.parked_hits, 2, "{change}: {after:?}");
+            } else {
+                assert_eq!(after.groups_started, 2, "{change}: must wake: {after:?}");
+                assert_eq!(after.parked_hits, 1, "{change}: {after:?}");
+            }
+        });
+        fs::remove_dir_all(root).unwrap();
+    }
+}

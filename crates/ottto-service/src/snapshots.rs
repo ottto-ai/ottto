@@ -21198,6 +21198,39 @@ fn codex_parent_open(
     codex_parent_open_match(census, found[0]).map(|(_path, identity, file)| (identity, file))
 }
 
+/// Cross-scan parent wake input. This never serves either after-parse
+/// fence: those continue to probe the live opened identity. One locate and
+/// one fresh head/tail read, charged by the caller like a normal probe.
+fn retained_codex_parent(
+    census: CodexParentCensus<'_>,
+    parent: &str,
+    cache: &sampled_scan::SharedCache,
+) -> (
+    Result<String, CodexParentUnresolvable>,
+    Option<(String, String)>,
+) {
+    let opened = codex_parent_locate(census, parent).and_then(|(key, file)| {
+        cache
+            .retained_open(Path::new(&key), &file)
+            .map(|(_, identity, live)| (identity, live))
+            .ok_or(CodexParentUnresolvable::Absent)
+    });
+    match opened {
+        Ok((identity, live)) => (Ok(identity.clone()), Some((live, identity))),
+        Err(cause) => (Err(cause), None),
+    }
+}
+
+fn retained_parent_ledger(
+    identity: Option<String>,
+    qualified: Option<&(String, String)>,
+) -> Option<String> {
+    identity.map(|identity| match qualified {
+        Some((live, retained)) if *live == identity => retained.clone(),
+        _ => identity,
+    })
+}
+
 /// U1a-2a (rev 2 §5.2(12)): budgeted mode, where proof work is owed: a
 /// Codex scan with a shared cache on the validated layout.
 fn codex_parent_proofs_enabled(
@@ -23397,7 +23430,15 @@ fn codex_parent_step_start(
             if matches!(found[at], CodexCensusMatch::One(_)) {
                 page.charge(false, SAMPLE_READ_BYTES);
             }
-            Some(codex_parent_open_match(census, found[at]))
+            Some(
+                codex_parent_open_match(census, found[at]).map(|(path, identity, file)| {
+                    let identity = context
+                        .cache
+                        .retained_open(&path, &file)
+                        .map_or(identity, |(_, retained, _)| retained);
+                    (path, identity, file)
+                }),
+            )
         };
         // 1. Re-validate every witness against this traversal's open.
         let mut dropped = Vec::new();
@@ -26658,7 +26699,11 @@ impl OwnedSourceScan {
                 boot.allow_probe_bytes(
                     codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
                 );
-                let outcome = boot.step(attribution_context, index);
+                let outcome = boot.step_with_cache(
+                    attribution_context,
+                    index,
+                    sampling.as_ref().map(|context| context.cache.as_ref()),
+                );
                 // Header and probe bytes are singleton-budget reads (§d.2).
                 codex_page.charge(false, boot.take_charge());
                 let members = boot.group.members.len();
@@ -26761,6 +26806,15 @@ impl OwnedSourceScan {
                     let live_file = boot.live().and_then(|(live, _)| {
                         open_candidate_file(SnapshotSource::Codex, &mut live.clone()).ok()
                     });
+                    let wake_stamp =
+                        boot.live()
+                            .zip(live_file.as_ref())
+                            .and_then(|((live, _), file)| {
+                                context
+                                    .cache
+                                    .retained_open(&live.path, file)
+                                    .map(|(stamp, _, _)| stamp)
+                            });
                     let memo_key =
                         sampled_scan::codex_cursor::memo_key(&context.namespace, &boot.key);
                     if let Some(entry) = context.cache.memo_lookup(&memo_key) {
@@ -26769,7 +26823,9 @@ impl OwnedSourceScan {
                         let hit = boot
                             .memo_digest(index, &codex_title_metadata)
                             .zip(live_file.as_ref())
-                            .and_then(|(digest, file)| entry.matches(&digest, file, None, ""));
+                            .and_then(|(digest, file)| {
+                                entry.matches_stamp(&digest, file, None, "", wake_stamp.clone()?)
+                            });
                         if let Some(stamp) = hit {
                             // No wake dependency changed: the same terminal
                             // debt again, per member, at zero replay bytes.
@@ -26793,11 +26849,11 @@ impl OwnedSourceScan {
                         }
                         context.cache.memo_forget(&memo_key);
                     }
-                    let parked = live_file.as_ref().and_then(|file| {
-                        context
-                            .cache
-                            .cursor_parked(&boot.key, file, dependencies.as_deref())
-                    });
+                    let parked = context.cache.cursor_parked_stamp(
+                        &boot.key,
+                        wake_stamp,
+                        dependencies.as_deref(),
+                    );
                     if let Some(disclosure) = parked {
                         context.cache.cursor_unwait(&context.namespace, &boot.key);
                         codex_file_join::disclose_members(
@@ -26866,6 +26922,14 @@ impl OwnedSourceScan {
                 // like main's unpaged read: each member at most
                 // `MAX_CODEX_JSONL_FILE_BYTES`, the group's total uncapped
                 // (R2-N7, disclosed).
+                let active_dependencies = boot.live().map(|(live, _)| {
+                    sampled_scan::codex_cursor::group_dependencies(
+                        &boot.group.members,
+                        &live.path,
+                        &codex_title_metadata,
+                        |member| member.opened_object_identity.clone(),
+                    )
+                });
                 let owner = boot.group.owner.clone();
                 let group_members = boot.group.members.clone();
                 let boot_key = boot.key.clone();
@@ -26901,7 +26965,7 @@ impl OwnedSourceScan {
                     match context.cache.cursor_start_group(
                         &mut job,
                         &context.namespace,
-                        dependencies,
+                        active_dependencies,
                         state_census_complete && sidecar_census_complete,
                         index,
                     ) {
@@ -28654,7 +28718,11 @@ impl OwnedSourceScan {
                                         &session_id,
                                         sampled_scan::codex_cursor::ParentWitness {
                                             cause,
-                                            identity: Some(identity),
+                                            identity: Some(
+                                                context
+                                                    .cache
+                                                    .retained_stamp_identity(&candidate, &identity),
+                                            ),
                                             waits_on: None,
                                         },
                                     );
@@ -28673,7 +28741,11 @@ impl OwnedSourceScan {
                                         &session_id,
                                         sampled_scan::codex_cursor::ParentWitness {
                                             cause: CodexParentUnresolvable::DeferredRestart,
-                                            identity: Some(identity),
+                                            identity: Some(
+                                                context
+                                                    .cache
+                                                    .retained_stamp_identity(&candidate, &identity),
+                                            ),
                                             waits_on: parsed_file.codex_parent_session_ref.clone(),
                                         },
                                     );
@@ -28712,7 +28784,10 @@ impl OwnedSourceScan {
                                 &path_id,
                                 sampled_scan::codex_cursor::ParentWitness {
                                     cause: CodexParentUnresolvable::NoLedger,
-                                    identity: Some(candidate.opened_object_identity.clone()),
+                                    identity: Some(context.cache.retained_stamp_identity(
+                                        &candidate,
+                                        &candidate.opened_object_identity,
+                                    )),
                                     waits_on: None,
                                 },
                             );
@@ -28798,23 +28873,15 @@ impl OwnedSourceScan {
                                     .codex_parent_session_ref
                                     .as_deref()
                                     .map(|parent| {
-                                        let current = match used.clone() {
-                                            Some(used) => Some(used),
-                                            None => {
-                                                let (current, fresh) = codex_parent_identities
-                                                    .probe(
-                                                        codex_parent_identities.census(index),
-                                                        parent,
-                                                    );
-                                                if fresh {
-                                                    codex_page.charge(
-                                                    false,
-                                                    sampled_scan::codex_cursor::SAMPLE_READ_BYTES,
-                                                );
-                                                }
-                                                current.ok()
-                                            }
-                                        };
+                                        let (current, qualified) = retained_codex_parent(
+                                            codex_parent_identities.census(index),
+                                            parent,
+                                            &context.cache,
+                                        );
+                                        codex_page.charge(
+                                            false,
+                                            sampled_scan::codex_cursor::SAMPLE_READ_BYTES,
+                                        );
                                         sampled_scan::codex_cursor::ParentDep {
                                             id: parent.to_owned(),
                                             // An invalidation dependency only, never
@@ -28822,15 +28889,20 @@ impl OwnedSourceScan {
                                             // takes precedence; with none, the indexed
                                             // identity (main's term), so its arrival,
                                             // change or removal misses once.
-                                            ledger: used.clone().or_else(|| {
-                                                index
-                                                    .codex_parent_ownership_ledgers
-                                                    .get(resolve_codex_identity(parent).as_str())
-                                                    .map(|ledger| {
-                                                        ledger.opened_object_identity.clone()
-                                                    })
-                                            }),
-                                            current,
+                                            ledger: retained_parent_ledger(
+                                                used.clone().or_else(|| {
+                                                    index
+                                                        .codex_parent_ownership_ledgers
+                                                        .get(
+                                                            resolve_codex_identity(parent).as_str(),
+                                                        )
+                                                        .map(|ledger| {
+                                                            ledger.opened_object_identity.clone()
+                                                        })
+                                                }),
+                                                qualified.as_ref(),
+                                            ),
+                                            current: current.ok(),
                                             // PR-P: the step-map witness this
                                             // parse read, so its arrival, change
                                             // or removal misses once.
@@ -28849,7 +28921,7 @@ impl OwnedSourceScan {
                                 sampled_scan::codex_cursor::MemoEntry::new(
                                     digest,
                                     live,
-                                    stamp,
+                                    context.cache.retained_stamp(&candidate.path, stamp),
                                     parent,
                                     sidecar,
                                     sampled_scan::codex_cursor::Disclosure {
@@ -30461,7 +30533,10 @@ impl OwnedSourceScan {
                                 parent,
                                 sampled_scan::codex_cursor::ParentWitness {
                                     cause: CodexParentUnresolvable::ParentLossy,
-                                    identity: Some(candidate.opened_object_identity.clone()),
+                                    identity: Some(context.cache.retained_stamp_identity(
+                                        &candidate,
+                                        &candidate.opened_object_identity,
+                                    )),
                                     waits_on: None,
                                 },
                             );
@@ -30558,6 +30633,10 @@ impl OwnedSourceScan {
                 .as_ref()
                 .filter(|_| source == SnapshotSource::Codex)
             {
+                let wake_stamp = context
+                    .cache
+                    .retained_open(&candidate.path, &opened_file)
+                    .map(|(stamp, _, _)| stamp);
                 let key = local_index_key(&candidate.path);
                 // Keyed per namespace (R1-M1): the digest carries the upload
                 // context, so concurrent namespaces must not evict each other.
@@ -30597,16 +30676,20 @@ impl OwnedSourceScan {
                     // L4 (PR-1): the parent's index ledger identity, and its
                     // current opened identity (L-5 probe; charged when it opens).
                     let parent_now = entry.parent_ref().map(|parent| {
-                        let (current, fresh) = codex_parent_identities
-                            .probe(codex_parent_identities.census(index), parent);
-                        if fresh {
-                            codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
-                        }
+                        let (current, qualified) = retained_codex_parent(
+                            codex_parent_identities.census(index),
+                            parent,
+                            &context.cache,
+                        );
+                        codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                         sampled_scan::codex_cursor::ParentNow {
-                            ledger: index
-                                .codex_parent_ownership_ledgers
-                                .get(resolve_codex_identity(parent).as_str())
-                                .map(|ledger| ledger.opened_object_identity.clone()),
+                            ledger: retained_parent_ledger(
+                                index
+                                    .codex_parent_ownership_ledgers
+                                    .get(resolve_codex_identity(parent).as_str())
+                                    .map(|ledger| ledger.opened_object_identity.clone()),
+                                qualified.as_ref(),
+                            ),
                             current: current.ok(),
                             // PR-P: the step map's witness, as the classifier
                             // would read it now; an overflowing ref is
@@ -30645,7 +30728,13 @@ impl OwnedSourceScan {
                         )
                     });
                     let hit = digest.as_deref().and_then(|digest| {
-                        entry.matches(digest, &opened_file, parent_now.as_ref(), &sidecar_now)
+                        entry.matches_stamp(
+                            digest,
+                            &opened_file,
+                            parent_now.as_ref(),
+                            &sidecar_now,
+                            wake_stamp.clone()?,
+                        )
                     });
                     if let Some(stamp) = hit {
                         // An append cannot cure this hold and no wake
@@ -30715,9 +30804,9 @@ impl OwnedSourceScan {
                 let parked = side_plan
                     .is_none()
                     .then(|| {
-                        context.cache.cursor_parked(
+                        context.cache.cursor_parked_stamp(
                             &key,
-                            &opened_file,
+                            wake_stamp.clone(),
                             sampled_scan::reduction_dependencies(
                                 source,
                                 &candidate,
