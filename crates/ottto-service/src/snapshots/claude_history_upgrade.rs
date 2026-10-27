@@ -599,8 +599,15 @@ impl HistoryPage {
             let Some(remaining) = self.bytes.checked_sub(paid) else {
                 return false;
             };
+            let removed = 1 + twins
+                .iter()
+                .filter(|(twin, _)| self.reserved.contains(twin))
+                .count();
+            let Some(files) = self.files.checked_sub(removed) else {
+                return false;
+            };
             self.bytes = remaining;
-            self.files = self.files.saturating_sub(1 + twins.len());
+            self.files = files;
             self.reserved.remove(key);
             for (twin, _) in &twins {
                 self.reserved.remove(twin);
@@ -2175,5 +2182,32 @@ mod tests {
         assert_eq!(request_owned_family_root(&item), Some("root-1"));
         item.source_session_id = "root-1".into();
         assert_eq!(request_owned_family_root(&item), Some("root-1"));
+    }
+}
+
+#[cfg(test)]
+mod large_full_reservation_tests {
+    use super::*;
+
+    #[test]
+    fn live_twin_extents_preserve_exact_page_count_and_byte_caps() {
+        super::super::with_body_witness_adoption_byte_budget(1000, || {
+            let mut page = HistoryPage::default();
+            assert!(page.reserve("small", 100));
+            page.staged_twins = Some(("a".into(), vec![("b".into(), 200)]));
+            assert!(page.reserve("a", 300));
+            assert!(page.reserve_large_full_group("a", 300, vec![("b".into(), 600)], 200));
+            assert_eq!((page.files, page.bytes), (3, 1000));
+            assert!(!page.reserve("one-more-byte", 1));
+
+            let mut page = HistoryPage::default();
+            assert!(page.reserve("small", 100));
+            assert!(page.reserve("a", 300)); // new twin was not indexed/reserved
+            assert!(page.reserve_large_full_group("a", 300, vec![("new".into(), 500)], 0));
+            assert_eq!((page.files, page.bytes), (3, 900), "every live path counts");
+            assert!(page.reserved.contains("small"));
+            assert!(page.reserved.contains("a"));
+            assert!(page.reserved.contains("new"));
+        });
     }
 }
