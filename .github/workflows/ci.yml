@@ -541,6 +541,9 @@ jobs:
 
   money-equivalence:
     name: Money equivalence (emitted bodies)
+    permissions:
+      contents: read
+      pull-requests: read # Resolve the branch PR base on dispatch.
     # Opt-in only: no added macOS minutes on pushes/PRs. One standard Mac,
     # two independent builds, no matrix/retry or cache writes. Never run the
     # expensive benchmark or ordinary Mac jobs alongside this dispatch.
