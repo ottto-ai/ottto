@@ -511,6 +511,8 @@ fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
 
 #[test]
 fn native_comparison_original_member_change_unit_oracle() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();
         return;

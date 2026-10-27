@@ -4186,6 +4186,8 @@ fn native_comparison_corrected_native_receipt_fixture(
 
 #[test]
 fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save",
     ) {
@@ -4206,6 +4208,8 @@ fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_se
 
 #[test]
 fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base",
     ) {

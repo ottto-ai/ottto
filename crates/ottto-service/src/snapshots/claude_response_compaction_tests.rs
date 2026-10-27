@@ -1813,6 +1813,8 @@ fn x_out_t1_bounds_the_finished_claude_file() {
 /// bound or a larger cache budget.
 #[test]
 fn x_out_dark_covers_sparse_hours_and_copy_restoration() {
+    // Dark (gate-off) output bound by design: the test asserts !e2::enabled().
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }

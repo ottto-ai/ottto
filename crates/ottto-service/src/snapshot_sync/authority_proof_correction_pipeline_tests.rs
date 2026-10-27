@@ -2578,6 +2578,8 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
 #[serial(source_manifests)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_quarantine() {
+    // Reported-authority replacement/proof corrections; E2 literals never demote to native.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     assert!(
         crate::heap_layout_bound::layout_supported(),
         "native terminal needs supported layout"
