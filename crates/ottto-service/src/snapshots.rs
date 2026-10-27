@@ -31052,7 +31052,10 @@ impl OwnedSourceScan {
                 native_comparison
                     .as_mut()
                     .expect("checked target phase")
-                    .retain_target_metadata(bytes, capture_credit.expect("funded target input"))?;
+                    .retain_target_metadata(
+                        bytes,
+                        capture_credit.as_deref_mut().expect("funded target input"),
+                    )?;
             }
 
             let mut parser = match sampled_scan::new_source_parser(
