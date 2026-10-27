@@ -316,7 +316,8 @@ pub(super) struct HeldAuditProgress {
     pub(super) key: String,
     pub(super) due: u64,
     pub(super) attempted: bool,
-    /// Negative scheduling evidence: this actual large Full was delayed.
+    /// Negative scheduling evidence: this large held Full was delayed at
+    /// selection or actual acquisition admission.
     /// Independent of cached priority and the last committed file size.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) large_full_deferred: bool,
@@ -506,7 +507,9 @@ impl OwnedSourceScan {
         {
             // Displaced by older debt at the existing page limit. No attempt,
             // no deadline reset: the same slot remains eligible next pass.
-            self.index.held_audit_progress.as_mut().unwrap().attempted = false;
+            let slot = self.index.held_audit_progress.as_mut().unwrap();
+            slot.attempted = false;
+            slot.large_full_deferred = true;
             return;
         }
         self.index.held_audit_progress.as_mut().unwrap().attempted = true;
@@ -630,6 +633,44 @@ mod tests {
             .pending_candidates
             .iter()
             .any(|candidate| candidate.path == held && candidate.census_member));
+
+        // Selection displaced the held audit before parser admission. A
+        // newly free sampled slot must preserve its overdue deadline too,
+        // even if its key never reached the bounded priority cache.
+        assert!(
+            scan.index
+                .held_audit_progress
+                .as_ref()
+                .unwrap()
+                .large_full_deferred
+        );
+        assert!(!scan.index.claude_large_full_deferred.contains(&held_key));
+        let mut displaced: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&scan.index).unwrap()).unwrap();
+        displaced.claude_large_full_deferred = claude_large_full::Priority::fallback();
+        let restored = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            displaced,
+            "2026-10-27T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            1,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(
+            Arc::new(sampled_scan::SharedCache::default()),
+            crate::transcript_acquisition::Scope("selection-held-deadline".into()),
+        );
+        assert_eq!(
+            restored.index.files[&held_key].unverified_deadline(),
+            Some(50),
+            "selection-only displacement cannot restart an overdue audit interval"
+        );
+        assert!(restored.index.files[&held_key].audit_requires_full(100));
 
         let mut candidate = candidate();
         candidate.path = held;
