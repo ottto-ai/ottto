@@ -461,6 +461,9 @@ fn oversized_shed_upload_is_reoffered_at_the_original_retry_deadline() {
 #[test]
 #[serial(source_manifests)]
 fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
+    // Legacy demotion hold; E2 literals bypass it. Gate-on local holds and the
+    // same six-hour floor: oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("oversized-blocking-hold-floor");
     fixture.baseline();
@@ -688,4 +691,86 @@ fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
     assert!(page.parsed.contains(OVERSIZED_SESSION));
     assert_eq!(page.scan.scanned_file_count, 1);
     assert!(!page.scan.census_complete);
+}
+
+/// E2 holds stay progress-blocking beside an oversized file and are offered
+/// again at the same recovery floor, never cancelled or uploaded while held.
+#[test]
+#[serial(source_manifests)]
+fn oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor() {
+    if !c1a_layout_supported("oversized-e2-hold-floor") {
+        return;
+    }
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let _manifests = SourceManifestTestGuard::new();
+    let mut fixture = c1a_fixture("oversized-e2-hold-floor");
+    fixture.owned_base_preparation = true;
+    fixture.local_holds.insert(REARM_ROOT.to_owned());
+    let oversized = oversized_create(&fixture);
+    let at = time::OffsetDateTime::parse(
+        "2026-08-02T09:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+    .unix_timestamp() as u64;
+    let (seed, starts) = oversized_walk(&fixture, at, RearmUpload::Accept);
+    assert_eq!(starts.len(), 1);
+    let assert_held = |pages: &[RearmPage]| {
+        // classify removes held bodies from scan.snapshots before upload. The
+        // existing finalizer trace captures their exact body before that cut.
+        let trace = fixture.body_trace.borrow();
+        let body = trace
+            .finalizer_bodies
+            .get(REARM_ROOT)
+            .expect("the held root is re-offered");
+        assert_eq!(
+            body["usage_accounting_contract"],
+            crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT
+        );
+        let fingerprint = body["snapshot_fingerprint"].as_str().unwrap();
+        assert!(pages.iter().any(|page| page.parsed.contains(REARM_ROOT)));
+        assert!(pages.iter().any(|page| page.held.contains(fingerprint)));
+        assert!(pages.iter().all(
+            |page| !page.offered.contains(fingerprint) && !page.uploaded.contains(fingerprint)
+        ));
+        let last = pages.last().unwrap();
+        assert!(!last.scan.census_complete);
+        assert_eq!(last.scan.oversized_file_count, 1);
+        assert_eq!(
+            last.index.bounded_sweep_unsettled_cause_names(),
+            ["completed_blocking_holds"]
+        );
+        assert!(last
+            .index
+            .bound_terminal_claude_authority_revision_for_test(REARM_ROOT)
+            .is_none());
+    };
+    assert_held(&seed);
+    let mut floor = oversized_floor(&c1a_saved(&fixture));
+    for _ in 0..2 {
+        for now in [floor - 5 * 3600, floor - 3600, floor - 1] {
+            if now == floor - 1 {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&oversized)
+                    .unwrap()
+                    .set_len(OVERSIZED_BYTES + floor)
+                    .unwrap();
+            }
+            let quiet = oversized_tick(&fixture, now);
+            assert!(quiet.held.is_empty());
+            assert!(!quiet.scan.census_complete);
+            if now == floor - 1 {
+                assert!(oversized_deadline(&c1a_saved(&fixture)) > floor);
+            }
+        }
+        *fixture.body_trace.borrow_mut() = RearmBodyTrace::default();
+        let (retry, starts) = oversized_walk(&fixture, floor, RearmUpload::Accept);
+        assert_eq!(starts.len(), 1, "one recovery walk at the floor");
+        assert_eq!(starts[0]["counts"]["reason"], "terminal_unhealthy_retry");
+        assert_held(&retry);
+        let next_floor = oversized_floor(&c1a_saved(&fixture));
+        assert_eq!(next_floor, floor + 6 * 3600);
+        floor = next_floor;
+    }
 }

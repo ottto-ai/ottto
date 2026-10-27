@@ -48,3 +48,17 @@ Codex wake paths. #801 locks the state directory before state writes.
 
 These main changes preserve the reasons for the 51 pins and the revision-3
 adoption contract. No new pin or weaker assertion is part of the integration.
+
+## Integration fixture updates
+
+The original 51 T8 pins keep their reasons. Main #800 adds one more legacy
+oracle, `oversized_blocking_hold_is_reoffered_once_per_six_hour_floor`, now
+explicitly gate off because request-owned literals bypass its demotion hold.
+Gate-on `oversized_request_owned_hold_is_reoffered_once_per_six_hour_floor`
+uses the existing local-hold fixture and tests the same two six-hour recovery
+floors, no early restart, held literal exclusion, and incomplete census.
+
+The M-a fixture filler target changes from 212 to 210 permille per filler.
+Its prior E2 headroom was about 300 bytes of X_out; longer CI paths exhausted
+the 256 KiB prefix margin. The margin, exact two-victim/copy-only equality,
+zero-budget tail conditions, and production resource budgets stay unchanged.
