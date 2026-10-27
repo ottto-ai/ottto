@@ -66,14 +66,11 @@ fn parse(path: &Path, birth: Option<i128>, index: &ScanIndex, lines: &[Value]) -
     for value in lines {
         apply_claude_code_line(value, &mut a);
     }
-    a.finalize_claude_responses_e2(
-        None,
-        Some(ReadContext {
-            index,
-            path,
-            twins: &Default::default(),
-        }),
-    );
+    a.finalize_claude_responses_e2(Some(ReadContext {
+        index,
+        path,
+        twins: &Default::default(),
+    }));
     let mut items = a.into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None);
     // The page's copy decision, as the scan runs it; `publish` decides again
     // over the whole page, where a parsed witness proves its own requests.
@@ -1063,12 +1060,10 @@ fn e2_diagnostic_fields_are_nonzero_only() {
 }
 
 #[test]
-fn e2_reported_selector_inputs_match_p1_with_legacy_output_kept() {
+fn e2_reported_selector_inputs_keep_model_speed_effort_and_hour() {
     // Publication runs with the gate on, so the parse does too: dark
     // keeps no grain map to publish.
     with_enabled(|| {
-        use super::super::body::reported_live_key;
-        use super::super::rows::ClaudeApiRow;
         let p = root_file("selector-parity");
         let index = ScanIndex::default();
         for native_model in [true, false] {
@@ -1091,22 +1086,21 @@ fn e2_reported_selector_inputs_match_p1_with_legacy_output_kept() {
                             api.speed = speed.to_owned();
                             api.effort = effort.to_owned();
                             api.observed_at = at(3601); // fallback clock is another hour
-                            let api_view = ClaudeApiRow {
-                                request_hash: claude_request_hash("r"),
-                                tokens: Default::default(),
-                                cost_micros: api.cost_usd_micros,
-                                clock: u64::try_from((t0() / 1_000_000_000) + 3601).unwrap(),
-                                model: &api.model,
-                                speed: &api.speed,
-                                effort: &api.effort,
-                            };
                             for occurrence in [Some(&occurrence), None] {
-                                let legacy = reported_live_key(&api_view, occurrence).unwrap();
                                 let mut e2 =
                                     reported_key(&api, occurrence, &SelectorCapture::default())
                                         .unwrap();
                                 let kept_effort = e2.2.remove("reasoning_effort");
-                                assert_eq!(e2, legacy, "same model, speed, selectors and hour");
+                                assert_eq!(
+                                    e2.1,
+                                    occurrence
+                                        .and_then(|o| o.model.as_deref())
+                                        .unwrap_or(&api.model)
+                                );
+                                assert_eq!(
+                                    e2.2.get("speed_mode").map(String::as_str),
+                                    (!speed.is_empty()).then_some(speed)
+                                );
                                 let expected_effort = occurrence
                                     .and_then(|o| o.reasoning_effort.as_deref())
                                     .or_else(|| {
@@ -1120,7 +1114,7 @@ fn e2_reported_selector_inputs_match_p1_with_legacy_output_kept() {
                                     "E2 intentionally retains effort"
                                 );
                                 assert_eq!(
-                                    legacy.0,
+                                    e2.0,
                                     if occurrence.is_some() && native_clock {
                                         HOUR
                                     } else {
@@ -2543,14 +2537,11 @@ fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding()
                         &mut accumulator,
                     );
                 }
-                accumulator.finalize_claude_responses_e2(
-                    None,
-                    Some(ReadContext {
-                        index: &index,
-                        path: &path,
-                        twins: &Default::default(),
-                    }),
-                );
+                accumulator.finalize_claude_responses_e2(Some(ReadContext {
+                    index: &index,
+                    path: &path,
+                    twins: &Default::default(),
+                }));
                 let item = accumulator
                     .into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None)
                     .remove(0);
@@ -2788,14 +2779,11 @@ fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
             for line in [org_marker(ORG_A), line("one", &at(1), 10)] {
                 apply_claude_code_line(&line, &mut accumulator);
             }
-            accumulator.finalize_claude_responses_e2(
-                None,
-                Some(ReadContext {
-                    index: &index,
-                    path: &path,
-                    twins: &Default::default(),
-                }),
-            );
+            accumulator.finalize_claude_responses_e2(Some(ReadContext {
+                index: &index,
+                path: &path,
+                twins: &Default::default(),
+            }));
             let mut items =
                 accumulator.into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None);
             assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
@@ -3117,14 +3105,11 @@ fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
                 for value in &lines {
                     apply_claude_code_line(value, &mut accumulator);
                 }
-                accumulator.finalize_claude_responses_e2(
-                    None,
-                    Some(ReadContext {
-                        index: &index,
-                        path: &path,
-                        twins: &Default::default(),
-                    }),
-                );
+                accumulator.finalize_claude_responses_e2(Some(ReadContext {
+                    index: &index,
+                    path: &path,
+                    twins: &Default::default(),
+                }));
                 let item = accumulator
                     .into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None)
                     .remove(0);
@@ -3518,14 +3503,11 @@ fn e2_identity_marker_overflow_drops_excluded_starting_witness() {
             for value in &lines {
                 apply_claude_code_line(value, &mut accumulator);
             }
-            accumulator.finalize_claude_responses_e2(
-                None,
-                Some(ReadContext {
-                    index: &index,
-                    path: &path,
-                    twins: &Default::default(),
-                }),
-            );
+            accumulator.finalize_claude_responses_e2(Some(ReadContext {
+                index: &index,
+                path: &path,
+                twins: &Default::default(),
+            }));
             let item = accumulator
                 .into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None)
                 .remove(0);
@@ -3658,14 +3640,11 @@ fn e2_identity_proven_original_excludes_prefix_without_lending_its_org() {
             for value in &lines {
                 apply_claude_code_line(value, &mut accumulator);
             }
-            accumulator.finalize_claude_responses_e2(
-                None,
-                Some(ReadContext {
-                    index: &index,
-                    path: &copy,
-                    twins: &Default::default(),
-                }),
-            );
+            accumulator.finalize_claude_responses_e2(Some(ReadContext {
+                index: &index,
+                path: &copy,
+                twins: &Default::default(),
+            }));
             let item = accumulator
                 .into_items(&copy, "2026-08-02T09:00:00Z", "fixture".into(), None)
                 .remove(0);
@@ -3748,14 +3727,11 @@ fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
                         accumulator.account_identifier_hash = Some(login.clone());
                     }
                     apply_claude_code_line(&line("login", &at(1), 30), &mut accumulator);
-                    accumulator.finalize_claude_responses_e2(
-                        None,
-                        Some(ReadContext {
-                            index: &index,
-                            path: &b,
-                            twins: &Default::default(),
-                        }),
-                    );
+                    accumulator.finalize_claude_responses_e2(Some(ReadContext {
+                        index: &index,
+                        path: &b,
+                        twins: &Default::default(),
+                    }));
                     markerless = accumulator
                         .into_items(&b, "2026-08-02T09:00:00Z", "fixture".into(), None)
                         .remove(0);
@@ -3821,14 +3797,11 @@ fn e2_identity_copy_rebuild_keeps_later_marker_boundary_and_cost_attachment() {
             ] {
                 apply_claude_code_line(&value, &mut accumulator);
             }
-            accumulator.finalize_claude_responses_e2(
-                None,
-                Some(ReadContext {
-                    index: &index,
-                    path: &path,
-                    twins: &Default::default(),
-                }),
-            );
+            accumulator.finalize_claude_responses_e2(Some(ReadContext {
+                index: &index,
+                path: &path,
+                twins: &Default::default(),
+            }));
             let mut items =
                 accumulator.into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None);
             let read = sidecar(&[
@@ -3888,14 +3861,11 @@ fn e2_identity_conflicting_twin_bindings_clear_root_fallback_in_every_order() {
                 apply_claude_code_line(&org_marker(org), &mut accumulator);
             }
             apply_claude_code_line(&line(login, &at(1), 10), &mut accumulator);
-            accumulator.finalize_claude_responses_e2(
-                None,
-                Some(ReadContext {
-                    index: &index,
-                    path,
-                    twins: &Default::default(),
-                }),
-            );
+            accumulator.finalize_claude_responses_e2(Some(ReadContext {
+                index: &index,
+                path,
+                twins: &Default::default(),
+            }));
             accumulator
                 .into_items(path, "2026-08-02T09:00:00Z", "fixture".into(), None)
                 .remove(0)

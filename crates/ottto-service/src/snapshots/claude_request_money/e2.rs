@@ -1809,8 +1809,8 @@ fn live_key(
     (bucket, model.to_owned(), context)
 }
 
-/// Matched and side-call grains keep today's reported-rebuild enrichment
-/// (`reported_live_key`): OTEL speed joins the selector, an OTEL effort tier
+/// Matched and side-call grains keep reported enrichment:
+/// OTEL speed joins the selector, an OTEL effort tier
 /// fills a missing transcript effort (kept in the context),
 /// the transcript's model and clock win, and the API row's clock and model
 /// are the fallbacks. Placed through [`grain_key`].

@@ -48,6 +48,8 @@ pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
+// P1-only census helpers remain until the separate persisted-format cleanup.
+#[allow(dead_code)]
 pub(crate) mod claude_request_census;
 pub(crate) mod claude_request_identity;
 pub(crate) mod claude_request_money;
@@ -19581,7 +19583,6 @@ impl SnapshotAccumulator {
         effort: Option<String>,
     ) {
         let PlacedClaudeUsage {
-            model,
             placement:
                 Some(ClaudeRowPlacement {
                     bucket: bucket_start,

@@ -57,8 +57,7 @@ pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
 /// revision constant fails to compile. The release check reads the next
 /// line, so keep it free of comments and other digits.
 pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 3;
-/// The request-owned usage literal of E2 (the
-/// `REQUEST_OWNED_CONTRACT`). Listed roots never emit it.
+/// E2's request-owned usage literal. Listed roots never emit it.
 pub(crate) const REQUEST_OWNED_USAGE_CONTRACT: &str = "claude_request_owned_usage:v1";
 
 /// At most one owed-without-list alarm an hour.

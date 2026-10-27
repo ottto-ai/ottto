@@ -5,8 +5,8 @@ use super::ClaudeMoneyTokens;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-/// `request_usage_origin` of a grain (B1); None is a transcript grain. The
-/// variant names are the reader's wire values.
+/// `request_usage_origin` of a grain; None is a transcript grain.
+/// The variant names are the reader's wire values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)]
@@ -23,9 +23,7 @@ pub(crate) enum ClaudeRequestUsageOrigin {
 /// (the reduced selector context plus the row's billing fields).
 pub(crate) type ClaudeLiveKey = (String, String, BTreeMap<String, String>);
 
-/// Common reported enrichment only. Callers keep their placement/output rules:
-/// P1 uses its legacy base and omits effort from the reduced context; E2 uses
-/// native placement and retains effort on the emitted row.
+/// Reported enrichment for E2 native placement and emitted row effort.
 pub(super) struct ReportedInputs<'a> {
     pub(super) selector: SelectorCapture,
     pub(super) effort: Option<&'a str>,

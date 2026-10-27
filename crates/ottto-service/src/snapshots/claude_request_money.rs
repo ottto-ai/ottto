@@ -13,7 +13,7 @@ use super::UsageTotals;
 use serde::Serialize;
 
 /// One reading of a Claude cache-creation write: the flat total and its
-/// 5m/1h split. Every caller (transcript lines, API sidecar rows, the shadow)
+/// 5m/1h split. Every caller (transcript lines and API sidecar rows)
 /// uses this; each keeps its own mapping of the three outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheCreation {
@@ -50,19 +50,6 @@ pub(crate) struct ClaudeMoneyTokens {
 }
 
 impl ClaudeMoneyTokens {
-    pub(crate) fn conserved(&self) -> u64 {
-        [
-            self.input,
-            self.output,
-            self.cache_read,
-            self.cache_5m,
-            self.cache_1h,
-            self.unattributed,
-        ]
-        .into_iter()
-        .fold(0, u64::saturating_add)
-    }
-
     pub(crate) fn add(&mut self, other: &Self) {
         self.input = self.input.saturating_add(other.input);
         self.output = self.output.saturating_add(other.output);
@@ -95,18 +82,6 @@ impl ClaudeMoneyTokens {
             cache_1h: usage.cache_creation_1h_tokens,
             unattributed: usage.unattributed_total_tokens,
             reasoning: usage.reasoning_output_tokens,
-        }
-    }
-
-    pub(crate) fn from_model_usage(row: &super::SnapshotModelUsage) -> Self {
-        Self {
-            input: row.input_tokens,
-            output: row.output_tokens,
-            cache_read: row.cache_read_tokens,
-            cache_5m: row.cache_creation_5m_tokens,
-            cache_1h: row.cache_creation_1h_tokens,
-            unattributed: row.unattributed_total_tokens,
-            reasoning: row.reasoning_output_tokens,
         }
     }
 }
