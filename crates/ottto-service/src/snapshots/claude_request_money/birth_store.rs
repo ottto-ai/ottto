@@ -78,11 +78,22 @@ struct Session(
 // Sessions are a sorted Vec: inserts within a page grow amortized, and the
 // save-time prune shrinks it back to its length.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BirthStore(Vec<Session>, Vec<(LocationKey, u8)>);
+pub(crate) struct BirthStore(Vec<Session>, Vec<(LocationKey, u8)>, MoneyMarks);
+/// Money-rule marks (design item 8): the rule version applied and, per
+/// indexed path with a settled request-owned body, which rules shaped its
+/// money. A later money fix re-owes only the paths its mask names.
+#[derive(Debug, Clone, Default)]
+struct MoneyMarks {
+    version: u16,
+    /// Sorted by path key; nonzero marks only.
+    paths: Vec<(LocationKey, u8)>,
+}
 // One versioned binary string keeps the handwritten pretty index writer within
 // the disk budget too. Integer fields are little endian; no wall time is invented.
 // CMB4 path record: key 16, birth 8, generation u32 (low bit: identity
-// follows), then object 8 and size 4 when known.
+// follows), then object 8 and size 4 when known. CMB5 is CMB4 plus the
+// money-rule trailer: version u16, count u32, then (key 16, marks 1) records;
+// it is written only once a mark or a version exists.
 impl Serialize for BirthStore {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let byte_len = self
@@ -98,9 +109,11 @@ impl Serialize for BirthStore {
                             .checked_mul(12)?,
                     )
             })
+            .and_then(|n| n.checked_add(6 + self.2.paths.len().checked_mul(17)?))
             .ok_or_else(|| serde::ser::Error::custom("birth table size overflow"))?;
+        let marked = self.2.version != 0 || !self.2.paths.is_empty();
         let mut bytes = Vec::with_capacity(byte_len);
-        bytes.extend_from_slice(b"CMB4");
+        bytes.extend_from_slice(if marked { b"CMB5" } else { b"CMB4" });
         bytes.extend_from_slice(&(self.0.len() as u32).to_le_bytes());
         for Session(session, owner, cutoff, absent, paths) in &self.0 {
             bytes.extend_from_slice(&session.0);
@@ -120,6 +133,14 @@ impl Serialize for BirthStore {
                     bytes.extend_from_slice(&opened.object.to_le_bytes());
                     bytes.extend_from_slice(&opened.size.to_le_bytes());
                 }
+            }
+        }
+        if marked {
+            bytes.extend_from_slice(&self.2.version.to_le_bytes());
+            bytes.extend_from_slice(&(self.2.paths.len() as u32).to_le_bytes());
+            for (path, marks) in &self.2.paths {
+                bytes.extend_from_slice(&path.0);
+                bytes.push(*marks);
             }
         }
         // serde_json streams Display into the quoted string: no second base64 buffer.
@@ -148,7 +169,7 @@ impl<'de> Deserialize<'de> for BirthStore {
                 b"CMB1" => 24,
                 b"CMB2" => 32,
                 b"CMB3" => 32,
-                b"CMB4" => 28,
+                b"CMB4" | b"CMB5" => 28,
                 _ => return None,
             };
 
@@ -172,14 +193,14 @@ impl<'de> Deserialize<'de> for BirthStore {
                     let birth = u64::from_le_bytes(take(&mut input)?);
                     let generation = match &version {
                         b"CMB1" => 0,
-                        b"CMB4" => u64::from(u32::from_le_bytes(take(&mut input)?)),
+                        b"CMB4" | b"CMB5" => u64::from(u32::from_le_bytes(take(&mut input)?)),
                         _ => u64::from_le_bytes(take(&mut input)?),
                     };
-                    let tagged = matches!(&version, b"CMB3" | b"CMB4");
+                    let tagged = matches!(&version, b"CMB3" | b"CMB4" | b"CMB5");
                     let has_identity = tagged && generation & 1 != 0;
                     let generation = if tagged { generation >> 1 } else { generation };
                     let opened = match (&version, has_identity) {
-                        (b"CMB4", true) => BirthIdentity {
+                        (b"CMB4" | b"CMB5", true) => BirthIdentity {
                             object: u64::from_le_bytes(take(&mut input)?),
                             size: u32::from_le_bytes(take(&mut input)?),
                         },
@@ -207,10 +228,24 @@ impl<'de> Deserialize<'de> for BirthStore {
                     paths.into_boxed_slice(),
                 ));
             }
+            let mut marks = MoneyMarks::default();
+            if &version == b"CMB5" {
+                marks.version = u16::from_le_bytes(take(&mut input)?);
+                let count = u32::from_le_bytes(take(&mut input)?) as usize;
+                if count.checked_mul(17) != Some(input.len()) {
+                    return None;
+                }
+                marks.paths = Vec::with_capacity(count);
+                for _ in 0..count {
+                    marks
+                        .paths
+                        .push((LocationKey(take(&mut input)?), take::<1>(&mut input)?[0]));
+                }
+            }
             if !input.is_empty() {
                 return None;
             }
-            BirthStore(sessions, Vec::new()).valid()
+            BirthStore(sessions, Vec::new(), marks).valid()
         }
         let encoded = String::deserialize(deserializer)?;
         decode(encoded).ok_or_else(|| serde::de::Error::custom("invalid birth table"))
@@ -218,7 +253,42 @@ impl<'de> Deserialize<'de> for BirthStore {
 }
 impl BirthStore {
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.is_empty() && self.2.version == 0 && self.2.paths.is_empty()
+    }
+    /// The money-rule version this table's marks were last re-owed under.
+    pub(crate) fn money_rule_version(&self) -> u16 {
+        self.2.version
+    }
+    pub(crate) fn set_money_rule_version(&mut self, version: u16) {
+        self.2.version = version;
+    }
+    pub(crate) fn money_marks(&self, path: LocationKey) -> u8 {
+        self.2
+            .paths
+            .binary_search_by_key(&path, |m| m.0)
+            .map_or(0, |i| self.2.paths[i].1)
+    }
+    /// Replace a path's marks with its newly settled body's (zero forgets it).
+    pub(crate) fn set_money_marks(&mut self, path: &str, marks: u8) {
+        if marks == 0 && self.2.paths.is_empty() {
+            return;
+        }
+        let key = location_key(path);
+        match (self.2.paths.binary_search_by_key(&key, |m| m.0), marks) {
+            (Ok(i), 0) => {
+                self.2.paths.remove(i);
+            }
+            (Ok(i), marks) => self.2.paths[i].1 = marks,
+            (Err(_), 0) => {}
+            (Err(i), marks) => self.2.paths.insert(i, (key, marks)),
+        }
+    }
+    /// Keep only marks of the given (indexed) paths.
+    pub(crate) fn retain_money_marks(&mut self, live: &[LocationKey]) {
+        self.2
+            .paths
+            .retain(|(key, _)| live.binary_search(key).is_ok());
+        self.2.paths.shrink_to_fit();
     }
     fn get(&self, session: &str) -> Option<&Session> {
         let key = session_key(session);
@@ -450,6 +520,13 @@ impl BirthStore {
     }
     /// Observations survive partial/held save restoration independently of ACKs.
     pub(crate) fn preserve_missing_from(&mut self, previous: &Self) {
+        // A mark only adds a re-read later; keep the newer version.
+        self.2.version = self.2.version.max(previous.2.version);
+        for &(key, marks) in &previous.2.paths {
+            if let Err(i) = self.2.paths.binary_search_by_key(&key, |m| m.0) {
+                self.2.paths.insert(i, (key, marks));
+            }
+        }
         for old in &previous.0 {
             match self.0.binary_search_by_key(&old.0, |s| s.0) {
                 Err(i) => self.0.insert(i, old.clone()),
@@ -509,6 +586,8 @@ impl BirthStore {
     /// Optional data is discarded as a unit if malformed or unordered.
     pub(crate) fn valid(self) -> Option<Self> {
         if self.0.windows(2).any(|w| w[0].0 >= w[1].0)
+            || self.2.paths.windows(2).any(|w| w[0].0 >= w[1].0)
+            || self.2.paths.iter().any(|m| m.1 == 0)
             || self.0.iter().any(|s| {
                 s.2 == 0
                     || s.4.is_empty()
@@ -527,6 +606,7 @@ impl BirthStore {
         std::mem::size_of::<Self>()
             + self.0.capacity() * std::mem::size_of::<Session>()
             + self.1.capacity() * std::mem::size_of::<(LocationKey, u8)>()
+            + self.2.paths.capacity() * std::mem::size_of::<(LocationKey, u8)>()
             + self
                 .0
                 .iter()
@@ -548,7 +628,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for BirthStore {
                 .checked_add(std::mem::align_of::<(LocationKey, u64, u64, BirthIdentity)>())?;
         }
         c.add(bytes)?;
-        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.1, c)
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.1, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.2.paths, c)
     }
 }
 
@@ -629,6 +710,59 @@ mod tests {
             std::mem::size_of::<BirthIdentity>(), std::mem::size_of::<(LocationKey, u8)>(),
             std::mem::size_of::<ClaudeOpenedBirth>(), std::mem::size_of::<crate::snapshots::claude_context_file_birth::ClaudeFileBirth>(),
             std::mem::size_of::<Option<(u8, u64)>>());
+    }
+
+    #[test]
+    fn money_rule_marks_persist_in_a_cmb5_trailer_only_once_marked() {
+        let wire = |store: &BirthStore| {
+            let text = serde_json::to_value(store).unwrap();
+            URL_SAFE_NO_PAD.decode(text.as_str().unwrap()).unwrap()
+        };
+        let mut store = BirthStore::default();
+        store.record_observation("s", "A", 100);
+        let unmarked = wire(&store);
+        assert_eq!(&unmarked[..4], b"CMB4", "no marks: the CMB4 bytes stay");
+        store.set_money_marks("B", 0);
+        assert_eq!(wire(&store), unmarked, "a zero mark writes nothing");
+        store.set_money_marks("B", 4);
+        store.set_money_marks("A", 1 | 2);
+        store.set_money_rule_version(1);
+        let marked = wire(&store);
+        assert_eq!(&marked[..4], b"CMB5");
+        assert_eq!(marked.len(), unmarked.len() + 6 + 2 * 17, "17 bytes a path");
+        let restored: BirthStore =
+            serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(restored.money_rule_version(), 1);
+        assert_eq!(restored.money_marks(location_key("A")), 3);
+        assert_eq!(restored.money_marks(location_key("B")), 4);
+        assert_eq!(restored.observed_birth("s", "A"), Some(100));
+        // A marks-only table is not empty: the version must survive a save.
+        let mut only = BirthStore::default();
+        only.set_money_rule_version(1);
+        assert!(!only.is_empty());
+        // A newer body without marks forgets the path; a partial restore only
+        // adds marks back (a later extra re-read, never a missed one).
+        let mut next = restored.clone();
+        next.set_money_marks("B", 0);
+        assert_eq!(next.money_marks(location_key("B")), 0);
+        next.preserve_missing_from(&restored);
+        assert_eq!(next.money_marks(location_key("B")), 4);
+        next.retain_money_marks(&[location_key("A")]);
+        assert_eq!(next.money_marks(location_key("B")), 0);
+        assert_eq!(next.money_marks(location_key("A")), 3);
+        // A malformed trailer drops the optional table as a unit.
+        let mut bad = marked.clone();
+        bad.pop();
+        assert!(serde_json::from_value::<BirthStore>(serde_json::json!(
+            URL_SAFE_NO_PAD.encode(&bad)
+        ))
+        .is_err());
+        let mut zero = marked;
+        *zero.last_mut().unwrap() = 0;
+        assert!(serde_json::from_value::<BirthStore>(serde_json::json!(
+            URL_SAFE_NO_PAD.encode(&zero)
+        ))
+        .is_err());
     }
 
     /// One session "s" with one path "A" born at 100, in a legacy layout.

@@ -60,6 +60,8 @@ pub mod snapshots;
 mod source_rotation;
 pub mod telemetry_attach;
 #[cfg(test)]
+mod test_isolation;
+#[cfg(test)]
 mod test_scratch;
 mod transcript_acquisition;
 mod transcript_cache;

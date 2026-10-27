@@ -90,7 +90,8 @@ fn e2_body_of_previously_proven_family_is_not_a_demotion() {
         // Today (gate off): an unreconstructable revision is a demotion and
         // is held; a healthy one rebuilds the exclusive body.
         let mut proven = proven_family();
-        let (child, disposition) = child_page(&mut proven, healthy);
+        let (child, disposition) =
+            claude_request_money::e2::with_disabled(|| child_page(&mut proven, healthy));
         assert_eq!(
             disposition.quarantined_entity_count(),
             usize::from(!healthy),

@@ -16,6 +16,8 @@ const HEALTHY: [&str; 5] = [
 #[test]
 #[serial(source_manifests)]
 fn structural_reread_observe_counts_all_triggers_for_seven_days_without_changing_reads() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("structural-reread-seven-days-observe") {
         return;
     }

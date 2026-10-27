@@ -251,6 +251,8 @@ fn parse_member(path: &Path, fingerprint: &str) -> SnapshotItem {
 /// census re-proves the family and uploads it; it never ends terminal.
 #[test]
 fn family_proven_before_thinking_reader_reproves_after_upgrade() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use super::tests::{complete_api_row, complete_trace_row, manifest_index_entry};
     let dir = std::env::temp_dir().join(format!(
         "ottto-claude-thinking-family-{}-{}",

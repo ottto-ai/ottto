@@ -376,11 +376,12 @@ pub(crate) fn retained_refusal_settles_for_test(
 // Local index projection producer revision; independent of semantic/wire identity.
 // Each indexed file whose stored revision differs is re-read once; the stamp is
 // written only when its upload settles, so an interrupted pass resumes. Claude
-// Code 2 re-reads its history once so the newer context numbers fill in. Bump a
+// Code 2 re-reads its history once so the newer context numbers fill in; 3 (E2)
+// re-reads it once more for request-owned money, paced. Bump a
 // source at most once per release; Codex and Pi stay unchanged.
 pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
     match source {
-        SnapshotSource::ClaudeCode => 2,
+        SnapshotSource::ClaudeCode => 3,
         SnapshotSource::Codex | SnapshotSource::Pi => 1,
     }
 }
@@ -6198,6 +6199,13 @@ fn prepare_sync_source_inner(
     if source == SnapshotSource::ClaudeCode {
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
+        crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
+        // Identity adoption lowers paced revision debt. Capture it BEFORE
+        // the committed baseline, so an unaccepted/shed page cannot restore
+        // revision 3 while retaining the newly observed identity contract.
+        index.observe_claude_request_identity_contract(
+            cycle_request_identity_permit(source, &activity_hint).is_some(),
+        );
     }
     let committed_index = index.clone();
     let reoffer_paths =
@@ -8932,6 +8940,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
     let request_owned_enabled = crate::snapshots::claude_request_money::e2::enabled();
+    // A family kept on ordinary money (listed) reads its telemetry as gate off.
+    let request_owned =
+        |root: &str| crate::snapshots::claude_request_money::e2::family_applies(index, root, None);
     let mut identity_unhealthy_roots = BTreeSet::new();
     let usage_roots = usage_roots
         .into_iter()
@@ -8949,7 +8960,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             // Attachment already consumed the permissive read. A later strict
             // reread may recover, but this page must not settle the earlier
             // incomplete attachment as final history.
-            if request_owned_enabled
+            if request_owned(session_id)
                 && paired
                 && api_read
                     .session_report(session_id)
@@ -8962,7 +8973,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
                 full_rearm_evidence_complete = false;
-                if emission_permitted || request_owned_enabled {
+                if emission_permitted || request_owned(session_id) {
                     identity_unhealthy_roots.insert(session_id.clone());
                 }
             }
@@ -9018,13 +9029,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
-            if emission_permitted || request_owned_enabled {
+            if emission_permitted || request_owned(&root_session_id) {
                 identity_unhealthy_roots.insert(root_session_id);
             }
             continue;
         }
         stats.complete_sidecar_root_count += 1;
-        if request_owned_enabled {
+        if request_owned(&root_session_id) {
             strict_healthy_roots.insert(root_session_id.clone());
         }
         let api_request_ids = api
@@ -9208,6 +9219,19 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         ),
     };
     drop(identity_evidence);
+    // E2 grains have served their last consumer: contract 5 and account
+    // qualification now own the final rows. Do not retain or clone the fold
+    // alongside upload entities. A withheld entity still needs its original
+    // fold for the hold; it has no request-owned emitted body.
+    #[cfg(test)]
+    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
+        &scan_result.snapshots,
+    );
+    for item in &mut scan_result.snapshots {
+        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
+            crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
+        }
+    }
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -17577,6 +17601,8 @@ mod tests {
     // A local preflight quarantine records Poisoned in the shared client_report counters.
     #[serial(client_report)]
     fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
+        // Parse-stage native hours: gate on, e2::finish_page emits the hours.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let root = test_dir("admission-native-hourly");
         std::fs::create_dir_all(&root).unwrap();
         let source = SnapshotSource::ClaudeCode;
@@ -23523,6 +23549,8 @@ mod tests {
     }
     #[test]
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
+        // Legacy session-account wire shape; E2 emits request-owned account partitions.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         use crate::claude_local_otel::ClaudeIdentityDisposition;
         use sha2::{Digest, Sha256};
         let (dir, raw, api, trace) =
@@ -23682,6 +23710,8 @@ mod tests {
     // A shed page records RatelimitBackoff in the shared client_report counters.
     #[serial(client_report)]
     fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
+        // Legacy session-account wire shape; E2 emits request-owned account partitions.
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         let (root, mut prior, _, _) =
             crate::snapshots::claude_request_account_mixed_fixture(2, true);
         let (candidate_root, mut candidate, api, trace) =

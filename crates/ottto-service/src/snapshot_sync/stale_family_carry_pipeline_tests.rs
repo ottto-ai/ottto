@@ -471,6 +471,8 @@ fn c1b_invalid_pending_keeps_base_rearm() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_sidecar_changed_family_is_reread_like_base() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1b_sidecar_changed") {
         return;
     }
@@ -649,6 +651,8 @@ fn c1b_recoverable_member_change_cancels_the_carry_like_base() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_member_change_on_the_walk_ending_page_keeps_the_held_path() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1b_terminal_page_member_change") {
         return;
     }
@@ -833,6 +837,8 @@ fn c1b_held_retry_chain(
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_one() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1b_retry_pending_beside_witnessed") {
         return;
     }
@@ -929,6 +935,8 @@ fn c1b_retry_pending_family_is_never_carried() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1b_retry_pending_existing_mark") {
         return;
     }
@@ -993,6 +1001,8 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1b_held_mark_full_rearm_window") {
         return;
     }
@@ -1100,6 +1110,8 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
 #[test]
 #[serial(source_manifests)]
 fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("c1a_latch_retry_pending_debt") {
         return;
     }
@@ -1244,6 +1256,8 @@ fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
 #[test]
 #[serial(source_manifests)]
 fn fix2_late_api_row_rereads_the_family_like_base() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("fix2_late_api_row") {
         return;
     }
@@ -1273,6 +1287,8 @@ fn fix2_late_api_row_rereads_the_family_like_base() {
 #[test]
 #[serial(source_manifests)]
 fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
+    // Contract-5 tagging oracle; markerless single-account E2 bodies keep the D1 wire shape.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use sha2::{Digest, Sha256};
     if !c1a_layout_supported("scoped_retry_late_identity") {
         return;
@@ -1388,6 +1404,8 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
 #[test]
 #[serial(source_manifests)]
 fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_family() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("scoped_retry_mark_and_authority") {
         return;
     }

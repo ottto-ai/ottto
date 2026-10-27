@@ -205,6 +205,8 @@ fn identity_pipeline_cycle(
 #[serial]
 #[serial(source_cadences, source_manifests)]
 fn native_comparison_real_source_preparation_stays_base_without_paired_evidence() {
+    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
     let cycle = identity_pipeline_cycle(&fixture, "native-preparation", "").unwrap();
@@ -235,6 +237,8 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
 #[serial]
 #[serial(source_cadences, source_manifests)]
 fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
+    // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_identity as identity;
     let fixture = IdentityPipelineHome::new();
     let session = |cycle: &IdentityPipelineCycle| {
@@ -499,6 +503,8 @@ fn write_native_bootstrap_sidecars(fixture: &IdentityPipelineHome, support: &Pat
 // finish_sync_source leases and commits the shared client_report counters.
 #[serial(client_report)]
 fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_real_bootstrap: supported_positive=UNEXECUTED layout_supported=false; actual unsupported BASE preparation covered separately").unwrap();
         return;

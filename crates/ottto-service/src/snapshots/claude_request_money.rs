@@ -400,9 +400,11 @@ static SHADOW_ENABLED_FOR_TEST: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Tests opt in per support directory (tests run in parallel); production
 /// always runs the shadow.
+/// The P1 shadow is the gate-off design: an armed test runs with the E2
+/// gate off on its thread (PR D deletes both).
 #[cfg(test)]
 #[must_use = "keep the guard alive until the test finishes using the shadow"]
-pub(crate) struct ShadowTestGuard(PathBuf);
+pub(crate) struct ShadowTestGuard(PathBuf, #[allow(dead_code)] e2::GateForTest);
 
 #[cfg(test)]
 impl Drop for ShadowTestGuard {
@@ -418,7 +420,7 @@ pub(crate) fn enable_shadow_for_test(support_dir: &Path) -> ShadowTestGuard {
         .lock()
         .expect("shadow control")
         .push(support_dir.to_path_buf());
-    ShadowTestGuard(support_dir.to_path_buf())
+    ShadowTestGuard(support_dir.to_path_buf(), e2::GateForTest::off())
 }
 
 /// Panic-safe cleanup for a synthetic shadow scope. This does not arm it;
@@ -4720,7 +4722,12 @@ mod seal_tests {
         store::flush();
         store::flush();
         assert_eq!(stamp(), synced, "a present synced marker is not rewritten");
-        std::fs::remove_dir_all(&diagnostics).unwrap();
+        {
+            // Parked, the writer runs no idle pass (any test's job ends with
+            // one) that could heal the marker while the directory is removed.
+            let _paused = store::pause_for_test();
+            std::fs::remove_dir_all(&diagnostics).unwrap();
+        }
         store::wake_writer();
         store::flush();
         assert_eq!(
