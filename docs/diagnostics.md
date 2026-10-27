@@ -497,9 +497,10 @@ traversal's start: `backfill_changed`, `active_upload_context_changed`,
 may increment multiple components. The first observation in a process, an
 unobserved retained traversal and an unavailable component are unknown and
 increment no change counter. Epoch differences require both epochs available;
-availability has its own counter. Ordered roots are compared in full, so a
-same-count replacement or reorder counts. `root_count` is the most recent
-comparison's gauge, including zero. These process-local observations do not
+availability has its own counter. Ordered roots are compared through a
+domain-separated SHA-256 digest with length-prefixed normalized path bytes, so a same-count
+replacement or reorder counts. Diagnostics retain no root paths.
+`root_count` is the most recent comparison's gauge, including zero. These process-local observations do not
 persist or affect decisions; no roots, paths, keys, namespaces, hashes, token
 values or body contents are emitted.
 

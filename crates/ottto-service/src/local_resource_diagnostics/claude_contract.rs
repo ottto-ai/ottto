@@ -73,11 +73,23 @@ impl Counts {
 pub(crate) fn note(f: impl FnOnce(&mut Counts)) {
     claude_reread::update(|counts| f(&mut counts.contract));
 }
+fn roots_digest(roots: &[PathBuf]) -> [u8; 32] {
+    let mut hash = Sha256::new_with_prefix(b"ottto:traversal-roots:v1\0");
+    for root in roots
+        .iter()
+        .map(|root| root.components().collect::<PathBuf>())
+    {
+        let bytes = root.as_os_str().as_encoded_bytes();
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    hash.finalize().into()
+}
 type Parts = [Option<[u8; 32]>; 7];
 #[derive(Default)]
 struct ContextState {
     prepared: [Option<[u8; 32]>; 3],
-    retained: Option<(String, Parts, Vec<PathBuf>)>,
+    retained: Option<(String, Parts, [u8; 32])>,
 }
 #[cfg(not(test))]
 static CONTEXT: Mutex<ContextState> = Mutex::new(ContextState {
@@ -142,7 +154,7 @@ pub(crate) fn compare_context(observed: TraversalContext<'_>) -> Parts {
                         attribution_epoch_changed: changed[4],
                         cache_capability_changed: changed[5],
                         replay_changed: changed[6],
-                        roots_changed: u64::from(roots != observed.roots),
+                        roots_changed: u64::from(*roots != roots_digest(observed.roots)),
                     });
                 }
             }
@@ -151,7 +163,7 @@ pub(crate) fn compare_context(observed: TraversalContext<'_>) -> Parts {
     })
 }
 pub(crate) fn started_context(key: &str, parts: Parts, roots: &[PathBuf]) {
-    context(|state| state.retained = Some((key.to_owned(), parts, roots.to_vec())));
+    context(|state| state.retained = Some((key.to_owned(), parts, roots_digest(roots))));
 }
 
 #[cfg(test)]
@@ -223,6 +235,30 @@ mod tests {
             "unknown epoch adds no change"
         );
         assert_eq!(counts.root_count, Some(1));
+        let scope = claude_reread::Scope::begin(true);
+        let ordered = [roots[0].clone(), other[0].clone()];
+        started_context("ordered", parts, &ordered);
+        compare(Some("ordered"), 1, Some("a"), Some("replay-a"), &ordered);
+        assert_eq!(
+            claude_reread::Counts::default()
+                .with_current()
+                .contract
+                .traversal_context_change
+                .roots_changed,
+            0
+        );
+        let reversed = [other[0].clone(), roots[0].clone()];
+        compare(Some("ordered"), 1, Some("a"), Some("replay-a"), &reversed);
+        compare(
+            Some("unobserved"),
+            1,
+            Some("a"),
+            Some("replay-a"),
+            &reversed,
+        );
+        let ordered_counts = scope.finish().contract;
+        assert_eq!(ordered_counts.traversal_context_change.roots_changed, 1);
+        assert_eq!(ordered_counts.root_count, Some(2));
         let json = serde_json::to_string(&counts).unwrap();
         for forbidden in [
             "synthetic",
