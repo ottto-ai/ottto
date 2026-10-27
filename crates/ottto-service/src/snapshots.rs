@@ -45780,14 +45780,13 @@ impl ScanIndex {
                     && crate::local_resource_diagnostics::claude_reread::active()
                 {
                     let held = self.decode_holds_file(key)
-                        || entry
-                            .last_snapshot_fingerprint
-                            .as_ref()
-                            .is_some_and(|fp| locally_held.contains(fp))
-                        || self
-                            .file_snapshot_fingerprints
-                            .get(key)
-                            .is_some_and(|fps| !fps.is_disjoint(locally_held));
+                        || entry.last_snapshot_fingerprint.as_ref().is_some_and(|fp| {
+                            locally_held.contains(fp) || self.decode_holds_entity(fp)
+                        })
+                        || self.file_snapshot_fingerprints.get(key).is_some_and(|fps| {
+                            !fps.is_disjoint(locally_held)
+                                || fps.iter().any(|fp| self.decode_holds_entity(fp))
+                        });
                     // Exactly the early exact-incidence branch, and the legacy
                     // head/equality fallback would have admitted this sibling.
                     let exact_only = !held
@@ -85336,6 +85335,44 @@ mod tests {
         assert!(owned.claude_owned_start_census[root]
             .emitted_source_file_fingerprint
             .is_none());
+    }
+
+    #[test]
+    fn restoration_diagnostics_treat_entity_decode_holds_as_held() {
+        use crate::local_resource_diagnostics::claude_reread::Scope;
+        let key = "/opaque/entity-decode-held.jsonl".to_string();
+        let head = "a".repeat(64);
+        let held = "b".repeat(64);
+        for held_head in [false, true] {
+            let mut previous = ScanIndex::default();
+            let mut entry = manifest_index_entry(Some(if held_head { &held } else { &head }));
+            entry.source_file_fingerprint.clear();
+            previous.files.insert(key.clone(), entry);
+            let mut working = previous.clone();
+            working.files.get_mut(&key).unwrap().source_file_fingerprint = "c".repeat(64);
+            working.file_snapshot_fingerprints.insert(
+                key.clone(),
+                BTreeSet::from([if held_head {
+                    head.clone()
+                } else {
+                    held.clone()
+                }]),
+            );
+            let mut value = serde_json::to_value(&working).unwrap();
+            value["quarantined_snapshot_fingerprints"][&held] = serde_json::json!({"unknown": 1});
+            let working =
+                lenient_decode::read_bounded(&serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(working.decode_holds_entity(&held));
+            assert!(!working.decode_holds_file(&key));
+            let scope = Scope::begin(true);
+            let saved = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+            let counts = scope.finish().claude_reread;
+            assert_eq!(counts.restored_empty_held, 1);
+            assert_eq!(counts.restored_empty_sibling, 0);
+            assert_eq!(counts.sibling_exact_incidence_only, 0);
+            assert!(saved.files[&key].source_file_fingerprint.is_empty());
+            assert!(saved.decode_holds_entity(&held));
+        }
     }
 
     #[test]
