@@ -119,6 +119,15 @@ fn lock_is_free(path: &Path) -> bool {
     free
 }
 
+/// Tests that need a lock free after it was flocked in the same test (by
+/// the test, the pass or `lock_is_free`) run alone in a child test process:
+/// a process that another test spawns at that moment may still hold a copy
+/// of the released descriptor (see `crate::test_isolation`). Returns whether
+/// to run the test's body here.
+fn run_isolated() -> bool {
+    crate::test_isolation::run_here()
+}
+
 fn hold_lock(path: &Path) -> fs::File {
     let file = fs::OpenOptions::new()
         .read(true)
@@ -274,6 +283,9 @@ fn grammar_accepts_only_proven_artifacts() {
 
 #[test]
 fn orphan_temp_is_removed_when_lock_is_free_and_writer_is_gone() {
+    if !run_isolated() {
+        return;
+    }
     let f = fixture();
     let canonical = f.dest.join(format!("{INDEX}.json"));
     write(&canonical, b"{\"generation\":3}");
@@ -321,6 +333,9 @@ fn temp_is_kept_while_another_descriptor_holds_the_lock() {
 
 #[test]
 fn scan_index_save_in_progress_is_never_disturbed() {
+    if !run_isolated() {
+        return;
+    }
     let f = fixture();
     let path = f.dest.join(format!("{INDEX}.json"));
     // The generation-1 state the saver loaded before saving.
@@ -370,6 +385,9 @@ fn scan_index_save_in_progress_is_never_disturbed() {
 
 #[test]
 fn scan_index_save_after_the_sweep_succeeds() {
+    if !run_isolated() {
+        return;
+    }
     let f = fixture();
     let path = f.dest.join("codex-scan-index-v3.json");
     let mut index = ScanIndex::default();
@@ -801,6 +819,9 @@ fn log_line_is_content_free() {
 
 #[test]
 fn each_artifact_uses_its_own_base_lock() {
+    if !run_isolated() {
+        return;
+    }
     let old_nanos = (SystemTime::now() - Duration::from_secs(3 * 60 * 60))
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -883,6 +904,9 @@ fn plant_three_orphans(dest: &Path) -> Vec<(PathBuf, PathBuf)> {
 
 #[test]
 fn another_daemon_running_applies_nothing_and_takes_no_lock() {
+    if !run_isolated() {
+        return;
+    }
     let f = fixture();
     let planted = plant_three_orphans(&f.dest);
     let locks: Vec<PathBuf> = planted.iter().map(|(_, lock)| lock.clone()).collect();
@@ -980,6 +1004,9 @@ fn daemon_seen_before_a_later_lock_stops_the_rest_of_the_pass() {
 
 #[test]
 fn pass_holds_one_lock_at_a_time_and_releases_all_of_them() {
+    if !run_isolated() {
+        return;
+    }
     let f = fixture();
     let planted = plant_three_orphans(&f.dest);
     let dest = f.dest.clone();
@@ -1081,6 +1108,9 @@ fn directory_listing_stops_at_the_deadline() {
 
 #[test]
 fn deadline_at_any_point_stops_the_pass_with_every_lock_released() {
+    if !run_isolated() {
+        return;
+    }
     let mut previous_removed = 0;
     let mut stopped_between_removals = false;
     for checks in 0.. {
@@ -1315,6 +1345,9 @@ fn deadline_during_the_process_table_read_applies_nothing() {
 
 #[test]
 fn hardlinked_lock_is_never_flocked() {
+    if !run_isolated() {
+        return;
+    }
     let f = fixture();
     let orphan = plant_orphan(&f.dest, INDEX);
     let lock = f.dest.join(format!("{INDEX}.lock"));
@@ -1343,6 +1376,9 @@ fn hardlinked_lock_is_never_flocked() {
 
 #[test]
 fn lock_hardlinked_after_the_first_look_is_never_flocked() {
+    if !run_isolated() {
+        return;
+    }
     let f = fixture();
     plant_orphan(&f.dest, INDEX);
     let lock = f.dest.join(format!("{INDEX}.lock"));
@@ -1529,6 +1565,9 @@ mod native_process_table {
 
     #[test]
     fn healthy_table_without_a_daemon_lets_the_pass_apply() {
+        if !run_isolated() {
+            return;
+        }
         assert!(!FakeLibproc::healthy().read().expect("readable"));
         let (_f, planted, report) = sweep_with(FakeLibproc::healthy());
         assert_eq!(report.other_daemon_check, OtherDaemonState::Clear);
