@@ -66,19 +66,29 @@ def main():
                 raise RuntimeError(f"expected one test binary: {bins}")
             # Native tests must emit a VERIFIED receipt each; Linux's explicit
             # UNEXECUTED line or a zero-match test result cannot pass this job.
-            result = command([bins[0], "money_equivalence_tests::", "--nocapture",
+            result = subprocess.run([bins[0], "money_equivalence_tests::", "--nocapture",
                               "--test-threads=1"], cwd=tree, env=env,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             print(result.stdout, flush=True)
             (receipts / f"{arm}.log").write_text(result.stdout)
-            verified = re.findall(r"^MONEY_EQUIVALENCE (\w+) VERIFIED ", result.stdout, re.M)
-            if len(verified) != 10 or len(set(verified)) != 10 or "UNEXECUTED" in result.stdout:
+            result.check_returncode()
+            verified = re.findall(r"\bMONEY_EQUIVALENCE (\w+) VERIFIED ", result.stdout, re.M)
+            expected = {
+                "progressive_response", "duplicate_request_ids", "resolver_conflict",
+                "quiet_sidecar_growth", "side_owner", "side_without_owner",
+                "side_owner_directory_unlisted", "failed_then_healthy_telemetry",
+                "codex_v2_sticky", "codex_legacy_acked_sticky",
+            }
+            if len(verified) != len(expected) or set(verified) != expected or "UNEXECUTED" in result.stdout:
                 raise RuntimeError(f"incomplete native coverage: {verified}")
         left, right = receipts / "base", receipts / "head"
         names = sorted(p.name for p in left.glob("*.json"))
         if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json")):
             raise RuntimeError("missing or extra fixture receipts")
         for name in names:
+            inputs = Path(name).with_suffix(".inputs")
+            if (left / inputs).read_bytes() != (right / inputs).read_bytes():
+                raise RuntimeError(f"synthetic inputs differ across base/head: {inputs}")
             a, b = (left / name).read_bytes(), (right / name).read_bytes()
             if a != b or hashlib.sha256(a).digest() != hashlib.sha256(b).digest():
                 raise RuntimeError(f"base/head emitted bytes or digest differ: {name}")

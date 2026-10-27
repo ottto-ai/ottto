@@ -47,6 +47,42 @@ fn input_clock(path: &Path) {
         .unwrap();
 }
 
+/// Save the exact synthetic JSONL inputs, separately from emitted bodies.
+/// CI compares these too: a generator drift cannot masquerade as reader drift.
+fn save_inputs(c: &Corpus) {
+    fn walk(base: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(base, &path, files);
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                files.insert(
+                    path.strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    walk(&c.base, &c.base, &mut files);
+    assert!(!files.is_empty());
+    if let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") {
+        std::fs::create_dir_all(&out).unwrap();
+        let path = PathBuf::from(out)
+            .join(c.base.file_name().unwrap())
+            .with_extension("inputs");
+        let mut saved = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(saved, "{}", serde_json::to_string(&files).unwrap()).unwrap();
+    }
+}
+
 fn receipt(name: &str, bodies: &[Vec<u8>]) {
     assert!(!bodies.is_empty(), "zero emitted bodies is no proof");
     let bytes = serde_json::to_vec(bodies).unwrap();
@@ -71,6 +107,7 @@ fn compare_claude(
     prior: ScanIndex,
     mode: (usize, usize, usize),
 ) -> Vec<u8> {
+    save_inputs(c);
     let mut tail = c.raw(retained, prior.clone(), 100, true, &[]);
     assert_eq!(
         tail.modes, mode,
@@ -111,6 +148,20 @@ fn claude_case(name: &str) {
     }
     with_e2(|| {
         let mut c = corpus(name);
+        if name == "side_owner_directory_unlisted" {
+            let hidden = c
+                .root
+                .join("unlisted")
+                .join(ROOT)
+                .join("subagents/agent-unlisted.jsonl");
+            std::fs::create_dir_all(hidden.parent().unwrap()).unwrap();
+            std::fs::write(&hidden, line(ROOT, "hidden-owner", AT, 20)).unwrap();
+            input_clock(&hidden);
+            // A real owner file exists, but its directory is outside this
+            // page's listed root. Trace ownership must not invent its body.
+            c.root = c.root.join("listed");
+            std::fs::create_dir_all(&c.root).unwrap();
+        }
         let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
         if name == "side_owner" {
             let agent = c.agent(0, &line(ROOT, "agent", AT, 20));
@@ -268,6 +319,7 @@ fn codex_case(legacy: bool) {
     append(&path, &codex_rows("turn-b", 30));
     input_clock(&path);
     let _cutover = crate::snapshots::TestCutover::set(0);
+    save_inputs(&c);
     let (tail_index, tail, modes) = other_page(&c, &scanner, source, prior.clone());
     assert_eq!(modes, (0, 1, 0), "must reuse retained Codex reduction");
     let (_, full, modes) = other_page(&c, &E2ScanFixture::default(), source, prior);
