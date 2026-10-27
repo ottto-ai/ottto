@@ -91,6 +91,14 @@ impl Corpus {
         rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
         traces: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
     ) {
+        self.evidence_for(ROOT, rows, traces);
+    }
+    fn evidence_for(
+        &self,
+        session: &str,
+        rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+        traces: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
+    ) {
         for (directory, values) in [
             (
                 "claude-code-effort",
@@ -110,7 +118,7 @@ impl Corpus {
                 .support
                 .join("local-otel")
                 .join(directory)
-                .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
+                .join(format!("{:x}.jsonl", Sha256::digest(session.as_bytes())));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(
                 path,
@@ -152,6 +160,7 @@ impl Corpus {
             scan,
             modes,
             disposition: Default::default(),
+            released: Default::default(),
         }
     }
     fn reload(&self, index: &mut ScanIndex) -> ScanIndex {
@@ -170,11 +179,19 @@ struct Page {
     scan: SourceScanResult,
     modes: (usize, usize, usize),
     disposition: crate::snapshots::ClaudeUsageAuthorityDisposition,
+    released: e2::pipeline_test_observer::Released,
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
-        let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan(&corpus.support, &mut self.scan, &mut self.index);
+        let ((mut disposition, _, _), released) =
+            e2::pipeline_test_observer::capture_released(|| {
+                apply_claude_local_evidence_to_scan(
+                    &corpus.support,
+                    &mut self.scan,
+                    &mut self.index,
+                )
+            });
+        self.released = released;
         self.index
             .veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut self.scan.snapshots);
         let deferred = self.index.bind_session_accounts_with_mixed(
@@ -236,9 +253,17 @@ impl Page {
     }
 }
 fn api(request: &str, tokens: u64, cost: u64) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    api_for(ROOT, request, tokens, cost)
+}
+fn api_for(
+    session: &str,
+    request: &str,
+    tokens: u64,
+    cost: u64,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
     let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence {
         capture_revision: "claude_api_request:v2".into(),
-        session_id: ROOT.into(),
+        session_id: session.into(),
         request_id: request.into(),
         client_request_id: format!("client-{request}"),
         observed_at: AT.into(),
@@ -264,9 +289,16 @@ fn api(request: &str, tokens: u64, cost: u64) -> crate::claude_local_otel::Claud
     row
 }
 fn trace(request: &str, agent: &str) -> crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+    trace_for(ROOT, request, agent)
+}
+fn trace_for(
+    session: &str,
+    request: &str,
+    agent: &str,
+) -> crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
     let mut row = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
         capture_revision: "claude_llm_request_ownership:v1".into(),
-        session_id: ROOT.into(),
+        session_id: session.into(),
         request_id: request.into(),
         client_request_id: format!("client-{request}"),
         agent_id: agent.into(),
@@ -337,6 +369,9 @@ fn upload(
 fn ack(batch: &[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let mut response = accepted_batch(0);
     response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+    // Head-CAS covers the whole request once any item carries cache
+    // observations (`validate_entity_ack`): every accepted entity gets a head.
+    let head_cas = batch.iter().any(|item| item.cache_observations.is_some());
     for item in batch {
         let mut reference = entity_ack_ref(&item.snapshot_fingerprint);
         reference.source_session_id = item.source_session_id.clone();
@@ -345,7 +380,7 @@ fn ack(batch: &[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchRe
         reference.body_witness_digest = reference
             .body_witness_version
             .map(|_| snapshot_upload_body_witness(item));
-        if item.cache_observations.is_some() {
+        if head_cas {
             reference.head_etag = Some("e".repeat(64));
         }
         response.accepted_entities.push(reference);
@@ -367,6 +402,41 @@ fn literal(page: &Page) {
         .snapshots
         .iter()
         .all(crate::snapshots::claude_request_money::is_request_owned_literal));
+    assert!(
+        page.scan.snapshots.iter().all(|item| item
+            .claude_money
+            .as_deref()
+            .map_or(true, e2::pipeline_test_observer::released_for_marks)),
+        "final identity-tagged rows must not retain E2 fold storage for upload"
+    );
+}
+/// Each indexed file still on disk: the body it last sent (snapshot
+/// fingerprint and upload body witness), as the index stores it.
+fn stored_bodies(
+    index: &ScanIndex,
+) -> std::collections::BTreeMap<String, (Option<String>, Option<String>)> {
+    index
+        .files
+        .iter()
+        .filter(|(key, _)| std::path::Path::new(key.as_str()).is_file())
+        .map(|(key, entry)| {
+            (
+                key.clone(),
+                (
+                    entry.last_snapshot_fingerprint.clone(),
+                    entry.last_upload_body_witness.clone(),
+                ),
+            )
+        })
+        .collect()
+}
+fn append(path: &Path, text: &str) {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
 }
 fn assert_mode(actual: (usize, usize, usize), expected: (usize, usize, usize)) {
     let expected = if crate::heap_layout_bound::layout_supported() {
@@ -395,6 +465,7 @@ fn ready(
         scan: p.scan.clone(),
         modes: p.modes,
         disposition: p.disposition.clone(),
+        released: p.released,
     };
     send.finish();
     let (result, _, _) = upload(&send.scan.snapshots, &mut e2_progress(), ack);
@@ -408,6 +479,10 @@ fn ready(
 
 #[test]
 fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
+    e2::with_disabled(e2_pipeline_dark_matches_fold_absent_publication_and_selection_body);
+}
+
+fn e2_pipeline_dark_matches_fold_absent_publication_and_selection_body() {
     let mut c = Corpus::new("e2-pipeline-dark");
     c.root(
         ROOT,
@@ -737,6 +812,56 @@ fn e2_pipeline_twins_copy_discovered_first() {
     twins(true);
 }
 
+/// R1: each walk meets both path twins, but a settled twin does not pull its
+/// family into the page. Only a twin the page reads does; otherwise the
+/// family is read again and one batch is sent on every walk.
+#[test]
+fn e2_pipeline_settled_twins_are_not_read_again() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-twins-settled");
+        c.write_at(
+            &format!("a-original/{ROOT}.jsonl"),
+            &line(ROOT, "r1", AT, 10),
+            "2026-08-02T07:00:00Z",
+        );
+        c.write_at(
+            &format!("z-copy/{ROOT}.jsonl"),
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut index = ScanIndex::default();
+        let mut pages = Vec::new();
+        for _ in 0..4 {
+            let mut page = c.raw(&scanner, index, 100, false, &[]);
+            page.enrich(&c);
+            page.finish();
+            if !page.scan.snapshots.is_empty() {
+                let mut progress = e2_progress();
+                let (result, _, _) = upload(&page.scan.snapshots, &mut progress, ack);
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                page.index
+                    .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+            }
+            pages.push((
+                page.scan.scanned_file_count,
+                page.scan.snapshots.len(),
+                page.scan.census_complete,
+            ));
+            index = c.reload(&mut page.index);
+        }
+        assert_eq!(pages[0].0, 2, "the first walk reads both twins: {pages:?}");
+        assert_eq!(
+            pages[2..]
+                .iter()
+                .map(|page| (page.0, page.1))
+                .collect::<Vec<_>>(),
+            [(0, 0), (0, 0)],
+            "settled twins are not read again: {pages:?}"
+        );
+    });
+}
+
 #[test]
 fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
     with_e2(|| {
@@ -798,7 +923,7 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:00:00Z",
         );
-        c.write_at(
+        let survivor = c.write_at(
             &format!("z/{ROOT}.jsonl"),
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:03:00Z",
@@ -809,11 +934,27 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
         first.finish();
         let prior = c.reload(&mut first.index);
         std::fs::remove_file(original).unwrap();
-        let left = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        literal(&left);
+        let stored = stored_bodies(&prior);
+        let mut left = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        // R1 (owner-authorized): the unchanged survivor is not read again
+        // (latest wins); it re-emits on its next real change.
+        assert!(
+            left.scan.snapshots.is_empty(),
+            "an unchanged survivor emits nothing new"
+        );
+        left.finish();
         assert_eq!(
-            total(&left),
-            1,
+            stored_bodies(&left.index),
+            stored,
+            "the stored body stays byte-identical"
+        );
+        append(&survivor, &line(ROOT, "r2", "2026-08-02T07:04:00Z", 20));
+        let prior = c.reload(&mut left.index);
+        let changed = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&changed);
+        assert_eq!(
+            total(&changed),
+            2,
             "the sole surviving path keeps known original money"
         );
     });
@@ -930,7 +1071,8 @@ fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
         assert_eq!((root.request_count, root.input_tokens), (2, 17));
         assert_eq!((agent.request_count, agent.input_tokens), (2, 25));
         assert_eq!(
-            e2::pipeline_test_observer::root_fallbacks(&p.scan.snapshots),
+            e2::pipeline_test_observer::root_fallbacks(&p.scan.snapshots)
+                + p.released.root_fallbacks,
             1,
             "exactly one side call used the counted root fallback"
         );
@@ -1470,7 +1612,7 @@ fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
         );
         assert_eq!(copy.removed_request_count, Some(0));
         assert!(
-            e2::pipeline_test_observer::disclosed(&p.scan.snapshots) > 0,
+            e2::pipeline_test_observer::disclosed(&p.scan.snapshots) + p.released.disclosed > 0,
             "an orphan copy is disclosed"
         );
     });
@@ -1489,7 +1631,7 @@ fn restored_twins(reverse: bool, equal: bool) {
             &line(ROOT, "r1", AT, 10),
             "2026-08-02T07:02:00Z",
         );
-        c.write_at(
+        let twin = c.write_at(
             &format!("{b}/{ROOT}.jsonl"),
             &line(ROOT, "r1", AT, 10),
             if equal {
@@ -1513,13 +1655,29 @@ fn restored_twins(reverse: bool, equal: bool) {
             "all-prebirth restored twins must count once on their first page"
         );
         first.finish();
+        let stored = stored_bodies(&first.index);
         let prior = c.reload(&mut first.index);
-        let again = ready(&c, &scanner, prior, 100, false);
-        literal(&again);
+        let mut again = ready(&c, &scanner, prior, 100, false);
+        // R1 (owner-authorized): an unchanged repeated page reads and sends
+        // nothing (latest wins); a real change re-emits the twin group.
+        assert!(
+            again.scan.snapshots.is_empty(),
+            "an unchanged repeated page emits nothing new"
+        );
+        again.finish();
         assert_eq!(
-            total(&again),
-            1,
-            "restart and repeated page cannot change the total"
+            stored_bodies(&again.index),
+            stored,
+            "the stored body stays byte-identical"
+        );
+        append(&twin, &line(ROOT, "r2", "2026-08-02T07:04:00Z", 20));
+        let prior = c.reload(&mut again.index);
+        let changed = ready(&c, &scanner, prior, 100, false);
+        literal(&changed);
+        assert_eq!(
+            total(&changed),
+            2,
+            "restart and repeated page cannot change the total; the new response counts once"
         );
     });
 }
@@ -2145,6 +2303,211 @@ fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
             (0, Some(1))
         );
     });
+}
+
+/// Design item 9 (PR C): the legacy fork-prefix exclusion and the E2 copy
+/// skip never both remove a copied request. A legacy fork child whose
+/// leading request telemetry assigns to its parent, with a divergent parent
+/// prefix (the exclusion's exact shape, derived on this page), publishes
+/// that request removed exactly once and counts every other request once.
+#[test]
+fn e2_pipeline_legacy_fork_prefix_is_removed_exactly_once() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-pipeline-legacy-fork-prefix");
+        c.root(
+            ROOT,
+            &(line(ROOT, "shared", AT, 10) + &line(ROOT, "parent", "2026-08-02T07:01:00Z", 20)),
+        );
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(line(COPY, "shared", AT, 10) + &line(COPY, "child", "2026-08-02T07:04:00Z", 30)),
+            "2026-08-02T07:03:00Z",
+        );
+        c.evidence_for(
+            ROOT,
+            &[
+                api_for(ROOT, "shared", 10, 100),
+                api_for(ROOT, "parent", 20, 200),
+            ],
+            &[trace_for(ROOT, "shared", ""), trace_for(ROOT, "parent", "")],
+        );
+        c.evidence_for(
+            COPY,
+            &[api_for(COPY, "child", 30, 300)],
+            &[trace_for(COPY, "child", "")],
+        );
+        let p = ready(
+            &c,
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            false,
+        );
+        literal(&p);
+        assert_eq!(
+            e2::pipeline_test_observer::legacy_excluded(&p.index, COPY),
+            1,
+            "the legacy exclusion would remove the shared prefix from the child"
+        );
+        let copy = body(&p, COPY).expect("the child publishes");
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (1, Some(1)),
+            "the shared request is removed once, by the E2 copy rule only"
+        );
+        assert_eq!(
+            body(&p, ROOT).expect("the parent publishes").request_count,
+            2
+        );
+        assert_eq!(total(&p), 3, "every request counts exactly once");
+    });
+}
+
+/// The `fork-context-ref` line `/branch` (Claude Code 2.1.309+) writes into
+/// the new session, naming the session it copied.
+fn fork_ref(session: &str, parent: &str) -> String {
+    json!({"type":"fork-context-ref", "sessionId":session, "agentId":"fork-agent",
+        "contextLength":1, "parentSessionId":parent, "parentLastUuid":"parent-last",
+        "timestamp":"2026-08-02T07:03:00Z"})
+    .to_string()
+        + "\n"
+}
+
+/// PR C (a): the /branch of a session untouched for over 35 days, whose
+/// census record is retired (it keeps no request ids). `named` writes the
+/// branch's `fork-context-ref` line naming `parent`. Returns the branch body
+/// (requests, removed) and the page's disclosed count.
+fn branch_of_retired(name: &str, named: Option<&str>) -> ((u64, Option<u64>), u64) {
+    with_e2(|| {
+        let mut c = Corpus::new(name);
+        c.root(ROOT, &line(ROOT, "original", AT, 10));
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let original = ready(&c, &scanner, old.clone(), 100, false);
+        assert_eq!(total(&original), 1, "the original counts its request");
+        let mut prior = settle(&c, &old, original, &mut progress);
+        e2::pipeline_test_observer::retire_census(&mut prior, &format!("{ROOT}.jsonl"));
+        let fork = named
+            .map(|parent| fork_ref(COPY, parent))
+            .unwrap_or_default();
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(fork + &line(COPY, "original", AT, 10)),
+            "2026-08-02T07:03:00Z",
+        );
+        let branch = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&branch);
+        assert!(body(&branch, ROOT).is_none(), "the original is unchanged");
+        let copy = body(&branch, COPY).expect("the branch publishes its body");
+        (
+            (copy.request_count, copy.removed_request_count),
+            e2::pipeline_test_observer::disclosed(&branch.scan.snapshots),
+        )
+    })
+}
+#[test]
+fn e2_pipeline_branch_of_a_retired_original_named_by_its_fork_line_is_skipped() {
+    assert_eq!(
+        branch_of_retired("e2-pipeline-retired-named", Some(ROOT)),
+        ((0, Some(1)), 0),
+        "the still-indexed original the fork line names proves the copy: never counted twice"
+    );
+}
+#[test]
+fn e2_pipeline_branch_of_a_retired_original_without_a_fork_line_counts_and_discloses() {
+    // No durable per-request store: without the name, the retired original
+    // proves nothing, so the copy counts once more and is disclosed.
+    assert_eq!(
+        branch_of_retired("e2-pipeline-retired-unnamed", None),
+        ((1, Some(0)), 1)
+    );
+}
+#[test]
+fn e2_pipeline_branch_naming_an_unindexed_session_counts_and_discloses() {
+    // The fork line names a session that is not indexed: no proof.
+    assert_eq!(
+        branch_of_retired("e2-pipeline-retired-unindexed", Some(LATE)),
+        ((1, Some(0)), 1)
+    );
+}
+
+/// PR C (c) and (d): the copy is read while its holder `LATE`, changed
+/// since its last read, is still queued by the traversal. `stale_record`:
+/// the holder keeps a census record of its old content (rewritten in place
+/// without the request); else it has none (indexed, record lost) and grew.
+/// The copy waits for the holder's re-read instead of deciding on what the
+/// stale (or absent) record says, then each request counts exactly once.
+fn copy_waits_for_queued_holder(stale_record: bool) {
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-pipeline-queued-holder-{stale_record}"));
+        let original = c.root(LATE, &line(LATE, "original", AT, 10));
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let first = ready(&c, &scanner, old.clone(), 100, false);
+        let mut prior = settle(&c, &old, first, &mut progress);
+        let expected_original = if stale_record {
+            std::fs::write(&original, line(LATE, "rewritten", AT, 100)).unwrap();
+            1
+        } else {
+            e2::pipeline_test_observer::forget_census(&mut prior, &format!("{LATE}.jsonl"));
+            let grown = line(LATE, "original", AT, 10) + &line(LATE, "more", AT, 20);
+            std::fs::write(&original, grown).unwrap();
+            2
+        };
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "original", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut held = c.raw(&scanner, prior.clone(), 1, false, &[]);
+        held.enrich(&c);
+        let opened = scanner.paths();
+        assert_eq!(opened.len(), 1, "one file per page");
+        assert!(
+            opened[0].ends_with(format!("{COPY}.jsonl")),
+            "the copy is read while its changed holder is still queued"
+        );
+        assert_withheld(&held, COPY, "the holder's re-read decides");
+        prior = settle(&c, &prior, held, &mut progress);
+        let (mut copy_body, mut original_requests) = (None, None);
+        for _ in 0..4 {
+            let page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+            if let Some(found) = body(&page, LATE) {
+                literal(&page);
+                original_requests = Some(found.request_count);
+            }
+            if let Some(found) = body(&page, COPY) {
+                literal(&page);
+                copy_body = Some((found.request_count, found.removed_request_count));
+            }
+            prior = settle(&c, &prior, page, &mut progress);
+            if copy_body.is_some() && original_requests.is_some() {
+                break;
+            }
+        }
+        assert_eq!(original_requests, Some(expected_original));
+        assert_eq!(
+            copy_body,
+            Some(if stale_record {
+                (1, Some(0))
+            } else {
+                (0, Some(1))
+            }),
+            "the copy's request counts exactly once: in the copy only when the \
+             re-read holder no longer holds it"
+        );
+    });
+}
+#[test]
+fn e2_pipeline_copy_waits_for_a_queued_stale_holder() {
+    copy_waits_for_queued_holder(true);
+}
+#[test]
+fn e2_pipeline_copy_waits_for_a_queued_indexed_holder_without_a_census_record() {
+    copy_waits_for_queued_holder(false);
 }
 
 /// Owner ruling 5 (Codex P1-2): a file whose every response conflicts keeps

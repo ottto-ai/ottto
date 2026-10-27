@@ -37,6 +37,8 @@ use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
+pub(crate) const E2_GROUPING: &str =
+    "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1";
 
 /// The contract a sync cycle builds Claude bodies under: the full collector
 /// token, which names its version, under a permit, and `""` without one.
@@ -51,7 +53,7 @@ const fn compiled_cycle_contract(permitted: bool, request_owned: bool) -> &'stat
     if !permitted {
         ""
     } else if request_owned {
-        "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1"
+        E2_GROUPING
     } else {
         COLLECTOR
     }
@@ -1534,9 +1536,12 @@ pub(crate) struct RequestAccounts {
     pub(crate) inherited: u64,
     skipped_inherited: u64,
     first_retained: Option<u64>,
+    reconciled: bool,
+    /// Root start known, but the native Unknown grains are not filled yet.
+    root_fallback_pending: bool,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained, reconciled, root_fallback_pending);
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A conflict fills missing shares; trusted own/earlier org runs stay intact.
@@ -1702,7 +1707,11 @@ pub(crate) fn request_accounts(
 impl RequestAccounts {
     pub(crate) fn account(&self, sequence: u64) -> AccountPartition {
         if self.subagent {
-            return self.starting.clone().or_else(|| self.fallback.clone());
+            return self.starting.clone().or_else(|| {
+                (!self.root_fallback_pending)
+                    .then(|| self.fallback.clone())
+                    .flatten()
+            });
         }
         let end = self.runs.partition_point(|run| run.position <= sequence);
         self.runs[..end]
@@ -1710,7 +1719,11 @@ impl RequestAccounts {
             .rev()
             .find_map(|run| run.account.clone())
             .or_else(|| self.starting.clone())
-            .or_else(|| self.fallback.clone())
+            .or_else(|| {
+                (!self.root_fallback_pending)
+                    .then(|| self.fallback.clone())
+                    .flatten()
+            })
     }
     fn is_inherited(&self, sequence: u64) -> bool {
         !self.subagent
@@ -1751,6 +1764,59 @@ impl RequestAccounts {
         runs.last().map(|run| run.position)
     }
 
+    /// X_out's E term for a gate-on fold's accounts: the boxed
+    /// `request_accounts` for `markers` and a bound login of `login` bytes,
+    /// built twice while `finish_native` rebuilds beside the first, with
+    /// each build's scratch (the contradicted positions, the distinct-key
+    /// set, the excluded positions). Each `AccountPartition` is charged per
+    /// reference. Also what one grain key's partition costs, and the marker
+    /// runs (at most one inherited body each).
+    pub(crate) fn finish_heap_bound(
+        markers: Option<&OrgMarkers>,
+        login: usize,
+    ) -> Option<(usize, usize, usize)> {
+        use crate::heap_layout_bound::tree_node_bytes;
+        use std::mem::{align_of, size_of};
+        let (runs, org) = markers.map_or((0, 0), |markers| {
+            let org = markers
+                .entries
+                .iter()
+                .chain(&markers.starting_marker)
+                .filter_map(|marker| marker.org.as_ref().map(String::capacity))
+                .max()
+                .unwrap_or(0);
+            (markers.entries.len().max(1), org)
+        });
+        // Neither a login nor a marker: every partition is None.
+        let partition = if login == 0 && runs == 0 {
+            0
+        } else {
+            size_of::<AuthorityKey>()
+                .checked_add(align_of::<AuthorityKey>())?
+                .checked_add(2 * size_of::<usize>())?
+                .checked_add(login.max(org))?
+        };
+        // `push` growth from four slots.
+        let slots = if runs == 0 {
+            0
+        } else {
+            runs.checked_mul(2)?.checked_add(4)?
+        };
+        let build = slots
+            .checked_mul(size_of::<AccountRun>())?
+            // starting, fallback, bound, retained_root and every run's account
+            .checked_add(runs.checked_add(4)?.checked_mul(partition)?)?;
+        let scratch = slots.checked_mul(2 * size_of::<u64>())?.checked_add(
+            runs.checked_add(1)?
+                .checked_mul(tree_node_bytes::<&Arc<AuthorityKey>, ()>()?)?,
+        )?;
+        let bytes = size_of::<Self>()
+            .checked_add(align_of::<Self>())?
+            .checked_add(build.checked_mul(2)?)?
+            .checked_add(scratch)?;
+        Some((bytes, partition, runs))
+    }
+
     /// Rebuild only after the money owner confirms exclusion. Restored files
     /// keep every marker; excluded requests cannot lend a marker to own usage.
     pub(crate) fn finish_native(&mut self, markers: Option<&OrgMarkers>, prefix_excluded: bool) {
@@ -1781,36 +1847,39 @@ impl RequestAccounts {
     }
 }
 
-/// Stronger evidence can contradict a marker, but never relocates an E2
-/// request. Only missing shares fall back to the native starting account.
+/// Own exact telemetry uses the existing request classifier, with the same
+/// standing as an own credential_org. Only missing evidence inherits an
+/// earlier own request, then the start/binding; every such fill is counted.
 pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
+    use super::claude_request_money::e2::place_request_identity;
     for item in items {
-        let root = super::claude_snapshot_family_root_ref(item).to_owned();
-        // The existing account owner already proved uniform request coverage.
-        // This is retained evidence, never today's login or a later marker.
-        let qualified = item
-            .claude_org_markers
-            .is_none()
-            .then(|| super::exact_session_account_hash(item))
-            .flatten();
-        let Some(fold) = item.claude_money.as_deref_mut() else {
+        let Some(mut fold) = item.claude_money.take() else {
             continue;
         };
-        let Some(accounts) = fold.accounts.as_deref_mut() else {
+        let Some(mut accounts) = fold.accounts.take() else {
+            item.claude_money = Some(fold);
             continue;
         };
-        if accounts.subagent {
+        if accounts.reconciled {
+            fold.accounts = Some(accounts);
+            item.claude_money = Some(fold);
             continue;
         }
-        if accounts.starting.is_none()
+        let native = accounts.clone();
+        // Existing account-owner qualification remains a fallback for a
+        // markerless file, never an override of a request's own telemetry.
+        if !accounts.subagent
+            && accounts.starting.is_none()
             && !accounts.mixed
+            && item.claude_org_markers.is_none()
             && item.claude_usage_request_ids.iter().all(|request| {
-                !evidence
-                    .invalid_logins
-                    .contains(&(root.as_str(), request.as_str()))
+                !evidence.invalid_logins.contains(&(
+                    super::claude_snapshot_family_root_ref(item),
+                    request.as_str(),
+                ))
             })
         {
-            if let Some(login) = qualified {
+            if let Some(login) = super::exact_session_account_hash(item) {
                 let key = Some(Arc::new(AuthorityKey {
                     login: Some(login),
                     org: None,
@@ -1818,53 +1887,162 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                 }));
                 accounts.starting = key.clone();
                 accounts.fallback = key.clone();
-                accounts.bound = key.clone();
-                accounts.conflict = false;
-                fold.entity.repartition(key);
+                if accounts.bound.is_none() {
+                    accounts.bound = key;
+                }
             }
         }
-        for (request, occurrence) in &item.claude_usage_occurrences {
-            match evidence.requests.get(&(root.as_str(), request.as_str())) {
-                Some(None) => accounts.conflict = true,
-                Some(Some(row)) => {
-                    if let Some(identity) = &row.request_identity {
-                        if matches!(
-                            identity.disposition,
-                            ClaudeIdentityDisposition::Conflict
-                                | ClaudeIdentityDisposition::Invalid
-                        ) || matches!(
-                            identity.account.disposition,
-                            ClaudeIdentityDisposition::Conflict
-                                | ClaudeIdentityDisposition::Invalid
-                        ) || (identity.account.disposition != ClaudeIdentityDisposition::Missing
-                            && evidence
-                                .invalid_logins
-                                .contains(&(root.as_str(), request.as_str())))
-                        {
-                            accounts.conflict = true;
+        // Existing occurrence storage owns these requests. The temporary sort
+        // is 16 bytes per resolved request, at most 1 MiB (native 65,536 cap).
+        let mut occurrences = std::mem::take(&mut item.claude_usage_occurrences);
+        let mut requests = occurrences.iter_mut().collect::<Vec<_>>();
+        requests.sort_unstable_by_key(|(_, occurrence)| occurrence.sequence);
+        let first_retained = requests
+            .iter()
+            .find(|(_, occurrence)| {
+                !fold.is_skipped(occurrence.sequence) && !occurrence.usage.is_zero()
+            })
+            .map(|(_, occurrence)| occurrence.sequence);
+        let old_identified = requests
+            .iter()
+            .filter(|(_, occurrence)| {
+                !fold.is_skipped(occurrence.sequence)
+                    && !occurrence.usage.is_zero()
+                    && native.is_inherited(occurrence.sequence)
+            })
+            .map(|(_, occurrence)| occurrence.usage.request_count)
+            .sum::<u64>();
+        accounts.inherited = accounts.inherited.saturating_sub(old_identified);
+        let mut earlier: Option<(u64, AccountPartition)> = None;
+        let mut keys: Vec<Arc<AuthorityKey>> = Vec::new();
+        // Recompute local clocks at their final accounts. Id-less records do
+        // not prove an exact request identity and cannot decide current login.
+        for grain in fold.entity.grains.values_mut() {
+            grain.last_own_at = None;
+        }
+        for (request, occurrence) in requests {
+            if fold.is_skipped(occurrence.sequence) || occurrence.usage.is_zero() {
+                occurrence.e2_inherited = Some(false);
+                continue;
+            }
+            let sequence = occurrence.sequence;
+            let root = super::claude_snapshot_family_root_ref(item);
+            let telemetry = evidence
+                .requests
+                .get(&(root, request.as_str()))
+                .and_then(|row| *row);
+            let identity = request_occurrence_facts(item, request, occurrence, false)
+                .map(|facts| classify_ref(evidence, &facts));
+            let own = match identity {
+                Some(IdentityRef::Tagged(key)) if telemetry.is_some() && key.login.is_some() => {
+                    let found = keys.iter().find(|known| key.matches(known));
+                    match found {
+                        Some(known) => Some(Arc::clone(known)),
+                        None if keys.len() < MAX_AUTHORITY_KEYS => {
+                            let own = Arc::new(key.to_key());
+                            keys.push(Arc::clone(&own));
+                            Some(own)
                         }
-                        match organization_hash(identity) {
-                            Err(()) => accounts.conflict = true,
-                            Ok(Some(org)) => {
-                                if accounts
-                                    .account(occurrence.sequence)
-                                    .as_ref()
-                                    .and_then(|key| key.org.as_deref())
-                                    .is_some_and(|own| own != org)
-                                {
-                                    accounts.conflict = true;
-                                }
-                            }
-                            Ok(None) => {}
+                        None => {
+                            // Preserve the verdict for the existing grouping
+                            // cap allocator; valid overflow is not missing data.
+                            fold.entity.identity_over_cap = true;
+                            accounts.conflict = true;
+                            None
                         }
                     }
                 }
-                None => {}
-            }
+                _ => None,
+            };
+            let marker_end = native.runs.partition_point(|run| run.position <= sequence);
+            let marker = native.runs[..marker_end]
+                .iter()
+                .rev()
+                .find(|run| run.account.is_some());
+            let own_marker = marker.filter(|run| run.position == sequence);
+            // Absence of a paired trace is not a contradiction of an own org.
+            // Keep the existing strong-org guards; only genuinely conflicting
+            // telemetry is disclosed, never used to relocate an own org run.
+            let contradicted =
+                matches!(evidence.requests.get(&(root, request.as_str())), Some(None))
+                    || telemetry.is_some_and(|row| {
+                        row.request_identity.as_ref().is_some_and(|identity| {
+                            matches!(
+                                identity.disposition,
+                                ClaudeIdentityDisposition::Conflict
+                                    | ClaudeIdentityDisposition::Invalid
+                            ) || matches!(
+                                identity.account.disposition,
+                                ClaudeIdentityDisposition::Conflict
+                                    | ClaudeIdentityDisposition::Invalid
+                            ) || (identity.account.disposition
+                                != ClaudeIdentityDisposition::Missing
+                                && evidence.invalid_logins.contains(&(root, request.as_str())))
+                                || match organization_hash(identity) {
+                                    Err(()) => true,
+                                    Ok(Some(org)) => own_marker
+                                        .and_then(|run| run.account.as_ref())
+                                        .and_then(|key| key.org.as_deref())
+                                        .is_some_and(|own| own != org),
+                                    Ok(None) => false,
+                                }
+                        })
+                    });
+            accounts.conflict |= contradicted;
+            let preserve_org = contradicted && own_marker.is_some();
+            let refused = contradicted && own.is_none() && own_marker.is_none();
+            let before = accounts.inherited;
+            let account = if preserve_org {
+                own_marker.and_then(|run| run.account.clone())
+            } else if let Some(own) = own {
+                let account = Some(own);
+                // The first retained request establishes the actual start;
+                // a durable binding only fills a request with no own evidence.
+                if !accounts.subagent && first_retained == Some(sequence) {
+                    accounts.starting = account.clone();
+                    accounts.fallback = account.clone();
+                }
+                earlier = Some((sequence, account.clone()));
+                account
+            } else if refused {
+                accounts.conflict = true;
+                accounts.inherited = accounts
+                    .inherited
+                    .saturating_add(occurrence.usage.request_count);
+                accounts.fallback.clone().or_else(|| accounts.bound.clone())
+            } else {
+                let account = match (marker, earlier.as_ref()) {
+                    (Some(marker), Some((position, account))) if marker.position < *position => {
+                        account.clone()
+                    }
+                    (Some(marker), _) => marker.account.clone(),
+                    (_, Some((_, account))) => account.clone(),
+                    _ => accounts
+                        .starting
+                        .clone()
+                        .or_else(|| accounts.fallback.clone())
+                        .or_else(|| accounts.bound.clone()),
+                };
+                if own_marker.is_none() && account.is_some() {
+                    accounts.inherited = accounts
+                        .inherited
+                        .saturating_add(occurrence.usage.request_count);
+                }
+                account
+            };
+            occurrence.e2_inherited = account.as_ref().map(|_| accounts.inherited > before);
+            place_request_identity(
+                &mut fold,
+                occurrence,
+                telemetry,
+                native.account(sequence),
+                account,
+            );
         }
-        if accounts.conflict {
-            fold.entity.inherit_missing(accounts.fallback.clone());
-        }
+        item.claude_usage_occurrences = occurrences;
+        accounts.reconciled = true;
+        fold.accounts = Some(accounts);
+        item.claude_money = Some(fold);
     }
 }
 
@@ -2019,9 +2197,34 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
                 None => accounts.retained_root.clone(),
             };
             accounts.fallback = accounts.starting.clone();
-            fold.entity.repartition(accounts.fallback.clone());
+            if settled || accounts.reconciled {
+                // Own request logins survive; only missing shares inherit RD47.
+                let inherited = fold
+                    .entity
+                    .grains
+                    .iter()
+                    .filter(|((_, _, account), _)| account.is_none())
+                    .map(|(_, grain)| grain.requests)
+                    .sum::<u64>()
+                    .saturating_sub(fold.side_requests);
+                fold.entity.inherit_missing(accounts.fallback.clone());
+                if accounts.fallback.is_some() {
+                    accounts.inherited = accounts.inherited.saturating_add(inherited);
+                    for occurrence in item.claude_usage_occurrences.values_mut() {
+                        if occurrence.e2_inherited.is_none() && !occurrence.usage.is_zero() {
+                            occurrence.e2_inherited = Some(true);
+                        }
+                    }
+                }
+            } else {
+                fold.entity.repartition(accounts.fallback.clone());
+            }
         } else if let Some(root) = roots.get(&root) {
             accounts.fallback = root.starting.clone();
+            // The side-call pass lends the root start without remapping
+            // this file's native grains. Keep account(sequence) aligned with
+            // those grains until the final missing-share fill is applied.
+            accounts.root_fallback_pending = !settled && accounts.starting.is_none();
             if root.conflict {
                 accounts.conflict = true;
             }
@@ -2061,7 +2264,9 @@ fn inherited_requests(members: &[&SnapshotItem]) -> u64 {
         for occurrence in item.claude_usage_occurrences.values() {
             if !fold.is_skipped(occurrence.sequence)
                 && !occurrence.usage.is_zero()
-                && accounts.is_inherited(occurrence.sequence)
+                && occurrence
+                    .e2_inherited
+                    .unwrap_or_else(|| accounts.is_inherited(occurrence.sequence))
             {
                 identified = identified.saturating_add(occurrence.usage.request_count);
             }
@@ -2093,7 +2298,9 @@ fn inherited_requests(members: &[&SnapshotItem]) -> u64 {
                 let accounts = fold.accounts.as_deref().expect("identity accounts");
                 if !fold.is_skipped(occurrence.sequence) && !occurrence.usage.is_zero() {
                     counted = true;
-                    inherited &= accounts.is_inherited(occurrence.sequence);
+                    inherited &= occurrence
+                        .e2_inherited
+                        .unwrap_or_else(|| accounts.is_inherited(occurrence.sequence));
                     requests = requests.max(occurrence.usage.request_count);
                 }
             }
@@ -2146,8 +2353,14 @@ pub(crate) fn record_page_identity_counts(items: &[SnapshotItem]) {
     }
 }
 
-static IDENTITY_COUNTS: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static IDENTITY_COUNTS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+pub(crate) fn record_listed_legacy_counts(families: u64, files: u64) {
+    // Current loaded-list inventory, not process-total sums across cycles.
+    IDENTITY_COUNTS[3].store(families, std::sync::atomic::Ordering::Relaxed);
+    IDENTITY_COUNTS[4].store(files, std::sync::atomic::Ordering::Relaxed);
+}
 #[derive(Default, serde::Serialize)]
 pub(crate) struct IdentityCounts {
     #[serde(skip_serializing_if = "is_zero")]
@@ -2156,18 +2369,24 @@ pub(crate) struct IdentityCounts {
     claude_inherited_org_requests: u64,
     #[serde(skip_serializing_if = "is_zero")]
     claude_identity_conflict_fallbacks: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_listed_legacy_families: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_listed_legacy_files: u64,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 pub(crate) fn take_identity_counts() -> IdentityCounts {
-    let [mixed, inherited, conflicts] = IDENTITY_COUNTS
+    let [mixed, inherited, conflicts, families, files] = IDENTITY_COUNTS
         .each_ref()
         .map(|counter| counter.swap(0, std::sync::atomic::Ordering::Relaxed));
     IdentityCounts {
         claude_mixed_login_sessions: mixed,
         claude_inherited_org_requests: inherited,
         claude_identity_conflict_fallbacks: conflicts,
+        claude_listed_legacy_families: families,
+        claude_listed_legacy_files: files,
     }
 }
 
@@ -2178,32 +2397,58 @@ fn request_owned_grouping(
     fallback: Option<&AccountPartition>,
 ) -> Option<Grouping> {
     let mut grouping = Grouping::new(bucket_row_count(item));
-    super::claude_request_money::e2::visit_identity_rows(item, |bucket, row, account, cost| {
-        let mut usage = super::usage_totals_from_model_usage(&row);
-        if let Some(cost) = cost {
-            usage.costs.observed = true;
-            usage.costs.reported = true;
-            usage.costs.total = Some(u128::from(cost) * 1_000_000);
-        }
-        let account = fallback.unwrap_or(&account);
-        let identity = match account.as_ref() {
-            Some(key) => IdentityRef::Tagged(KeyRef {
-                login: key.login.as_deref(),
-                org: key.org.as_deref(),
-                basis: key.basis,
-            }),
-            None => IdentityRef::Missing,
-        };
-        // E2 grains carry no per-request clock, so they never decide the
-        // local current account (#775); their totals still group exactly.
-        grouping.add_at(
-            bucket,
-            &row_key_from_model_usage(&row),
-            &usage,
-            identity,
-            None,
-        );
-    })?;
+    super::claude_request_money::e2::visit_identity_rows(
+        item,
+        |bucket, row, account, cost, last_at| {
+            let mut usage = super::usage_totals_from_model_usage(&row);
+            if let Some(cost) = cost {
+                usage.costs.observed = true;
+                usage.costs.reported = true;
+                usage.costs.total = Some(u128::from(cost) * 1_000_000);
+            }
+            let account = fallback.unwrap_or(&account);
+            let identity = match account.as_ref() {
+                Some(key) => IdentityRef::Tagged(KeyRef {
+                    login: key.login.as_deref(),
+                    org: key.org.as_deref(),
+                    basis: key.basis,
+                }),
+                None => IdentityRef::Missing,
+            };
+            let at = last_at
+                .and_then(|at| OffsetDateTime::from_unix_timestamp_nanos(at).ok())
+                .and_then(|at| at.format(&Rfc3339).ok());
+            grouping.add_at(
+                bucket,
+                &row_key_from_model_usage(&row),
+                &usage,
+                identity,
+                at.as_deref(),
+            );
+        },
+    )?;
+    grouping.keys_over_cap |= fallback.is_none()
+        && item
+            .claude_money
+            .as_deref()
+            .is_some_and(|fold| fold.entity.identity_over_cap);
+    grouping.latest.unordered |= item
+        .claude_money
+        .as_deref()
+        .is_some_and(|fold| fold.entity.clock_incomplete)
+        || item.claude_usage_occurrences.values().any(|occurrence| {
+            !occurrence.usage.is_zero()
+                && item
+                    .claude_money
+                    .as_deref()
+                    .is_some_and(|fold| !fold.is_skipped(occurrence.sequence))
+                && (!occurrence.event_clock_complete
+                    || occurrence
+                        .timestamp
+                        .as_deref()
+                        .and_then(rfc3339_unix_seconds)
+                        .is_none())
+        });
     Some(grouping)
 }
 
@@ -3421,6 +3666,45 @@ pub(crate) fn publish_request_owned_activity(
     }
 }
 
+fn request_occurrence_facts<'a>(
+    item: &'a SnapshotItem,
+    request_id: &'a str,
+    occurrence: &'a super::ClaudeTranscriptUsageOccurrence,
+    duplicated_elsewhere: bool,
+) -> Option<RequestFacts<'a>> {
+    let root = owner_root(item)?;
+    let timestamp = occurrence.timestamp.as_deref()?;
+    let desktop = item
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.entrypoint.as_deref())
+        == Some("claude-desktop");
+    Some(RequestFacts {
+        root,
+        source_session_id: &item.source_session_id,
+        request_id,
+        terminal_unix_seconds: rfc3339_unix_seconds(timestamp),
+        event_clock_complete: occurrence.event_clock_complete,
+        marker: item
+            .claude_org_markers
+            .as_deref()
+            .map_or(MarkerVerdict::None, |markers| {
+                markers.verdict(occurrence.sequence, desktop)
+            }),
+        desktop,
+        scan_unix_seconds: rfc3339_unix_seconds(&item.collected_at),
+        email_home: item
+            .claude_org_markers
+            .as_deref()
+            .and_then(|markers| markers.email_home(occurrence.sequence)),
+        session_start_unix_seconds: item
+            .source_started_at
+            .as_deref()
+            .and_then(rfc3339_unix_seconds),
+        duplicated_elsewhere,
+    })
+}
+
 fn collect_request_owned_activity(
     item: &SnapshotItem,
     evidence: &ScanEvidence<'_>,
@@ -3428,9 +3712,6 @@ fn collect_request_owned_activity(
     original: Option<&super::SessionAccountEvidence>,
 ) -> crate::desktop_recent::RecentActivity {
     let Some(fold) = item.claude_money.as_deref() else {
-        return Default::default();
-    };
-    let Some(root) = owner_root(item) else {
         return Default::default();
     };
     let mut activity = crate::desktop_recent::RecentActivity::default();
@@ -3452,34 +3733,8 @@ fn collect_request_owned_activity(
         let Some(timestamp) = occurrence.timestamp.as_deref() else {
             continue;
         };
-        let desktop = item
-            .origin
-            .as_ref()
-            .and_then(|origin| origin.entrypoint.as_deref())
-            == Some("claude-desktop");
-        let facts = RequestFacts {
-            root,
-            source_session_id: &item.source_session_id,
-            request_id,
-            terminal_unix_seconds: rfc3339_unix_seconds(timestamp),
-            event_clock_complete: occurrence.event_clock_complete,
-            marker: item
-                .claude_org_markers
-                .as_deref()
-                .map_or(MarkerVerdict::None, |markers| {
-                    markers.verdict(occurrence.sequence, desktop)
-                }),
-            desktop,
-            scan_unix_seconds: rfc3339_unix_seconds(&item.collected_at),
-            email_home: item
-                .claude_org_markers
-                .as_deref()
-                .and_then(|markers| markers.email_home(occurrence.sequence)),
-            session_start_unix_seconds: item
-                .source_started_at
-                .as_deref()
-                .and_then(rfc3339_unix_seconds),
-            duplicated_elsewhere: false,
+        let Some(facts) = request_occurrence_facts(item, request_id, occurrence, false) else {
+            continue;
         };
         let identity = classify_ref(evidence, &facts);
         RequestSink::note_desktop_activity(

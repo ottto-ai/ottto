@@ -671,6 +671,8 @@ fn qualified_prior(
 
 #[test]
 fn envelope_experiment_frozen_old_proof_does_not_mask_new_native_request() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, parent, raw) = claude_account_family_fixture();
     let (api0, trace0) = reports(&parent, false);
     let mut index = fixture_index(&dir, &parent, &raw);
@@ -755,6 +757,8 @@ impl ProcessPermit {
 
 #[test]
 fn envelope_experiment_native_save_bootstrap_restart_matches_base_owners() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, parent, raw) = claude_account_family_fixture();
     let scratch = crate::test_scratch::ScratchDir::new("envelope-bootstrap");
     let path = scratch.join("index.json");
@@ -1679,6 +1683,8 @@ fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
 
 #[test]
 fn native_comparison_current_nonreported_member_withdraws_whole_family() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let fixture = NativePreparationFixture::new();
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
     let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
@@ -4182,6 +4188,8 @@ fn native_comparison_corrected_native_receipt_fixture(
 
 #[test]
 fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save",
     ) {
@@ -4202,6 +4210,8 @@ fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_se
 
 #[test]
 fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base",
     ) {

@@ -162,14 +162,28 @@ pub(super) fn reported_inputs<'a>(
             &serde_json::Value::String(speed.to_owned()),
         );
     }
+    let (model, effort) = reported_model_effort(model, effort, occurrence);
     ReportedInputs {
         selector,
-        effort: occurrence
-            .and_then(|o| o.reasoning_effort.as_deref())
-            .or_else(|| CLAUDE_EFFORT_TIERS.contains(&effort).then_some(effort)),
-        model: occurrence.and_then(|o| o.model.as_deref()).unwrap_or(model),
+        effort,
+        model,
         timestamp: occurrence.and_then(|o| o.timestamp.as_deref()),
     }
+}
+
+/// `reported_inputs`' model and effort: the transcript's win; a reported
+/// effort tier fills a missing transcript effort.
+pub(super) fn reported_model_effort<'a>(
+    model: &'a str,
+    effort: &'a str,
+    occurrence: Option<&'a super::super::ClaudeTranscriptUsageOccurrence>,
+) -> (&'a str, Option<&'a str>) {
+    (
+        occurrence.and_then(|o| o.model.as_deref()).unwrap_or(model),
+        occurrence
+            .and_then(|o| o.reasoning_effort.as_deref())
+            .or_else(|| CLAUDE_EFFORT_TIERS.contains(&effort).then_some(effort)),
+    )
 }
 
 /// One side of a grain slice.
@@ -181,6 +195,8 @@ pub(crate) struct ClaudeGrainSide {
     /// Contributions without a cost (the side's cost is then unknown).
     pub(crate) unpriced: u64,
     pub(crate) contributions: u64,
+    /// Local display only; newest own transcript clock, never serialized.
+    pub(crate) last_own_at: Option<i128>,
 }
 
 impl ClaudeGrainSide {

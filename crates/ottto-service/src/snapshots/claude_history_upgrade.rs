@@ -23,7 +23,10 @@
 //! reason (census records, proofs, index identity), but none of its new
 //! bodies reaches an upload path, and its upload tuple (revision, semantic
 //! group, body witness, membership) stays as it was. A file that only owes
-//! the upgrade is skipped as before.
+//! the upgrade is skipped as before; one held only by the page budget, once
+//! the page admitted history, is queued again as a re-read (never a census
+//! member) for the next page of the same walk, so a revision bump re-reads
+//! the history in consecutive paced pages instead of one page per walk.
 //!
 //! The parse reason is a diagnostic only; no decision here reads it.
 //!
@@ -45,15 +48,15 @@ pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
 /// Bytes of history one page may upgrade (1 GiB), for every revision. No
 /// file is admitted past it, including a page's first file.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
-/// Highest active Claude revision the gate is open for (SOURCE F2). The
-/// revision-3 row below exists, but this stays at the current revision until
-/// MONEY's activation PR (#699) raises it with the Claude revision constant
-/// (SOURCE h732 C1). Above it every owed upgrade and every listed change is
-/// held, no file is stamped, activation is refused at runtime
+/// Highest active Claude revision the gate is open for (SOURCE F2). MONEY's
+/// activation (#699, E2 PR C) raised it to the revision-3 row together with
+/// the Claude revision constant and the E2 gate (SOURCE h732 C1). Above it
+/// every owed upgrade and every listed change is held, no file is stamped,
+/// activation is refused at runtime
 /// (`activate_effective_upload_body_witness_revision`), and the Claude
 /// revision constant fails to compile. The release check reads the next
 /// line, so keep it free of comments and other digits.
-pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 2;
+pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 3;
 /// The request-owned usage literal of MONEY P2 (#699's
 /// `REQUEST_OWNED_CONTRACT`). Listed roots never emit it.
 pub(crate) const REQUEST_OWNED_USAGE_CONTRACT: &str = "claude_request_owned_usage:v1";
@@ -390,7 +393,9 @@ pub(super) fn probe_opened_birth(
         .map(|m| super::claude_context_file_birth::ClaudeOpenedBirth::from_metadata(&m));
     #[cfg(test)]
     let opened = opened.map(|mut opened| {
-        if let Some(birth) = STAGED_BIRTHS_FOR_TEST.with(|births| births.borrow().get(key).copied())
+        if let Some(birth) = STAGED_BIRTHS_FOR_TEST
+            .with(|births| births.borrow().get(key).copied())
+            .or_else(super::claude_request_money::e2::fixture_birth)
         {
             opened.birth = birth;
         }
@@ -664,6 +669,11 @@ impl HistoryPage {
     pub(super) fn note_family_closure_root_absent(&mut self) {
         self.family_closure_root_absent_excluded =
             self.family_closure_root_absent_excluded.saturating_add(1);
+    }
+
+    /// This page admitted at least one history file to its budget.
+    pub(super) fn admitted_any(&self) -> bool {
+        self.files > 0
     }
 
     pub(super) fn any(&self) -> bool {

@@ -20,7 +20,7 @@ use super::{
     BucketRowAccumulator, ClaudeResponseObservation, ClaudeResponseRecord,
     ClaudeTranscriptUsageOccurrence, RequestSlot, RowKey, SelectorCapture, SnapshotModelUsage,
     SnapshotToolUsage, SnapshotUsageBucket, UsageBucketState, UsageCosts, UsageTotals,
-    SELECTOR_CONTEXT_ALLOWED,
+    ROW_BILLING_FIELDS, SELECTOR_CONTEXT_ALLOWED,
 };
 use crate::heap_layout_bound::{tree_node_bytes, Counter, HeapLayoutBound};
 use crate::owned_heap::{OwnedMap, OwnedVec, ValueGuard};
@@ -119,6 +119,7 @@ impl ClaudeResponseBook {
             return Some(CompletionBounds {
                 peak: 0,
                 output: Some(0),
+                fold: Some(FoldKeys::default()),
             });
         }
         if !crate::heap_layout_bound::layout_supported() {
@@ -144,9 +145,13 @@ impl ClaudeResponseBook {
             .len()
             .checked_mul(std::mem::size_of::<ClaudeResponseObservation>())?;
         let peak = peak.max(response_sort);
-        (peak <= limit).then(|| CompletionBounds {
-            peak,
-            output: output.and_then(|book| book.bytes(limit)),
+        (peak <= limit).then(|| {
+            let bytes = output.and_then(|book| book.bytes(limit));
+            CompletionBounds {
+                peak,
+                output: bytes,
+                fold: output.filter(|_| bytes.is_some()).map(|book| book.fold),
+            }
         })
     }
 
@@ -165,7 +170,34 @@ pub(super) struct CompletionBounds {
     /// these responses, with their finalize scratch; `None` when it cannot
     /// be bounded.
     pub(super) output: Option<usize>,
+    /// What a gate-on E2 fold's grain keys copy from the same responses;
+    /// present exactly when `output` is.
+    pub(super) fold: Option<FoldKeys>,
 }
+
+/// The responses' share of a gate-on E2 fold's grain keys (`live_key`),
+/// for X_out's E term: every response its own key, worst case.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FoldKeys {
+    pub(super) responses: usize,
+    /// Responses naming no model: each a `model_fallbacks` entry.
+    pub(super) modelless: usize,
+    /// The largest model a response names.
+    pub(super) max_model: usize,
+    /// Context text a key can copy from its response: the selector's
+    /// context, a `context_bucket`, the effort and its `reasoning_effort`
+    /// key. The file's base selector is the caller's.
+    pub(super) context_strings: usize,
+    /// Context entries from the response, each key capped at
+    /// `KEY_CONTEXT_FIELDS`.
+    pub(super) context_entries: usize,
+}
+
+/// A key's context keeps allow-listed selector keys and the hoisted billing
+/// fields (`build_row_identity`, `live_key`); `reasoning_effort` is the
+/// caller's one more.
+pub(super) const KEY_CONTEXT_FIELDS: usize =
+    SELECTOR_CONTEXT_ALLOWED.len() + ROW_BILLING_FIELDS.len();
 
 /// Live copies of one usage row's strings and maps (X_out family R): the
 /// accumulator's row, `bound_claude_attribution_mcp_tool_cardinality`'s
@@ -214,6 +246,9 @@ struct ResponseOutput {
     selector_bytes: usize,
     /// Context plus sources entries.
     selector_entries: usize,
+    /// The context map's share of `selector_bytes` and `selector_entries`.
+    context_bytes: usize,
+    context_entries: usize,
     tool_bytes: usize,
     tool_entries: usize,
 }
@@ -229,6 +264,8 @@ impl ResponseOutput {
             slot,
             selector_bytes,
             selector_entries,
+            context_bytes,
+            context_entries,
             tool_bytes,
             tool_entries,
         } = record;
@@ -241,6 +278,8 @@ impl ResponseOutput {
             slot: self.slot.max(slot),
             selector_bytes: self.selector_bytes.checked_add(selector_bytes)?,
             selector_entries: self.selector_entries.checked_add(selector_entries)?,
+            context_bytes: self.context_bytes.checked_add(context_bytes)?,
+            context_entries: self.context_entries.checked_add(context_entries)?,
             tool_bytes: self.tool_bytes.checked_add(tool_bytes)?,
             tool_entries: self.tool_entries.checked_add(tool_entries)?,
         })
@@ -261,6 +300,7 @@ struct BookOutput {
     /// `(String, String)` entries and roots of every selector map built.
     selector_nodes: usize,
     tool_entries: usize,
+    fold: FoldKeys,
 }
 
 impl BookOutput {
@@ -279,6 +319,8 @@ impl BookOutput {
             slot,
             selector_bytes,
             selector_entries,
+            context_bytes,
+            context_entries,
             tool_bytes,
             tool_entries,
         } = response;
@@ -318,6 +360,19 @@ impl BookOutput {
         let selector_nodes = entries
             .checked_add(2)?
             .checked_add(row_entries.checked_add(2)?.checked_mul(ROW_COPIES)?)?;
+        // E2's key: the context (and a `context_bucket`), then the effort.
+        let key_strings = context_bytes
+            .checked_add("context_bucket".len() + "short".len())?
+            .checked_add(effort)?
+            .checked_add("reasoning_effort".len())?;
+        let key_entries = context_entries.checked_add(1)?.min(KEY_CONTEXT_FIELDS);
+        let fold = FoldKeys {
+            responses: self.fold.responses.checked_add(1)?,
+            modelless: self.fold.modelless.checked_add(usize::from(model == 0))?,
+            max_model: self.fold.max_model.max(model),
+            context_strings: self.fold.context_strings.checked_add(key_strings)?,
+            context_entries: self.fold.context_entries.checked_add(key_entries)?,
+        };
         let next = Self {
             responses: self.responses.checked_add(1)?,
             max_model: self.max_model.max(model),
@@ -325,8 +380,9 @@ impl BookOutput {
             scratch: self.scratch.max(scratch),
             selector_nodes: self.selector_nodes.checked_add(selector_nodes)?,
             tool_entries: self.tool_entries.checked_add(tool_entries)?,
+            fold,
         };
-        (next.strings <= limit).then_some(next)
+        (next.strings <= limit && next.fold.context_strings <= limit).then_some(next)
     }
 
     /// The summed term, on its own counter. Per response: one node each in
@@ -347,6 +403,7 @@ impl BookOutput {
             scratch,
             selector_nodes,
             tool_entries,
+            fold: _,
         } = self;
         let arc = size_of::<SelectorCapture>()
             .checked_add(align_of::<SelectorCapture>())?
@@ -847,12 +904,15 @@ fn record_output(
             .checked_add(capacity(model))?
             .checked_add(capacity(effort))?,
     };
-    let mut selector_bytes = 0usize;
-    for (key, value) in selector.context.iter().chain(&selector.sources) {
-        selector_bytes = selector_bytes
-            .checked_add(key.capacity())?
-            .checked_add(value.capacity())?;
-    }
+    let text = |map: &BTreeMap<String, String>| {
+        map.iter().try_fold(0usize, |bytes, (key, value)| {
+            bytes
+                .checked_add(key.capacity())?
+                .checked_add(value.capacity())
+        })
+    };
+    let context_bytes = text(&selector.context)?;
+    let selector_bytes = context_bytes.checked_add(text(&selector.sources)?)?;
     let mut tool_bytes = 0usize;
     for (id, name) in tool_uses {
         tool_bytes = tool_bytes
@@ -868,6 +928,8 @@ fn record_output(
         slot,
         selector_bytes,
         selector_entries: selector.context.len().checked_add(selector.sources.len())?,
+        context_bytes,
+        context_entries: selector.context.len(),
         tool_bytes,
         tool_entries: tool_uses.len(),
     };
@@ -1223,6 +1285,8 @@ mod output_tests {
             slot: 7,
             selector_bytes: 40,
             selector_entries: 2,
+            context_bytes: 15,
+            context_entries: 1,
             tool_bytes: 11,
             tool_entries: 1,
         };
@@ -1235,6 +1299,8 @@ mod output_tests {
             slot: 3,
             selector_bytes: 26,
             selector_entries: 4,
+            context_bytes: 8,
+            context_entries: 2,
             tool_bytes: 22,
             tool_entries: 2,
         };
@@ -1256,10 +1322,12 @@ mod output_tests {
                 (
                     merged.selector_bytes,
                     merged.selector_entries,
+                    merged.context_bytes,
+                    merged.context_entries,
                     merged.tool_bytes,
                     merged.tool_entries,
                 ),
-                (66, 6, 33, 3),
+                (66, 6, 23, 3, 33, 3),
                 "{label}: union terms sum"
             );
         }
@@ -1324,11 +1392,12 @@ mod output_tests {
         ];
         let mut selectors = ClaudeSelectorTable::default();
         let mut records = OwnedVec::new();
-        let (mut selector_bytes, mut tool_bytes) = (0, 0);
+        let (mut selector_bytes, mut context_bytes, mut tool_bytes) = (0, 0, 0);
         for (index, (key, value, tool_id, timestamp)) in keys.into_iter().enumerate() {
             let mut selector = SelectorCapture::default();
             selector.insert(key, value.to_string(), "usage");
             selector_bytes += 2 * key.len() + value.len() + "usage".len();
+            context_bytes += key.len() + value.len();
             tool_bytes += tool_id.len() + "Bash".len();
             records.push(CompactClaudeResponseRecord::encode(
                 records.first(),
@@ -1362,10 +1431,12 @@ mod output_tests {
             (
                 output.selector_bytes,
                 output.selector_entries,
+                output.context_bytes,
+                output.context_entries,
                 output.tool_bytes,
                 output.tool_entries,
             ),
-            (selector_bytes, 6, tool_bytes, 3),
+            (selector_bytes, 6, context_bytes, 3, tool_bytes, 3),
             "union terms: every record's"
         );
     }

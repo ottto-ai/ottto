@@ -252,6 +252,13 @@ pub(super) struct HeaderInventory {
     /// directory census. Only a fresh walk can change that.
     pub(super) bounded_out: bool,
 }
+
+/// A group's key in `HeaderInventory::groups`, which is also the order the
+/// inventory reads groups in.
+fn group_key(home: &Path, owner: &str) -> String {
+    sha256_hex(&["codex_file_group:v1", &local_index_key(home), owner])
+}
+
 impl HeaderInventory {
     pub(super) fn new(
         roots: &[PathBuf],
@@ -372,11 +379,7 @@ impl HeaderInventory {
     pub(super) fn groups(&self) -> BTreeMap<String, Group> {
         let mut groups = BTreeMap::<String, Group>::new();
         for header in &self.headers {
-            let key = sha256_hex(&[
-                "codex_file_group:v1",
-                &local_index_key(&header.home),
-                &header.owner,
-            ]);
+            let key = group_key(&header.home, &header.owner);
             groups
                 .entry(key)
                 .or_insert_with(|| Group {
@@ -1630,14 +1633,9 @@ pub(super) mod tests {
         panic!("bounded group replay did not finish");
     }
     pub(crate) fn fixture() -> (PathBuf, HeaderInventory) {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-codex-join-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // Not keyed on the clock: macOS reads it in whole microseconds, so two
+        // tests could share (and one remove) the other's root.
+        let root = crate::test_scratch::unique_path("ottto-codex-join");
         let sessions = root.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -2703,14 +2701,7 @@ pub(super) mod tests {
     /// A settled `known` rollout beside one whose malformed line keeps the
     /// generation red, so it is retained behind its bounded retry deadline.
     fn retained_red_generation(known: Vec<Value>) -> (PathBuf, ScanIndex) {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-codex-retained-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = crate::test_scratch::unique_path("ottto-codex-retained");
         let sessions = root.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         write_rows(&sessions.join("a.jsonl"), &known);

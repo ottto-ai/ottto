@@ -62,6 +62,23 @@ fn e2_page(
     index: &mut ScanIndex,
     permitted: bool,
 ) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition, bool) {
+    let (items, disposition, failed, _) = e2_page_counted(dirs, support, index, permitted);
+    (items, disposition, failed)
+}
+
+/// `e2_page` plus the page identity counters `finish_page` recorded (read
+/// before the emitted folds they derive from are released).
+fn e2_page_counted(
+    dirs: &[PathBuf],
+    support: &Path,
+    index: &mut ScanIndex,
+    permitted: bool,
+) -> (
+    Vec<SnapshotItem>,
+    ClaudeUsageAuthorityDisposition,
+    bool,
+    serde_json::Value,
+) {
     claude_request_money::e2::with_enabled(|| {
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
@@ -84,14 +101,22 @@ fn e2_page(
             })
             .flatten();
         assert_eq!(permit.is_some(), permitted);
-        let (disposition, _, stats) =
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
-                support, &mut scan, index, permit,
-            );
+        claude_request_identity::retain_root_accounts(
+            &mut scan.snapshots,
+            index,
+            "e2-identity-machine",
+        );
+        let ((disposition, _, stats), counts) =
+            claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
+                    support, &mut scan, index, permit,
+                )
+            });
         (
             scan.snapshots,
             disposition,
             stats.effort_evidence_load_failed,
+            counts,
         )
     })
 }
@@ -158,6 +183,12 @@ fn e2_pipeline_tags_the_final_root_and_agent_rows() {
             assert!(e2_is_literal(item), "{label} (permitted={permitted})");
             assert_eq!(item.request_count, requests, "{label}: own requests only");
             e2_assert_identity_consistent(item, label);
+            if !permitted {
+                assert!(
+                    item.request_evidence.is_empty(),
+                    "no cohort permit, no contract-5 evidence"
+                );
+            }
             assert!(
                 e2_rows(item).all(|row| row.account_identifier_hash == Some(e2_account())),
                 "{label}: the one proven login tags every final row (permitted={permitted})"
@@ -289,5 +320,200 @@ fn e2_pipeline_telemetry_read_failure_is_never_complete_and_withholds_nothing() 
         items.len(),
         "live bodies are not withheld"
     );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+fn e2_resign(row: &mut crate::claude_local_otel::ClaudeLocalOtelEvidence) {
+    row.fingerprint.clear();
+    row.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(row).unwrap())
+    );
+}
+
+fn e2_login_counts(item: &SnapshotItem) -> BTreeMap<Option<String>, u64> {
+    let mut counts = BTreeMap::new();
+    for row in item
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+    {
+        if let Some(parts) = &row.identity_parts {
+            for part in parts {
+                *counts
+                    .entry(part.account_identifier_hash.clone())
+                    .or_default() += part.request_count;
+            }
+        } else {
+            *counts
+                .entry(row.account_identifier_hash.clone())
+                .or_default() += row.request_count;
+        }
+    }
+    counts
+}
+
+#[test]
+fn e2_pipeline_root_and_child_keep_independent_own_telemetry_logins() {
+    let (dir, root, _) = claude_account_family_fixture();
+    let support = dir.join("support");
+    let (mut api, trace) = e2_family_evidence(&root);
+    api[4].account_identifier_hash = Some("b".repeat(64));
+    e2_resign(&mut api[4]);
+    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        &root,
+        &trace,
+    );
+    let (items, disposition, failed) = e2_page(
+        std::slice::from_ref(&dir),
+        &support,
+        &mut ScanIndex::default(),
+        true,
+    );
+    assert!(!failed);
+    assert_eq!(items.len(), 2);
+    for item in &items {
+        assert!(e2_is_literal(item));
+        let (login, requests) = if item.source_session_id == root {
+            ("a", 4)
+        } else {
+            ("b", 1)
+        };
+        assert_eq!(
+            e2_login_counts(item),
+            BTreeMap::from([(Some(login.repeat(64)), requests)])
+        );
+    }
+    assert_eq!(disposition.quarantined_entity_count(), 0);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
+    for (bound, partial) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (dir, root, _) = claude_account_family_fixture();
+        let support = dir.join("support");
+        let (mut api, trace) = e2_family_evidence(&root);
+        for row in &mut api[2..4] {
+            row.account_identifier_hash = Some("b".repeat(64));
+            e2_resign(row);
+        }
+        if partial {
+            api.retain(|row| row.request_id != "req_2" && row.request_id != "req_4");
+        }
+        e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, &root, &api);
+        e2_write_rows(
+            &support,
+            "local-otel/claude-code-trace-ownership",
+            &root,
+            &trace,
+        );
+        let mut index = ScanIndex::default();
+        if bound {
+            index.session_account_bindings.insert(
+                sha256_hex(&["session_owner:v1", "e2-identity-machine", &root]),
+                SessionAccountBinding {
+                    account_identifier_hash: e2_account(),
+                    workspace_identifier_hash: None,
+                },
+            );
+        }
+        let (items, disposition, failed, counts) =
+            e2_page_counted(std::slice::from_ref(&dir), &support, &mut index, true);
+        assert!(!failed);
+        let item = items
+            .iter()
+            .find(|item| item.source_session_id == root)
+            .unwrap();
+        assert_eq!(
+            e2_login_counts(item),
+            BTreeMap::from([(Some(e2_account()), 2), (Some("b".repeat(64)), 2)]),
+            "bound={bound}"
+        );
+        assert_eq!(item.request_count, 4);
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some(if partial { "0.0002" } else { "0.0004" })
+        );
+        if partial {
+            assert_eq!(
+                counts["claude_inherited_org_requests"], 2,
+                "missing requests inherit A then B, counted"
+            );
+        } else {
+            assert!(
+                counts.get("claude_inherited_org_requests").is_none(),
+                "own evidence needs no fill: {counts}"
+            );
+        }
+        assert!(
+            counts.get("claude_identity_conflict_fallbacks").is_none(),
+            "no conflict: {counts}"
+        );
+        assert_eq!(disposition.quarantined_entity_count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn e2_pipeline_exact_telemetry_over_cap_uses_the_existing_counted_start_fallback() {
+    let dir = temp_dir("e2-identity-telemetry-cap");
+    let root = "1449b91b-f36e-4cbc-a5bb-50fc66430ba5";
+    let support = dir.join("support");
+    let mut lines = String::new();
+    let mut api = Vec::new();
+    let mut trace = Vec::new();
+    for n in 1..=17 {
+        let request = format!("req_{n}");
+        lines.push_str(&format!("{}\n", json!({
+            "timestamp": format!("2026-08-02T07:00:{n:02}Z"), "type": "assistant",
+            "sessionId": root, "requestId": request,
+            "message": {"id": format!("msg_{n}"), "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 10}}
+        })));
+        let mut row = complete_api_row(root, &request, n, 10, 10, 0);
+        row.account_identifier_hash = Some(format!("{n:064x}"));
+        e2_resign(&mut row);
+        api.push(row);
+        trace.push(complete_trace_row(root, &request, ""));
+    }
+    fs::write(dir.join(format!("{root}.jsonl")), lines).unwrap();
+    e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, root, &api);
+    e2_write_rows(
+        &support,
+        "local-otel/claude-code-trace-ownership",
+        root,
+        &trace,
+    );
+    let (items, disposition, failed, counts) = e2_page_counted(
+        std::slice::from_ref(&dir),
+        &support,
+        &mut ScanIndex::default(),
+        true,
+    );
+    assert!(!failed);
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert!(e2_is_literal(item));
+    assert_eq!(item.request_count, 17);
+    assert_eq!(
+        e2_login_counts(item),
+        BTreeMap::from([(Some(format!("{:064x}", 1)), 17)]),
+        "bounded fallback uses the start, never the sixteenth login"
+    );
+    assert_eq!(
+        item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+        Some("0.0017")
+    );
+    let display = item.claude_account_display.as_deref().unwrap();
+    assert_eq!(display.current.status, "known");
+    assert_eq!(
+        display.current.account_identifier_hash,
+        Some(format!("{:064x}", 1))
+    );
+    assert_eq!(counts["claude_identity_conflict_fallbacks"], 1);
+    assert_eq!(disposition.quarantined_entity_count(), 0);
     fs::remove_dir_all(dir).unwrap();
 }
