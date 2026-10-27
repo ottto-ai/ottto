@@ -239,11 +239,11 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             serde_json::from_value(serde_json::json!({
                 "size_bytes":std::fs::metadata(&path).unwrap().len(),
                 "modified_unix_seconds":1,"source_file_fingerprint":"fp",
-                "effective_upload_body_witness_revision":3
+                "effective_upload_body_witness_revision":if money {3} else {2}
             }))
             .unwrap(),
         );
-        index.activate_effective_upload_body_witness_revision(3);
+        index.activate_effective_upload_body_witness_revision(if money { 3 } else { 2 });
         index.adopt_effective_upload_body_witness_revision_monotonically();
         if money {
             index.claude_money_birth_store.set_money_rule_version(1);
@@ -313,7 +313,8 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             );
             assert_eq!(index.claude_money_birth_store.money_rule_version(), 2);
         } else {
-            index.activate_effective_upload_body_witness_revision(4);
+            // Use the supported revision ceiling; do not loosen activation.
+            index.activate_effective_upload_body_witness_revision(3);
         }
         assert!(index.effective_upload_body_witness_revision_requires_adoption(&key));
         let cache = SharedCache::default();
