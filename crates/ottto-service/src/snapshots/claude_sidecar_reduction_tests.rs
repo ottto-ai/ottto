@@ -375,6 +375,8 @@ fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize
 
 #[test]
 fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     let prior = seed_predecessor(&f, &cache);
@@ -537,6 +539,8 @@ fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
 
 #[test]
 fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
@@ -614,6 +618,8 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
 
 #[test]
 fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
@@ -676,6 +682,8 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
 
 #[test]
 fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     for conflict in [false, true] {
         let f = Fixture::new(2);
         let cache = Arc::new(SharedCache::default());

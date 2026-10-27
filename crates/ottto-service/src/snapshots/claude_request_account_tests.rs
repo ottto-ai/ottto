@@ -27,6 +27,8 @@ pub(crate) fn output(name: &str, item: &SnapshotItem) {
 
 #[test]
 fn claude_p92_clock_qualification_and_all_bucket_coverage() {
+    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, items) = claude_account_family_fixture();
     let path = dir
         .join(&root)
@@ -299,6 +301,8 @@ pub(crate) fn claude_request_account_mixed_fixture(
 
 #[test]
 fn claude_p92_mixed_body_capability_and_restart_refusals() {
+    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, mut mixed, api, trace) = claude_request_account_mixed_fixture(4, true);
     let (prior_dir, mut prior, _, _) = claude_request_account_mixed_fixture(2, true);
     let before = serde_json::to_value(&mixed).unwrap();
@@ -598,6 +602,8 @@ fn h296_trace_refingerprint(row: &mut crate::claude_local_otel::ClaudeTraceOwner
 
 #[test]
 fn claude_h296_root_and_child_have_independent_exact_request_logins() {
+    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, mut api, trace) = h296_root_evidence();
     let child_path = dir.join(&root.source_session_id).join("subagents/agent-a4d1585d310070d0f.jsonl");
     let child = parse_claude_code_jsonl_file(&child_path, "2026-08-02T07:01:00Z", "child-fp".into()).unwrap().remove(0);
@@ -672,6 +678,8 @@ fn claude_h296_root_refuses_partial_no_otel_owners_and_collisions() {
 
 #[test]
 fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
+    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, original, api, trace) = h296_root_evidence();
     for case in ["missing_clock", "observer_fallback", "hour_minimum", "missing_hour", "creator_conflict", "creator_other_account", "unsupported_route", "multiple_logins"] {
         let mut item = original.clone(); let mut api = api.clone();
@@ -702,6 +710,8 @@ fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
 
 #[test]
 fn claude_h296_root_production_enrichment_keeps_child_separate() {
+    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
     let digest = format!("{:x}", Sha256::digest(root.source_session_id.as_bytes()));
@@ -740,6 +750,8 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
 /// permitted cycle reaches contract 5.
 #[test]
 fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
+    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_identity as identity;
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
@@ -786,6 +798,8 @@ fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
 
 #[test]
 fn claude_h296_root_requires_original_clocks_in_every_hour_before_fold() {
+    // D1 session-account qualification and binding; E2 keeps per-request account partitions.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, _) = claude_account_family_fixture();
     let path = dir.join(format!("{root}.jsonl"));
     let first: Value = serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap()).unwrap();

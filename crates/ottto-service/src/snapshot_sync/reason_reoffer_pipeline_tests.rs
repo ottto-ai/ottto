@@ -1027,6 +1027,8 @@ fn capture_late_identity_rows(pipeline: &ReofferPipeline, login: &str, org: &str
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
+    // R2-N2: gate on, conflicting org markers go to the starting account; the login is dropped.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !supported("late_api_row_tags_the_reoffered_body_once_the_pair_is_proven") {
         return;
     }
@@ -2095,6 +2097,8 @@ fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn tombstoned_returning_history_obeys_the_move_hold() {
+    // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !supported("tombstoned_returning_history_obeys_the_move_hold") {
         return;
     }
@@ -2201,6 +2205,8 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
+    // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !supported("returning_tombstoned_family_is_held_until_proof_then_reoffered_once") {
         return;
     }
@@ -2321,6 +2327,8 @@ fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
+    // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !supported("returning_tombstoned_family_that_grew_reproves_in_a_fresh_window") {
         return;
     }

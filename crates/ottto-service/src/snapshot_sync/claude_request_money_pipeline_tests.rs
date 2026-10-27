@@ -166,6 +166,8 @@ fn money_census(fixture: &PipelineFixture, index: &ScanIndex) -> BTreeMap<String
 
 /// One arm: a baseline traversal, then an append and a second traversal.
 fn money_pipeline_arm(name: &str, corpus: MoneyCorpus) -> MoneyPipelineArm {
+    // The P1 shadow is the gate-off design (PR D deletes both).
+    let _gate = money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new(name);
     money_write_corpus(&fixture, corpus);
@@ -400,6 +402,8 @@ fn money_shadow_changes_no_page_decision_through_the_real_caller() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_shadow_capture_never_enters_live_items_or_reservations() {
+    // The P1 shadow is the gate-off design (PR D deletes both).
+    let _gate = money::e2::GateForTest::off();
     let fixture = PipelineFixture::new("money-shadow-zero-live");
     money_write_corpus(
         &fixture,
@@ -694,6 +698,8 @@ fn money_shadow_batch_admits_long_models_in_full() {
 #[serial(source_manifests)]
 #[serial(claude_request_money_shadow)]
 fn money_shadow_reader_failure_is_never_complete_and_changes_nothing() {
+    // The P1 shadow is the gate-off design (PR D deletes both).
+    let _gate = money::e2::GateForTest::off();
     let corpus = MoneyCorpus {
         shadow: false,
         copies_and_rows: true,
@@ -738,6 +744,8 @@ fn money_shadow_reader_failure_is_never_complete_and_changes_nothing() {
 #[serial(source_manifests)]
 #[serial(claude_request_money_shadow)]
 fn money_shadow_refusal_logs_and_changes_nothing() {
+    // The P1 shadow is the gate-off design (PR D deletes both).
+    let _gate = money::e2::GateForTest::off();
     let corpus = MoneyCorpus {
         shadow: false,
         copies_and_rows: true,
@@ -1587,6 +1595,8 @@ fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
+    // The P1 shadow is the gate-off design (PR D deletes both).
+    let _gate = money::e2::GateForTest::off();
     let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     let fixture = PipelineFixture::new("money-p1b-full-reads");
     for at in 0..2048 {
@@ -2284,6 +2294,8 @@ fn money_p1b_dense_deferred_day_suppresses_unchanged_rows_and_closes() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
+    // The P1 shadow is the gate-off design (PR D deletes both).
+    let _gate = money::e2::GateForTest::off();
     let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     let fixture = PipelineFixture::new("money-p1b-natural-deferred-day");
     for at in 0..2048 {
@@ -2371,6 +2383,8 @@ fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
+    // The P1 shadow is the gate-off design (PR D deletes both).
+    let _gate = money::e2::GateForTest::off();
     let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     for (family_count, ack_mode) in [65_usize, 129].into_iter().flat_map(|n| ["ack", "lag", "sealed"].map(|mode| (n, mode))) {
         let fixture = PipelineFixture::new("money-p1b-small-full-rotation");
@@ -2821,6 +2835,8 @@ fn money_p1b_write_sync_save_and_ack_faults_never_create_false_progress() {
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_64k_capture_input_refusal_preserves_live_output() {
+    // The P1 shadow is the gate-off design (PR D deletes both).
+    let _gate = money::e2::GateForTest::off();
     let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     let fixture = PipelineFixture::new("money-long-capture-refusal");
     const SESSION: &str = "10000000-1234-4567-890a-123456789abc";

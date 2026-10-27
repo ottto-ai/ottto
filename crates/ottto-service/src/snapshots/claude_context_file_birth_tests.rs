@@ -1636,6 +1636,8 @@ fn api_row_without_trace_row_counts_as_owned() {
 
 #[test]
 fn telemetry_proven_session_keeps_todays_numbers() {
+    // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-file-birth-parity");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(
@@ -1796,6 +1798,8 @@ fn context_basis_counts_by_version_stay_bounded() {
 /// contract 5 rows and account tags are byte-identical to the clear.
 #[test]
 fn capture_on_bodies_match_the_clear_outside_context_scalars() {
+    // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_identity as identity;
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
@@ -2974,6 +2978,8 @@ fn first_own_request_time_is_absent_unless_the_birth_is_measured() {
 /// for the same file the birth rule measures.
 #[test]
 fn strict_path_has_no_first_own_request_time() {
+    // Legacy reported-usage body/authority assertions; E2 emits request-owned grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let dir = temp_dir("claude-file-birth-first-own-strict");
     let now = OffsetDateTime::now_utc();
     let (path, parsed) = root_session(

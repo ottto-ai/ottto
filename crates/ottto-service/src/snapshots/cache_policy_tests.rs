@@ -60,11 +60,14 @@ pub(super) const POLICY_STATE_BYTES: usize =
 /// any eviction.
 pub(super) const FILLERS: usize = 4;
 /// One filler's charge, in thousandths of the state budget: four fill about
-/// 85% of it, as four 1,400-response reductions did before compact Claude
+/// 84% of it, as four 1,400-response reductions did before compact Claude
 /// records (#653 T3: 27,664,691 B, 6,887,051 B each), leaving about 4.8 MB.
 /// `filler_records` sizes the filler file from measured charges, so a change
 /// to the per-response charge cannot leave the zero-budget steps unreached.
-const FILLER_STATE_PERMILLE: usize = 212;
+// Keep M-a's 256 KiB prefix margin with E2's itemized finish term, main's
+// stored ctime/birth fields, and the longer Linux CI paths. This calibrates
+// fixture fill only; zero-budget and exact two-victim assertions stay intact.
+const FILLER_STATE_PERMILLE: usize = 210;
 /// The two probe files that measure a filler's charge per response.
 const FILLER_PROBE_RECORDS: [usize; 2] = [700, 1400];
 /// One appended record this long leaves the tail parser's line buffer at

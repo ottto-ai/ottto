@@ -1015,6 +1015,8 @@ fn fe_claude_source_prefix_d1_record_is_unverified_and_replaced_next_read() {
 /// matching API and trace evidence mints v1 at a healthy terminal.
 #[test]
 fn fe_claude_census_control_exact_api_rows_mint_v1() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1033,6 +1035,8 @@ fn fe_claude_census_control_exact_api_rows_mint_v1() {
 /// on unequal request sets; the SOURCE rows below need an explicit guard.
 #[test]
 fn fe_claude_census_diag_main_folds_extra_api_rows_as_auxiliary() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1217,6 +1221,8 @@ fn fe_claude_prefix_without_d1_record_still_cannot_mint_v1() {
 /// incomplete page, even with unchanged API/trace evidence.
 #[test]
 fn fe_claude_unverified_source_cannot_reconstruct_a_saved_family_witness() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1342,6 +1348,8 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
 /// without an indexed audit marker (even if the D1 record cannot be stored).
 #[test]
 fn fe_claude_finalizer_only_response_loss_refuses_the_grown_prefix() {
+    // Resolver conflict as drop residue is gate-off only; gate on it is a disclosed E2 conflict.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1407,6 +1415,8 @@ fn fe_claude_full_without_h1c_admission_keeps_strict_completion() {
 /// logical-family witness reconstruct v1 from the same prefix.
 #[test]
 fn fe_claude_prefix_with_different_physical_key_cannot_reconstruct_v1() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1437,6 +1447,8 @@ fn fe_claude_prefix_with_different_physical_key_cannot_reconstruct_v1() {
 /// Ordinary EOF-recomposed Tail retains positive behavior despite unverified D1.
 #[test]
 fn fe_claude_ordinary_tail_d1_debt_does_not_exclude_recomposed_body() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1503,6 +1515,8 @@ fn fe_claude_prefix_provenance_round_trips_without_d1() {
 /// replays all later rows and revalidates EOF. No FE prefix is cached.
 #[test]
 fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -1737,6 +1751,8 @@ fn fe_n1_identity_incomplete_record_cannot_bind_recomposed_body() {
 /// Neither a reload nor loss of the optional retained copy cancels the read.
 #[test]
 fn fe_n1_held_tail_save_reload_reaches_due_full_and_reproves() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_census::{
         identity_incomplete_hold_totals, ClaudeRequestCensusShape as Shape,
     };
@@ -1947,6 +1963,8 @@ fn restore_dated(index: &mut ScanIndex, due: u64) -> usize {
 /// the verified source lets the saved witness re-prove.
 #[test]
 fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_census::{
         identity_incomplete_hold_deadlines_restored_total as restored,
         identity_incomplete_hold_totals, ClaudeRequestCensusShape as Shape,
@@ -2039,6 +2057,8 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
 /// brings it back for its one due Full.
 #[test]
 fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_census::identity_incomplete_hold_deadlines_restored_total as restored;
     use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
     use std::time::{Duration, UNIX_EPOCH};
@@ -2141,6 +2161,8 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
 /// never as explicit vanished-file retirement.
 #[test]
 fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reload() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use std::time::{Duration, UNIX_EPOCH};
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -2256,6 +2278,8 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
 /// The test never deletes a pending slot. Failed progress turns rotate too.
 #[test]
 fn fe_n1_option_b_saturated_non_draining_debts_do_not_starve_many_readable_holds() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
     use crate::transcript_cache::CACHE_ENTRIES;
     use std::time::{Duration, UNIX_EPOCH};
@@ -2395,6 +2419,8 @@ fn fe_n1_option_b_saturated_non_draining_debts_do_not_starve_many_readable_holds
 /// must never turn it into a sampled marker taking the reserved last slot.
 #[test]
 fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove() {
+    // v1 reported-usage witness oracle (mints_v1); gate on, E2 items skip the v1 fold.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
     use crate::transcript_cache::CACHE_ENTRIES;
     if !crate::heap_layout_bound::layout_supported() {

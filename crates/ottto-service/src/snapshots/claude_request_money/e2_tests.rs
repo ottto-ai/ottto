@@ -806,6 +806,10 @@ fn queued_traversal(queued: &[PathBuf], candidates: &[PathBuf]) -> ScanIndex {
 
 #[test]
 fn e2_dark_leaves_an_undiscovered_members_side_call_to_the_member() {
+    with_disabled(e2_dark_leaves_an_undiscovered_members_side_call_to_the_member_body);
+}
+
+fn e2_dark_leaves_an_undiscovered_members_side_call_to_the_member_body() {
     // Dark keeps the reference selection, so the root can be on a page before
     // its family directory is listed. It neither holds nor counts the row the
     // trace names for an undiscovered member: the gate would have deferred
@@ -938,16 +942,20 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].request_count, 2);
     // Gate off withholds nothing and changes nothing.
-    let mut items = page();
+    let mut items = with_disabled(page);
     items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
     let before = canonical(&items);
-    assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
+    assert!(with_disabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded)).is_empty());
     assert_eq!(canonical(&items), before);
     cleanup(&[&first, &copy]);
 }
 
 #[test]
 fn e2_gate_off_keeps_canonical_bytes_and_fingerprint() {
+    with_disabled(e2_gate_off_keeps_canonical_bytes_and_fingerprint_body);
+}
+
+fn e2_gate_off_keeps_canonical_bytes_and_fingerprint_body() {
     let p = root_file("dark");
     let index = ScanIndex::default();
     let mut items = vec![parse(
@@ -1049,8 +1057,8 @@ fn e2_native_resolver_owns_progressive_and_idless_decisions() {
 fn e2_diagnostic_fields_are_nonzero_only() {
     assert_eq!(serde_json::to_value(Counts::default()).unwrap(), json!({}));
     assert_eq!(
-        serde_json::to_value(Counts([1, 2, 0, 0, 0, 3, 0, 1])).unwrap(),
-        json!({"fold_us":1,"responses":2,"side_call_root_fallback":3,"dark_unexplained":1})
+        serde_json::to_value(Counts([1, 2, 0, 0, 0, 3, 0])).unwrap(),
+        json!({"fold_us":1,"responses":2,"side_call_root_fallback":3})
     );
 }
 
@@ -1244,7 +1252,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         }
         items
     };
-    let items = parse_page(&index);
+    let items = with_disabled(|| parse_page(&index));
     let items_enabled = with_enabled(|| parse_page(&index));
     // An off-page member is parsed through the native resolver and recorded
     // through the actual census writer, rather than hand-feeding holder sets.
@@ -1333,7 +1341,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             if enabled {
                 with_enabled(run)
             } else {
-                run()
+                with_disabled(run)
             }
         };
         let parsed = if enabled { &items_enabled } else { &items };
@@ -1428,7 +1436,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         let withheld = if enabled {
             with_enabled(|| finish_page(&mut page, &index, TelemetryRead::Loaded))
         } else {
-            finish_page(&mut page, &index, TelemetryRead::Loaded)
+            with_disabled(|| finish_page(&mut page, &index, TelemetryRead::Loaded))
         };
         assert!(withheld.is_empty());
         let pipeline_time = enrichment_time + finish_start.elapsed();
@@ -2190,6 +2198,65 @@ fn e2_identity_mid_session_request_with_two_orgs_goes_to_the_starting_account() 
         assert_eq!(
             org_amounts(&item),
             BTreeMap::from([(org_hash(ORG_A), (60, 3))])
+        );
+        assert_evidence_referenced(&item);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_two_org_request_with_its_own_telemetry_login_goes_to_the_starting_account() {
+    // SOURCE R2-N2: the R3-N2 pair request also carries its own exact
+    // telemetry login. Two orgs on one request are never guessed, and the
+    // login does not move it either: starting account, counted.
+    const ORG_C: &str = "33333333-3333-4333-8333-333333333333";
+    with_enabled(|| {
+        let path = root_file("identity-pair-own-login");
+        let index = ScanIndex::default();
+        let mut items = vec![parse(
+            &path,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("a", &at(1), 10),
+                switch_context(),
+                org_marker(ORG_B),
+                json!({"type":"attachment","sessionId":ROOT,
+                    "attachment":{"type":"session_context",
+                        "context":{"userEmail":"other@example.invalid"}}}),
+                org_marker(ORG_C),
+                line("b", &at(2), 20),
+                line("c", &at(3), 30),
+            ],
+        )];
+        let mut own = row("b", 2, 20);
+        own.account_identifier_hash = Some("b".repeat(64));
+        let read = sidecar(&[refingerprint(own)]);
+        attach_page(&mut items, &read);
+        let api = api_report(&read);
+        let trace = ClaudeTraceOwnershipLoadReport::default();
+        let evidence =
+            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
+        let item = tag_owned(items, &index).remove(0);
+        assert_eq!((item.request_count, item.input_tokens), (3, 60));
+        let accounts = fold(&item).accounts.as_ref().unwrap();
+        assert!(accounts.conflict, "the pair is counted as a conflict");
+        assert!(!accounts.mixed);
+        assert_eq!(
+            org_amounts(&item),
+            BTreeMap::from([(org_hash(ORG_A), (60, 3))])
+        );
+        let login_b = "b".repeat(64);
+        assert!(
+            rows_of(&item).all(|row| {
+                row.account_identifier_hash.as_deref() != Some(login_b.as_str())
+                    && row.identity_parts.iter().flatten().all(|part| {
+                        part.account_identifier_hash.as_deref() != Some(login_b.as_str())
+                    })
+            }),
+            "the pair request's own login does not move it"
         );
         assert_evidence_referenced(&item);
         cleanup(&[&path]);
@@ -4344,4 +4411,41 @@ fn e2_virgin_live_maps_have_no_heap_and_initialized_empty_maps_stay_charged() {
         std::mem::size_of::<BeforeInitializationBit>(),
         std::mem::size_of::<ClaudeEntityBody>()
     );
+}
+
+#[test]
+fn e2_identity_incomplete_clock_survives_discarded_twin_in_both_orders() {
+    with_enabled(|| {
+        for reverse in [false, true] {
+            let path_a = root_file("identity-clock-twin-a");
+            let path_b = root_file("identity-clock-twin-b");
+            let index = ScanIndex::default();
+            let a = parse(
+                &path_a,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_A), line("a", &at(1), 10)],
+            );
+            let mut b = parse(
+                &path_b,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_B), line("b", &at(2), 20)],
+            );
+            b.claude_usage_occurrences
+                .get_mut("b")
+                .unwrap()
+                .event_clock_complete = false;
+            let items = tag_owned(if reverse { vec![b, a] } else { vec![a, b] }, &index);
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].request_count, 2);
+            let display = items[0].claude_account_display.as_deref().unwrap();
+            assert_eq!(display.current.status, "unknown");
+            assert_eq!(
+                display.current.unknown_reason.as_deref(),
+                Some("request_order_unavailable")
+            );
+            cleanup(&[&path_a, &path_b]);
+        }
+    });
 }
