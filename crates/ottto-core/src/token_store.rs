@@ -1297,7 +1297,7 @@ mod tests {
                 .map(|starter| {
                     let support = support.clone();
                     let barrier = Arc::clone(&barrier);
-                    thread::spawn(move || {
+                    std::thread::spawn(move || {
                         barrier.wait();
                         if starter % 2 == 0 {
                             // serve: lock for life, then load or create.
