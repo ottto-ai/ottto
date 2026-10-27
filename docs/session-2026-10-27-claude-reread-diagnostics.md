@@ -37,3 +37,10 @@ and retaining the ctime/birth and parent-ledger metadata checks. The histogram's
 plain stderr carrier is intentional and documented. Existing assertions, census
 entry size pin and visit/memory budgets remain unchanged; final Linux and native
 Rust contract receipts are recorded in the PR.
+
+The merge review also found that preparation errors could discard normalization
+counts without a native lease. The no-lease error path now emits nonzero counts
+through the existing decision carrier; leased error reporting stays unchanged.
+A real preparation regression loads an unbound record and forces progress
+generation overflow under both gate states, checking one reported clear and the
+unchanged failure and durable progress.

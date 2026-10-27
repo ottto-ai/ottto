@@ -5746,6 +5746,10 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
+    // The gate is fixed for this synchronous preparation. A lease reports
+    // errors while unwinding; without one, the wrapper must emit the counts.
+    let report_without_lease = source == SnapshotSource::ClaudeCode
+        && !crate::snapshots::claude_native_comparison::enabled();
     let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
         source == SnapshotSource::ClaudeCode,
     );
@@ -5769,6 +5773,8 @@ fn prepare_sync_source(
         } else {
             crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
         }
+    } else if report_without_lease {
+        crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
     }
     result
 }
