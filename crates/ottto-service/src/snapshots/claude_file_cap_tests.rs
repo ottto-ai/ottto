@@ -101,7 +101,7 @@ fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
     let path = fixture.path();
     let mut file = File::create(&path).unwrap();
     let valid_size = write_row(&mut file, &usage(0));
-    file.set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1).unwrap();
+    file.set_len(MAX_JSONL_FILE_BYTES + 1).unwrap();
     drop(file);
     let key = local_index_key(&path);
     let mut index = ScanIndex::default();
@@ -132,7 +132,7 @@ fn oversized_claude_shrink_then_grow_keeps_unread_content_unproven() {
         .write(true)
         .open(&path)
         .unwrap()
-        .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
+        .set_len(MAX_JSONL_FILE_BYTES + 1)
         .unwrap();
     let grown = fixture.scan(SnapshotSource::ClaudeCode, &mut index, 13);
     assert_eq!(grown.oversized_file_count, 1);
