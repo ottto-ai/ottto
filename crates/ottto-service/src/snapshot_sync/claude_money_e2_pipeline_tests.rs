@@ -2608,6 +2608,7 @@ fn e2_pipeline_cold_known_twins_read_once_across_page_boundary() {
         literal(&page);
         assert_eq!(page.scan.scanned_file_count, 2, "known family is complete");
         assert_eq!(total(&page), 2, "copy skipped; own new request preserved");
+        let first_reads = scanner.paths().len();
         let prior = settle(&c, &prior, page, &mut progress);
         let stored = stored_bodies(&prior);
         let page = ready(&c, &scanner, prior.clone(), 1, false);
@@ -2618,6 +2619,10 @@ fn e2_pipeline_cold_known_twins_read_once_across_page_boundary() {
         assert!(page.scan.snapshots.is_empty());
         let prior = settle(&c, &prior, page, &mut progress);
         assert_eq!(stored_bodies(&prior), stored);
-        assert_eq!(scanner.paths().len(), 2, "two acquisitions over both pages");
+        assert_eq!(
+            first_reads + scanner.paths().len(),
+            2,
+            "two acquisitions over both pages"
+        );
     });
 }

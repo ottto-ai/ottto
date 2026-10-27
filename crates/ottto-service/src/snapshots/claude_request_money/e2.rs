@@ -458,8 +458,9 @@ pub(crate) fn money_marks(item: &SnapshotItem) -> u8 {
     .fold(0, |marks, (_, mark)| marks | mark)
 }
 
-/// A request-owned emitted body after its fold's last consumer (contract 5,
-/// account qualification): the final rows own its money now. `money_marks`
+/// A request-owned emitted body after its last local consumer (comparison,
+/// finalizer, contract 5, account qualification and optional shadow): the
+/// final rows own its money now; native inputs can go too. `money_marks`
 /// still reads `disclosed` when the settled body is acknowledged, so a
 /// disclosing fold keeps its inline counters and frees every heap field;
 /// any other fold is dropped.

@@ -25884,9 +25884,11 @@ impl OwnedSourceScan {
                 .filter_map(|index_key| {
                     let path = PathBuf::from(&index_key);
                     let (root_session_id, _) = claude_index_path_family_member(&path)?;
-                    forced_claude_family_reparses
-                        .contains(&root_session_id)
-                        .then_some(path)
+                    (forced_claude_family_reparses.contains(&root_session_id)
+                        && (claude_family_membership_is_authoritative
+                            || index.files.contains_key(&index_key)
+                            || claude_twin_only_family_reparses.contains(&root_session_id)))
+                    .then_some(path)
                 })
                 .collect::<BTreeSet<_>>();
             if let Some(traversal) = index.traversal.as_mut() {
