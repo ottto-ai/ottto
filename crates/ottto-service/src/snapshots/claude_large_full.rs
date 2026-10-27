@@ -386,6 +386,16 @@ fn twin_group(
     let Some(keys) = groups.get(&member) else {
         return Ok(None);
     };
+    // Ordinary small indexed twins keep their existing scheduling and avoid
+    // a new per-member metadata walk. A grown member is checked when its
+    // actual large candidate reaches this gate; E2 still forbids partial money.
+    if !is_large(candidate)
+        && keys
+            .iter()
+            .all(|(_, size)| size.is_some_and(|bytes| bytes <= LARGE_FULL_BYTES))
+    {
+        return Ok(None);
+    }
     let key = local_index_key(&candidate.path);
     let mut twins = Vec::new();
     let mut total = candidate.size_bytes;
