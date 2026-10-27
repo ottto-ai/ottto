@@ -89,6 +89,7 @@ impl Counters {
              write_deferred={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} refused{{corrupt:{},newer:{},older:{},allowlist:{},unusable:{}}} \
+             unusable{{errno:{},mode:{},shape:{}}} \
              gc_records_deleted={} peak_codec_bytes={}",
             source.api_slug(),
             self.restore_attempts,
@@ -118,6 +119,9 @@ impl Counters {
             store.refused_older,
             store.refused_allowlist,
             store.refused_unusable,
+            store.unusable_errno,
+            store.unusable_mode,
+            store.unusable_shape,
             store.gc_records_deleted,
             store.peak_codec_bytes,
         )

@@ -314,6 +314,11 @@ pub(crate) struct StoreCounters {
     pub(crate) refused_older: u64,
     pub(crate) refused_allowlist: u64,
     pub(crate) refused_unusable: u64,
+    /// Why records were unusable: the last OS error number (0 when none),
+    /// group or other access bits set, or not a regular file or over size.
+    pub(crate) unusable_errno: u64,
+    pub(crate) unusable_mode: u64,
+    pub(crate) unusable_shape: u64,
     /// GC deletions: records and stale temp files.
     pub(crate) gc_records_deleted: u64,
     pub(crate) gc_temps_deleted: u64,
@@ -385,8 +390,15 @@ impl DurableTailStore {
                 self.counters.missing += 1;
                 return ReadOutcome::Missing;
             }
-            Err(_) => {
+            Err(error) => {
                 self.counters.refused_unusable += 1;
+                match error.raw_os_error() {
+                    Some(errno) => self.counters.unusable_errno = errno.unsigned_abs() as u64,
+                    None if error.kind() == io::ErrorKind::PermissionDenied => {
+                        self.counters.unusable_mode += 1
+                    }
+                    None => self.counters.unusable_shape += 1,
+                }
                 return ReadOutcome::Refused(Refusal::Unusable);
             }
         };
@@ -693,9 +705,13 @@ fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
         Err(error) => return Err(error),
     };
     let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.len() > (RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES) as u64
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "durable store record not owner-only",
+        ));
+    }
+    if !metadata.is_file() || metadata.len() > (RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES) as u64
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
