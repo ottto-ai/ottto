@@ -156,6 +156,20 @@ fn record_file(store: &DurableTailStore, key: &Digest32) -> PathBuf {
     store.dir().join(format!("{}{RECORD_SUFFIX}", hex(key)))
 }
 
+/// Put record bytes back as an owner-only file, as the store writes them; a
+/// recreated file would otherwise take the umask's 0644 and be refused.
+fn put_record(path: &Path, bytes: &[u8]) {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    std::io::Write::write_all(&mut file, bytes).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 #[test]
 fn envelope_round_trips_and_carries_no_path_or_raw_bytes() {
     let scratch = Scratch::new();
@@ -285,7 +299,7 @@ fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
                 },
             ),
         ] {
-            fs::write(record_file(&store, &key), record_bytes).unwrap();
+            put_record(&record_file(&store, &key), record_bytes);
             let record = found(store.read(&key, &allowlist));
             assert_eq!(
                 record.eligible(&expected),
@@ -294,7 +308,7 @@ fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
             );
         }
         for bytes in torn(&new_record) {
-            fs::write(record_file(&store, &key), &bytes).unwrap();
+            put_record(&record_file(&store, &key), &bytes);
             assert_eq!(
                 store.read(&key, &allowlist),
                 ReadOutcome::Refused(Refusal::Corrupt),
@@ -312,9 +326,9 @@ fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
 
     // A later save that did not change the entry leaves the older record
     // valid: generation at or below the committed one, same entry.
-    fs::write(&index_path, &new_index_bytes).unwrap();
+    fs::write(&index_path, new_index_bytes).unwrap();
     let mut index = ScanIndex::load(&index_path).unwrap();
-    fs::write(record_file(&store, &key), &new_record).unwrap();
+    put_record(&record_file(&store, &key), &new_record);
     let g3 = save_index(&mut index, &index_path);
     let record = found(store.read(&key, &allowlist));
     assert_eq!(record.index_generation, g2);
@@ -478,7 +492,7 @@ fn interrupted_replacement_renamed_but_directory_not_synced() {
     assert_eq!(survived.record.binding, new);
     assert_eq!(survived.eligible(&committed), Ok(()));
     // The rename was lost with the directory entry: the old record is back.
-    fs::write(record_file(&store, &new.key), &old_bytes).unwrap();
+    put_record(&record_file(&store, &new.key), &old_bytes);
     let reverted = found(store.read(&new.key, &allowlist));
     assert_eq!(reverted.index_generation, 1);
     assert_eq!(reverted.eligible(&committed), Err(Ineligible::EntryChanged));
@@ -520,7 +534,7 @@ fn schema_both_ways_and_downgrade() {
         let path = record_file(&store, &binding.key);
         let mut bytes = fs::read(&path).unwrap();
         set_version(&mut bytes, version);
-        fs::write(&path, &bytes).unwrap();
+        put_record(&path, &bytes);
     }
     assert_eq!(
         store.read(&newer.key, &allowlist),
@@ -747,7 +761,7 @@ fn a_record_readable_by_others_is_refused() {
         )
         .unwrap();
     let path = record_file(&store, &b.key);
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(
         store.read(&b.key, &placeholder_allowlist()),
         ReadOutcome::Refused(Refusal::Unusable)
@@ -832,7 +846,7 @@ fn certificate_ignores_ctime_and_refuses_content_changes() {
     let mtime = fs::metadata(&edited).unwrap().modified().unwrap();
     let mut changed = bytes.clone();
     changed[0] = b'b';
-    fs::write(&edited, &changed).unwrap();
+    fs::write(&edited, changed).unwrap();
     File::options()
         .write(true)
         .open(&edited)
@@ -848,7 +862,7 @@ fn certificate_ignores_ctime_and_refuses_content_changes() {
     let mut changed = bytes.clone();
     let at = changed.len() - 2;
     changed[at] = b'z';
-    fs::write(&tail_edit, &changed).unwrap();
+    fs::write(&tail_edit, changed).unwrap();
     File::options()
         .write(true)
         .open(&tail_edit)
@@ -864,7 +878,7 @@ fn certificate_ignores_ctime_and_refuses_content_changes() {
     let replaced = scratch.transcript("replace.jsonl", &bytes);
     let cert_r = certificate(&replaced);
     let staged = scratch.transcript("staged.jsonl", &bytes);
-    fs::rename(&staged, &replaced).unwrap();
+    fs::rename(staged, &replaced).unwrap();
     assert_eq!(admits(&replaced, &cert_r), Err(FullReason::Replaced));
 }
 

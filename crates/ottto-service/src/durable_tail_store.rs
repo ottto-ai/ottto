@@ -179,14 +179,6 @@ pub(crate) fn entry_digest(source_file_fingerprint: &str, body_witness: Option<&
     )
 }
 
-/// `entry_digest` of a committed index entry.
-pub(crate) fn entry_digest_of(entry: &crate::snapshots::ScanIndexEntry) -> Digest32 {
-    entry_digest(
-        &entry.source_file_fingerprint,
-        entry.last_upload_body_witness.as_deref(),
-    )
-}
-
 /// Where a scan index's store lives: a sibling directory of the index file.
 pub(crate) fn store_dir_for_index(index_path: &Path) -> PathBuf {
     index_path.with_extension("durable-tail")
