@@ -24222,7 +24222,8 @@ impl ScanIndex {
                 if parsed.append_compatible(&now_stamp) {
                     Ok(())
                 } else {
-                    // Equal length to what was parsed, but changed: Q-U28.
+                    // Equal length to what was parsed with a moved mtime (a
+                    // ctime-only change is the same content): Q-U28.
                     Err(FullReason::SameSizeEdit)
                 }
             });
@@ -24235,6 +24236,9 @@ impl ScanIndex {
         };
         match reason {
             FullReason::AuditDue | FullReason::ClockChanged | FullReason::ScopeChanged => {}
+            // Q-U28: a same-size change that moved mtime (`same_content`; a
+            // ctime-only change was admitted above). Matching samples are not
+            // whole-file equality: it stays refused and is re-requested.
             FullReason::SameSizeEdit if samples_match(self, file) => {}
             _ => {
                 if samples_match(self, file) {

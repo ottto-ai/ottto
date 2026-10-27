@@ -1321,6 +1321,71 @@ fn live_member_growth_mid_job_publishes_frozen_prefix_then_replaces_it() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// E1 S3: a metadata-only change of a member already read, while the job
+/// is paused in its live member, is not a member change: the job resumes
+/// without invalidation or a second group start and counts the unpaged
+/// body. A moved mtime at the same length still invalidates it.
+#[test]
+fn paused_group_resumes_across_a_sealed_member_metadata_only_change() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    for change in ["chmod", "mtime"] {
+        let root = paged_corpus(&format!("s3-sealed-{change}"));
+        let sealed = root.join("sessions/a.jsonl");
+        let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
+        let cache = Arc::new(SharedCache::default());
+        let done = with_test_limits(2048, 1024, 64, || {
+            let (index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
+                cache.paused_group_position() == Some(1)
+            });
+            let before = fs::metadata(&sealed).unwrap();
+            if change == "chmod" {
+                let ctime = |m: &fs::Metadata| (m.ctime(), m.ctime_nsec());
+                let mut tries = 0;
+                loop {
+                    let mode = fs::metadata(&sealed).unwrap().permissions().mode();
+                    fs::set_permissions(&sealed, fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+                    let after = fs::metadata(&sealed).unwrap();
+                    assert_eq!(
+                        (after.len(), after.modified().unwrap(), after.ino()),
+                        (before.len(), before.modified().unwrap(), before.ino())
+                    );
+                    if ctime(&after) != ctime(&before) {
+                        break;
+                    }
+                    tries += 1;
+                    assert!(tries < 2000, "chmod never moved ctime");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            } else {
+                File::options()
+                    .write(true)
+                    .open(&sealed)
+                    .unwrap()
+                    .set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+                    )
+                    .unwrap();
+                assert_eq!(fs::metadata(&sealed).unwrap().len(), before.len());
+            }
+            let (_, done, _) = pages(&root, index, &cache, || completions(&cache) > 0);
+            done
+        });
+        let after = counters(&cache);
+        if change == "chmod" {
+            assert_eq!(after.jobs_invalidated, 0, "{change}: {after:?}");
+            assert_eq!(after.groups_started, 1, "{change}: {after:?}");
+            assert_eq!(input_totals(&done), input_totals(&unpaged), "{change}");
+        } else {
+            assert!(after.jobs_invalidated >= 1, "{change}: {after:?}");
+            assert_eq!(after.groups_started, 2, "{change}: {after:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[test]
 fn restart_mid_job_reboots_group_and_keeps_owner_blocked() {
     if !crate::heap_layout_bound::layout_supported() {

@@ -75,11 +75,33 @@ impl FileStamp {
             false
         }
     }
+
+    /// The one content rule: the same object at the same length and
+    /// nanosecond mtime. ctime is never compared: a chmod, an xattr write
+    /// (Spotlight, backup, quarantine) or a new hard link moves it without
+    /// touching a byte (Ron's re-read rule). A same-size rewrite that keeps
+    /// mtime passes; samples are not consulted here. Without Unix identity
+    /// this is the length alone, as the derived equality was, and
+    /// `select_mode` still refuses as `UnsupportedIdentity`.
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.same_object(other)
+                && self.length == other.length
+                && self.modified == other.modified
+        }
+        #[cfg(not(unix))]
+        {
+            self.length == other.length
+        }
+    }
 }
 
 /// An opened object's identity and length, as one held-FD stamp sees it.
-pub(crate) trait StampIdentity: PartialEq {
+pub(crate) trait StampIdentity {
     fn same_object(&self, other: &Self) -> bool;
+    /// `FileStamp::same_content`'s rule: object, length and mtime; never ctime.
+    fn same_content(&self, other: &Self) -> bool;
     fn length(&self) -> u64;
 }
 
@@ -87,16 +109,20 @@ impl StampIdentity for FileStamp {
     fn same_object(&self, other: &Self) -> bool {
         FileStamp::same_object(self, other)
     }
+    fn same_content(&self, other: &Self) -> bool {
+        FileStamp::same_content(self, other)
+    }
     fn length(&self) -> u64 {
         self.length
     }
 }
 
 /// The one append-compatibility rule: the same object, and either grown or
-/// unchanged. A shrink, an equal-length edit or a replacement is refused.
-/// Appended bytes are outside the old frozen length.
+/// the same content (`same_content`: a ctime-only change is unchanged). A
+/// shrink, an equal-length edit that moves mtime or a replacement is
+/// refused. Appended bytes are outside the old frozen length.
 pub(crate) fn append_compatible<S: StampIdentity>(old: &S, now: &S) -> bool {
-    old.same_object(now) && (now.length() > old.length() || now == old)
+    old.same_object(now) && (now.length() > old.length() || old.same_content(now))
 }
 
 /// Only bounded private byte samples are retained, never the entire source.
@@ -203,14 +229,14 @@ impl Checkpoint {
     pub(crate) fn sealed_offset(&self) -> u64 {
         self.samples.sealed_offset
     }
-    /// Whether the opened object `file` still carries exactly the stamp this
-    /// checkpoint committed: no append, truncation, in-place edit or
-    /// metadata/ctime change to it since. P1-RETAIN R0's gate before a release
-    /// for this copy. It reads the open handle, so a path replaced after
-    /// revalidation is not seen here; the next take's `Replaced` check catches
-    /// it (at most one wasted release).
+    /// Whether the opened object `file` still has the content this
+    /// checkpoint committed (`FileStamp::same_content`): no append,
+    /// truncation or mtime-moving edit since; a ctime-only change keeps it.
+    /// P1-RETAIN R0's gate before a release for this copy. It reads the open
+    /// handle, so a path replaced after revalidation is not seen here; the
+    /// next take's `Replaced` check catches it (at most one wasted release).
     pub(crate) fn stamp_matches(&self, file: &File) -> io::Result<bool> {
-        Ok(FileStamp::capture(file.metadata()?)? == self.stamp)
+        Ok(FileStamp::capture(file.metadata()?)?.same_content(&self.stamp))
     }
     pub(crate) fn audit_debt(&self) -> Option<AuditDebt> {
         self.audit_debt
@@ -399,7 +425,10 @@ impl PrefixSeal {
                 .is_ok_and(|bytes| sha256_hex(&bytes) == *expected))
         })
         .map_err(|_| FullReason::InvalidCheckpoint)?;
-        if file.metadata().and_then(FileStamp::capture).ok().as_ref() != Some(&stamp) {
+        #[cfg(test)]
+        between_guards();
+        let after = file.metadata().and_then(FileStamp::capture);
+        if !after.is_ok_and(|after| after.same_content(&stamp)) {
             return Err(FullReason::Replaced);
         }
         match mode {
@@ -409,11 +438,12 @@ impl PrefixSeal {
     }
 
     /// U1a-2a fence, Q-U28 only: whether the held FD's head and boundary
-    /// windows still hash to this seal's samples. It exists for a same-size,
-    /// ctime-only change, which `admits` refuses as `SameSizeEdit` before it
-    /// reads any sample. It reads at most the seal's two windows of
-    /// `sample_len` (≤ 2 · `SAMPLE_BYTES`) through the shared reader, at the
-    /// offsets `admits` uses. A seal whose samples are invalid, an offset
+    /// windows still hash to this seal's samples. It exists for a same-size
+    /// change that moved mtime, which `admits` refuses as `SameSizeEdit`
+    /// before it reads any sample (a ctime-only change is the same content
+    /// since E1 S3, so `admits` no longer refuses it). It reads at most the
+    /// seal's two windows of `sample_len` (≤ 2 · `SAMPLE_BYTES`) through the
+    /// shared reader, at the offsets `admits` uses. A seal whose samples are invalid, an offset
     /// that does not compute, and a short or failed read are all `false`.
     ///
     /// **Seek position.** The reader seeks. This restores the FD's position
@@ -629,9 +659,9 @@ fn select_mode(
             ReadMode::Full(FullReason::Replaced)
         } else if stamp.length < old.stamp.length {
             ReadMode::Full(FullReason::Shrunk)
-        } else if stamp.length == old.stamp.length && stamp != old.stamp {
+        } else if stamp.length == old.stamp.length && !stamp.same_content(old.stamp) {
             ReadMode::Full(FullReason::SameSizeEdit)
-        } else if stamp == old.stamp && old.sealed_offset == stamp.length {
+        } else if stamp.same_content(old.stamp) && old.sealed_offset == stamp.length {
             ReadMode::Unchanged
         } else if !sample_eq(SampleAt::Head)? {
             ReadMode::Full(FullReason::HeadChanged)
@@ -701,7 +731,9 @@ impl ReadPlan {
                 }
             },
         )?;
-        if FileStamp::capture(file.metadata()?)? != stamp {
+        #[cfg(test)]
+        between_guards();
+        if !FileStamp::capture(file.metadata()?)?.same_content(&stamp) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "source changed during acquisition guards",
@@ -851,7 +883,9 @@ impl ReadPlan {
         current_scope: &Scope,
         now: u64,
     ) -> io::Result<Checkpoint> {
-        if FileStamp::capture(file.metadata()?)? != self.stamp || current_scope != &self.scope {
+        if !FileStamp::capture(file.metadata()?)?.same_content(&self.stamp)
+            || current_scope != &self.scope
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "source or interpretation changed during acquisition",
@@ -975,7 +1009,7 @@ impl ReadPlan {
         if current.length < self.stamp.length || current.length < consumed.max(sealed) {
             return invalid(Shrunk);
         }
-        if current.length == self.stamp.length && current != self.stamp {
+        if current.length == self.stamp.length && !current.same_content(&self.stamp) {
             return invalid(SameSizeEdit);
         }
         if self.mode == ReadMode::Unchanged
@@ -1011,7 +1045,7 @@ impl ReadPlan {
             // length sealed and consumed) is verified when it commits. A
             // grown, partial or clock-regressed read keeps the start below.
             ReadMode::Full(_)
-                if current == self.stamp
+                if current.same_content(&self.stamp)
                     && sealed == self.stamp.length
                     && consumed == self.stamp.length
                     && now >= started =>
@@ -1220,7 +1254,7 @@ impl ReadPlan {
         if current.length < parked.stamp.length {
             return Err(FullReason::Shrunk);
         }
-        if current.length == parked.stamp.length && current != parked.stamp {
+        if current.length == parked.stamp.length && !current.same_content(&parked.stamp) {
             return Err(FullReason::SameSizeEdit);
         }
         let sealed = parked.samples.sealed_offset;
@@ -1240,7 +1274,10 @@ impl ReadPlan {
             Some(pending) => Some(pending.restore(file, parked.stamp.length, &mut reread_bytes)?),
             None => None,
         };
-        if file.metadata().and_then(FileStamp::capture).ok().as_ref() != Some(&current) {
+        #[cfg(test)]
+        between_guards();
+        let after = file.metadata().and_then(FileStamp::capture);
+        if !after.is_ok_and(|after| after.same_content(&current)) {
             return Err(FullReason::Replaced);
         }
         file.seek(SeekFrom::Start(resume))
@@ -1292,6 +1329,25 @@ impl crate::heap_layout_bound::HeapLayoutBound for ReadMode {
 #[cfg(test)]
 thread_local! {
     static SAMPLES_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BETWEEN_GUARDS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tests only: the hook `prepare`, `PrefixSeal::admits` and `unpark` run
+/// between their opening stamp capture and its re-capture.
+#[cfg(test)]
+fn between_guards() {
+    BETWEEN_GUARDS.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+/// Tests only: set (or clear, with `None`) this thread's `between_guards` hook.
+#[cfg(test)]
+pub(crate) fn set_between_guards(hook: Option<Box<dyn FnMut()>>) {
+    BETWEEN_GUARDS.with(|slot| *slot.borrow_mut() = hook);
 }
 
 /// Tests only (R1-M1): `PrefixSeal::samples_match` calls on this thread
@@ -2123,6 +2179,27 @@ mod tests {
             same("unchanged", |_, _| None, 200, false, Ok(0)),
             same("grown", append, 200, false, Ok(windows)),
             same(
+                "metadata only (E1 S3)",
+                |f, _| {
+                    metadata_only(&f.0, Meta::Chmod);
+                    None
+                },
+                200,
+                false,
+                Ok(0),
+            ),
+            same(
+                "metadata only and growth (E1 S3)",
+                |f, _| {
+                    f.append(b"next\n");
+                    metadata_only(&f.0, Meta::Chmod);
+                    None
+                },
+                200,
+                false,
+                Ok(windows),
+            ),
+            same(
                 "equal-length edit",
                 |f, bytes| {
                     let mut edited = bytes.to_vec();
@@ -2208,6 +2285,15 @@ mod tests {
                 Ok(0),
             ),
             partial("partial: unchanged", |_, _| None, Ok(windows), Ok(windows)),
+            partial(
+                "partial: metadata only (E1 S3)",
+                |f, _| {
+                    metadata_only(&f.0, Meta::Chmod);
+                    None
+                },
+                Ok(windows),
+                Ok(windows),
+            ),
             partial(
                 "partial: equal-length interior edit beyond both windows",
                 |f, bytes| {
@@ -2342,13 +2428,14 @@ mod tests {
     }
 
     /// U1a-2a Q-U28: `samples_match` is true for a ctime-only change (which
-    /// `admits` still refuses as `SameSizeEdit`), false for a head or a
-    /// boundary edit, a truncation and an invalid seal sample, and it leaves
-    /// the FD's position where it was, so a reader on that FD continues
-    /// correctly, on every path.
+    /// `admits` admits since E1 S3, reading nothing) and for a same-size
+    /// change that moved mtime (which `admits` still refuses as
+    /// `SameSizeEdit`), false for a head or a boundary edit, a truncation and
+    /// an invalid seal sample, and it leaves the FD's position where it was,
+    /// so a reader on that FD continues correctly, on every path.
     #[test]
     fn prefix_seal_samples_match_only_the_sealed_windows_and_keep_the_position() {
-        use std::os::unix::fs::{FileExt, PermissionsExt};
+        use std::os::unix::fs::FileExt;
         let bytes = wide_rows("q-u28");
         assert!(bytes.len() > 2 * SAMPLE_BYTES);
         let check = |f: &Fixture, seal: &PrefixSeal| {
@@ -2364,20 +2451,32 @@ mod tests {
             matched
         };
 
-        // ctime only: same bytes, so the samples match; admission is
-        // unchanged (`SameSizeEdit`).
+        // ctime only: same bytes, so the samples match; since E1 S3 it is
+        // the same content and `admits` admits it reading no sample.
         let f = Fixture::new(&bytes);
         let seal = initial(&f, 1000).seal(1000);
         assert!(check(&f, &seal));
-        // Past the filesystem's ctime granularity.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let mode = fs::metadata(&f.0).unwrap().permissions().mode();
-        fs::set_permissions(&f.0, fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+        for meta in metas() {
+            metadata_only(&f.0, meta);
+            assert_eq!(
+                seal.admits(&mut f.open(), &scope(), 1100, false),
+                Ok(0),
+                "{meta:?}"
+            );
+            assert!(check(&f, &seal), "ctime-only change: {meta:?}");
+        }
+        // A middle rewrite at the same size that moved mtime and left both
+        // windows equal: the samples match, `admits` still refuses.
+        assert_ne!(bytes[SAMPLE_BYTES + 50], b'b');
+        f.open()
+            .write_all_at(b"b", (SAMPLE_BYTES + 50) as u64)
+            .unwrap();
+        touch(&f);
         assert_eq!(
             seal.admits(&mut f.open(), &scope(), 1100, false),
             Err(FullReason::SameSizeEdit)
         );
-        assert!(check(&f, &seal), "ctime-only change");
+        assert!(check(&f, &seal), "moved mtime, equal windows");
 
         // A head edit and a boundary edit, both at the same size.
         for at in [0, bytes.len() as u64 - 2] {
@@ -2612,6 +2711,55 @@ mod tests {
             let inline = base.same_object(&now) && (now == base || now.length > base.length);
             assert_eq!(append_compatible(&base, &now), expected, "{case}");
             assert_eq!(inline, expected, "{case}: replaced inline predicate");
+        }
+        // E1 S3: a ctime-only change is the same content, which the replaced
+        // inline predicate refused; every content field still counts.
+        let ctime_only = FileStamp {
+            changed: (5, 6),
+            ..base.clone()
+        };
+        assert_ne!(ctime_only, base, "structural equality keeps ctime");
+        assert!(base.same_content(&ctime_only));
+        assert!(append_compatible(&base, &ctime_only), "ctime only");
+        for (case, now) in [
+            (
+                "length",
+                FileStamp {
+                    length: 101,
+                    ..base.clone()
+                },
+            ),
+            (
+                "device",
+                FileStamp {
+                    device: 8,
+                    ..base.clone()
+                },
+            ),
+            (
+                "inode",
+                FileStamp {
+                    inode: 12,
+                    ..base.clone()
+                },
+            ),
+            (
+                "mtime seconds",
+                FileStamp {
+                    modified: (9, 2),
+                    ..base.clone()
+                },
+            ),
+            (
+                "mtime nanoseconds",
+                FileStamp {
+                    modified: (1, 3),
+                    ..base.clone()
+                },
+            ),
+        ] {
+            assert!(!base.same_content(&now), "{case}");
+            assert!(!now.same_content(&base), "{case}");
         }
         // `holds` keeps its behaviour on an equal-length in-place edit.
         let g = Fixture::new(b"one\ntwo\n");
@@ -2967,5 +3115,282 @@ mod tests {
         file.write_all_at(b"X", sealed - 1).unwrap();
         let plan = ReadPlan::prepare(&mut file, Some(&checkpoint), &scope(), None, now).unwrap();
         assert_eq!(plan.mode(), ReadMode::Full(FullReason::BoundaryChanged));
+    }
+
+    /// A metadata-only change: it moves ctime, never a byte or mtime.
+    #[derive(Clone, Copy, Debug)]
+    enum Meta {
+        Chmod,
+        /// An extended attribute, as Spotlight, backup and quarantine write
+        /// them. macOS (APFS) only.
+        #[cfg(target_os = "macos")]
+        Xattr,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn metas() -> Vec<Meta> {
+        vec![Meta::Chmod, Meta::Xattr]
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn metas() -> Vec<Meta> {
+        vec![Meta::Chmod]
+    }
+
+    /// Apply `meta` to `path` until `stat` shows a new ctime (bounded
+    /// retries absorb a coarse filesystem clock instead of a sleep), and
+    /// assert every time that object, length and mtime are untouched. It
+    /// returns only once the stamp differs from the one before in ctime alone.
+    fn metadata_only(path: &std::path::Path, meta: Meta) {
+        use std::os::unix::fs::PermissionsExt;
+        let stamp = || FileStamp::capture(fs::metadata(path).unwrap()).unwrap();
+        let before = stamp();
+        for _ in 0..2000 {
+            match meta {
+                Meta::Chmod => {
+                    let mode = fs::metadata(path).unwrap().permissions().mode();
+                    fs::set_permissions(path, fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+                }
+                #[cfg(target_os = "macos")]
+                Meta::Xattr => assert!(std::process::Command::new("/usr/bin/xattr")
+                    .args(["-w", "com.ottto.e1-s3-metadata-only"])
+                    .arg(format!("{:?}", std::time::Instant::now()))
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()),
+            }
+            let after = stamp();
+            assert!(after.same_content(&before), "{meta:?} kept the content");
+            if after.changed != before.changed {
+                assert_ne!(after, before);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("{meta:?} never moved ctime");
+    }
+
+    /// A change E1 S3 tests: metadata only, or an mtime move at equal
+    /// length with no byte changed (`n` picks a distinct mtime).
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        Meta(Meta),
+        Mtime,
+    }
+
+    fn changes() -> Vec<Change> {
+        let mut changes: Vec<_> = metas().into_iter().map(Change::Meta).collect();
+        changes.push(Change::Mtime);
+        changes
+    }
+
+    fn apply(path: &std::path::Path, change: Change, n: u64) {
+        match change {
+            Change::Meta(meta) => metadata_only(path, meta),
+            Change::Mtime => OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(n))
+                .unwrap(),
+        }
+    }
+
+    /// E1 S3 (Ron's re-read rule): a metadata-only change at equal length
+    /// is the same content. Before `prepare` it is `Unchanged` with zero
+    /// sample bytes read (never `SameSizeEdit`), the seal admits it reading
+    /// nothing and `stamp_matches` keeps the copy; with growth it is a
+    /// `Tail`; a moved mtime at equal length is still `SameSizeEdit`. Every
+    /// decision is inside the horizon with no debt: before S1 an old or
+    /// debt-due checkpoint is `Full(AuditDue)` whatever ctime does, so these
+    /// fixtures stay clear of it.
+    #[test]
+    fn metadata_only_change_before_prepare_is_unchanged_and_reads_nothing() {
+        for meta in metas() {
+            let bytes = wide_rows("s3-before");
+            let f = Fixture::new(&bytes);
+            let cp = initial(&f, 1000);
+            let seal = cp.seal(1000);
+            metadata_only(&f.0, meta);
+            assert!(cp.stamp_matches(&f.open()).unwrap(), "{meta:?}");
+            assert_eq!(
+                seal.admits(&mut f.open(), &scope(), 1100, false),
+                Ok(0),
+                "{meta:?}"
+            );
+            let (mode, next, read) = run(&f, Some(&cp), None, 1100);
+            assert_eq!((mode, read), (ReadMode::Unchanged, 0), "{meta:?}");
+            assert_eq!(next.sealed_offset(), cp.sealed_offset());
+
+            // Growth and a metadata change: a tail of the appended row.
+            f.append(b"{\"next\":1}\n");
+            metadata_only(&f.0, meta);
+            let (mode, grown, read) = run(&f, Some(&next), None, 1200);
+            assert_eq!((mode, read), (ReadMode::Tail, 2 * SAMPLE_BYTES), "{meta:?}");
+            assert_eq!(grown.sealed_offset(), bytes.len() as u64 + 11);
+
+            // A moved mtime at equal length is still a same-size edit.
+            touch(&f);
+            assert!(!grown.stamp_matches(&f.open()).unwrap(), "{meta:?}");
+            assert_eq!(
+                run(&f, Some(&grown), None, 1300).0,
+                ReadMode::Full(FullReason::SameSizeEdit),
+                "{meta:?}"
+            );
+        }
+    }
+
+    /// E1 S3: a change between a decision's opening stamp and its
+    /// re-capture (the `between_guards` hook). Metadata only keeps
+    /// `prepare`'s tail, the seal's admission and `unpark`'s resume; a moved
+    /// mtime there still aborts each.
+    #[test]
+    fn metadata_only_change_between_guard_captures_keeps_the_decision() {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                set_between_guards(None);
+            }
+        }
+        let _clear = Clear;
+        for change in changes() {
+            let kept = matches!(change, Change::Meta(_));
+            let arm = move |path: &std::path::Path| {
+                let path = path.to_path_buf();
+                let mut n = 0;
+                set_between_guards(Some(Box::new(move || {
+                    n += 1;
+                    apply(&path, change, n);
+                })));
+            };
+
+            let f = Fixture::new(&wide_rows("s3-guards"));
+            let cp = initial(&f, 1000);
+            f.append(b"{\"next\":1}\n");
+            arm(&f.0);
+            let prepared = ReadPlan::prepare(&mut f.open(), Some(&cp), &scope(), None, 1100);
+            set_between_guards(None);
+            match prepared {
+                Ok(plan) => assert!(kept && plan.mode() == ReadMode::Tail, "{change:?}"),
+                Err(error) => assert!(
+                    !kept && error.kind() == io::ErrorKind::InvalidData,
+                    "{change:?}: {error}"
+                ),
+            }
+
+            let f = Fixture::new(&wide_rows("s3-guards"));
+            let seal = initial(&f, 1000).seal(1000);
+            arm(&f.0);
+            let admitted = seal.admits(&mut f.open(), &scope(), 1100, false);
+            set_between_guards(None);
+            let expected = if kept {
+                Ok(0)
+            } else {
+                Err(FullReason::Replaced)
+            };
+            assert_eq!(admitted, expected, "{change:?}");
+
+            let f = Fixture::new(&wide_rows("s3-guards"));
+            let (plan, consumed) = partial_read(&f, 2, 7);
+            let parked = plan.park(100);
+            arm(&f.0);
+            let mut held = f.open();
+            let unparked = ReadPlan::unpark(&mut held, &parked, None);
+            set_between_guards(None);
+            match unparked {
+                Ok(_) => assert!(
+                    kept && held.stream_position().unwrap() == consumed,
+                    "{change:?}"
+                ),
+                Err(reason) => assert!(
+                    !kept && reason == FullReason::Replaced,
+                    "{change:?}: {reason:?}"
+                ),
+            }
+        }
+    }
+
+    /// E1 S3: a change between the native parse and its commit. Metadata
+    /// only still commits `commit_after_native_completion`, still verifies a
+    /// complete Full read at `commit_sealed_prefix` (AD-1) and keeps the
+    /// lossy identity's `holds`; a moved mtime at equal length still
+    /// refuses each.
+    #[test]
+    fn metadata_only_change_between_parse_and_commit_still_commits() {
+        for change in changes() {
+            let kept = matches!(change, Change::Meta(_));
+            let f = Fixture::new(b"one\ntwo\n");
+            let mut file = f.open();
+            let mut plan = ReadPlan::prepare(&mut file, None, &scope(), None, 100).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            plan.observe_complete_records(&bytes).unwrap();
+            apply(&f.0, change, 1);
+            let committed = plan.commit_after_native_completion(&file, &scope(), 100);
+            assert_eq!(committed.is_ok(), kept, "{change:?}");
+
+            let f = Fixture::new(b"one\ntwo\n");
+            let (mut file, plan, frozen) = sealed_read(&f, 100);
+            apply(&f.0, change, 1);
+            let sealed =
+                plan.commit_sealed_prefix(&mut file, true, &scope(), 100, 200, false, frozen);
+            if kept {
+                let cp = sealed.unwrap();
+                assert_eq!((cp.last_full_verified(), cp.audit_debt()), (200, None));
+            } else {
+                assert_eq!(
+                    sealed.err(),
+                    Some(PrefixRefusal::Invalidated(FullReason::SameSizeEdit))
+                );
+            }
+
+            let f = Fixture::new(b"one\ntwo\n");
+            let (mut file, plan, frozen) = sealed_read(&f, 100);
+            let (_, identity) = plan.commit_sealed_prefix_or_lossy_identity(
+                &mut file,
+                true,
+                &scope(),
+                100,
+                200,
+                true,
+                frozen,
+            );
+            let identity = identity.unwrap();
+            apply(&f.0, change, 1);
+            assert_eq!(identity.holds(&mut file), kept, "{change:?}");
+        }
+    }
+
+    /// E1 S3: a change while a read is parked. Metadata only unparks at the
+    /// resume offset and finishes with the uninterrupted read's certificate;
+    /// a moved mtime at equal length (no byte changed) refuses as
+    /// `SameSizeEdit`.
+    #[test]
+    fn metadata_only_change_while_parked_resumes_the_read() {
+        for change in changes() {
+            let f = Fixture::new(&wide_rows("s3-park"));
+            let (plan, consumed) = partial_read(&f, 2, 7);
+            let (control, _) = partial_read(&f, 2, 7);
+            let parked = plan.park(100);
+            drop(plan);
+            let uninterrupted = finish_read(&f, control, consumed, 100, 200);
+            apply(&f.0, change, 1);
+            let mut held = f.open();
+            let unparked = ReadPlan::unpark(&mut held, &parked, None);
+            if let Change::Mtime = change {
+                assert_eq!(unparked.err(), Some(FullReason::SameSizeEdit));
+                continue;
+            }
+            let Ok(unparked) = unparked else {
+                panic!("{change:?}: refused");
+            };
+            assert_eq!(held.stream_position().unwrap(), consumed);
+            assert_eq!(
+                finish_read(&f, unparked.plan, consumed, unparked.started, 200),
+                uninterrupted,
+                "{change:?}"
+            );
+        }
     }
 }

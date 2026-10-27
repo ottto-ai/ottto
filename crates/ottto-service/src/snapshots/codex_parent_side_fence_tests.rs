@@ -69,6 +69,18 @@ impl Parent {
         fs::set_permissions(&self.path, fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
     }
 
+    /// A same-size edit outside both sealed windows that moves mtime: the
+    /// samples still match (Q-U28's cheap distinction cannot see it).
+    fn rewrite_middle(&self, at: u64) {
+        let mut byte = [0_u8];
+        self.file.read_exact_at(&mut byte, at).unwrap();
+        byte[0] = if byte[0] == b'#' { b'%' } else { b'#' };
+        self.writer().write_all_at(&byte, at).unwrap();
+        self.writer()
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+            .unwrap();
+    }
+
     /// A same-size edit inside the sealed head window.
     fn rewrite_head(&self) {
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -367,22 +379,41 @@ fn seal_refusals_route_to_the_request_path_and_the_rearm_table() {
     }
 }
 
-/// Q-U28 at admission: a ctime-only change refuses `SameSizeEdit`, the
-/// samples match, so it is the same object and takes the request path; a
-/// same-size rewrite of a sealed window is a new object that consumes the
-/// record and restarts the request.
+/// Q-U28 at admission. Since E1 S3 a ctime-only change is the same
+/// content: the record is admitted, nothing is requested or counted, and the
+/// held FD's position is kept. A same-size rewrite between the sealed
+/// windows that moves mtime matches both samples, so it is the same object:
+/// refused `SameSizeEdit` and re-requested, never admitted. A same-size
+/// rewrite of a sealed window is a new object that consumes the record and
+/// restarts the request.
 #[test]
 fn a_ctime_only_change_is_the_same_object_and_a_rewrite_consumes_the_record() {
     let mut parent = Parent::new("q-u28", 9_000);
     let now = now();
     let len = parent.len();
     let mut index = with_record(parent.record(SideVerdict::Settled, now));
+    let before = serde_json::to_value(&index).unwrap();
     parent.touch_ctime();
+    parent.file.seek(SeekFrom::Start(123)).unwrap();
+    let (fenced, counts) = parent.fence(&mut index, len, now);
+    assert_eq!(fenced, SideFence::Admitted, "ctime only");
+    assert_eq!(counts, Counts::default());
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+    assert_eq!(parent.file.stream_position().unwrap(), 123, "position kept");
+
+    let mut index = with_record(parent.record(SideVerdict::Settled, now));
+    parent.rewrite_middle(SAMPLE_BYTES as u64 + 100);
     let (fenced, counts) = parent.fence(&mut index, len, now);
     assert_eq!(fenced, SideFence::Refused(FullReason::SameSizeEdit));
     assert_eq!(counts.side_refusals, 1);
     assert!(index.codex_parent_side.contains_key(KEY), "same object");
-    assert_eq!(index.codex_parent_side_requests[KEY].attempts, 0);
+    let requested = index.codex_parent_side_requests[KEY];
+    assert_eq!(
+        (requested.state, requested.attempts, requested.dev_ino),
+        (SideRequestState::Live, 0, parent.dev_ino()),
+        "re-requested"
+    );
+    assert_eq!(parent.file.stream_position().unwrap(), 123, "position kept");
 
     let mut index = with_record(parent.record(SideVerdict::Settled, now));
     let mut charged = parent.request(SideRequestState::Lossy, 4);
@@ -507,7 +538,9 @@ fn an_epoch_pruned_request_rearms_with_at_least_its_attempts() {
 /// The request-side object test: a shrink below `state_extent`, or a record
 /// for another object, is a new object (record consumed, request
 /// restarted); a same-size ctime change with matching record samples only
-/// moves `state_ctime`; with no record it is counted and changes nothing.
+/// moves `state_ctime` (and, since E1 S3, the record is admitted, so the
+/// evicted request is not re-armed); with no record it is counted and
+/// changes nothing.
 #[test]
 fn the_request_side_object_test_restarts_on_a_shrink_and_moves_state_ctime_on_q_u28() {
     let mut parent = Parent::new("shrink", 9_000);
@@ -532,7 +565,7 @@ fn the_request_side_object_test_restarts_on_a_shrink_and_moves_state_ctime_on_q_
     let mut index = with_record(record.clone());
     index.codex_parent_side_requests.insert(KEY.into(), request);
     parent.touch_ctime();
-    parent.fence(&mut index, 1, now);
+    assert_eq!(parent.fence(&mut index, 1, now).0, SideFence::Admitted);
     let moved = index.codex_parent_side_requests[KEY];
     assert_eq!(moved.state_ctime, parent.ctime());
     assert_eq!(
@@ -540,12 +573,8 @@ fn the_request_side_object_test_restarts_on_a_shrink_and_moves_state_ctime_on_q_
             state_ctime: request.state_ctime,
             ..moved
         },
-        SideRequest {
-            state: SideRequestState::Live,
-            attempts: 6,
-            ..request
-        },
-        "the ctime-only refusal re-arms the evicted request once"
+        request,
+        "a ctime-only change is admitted: the evicted request stays as it was"
     );
     assert!(index.codex_parent_side.contains_key(KEY));
 
