@@ -228,11 +228,16 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
     let source = SnapshotSource::ClaudeCode;
     let namespace = Scope("owed-test".into());
     let scope = Scope("owed-file".into());
-    let index_path = root.join("index.json");
     let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
     native_fixture(&path);
     let key = local_index_key(&path);
     for money in [false, true] {
+        // Independent committed generations; both arms exercise real CAS.
+        let index_path = root.join(if money {
+            "money-index.json"
+        } else {
+            "revision-index.json"
+        });
         let mut index = ScanIndex::default();
         index.files.insert(
             key.clone(),

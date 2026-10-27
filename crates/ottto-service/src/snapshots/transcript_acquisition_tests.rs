@@ -1338,9 +1338,10 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         ["restore", "view_changed", "priority_changed", "parent_ref"].map(|arm| (v2, arm))
     }) {
         let fixture = ScanFixture::new(source);
-        // A dated origin selects real V2. The undated origin exercises
-        // Legacy under the same active cutover (never infer V2 on restore).
-        if v2 {
+        // A dated origin can select V2; an undated origin stays Legacy.
+        // The Legacy -> V2 view-change control needs a dated header with
+        // prior Legacy ACK evidence, so either injected view is valid.
+        if v2 || arm == "view_changed" {
             let text = fs::read_to_string(&fixture.file.0).unwrap();
             let mut meta: Value = serde_json::from_str(text.trim()).unwrap();
             meta["payload"]["timestamp"] = json!("2026-10-07T10:00:00Z");
@@ -1384,10 +1385,22 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         let lock = crate::locked_state_dir::test_locks::hold(&state);
         let first = Arc::new(sampled_scan::SharedCache::default());
         first.durable_begin_pass(source, &index_path, &namespace, capture);
+        let mut initial = ScanIndex::default();
+        if !v2 && arm == "view_changed" {
+            initial.files.insert(
+                local_index_key(&fixture.file.0),
+                serde_json::from_value(json!({
+                    "size_bytes":0, "modified_unix_seconds":0,
+                    "source_file_fingerprint":"prior-legacy-source",
+                    "last_snapshot_fingerprint":"prior-legacy-ack"
+                }))
+                .unwrap(),
+            );
+        }
         let (mut index, _, modes, _) = production_scan_at_with_setup(
             &fixture,
             source,
-            ScanIndex::default(),
+            initial,
             Some(first.clone()),
             &namespace.0,
             NOW,
