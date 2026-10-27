@@ -22345,6 +22345,9 @@ mod tests {
                 mod unhealthy_retry_reread_acceptance_tests {
                     include!("snapshot_sync/unhealthy_retry_reread_acceptance_tests.rs");
                 }
+                mod oversized_discovery_pipeline_tests {
+                    include!("snapshot_sync/oversized_discovery_pipeline_tests.rs");
+                }
                 mod structural_reread_guard_tests {
                     include!("snapshot_sync/structural_reread_guard_tests.rs");
                 }
