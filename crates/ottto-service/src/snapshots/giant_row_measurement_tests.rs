@@ -245,6 +245,7 @@ fn parse(f: &Fixture) -> Observation {
                 scan_complete: true,
                 opened_object_identity: String::new(),
                 unresolvable: None,
+                opened_witness: None,
             },
         )]))))
     } else {

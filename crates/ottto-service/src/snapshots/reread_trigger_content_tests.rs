@@ -1,15 +1,18 @@
 // Ron's re-read rule at the real scan seam, for Claude and Codex: only
-// content (size, sampled bytes) or output-relevant inputs may trigger a
-// re-read. ctime, xattr, mode, hard-link and mtime flips are cross-checks
+// content (size, mtime, sampled bytes) or output-relevant inputs may trigger
+// a re-read. ctime-only changes (xattr, mode, hard link) are cross-checks
 // that re-validate the bounded content samples and never read the file
-// again on their own. A new object (device, inode, birth) is output-relevant:
-// the parse consumes it. All fixtures are synthetic and content-free.
+// again on their own. mtime stays a trigger: it moves only on content
+// writes, including a truncate/regrow the samples cannot see. A new object
+// (device, inode, birth) is output-relevant: the parse consumes it. All
+// fixtures are synthetic and content-free.
 use super::*;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 const CLAUDE_LINE: &str = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
 const CLAUDE_APPEND: &str = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a2\",\"timestamp\":\"2026-07-22T08:00:02Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
+const CLAUDE_MIDDLE: &str = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a3\",\"timestamp\":\"2026-07-22T08:00:01.500Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_3\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":21,\"output_tokens\":5,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
 const CODEX_HEADER: &str = "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-aaaa-7000-9000-aaaaaaaaaaaa\"}}\n";
 const CODEX_USAGE: &str = "{\"timestamp\":\"2026-07-22T08:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":12,\"output_tokens\":4},\"model\":\"gpt-5.5\"}}}\n";
 const CODEX_APPEND: &str = "{\"timestamp\":\"2026-07-22T08:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":19,\"output_tokens\":7},\"model\":\"gpt-5.5\"}}}\n";
@@ -215,12 +218,6 @@ fn metadata_only_changes_never_trigger_a_reread() {
         );
         assert_eq!(fixture.rescan(), 0, "{name}: hard link reads nothing");
         assert_eq!(fixture.fingerprint(), stored, "{name}: hard link");
-
-        // A touch moves mtime and ctime only.
-        tick();
-        fixture.set_modified(SystemTime::now() + std::time::Duration::from_secs(5));
-        assert_eq!(fixture.rescan(), 0, "{name}: touch reads nothing");
-        assert_eq!(fixture.fingerprint(), stored, "{name}: touch");
     }
 }
 
@@ -268,10 +265,12 @@ fn same_bytes_under_a_new_inode_read_once_for_its_object_inputs() {
                 "{name}: the read stores the live witness"
             );
             assert_eq!(fixture.rescan(), 0, "{name}: then settled, no loop");
-            // A metadata-only change on the new object reads nothing.
+            // A ctime-only change on the new object reads nothing.
             tick();
-            fixture.set_modified(SystemTime::now() + std::time::Duration::from_secs(5));
-            assert_eq!(fixture.rescan(), 0, "{name}: touch after replace");
+            let mode = fixture.metadata().permissions().mode();
+            fs::set_permissions(&fixture.path, fs::Permissions::from_mode(mode ^ 0o004))
+                .expect("chmod");
+            assert_eq!(fixture.rescan(), 0, "{name}: chmod after replace");
         }
     }
 }
@@ -296,6 +295,14 @@ fn real_content_changes_are_reread() {
         assert_eq!(fixture.rescan(), 1, "{name}: append is re-read");
         assert_ne!(fixture.fingerprint(), stored, "{name}: append");
         assert_eq!(fixture.rescan(), 0, "{name}: settled after the append");
+
+        // Touch: an explicit content-time change is re-read, then settles.
+        let stored = fixture.fingerprint();
+        tick();
+        fixture.set_modified(SystemTime::now() + std::time::Duration::from_secs(5));
+        assert_eq!(fixture.rescan(), 1, "{name}: touch is re-read");
+        assert_ne!(fixture.fingerprint(), stored, "{name}: touch");
+        assert_eq!(fixture.rescan(), 0, "{name}: settled after the touch");
 
         // Same-size edit inside the sampled bytes, mtime restored: the
         // content samples differ, so the cross-check reads.
@@ -358,4 +365,239 @@ fn ctime_mismatch_revalidates_samples_without_a_full_read() {
         assert_eq!(fixture.rescan(), 0, "{name}: samples match, no Full read");
         assert_eq!(fixture.fingerprint(), stored, "{name}: middle rewrite");
     }
+}
+
+/// A truncate/regrow on the same inode to the same length, leaving the
+/// first and last 4 KiB byte-identical but changing a usage row in between,
+/// with its natural mtime: the samples cannot see it, mtime does. Re-read.
+#[test]
+fn truncate_regrow_with_unchanged_samples_is_reread_by_mtime() {
+    for (source, name, _) in sources() {
+        let padding = format!(
+            "{{\"type\":\"ottto_reread_padding\",\"pad\":\"{}\"}}\n",
+            "a".repeat(FILE_CONTENT_SAMPLE_BYTES + 512)
+        );
+        let (head, middle, edited, tail) = match source {
+            SnapshotSource::Codex => (
+                CODEX_HEADER.to_string(),
+                CODEX_USAGE.replace("\"input_tokens\":12", "\"input_tokens\":15"),
+                CODEX_USAGE.replace("\"input_tokens\":12", "\"input_tokens\":16"),
+                CODEX_APPEND,
+            ),
+            _ => (
+                CLAUDE_LINE.to_string(),
+                CLAUDE_MIDDLE.to_string(),
+                CLAUDE_MIDDLE.replace("\"input_tokens\":21", "\"input_tokens\":22"),
+                CLAUDE_APPEND,
+            ),
+        };
+        let body = format!("{head}{padding}{middle}{padding}{tail}");
+        let regrown = format!("{head}{padding}{edited}{padding}{tail}");
+        assert_eq!(body.len(), regrown.len());
+        assert_ne!(body, regrown);
+        let mut fixture = Fixture::settled(source, &format!("{name}-regrow"), body.as_bytes());
+        let stored = fixture.fingerprint();
+        let original = fixture.metadata();
+        tick();
+        // `File::create` truncates the same inode, then regrows it.
+        fs::File::create(&fixture.path)
+            .and_then(|mut file| file.write_all(regrown.as_bytes()))
+            .expect("truncate and regrow");
+        let regrown_metadata = fixture.metadata();
+        assert_eq!(
+            (original.dev(), original.ino(), original.len()),
+            (
+                regrown_metadata.dev(),
+                regrown_metadata.ino(),
+                regrown_metadata.len()
+            ),
+            "{name}: same object and length"
+        );
+        let sample = FILE_CONTENT_SAMPLE_BYTES;
+        assert_eq!(body.as_bytes()[..sample], regrown.as_bytes()[..sample]);
+        assert_eq!(
+            body.as_bytes()[body.len() - sample..],
+            regrown.as_bytes()[regrown.len() - sample..]
+        );
+        assert_eq!(fixture.rescan(), 1, "{name}: truncate/regrow is re-read");
+        assert_ne!(fixture.fingerprint(), stored, "{name}: truncate/regrow");
+        assert_eq!(fixture.rescan(), 0, "{name}: then settled");
+    }
+}
+
+const FORK_CHILD: &str = "019fc428-0000-7000-8000-0000000000c1";
+const FORK_PARENT: &str = "019fc428-0000-7000-8000-0000000000c2";
+
+fn jsonl(values: &[Value]) -> String {
+    values
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+/// A settled parent and a legacy fork child whose ownership uses the
+/// parent's prefix ledger (the shape of
+/// `codex_parent_prefix_ledger_survives_paged_scan_and_index_restart`).
+fn write_codex_fork(root: &Path) -> (PathBuf, PathBuf) {
+    let parent_turn = json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"reread-parent-turn","model":"gpt-5.6-sol"}});
+    let parent_usage = codex_test_token_line(
+        "2026-08-02T08:00:02Z",
+        None,
+        (100, 80, 10, 2),
+        Some((100, 80, 10, 2)),
+    );
+    let child = root.join(format!("rollout-2026-08-02T08-00-00-{FORK_CHILD}.jsonl"));
+    fs::write(
+        &child,
+        jsonl(&[
+            json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":FORK_CHILD,"forked_from_id":FORK_PARENT,"thread_source":"user"}}),
+            parent_turn.clone(),
+            parent_usage.clone(),
+            json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"reread-child-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:20:02Z",
+                None,
+                (125, 98, 14, 3),
+                Some((25, 18, 4, 1)),
+            ),
+        ]),
+    )
+    .expect("write fork child");
+    let parent = root.join(format!("rollout-2026-08-02T08-10-00-{FORK_PARENT}.jsonl"));
+    fs::write(
+        &parent,
+        jsonl(&[
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":FORK_PARENT,"thread_source":"user"}}),
+            parent_turn,
+            parent_usage,
+            json!({"timestamp":"2026-08-02T08:30:01Z","type":"turn_context","payload":{"turn_id":"reread-parent-later","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:30:02Z",
+                None,
+                (150, 115, 18, 3),
+                Some((50, 35, 8, 1)),
+            ),
+        ]),
+    )
+    .expect("write fork parent");
+    (parent, child)
+}
+
+/// Scans until the child is emitted (parent prepass and restarts included).
+fn codex_fork_child_usage(root: &Path, index: &mut ScanIndex, hour: u32) -> (u64, u64, u64) {
+    for cycle in 0..8 {
+        let mut scan = scan_source_roots(
+            SnapshotSource::Codex,
+            &[root.to_path_buf()],
+            index,
+            &format!("2026-08-02T{hour:02}:{cycle:02}:00Z"),
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("codex fork scan");
+        let child = scan
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_session_id == FORK_CHILD)
+            .map(|item| (item.input_tokens, item.output_tokens, item.request_count));
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);
+        if let Some(child) = child {
+            return child;
+        }
+    }
+    panic!("fork child never converged");
+}
+
+/// Reviewer P1-1: a ctime-only parent change (chmod) must keep the parent's
+/// prefix ledger valid for a child that really changed. The parent is not
+/// re-read (its scan fingerprint adopts the stored ctime), so a dropped
+/// ledger would hold the child's fresh usage with nothing to repair it.
+#[test]
+fn codex_parent_ctime_only_change_keeps_its_ledger_for_a_changed_child() {
+    let home = temp_dir("reread-codex-parent-ledger");
+    let root = home.join("transcripts");
+    fs::create_dir_all(&root).expect("create root");
+    let (parent, child) = write_codex_fork(&root);
+    let mut index = ScanIndex::default();
+    codex_fork_child_usage(&root, &mut index, 9);
+    let ledger = index.codex_parent_ownership_ledgers[FORK_PARENT].clone();
+    assert!(ledger.scan_complete && ledger.opened_witness.is_some());
+    let settled = scan_source_roots(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&root),
+        &mut index,
+        "2026-08-02T10:00:00Z",
+        BACKFILL_WINDOW_DAYS,
+    )
+    .expect("settled scan");
+    assert_eq!(settled.scanned_file_count, 0, "settled before the change");
+    let parent_fingerprint = index.files[&local_index_key(&parent)]
+        .source_file_fingerprint
+        .clone();
+
+    let before = ctime(&fs::metadata(&parent).expect("stat parent"));
+    tick();
+    let mode = fs::metadata(&parent).expect("stat").permissions().mode();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(mode ^ 0o004)).expect("chmod");
+    assert_ne!(ctime(&fs::metadata(&parent).expect("stat")), before);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&child)
+        .and_then(|mut file| {
+            file.write_all(
+                jsonl(&[
+                    json!({"timestamp":"2026-08-02T08:40:01Z","type":"turn_context","payload":{"turn_id":"reread-child-later","model":"gpt-5.6-sol"}}),
+                    codex_test_token_line(
+                        "2026-08-02T08:40:02Z",
+                        None,
+                        (175, 138, 20, 4),
+                        Some((50, 40, 6, 1)),
+                    ),
+                ])
+                .as_bytes(),
+            )
+        })
+        .expect("append child");
+
+    let mut changed = scan_source_roots(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&root),
+        &mut index,
+        "2026-08-02T10:01:00Z",
+        BACKFILL_WINDOW_DAYS,
+    )
+    .expect("scan after parent chmod and child append");
+    assert_eq!(
+        changed.scanned_file_count, 1,
+        "only the appended child is read; the parent is not re-read"
+    );
+    let child_after = changed
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.source_session_id == FORK_CHILD)
+        .map(|item| (item.input_tokens, item.output_tokens, item.request_count))
+        .expect("the child's fresh usage is emitted, not held");
+    assert_eq!(
+        changed.ownership_incomplete_file_count, 0,
+        "the child is not held"
+    );
+    finalize_scan_after_policy(SnapshotSource::Codex, &mut changed, &mut index);
+    assert_eq!(
+        index.files[&local_index_key(&parent)].source_file_fingerprint,
+        parent_fingerprint,
+        "the parent's scan fingerprint is unchanged"
+    );
+    let rewitnessed = &index.codex_parent_ownership_ledgers[FORK_PARENT];
+    assert_eq!(rewitnessed.signatures, ledger.signatures);
+    assert!(rewitnessed.scan_complete);
+
+    // Oracle: a fresh index over the same bytes.
+    let mut oracle = ScanIndex::default();
+    assert_eq!(
+        child_after,
+        codex_fork_child_usage(&root, &mut oracle, 11),
+        "ownership and output match a full fresh read"
+    );
+    let _ = fs::remove_dir_all(home);
 }

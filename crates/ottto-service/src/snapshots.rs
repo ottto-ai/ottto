@@ -2703,6 +2703,12 @@ struct CodexParentOwnershipLedger {
     /// children retry instead of treating the newly inherited suffix as local.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     opened_object_identity: String,
+    /// The live witness of that same open. A later open of the same object
+    /// with the same mtime and content samples still revalidates the ledger
+    /// when only ctime moved (chmod, xattr, hard link). Absent on older
+    /// ledgers, which keep the exact identity comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opened_witness: Option<OpenedObjectWitness>,
     /// PR-P: a step-map-only witness that this parent yields no usable ledger
     /// (never persisted, never `scan_complete`, so every existing reader
     /// ignores it). A ledger insert under the same key replaces it.
@@ -17987,6 +17993,7 @@ impl SnapshotAccumulator {
                     && !self.codex_physical_signatures.is_empty(),
                 opened_object_identity: String::new(),
                 unresolvable: None,
+                opened_witness: None,
             },
         ))
     }
@@ -20989,6 +20996,16 @@ fn codex_parent_open_match(
     census: CodexParentCensus<'_>,
     found: CodexCensusMatch<'_>,
 ) -> Result<(PathBuf, String, File), CodexParentUnresolvable> {
+    codex_parent_open_match_witnessed(census, found)
+        .map(|(path, identity, _witness, file)| (path, identity, file))
+}
+
+/// `codex_parent_open_match` plus the live opened witness, for the
+/// content-qualified cross-scan ledger check.
+fn codex_parent_open_match_witnessed(
+    census: CodexParentCensus<'_>,
+    found: CodexCensusMatch<'_>,
+) -> Result<(PathBuf, String, Option<OpenedObjectWitness>, File), CodexParentUnresolvable> {
     use CodexParentUnresolvable::*;
     // More than one physical rollout claiming the same source session id is
     // ambiguous evidence, even if one happens to match the old witness.
@@ -21035,7 +21052,12 @@ fn codex_parent_open_match(
         opened_witness: None,
     };
     let file = open_candidate_file(SnapshotSource::Codex, &mut candidate).map_err(|_| Absent)?;
-    Ok((candidate.path, candidate.opened_object_identity, file))
+    Ok((
+        candidate.path,
+        candidate.opened_object_identity,
+        candidate.opened_witness,
+        file,
+    ))
 }
 
 /// Uncached: one census pass and one no-follow open of the parent's single
@@ -23357,10 +23379,28 @@ fn codex_parent_step_start(
 /// retryable until a normal parent parse publishes fresh structural evidence.
 /// PR-P: one census pass for every eligible ledger, then one open per
 /// distinct resolved id; the fold is PR-1's.
+#[cfg(test)]
 fn validated_codex_parent_ownership_ledgers(
     index: &ScanIndex,
     census: CodexParentCensus<'_>,
 ) -> BTreeMap<String, CodexParentOwnershipLedger> {
+    validate_codex_parent_ownership_ledgers(index, census).0
+}
+
+/// The page-start step map of validated parent ledgers, plus the index
+/// ledgers (by index key) to re-witness at the live open. A ledger whose
+/// parent kept its object, birth, mtime and fresh content samples while only
+/// ctime moved (chmod, xattr, hard link) still validates (Ron's re-read rule,
+/// across scans): it is re-witnessed at the live identity, so this page's
+/// after-parse fence and later scans compare the parent as it is now, and
+/// the parent itself is never re-read for a metadata-only change.
+fn validate_codex_parent_ownership_ledgers(
+    index: &ScanIndex,
+    census: CodexParentCensus<'_>,
+) -> (
+    BTreeMap<String, CodexParentOwnershipLedger>,
+    Vec<(String, CodexParentOwnershipLedger)>,
+) {
     let eligible = index
         .codex_parent_ownership_ledgers
         .iter()
@@ -23369,50 +23409,86 @@ fn validated_codex_parent_ownership_ledgers(
                 && !ledger.signatures.is_empty()
                 && !ledger.opened_object_identity.is_empty()
         })
-        .map(|(session_id, ledger)| (resolve_codex_identity(session_id.as_str()), ledger))
+        .map(|(key, ledger)| (resolve_codex_identity(key.as_str()), key, ledger))
         .collect::<Vec<_>>();
     let mut wanted = eligible
         .iter()
-        .map(|(id, _)| id.as_str())
+        .map(|(id, ..)| id.as_str())
         .collect::<Vec<_>>();
     wanted.sort_unstable();
     wanted.dedup();
     if wanted.is_empty() {
-        return BTreeMap::new();
+        return (BTreeMap::new(), Vec::new());
     }
-    // The file is dropped at once, as PR-1 drops it per ledger.
+    let mut stored_witnesses = BTreeMap::<&str, Vec<&OpenedObjectWitness>>::new();
+    for (session_id, _, ledger) in &eligible {
+        if let Some(witness) = ledger.opened_witness.as_ref() {
+            stored_witnesses
+                .entry(session_id.as_str())
+                .or_default()
+                .push(witness);
+        }
+    }
+    // The file is dropped at once, as PR-1 drops it per ledger. Each open
+    // yields its live identity and witness, plus the identity of each
+    // ledger's own witnessed open that differs from it only by ctime.
     let opened = codex_parent_census_matches(census, &wanted)
         .into_iter()
-        .map(|found| {
-            codex_parent_open_match(census, found)
-                .ok()
-                .map(|(_path, identity, _file)| identity)
+        .zip(&wanted)
+        .map(|(found, session_id)| {
+            let (_path, identity, live, mut file) =
+                codex_parent_open_match_witnessed(census, found).ok()?;
+            let mut qualified = Vec::new();
+            if let Some(live) = live.as_ref() {
+                for stored in stored_witnesses.get(session_id).into_iter().flatten() {
+                    if *stored != live && stored.same_content_object(live) {
+                        if let Ok(Some(earlier)) = content_qualified_identity(&mut file, stored) {
+                            qualified.push(earlier);
+                        }
+                    }
+                }
+            }
+            Some((identity, live, qualified))
         })
         .collect::<Vec<_>>();
     // PR-1's fold: a matching identity validates; two different ledgers
     // under one resolved id conflict and are both dropped.
     let mut validated = BTreeMap::new();
+    let mut rewitnessed = Vec::new();
     let mut conflicts = BTreeSet::new();
-    for (session_id, ledger) in &eligible {
+    for (session_id, key, ledger) in &eligible {
         if conflicts.contains(session_id.as_str()) {
             continue;
         }
         let Ok(at) = wanted.binary_search(&session_id.as_str()) else {
             continue; // unreachable: every eligible id is wanted
         };
-        if opened[at].as_deref() == Some(ledger.opened_object_identity.as_str()) {
-            if validated
-                .get(session_id.as_str())
-                .is_some_and(|existing| existing != *ledger)
-            {
-                validated.remove(session_id.as_str());
-                conflicts.insert(session_id.clone());
-            } else {
-                validated.insert(session_id.clone(), (*ledger).clone());
-            }
+        let Some((identity, live, qualified)) = opened[at].as_ref() else {
+            continue;
+        };
+        let ledger = if ledger.opened_object_identity == *identity {
+            (*ledger).clone()
+        } else if qualified.contains(&ledger.opened_object_identity) {
+            let mut current = (*ledger).clone();
+            current.opened_object_identity = identity.clone();
+            current.opened_witness = live.clone();
+            rewitnessed.push(((*key).clone(), current.clone()));
+            current
+        } else {
+            continue;
+        };
+        if validated
+            .get(session_id.as_str())
+            .is_some_and(|existing| *existing != ledger)
+        {
+            validated.remove(session_id.as_str());
+            conflicts.insert(session_id.clone());
+        } else {
+            validated.insert(session_id.clone(), ledger);
         }
     }
-    validated
+    rewitnessed.retain(|(key, _)| !conflicts.contains(&resolve_codex_identity(key)));
+    (validated, rewitnessed)
 }
 
 /// L-1 release (§d.1.3) of every owner whose recorded members all left the
@@ -25227,10 +25303,12 @@ impl OwnedSourceScan {
         // which this page no longer writes until it finishes.
         let codex_parent_identities = CodexParentIdentities::new(source, index.traversal.as_ref());
         let codex_parent_ownership_ledgers = (source == SnapshotSource::Codex).then(|| {
-            Arc::new(Mutex::new(validated_codex_parent_ownership_ledgers(
+            let (validated, rewitnessed) = validate_codex_parent_ownership_ledgers(
                 index,
                 codex_parent_identities.census(index),
-            )))
+            );
+            index.codex_parent_ownership_ledgers.extend(rewitnessed);
+            Arc::new(Mutex::new(validated))
         });
         if source == SnapshotSource::ClaudeCode {
             claude_retry_queue_due_families(index, collected_at);
@@ -32319,8 +32397,9 @@ impl OwnedJsonlParser {
         // terminal loss rather than a reason to discard the whole file forever.
         recognized_usage_drop_count =
             recognized_usage_drop_count.saturating_add(report.over_line_cap_count);
-        let observed_after_read = opened_object_identity(source, reader.get_mut())
-            .with_context(|| format!("revalidate opened JSONL {}", path.display()))?;
+        let (observed_after_read, observed_witness) =
+            opened_object_identity_and_witness(source, reader.get_mut())
+                .with_context(|| format!("revalidate opened JSONL {}", path.display()))?;
         // A cursor job read only up to its frozen extent; appended bytes
         // belong to the next tail, so its object may have grown. Only a job
         // whose prefix certificate passed against the held FD carries
@@ -32419,6 +32498,10 @@ impl OwnedJsonlParser {
         let mut codex_parent_ownership_ledger = accumulator.codex_parent_ownership_ledger();
         if let Some((_, ledger)) = codex_parent_ownership_ledger.as_mut() {
             ledger.opened_object_identity = expected_opened_object_identity.to_string();
+            // Only a witness of exactly the expected object; a grown cursor
+            // read keeps the exact identity comparison.
+            ledger.opened_witness =
+                observed_witness.filter(|_| observed_after_read == expected_opened_object_identity);
         }
         // PR-P: what this file's children see when it is their parent. Own-byte
         // causes first; an inherited deferral suppresses only `ParentHeld`.
@@ -36978,13 +37061,15 @@ struct CandidateFile {
 }
 
 /// The object inputs of one opened-object identity (device, inode, ctime),
-/// the file birth time and a digest of the content it sampled (length, head
-/// and tail samples). Stored with the scan fingerprint it produced so that a
-/// later open of the same object whose content samples still match reuses
-/// the stored ctime and mtime: a ctime, xattr, mode, hard-link or mtime flip
-/// is then re-validated by content and never triggers a re-read on its own.
-/// Device, inode and birth stay triggers: the parse consumes them (Claude
-/// request births and money birth cutoffs, Codex created-thread matching).
+/// the file birth and modification times and a digest of the content it
+/// sampled (length, head and tail samples). Stored with the scan fingerprint
+/// (and a Codex parent ledger) it produced so that a later open of the same
+/// object with the same mtime and content samples reuses the stored ctime: a
+/// ctime-only change (chmod, xattr, hard link, Spotlight, backup) is then
+/// re-validated by content and never triggers a re-read on its own. Device,
+/// inode and birth stay triggers: the parse consumes them (Claude request
+/// births and money birth cutoffs, Codex created-thread matching). mtime
+/// stays a trigger: it moves only on content writes (truncate/regrow too).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OpenedObjectWitness {
     device: u64,
@@ -36993,7 +37078,29 @@ pub(crate) struct OpenedObjectWitness {
     changed_nanos: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     birth_nanos: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modified_nanos: Option<u64>,
     content: String,
+}
+
+impl OpenedObjectWitness {
+    /// The same object, birth, mtime and sampled content (length included):
+    /// only ctime may differ. The cross-scan rule for every reuse decision.
+    fn same_content_object(&self, other: &Self) -> bool {
+        (
+            self.device,
+            self.inode,
+            self.birth_nanos,
+            self.modified_nanos,
+            &self.content,
+        ) == (
+            other.device,
+            other.inode,
+            other.birth_nanos,
+            other.modified_nanos,
+            &other.content,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -41184,6 +41291,7 @@ fn opened_object_identity_and_witness(
         changed_seconds: metadata.ctime(),
         changed_nanos: metadata.ctime_nsec(),
         birth_nanos: metadata.created().ok().and_then(unix_nanos),
+        modified_nanos: metadata.modified().ok().and_then(unix_nanos),
         content: opened_content_digest(len, &samples),
     });
     #[cfg(not(unix))]
@@ -41193,15 +41301,15 @@ fn opened_object_identity_and_witness(
     Ok((identity, witness))
 }
 
-/// Ron's re-read rule: only content (size, sampled bytes) or output-relevant
-/// inputs may trigger a re-read; ctime, xattr, mode, hard-link and mtime
-/// flips never do. When this path's stored witness describes the same object
-/// (device, inode, birth) and sampled the same length and head/tail bytes,
-/// the fingerprint reuses the stored ctime and mtime, so it equals the
-/// stored fingerprint and the candidate gate skips. A ctime or mtime
-/// mismatch therefore only costs this bounded sample re-read, never a Full
-/// read. A size or sampled-byte change, or a new object (whose device,
-/// inode and birth the parse consumes), keeps the live identity and reads.
+/// Ron's re-read rule: only content (size, mtime, sampled bytes) or
+/// output-relevant inputs may trigger a re-read; ctime, xattr, mode and
+/// hard-link flips never do. When this path's stored witness describes the
+/// same object (device, inode, birth), mtime, length and head/tail bytes,
+/// the fingerprint reuses the stored ctime, so it equals the stored
+/// fingerprint and the candidate gate skips. A ctime-only mismatch therefore
+/// only costs this bounded sample re-read, never a Full read. A size, mtime
+/// or sampled-byte change, or a new object (whose device, inode and birth
+/// the parse consumes), keeps the live identity and reads.
 /// Returns the opened-object identity to fingerprint with, if adopted.
 fn adopt_unchanged_content_witness(
     source: SnapshotSource,
@@ -41222,34 +41330,36 @@ fn adopt_unchanged_content_witness(
     ) else {
         return Ok(None);
     };
-    let same_object = (stored.device, stored.inode, stored.birth_nanos)
-        == (current.device, current.inode, current.birth_nanos);
-    if !same_object || entry.size_bytes != candidate.size_bytes || stored.content != current.content
-    {
-        return Ok(None);
-    }
-    if stored == current
+    let unchanged_content = stored.same_content_object(current)
+        && entry.size_bytes == candidate.size_bytes
         && entry.modified_unix_seconds == candidate.modified_unix_seconds
-        && stored_nanos == candidate.modified_unix_nanos
-    {
-        // Nothing moved: the live identity already reproduces the stored one.
+        && stored_nanos == candidate.modified_unix_nanos;
+    if !unchanged_content || stored == current {
+        // A content change reads; with nothing moved the live identity
+        // already reproduces the stored one.
         return Ok(None);
     }
-    file.seek(SeekFrom::Start(0))?;
-    let samples = read_opened_content_samples(file, candidate.size_bytes)?;
-    file.seek(SeekFrom::Start(0))?;
-    // Fresh samples, so bytes written after the open still force a read.
-    if opened_content_digest(candidate.size_bytes, &samples) != stored.content {
+    let Some(identity) = content_qualified_identity(file, stored)? else {
         return Ok(None);
-    }
-    candidate.modified_unix_seconds = entry.modified_unix_seconds;
-    candidate.modified_unix_nanos = stored_nanos;
+    };
     candidate.opened_witness = Some(stored.clone());
-    Ok(Some(opened_object_identity_from(
-        candidate.size_bytes,
-        Some(stored),
-        &samples,
-    )))
+    Ok(Some(identity))
+}
+
+/// The opened-object identity `file` had when `stored` was witnessed, if its
+/// fresh content samples (taken now, so bytes written after the open still
+/// count) match: the identity with only ctime restored. The caller has
+/// already matched object, birth and mtime (`same_content_object`).
+fn content_qualified_identity(
+    file: &mut File,
+    stored: &OpenedObjectWitness,
+) -> std::io::Result<Option<String>> {
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(0))?;
+    let samples = read_opened_content_samples(file, len)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok((opened_content_digest(len, &samples) == stored.content)
+        .then(|| opened_object_identity_from(len, Some(stored), &samples)))
 }
 
 fn unix_seconds(value: SystemTime) -> Option<u64> {
@@ -48995,6 +49105,7 @@ mod tests {
             scan_complete: true,
             opened_object_identity: String::new(),
             unresolvable: None,
+            opened_witness: None,
         };
         let ledgers = BTreeMap::from([(parent.to_string(), parent_ledger)]);
         let unresolved =
@@ -77773,6 +77884,7 @@ mod tests {
                 scan_complete: true,
                 opened_object_identity: String::new(),
                 unresolvable: None,
+                opened_witness: None,
             },
         )]);
         parse_codex_test_with_ledgers(path, ledgers)
@@ -77921,6 +78033,7 @@ mod tests {
                 scan_complete: true,
                 opened_object_identity: String::new(),
                 unresolvable: None,
+                opened_witness: None,
             },
         )]);
         let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
@@ -80026,6 +80139,7 @@ mod tests {
                 scan_complete: true,
                 opened_object_identity: "object".to_string(),
                 unresolvable: None,
+                opened_witness: None,
             },
         );
         assert!(index.canonicalize_codex_identity_keys());
@@ -80414,6 +80528,7 @@ mod tests {
                     scan_complete: true,
                     opened_object_identity: String::new(),
                     unresolvable: None,
+                    opened_witness: None,
                 },
             )])
         }
@@ -87009,7 +87124,7 @@ pub(crate) mod cache_adapter_tests {
 // Closed owned-field inventory for optional scan overlap admission.
 crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, selector_sources, usage, reasoning_effort);
 crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity, opened_witness);
-crate::heap_layout_bound::fields!(OpenedObjectWitness; device, inode, changed_seconds, changed_nanos, birth_nanos, content);
+crate::heap_layout_bound::fields!(OpenedObjectWitness; device, inode, changed_seconds, changed_nanos, birth_nanos, modified_nanos, content);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; current, previous_windows, confirmed_absent_members);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPendingWindow; version, census_window_end, account_identifier_hash, evidence_request_count, census_complete, members, member_requests, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountRequestSet; prefixes, fingerprint, identity_revision);
@@ -87033,7 +87148,7 @@ crate::heap_layout_bound::fields!(ClaudeProofCorrectionCandidate; index_key, roo
 crate::heap_layout_bound::fields!(ClaudeCutoffCorrectionCandidate; index_key, root, member, proof, revision);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyPending; census_window_end, member_request_id_hashes, member_occurrences, invalid, idless_revision);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyWitness; evidence_fingerprint, member_request_id_fingerprints, member_occurrence_fingerprints, assigned_request_id_fingerprints, legacy_excluded_request_id_hashes, legacy_exclusion_evidence_fingerprint, legacy_owner_roots);
-crate::heap_layout_bound::fields!(CodexParentOwnershipLedger; signatures, scan_complete, opened_object_identity, unresolvable);
+crate::heap_layout_bound::fields!(CodexParentOwnershipLedger; signatures, scan_complete, opened_object_identity, opened_witness, unresolvable);
 crate::heap_layout_bound::fields!(CodexPathSidecarCandidate; identity, recorded_evidence, created_thread, identity_conflict, detail_incomplete, rollout_file_matches, parent, child_created_at_nanos, projected_next_ordinal);
 crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);

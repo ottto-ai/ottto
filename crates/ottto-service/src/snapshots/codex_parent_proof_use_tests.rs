@@ -185,6 +185,7 @@ fn complete_ledger() -> BTreeMap<String, CodexParentOwnershipLedger> {
             scan_complete: true,
             opened_object_identity: String::new(),
             unresolvable: None,
+            opened_witness: None,
         },
     )])
 }
