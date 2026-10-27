@@ -34,7 +34,16 @@ def main():
         if len(bases) > 1:
             raise RuntimeError("ambiguous PR base: supply money_equivalence_base")
         ref = "origin/" + (next(iter(bases)) if bases else "main")
-    base_sha = output(["git", "rev-parse", "--verify", "--end-of-options", ref + "^{commit}"])
+    if ref.startswith("-"):
+        raise RuntimeError("comparison ref cannot be a git option")
+    resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", ref + "^{commit}"],
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if resolved.returncode:
+        # Also accept ordinary branch names and explicit pull-request refs.
+        command(["git", "fetch", "--no-tags", "origin", ref])
+        base_sha = output(["git", "rev-parse", "FETCH_HEAD^{commit}"])
+    else:
+        base_sha = resolved.stdout.strip()
     head_sha = output(["git", "rev-parse", "HEAD"])
     manifest = {"base": base_sha, "head": head_sha, "base_ref": ref,
                 "arms": ["retained_ram_tail_or_unchanged", "cold_full"],

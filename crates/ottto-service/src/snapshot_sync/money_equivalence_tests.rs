@@ -217,6 +217,16 @@ fn claude_case(name: &str) {
                     .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
                 std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
                 std::fs::write(&bad, "{broken-json\n").unwrap();
+                let health = crate::claude_local_otel::load_claude_api_request_evidence_report(
+                    &c.support,
+                    [ROOT.to_owned()],
+                )
+                .health;
+                assert_eq!(health.malformed_lines, 1);
+                assert!(
+                    !health.is_complete(),
+                    "failed telemetry decode must be witnessed"
+                );
                 let failed = compare_claude(&c, &scanner, prior.clone(), (0, 0, 1));
                 c.evidence(&[api("r1", 10, 100)], &[]);
                 let healthy = compare_claude(&c, &scanner, prior, (0, 0, 1));
@@ -315,10 +325,22 @@ fn codex_case(legacy: bool) {
         assert!(index.files.values().all(|e| e.codex_counting_v2 != legacy));
         index
     };
-    let prior = c.reload(&mut index);
+    let mut prior = c.reload(&mut index);
     append(&path, &codex_rows("turn-b", 30));
     input_clock(&path);
     let _cutover = crate::snapshots::TestCutover::set(0);
+    if legacy {
+        // The old binary's cutover differs, so its RAM reduction cannot be
+        // reused. Warm the upgraded binary from the actual Legacy ACK facts,
+        // then exercise its next page's retained Tail under that same rule.
+        let (mut upgraded, scan, modes) = other_page(&c, &scanner, source, prior);
+        assert_eq!(modes, (1, 0, 0));
+        assert!(!scan.snapshots.is_empty());
+        assert!(upgraded.files.values().all(|e| !e.codex_counting_v2));
+        prior = c.reload(&mut upgraded);
+        append(&path, &codex_rows("turn-c", 40));
+        input_clock(&path);
+    }
     save_inputs(&c);
     let (tail_index, tail, modes) = other_page(&c, &scanner, source, prior.clone());
     assert_eq!(modes, (0, 1, 0), "must reuse retained Codex reduction");
