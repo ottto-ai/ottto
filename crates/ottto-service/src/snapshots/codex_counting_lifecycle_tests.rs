@@ -336,6 +336,8 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     };
     let key = local_index_key(&path);
     let old_key = format!("/synthetic/sessions/rollout-2026-10-01T10-00-00-{SESSION}.jsonl");
@@ -414,6 +416,8 @@ fn archived_candidate() -> CandidateFile {
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     }
 }
 
