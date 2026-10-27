@@ -2002,6 +2002,14 @@ pub(super) mod tests {
         previous: &ScanIndex,
         hold_owner: Option<&str>,
     ) -> ScanIndex {
+        working.activate_upload_context(
+            if previous.files.is_empty() {
+                "counting-A"
+            } else {
+                "counting-B"
+            }
+            .into(),
+        );
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
         if let Some(owner) = hold_owner {
             result.hold_codex_groups(
@@ -2018,10 +2026,19 @@ pub(super) mod tests {
             .map(|item| item.snapshot_fingerprint.clone())
             .collect::<BTreeSet<_>>();
         let path = root.join(file);
-        working
-            .committable_subset(previous, &accepted, &BTreeMap::new())
-            .save(&path)
-            .unwrap();
+        let bodies = result
+            .snapshots
+            .iter()
+            .map(|item| {
+                (
+                    item.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(item),
+                )
+            })
+            .collect();
+        let mut selected = working.committable_subset(previous, &accepted, &BTreeMap::new());
+        selected.settle_upload_contexts(&result, &accepted, &bodies, &BTreeSet::new());
+        selected.save(&path).unwrap();
         ScanIndex::load(&path).unwrap()
     }
     #[test]
@@ -2067,6 +2084,10 @@ pub(super) mod tests {
         for key in &keys {
             assert!(previous.files[key].codex_counting_v2, "saved V2 ACK");
             assert!(previous.files[key].last_snapshot_fingerprint.is_some());
+            assert_eq!(
+                previous.settled_upload_context(&previous.files[key]),
+                Some(Sha256::digest(b"counting-A").into())
+            );
         }
         // The held and settled outcomes are alternatives: each starts from its
         // own copy of the saved index the cycle loaded.
@@ -2093,12 +2114,20 @@ pub(super) mod tests {
         for key in &keys {
             assert!(held.files[key].codex_counting_v2, "mark kept with its ACK");
             assert_eq!(local_ack(&held.files[key]), local_ack(&previous.files[key]));
+            assert_eq!(
+                held.settled_upload_context(&held.files[key]),
+                previous.settled_upload_context(&previous.files[key])
+            );
         }
         // Paired control: the selected save records false with the new facts.
         let (working, result) = legacy_scan();
         let settled = save_selected(&root, "settled.json", working, result, &previous, None);
         for key in &keys {
             assert!(!settled.files[key].codex_counting_v2, "false with new ACK");
+            assert_eq!(
+                settled.settled_upload_context(&settled.files[key]),
+                Some(Sha256::digest(b"counting-B").into())
+            );
             assert_ne!(
                 settled.files[key].last_snapshot_fingerprint,
                 previous.files[key].last_snapshot_fingerprint

@@ -221,6 +221,7 @@ impl Serialize for ScanIndex {
         field!(schema_version);
         field!(generation);
         field!(upload_context_fingerprint, Option::is_none);
+        field!(upload_contexts);
         map.serialize_entry(
             "files",
             &WireMap(&self.files, self.decode_holds.0.get("files")),
@@ -419,6 +420,7 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
+    "upload_contexts",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1507,6 +1509,7 @@ impl<R: BufRead + Seek> Decoder<R> {
     fn index(&mut self, pass: Pass) -> std::result::Result<ScanIndex, Error> {
         let mut index = ScanIndex {
             accepted_snapshot_fingerprint_ledger_version: 0,
+            upload_contexts: None,
             ..ScanIndex::default()
         }; // legacy serde default
         let array = self.ws()? == Some(b'[');
@@ -1578,6 +1581,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "upload_context_fingerprint" => {
                             index.upload_context_fingerprint = self.typed(value)?
                         }
+                        "upload_contexts" => index.upload_contexts = self.typed(value)?,
                         "files" => index.files = self.records("files", value, true)?,
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?

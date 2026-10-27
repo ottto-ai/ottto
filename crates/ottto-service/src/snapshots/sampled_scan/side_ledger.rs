@@ -1116,6 +1116,7 @@ mod tests {
             last_snapshot_fingerprint: None,
             last_upload_body_witness: None,
             effective_upload_body_witness_revision: 0,
+            settled_upload_context: None,
             scan_identity_version: None,
             codex_joined_member_set: None,
             codex_captured_joined_member_set: None,

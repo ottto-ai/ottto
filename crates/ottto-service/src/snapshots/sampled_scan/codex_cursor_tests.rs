@@ -7038,6 +7038,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
                 last_snapshot_fingerprint: None,
                 last_upload_body_witness: None,
                 effective_upload_body_witness_revision: 0,
+                settled_upload_context: None,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 codex_joined_member_set: None,
                 codex_captured_joined_member_set: None,

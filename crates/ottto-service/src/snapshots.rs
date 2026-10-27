@@ -3631,6 +3631,8 @@ pub struct ScanIndex {
     /// complete census, so a bounded/failed sweep cannot skip untouched files.
     #[serde(skip)]
     active_upload_context_fingerprint: Option<String>,
+    #[serde(skip)]
+    active_upload_context_digest: Option<[u8; 32]>,
     /// Runtime-only revision of the effective additive upload projection.
     /// Adoption is recorded per complete, settled file rather than per census.
     #[serde(skip)]
@@ -3785,6 +3787,9 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_default"
     )]
     pub(crate) claude_money_birth_store: claude_money_birth_store::BirthStore,
+    /// Full context digests. Absence means a pre-marker index, migrated once.
+    #[serde(default)]
+    upload_contexts: Option<Vec<[u8; 32]>>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -3940,6 +3945,7 @@ impl Default for ScanIndex {
             generation: 0,
             upload_ack_retirement_handoff: None,
             upload_context_fingerprint: None,
+            upload_contexts: Some(Vec::new()),
             files: BTreeMap::new(),
             reread_guard: reread_guard::State::default(),
             session_account_bindings: BTreeMap::new(),
@@ -4019,6 +4025,7 @@ impl Default for ScanIndex {
             quarantined_snapshot_fingerprints: BTreeMap::new(),
             active_quarantine_witness: None,
             active_upload_context_fingerprint: None,
+            active_upload_context_digest: None,
             active_effective_upload_body_witness_revision: 0,
             active_effective_upload_body_witness_revision_monotone: false,
             effective_upload_body_witness_revision_excluded_source_files: BTreeSet::new(),
@@ -4251,6 +4258,9 @@ pub struct ScanIndexEntry {
     /// stored ctime belongs to. Zero (unavailable) never adopts the ctime.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub(crate) opened_birth_nanos: u64,
+    /// Index-local reference to a full accepted context digest, never projection evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) settled_upload_context: Option<u16>,
 }
 impl ScanIndexEntry {
     fn codex_recovery_is_pending(&self) -> bool {
@@ -7418,6 +7428,15 @@ struct PendingIndexFinalization {
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
+    upload_context_candidate: Option<UploadContextCandidate>,
+}
+
+#[derive(Debug, Clone)]
+struct UploadContextCandidate {
+    context: [u8; 32],
+    fingerprint: Option<String>,
+    body: Option<String>,
+    entities: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -7698,6 +7717,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
     }
     let mut by_source_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut by_source_file_body_witness: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut context_bodies: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for snapshot in &result.snapshots {
         if let Some(source_file_fingerprint) = snapshot.source_file_fingerprint.as_ref() {
             by_source_file
@@ -7708,12 +7728,19 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .entry(source_file_fingerprint.clone())
                 .or_default()
                 .insert(body_witness(snapshot));
+            context_bodies
+                .entry(source_file_fingerprint.clone())
+                .or_default()
+                .insert(
+                    snapshot.snapshot_fingerprint.clone(),
+                    body_witness(snapshot),
+                );
         }
     }
 
     let mut noop_source_files = BTreeSet::new();
     let mut carried_noop_entities = BTreeSet::new();
-    for pending in &result.pending_finalization {
+    for pending in &mut result.pending_finalization {
         if let Some(diagnostic) = result.local_codex_diagnostics.as_mut() {
             let key_digest = codex_scan_diagnostics::digest(&pending.index_key);
             for sample in diagnostic.lineage.iter_mut().flatten() {
@@ -7799,6 +7826,19 @@ pub fn finalize_scan_after_policy_with_body_witness(
             entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
             entry.last_upload_body_witness = final_upload_body_witness.clone();
         }
+        // Projection stages proof only; the selected ACK fold owns acceptance.
+        pending.upload_context_candidate =
+            index
+                .active_upload_context_digest
+                .map(|context| UploadContextCandidate {
+                    context,
+                    fingerprint: final_group_fingerprint.clone(),
+                    body: final_upload_body_witness.clone(),
+                    entities: context_bodies
+                        .get(&pending.source_file_fingerprint)
+                        .cloned()
+                        .unwrap_or_default(),
+                });
         let stamped = index.stamp_effective_upload_body_witness_revision(
             &pending.index_key,
             &pending.source_file_fingerprint,
@@ -29440,6 +29480,7 @@ impl OwnedSourceScan {
                         }
                         let alias_fingerprint = alias.source_file_fingerprint.clone();
                         pending_finalization.push(PendingIndexFinalization {
+                            upload_context_candidate: None,
                             sampled_audit_verified: false,
                             codex_pending_recovery: index
                                 .files
@@ -29501,6 +29542,7 @@ impl OwnedSourceScan {
                     }
                 }
                 pending_finalization.push(PendingIndexFinalization {
+                    upload_context_candidate: None,
                     sampled_audit_verified,
                     codex_pending_recovery: index
                         .files
@@ -42909,7 +42951,162 @@ impl ScanIndex {
     }
 
     pub fn activate_upload_context(&mut self, fingerprint: String) {
+        self.active_upload_context_digest = Some(Sha256::digest(fingerprint.as_bytes()).into());
         self.active_upload_context_fingerprint = Some(fingerprint);
+    }
+
+    fn settled_upload_context(&self, entry: &ScanIndexEntry) -> Option<[u8; 32]> {
+        self.upload_contexts
+            .as_ref()?
+            .get(usize::from(entry.settled_upload_context?))
+            .copied()
+    }
+
+    fn intern_upload_context(&mut self, context: [u8; 32]) -> Option<u16> {
+        let contexts = self.upload_contexts.get_or_insert_with(Vec::new);
+        if let Some(id) = contexts.iter().position(|stored| stored == &context) {
+            return u16::try_from(id).ok();
+        }
+        let id = u16::try_from(contexts.len()).ok()?;
+        contexts.push(context);
+        Some(id)
+    }
+
+    fn upload_context_held(&self, key: &str, source: &str) -> bool {
+        self.decode_holds_file(key)
+            || self
+                .effective_upload_body_witness_revision_excluded_source_files
+                .contains(source)
+            || self.claude_history_emission_held(source).is_some()
+            || self.claude_history_emission.literal_denied(source)
+            || claude_index_path_family_member(Path::new(key)).is_some_and(|(root, _)| {
+                self.claude_usage_authority_quarantine.contains_key(&root)
+                    || self.claude_account_deferred_holds.contains_key(&root)
+            })
+    }
+
+    fn migrate_upload_contexts(&mut self) {
+        if self.upload_contexts.is_some() {
+            return;
+        }
+        self.upload_contexts = Some(Vec::new());
+        let Some(global) = &self.upload_context_fingerprint else {
+            return;
+        };
+        let context = Sha256::digest(global.as_bytes()).into();
+        let eligible = self
+            .files
+            .iter()
+            .filter(|(key, entry)| {
+                !entry.source_file_fingerprint.is_empty()
+                    && !entry.codex_recovery_is_pending()
+                    && !self.upload_context_held(key, &entry.source_file_fingerprint)
+                    && (self.confirmed_empty_files.contains(*key)
+                        || self
+                            .file_snapshot_fingerprints
+                            .get(*key)
+                            .is_some_and(|fps| {
+                                !fps.is_empty()
+                                    && fps.iter().all(|fp| {
+                                        self.accepted_snapshot_fingerprints.contains(fp)
+                                            && !self
+                                                .quarantined_snapshot_fingerprints
+                                                .contains_key(fp)
+                                    })
+                            }))
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<BTreeSet<_>>();
+        let id = self.intern_upload_context(context);
+        // Legacy IDs are never trusted without their original full-digest table.
+        for (key, entry) in &mut self.files {
+            entry.settled_upload_context = eligible.contains(key).then_some(id).flatten();
+        }
+    }
+
+    fn prune_upload_contexts(&mut self) {
+        // Opaque entries may reference IDs we cannot decode or renumber.
+        if self.decode_has_opaque_file_incidence() {
+            return;
+        }
+        let old = self.upload_contexts.take().unwrap_or_default();
+        let used = self
+            .files
+            .values()
+            .filter_map(|entry| entry.settled_upload_context)
+            .collect::<BTreeSet<_>>();
+        let mut remap = BTreeMap::new();
+        let mut contexts = Vec::new();
+        for id in used {
+            if let Some(context) = old.get(usize::from(id)) {
+                remap.insert(id, u16::try_from(contexts.len()).expect("u16 context IDs"));
+                contexts.push(*context);
+            }
+        }
+        for entry in self.files.values_mut() {
+            entry.settled_upload_context = entry
+                .settled_upload_context
+                .and_then(|id| remap.get(&id).copied());
+        }
+        self.upload_contexts = Some(contexts);
+    }
+
+    /// Runs only after selected-entry restoration, using the context and exact
+    /// bodies staged before POST, including entities suppressed as semantic no-ops.
+    pub(crate) fn settle_upload_contexts(
+        &mut self,
+        scan: &SourceScanResult,
+        accepted: &BTreeSet<String>,
+        bodies: &BTreeMap<String, String>,
+        held: &BTreeSet<String>,
+    ) {
+        for pending in &scan.pending_finalization {
+            let Some(candidate) = &pending.upload_context_candidate else {
+                continue;
+            };
+            let Some(entry) = self.files.get(&pending.index_key) else {
+                continue;
+            };
+            if Some(candidate.context) != self.active_upload_context_digest
+                || entry.source_file_fingerprint != pending.source_file_fingerprint
+                || entry.last_snapshot_fingerprint != candidate.fingerprint
+                || entry.last_upload_body_witness != candidate.body
+                || entry.codex_recovery_is_pending()
+                || self.upload_context_held(&pending.index_key, &pending.source_file_fingerprint)
+                || candidate
+                    .entities
+                    .keys()
+                    .any(|fp| held.contains(fp) || self.decode_holds_entity(fp))
+            {
+                continue;
+            }
+            let settled = if candidate.entities.is_empty() {
+                self.confirmed_empty_files.contains(&pending.index_key)
+                    && self
+                        .file_snapshot_fingerprints
+                        .get(&pending.index_key)
+                        .map_or(true, BTreeSet::is_empty)
+            } else {
+                self.file_snapshot_fingerprints
+                    .get(&pending.index_key)
+                    .is_some_and(|fps| {
+                        fps.len() == candidate.entities.len()
+                            && candidate.entities.iter().all(|(fp, body)| {
+                                fps.contains(fp)
+                                    && accepted.contains(fp)
+                                    && bodies.get(fp) == Some(body)
+                                    && !self.quarantined_snapshot_fingerprints.contains_key(fp)
+                            })
+                    })
+            };
+            if settled {
+                let id = self.intern_upload_context(candidate.context);
+                self.files
+                    .get_mut(&pending.index_key)
+                    .expect("selected entry")
+                    .settled_upload_context = id;
+            }
+        }
     }
 
     /// Select before taking the committed baseline and scanning. Nonzero
@@ -44930,6 +45127,7 @@ impl ScanIndex {
             }
             entry.last_snapshot_fingerprint = None;
             entry.last_upload_body_witness = None;
+            entry.settled_upload_context = None;
             claude_history_upgrade::re_owe(
                 &mut entry.effective_upload_body_witness_revision,
                 0,
@@ -45552,6 +45750,7 @@ impl ScanIndex {
     /// Both load entry points repair tombstones and retain guard (b) from
     /// the history gate's load origin, before any replay or scan can save.
     fn settle_claude_index_load(&mut self, path: &Path, load_origin: ScanIndexLoadOrigin) {
+        self.migrate_upload_contexts();
         self.settle_claude_retired_family_tombstone_decode();
         let fresh = load_origin.is_fresh(self);
         // #712 is the sole freshness rule. Missing/Quarantined origins never
@@ -45960,6 +46159,7 @@ impl ScanIndex {
                 "local snapshot scan index disappeared concurrently"
             ));
         }
+        self.prune_upload_contexts();
         self.retire_committed_claude_account_pending_windows();
         let previous_generation = self.generation;
         self.schema_version = SCAN_INDEX_SCHEMA_VERSION;
@@ -46679,6 +46879,7 @@ impl ScanIndex {
                     if let Some(entry) = result.files.get_mut(key) {
                         entry.last_snapshot_fingerprint = None;
                         entry.last_upload_body_witness = None;
+                        entry.settled_upload_context = None;
                     }
                     result.re_owe_effective_upload_body_witness_revision(key, 0);
                 }
@@ -46803,6 +47004,7 @@ impl ScanIndex {
                     if let Some(entry) = self.files.get_mut(key) {
                         entry.last_snapshot_fingerprint = None;
                         entry.last_upload_body_witness = None;
+                        entry.settled_upload_context = None;
                     }
                     self.re_owe_effective_upload_body_witness_revision(key, 0);
                 }
@@ -47131,6 +47333,7 @@ impl ScanIndex {
             generation: previous.generation,
             upload_ack_retirement_handoff: previous.upload_ack_retirement_handoff.clone(),
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
+            upload_contexts: self.upload_contexts.clone(),
             reread_guard: self.reread_state_for_subset(&files),
             files,
             session_account_bindings: self.session_account_bindings.clone(),
@@ -47237,6 +47440,7 @@ impl ScanIndex {
             quarantined_snapshot_fingerprints: retained_quarantine.clone(),
             active_quarantine_witness: self.active_quarantine_witness.clone(),
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
+            active_upload_context_digest: self.active_upload_context_digest,
             active_effective_upload_body_witness_revision: self
                 .active_effective_upload_body_witness_revision,
             active_effective_upload_body_witness_revision_monotone: self
@@ -47815,7 +48019,9 @@ impl ScanIndex {
                 Some(CandidateParseReason::BodyWitnessAdoption),
             );
         }
-        if self.upload_context_fingerprint != self.active_upload_context_fingerprint {
+        if self.active_upload_context_digest.is_some()
+            && self.settled_upload_context(entry) != self.active_upload_context_digest
+        {
             return (
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::UploadContext),
@@ -48061,6 +48267,10 @@ impl ScanIndex {
                 last_snapshot_fingerprint,
                 last_upload_body_witness,
                 effective_upload_body_witness_revision,
+                settled_upload_context: self
+                    .files
+                    .get(&key)
+                    .and_then(|entry| entry.settled_upload_context),
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 codex_joined_member_set: None,
                 codex_captured_joined_member_set: None,
@@ -48118,6 +48328,10 @@ impl ScanIndex {
                 last_snapshot_fingerprint,
                 last_upload_body_witness,
                 effective_upload_body_witness_revision,
+                settled_upload_context: self
+                    .files
+                    .get(&key)
+                    .and_then(|entry| entry.settled_upload_context),
                 scan_identity_version: Some(scan_identity_version),
                 codex_joined_member_set: None,
                 codex_captured_joined_member_set: None,
@@ -51286,6 +51500,7 @@ mod tests {
                     last_snapshot_fingerprint: Some("sha256:snapshot".to_string()),
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
+                    settled_upload_context: None,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                     codex_joined_member_set: None,
                     codex_captured_joined_member_set: None,
@@ -52673,6 +52888,7 @@ mod tests {
                     last_snapshot_fingerprint: Some("group".to_string()),
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
+                    settled_upload_context: None,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                     codex_joined_member_set: None,
                     codex_captured_joined_member_set: None,
@@ -53125,6 +53341,7 @@ mod tests {
                     last_snapshot_fingerprint: Some("legacy-snapshot-fingerprint".to_string()),
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
+                    settled_upload_context: None,
                     scan_identity_version: None,
                     codex_joined_member_set: None,
                     codex_captured_joined_member_set: None,
@@ -53222,6 +53439,7 @@ mod tests {
                     last_snapshot_fingerprint: Some("legacy-snapshot".to_string()),
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
+                    settled_upload_context: None,
                     scan_identity_version: None,
                     codex_joined_member_set: None,
                     codex_captured_joined_member_set: None,
@@ -53289,6 +53507,7 @@ mod tests {
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
+                    settled_upload_context: None,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                     codex_joined_member_set: None,
                     codex_captured_joined_member_set: None,
@@ -53343,6 +53562,7 @@ mod tests {
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
+                    settled_upload_context: None,
                     scan_identity_version: None,
                     codex_joined_member_set: None,
                     codex_captured_joined_member_set: None,
@@ -53394,6 +53614,7 @@ mod tests {
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
+                    settled_upload_context: None,
                     scan_identity_version: None,
                     codex_joined_member_set: None,
                     codex_captured_joined_member_set: None,
@@ -59176,6 +59397,7 @@ mod tests {
             last_snapshot_fingerprint: None,
             last_upload_body_witness: None,
             effective_upload_body_witness_revision: 0,
+            settled_upload_context: None,
             scan_identity_version: None,
             codex_joined_member_set: None,
             codex_captured_joined_member_set: None,
@@ -83138,6 +83360,7 @@ mod tests {
                 last_snapshot_fingerprint: None,
                 last_upload_body_witness: None,
                 effective_upload_body_witness_revision: 0,
+                settled_upload_context: None,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 codex_joined_member_set: None,
                 codex_captured_joined_member_set: None,
@@ -84760,6 +84983,7 @@ mod tests {
                 last_snapshot_fingerprint: None,
                 last_upload_body_witness: None,
                 effective_upload_body_witness_revision: 0,
+                settled_upload_context: None,
                 scan_identity_version: None,
                 codex_joined_member_set: None,
                 codex_captured_joined_member_set: None,
@@ -86338,6 +86562,7 @@ mod tests {
             last_snapshot_fingerprint: fingerprint.map(str::to_string),
             last_upload_body_witness: None,
             effective_upload_body_witness_revision: 0,
+            settled_upload_context: None,
             scan_identity_version: Some("semantic_sync:v1".to_string()),
             codex_joined_member_set: None,
             codex_captured_joined_member_set: None,
@@ -87428,6 +87653,7 @@ mod tests {
                 last_snapshot_fingerprint: Some("group".to_string()),
                 last_upload_body_witness: None,
                 effective_upload_body_witness_revision: 0,
+                settled_upload_context: None,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 codex_joined_member_set: None,
                 codex_captured_joined_member_set: None,
@@ -88446,12 +88672,13 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reread_required, reread_ticket, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; upload_context_candidate, sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, reread_guard, held_audit_progress, claude_money_birth_store);
-crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
+crate::heap_layout_bound::fields!(UploadContextCandidate; context, fingerprint, body, entities);
+crate::heap_layout_bound::fields!(ScanIndex; upload_contexts, active_upload_context_digest, decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, reread_guard, held_audit_progress, claude_money_birth_store);
+crate::heap_layout_bound::fields!(ScanIndexEntry; settled_upload_context, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; unchanged_reread_admitted, reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
@@ -88851,3 +89078,6 @@ fn pause_scan_index_cas_if_requested_for_test() {
 
 crate::heap_layout_bound::fields!(ClaudeRemovedUsage; input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, unattributed_total_tokens, reasoning_output_tokens);
 crate::heap_layout_bound::fields!(UploadAckRetirementHandoff; destination_namespace_hash, committed_generation, bodies, pending_bodies);
+
+#[cfg(test)]
+mod upload_context_tests;

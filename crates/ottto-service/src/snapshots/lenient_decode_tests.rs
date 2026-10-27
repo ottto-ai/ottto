@@ -839,6 +839,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
         diagnostic_reason: FileReason::Complete,
         parsed_snapshot_count: 1,
         effective_upload_body_witness_revision: 0,
+        upload_context_candidate: None,
     });
     finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut loaded);
     assert!(scan.snapshots.is_empty());

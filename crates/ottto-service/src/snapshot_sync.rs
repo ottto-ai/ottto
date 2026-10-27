@@ -2936,6 +2936,14 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     if let Some(fallback) = fallback {
         fallback.restore(&mut committable, committed_index)?;
     }
+    if let Some(scan) = correction_scan {
+        committable.settle_upload_contexts(
+            scan,
+            &durable.accepted_fingerprints,
+            &durable.accepted_body_witnesses,
+            locally_held,
+        );
+    }
     match cause {
         Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
         None => committable.mark_bounded_sweep_unsettled(),
@@ -7920,6 +7928,12 @@ fn finish_sync_source(
         locally_held_fingerprints,
         &census_absent_upload_acks,
     )?;
+    index.settle_upload_contexts(
+        &scan_result,
+        &upload_progress.accepted_fingerprints,
+        &upload_progress.accepted_body_witnesses,
+        locally_held_fingerprints,
+    );
     // Every selected-state restoration above has finished. A non-current
     // comparison already revoked this lease locally and cannot mint a native
     // correction later in this finish. Retire only that Claude prior index
@@ -11770,6 +11784,7 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 effective_upload_body_witness_revision: 0,
+                settled_upload_context: None,
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
             },
