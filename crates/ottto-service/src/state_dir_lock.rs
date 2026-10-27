@@ -134,7 +134,7 @@ fn record_holder_pid(file: &mut File) -> std::io::Result<()> {
 
 fn read_holder_pid(file: &mut File) -> Option<u32> {
     let mut text = String::new();
-    file.by_ref().take(32).read_to_string(&mut text).ok()?;
+    Read::by_ref(file).take(32).read_to_string(&mut text).ok()?;
     text.trim().parse().ok()
 }
 
