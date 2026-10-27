@@ -29,7 +29,6 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-          fetch-depth: 0
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt
@@ -52,7 +51,6 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-          fetch-depth: 0
 
       # rusqlite links the system SQLite; command-environment tests probe zsh.
       - name: Install system packages
@@ -70,7 +68,7 @@ jobs:
           echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
       - name: Compiler receipt
         run: rustc -Vv && cargo -V
@@ -86,44 +84,13 @@ jobs:
             crates -> crates/target
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
-      # W1 validation: diagnose the unrelated process-environment fixture
-      # before the full suite, then serialize without dropping any tests.
-      - name: Refresher failure reproduction
-        run: cargo test -p ottto-service --lib --locked claude_refresher::tests::refresher_verifies_the_stored_expiry_and_stops_after_a_failure -- --exact --nocapture --test-threads=1
-
       - name: Runtime tests
         # Print a failing assertion when it happens, not only after the suite.
         # Keep going past a failing test binary so one run lists every failure.
-        run: cargo test --workspace --locked --no-fail-fast -- --nocapture --test-threads=1
+        run: cargo test --workspace --locked --no-fail-fast -- --nocapture
 
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
 
       - name: Connector package tests
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
-
-      # W1 validation overlay: removed before final contracts; no daemon work.
-      - name: W1 touched-file clippy probe
-        if: always()
-        run: |
-          set -euo pipefail
-          cargo clippy -p ottto-service --all-targets --locked --message-format=json > "$RUNNER_TEMP/w1-clippy.jsonl"
-          python3 - "$RUNNER_TEMP/w1-clippy.jsonl" <<'PYCLIPPY'
-          import json, sys
-          paths = {"crates/ottto-service/src/snapshots.rs", "crates/ottto-service/src/snapshot_sync.rs", "crates/ottto-service/src/snapshots/claude_request_money/e2.rs", "crates/ottto-service/src/snapshot_sync/claude_money_e2_pipeline_tests.rs", "crates/ottto-service/src/snapshot_sync/money_e2_bench_tests.rs"}
-          bad=[]
-          for line in open(sys.argv[1]):
-              r=json.loads(line)
-              if r.get("reason")!="compiler-message": continue
-              m=r["message"]
-              if m["level"] in ("warning", "error") and any(p["file_name"] in paths for p in m["spans"]): bad.append(m)
-          for m in bad: print(m["rendered"])
-          assert not bad, "touched-file clippy must be clean"
-          print("W1_TOUCHED_FILE_CLIPPY_CLEAN")
-          PYCLIPPY
-      - name: W1 clippy receipt
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: w1-linux-clippy
-          path: ${{ runner.temp }}/w1-clippy.jsonl

@@ -298,28 +298,6 @@ jobs:
           cargo test -p ottto-service --lib --locked --release --no-run --message-format=json > "$RUNNER_TEMP/e2-build-reference.jsonl"
           python3 -c 'import json,sys,shutil; bins=[r["executable"] for r in map(json.loads, open(sys.argv[1])) if r.get("reason")=="compiler-artifact" and r.get("executable")]; assert len(bins)==1, bins; shutil.copy2(bins[0], sys.argv[2])' "$RUNNER_TEMP/e2-build-reference.jsonl" "$RUNNER_TEMP/bench-reference"
           df -h "$RUNNER_TEMP"
-      # W1-only measurement overlay; remove after receipts, before contracts.
-      - name: Build the W1 main baseline
-        working-directory: candidate
-        run: |
-          set -euo pipefail
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
-          rel=crates/ottto-service/src/snapshot_sync/money_e2_bench_tests.rs
-          root="$PWD"
-          for spec in before:790c2dfff487c2f223975b4d2aab2739ad98dbe0; do
-            name="${spec%%:*}"; ref="${spec#*:}"
-            git worktree add --detach "$RUNNER_TEMP/w1-$name-source" "$ref"
-            cp "$root/$rel" "$RUNNER_TEMP/w1-$name-source/$rel"
-            cd "$RUNNER_TEMP/w1-$name-source"
-            cargo test -p ottto-service --lib --locked --release --no-run --message-format=json > "$RUNNER_TEMP/e2-w1-build-$name.jsonl"
-            python3 - "$RUNNER_TEMP/e2-w1-build-$name.jsonl" "$RUNNER_TEMP/bench-w1-$name" <<'PYBIN'
-          import json,shutil,sys
-          bins=[r["executable"] for r in map(json.loads,open(sys.argv[1])) if r.get("reason")=="compiler-artifact" and r.get("executable")]
-          assert len(bins)==1,bins
-          shutil.copy2(bins[0],sys.argv[2])
-          PYBIN
-            cd "$root"
-          done
       - name: Prepare the M4-shaped corpus
         run: |
           set -euo pipefail
@@ -343,19 +321,8 @@ jobs:
           set -euo pipefail
           export OTTTO_E2_BENCH_ROOT="$RUNNER_TEMP/e2-bench"
           test_name="$(cat "$RUNNER_TEMP/e2-test-name.txt")"
-          run_w1_before() {
-            local round="$1"
-            OTTTO_E2_BENCH_MODE=arm OTTTO_E2_BENCH_ARM=on OTTTO_E2_BENCH_TAG="w1-before-$round" \
-              OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/e2-w1-before-$round.json" \
-              "$RUNNER_TEMP/bench-w1-before" "$test_name" --exact --ignored --nocapture --test-threads 1 2>&1 \
-              | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
-            rm -rf "$OTTTO_E2_BENCH_ROOT/runs/w1-before-$round"
-          }
           run_arm() {
             local arm="$1" round="$2" bin="$RUNNER_TEMP/bench-candidate"
-            # Counterbalance the matched main/on pair as well as the
-            # canonical arm order, without adding any measured runs.
-            if [ "$arm" = on ] && [ $((round % 2)) -eq 1 ]; then run_w1_before "$round"; fi
             [ "$arm" = reference ] && bin="$RUNNER_TEMP/bench-reference"
             # Each run is a fresh process with an empty state directory; the
             # corpus is shared and restored after the largest-file appends.
@@ -364,19 +331,6 @@ jobs:
               "$bin" "$test_name" --exact --ignored --nocapture --test-threads 1 2>&1 \
               | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
             rm -rf "$OTTTO_E2_BENCH_ROOT/runs/$arm-$round"
-            if [ "$arm" = on ]; then
-              if [ $((round % 2)) -eq 0 ]; then run_w1_before "$round"; fi
-              python3 - "$RUNNER_TEMP" "$round" <<'PYPARITY'
-          import json,pathlib,sys
-          root=pathlib.Path(sys.argv[1]); n=sys.argv[2]
-          receipts={stage:json.loads((root/f"e2-w1-{stage}-{n}.json").read_text()) for stage in ("before",)}
-          receipts["after"]=json.loads((root/f"e2-arm-on-{n}.json").read_text())
-          for stage,r in receipts.items():
-              print("MONEY_E2_W1_PARITY",stage,n,json.dumps(r["uploads"],sort_keys=True))
-              assert r["uploads"]==receipts["before"]["uploads"], f"W1 {stage} changed exact upload receipt"
-          print("MONEY_E2_W1_PARITY_CLEAN",n)
-          PYPARITY
-            fi
           }
           for round in $(seq 0 $((BENCH_ROUNDS - 1))); do
             if [ $((round % 2)) -eq 0 ]; then order="reference dark on"; else order="on dark reference"; fi
