@@ -464,6 +464,13 @@ pub(crate) fn money_marks(item: &SnapshotItem) -> u8 {
 /// disclosing fold keeps its inline counters and frees every heap field;
 /// any other fold is dropped.
 pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
+    if super::request_owned_family_root(item).is_none() {
+        return;
+    }
+    // These serde-skipped inputs have served every local consumer. Emptying
+    // them here also keeps the generic upload clone from copying native maps.
+    item.claude_usage_occurrences = BTreeMap::new();
+    item.claude_usage_request_ids = BTreeSet::new();
     let Some(fold) = item.claude_money.as_deref_mut() else {
         return;
     };

@@ -403,6 +403,14 @@ fn literal(page: &Page) {
         .iter()
         .all(crate::snapshots::claude_request_money::is_request_owned_literal));
     assert!(
+        page.scan
+            .snapshots
+            .iter()
+            .all(|item| item.claude_usage_occurrences.is_empty()
+                && item.claude_usage_request_ids.is_empty()),
+        "final E2 bodies release native inputs before upload and retry clones"
+    );
+    assert!(
         page.scan.snapshots.iter().all(|item| item
             .claude_money
             .as_deref()
