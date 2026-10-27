@@ -40,6 +40,14 @@ mod reference_hook {
         run()
     }
 
+    pub(super) fn with_revision<T>(_revision: u64, _run: impl FnOnce() -> T) -> T {
+        unreachable!("the reference hook cannot override the compiled revision")
+    }
+
+    pub(super) fn item_storage(_items: &[crate::snapshots::SnapshotItem]) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+
     pub(super) fn drain_counts() -> serde_json::Value {
         serde_json::Value::Object(Default::default())
     }
@@ -81,6 +89,22 @@ mod e2_hook {
         drain_counts, take_diag, take_stages, with_gate, with_staged_births,
     };
 
+    pub(super) fn with_revision<T>(revision: u64, run: impl FnOnce() -> T) -> T {
+        crate::snapshots::with_max_gated_claude_revision(revision, || {
+            crate::snapshot_sync::with_claude_cycle_revision(revision, run)
+        })
+    }
+
+    pub(super) fn item_storage(items: &[crate::snapshots::SnapshotItem]) -> serde_json::Value {
+        let folds = items.iter().filter_map(|item| item.claude_money.as_deref());
+        let (mut count, mut bytes) = (0, 0usize);
+        for fold in folds {
+            count += 1;
+            bytes += crate::heap_layout_bound::completed_bound(fold, usize::MAX).unwrap_or(0);
+        }
+        serde_json::json!({"folds": count, "fold_bound_bytes": bytes})
+    }
+
     /// The gate-on arm as PR C ships it: revision 3 active (its policy row
     /// carries the request-owned literal; revision 2 denies every literal
     /// at the upload guard) and an installed, empty exclusions list
@@ -99,9 +123,7 @@ mod e2_hook {
             "",
         )
         .unwrap();
-        crate::snapshots::with_max_gated_claude_revision(3, || {
-            crate::snapshot_sync::with_claude_cycle_revision(3, run)
-        })
+        with_revision(3, run)
     }
 
     /// The history page byte budget (the reference's seam is private).
@@ -920,7 +942,7 @@ fn prepare(base: &Path, scale: f64, bytes_scale: f64) -> serde_json::Value {
 /// Physical footprint now (after asking malloc to return free pages) and
 /// its lifetime peak, from task_vm_info rev3.
 #[cfg(target_os = "macos")]
-fn footprint() -> (u64, u64) {
+fn footprint_sample(relieve: bool) -> (u64, u64) {
     #[repr(C)]
     #[derive(Default)]
     struct TaskVmInfo {
@@ -960,7 +982,9 @@ fn footprint() -> (u64, u64) {
     // SAFETY: a null zone asks every zone to return free pages; TASK_VM_INFO
     // (22) fills at most `count` words of `vm`.
     let status = unsafe {
-        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        if relieve {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
         task_info(
             mach_task_self_,
             22,
@@ -976,8 +1000,84 @@ fn footprint() -> (u64, u64) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn footprint() -> (u64, u64) {
+fn footprint_sample(_relieve: bool) -> (u64, u64) {
     (0, 0)
+}
+
+fn footprint() -> (u64, u64) {
+    footprint_sample(true)
+}
+
+// Bench-only attribution. Never relieve malloc in a timed window: that would
+// hide retention and change the allocation pattern being measured.
+#[cfg(target_os = "macos")]
+fn malloc_stats() -> serde_json::Value {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Stats {
+        blocks: u32,
+        live: usize,
+        high_water: usize,
+        reserved: usize,
+    }
+    extern "C" {
+        fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut Stats);
+    }
+    let mut stats = Stats::default();
+    // SAFETY: null sums all zones; the SDK's malloc_statistics_t layout above.
+    unsafe {
+        malloc_zone_statistics(std::ptr::null_mut(), &mut stats);
+    }
+    serde_json::json!({"live_bytes": stats.live, "reserved_bytes": stats.reserved,
+        "high_water_bytes": stats.high_water, "blocks": stats.blocks})
+}
+#[cfg(not(target_os = "macos"))]
+fn malloc_stats() -> serde_json::Value {
+    serde_json::Value::Null
+}
+
+thread_local! {
+    static ATTRIBUTION: std::cell::RefCell<Option<BTreeMap<&'static str, serde_json::Value>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(in crate::snapshot_sync) fn bench_mark(label: &'static str, items: &[SnapshotItem]) {
+    ATTRIBUTION.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let Some(marks) = cell.as_mut() else { return; };
+        let (now, peak) = footprint_sample(false);
+        let heap = malloc_stats();
+        let sum_bound = |f: fn(&SnapshotItem) -> Option<usize>| items.iter().filter_map(f).sum::<usize>();
+        marks.insert(label, serde_json::json!({"cpu_us": thread_cpu_us(), "footprint_bytes": now,
+            "footprint_peak_bytes": peak, "malloc": heap, "items": items.len(),
+            "occurrence_bound_bytes": sum_bound(|item| crate::heap_layout_bound::completed_bound(&item.claude_usage_occurrences, usize::MAX)),
+            "bucket_bound_bytes": sum_bound(|item| crate::heap_layout_bound::completed_bound(&item.usage_buckets, usize::MAX)),
+            "e2": e2_hook::item_storage(items)}));
+    });
+}
+
+fn bench_timed<T>(label: &'static str, run: impl FnOnce() -> T) -> T {
+    if !ATTRIBUTION.with(|cell| cell.borrow().is_some()) {
+        return run();
+    }
+    let cpu = thread_cpu_us();
+    let start = Instant::now();
+    let value = run();
+    let cpu = thread_cpu_us() - cpu;
+    ATTRIBUTION.with(|cell| {
+        if let Some(marks) = cell.borrow_mut().as_mut() {
+            let row = marks
+                .entry(label)
+                .or_insert_with(|| serde_json::json!({"cpu_us": 0, "wall_us": 0, "calls": 0}));
+            for (key, delta) in [
+                ("cpu_us", cpu),
+                ("wall_us", start.elapsed().as_micros() as u64),
+                ("calls", 1),
+            ] {
+                row[key] = serde_json::json!(row[key].as_u64().unwrap() + delta);
+            }
+        }
+    });
+    value
 }
 
 /// (user + system CPU microseconds of every thread, lifetime max RSS bytes).
@@ -1152,6 +1252,7 @@ impl Drop for Backend {
 
 /// The production owner, observing the completed scan before its finish.
 struct BenchOwner<'a> {
+    last_sample: Instant,
     inner: SnapshotCycleOwner<'a>,
     census_complete: Option<bool>,
     scanned_files: usize,
@@ -1167,7 +1268,7 @@ impl crate::source_rotation::Owner for BenchOwner<'_> {
         source: SnapshotSource,
         remaining: Option<usize>,
     ) -> anyhow::Result<Option<SourcePreparation>> {
-        self.inner.prepare(source, remaining)
+        bench_timed("owner.prepare", || self.inner.prepare(source, remaining))
     }
     fn validate(&mut self, frame: &SourcePreparation) -> anyhow::Result<()> {
         self.inner.validate(frame)
@@ -1177,10 +1278,24 @@ impl crate::source_rotation::Owner for BenchOwner<'_> {
         frame: SourcePreparation,
         remaining: Option<usize>,
     ) -> crate::source_rotation::Step<SourcePreparation, Self::Completed> {
-        self.inner.step(frame, remaining)
+        let value = bench_timed("owner.step", || self.inner.step(frame, remaining));
+        // Sample physical peaks at cooperative parser boundaries, at most 10 Hz.
+        if ATTRIBUTION.with(|cell| cell.borrow().is_some())
+            && self.last_sample.elapsed() >= Duration::from_millis(100)
+        {
+            self.last_sample = Instant::now();
+            let (now, peak) = footprint_sample(false);
+            ATTRIBUTION.with(|cell| {
+                if let Some(marks) = cell.borrow_mut().as_mut() {
+                    let prior = marks.get("scan.sample_peak").and_then(|r| r["footprint_bytes"].as_u64()).unwrap_or(0);
+                    if now > prior { marks.insert("scan.sample_peak", serde_json::json!({"footprint_bytes": now, "footprint_peak_bytes": peak, "malloc": malloc_stats()})); }
+                }
+            });
+        }
+        value
     }
     fn bound(&self, frame: &SourcePreparation, limit: usize) -> Option<usize> {
-        self.inner.bound(frame, limit)
+        bench_timed("owner.bound", || self.inner.bound(frame, limit))
     }
     fn finish(
         &mut self,
@@ -1190,7 +1305,20 @@ impl crate::source_rotation::Owner for BenchOwner<'_> {
         self.census_complete = Some(completed.2.census_complete);
         self.scanned_files = completed.2.scanned_file_count;
         self.index_path = Some(completed.0.index_path.clone());
-        self.inner.finish(completed, remaining)
+        bench_mark("scan.complete", &completed.2.snapshots);
+        ATTRIBUTION.with(|cell| {
+            if let Some(marks) = cell.borrow_mut().as_mut() {
+                let index_bound =
+                    crate::heap_layout_bound::completed_bound(&completed.1, usize::MAX);
+                marks.insert(
+                    "scan.index",
+                    serde_json::json!({"bound_bytes": index_bound}),
+                );
+            }
+        });
+        let result = bench_timed("owner.finish", || self.inner.finish(completed, remaining));
+        bench_mark("finish.done", &[]);
+        result
     }
     fn outcome(&mut self, source: SnapshotSource, result: anyhow::Result<()>) {
         self.inner.outcome(source, result)
@@ -1338,6 +1466,11 @@ impl Harness {
     /// One production cycle (one page) with its process wall/CPU, the
     /// backend's CPU taken out, and its local_resources records.
     fn page(&mut self) -> serde_json::Value {
+        ATTRIBUTION.with(|cell| {
+            *cell.borrow_mut() =
+                (env("OTTTO_E2_BENCH_MODE").as_deref() == Some("attribution")).then(BTreeMap::new)
+        });
+        bench_mark("page.begin", &[]);
         self.cadence.next_due_cycle();
         let witness = self.daemon.snapshot_scan_account_witness().unwrap();
         let collection = || AgentStatusCollection {
@@ -1354,6 +1487,7 @@ impl Harness {
             crate::agent_status_refresh::with_test_collection(collection(), || {
                 let mut failed = Vec::new();
                 let mut owner = BenchOwner {
+                    last_sample: Instant::now(),
                     inner: SnapshotCycleOwner {
                         retry: &mut self.retry,
                         account_witness: witness,
@@ -1395,8 +1529,12 @@ impl Harness {
         let index_path = index_path.expect("the page completed its scan");
         self.index_path = Some(index_path.clone());
         let e2 = window_counts(&records);
+        bench_mark("page.before_relief", &[]);
         let (footprint_now, _) = footprint();
+        bench_mark("page.after_relief", &[]);
+        let attribution = ATTRIBUTION.with(|cell| cell.borrow_mut().take());
         serde_json::json!({
+            "attribution": attribution,
             "census_complete": census_complete,
             "scanned_files": scanned_files,
             "wall_us": wall_us,
@@ -1482,10 +1620,30 @@ fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Valu
     };
     // Input reset: a previous run that died mid-append left extra bytes.
     restore.now();
+    // Native stack sampling belongs only to the separate diagnostic process.
+    // A missing sampler is recorded, never changes a performance receipt.
+    let mut sampler = None;
+    if cfg!(target_os = "macos") && env("OTTTO_E2_BENCH_MODE").as_deref() == Some("attribution") {
+        if let Some(output) = env("OTTTO_E2_BENCH_OUTPUT") {
+            let path = PathBuf::from(output).with_file_name(format!("e2-sample-{tag}.txt"));
+            sampler = std::process::Command::new("/usr/bin/sample")
+                .args([
+                    std::process::id().to_string(),
+                    "60".into(),
+                    "10".into(),
+                    "-file".into(),
+                    path.to_string_lossy().into_owned(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
+        }
+    }
     let footprint_start = footprint();
     let mut harness = Harness::new(base, &base.join("runs").join(&tag), p1_off);
     let support = base.join("runs").join(&tag).join("support");
-    e2_hook::with_gate(arm == "on", || {
+    let receipt = e2_hook::with_gate(arm == "on", || {
         e2_hook::with_switch_on(arm == "on", &support, || {
             let mut pages = Vec::new();
             loop {
@@ -1568,7 +1726,11 @@ fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Valu
                 "max_rss_bytes": max_rss,
             })
         })
-    })
+    });
+    if let Some(mut sampler) = sampler {
+        let _ = sampler.wait();
+    }
+    receipt
 }
 
 /// Scan-level history pages (the production activation reads the compiled
@@ -1661,8 +1823,24 @@ impl HistoryScan {
         let wall_us = started.elapsed().as_micros() as u64;
         let (cpu_after, _) = rusage();
         let items = scan.snapshots.len();
+        let reads = scan.scanned_file_count;
         drop(scan);
         let upgraded = Self::stamped(index, 3) - before;
+        let mut upgraded_keys = owed
+            .iter()
+            .filter(|key| {
+                index
+                    .files
+                    .get(*key)
+                    .is_some_and(|entry| entry.effective_upload_body_witness_revision >= 3)
+            })
+            .map(|key| {
+                key.strip_prefix(self.root.to_str().unwrap())
+                    .unwrap_or(key)
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        upgraded_keys.sort();
         let bytes = owed
             .iter()
             .filter_map(|key| index.files.get(key))
@@ -1671,6 +1849,8 @@ impl HistoryScan {
             .sum::<u64>();
         serde_json::json!({
             "files": upgraded,
+            "reads": reads,
+            "file_set_digest": format!("{:x}", Sha256::digest(upgraded_keys.join("\n"))),
             "bytes": bytes,
             "items": items,
             "wall_us": wall_us,
@@ -1739,8 +1919,21 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
         }
     };
     let mut stamp_pages = Vec::new();
-    e2_hook::with_gate(false, || walk_until_settled(&mut harness, &mut stamp_pages));
-    let stamped = HistoryScan::stamped(&load(&harness), 2);
+    e2_hook::with_gate(false, || {
+        e2_hook::with_revision(2, || walk_until_settled(&mut harness, &mut stamp_pages))
+    });
+    let stamp_index = load(&harness);
+    assert_eq!(
+        HistoryScan::stamped(&stamp_index, 3),
+        0,
+        "stamp walks must precede the flip"
+    );
+    let stamped = HistoryScan::stamped(&stamp_index, 2);
+    assert_eq!(
+        stamped, files,
+        "every fixture file must be stamped before switch-on"
+    );
+    drop(stamp_index);
     e2_hook::with_gate(true, || {
         e2_hook::with_switch_on(true, &support, || {
             let mut switch_on = || {
@@ -1812,20 +2005,101 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+/// Fix the cohort before any arm runs. Use the candidate's actual paced
+/// selection, then expose exactly those files through a hard-linked scan root.
+/// A physical root restriction also works in the pre-E2 reference, where
+/// revision marks do not prevent unrelated pending traversal reads. Hard links
+/// preserve bytes, timestamps and opened-object birth without copying content.
+fn plan_history_cohort(base: &Path) {
+    let support = base.join("runs").join("history-plan");
+    let scan = HistoryScan::new(base);
+    let mut index = ScanIndex::default();
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        e2_hook::with_gate(false, || {
+            e2_hook::with_revision(2, || scan.stamp(&mut index, &support))
+        });
+        e2_hook::with_gate(true, || {
+            e2_hook::with_revision(3, || scan.upgrade_page(&mut index))
+        });
+    });
+    let keys = index
+        .files
+        .iter()
+        .filter(|(_, entry)| entry.effective_upload_body_witness_revision >= 3)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    assert!(!keys.is_empty(), "the planned history page reads files");
+    let root = base.join("history-cohort");
+    assert!(!root.exists(), "prepare creates the history cohort once");
+    let source_root = projects(base);
+    let mut relative = Vec::new();
+    let mut bytes = 0u64;
+    for key in keys {
+        let source = Path::new(&key);
+        let path = source
+            .strip_prefix(&source_root)
+            .expect("a fixture transcript");
+        let target = root.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::hard_link(source, &target).unwrap();
+        bytes += std::fs::metadata(&target).unwrap().len();
+        relative.push(path.to_string_lossy().into_owned());
+    }
+    assert!(
+        relative.len() <= 2_000 && bytes <= 1 << 30,
+        "one paced history page"
+    );
+    std::fs::write(
+        base.join("history-cohort.json"),
+        serde_json::to_vec(&relative).unwrap(),
+    )
+    .unwrap();
+}
+
 /// One whole-history page (the paced upgrade's largest page: up to 2,000
-/// files / 1 GiB) per arm, in a fresh process: stamp at revision 2, then one
-/// timed revision-3 page. Its folds are never released by a page finish here,
-/// so the peak footprint is the worst case of a history page.
+/// files / 1 GiB) per arm, in a fresh process: stamp the same physical cohort
+/// at revision 2, then one timed revision-3 page. This scanner microbenchmark
+/// measures identical transcript work, not full-corpus directory/index overhead.
+/// The full traversal and production-cycle reread still use the entire corpus.
 fn history(base: &Path, arm: &str) -> serde_json::Value {
     check_arm(arm);
     let tag = env("OTTTO_E2_BENCH_TAG").unwrap_or_else(|| arm.to_string());
     let support = base.join("runs").join(format!("history-{tag}"));
     assert!(!support.exists(), "every run starts from an empty state");
-    let scan = HistoryScan::new(base);
+    let scan = HistoryScan {
+        root: base.join("history-cohort"),
+        collected_at: current_rfc3339(),
+    };
     e2_hook::with_gate(arm == "on", || {
         crate::snapshots::with_no_list_cutoff(u64::MAX, || {
             let mut index = ScanIndex::default();
-            let stamped = scan.stamp(&mut index, &support);
+            let mut stamp = || e2_hook::with_gate(false, || scan.stamp(&mut index, &support));
+            let stamped = if arm == "reference" {
+                stamp()
+            } else {
+                e2_hook::with_revision(2, stamp)
+            };
+            assert_eq!(
+                HistoryScan::stamped(&index, 3),
+                0,
+                "history starts before the flip"
+            );
+            let cohort: std::collections::BTreeSet<String> = serde_json::from_slice(
+                &std::fs::read(base.join("history-cohort.json"))
+                    .expect("prepare plans the matched history cohort"),
+            )
+            .unwrap();
+            assert_eq!(
+                stamped,
+                cohort.len(),
+                "the stamped physical cohort is exact"
+            );
+            let mut keys = cohort
+                .iter()
+                .map(|path| format!("/{path}"))
+                .collect::<Vec<_>>();
+            keys.sort();
+            let expected_digest = format!("{:x}", Sha256::digest(keys.join("\n")));
             let (footprint_before, _) = footprint();
             let _ = e2_hook::drain_counts();
             let _ = e2_hook::take_stages();
@@ -1835,6 +2109,20 @@ fn history(base: &Path, arm: &str) -> serde_json::Value {
             assert!(
                 page["files"].as_u64() > Some(0),
                 "MONEY_E2_BENCH history page upgraded no file: {page}"
+            );
+            assert_eq!(
+                page["files"].as_u64(),
+                Some(cohort.len() as u64),
+                "every arm upgrades the planned cohort"
+            );
+            assert_eq!(
+                page["reads"], page["files"],
+                "every history file is read once"
+            );
+            assert_eq!(
+                page["file_set_digest"].as_str(),
+                Some(expected_digest.as_str()),
+                "every arm reads the same file set"
             );
             let stages = e2_hook::take_stages();
             let e2 = e2_hook::drain_counts();
@@ -1889,23 +2177,44 @@ fn money_e2_bench_receipt() {
                 serde_json::to_vec_pretty(&manifest).unwrap(),
             )
             .unwrap();
+            let births = std::fs::read(base.join(STAGED_BIRTHS))
+                .ok()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .unwrap_or_default();
+            e2_hook::with_staged_births(births, || plan_history_cohort(&base));
             manifest
         }
-        "arm" | "reread" | "history" => {
+        "arm" | "attribution" | "reread" | "history" => {
             let manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&manifest_path).expect("prepare first"))
                     .unwrap();
             let arm_name = env("OTTTO_E2_BENCH_ARM").unwrap_or_default();
             // OTTTO_E2_BENCH_STAGED_BIRTHS=0 keeps the file system's births
             // (Linux: every root then looks all-copied, a stress shape).
-            let births = std::fs::read(base.join(STAGED_BIRTHS))
+            let mut births = std::fs::read(base.join(STAGED_BIRTHS))
                 .ok()
                 .filter(|_| env("OTTTO_E2_BENCH_STAGED_BIRTHS").as_deref() != Some("0"))
                 .map(|bytes| serde_json::from_slice::<BTreeMap<String, u64>>(&bytes).unwrap())
                 .unwrap_or_default();
+            // Linux stages births by absolute path. Preserve that evidence
+            // for the relocated hard links too; full-corpus modes keep their
+            // original mapping. Natural-birth Mac runs bypass this branch.
+            if mode == "history" && !births.is_empty() {
+                let cohort: Vec<PathBuf> = serde_json::from_slice(
+                    &std::fs::read(base.join("history-cohort.json")).unwrap(),
+                )
+                .unwrap();
+                for relative in cohort {
+                    let source = projects(&base).join(&relative);
+                    if let Some(&birth) = births.get(source.to_string_lossy().as_ref()) {
+                        let target = base.join("history-cohort").join(relative);
+                        births.insert(target.to_string_lossy().into_owned(), birth);
+                    }
+                }
+            }
             let staged = births.len();
             let mut receipt = e2_hook::with_staged_births(births, || match mode.as_str() {
-                "arm" => arm(&base, &manifest, &arm_name),
+                "arm" | "attribution" => arm(&base, &manifest, &arm_name),
                 "history" => history(&base, &arm_name),
                 _ => reread(&base, &manifest),
             });
@@ -1922,6 +2231,34 @@ fn money_e2_bench_receipt() {
     eprintln!("\n{tag} {}", serde_json::to_string(&summary).unwrap());
     if let Some(output) = env("OTTTO_E2_BENCH_OUTPUT") {
         std::fs::write(output, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    }
+    // Exactly one separate diagnostic process per arm, after the canonical
+    // receipt was captured. Never feed these CPU/footprint values to the gate.
+    if mode == "arm" && env("OTTTO_E2_BENCH_TAG").is_some_and(|tag| tag.ends_with("-0")) {
+        let tag = env("OTTTO_E2_BENCH_TAG").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "snapshot_sync::tests::money_e2_bench_tests::money_e2_bench_receipt",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env("OTTTO_E2_BENCH_MODE", "attribution")
+            .env("OTTTO_E2_BENCH_TAG", format!("attribution-{tag}"));
+        if let Some(output) = env("OTTTO_E2_BENCH_OUTPUT") {
+            let path = PathBuf::from(output);
+            child.env(
+                "OTTTO_E2_BENCH_OUTPUT",
+                path.with_file_name(format!("e2-attribution-{tag}.json")),
+            );
+        }
+        assert!(
+            child.status().expect("start diagnostic process").success(),
+            "attribution process succeeds"
+        );
     }
     // After the receipt line and file: the gate reads both either way.
     assert!(
