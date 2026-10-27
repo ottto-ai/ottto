@@ -32,7 +32,9 @@ Active fixtures, one test each:
 - Side call with a transcript owner.
 - Side call without a transcript owner.
 - Side call whose actual owner's directory is outside the listed scan root.
-- Failed telemetry read, followed by a healthy read.
+- Failed telemetry read holds both arms with no upload (including no zero-cost
+  body), followed by a healthy read from each held index. Only the healthy
+  emissions enter the nonempty body, witness and digest equality assertions.
 - Codex V2 counting remains selected after index reload and retained Tail.
 - Codex Legacy-ACK remains selected after index reload and retained Tail.
 

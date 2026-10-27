@@ -107,18 +107,31 @@ fn compare_claude(
     prior: ScanIndex,
     mode: (usize, usize, usize),
 ) -> Vec<u8> {
+    compare_claude_pages(c, claude_pages(c, retained, [prior.clone(), prior], mode))
+}
+
+fn claude_pages(
+    c: &Corpus,
+    retained: &E2ScanFixture,
+    [tail_prior, full_prior]: [ScanIndex; 2],
+    mode: (usize, usize, usize),
+) -> [Page; 2] {
     save_inputs(c);
-    let mut tail = c.raw(retained, prior.clone(), 100, true, &[]);
+    let tail = c.raw(retained, tail_prior, 100, true, &[]);
     assert_eq!(
         tail.modes, mode,
         "must exercise the named retained acquisition"
     );
-    let mut full = c.raw(&E2ScanFixture::default(), prior, 100, true, &[]);
+    let full = c.raw(&E2ScanFixture::default(), full_prior, 100, true, &[]);
     assert_eq!(
         full.modes.1 + full.modes.2,
         0,
         "cold arm cannot reuse a reduction"
     );
+    [tail, full]
+}
+
+fn compare_claude_pages(c: &Corpus, [mut tail, mut full]: [Page; 2]) -> Vec<u8> {
     for page in [&mut tail, &mut full] {
         page.enrich(c); // attach, side calls, identity reconcile and emission
         page.finish(); // policy/body witnesses/holds, as in the real pipeline
@@ -227,14 +240,44 @@ fn claude_case(name: &str) {
                     !health.is_complete(),
                     "failed telemetry decode must be witnessed"
                 );
-                let failed = compare_claude(&c, &scanner, prior.clone(), (0, 0, 1));
+                let mut failed = claude_pages(&c, &scanner, [prior.clone(), prior], (0, 0, 1));
+                for page in &mut failed {
+                    assert_eq!(page.scan.snapshots.len(), 1, "must scan the held session");
+                    let fingerprint = page.scan.snapshots[0]
+                        .source_file_fingerprint
+                        .clone()
+                        .expect("held session must name its source file");
+                    page.enrich(&c);
+                    assert_eq!(
+                        page.index
+                            .claude_history_emission_held(&fingerprint)
+                            .map(|hold| hold.as_str()),
+                        Some("telemetry_unread"),
+                        "failed telemetry must hold this session"
+                    );
+                    page.finish();
+                    assert!(page.scan.snapshots.is_empty(), "held session emits no body");
+                    let (result, wire, _) = upload(&page.scan.snapshots, &mut e2_progress(), ack);
+                    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                    assert!(
+                        wire.is_empty(),
+                        "failed telemetry must never upload, even $0"
+                    );
+                }
+                // Continue each arm from its held page's index. The retained
+                // arm keeps its scanner; the Full arm gets a fresh scanner.
+                let [tail_failed, full_failed] = failed;
                 c.evidence(&[api("r1", 10, 100)], &[]);
-                let healthy = compare_claude(&c, &scanner, prior, (0, 0, 1));
-                assert_ne!(
-                    failed, healthy,
-                    "healthy telemetry must affect emitted money"
+                let healthy = compare_claude_pages(
+                    &c,
+                    claude_pages(
+                        &c,
+                        &scanner,
+                        [tail_failed.index, full_failed.index],
+                        (0, 0, 1),
+                    ),
                 );
-                receipt(name, &[failed, healthy]);
+                receipt(name, &[healthy]);
                 return;
             }
             _ => unreachable!(),
