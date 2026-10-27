@@ -73,7 +73,7 @@ fn oversized_unchanged_has_no_clock_restarts_and_keeps_incomplete_disclosure() {
     let (fixture, _) = oversized_seed("oversized-unchanged");
     let saved = c1a_saved(&fixture);
     let latch = c1a_latch(&fixture);
-    for offset in [0, 3600, 7200, 86400] {
+    for offset in [0, 3600, 7200, 5 * 3600] {
         let page = oversized_tick(&fixture, oversized_deadline(&saved) + offset);
         assert!(!page.scan.census_complete);
         assert_eq!(
@@ -364,4 +364,328 @@ fn oversized_keeps_complete_families_empty_and_refuses_absence_retirement_sweep_
         c1a_saved(&fixture)["claude_retired_family_tombstones"],
         before["claude_retired_family_tombstones"]
     );
+}
+
+fn oversized_floor(saved: &serde_json::Value) -> u64 {
+    time::OffsetDateTime::parse(
+        saved["traversal"]["census_window_end"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+    .unix_timestamp() as u64
+        + 6 * 3600
+}
+
+/// Real pages, including durable reload at each boundary, until exhaustion.
+fn oversized_walk(
+    fixture: &RearmFixture,
+    now: u64,
+    first_upload: RearmUpload,
+) -> (Vec<RearmPage>, Vec<serde_json::Value>) {
+    let mut pages = Vec::new();
+    let mut transitions = Vec::new();
+    for number in 0..C1B_MAX_PAGES {
+        let upload = if number == 0 {
+            first_upload
+        } else {
+            RearmUpload::Accept
+        };
+        let (page, rows) = crate::local_resource_diagnostics::capture(|| {
+            fixture.page(&oversized_clock(now + number as u64), upload)
+        });
+        transitions.extend(rows.into_iter().filter(|row| {
+            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == "starting"
+        }));
+        let (ended, _) = c1b_traversal_ended(&page.index);
+        pages.push(page);
+        if ended {
+            return (pages, transitions);
+        }
+    }
+    panic!("oversized traversal must exhaust within the existing page bound");
+}
+
+#[test]
+#[serial(source_manifests)]
+fn oversized_shed_upload_is_reoffered_at_the_original_retry_deadline() {
+    if !c1a_layout_supported("oversized-shed-recovery") {
+        return;
+    }
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = c1a_fixture("oversized-shed-recovery");
+    oversized_create(&fixture);
+    let start = time::OffsetDateTime::parse(
+        "2026-08-02T08:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+    .unix_timestamp() as u64;
+    let (pages, _) = oversized_walk(&fixture, start, RearmUpload::Shed);
+    let first = &pages[0];
+    assert!(!first.fully_settled);
+    let owed = first
+        .scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == REARM_ROOT)
+        .expect("the shed page offered the root session");
+    assert!(first.offered.contains(&owed.snapshot_fingerprint));
+    assert!(first.uploaded.is_empty());
+    let saved = c1a_saved(&fixture);
+    assert_eq!(saved["traversal"]["counts"]["oversized_file_count"], 1);
+    assert!(pages
+        .last()
+        .unwrap()
+        .index
+        .bounded_sweep_unsettled_cause_names()
+        .contains(&"shed"));
+    let deadline = oversized_deadline(&saved);
+    assert!(deadline < oversized_floor(&saved));
+    oversized_tick(&fixture, deadline - 1);
+    let (retry, starts) = oversized_walk(&fixture, deadline, RearmUpload::Accept);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["counts"]["reason"], "terminal_unhealthy_retry");
+    assert!(
+        retry
+            .iter()
+            .any(|page| page.scan.snapshots.iter().any(|item| {
+                item.source_session_id == REARM_ROOT
+                    && page.offered.contains(&item.snapshot_fingerprint)
+                    && page.uploaded.contains(&item.snapshot_fingerprint)
+            })),
+        "the shed session reaches the real uploader and ACK on the old cadence"
+    );
+    assert!(!retry.last().unwrap().scan.census_complete);
+}
+
+#[test]
+#[serial(source_manifests)]
+fn oversized_blocking_hold_is_reoffered_once_per_six_hour_floor() {
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = PipelineFixture::new("oversized-blocking-hold-floor");
+    fixture.baseline();
+    let revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
+    let oversized = fixture.root.join(format!("{OVERSIZED_SESSION}.jsonl"));
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(OVERSIZED_BYTES)
+        .unwrap();
+    // The production replay reset leaves this real demotion hold no committed
+    // entry to restore. Completed settlement must keep it progress-blocking.
+    let cycle = PipelineCycle {
+        replay_generation: "replay-generation-reset",
+        proven_owner_session: Some(PIPELINE_HELD_SESSION),
+        historical_replay: true,
+        ..PIPELINE_HOLD_CYCLE
+    };
+    let walk = |now: u64| {
+        let mut pages = Vec::new();
+        let mut starts = Vec::new();
+        for number in 0..C1B_MAX_PAGES {
+            let (page, rows) = crate::local_resource_diagnostics::capture(|| {
+                fixture.page(
+                    &oversized_clock(now + number as u64),
+                    &cycle,
+                    PipelineUpload::Accept,
+                )
+            });
+            if let Some(start) = transition_row(&rows, "starting") {
+                starts.push(start);
+            }
+            let ended = c1b_traversal_ended(&page.index).0;
+            pages.push(page);
+            if ended {
+                return (pages, starts);
+            }
+        }
+        panic!("hold floor traversal must exhaust");
+    };
+    let at = time::OffsetDateTime::parse(
+        "2026-08-02T09:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+    .unix_timestamp() as u64;
+    let (seed, starts) = walk(at);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(seed.iter().map(|page| page.held.len()).sum::<usize>(), 1);
+    let held = seed
+        .iter()
+        .flat_map(|page| page.held.iter())
+        .next()
+        .unwrap()
+        .clone();
+    let saved = serde_json::to_value(&seed.last().unwrap().index).unwrap();
+    assert_eq!(saved["traversal"]["counts"]["oversized_file_count"], 1);
+    assert_eq!(
+        seed.last()
+            .unwrap()
+            .index
+            .bounded_sweep_unsettled_cause_names(),
+        ["completed_blocking_holds"]
+    );
+    let mut floor = oversized_floor(&saved);
+    for _ in 0..2 {
+        for now in [floor - 5 * 3600, floor - 3600, floor - 1] {
+            if now == floor - 1 {
+                // A content wake immediately before the floor installs a
+                // future ordinary deadline. It must not postpone the re-walk.
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&oversized)
+                    .unwrap()
+                    .set_len(OVERSIZED_BYTES + floor)
+                    .unwrap();
+            }
+            let (quiet, starts) = walk(now);
+            assert!(starts.is_empty(), "no hourly re-walk for a blocking hold");
+            assert!(quiet.iter().all(|page| page.held.is_empty()));
+            assert!(!quiet.last().unwrap().scan.census_complete);
+            if now == floor - 1 {
+                assert!(
+                    oversized_deadline(
+                        &serde_json::to_value(&quiet.last().unwrap().index).unwrap()
+                    ) > floor
+                );
+            }
+        }
+        let (retry, starts) = walk(floor);
+        assert_eq!(starts.len(), 1, "exactly one re-walk at the floor");
+        assert_eq!(starts[0]["counts"]["reason"], "terminal_unhealthy_retry");
+        assert_eq!(retry.iter().map(|page| page.held.len()).sum::<usize>(), 1);
+        assert!(
+            retry.iter().any(|page| page.held.contains(&held)),
+            "the same demoted body is offered to real hold classification again"
+        );
+        assert!(retry.iter().all(|page| !page.uploaded.contains(&held)));
+        let last = retry.last().unwrap();
+        assert!(!last.scan.census_complete);
+        assert_eq!(last.scan.oversized_file_count, 1);
+        assert_eq!(
+            last.index
+                .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
+            Some(revision.clone())
+        );
+        let next_floor = oversized_floor(&serde_json::to_value(&last.index).unwrap());
+        assert_eq!(next_floor, floor + 6 * 3600);
+        floor = next_floor;
+    }
+}
+
+#[test]
+#[serial(source_manifests)]
+fn oversized_restart_discovers_and_uploads_a_new_file_without_hints_within_floor() {
+    if !c1a_layout_supported("oversized-restart-no-hints") {
+        return;
+    }
+    let _manifests = SourceManifestTestGuard::new();
+    let (fixture, _) = oversized_seed("oversized-restart-no-hints");
+    let saved = c1a_saved(&fixture);
+    let floor = oversized_floor(&saved);
+    let restarted = ScanIndex::load(&fixture.index_path).unwrap();
+    assert_eq!(c1b_traversal_ended(&restarted), (true, true));
+    assert_eq!(
+        serde_json::to_value(&restarted).unwrap()["traversal"],
+        saved["traversal"]
+    );
+    assert!(fixture.hinted_paths.is_empty());
+    const NEW_SESSION: &str = "e8000000-0000-4000-8000-000000000008";
+    std::fs::write(
+        fixture.root.join(format!("{NEW_SESSION}.jsonl")),
+        rearm_transcript_line(NEW_SESSION, None, "req_no_hint", 0),
+    )
+    .unwrap();
+    // Every fixture page independently reloads the exhausted checkpoint: no
+    // process-local state or watcher input can discover this file for it.
+    let quiet = oversized_tick(&fixture, floor - 1);
+    assert!(!quiet.parsed.contains(NEW_SESSION));
+    let (retry, starts) = oversized_walk(&fixture, floor, RearmUpload::Accept);
+    assert_eq!(starts.len(), 1);
+    assert!(retry.iter().any(|page| page.parsed.contains(NEW_SESSION)));
+    assert!(
+        retry
+            .iter()
+            .any(|page| page.scan.snapshots.iter().any(|item| {
+                item.source_session_id == NEW_SESSION
+                    && page.offered.contains(&item.snapshot_fingerprint)
+                    && page.uploaded.contains(&item.snapshot_fingerprint)
+            })),
+        "no-hint discovery reaches the real uploader and durable ACK"
+    );
+    assert!(!retry.last().unwrap().scan.census_complete);
+    assert_eq!(retry.last().unwrap().scan.oversized_file_count, 1);
+    assert!(fixture.hinted_paths.is_empty());
+}
+
+#[test]
+#[serial(source_manifests)]
+fn oversized_two_files_retry_only_changed_content_and_keep_exact_count() {
+    if !c1a_layout_supported("oversized-two-files") {
+        return;
+    }
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = c1a_fixture("oversized-two-files");
+    let closed = c1b_generation(&fixture, "oversized-two", (8, 0));
+    assert!(closed.census_complete && closed.proven);
+    let changed = oversized_create(&fixture);
+    let unchanged = fixture
+        .root
+        .join("e8000000-0000-4000-8000-000000000008.jsonl");
+    std::fs::File::create(&unchanged)
+        .unwrap()
+        .set_len(OVERSIZED_BYTES)
+        .unwrap();
+    let seed = c1b_generation(&fixture, "oversized-two", (8, 10));
+    assert!(seed.red && !seed.census_complete);
+    let before = c1a_saved(&fixture);
+    let debts = before["traversal"]["oversized_discovery"]
+        .as_object()
+        .unwrap();
+    assert_eq!(debts.len(), 2);
+    assert_eq!(before["traversal"]["counts"]["oversized_file_count"], 2);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&changed)
+        .unwrap()
+        .set_len(OVERSIZED_BYTES + 100)
+        .unwrap();
+    let page = oversized_tick(&fixture, oversized_deadline(&before));
+    let grown = c1a_saved(&fixture);
+    let grown_debts = grown["traversal"]["oversized_discovery"]
+        .as_object()
+        .unwrap();
+    assert_eq!(grown_debts.len(), 2);
+    assert_eq!(
+        debts
+            .iter()
+            .filter(|(key, debt)| grown_debts[*key] != **debt)
+            .count(),
+        1
+    );
+    assert_eq!(page.scan.oversized_file_count, 2);
+    assert_eq!(page.scan.scanned_file_count, 0);
+    assert_eq!(
+        grown["traversal"]["census_window_end"],
+        before["traversal"]["census_window_end"]
+    );
+    // Shrink only that same file, leaving the other cap refusal intact.
+    std::fs::write(
+        &changed,
+        rearm_transcript_line(OVERSIZED_SESSION, None, "req_one_shrunk", 0),
+    )
+    .unwrap();
+    let page = oversized_tick(&fixture, oversized_deadline(&grown));
+    let after = c1a_saved(&fixture);
+    let remaining = after["traversal"]["oversized_discovery"]
+        .as_object()
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert!(
+        remaining.iter().all(|(key, debt)| debts[key] == *debt),
+        "the unchanged file's marker and count never change"
+    );
+    assert_eq!(page.scan.oversized_file_count, 1);
+    assert!(page.parsed.contains(OVERSIZED_SESSION));
+    assert_eq!(page.scan.scanned_file_count, 1);
+    assert!(!page.scan.census_complete);
 }

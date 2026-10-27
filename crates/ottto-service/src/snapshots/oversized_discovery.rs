@@ -1,5 +1,6 @@
 //! Oversized Claude files are honest sweep-wide loss, with content-driven,
-//! cadence-bounded discovery retries. This state never enters an upload body.
+//! cadence-bounded discovery retries and a six-hour recovery re-walk. This
+//! state never enters an upload body.
 use super::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +107,23 @@ pub(super) fn clock_retry_required(
             .saturating_sub(debt.observations);
     }
     counts.has_errors()
+}
+
+/// Full discovery is still needed for missed watcher events and blocking holds.
+/// Anchor it to the durable traversal start, independently of content retries:
+/// continuous growth must never push this recovery floor into the future.
+pub(super) fn floor_retry_due(
+    source: SnapshotSource,
+    traversal: &ScanTraversalCheckpoint,
+    collected_at: &str,
+) -> bool {
+    const FLOOR_SECONDS: u64 = 6 * 60 * 60;
+    source == SnapshotSource::ClaudeCode
+        && !traversal.oversized_discovery.is_empty()
+        && rfc3339_unix_seconds(collected_at).is_some_and(|now| {
+            rfc3339_unix_seconds(&traversal.census_window_end)
+                .is_some_and(|started| now >= started.saturating_add(FLOOR_SECONDS))
+        })
 }
 
 pub(super) fn retry_changed(traversal: &mut ScanTraversalCheckpoint, collected_at: &str) {

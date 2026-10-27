@@ -3517,9 +3517,10 @@ pub struct ScanIndex {
     /// can advance.
     #[serde(default)]
     bounded_sweep_had_unsettled_upload: bool,
-    /// Diagnostics only: the `UnsettledUploadCause` bits of the paths that
-    /// set `bounded_sweep_had_unsettled_upload` in this sweep. The traversal
-    /// transition lines name them; no gate reads them. Reset with the flag.
+    /// The `UnsettledUploadCause` bits of the paths that set
+    /// `bounded_sweep_had_unsettled_upload` in this sweep. Transition lines
+    /// name them; oversized retry scheduling preserves ordinary recovery for
+    /// every cause except blocking holds. Reset with the flag.
     /// Read through `unsettled_cause_bits`, which reports none without the
     /// flag and `Unattributed` for a flag with no recorded cause.
     #[serde(
@@ -3760,8 +3761,8 @@ pub struct ScanIndex {
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
-/// Diagnostic only: the traversal transition lines name them, and no gate
-/// reads them.
+/// Transition diagnostics and oversized retry scheduling use these bits;
+/// settlement and completeness continue to use the authoritative flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnsettledUploadCause {
     /// A 429/503 shed left a partial checkpoint.
@@ -39272,6 +39273,9 @@ fn ensure_bounded_traversal(
                                 })
                         })
         });
+        let unsettled_retry_required =
+            index.unsettled_cause_bits() & !UnsettledUploadCause::CompletedBlockingHolds.bit() != 0;
+        let floor_retry_due = oversized_discovery::floor_retry_due(source, traversal, collected_at);
         let terminal_unhealthy = traversal.pending_directories.is_empty()
             && !traversal
                 .pending_candidates
@@ -39279,7 +39283,8 @@ fn ensure_bounded_traversal(
                 .any(|candidate| candidate.census_member)
             && index.claude_stale_family_carry.replay.is_empty()
             && (oversized_discovery::clock_retry_required(source, traversal)
-                || (traversal.counts.has_errors() && family_retry_due)
+                || (traversal.counts.has_errors()
+                    && (family_retry_due || unsettled_retry_required || floor_retry_due))
                 || prior_admission.is_some());
         // What clears the latch: a generation that completes drops the
         // traversal, and a changed scan context takes the `else` branch below;
@@ -39289,9 +39294,10 @@ fn ensure_bounded_traversal(
         // absurdly far ahead, or missing altogether (an index persisted before
         // the deadline existed) is due now. The retry depends on the clock
         // alone, never on new input arriving.
-        let retry_due = prior_admission
-            .as_ref()
-            .is_some_and(|state| !state.complete && state.progressed)
+        let retry_due = floor_retry_due
+            || prior_admission
+                .as_ref()
+                .is_some_and(|state| !state.complete && state.progressed)
             || match rfc3339_unix_seconds(collected_at) {
                 Some(now) => {
                     traversal
@@ -39319,7 +39325,8 @@ fn ensure_bounded_traversal(
         // Serve scoped oversized changes only after deciding that no ordinary
         // retry starts. A simultaneous bound-family wake keeps its old cadence.
         // An oversized admission refusal remains sweep-wide loss. Only its
-        // content can wake its discovery; it must not re-arm unrelated families.
+        // content can wake scoped discovery between the slow recovery re-walks;
+        // that scoped work must not re-arm unrelated families.
         if source == SnapshotSource::ClaudeCode
             && prior_traversal_context_matches
             && prior_admission.is_none()
@@ -41955,15 +41962,15 @@ impl ScanIndex {
         self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Unattributed);
     }
 
-    /// Mark the sweep unsettled and record which path did it, for the
-    /// transition lines only. An earlier flag with no recorded cause stays
+    /// Mark the sweep unsettled and record which path did it, for transition
+    /// diagnostics and retry scheduling. A flag with no recorded cause stays
     /// `Unattributed` beside this one.
     pub(crate) fn mark_bounded_sweep_unsettled_by(&mut self, cause: UnsettledUploadCause) {
         self.bounded_sweep_unsettled_causes = self.unsettled_cause_bits() | cause.bit();
         self.bounded_sweep_had_unsettled_upload = true;
     }
 
-    /// Diagnostics only. The flag is authoritative: no cause without it, and
+    /// The flag is authoritative: no cause without it, and
     /// `Unattributed` for a flag with no recorded cause.
     fn unsettled_cause_bits(&self) -> u16 {
         match (
