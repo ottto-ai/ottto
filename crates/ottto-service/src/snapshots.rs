@@ -6600,6 +6600,18 @@ fn claude_full_rearm_digest_is_canonical(digest: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// A non-empty held-family scope of at most `MAX_SCOPED_HELD_FAMILY_ROOTS`
+/// canonical root digests: the only shape `mark_bounded_sweep_held_by_families`
+/// writes. Readers and later stamps treat anything else as unknown.
+fn held_family_scope_has_writer_shape(scope: &BTreeSet<String>) -> bool {
+    !scope.is_empty()
+        && scope.len() <= MAX_SCOPED_HELD_FAMILY_ROOTS
+        && scope
+            .iter()
+            .map(String::as_str)
+            .all(claude_full_rearm_digest_is_canonical)
+}
+
 /// Held families one sweep may scope its `CompletedBlockingHolds` marker to.
 /// More fall back to the sweep-wide unchanged-proof veto.
 pub(crate) const MAX_SCOPED_HELD_FAMILY_ROOTS: usize = 64;
@@ -42015,14 +42027,19 @@ impl ScanIndex {
     /// Mark the sweep unsettled by a `Completed` page's blocking local holds,
     /// scoped to the held entities' Claude families (`held_family_roots`, raw
     /// roots). The scope survives only while every earlier stamp of this
-    /// sweep was scoped too; `None`, no family or overflow drops it. The flag,
-    /// census withhold and every other reader of the flag are unchanged.
+    /// sweep was scoped too; `None`, no family or overflow drops it. A prior
+    /// scope outside the writer's shape (as loaded from a damaged index) is
+    /// unknown and stays sweep-wide until the next sweep resets the flag. The
+    /// flag, census withhold and every other reader of the flag are unchanged.
     pub(crate) fn mark_bounded_sweep_held_by_families(
         &mut self,
         held_family_roots: Option<&BTreeSet<String>>,
     ) {
         let prior = if self.bounded_sweep_had_unsettled_upload {
-            self.claude_full_rearm_progress.held_family_roots.take()
+            self.claude_full_rearm_progress
+                .held_family_roots
+                .take()
+                .filter(held_family_scope_has_writer_shape)
         } else {
             Some(BTreeSet::new())
         };
@@ -42058,16 +42075,8 @@ impl ScanIndex {
         }
         self.claude_full_rearm_progress
             .held_family_roots
-            .as_ref()
-            .filter(|scope| {
-                !scope.is_empty()
-                    && scope.len() <= MAX_SCOPED_HELD_FAMILY_ROOTS
-                    && scope
-                        .iter()
-                        .map(String::as_str)
-                        .all(claude_full_rearm_digest_is_canonical)
-            })
-            .cloned()
+            .clone()
+            .filter(held_family_scope_has_writer_shape)
     }
 
     /// Diagnostics only. The flag is authoritative: no cause without it, and

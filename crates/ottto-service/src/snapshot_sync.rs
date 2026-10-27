@@ -20154,6 +20154,9 @@ mod tests {
     /// `completed_blocking_holds` cause, but whose scope is empty, over the
     /// bound, holds a non-canonical digest, is missing, or has the wrong type,
     /// takes the sweep-wide unchanged-proof veto. The flag and cause stay.
+    /// Review 797 r2: that veto is sticky. A later held page of the same sweep
+    /// stamping a valid family cannot turn the unknown scope back into a
+    /// scoped exception; a healthy saved scope still accumulates.
     #[test]
     fn saved_held_family_scope_outside_the_writer_shape_keeps_the_sweep_wide_veto() {
         let entry = |source: &str, fingerprint: &str| {
@@ -20198,6 +20201,24 @@ mod tests {
                 .map(|held| held.len()),
             Some(1),
             "control: the writer's own scope is trusted"
+        );
+        let later_held_page = |index: ScanIndex| {
+            commit_completed_with_local_holds(
+                index,
+                &committed,
+                &test_upload_progress(),
+                &BTreeSet::from(["held-new".to_string()]),
+                &BTreeSet::new(),
+                true,
+                Some(&BTreeSet::from(["later-held-family".to_string()])),
+            )
+        };
+        assert_eq!(
+            later_held_page(ScanIndex::load(&index_path).expect("reload scan index"))
+                .unchanged_proof_unsettled_families()
+                .map(|held| held.len()),
+            Some(2),
+            "control: a healthy saved scope accumulates the later page's family"
         );
         let over_bound = (0..=crate::snapshots::MAX_SCOPED_HELD_FAMILY_ROOTS)
             .map(|n| format!("{n:032x}"))
@@ -20248,6 +20269,17 @@ mod tests {
                 loaded.unchanged_proof_unsettled_families(),
                 None,
                 "{case}: the sweep-wide veto"
+            );
+            let advanced = later_held_page(loaded);
+            assert_eq!(
+                advanced.bounded_sweep_unsettled_cause_names(),
+                ["completed_blocking_holds"],
+                "{case}: advanced"
+            );
+            assert_eq!(
+                advanced.unchanged_proof_unsettled_families(),
+                None,
+                "{case}: a later scoped page keeps the sweep-wide veto"
             );
         }
         let _ = std::fs::remove_dir_all(root);
