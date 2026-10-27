@@ -162,6 +162,8 @@ struct RearmFixture {
     index_path: PathBuf,
     progress_path: PathBuf,
     request_identity: bool,
+    // Synthetic watcher events supplied through the actual scan constructor.
+    hinted_paths: Vec<PathBuf>,
     native_file_limit: usize,
     serial_active_frame: bool,
     owned_base_preparation: bool,
@@ -187,6 +189,7 @@ impl RearmFixture {
             reread_guard_cache: None,
             case,
             request_identity: false,
+            hinted_paths: Vec::new(),
             native_file_limit: REARM_PAGE_FILES,
             serial_active_frame: false,
             owned_base_preparation: false,
@@ -337,7 +340,7 @@ impl RearmFixture {
             self.native_file_limit,
             true, // Match the ordinary test scanner's artifact setting.
             Some(&self.support),
-            &[],
+            &self.hinted_paths,
             false,
             true, // Match its context-curve setting; byte parity includes it.
             self.request_identity,

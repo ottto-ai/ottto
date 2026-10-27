@@ -179,7 +179,8 @@ fn oversized_metadata_only_touches_give_zero_wakes() {
         return;
     }
     let _manifests = SourceManifestTestGuard::new();
-    let (fixture, path) = oversized_seed("oversized-metadata");
+    let (mut fixture, path) = oversized_seed("oversized-metadata");
+    fixture.hinted_paths.push(path.clone());
     let before = c1a_saved(&fixture);
     let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     let original_modified = file.metadata().unwrap().modified().unwrap();
@@ -216,7 +217,8 @@ fn oversized_minutely_growth_is_bounded_by_existing_exponential_cadence() {
         return;
     }
     let _manifests = SourceManifestTestGuard::new();
-    let (fixture, path) = oversized_seed("oversized-cadence");
+    let (mut fixture, path) = oversized_seed("oversized-cadence");
+    fixture.hinted_paths.push(path.clone());
     let mut saved = c1a_saved(&fixture);
     let start = oversized_deadline(&saved);
     let mut wakes = 0;
@@ -323,7 +325,11 @@ fn oversized_keeps_complete_families_empty_and_refuses_absence_retirement_sweep_
     let witness = index
         .claude_usage_family_witness_digest_for_test(REARM_ROOT)
         .unwrap();
-    index.insert_retry_pending_claude_authority_for_test(REARM_ROOT);
+    let members = RearmFixture::family_keys(&index)
+        .into_iter()
+        .map(|(session, key)| (session, index.files[&key].source_file_fingerprint.clone()))
+        .collect();
+    index.bind_retry_pending_claude_authority_for_test(REARM_ROOT, members);
     index.save(&fixture.index_path).unwrap();
     let before = c1a_saved(&fixture);
     std::fs::remove_file(fixture.root.join(format!("{REARM_ROOT}.jsonl"))).unwrap();
