@@ -878,8 +878,10 @@ fn bound_terminal_member_of_committed_family_keeps_delivery_free_membership() {
         "member-held",
         activity,
     );
+    let provisional_context = scanned.intern_upload_context([42; 32]);
     {
         let entry = scanned.files.get_mut(member_key).expect("member entry");
+        entry.settled_upload_context = provisional_context;
         entry.last_upload_body_witness = Some("member-witness".to_string());
         entry.effective_upload_body_witness_revision = 1;
     }
@@ -895,6 +897,11 @@ fn bound_terminal_member_of_committed_family_keeps_delivery_free_membership() {
 
     assert!(scanned.locally_held_keys_restorable(&previous, &held, &no_account_holds));
     let reverted = scanned.with_locally_held_keys_reverted(&previous, &held, &no_account_holds);
+    let owned =
+        scanned
+            .clone()
+            .into_locally_held_keys_reverted(&previous, &held, &no_account_holds);
+    assert!(owned.files[member_key].settled_upload_context.is_none());
     let saved: ScanIndex =
         serde_json::from_slice(&serde_json::to_vec(&reverted).expect("encode index"))
             .expect("decode index");
@@ -902,6 +909,7 @@ fn bound_terminal_member_of_committed_family_keeps_delivery_free_membership() {
     assert_eq!(placeholder.source_file_fingerprint, member_revision);
     assert_eq!(placeholder.last_snapshot_fingerprint, None);
     assert_eq!(placeholder.last_upload_body_witness, None);
+    assert!(placeholder.settled_upload_context.is_none());
     assert_eq!(placeholder.effective_upload_body_witness_revision, 0);
     assert!(!saved.file_snapshot_fingerprints.contains_key(member_key));
     assert!(!saved.confirmed_empty_files.contains(member_key));

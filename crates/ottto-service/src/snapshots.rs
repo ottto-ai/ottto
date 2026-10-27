@@ -7724,17 +7724,15 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .entry(source_file_fingerprint.clone())
                 .or_default()
                 .insert(snapshot.snapshot_fingerprint.clone());
+            let witness = body_witness(snapshot);
             by_source_file_body_witness
                 .entry(source_file_fingerprint.clone())
                 .or_default()
-                .insert(body_witness(snapshot));
+                .insert(witness.clone());
             context_bodies
                 .entry(source_file_fingerprint.clone())
                 .or_default()
-                .insert(
-                    snapshot.snapshot_fingerprint.clone(),
-                    body_witness(snapshot),
-                );
+                .insert(snapshot.snapshot_fingerprint.clone(), witness);
         }
     }
 
@@ -43009,32 +43007,39 @@ impl ScanIndex {
             self.accepted_snapshot_fingerprints.contains(fp)
                 && !self.quarantined_snapshot_fingerprints.contains_key(fp)
         };
-        let eligible = self
-            .files
+        // Legacy singleton entries retain the file-group hash, not the entity
+        // fingerprint. Prove those groups once from accepted metadata only.
+        let accepted_singletons = self
+            .accepted_snapshot_fingerprints
             .iter()
-            .filter(|(key, entry)| {
-                !entry.source_file_fingerprint.is_empty()
-                    && !entry.codex_recovery_is_pending()
-                    && !self.upload_context_held(key, &entry.source_file_fingerprint)
-                    && ((self.confirmed_empty_files.contains(*key)
-                        && entry.last_snapshot_fingerprint.is_none()
-                        && self
-                            .file_snapshot_fingerprints
-                            .get(*key)
-                            .map_or(true, BTreeSet::is_empty))
-                        || (entry.last_snapshot_fingerprint.is_some()
-                            && self.file_snapshot_fingerprints.get(*key).map_or_else(
-                                || {
-                                    entry
-                                        .last_snapshot_fingerprint
-                                        .as_ref()
-                                        .is_some_and(accepted)
-                                },
-                                |fps| !fps.is_empty() && fps.iter().all(accepted),
-                            )))
-            })
-            .map(|(key, _)| key.clone())
+            .filter(|fp| accepted(fp))
+            .map(|fp| snapshot_file_entity_set_hex(std::iter::once(fp)))
             .collect::<BTreeSet<_>>();
+        let eligible =
+            self.files
+                .iter()
+                .filter(|(key, entry)| {
+                    !entry.source_file_fingerprint.is_empty()
+                        && !entry.codex_recovery_is_pending()
+                        && !self.upload_context_held(key, &entry.source_file_fingerprint)
+                        && ((self.confirmed_empty_files.contains(*key)
+                            && entry.last_snapshot_fingerprint.is_none()
+                            && self
+                                .file_snapshot_fingerprints
+                                .get(*key)
+                                .map_or(true, BTreeSet::is_empty))
+                            || (entry.last_snapshot_fingerprint.is_some()
+                                && self.file_snapshot_fingerprints.get(*key).map_or_else(
+                                    || {
+                                        entry.last_snapshot_fingerprint.as_ref().is_some_and(
+                                            |group| accepted_singletons.contains(group),
+                                        )
+                                    },
+                                    |fps| !fps.is_empty() && fps.iter().all(accepted),
+                                )))
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<BTreeSet<_>>();
         let id = self.intern_upload_context(context);
         // Legacy IDs are never trusted without their original full-digest table.
         for (key, entry) in &mut self.files {

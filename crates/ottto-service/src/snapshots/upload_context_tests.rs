@@ -332,15 +332,21 @@ fn legacy_context_inherits_persisted_acceptance_once_and_prunes_at_save() {
         BTreeSet::from(["unaccepted".into()]),
     );
     let singleton = "/synthetic/singleton.jsonl";
-    let scan = project(&mut index, SnapshotSource::Codex, singleton, false);
+    let mut scan = project(&mut index, SnapshotSource::Codex, singleton, false);
+    scan.snapshots.truncate(1);
+    finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
     let (accepted, _) = acks(&scan);
     index.record_accepted_snapshot_fingerprints(&accepted);
-    index
-        .files
-        .get_mut(singleton)
-        .unwrap()
-        .last_snapshot_fingerprint = accepted.first().cloned();
+    assert_ne!(
+        index.files[singleton].last_snapshot_fingerprint.as_ref(),
+        accepted.first()
+    );
     index.file_snapshot_fingerprints.remove(singleton);
+    let missing_group = "/synthetic/missing-group-map.jsonl";
+    let scan = project(&mut index, SnapshotSource::Codex, missing_group, false);
+    let (accepted, _) = acks(&scan);
+    index.record_accepted_snapshot_fingerprints(&accepted);
+    index.file_snapshot_fingerprints.remove(missing_group);
     project(
         &mut index,
         SnapshotSource::Codex,
@@ -360,6 +366,7 @@ fn legacy_context_inherits_persisted_acceptance_once_and_prunes_at_save() {
     ] {
         assert_context(&loaded, key, None);
     }
+    assert_context(&loaded, missing_group, None);
     assert_context(&loaded, singleton, Some("A"));
     assert_context(&loaded, "/synthetic/empty.jsonl", Some("A"));
     loaded.activate_upload_context("B".into());
