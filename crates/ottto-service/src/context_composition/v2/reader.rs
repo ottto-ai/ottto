@@ -18,7 +18,7 @@ struct ReaderFile(std::io::Take<File>);
 impl Read for ReaderFile {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.0.read(buffer)?;
-        super::checkpoint::record_read(read as u64);
+        super::checkpoint::record_transcript_read(read as u64);
         Ok(read)
     }
 }
