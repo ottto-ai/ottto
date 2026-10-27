@@ -71,7 +71,6 @@ impl Kind {
     ];
 
     /// The kinds_version 2 kinds in wire order.
-    #[allow(dead_code)] // Read once the reader uploads kinds_version 2.
     pub(crate) const V2: [Kind; 7] = [
         Kind::FilesRead,
         Kind::CommandOutput,
@@ -161,7 +160,6 @@ pub(crate) enum Part {
     ByAgent,
 }
 
-#[allow(dead_code)] // `as_str` is read once the reader uploads parts.
 impl Part {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -238,7 +236,6 @@ impl Part {
 // Line context and verdicts.
 // -------------------------------------------------------------------------
 
-#[allow(dead_code)] // Read once the reader builds kinds_version 2 contexts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Agent {
     Claude,
@@ -246,7 +243,6 @@ pub(crate) enum Agent {
 }
 
 /// Who wrote a prompt.
-#[allow(dead_code)] // `Agent` is set once the reader builds kinds_version 2 contexts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Author {
     You,
@@ -255,7 +251,6 @@ pub(crate) enum Author {
 
 /// Whether a line belongs to the session's first request, and if so whether
 /// the session-start facts measured that start.
-#[allow(dead_code)] // Set once the reader builds kinds_version 2 contexts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Request1 {
     /// The line is after the first request.
@@ -277,9 +272,9 @@ pub(crate) enum KindsVersion {
 }
 
 /// What the reader knows about the line being classified.
-#[allow(dead_code)] // `agent` is informational.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LineCtx<'a> {
+    #[allow(dead_code)] // Informational: no reader branches on it.
     pub(crate) agent: Agent,
     /// Whether the line belongs to the session's first request.
     pub(crate) request_1: Request1,
@@ -310,7 +305,6 @@ impl<'a> LineCtx<'a> {
     }
 
     /// A kinds_version 2 context.
-    #[allow(dead_code)] // Called once the reader uploads kinds_version 2.
     pub(crate) fn v2(
         agent: Agent,
         request_1: Request1,
@@ -368,7 +362,6 @@ impl Verdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolKey(Box<str>);
 
-#[allow(dead_code)] // Read once tool totals are uploaded.
 impl ToolKey {
     pub(crate) fn new(name: &str) -> Self {
         Self(name.into())
@@ -387,7 +380,6 @@ pub(crate) struct CallClass {
     /// The call's largest share.
     pub(crate) kind: Kind,
     pub(crate) part: Part,
-    #[allow(dead_code)] // Read once tool totals are uploaded.
     pub(crate) tool: ToolKey,
     /// The file the call read: as written in the transcript (kinds_version 1),
     /// or joined to the folder the read ran in (kinds_version 2).
@@ -538,7 +530,6 @@ pub(crate) fn claude_tool(ctx: &LineCtx, name: &str, input: &Value) -> CallClass
 
 /// A user record's own text (not a tool result): the whole record, so its
 /// flags (`isMeta`, `isCompactSummary`, `isSidechain`, `entrypoint`) count.
-#[allow(dead_code)] // The kinds_version 1 reader does not call it.
 pub(crate) fn claude_user_text(ctx: &LineCtx, line: &Value) -> Verdict {
     if !ctx.is_v1() {
         return v2::claude_user_text(ctx, line);
@@ -594,7 +585,6 @@ pub(crate) fn codex_mcp(ctx: &LineCtx, invocation: Option<&Value>) -> CallClass 
 
 /// An inner item Codex writes between a call and its output
 /// (`event_msg` / `item_completed`).
-#[allow(dead_code)] // Built once the reader decodes inner items.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum InnerItem<'a> {
     /// `CommandExecution`. `cwd` as written (a `file://` prefix is fine);
@@ -622,14 +612,13 @@ pub(crate) enum InnerItem<'a> {
 
 /// The script of a Codex command array: the last element of
 /// `[shell, -lc, script]`, else the words joined by spaces.
-#[allow(dead_code)] // Called once the reader decodes inner items.
+#[cfg(test)] // The reader calls `v2::command_words_script` directly.
 pub(crate) fn command_words_script(words: &[Value]) -> String {
     v2::command_words_script(words)
 }
 
 /// One entry of Codex's own `parsed_cmd` (`read`, `search`, `list_files`,
 /// `unknown`).
-#[allow(dead_code)] // Built once the reader decodes inner items.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ParsedCommand<'a> {
     pub(crate) kind: &'a str,
@@ -903,7 +892,6 @@ fn repository_hash(root: &Path) -> Option<String> {
 
 impl GitRootCache {
     /// A cache that looks up checkout roots (kinds_version 2).
-    #[allow(dead_code)] // Built once the reader uploads kinds_version 2.
     pub(crate) fn v2() -> Self {
         Self {
             lookup: true,
@@ -913,7 +901,6 @@ impl GitRootCache {
 
     /// Lookups not made because the cache was full (a health counter's
     /// input).
-    #[allow(dead_code)] // Read once the reader keeps health counters.
     pub(crate) fn skipped(&self) -> u64 {
         self.skipped
     }

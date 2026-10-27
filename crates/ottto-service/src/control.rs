@@ -11465,20 +11465,6 @@ struct InstallSessionEvent<'a> {
     device_id: Option<&'a str>,
 }
 
-#[allow(dead_code)]
-fn register_telemetry_device_legacy(
-    api_base_url: &str,
-    install_session: &InstallSessionApiResponse,
-    machine: &MachineIdentity,
-) -> Result<TelemetryDeviceRegisterApiResponse, LocalApiError> {
-    let url = api_url_with_base(api_base_url, "/api/v1/telemetry/devices/register");
-    let prior = prior_device_credential_for_registration()?;
-    let body = telemetry_device_register_body_with_prior(install_session, machine, prior.as_ref());
-    let registered = backend_post_json(&url, &body, &[])?;
-    validate_registration_continuity_response(&url, &registered, prior.as_ref())?;
-    Ok(registered)
-}
-
 fn prepare_telemetry_device_registration(
     api_base_url: &str,
     install_session: &InstallSessionApiResponse,
@@ -11771,6 +11757,7 @@ fn validate_device_credential_status(
     Ok(())
 }
 
+#[cfg(test)] // Only the removed legacy register path used it in production.
 fn validate_registration_continuity_response(
     url: &str,
     registered: &TelemetryDeviceRegisterApiResponse,
