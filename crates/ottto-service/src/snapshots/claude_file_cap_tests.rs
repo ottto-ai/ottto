@@ -424,16 +424,23 @@ impl crate::source_rotation::Owner for Rotation {
         _: Option<usize>,
     ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
         if let Some(receipt) = self.history_receipt.as_mut() {
-            use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-            let mut counter = Counter::new(crate::source_rotation::PARKED_BUDGET);
-            let measured = counter
-                .add(std::mem::size_of_val(&frame))
-                .and_then(|()| frame.heap_bound(&mut counter));
-            assert!(measured.is_some(),
-                "combined history/large-Full frame must fit existing bytes and visits: bytes={} visits={}",
-                counter.bytes, counter.visits_for_test());
-            receipt.visits_peak = receipt.visits_peak.max(counter.visits_for_test());
-            receipt.bytes_peak = receipt.bytes_peak.max(counter.bytes);
+            // Production accounting rejects Linux layouts. The native positive
+            // receipt must be measured on the validated macOS toolchain; Linux
+            // still executes every scheduling/revision/debt assertion below.
+            if crate::heap_layout_bound::layout_supported() {
+                use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+                let mut counter = Counter::new(crate::source_rotation::PARKED_BUDGET);
+                let measured = counter
+                    .add(std::mem::size_of_val(&frame))
+                    .and_then(|()| frame.heap_bound(&mut counter));
+                assert!(measured.is_some(),
+                    "combined history/large-Full frame must fit existing bytes and visits: bytes={} visits={}",
+                    counter.bytes, counter.visits_for_test());
+                receipt.visits_peak = receipt.visits_peak.max(counter.visits_for_test());
+                receipt.bytes_peak = receipt.bytes_peak.max(counter.bytes);
+            } else {
+                assert!(!cfg!(target_os = "macos"), "native layout receipt required");
+            }
             receipt.owed_seen = receipt.owed_seen.max(frame.history_upgrade.owed);
             receipt.budget_held = receipt
                 .budget_held
@@ -1065,5 +1072,8 @@ fn large_history_upgrade_is_paced_and_owed_history_drains() {
         "exercise #805's real paced history byte gate too"
     );
     assert!(peak <= 4096);
-    println!("claude_large_history_visit_peak: {peak}/4096");
+    println!(
+        "claude_large_history_visit_peak: {peak}/4096 layout_supported={}",
+        crate::heap_layout_bound::layout_supported()
+    );
 }
