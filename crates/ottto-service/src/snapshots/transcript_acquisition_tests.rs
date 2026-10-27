@@ -1264,6 +1264,7 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
                                     unresolvable: None,
                                     opened_changed_nanos: 0,
                                     opened_modified_nanos: 0,
+                                    opened_birth_nanos: 0,
                                 },
                             )
                         })

@@ -247,6 +247,7 @@ fn parse(f: &Fixture) -> Observation {
                 unresolvable: None,
                 opened_changed_nanos: 0,
                 opened_modified_nanos: 0,
+                opened_birth_nanos: 0,
             },
         )]))))
     } else {

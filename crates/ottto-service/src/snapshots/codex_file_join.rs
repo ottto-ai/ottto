@@ -329,6 +329,7 @@ impl HeaderInventory {
                 legacy_config_reconciliation_required: false,
                 opened_object_identity: String::new(),
                 fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: 0,
             };
             prepare_owned_scan_candidate(
                 SnapshotSource::Codex,

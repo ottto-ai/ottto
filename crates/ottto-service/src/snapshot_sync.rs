@@ -11636,6 +11636,7 @@ mod tests {
                 codex_counting_owner: None,
                 effective_upload_body_witness_revision: 0,
                 opened_changed_nanos: 0,
+                opened_birth_nanos: 0,
             },
         );
         index.file_snapshot_fingerprints.insert(

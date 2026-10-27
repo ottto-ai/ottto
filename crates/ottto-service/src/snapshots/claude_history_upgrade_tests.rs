@@ -498,6 +498,7 @@ fn family_on_disk(
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     };
     let subagents = project.join(family).join("subagents");
     fs::create_dir_all(&subagents).unwrap();

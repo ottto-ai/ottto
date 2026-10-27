@@ -2701,15 +2701,18 @@ struct CodexParentOwnershipLedger {
     /// children retry instead of treating the newly inherited suffix as local.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     opened_object_identity: String,
-    /// The ctime (unix nanos) and mtime of that same open. A later open of
-    /// the same object with this mtime whose identity, rebuilt with this
-    /// ctime and fresh content samples, equals `opened_object_identity` still
-    /// revalidates the ledger when only ctime moved (chmod, xattr, hard
-    /// link). Zero on older ledgers, which keep the exact identity comparison.
+    /// The ctime, mtime and file birth (unix nanos) of that same open. A
+    /// later open with this mtime and exactly this birth whose identity,
+    /// rebuilt with this ctime and fresh content samples, equals
+    /// `opened_object_identity` still revalidates the ledger when only ctime
+    /// moved (chmod, xattr, hard link). Zero on older ledgers (or without a
+    /// birth), which keep the exact identity comparison.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     opened_changed_nanos: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     opened_modified_nanos: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    opened_birth_nanos: u64,
     /// PR-P: a step-map-only witness that this parent yields no usable ledger
     /// (never persisted, never `scan_complete`, so every existing reader
     /// ignores it). A ledger insert under the same key replaces it.
@@ -4214,12 +4217,16 @@ pub struct ScanIndexEntry {
     )]
     pub codex_counting_owner: Option<String>,
     /// The ctime (unix nanos) in the opened-object identity that produced
-    /// `source_file_fingerprint` (Claude and Codex only). With size and mtime
-    /// unchanged the next scan rebuilds the identity from it, so a ctime-only
-    /// change never triggers a re-read. Older binaries drop it; zero keeps
-    /// the live-identity comparison once.
+    /// `source_file_fingerprint` (Claude and Codex only). With size, mtime
+    /// and file birth unchanged the next scan rebuilds the identity from it,
+    /// so a ctime-only change never triggers a re-read. Older binaries drop
+    /// it; zero keeps the live-identity comparison once.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub(crate) opened_changed_nanos: u64,
+    /// The file birth (unix nanos) of that open: the object generation the
+    /// stored ctime belongs to. Zero (unavailable) never adopts the ctime.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(crate) opened_birth_nanos: u64,
 }
 impl ScanIndexEntry {
     fn codex_recovery_is_pending(&self) -> bool {
@@ -17998,6 +18005,7 @@ impl SnapshotAccumulator {
                 unresolvable: None,
                 opened_changed_nanos: 0,
                 opened_modified_nanos: 0,
+                opened_birth_nanos: 0,
             },
         ))
     }
@@ -21054,6 +21062,7 @@ fn codex_parent_open_match_witnessed(
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     };
     let (file, stat) =
         open_candidate_file_stat(SnapshotSource::Codex, &mut candidate).map_err(|_| Absent)?;
@@ -21122,6 +21131,7 @@ fn codex_parent_locate(
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     };
     let file = open_candidate_beneath_root(&candidate).map_err(|_| Absent)?;
     let opened = file.metadata().map_err(|_| Absent)?;
@@ -23389,8 +23399,9 @@ fn validated_codex_parent_ownership_ledgers(
 
 /// The page-start step map of validated parent ledgers, plus the index
 /// ledgers (by index key) to re-witness at the live open. A ledger whose
-/// parent kept its mtime and whose identity, rebuilt from the live device and
-/// inode, the ledger's stored ctime and fresh content samples, still equals
+/// parent kept its mtime and exactly its (known) birth, and whose identity,
+/// rebuilt from the live device and inode, the ledger's stored ctime and
+/// fresh content samples, still equals
 /// the ledger identity, had only ctime moved (chmod, xattr, hard link). It
 /// still validates (Ron's re-read rule, across scans) and is re-witnessed at
 /// the live identity, so this page's after-parse fence and later scans
@@ -23422,19 +23433,24 @@ fn validate_codex_parent_ownership_ledgers(
     if wanted.is_empty() {
         return (BTreeMap::new(), Vec::new());
     }
-    let mut stored_times = BTreeMap::<&str, Vec<(u64, u64)>>::new();
+    let mut stored_times = BTreeMap::<&str, Vec<(u64, u64, u64)>>::new();
     for (session_id, _, ledger) in &eligible {
-        if ledger.opened_changed_nanos != 0 && ledger.opened_modified_nanos != 0 {
-            stored_times
-                .entry(session_id.as_str())
-                .or_default()
-                .push((ledger.opened_changed_nanos, ledger.opened_modified_nanos));
+        if ledger.opened_changed_nanos != 0
+            && ledger.opened_modified_nanos != 0
+            && ledger.opened_birth_nanos != 0
+        {
+            stored_times.entry(session_id.as_str()).or_default().push((
+                ledger.opened_changed_nanos,
+                ledger.opened_modified_nanos,
+                ledger.opened_birth_nanos,
+            ));
         }
     }
     // The file is dropped at once, as PR-1 drops it per ledger. Each open
     // yields its live identity and object inputs, plus, per stored (ctime,
-    // mtime) of a ledger with the live mtime, the identity rebuilt with that
-    // ctime: equal to the ledger identity exactly when only ctime moved.
+    // mtime, birth) of a ledger with the live mtime and birth, the identity
+    // rebuilt with that ctime: equal to the ledger identity exactly when only
+    // ctime moved.
     let opened = codex_parent_census_matches(census, &wanted)
         .into_iter()
         .zip(&wanted)
@@ -23443,14 +23459,15 @@ fn validate_codex_parent_ownership_ledgers(
                 codex_parent_open_match_witnessed(census, found).ok()?;
             let mut qualified = Vec::new();
             if let Some(live) = live {
-                for &(changed, modified) in stored_times.get(session_id).into_iter().flatten() {
+                for &times in stored_times.get(session_id).into_iter().flatten() {
+                    let (changed, modified, birth) = times;
                     if changed != live.changed_unix_nanos()
                         && live.modified_nanos == Some(modified)
-                        && live.born_by(changed)
+                        && live.same_birth(birth)
                     {
                         let object = live.with_changed_unix_nanos(changed);
                         if let Ok(earlier) = opened_identity_at(&mut file, &object) {
-                            qualified.push(((changed, modified), earlier));
+                            qualified.push((times, earlier));
                         }
                     }
                 }
@@ -23476,7 +23493,12 @@ fn validate_codex_parent_ownership_ledgers(
         let ledger = if ledger.opened_object_identity == *identity {
             (*ledger).clone()
         } else if qualified.iter().any(|(times, earlier)| {
-            *times == (ledger.opened_changed_nanos, ledger.opened_modified_nanos)
+            *times
+                == (
+                    ledger.opened_changed_nanos,
+                    ledger.opened_modified_nanos,
+                    ledger.opened_birth_nanos,
+                )
                 && *earlier == ledger.opened_object_identity
         }) {
             let Some(live) = live else {
@@ -23486,6 +23508,7 @@ fn validate_codex_parent_ownership_ledgers(
             current.opened_object_identity = identity.clone();
             current.opened_changed_nanos = live.changed_unix_nanos();
             current.opened_modified_nanos = live.modified_nanos.unwrap_or_default();
+            current.opened_birth_nanos = live.birth_nanos.unwrap_or_default();
             rewitnessed.push(((*key).clone(), current.clone()));
             current
         } else {
@@ -32519,6 +32542,7 @@ impl OwnedJsonlParser {
             {
                 ledger.opened_changed_nanos = stat.changed_unix_nanos();
                 ledger.opened_modified_nanos = stat.modified_nanos.unwrap_or_default();
+                ledger.opened_birth_nanos = stat.birth_nanos.unwrap_or_default();
             }
         }
         // PR-P: what this file's children see when it is their parent. Own-byte
@@ -37077,21 +37101,24 @@ struct CandidateFile {
     opened_object_identity: String,
     /// The ctime (unix nanos) in the opened-object identity that
     /// `source_file_fingerprint` used: the live one, or the entry's stored
-    /// one when size and mtime are unchanged (Claude and Codex only).
+    /// one when size, mtime and birth are unchanged (Claude and Codex only).
     fingerprint_changed_nanos: u64,
+    /// The live file birth (unix nanos) of that open; zero if unavailable.
+    fingerprint_birth_nanos: u64,
 }
 
 /// The object inputs of one opened-object identity (unix device, inode and
 /// ctime), plus the birth and mtime the content-only re-read rule checks.
-/// Never persisted: entries and Codex parent ledgers keep only the ctime
-/// (and a ledger its mtime). A later open of the same object rebuilds the
-/// identity from its live device and inode, that stored ctime and fresh
+/// Never persisted: entries and Codex parent ledgers keep only the ctime and
+/// birth (and a ledger its mtime). A later open of the same object rebuilds
+/// the identity from its live device and inode, that stored ctime and fresh
 /// content samples, so a ctime-only change (chmod, xattr, hard link,
 /// Spotlight, backup) reproduces the stored identity and never triggers a
 /// re-read on its own. A wrong or missing stored ctime only causes a read.
-/// Device and inode stay triggers (they are hashed live); birth is guarded
-/// (a stored ctime older than the birth is never used); mtime stays a
-/// trigger: it moves only on content writes (truncate/regrow too).
+/// Device and inode stay triggers (they are hashed live); birth binds the
+/// stored ctime to its object generation (a reused inode, even after a clock
+/// rollback, has another birth; an unavailable birth never adopts); mtime
+/// stays a trigger: it moves only on content writes (truncate/regrow too).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OpenedObjectStat {
     device: u64,
@@ -37122,10 +37149,11 @@ impl OpenedObjectStat {
         }
     }
 
-    /// A stored ctime can describe this object only if it was born by then:
-    /// a reused inode is a new object and keeps its live ctime.
-    fn born_by(&self, changed_unix_nanos: u64) -> bool {
-        !matches!(self.birth_nanos, Some(birth) if birth > changed_unix_nanos)
+    /// A stored ctime belongs to this object generation only if its stored
+    /// birth is known and exactly the live one. Ordering against ctime is no
+    /// binding (clock rollback, reused inodes); unavailable never binds.
+    fn same_birth(&self, stored_birth_nanos: u64) -> bool {
+        stored_birth_nanos != 0 && self.birth_nanos == Some(stored_birth_nanos)
     }
 }
 
@@ -40700,6 +40728,7 @@ fn candidate_from_traversal_path_at(
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
         fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     })
 }
 
@@ -40892,6 +40921,7 @@ fn collect_recent_jsonl_files(
             legacy_config_reconciliation_required: false,
             opened_object_identity: String::new(),
             fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         });
     }
 }
@@ -41031,9 +41061,12 @@ fn open_candidate_file_stat(
     let mut file = open_candidate_beneath_root(candidate)?;
     let (identity, stat) = opened_object_identity_and_stat(source, &mut file)?;
     candidate.opened_object_identity = identity;
-    candidate.fingerprint_changed_nanos = stat
-        .filter(|_| matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex))
-        .map_or(0, |stat| stat.changed_unix_nanos());
+    let tracked =
+        stat.filter(|_| matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex));
+    candidate.fingerprint_changed_nanos = tracked.map_or(0, |stat| stat.changed_unix_nanos());
+    candidate.fingerprint_birth_nanos = tracked
+        .and_then(|stat| stat.birth_nanos)
+        .unwrap_or_default();
     let metadata = file.metadata()?;
     candidate.physical_identity = reread_guard::physical_identity(&metadata);
     let modified = metadata.modified().ok();
@@ -41326,14 +41359,14 @@ fn opened_object_identity_and_stat(
 /// Ron's re-read rule: only content (size, mtime, sampled bytes) or
 /// output-relevant inputs may trigger a re-read; ctime, xattr, mode and
 /// hard-link flips never do. When this path's entry has the candidate's size
-/// and mtime, the fingerprint uses the entry's stored ctime with the live
-/// device and inode and fresh head/tail samples. With only ctime moved it
-/// then equals the stored fingerprint and the candidate gate skips: a
-/// ctime-only change costs this bounded sample re-read, never a Full read.
-/// A sampled-byte change or a new object (whose device and inode the
-/// identity hashes live; a reused inode born after the stored ctime keeps
-/// its live ctime) still changes the fingerprint and reads; a size or mtime
-/// change keeps the live identity and reads.
+/// and mtime and exactly its (known) file birth, the fingerprint uses the
+/// entry's stored ctime with the live device and inode and fresh head/tail
+/// samples. With only ctime moved it then equals the stored fingerprint and
+/// the candidate gate skips: a ctime-only change costs this bounded sample
+/// re-read, never a Full read. A sampled-byte change or a new object (whose
+/// device and inode the identity hashes live) still changes the fingerprint
+/// and reads; a size, mtime or birth change, or an unavailable birth, keeps
+/// the live identity and reads.
 /// Returns the opened-object identity to fingerprint with, if adopted.
 fn adopt_stored_changed_time(
     source: SnapshotSource,
@@ -41353,10 +41386,11 @@ fn adopt_stored_changed_time(
         || stored == candidate.fingerprint_changed_nanos
         || entry.size_bytes != candidate.size_bytes
         || entry.modified_unix_nanos != Some(candidate.modified_unix_nanos)
-        || !live.born_by(stored)
+        || !live.same_birth(entry.opened_birth_nanos)
     {
         // No stored ctime, nothing moved (the live identity already
-        // reproduces the stored one), a content change, or a new object.
+        // reproduces the stored one), a content change, or another (or an
+        // unbound) object generation.
         return Ok(None);
     }
     let identity = opened_identity_at(file, &live.with_changed_unix_nanos(stored))?;
@@ -47100,6 +47134,7 @@ impl ScanIndex {
                     .get(&key)
                     .and_then(|entry| entry.codex_counting_owner.clone()),
                 opened_changed_nanos: candidate.fingerprint_changed_nanos,
+                opened_birth_nanos: candidate.fingerprint_birth_nanos,
             },
         );
     }
@@ -47156,6 +47191,7 @@ impl ScanIndex {
                     .get(&key)
                     .and_then(|entry| entry.codex_counting_owner.clone()),
                 opened_changed_nanos: candidate.fingerprint_changed_nanos,
+                opened_birth_nanos: candidate.fingerprint_birth_nanos,
             },
         );
         match parse_outcome {
@@ -49120,6 +49156,7 @@ mod tests {
             unresolvable: None,
             opened_changed_nanos: 0,
             opened_modified_nanos: 0,
+            opened_birth_nanos: 0,
         };
         let ledgers = BTreeMap::from([(parent.to_string(), parent_ledger)]);
         let unresolved =
@@ -50284,6 +50321,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     opened_changed_nanos: 0,
+                    opened_birth_nanos: 0,
                 },
             )]),
             ..ScanIndex::default()
@@ -51132,6 +51170,7 @@ mod tests {
             legacy_config_reconciliation_required: false,
             opened_object_identity: String::new(),
             fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         }
     }
 
@@ -51642,6 +51681,7 @@ mod tests {
             legacy_config_reconciliation_required: false,
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         };
         let mut stale_witness = snapshot_quarantine_witness(SnapshotSource::Codex);
         stale_witness.collector_version.push_str("-old");
@@ -51668,6 +51708,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     opened_changed_nanos: 0,
+                    opened_birth_nanos: 0,
                 },
             )]),
             file_snapshot_fingerprints: BTreeMap::from([(
@@ -52119,6 +52160,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     opened_changed_nanos: 0,
+                    opened_birth_nanos: 0,
                 },
             )]),
             ..ScanIndex::default()
@@ -52215,6 +52257,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     opened_changed_nanos: 0,
+                    opened_birth_nanos: 0,
                 },
             )]),
             ..ScanIndex::default()
@@ -52256,6 +52299,7 @@ mod tests {
             legacy_config_reconciliation_required: false,
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -52280,6 +52324,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     opened_changed_nanos: 0,
+                    opened_birth_nanos: 0,
                 },
             )]),
             ..ScanIndex::default()
@@ -52308,6 +52353,7 @@ mod tests {
             legacy_config_reconciliation_required: false,
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -52332,6 +52378,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     opened_changed_nanos: 0,
+                    opened_birth_nanos: 0,
                 },
             )]),
             ..ScanIndex::default()
@@ -52357,6 +52404,7 @@ mod tests {
             legacy_config_reconciliation_required: true,
             opened_object_identity: "opened".to_string(),
             fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -52381,6 +52429,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     opened_changed_nanos: 0,
+                    opened_birth_nanos: 0,
                 },
             )]),
             ..ScanIndex::default()
@@ -58159,6 +58208,7 @@ mod tests {
             codex_counting_v2: false,
             codex_counting_owner: None,
             opened_changed_nanos: 0,
+            opened_birth_nanos: 0,
         };
 
         let mut index = ScanIndex {
@@ -77900,6 +77950,7 @@ mod tests {
                 unresolvable: None,
                 opened_changed_nanos: 0,
                 opened_modified_nanos: 0,
+                opened_birth_nanos: 0,
             },
         )]);
         parse_codex_test_with_ledgers(path, ledgers)
@@ -78050,6 +78101,7 @@ mod tests {
                 unresolvable: None,
                 opened_changed_nanos: 0,
                 opened_modified_nanos: 0,
+                opened_birth_nanos: 0,
             },
         )]);
         let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
@@ -80157,6 +80209,7 @@ mod tests {
                 unresolvable: None,
                 opened_changed_nanos: 0,
                 opened_modified_nanos: 0,
+                opened_birth_nanos: 0,
             },
         );
         assert!(index.canonicalize_codex_identity_keys());
@@ -80547,6 +80600,7 @@ mod tests {
                     unresolvable: None,
                     opened_changed_nanos: 0,
                     opened_modified_nanos: 0,
+                    opened_birth_nanos: 0,
                 },
             )])
         }
@@ -82077,6 +82131,7 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 opened_changed_nanos: 0,
+                opened_birth_nanos: 0,
             },
         );
         let frozen_census_paths = BTreeSet::from([local_index_key(&parent_path)]);
@@ -83698,6 +83753,7 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 opened_changed_nanos: 0,
+                opened_birth_nanos: 0,
             },
         );
         let a = binding(&home_a, "account-a");
@@ -85275,6 +85331,7 @@ mod tests {
             codex_counting_v2: false,
             codex_counting_owner: None,
             opened_changed_nanos: 0,
+            opened_birth_nanos: 0,
         }
     }
 
@@ -86179,6 +86236,7 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 opened_changed_nanos: 0,
+                opened_birth_nanos: 0,
             },
         );
         let manifest = index
@@ -87141,7 +87199,7 @@ pub(crate) mod cache_adapter_tests {
 
 // Closed owned-field inventory for optional scan overlap admission.
 crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, selector_sources, usage, reasoning_effort);
-crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity, fingerprint_changed_nanos);
+crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity, fingerprint_changed_nanos, fingerprint_birth_nanos);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; current, previous_windows, confirmed_absent_members);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPendingWindow; version, census_window_end, account_identifier_hash, evidence_request_count, census_complete, members, member_requests, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountRequestSet; prefixes, fingerprint, identity_revision);
@@ -87165,7 +87223,7 @@ crate::heap_layout_bound::fields!(ClaudeProofCorrectionCandidate; index_key, roo
 crate::heap_layout_bound::fields!(ClaudeCutoffCorrectionCandidate; index_key, root, member, proof, revision);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyPending; census_window_end, member_request_id_hashes, member_occurrences, invalid, idless_revision);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyWitness; evidence_fingerprint, member_request_id_fingerprints, member_occurrence_fingerprints, assigned_request_id_fingerprints, legacy_excluded_request_id_hashes, legacy_exclusion_evidence_fingerprint, legacy_owner_roots);
-crate::heap_layout_bound::fields!(CodexParentOwnershipLedger; signatures, scan_complete, opened_object_identity, opened_changed_nanos, opened_modified_nanos, unresolvable);
+crate::heap_layout_bound::fields!(CodexParentOwnershipLedger; signatures, scan_complete, opened_object_identity, opened_changed_nanos, opened_modified_nanos, opened_birth_nanos, unresolvable);
 crate::heap_layout_bound::fields!(CodexPathSidecarCandidate; identity, recorded_evidence, created_thread, identity_conflict, detail_incomplete, rollout_file_matches, parent, child_created_at_nanos, projected_next_ordinal);
 crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
@@ -87186,7 +87244,7 @@ crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paire
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, reread_guard, held_audit_progress, claude_money_birth_store);
-crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos);
+crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; unchanged_reread_admitted, reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
