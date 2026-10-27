@@ -31468,7 +31468,7 @@ impl OwnedSourceScan {
                     );
                 }
                 if let Some(phase) = native_comparison.as_mut().filter(|_| !comparison_target) {
-                    if let Some(credit) = capture_credit.as_deref_mut() {
+                    if let Some(credit) = capture_credit {
                         phase.record_parse_attempt_paid(&candidate, credit);
                     } else {
                         phase.record_parse_attempt(&candidate);

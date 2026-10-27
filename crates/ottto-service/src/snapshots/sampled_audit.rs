@@ -282,6 +282,14 @@ pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> u
         .cloned()
         .collect::<Vec<_>>();
     for key in &keys {
+        // A large Full delayed by the per-pass scheduler still owes its
+        // already-due rotating-slot audit. Moving it into a newly free sampled
+        // slot must not replace that deadline with a fresh interval.
+        let due = index
+            .held_audit_progress
+            .as_ref()
+            .filter(|slot| slot.key == *key && index.claude_large_full_deferred.contains(key))
+            .map_or(due, |slot| due.min(slot.due));
         if let Some(entry) = index.files.get_mut(key) {
             entry.scan_identity_version = Some(provenance_marker(due, true));
         }
@@ -419,18 +427,52 @@ impl OwnedSourceScan {
         self.census.observed_index_keys.insert(key.clone());
         self.identified_candidates
             .retain(|candidate| local_index_key(&candidate.path) != key);
-        self.identified_candidates.push_front(candidate);
+        let large = claude_large_full::is_large(&candidate);
+        let position = if large {
+            // A new rotating-slot audit cannot jump ahead of older deferred
+            // large Fulls. Small held files keep their existing first position.
+            self.identified_candidates
+                .iter()
+                .take_while(|candidate| {
+                    self.index
+                        .claude_large_full_deferred
+                        .contains(&local_index_key(&candidate.path))
+                })
+                .count()
+        } else {
+            0
+        };
+        self.identified_candidates.insert(position, candidate);
         // Preserve the ordinary page limit and every displaced candidate.
         while self.identified_candidates.len() > self.file_limit.max(1) {
             let candidate = self.identified_candidates.pop_back().unwrap();
             if let Some(traversal) = self.index.traversal.as_mut() {
-                traversal.pending_candidates.push_front(ScanTraversalPath {
-                    scan_root: candidate.scan_root,
-                    path: candidate.path,
-                    census_member: true,
-                    watcher_hint: false,
-                });
+                if let Some(pending) = traversal
+                    .pending_candidates
+                    .iter_mut()
+                    .find(|pending| large && pending.path == candidate.path)
+                {
+                    pending.census_member = true;
+                } else {
+                    traversal.pending_candidates.push_front(ScanTraversalPath {
+                        scan_root: candidate.scan_root,
+                        path: candidate.path,
+                        census_member: true,
+                        watcher_hint: false,
+                    });
+                }
             }
+        }
+        if large
+            && !self
+                .identified_candidates
+                .iter()
+                .any(|candidate| local_index_key(&candidate.path) == key)
+        {
+            // Displaced by older debt at the existing page limit. No attempt,
+            // no deadline reset: the same slot remains eligible next pass.
+            self.index.held_audit_progress.as_mut().unwrap().attempted = false;
+            return;
         }
         self.index.held_audit_progress.as_mut().unwrap().attempted = true;
         super::claude_request_census::note_identity_incomplete_hold_deadlines_restored(1);
@@ -466,6 +508,105 @@ mod tests {
             fingerprint_birth_nanos: 0,
         }
     }
+    #[test]
+    fn deferred_large_held_audit_keeps_original_deadline_and_older_turn() {
+        use crate::snapshots::claude_request_census::{
+            ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+        };
+        let scratch = crate::test_scratch::ScratchDir::new("large-held-audit");
+        let root = scratch.as_ref().to_path_buf();
+        let older = root.join("a-older.jsonl");
+        let held = root.join("b-held.jsonl");
+        fs::write(&older, "{}\n").unwrap();
+        fs::write(&held, "{}\n").unwrap();
+        let old_key = local_index_key(&older);
+        let held_key = local_index_key(&held);
+        let mut index = ScanIndex {
+            claude_request_identity_contract: Some(claude_request_identity::COLLECTOR.into()),
+            ..ScanIndex::default()
+        };
+        index.files.insert(old_key.clone(), entry());
+        let mut held_entry = entry();
+        // The rotating slot constructs its candidate from native index size.
+        // This test exercises scheduling only; it never decodes sparse data.
+        held_entry.size_bytes = 257 * 1024 * 1024;
+        index.files.insert(held_key.clone(), held_entry);
+        index.claude_request_census_mut_for_test().insert_for_test(
+            &held_key,
+            Record::synthetic_for_test(&"a".repeat(64), 1, Shape::IdentityIncomplete, vec![1])
+                .with_unverified_for_test(true),
+        );
+        index.claude_large_full_deferred.push_back(old_key.clone());
+        index.held_audit_progress = Some(HeldAuditProgress {
+            key: held_key.clone(),
+            due: 50,
+            attempted: false,
+        });
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            &[root],
+            index,
+            "2026-10-27T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            1,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        );
+        scan.prepare_held_audit_progress(100);
+        assert_eq!(scan.identified_candidates.len(), 1, "existing page limit");
+        assert_eq!(
+            local_index_key(&scan.identified_candidates[0].path),
+            old_key
+        );
+        assert!(!scan.index.held_audit_progress.as_ref().unwrap().attempted);
+        assert_eq!(
+            progress_debt(&scan.index, &held_key, 100)
+                .unwrap()
+                .due_unix_seconds,
+            50
+        );
+        assert!(scan
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .any(|candidate| candidate.path == held && candidate.census_member));
+
+        let mut candidate = candidate();
+        candidate.path = held;
+        candidate.scan_root = scratch.as_ref().to_path_buf();
+        candidate.size_bytes = 257 * 1024 * 1024;
+        scan.index.held_audit_progress.as_mut().unwrap().attempted = true;
+        let mut full_spent = true;
+        assert!(!claude_large_full::admit(
+            &mut scan.index,
+            &candidate,
+            true,
+            &mut full_spent
+        ));
+        assert!(!scan.index.held_audit_progress.as_ref().unwrap().attempted);
+        assert_eq!(
+            scan.index.claude_large_full_deferred,
+            VecDeque::from([old_key, held_key.clone()])
+        );
+        assert_eq!(restore_held_audit_deadlines(&mut scan.index, 100), 1);
+        assert_eq!(
+            scan.index.files[&held_key].unverified_deadline(),
+            Some(50),
+            "moving into a free sampled slot cannot postpone overdue debt"
+        );
+        assert!(scan.index.files[&held_key].audit_requires_full(100));
+        assert_eq!(
+            scan.index.files[&held_key].source_file_fingerprint,
+            "source"
+        );
+    }
+
     fn index() -> ScanIndex {
         let mut index = ScanIndex::default();
         let key = local_index_key(&candidate().path);

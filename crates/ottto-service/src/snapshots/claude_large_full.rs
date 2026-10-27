@@ -58,6 +58,15 @@ pub(super) fn admit(
                     watcher_hint: false,
                 });
             }
+            if let Some(slot) = index
+                .held_audit_progress
+                .as_mut()
+                .filter(|slot| slot.key == key)
+            {
+                // Queueing was not an audit attempt. Keep its original turn
+                // and deadline until native acquisition can actually start.
+                slot.attempted = false;
+            }
             if !index.claude_large_full_deferred.contains(&key) {
                 index.claude_large_full_deferred.push_back(key);
             }
