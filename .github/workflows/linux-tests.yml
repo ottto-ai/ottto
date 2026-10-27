@@ -117,7 +117,7 @@ jobs:
           print("W1_TOUCHED_FILE_CLIPPY_CLEAN")
           PYCLIPPY
       - name: W1 same-corpus before after probe
-        if: success()
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="$RUNNER_TEMP/w1-target"
