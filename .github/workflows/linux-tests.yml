@@ -86,10 +86,15 @@ jobs:
             crates -> crates/target
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
+      # W1 validation: diagnose the unrelated process-environment fixture
+      # before the full suite, then serialize without dropping any tests.
+      - name: Refresher failure reproduction
+        run: cargo test -p ottto-service --lib --locked claude_refresher::tests::refresher_verifies_the_stored_expiry_and_stops_after_a_failure -- --exact --nocapture --test-threads=1
+
       - name: Runtime tests
         # Print a failing assertion when it happens, not only after the suite.
         # Keep going past a failing test binary so one run lists every failure.
-        run: cargo test --workspace --locked --no-fail-fast -- --nocapture
+        run: cargo test --workspace --locked --no-fail-fast -- --nocapture --test-threads=1
 
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
