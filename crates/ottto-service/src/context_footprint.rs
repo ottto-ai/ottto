@@ -364,8 +364,8 @@ fn harvest_recent_workspaces(
     workspaces.truncate(MAX_WORKSPACES_PER_CYCLE);
     if workspaces.is_empty() {
         eprintln!(
-            "context_footprint_harvest_metrics discovered=0 uploaded=0 skipped=0 failed=0 discovery_files_total={} discovery_files_read={} discovery_bytes_selected={}",
-            counts.files_total, counts.files_read, counts.bytes_selected
+            "context_footprint_harvest_metrics discovered=0 uploaded=0 skipped=0 failed=0 discovery_files_total={} discovery_files_read={} discovery_bytes_selected={} discovery_path_scopes={}",
+            counts.files_total, counts.files_read, counts.bytes_selected, counts.path_scopes
         );
         return Ok(ContextHarvestOutcome::default());
     }
@@ -421,14 +421,15 @@ fn harvest_recent_workspaces(
         }
     }
     eprintln!(
-        "context_footprint_harvest_metrics discovered={} uploaded={} skipped={} failed={} discovery_files_total={} discovery_files_read={} discovery_bytes_selected={}",
+        "context_footprint_harvest_metrics discovered={} uploaded={} skipped={} failed={} discovery_files_total={} discovery_files_read={} discovery_bytes_selected={} discovery_path_scopes={}",
         uploaded + skipped + failed,
         uploaded,
         skipped,
         failed,
         counts.files_total,
         counts.files_read,
-        counts.bytes_selected
+        counts.bytes_selected,
+        counts.path_scopes
     );
     if failed > 0 && uploaded == 0 && skipped == 0 {
         return Err(anyhow!(
@@ -1242,13 +1243,16 @@ pub(crate) fn safe_text(raw: &str, max_len: usize) -> Option<String> {
     Some(normalized.chars().take(max_len).collect())
 }
 
-/// Transcripts opened by one discovery pass, for the cycle metrics line.
-/// `bytes_selected` is the opened files' sizes, not bytes actually parsed.
+/// Transcripts handed to the cwd parser by one discovery pass, for the cycle
+/// metrics line. `bytes_selected` is those files' sizes, not bytes actually
+/// parsed. `path_scopes` counts workspaces scoped by their own path: real
+/// non-git directories and git probes that failed cannot be told apart.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct DiscoveryCounts {
     files_total: usize,
     files_read: usize,
     bytes_selected: u64,
+    path_scopes: usize,
 }
 
 fn discover_recent_claude_workspaces(
@@ -1258,6 +1262,16 @@ fn discover_recent_claude_workspaces(
 ) -> Vec<WorkspaceCandidate> {
     let mut files = Vec::new();
     collect_recent_jsonl_files(&home.join(".claude").join("projects"), now, &mut files);
+    discover_workspaces_in_files(files, counts, repository_scope)
+}
+
+/// `scope_of` answers a workspace's repository scope and whether it fell
+/// back to the path itself.
+fn discover_workspaces_in_files(
+    mut files: Vec<(PathBuf, SystemTime)>,
+    counts: &mut DiscoveryCounts,
+    mut scope_of: impl FnMut(&Path) -> (String, bool),
+) -> Vec<WorkspaceCandidate> {
     files.sort_by_key(|item| std::cmp::Reverse(item.1));
     counts.files_total = files.len();
     let mut by_path: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
@@ -1287,7 +1301,8 @@ fn discover_recent_claude_workspaces(
             }
             let key = path.to_string_lossy().to_string();
             if !scope_by_path.contains_key(&key) {
-                let scope = repository_scope(&path);
+                let (scope, path_scope) = scope_of(&path);
+                counts.path_scopes += usize::from(path_scope);
                 scopes.insert(scope.clone());
                 scope_by_path.insert(key.clone(), scope);
             }
@@ -1306,21 +1321,22 @@ fn discover_recent_claude_workspaces(
     }
     let mut candidates: Vec<_> = by_path.into_values().collect();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_seen));
+    // Every candidate was scoped when the scan admitted it.
     dedupe_workspace_candidates_by_repository(candidates, |candidate| {
         scope_by_path
             .get(candidate.path.to_string_lossy().as_ref())
             .cloned()
-            .unwrap_or_else(|| repository_scope(&candidate.path))
+            .unwrap_or_default()
     })
 }
 
-/// Workspaces of one repository share a scope; non-git directories are their
-/// own scope.
-fn repository_scope(path: &Path) -> String {
-    let fallback_text = path.to_string_lossy();
-    resolve_repository_identity(path, false)
-        .repository_hash
-        .unwrap_or_else(|| sha256_hex(&[fallback_text.as_ref()]))
+/// Workspaces of one repository share a scope; a workspace without a
+/// repository hash is its own scope (`true`).
+fn repository_scope(path: &Path) -> (String, bool) {
+    match resolve_repository_identity(path, false).repository_hash {
+        Some(hash) => (hash, false),
+        None => (sha256_hex(&[path.to_string_lossy().as_ref()]), true),
+    }
 }
 
 fn dedupe_workspace_candidates_by_repository(
@@ -2639,7 +2655,7 @@ mod tests {
                     last_seen: newer,
                 },
             ],
-            |candidate| repository_scope(&candidate.path),
+            |candidate| repository_scope(&candidate.path).0,
         );
 
         assert_eq!(out.len(), 1);
@@ -2675,11 +2691,33 @@ mod tests {
         }
         let mut candidates: Vec<_> = by_path.into_values().collect();
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_seen));
-        let mut out = dedupe_workspace_candidates_by_repository(candidates, |candidate| {
-            repository_scope(&candidate.path)
-        });
+        let mut by_scope: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
+        for candidate in candidates {
+            let scope = resolve_repository_identity(&candidate.path, false)
+                .repository_hash
+                .unwrap_or_else(|| frozen_path_scope(&candidate.path));
+            by_scope
+                .entry(scope)
+                .and_modify(|existing| {
+                    if existing.last_seen < candidate.last_seen {
+                        *existing = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+        let mut out: Vec<_> = by_scope.into_values().collect();
+        out.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_seen));
         out.truncate(MAX_WORKSPACES_PER_CYCLE);
         out
+    }
+
+    /// The path scope bytes as shipped before the early stop: SHA-256 of the
+    /// lossy path text followed by one NUL byte, lowercase hex.
+    fn frozen_path_scope(path: &Path) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update([0u8]);
+        format!("{:x}", hasher.finalize())
     }
 
     /// Writes one transcript per entry, naming its cwds, with the given age.
@@ -2788,13 +2826,27 @@ mod tests {
     fn discovery_counts_repository_scopes_not_directories() {
         let repo = init_git_repo("early-stop-scopes");
         let now = SystemTime::now();
-        let subdirs: Vec<PathBuf> = (0..12)
+        let mut subdirs: Vec<PathBuf> = (0..11)
             .map(|index| {
                 let dir = repo.join(format!("pkg-{index:02}"));
                 fs::create_dir_all(&dir).unwrap();
                 dir
             })
             .collect();
+        // A linked worktree is the same repository scope as its main checkout.
+        let worktree = temp_dir("early-stop-scopes-worktree");
+        fs::remove_dir_all(&worktree).unwrap();
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "early-stop",
+                worktree.to_string_lossy().as_ref(),
+            ],
+        );
+        subdirs.push(worktree.clone());
         let others: Vec<PathBuf> = (0..13)
             .map(|index| {
                 let dir = repo.join("..").join(format!(
@@ -2828,11 +2880,133 @@ mod tests {
         assert_eq!(found.len(), MAX_WORKSPACES_PER_CYCLE);
         assert_eq!(counts.files_read, 12 + 11);
         assert_eq!(counts.files_total, 12 + 13 + 1);
+        assert_eq!(counts.path_scopes, 11);
         for dir in others {
             let _ = fs::remove_dir_all(dir);
         }
+        let _ = fs::remove_dir_all(&worktree);
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// One transcript per entry naming `cwd`, returned as a captured
+    /// (path, mtime) tuple; the file's real mtime is left as written.
+    fn captured_transcripts(
+        root: &Path,
+        entries: &[(&Path, SystemTime)],
+    ) -> Vec<(PathBuf, SystemTime)> {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(index, (cwd, mtime))| {
+                let path = root.join(format!("captured-{index:03}.jsonl"));
+                fs::write(&path, format!("{}\n", json!({"cwd": cwd}))).unwrap();
+                (path, *mtime)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn discovery_ranks_by_captured_mtimes_and_orders_ties_by_scope() {
+        let root = temp_dir("early-stop-captured");
+        let dirs: Vec<PathBuf> = (0..16)
+            .map(|index| {
+                let dir = root.join(format!("ws-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let epoch = SystemTime::UNIX_EPOCH;
+        let at = |secs: u64| epoch + Duration::from_secs(secs);
+        // Captured times, not the files' real ones: ten distinct newest, a
+        // four-way tie across the twelfth scope, then an epoch fallback.
+        let mut entries: Vec<(&Path, SystemTime)> = (0..10)
+            .map(|index| (dirs[index].as_path(), at(2_000 - index as u64)))
+            .collect();
+        for dir in &dirs[10..14] {
+            entries.push((dir.as_path(), at(1_000)));
+        }
+        entries.push((dirs[14].as_path(), at(500)));
+        entries.push((dirs[15].as_path(), epoch));
+        let files = captured_transcripts(&root, &entries);
+        // Injected scopes make the tie order explicit: z-scopes sort last.
+        let scope_names = ["z1", "a1", "z0", "a0"];
+        let scope_of = |path: &Path| {
+            let index = dirs.iter().position(|dir| dir == path).unwrap();
+            match index {
+                10..=13 => (scope_names[index - 10].to_string(), false),
+                _ => (format!("m{index:02}"), true),
+            }
+        };
+        let mut counts = DiscoveryCounts::default();
+
+        let mut found = discover_workspaces_in_files(files, &mut counts, scope_of);
+        found.truncate(MAX_WORKSPACES_PER_CYCLE);
+
+        let mut expected: Vec<(PathBuf, SystemTime)> = (0..10)
+            .map(|index| (dirs[index].clone(), at(2_000 - index as u64)))
+            .collect();
+        // Scope order inside the tie: a0 (dir 13), a1 (dir 11).
+        expected.push((dirs[13].clone(), at(1_000)));
+        expected.push((dirs[11].clone(), at(1_000)));
+        assert_eq!(
+            found
+                .iter()
+                .map(|candidate| (candidate.path.clone(), candidate.last_seen))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!((counts.files_read, counts.files_total), (14, 16));
+        assert_eq!(counts.path_scopes, 10);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_counts_path_scopes_when_repository_probes_fail() {
+        let root = temp_dir("early-stop-probe-fails");
+        let dirs: Vec<PathBuf> = (0..14)
+            .map(|index| {
+                let dir = root.join(format!("pkg-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let entries: Vec<(&Path, SystemTime)> = dirs
+            .iter()
+            .enumerate()
+            .map(|(index, dir)| {
+                (
+                    dir.as_path(),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(100 - index as u64),
+                )
+            })
+            .collect();
+        // Documented limit: if every probe fails, twelve directories of one
+        // repository look like twelve scopes, so discovery stops early; the
+        // path-scope counter makes that visible.
+        let failing = |path: &Path| (frozen_path_scope(path), true);
+        let mut counts = DiscoveryCounts::default();
+        let found = discover_workspaces_in_files(
+            captured_transcripts(&root, &entries),
+            &mut counts,
+            failing,
+        );
+        assert_eq!(found.len(), MAX_WORKSPACES_PER_CYCLE);
+        assert_eq!((counts.files_read, counts.path_scopes), (12, 12));
+
+        // With the probe answering, they are one repository and every file
+        // is read.
+        let answering = |_: &Path| ("repository".to_string(), false);
+        let mut counts = DiscoveryCounts::default();
+        let found = discover_workspaces_in_files(
+            captured_transcripts(&root, &entries),
+            &mut counts,
+            answering,
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, dirs[0]);
+        assert_eq!((counts.files_read, counts.path_scopes), (14, 0));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
