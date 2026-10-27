@@ -3,7 +3,7 @@
 //! reported telemetry cost and side calls, and emits one literal body per
 //! session. The upload gate is ON; DARK test arms never change an item, a
 //! scan identity, parser scope or body witness.
-use super::super::claude_context_file_birth::ClaudeFileBirth;
+use super::super::claude_context_file_birth::{ClaudeFileBirth, ClaudeOpenedBirth};
 use super::super::claude_history_upgrade::{
     claude_path_twin_groups, path_twins, probe_opened_birth, ClaudeTwinGroups,
     REQUEST_OWNED_USAGE_CONTRACT,
@@ -16,8 +16,8 @@ use super::super::{
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,
     claude_snapshot_family_root_ref, claude_trace_evidence_fingerprint_is_valid,
     claude_trace_owner_session_id, local_index_key, rfc3339_unix_nanos, validate_claude_api_row,
-    ClaudeTranscriptUsageOccurrence, PlacedClaudeUsage, RowKey, ScanIndex, ScanTraversalCheckpoint,
-    ScanTraversalPath, SelectorCapture, SnapshotItem, UsageTotals,
+    ClaudeTranscriptUsageOccurrence, PlacedClaudeUsage, RowKey, ScanIndex, ScanIndexEntry,
+    ScanTraversalCheckpoint, ScanTraversalPath, SelectorCapture, SnapshotItem, UsageTotals,
 };
 use super::body::{
     reported_inputs, reported_model_effort, ClaudeGrainSide, ClaudeLiveKey,
@@ -77,6 +77,30 @@ const HOUR_NANOS: i128 = 3_600_000_000_000;
 /// Same bound the P1 holder walk used. A census walk that hits it cannot
 /// decide: the affected sessions or families are held, never counted.
 const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
+/// R3 H2(b), pending SOURCE ask (e): in strict partial mode a holder that
+/// only GREW since its census read (same recorded object, no shorter than
+/// its indexed size) still holds every id it listed. Off until ruled.
+const GROWN_HOLDER_CURRENT: bool = false;
+fn grown_holder_current() -> bool {
+    #[cfg(test)]
+    if let Some(on) = GROWN_HOLDER.with(std::cell::Cell::get) {
+        return on;
+    }
+    GROWN_HOLDER_CURRENT
+}
+#[cfg(test)]
+thread_local! { static GROWN_HOLDER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn with_grown_holder_current<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            GROWN_HOLDER.with(|v| v.set(self.0));
+        }
+    }
+    let _reset = Reset(GROWN_HOLDER.with(|v| v.replace(Some(on))));
+    f()
+}
 
 pub(crate) fn enabled() -> bool {
     #[cfg(test)]
@@ -352,12 +376,16 @@ enum CopyProof {
     /// Earlier MAIN files of other sessions (/branch of an all-pre-birth file).
     /// With the index key of the original its `fork-context-ref` line names.
     Holders(Option<String>),
+    /// A partial MAIN copy without a timestamp certificate: per request, an
+    /// earlier main file of another session that holds it NOW (strict
+    /// evidence, no named-parent shortcut). Every other copy counts.
+    Strict,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for CopyProof {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Twin(key) | Self::Holders(Some(key)) => key.heap_bound(c),
-            Self::Holders(None) => c.add(0),
+            Self::Holders(None) | Self::Strict => c.add(0),
         }
     }
 }
@@ -1525,6 +1553,15 @@ impl FileFold {
             self.keep_copies(false, markers);
             return;
         }
+        if self.first_own.is_some() && self.ambiguous.is_empty() && self.main_located(context) {
+            // Strict partial mode: no writer certificate, so each copy needs
+            // its own current holder; the page restores the rest. A request
+            // id two responses claim has no single grain to give back, so
+            // such a file counts every copy here, as before.
+            self.proof = Some(CopyProof::Strict);
+            self.keep_copies(false, markers);
+            return;
+        }
         if let Some(copy) = self.copy.take() {
             self.entity.absorb_grains(&copy);
         }
@@ -1590,8 +1627,12 @@ impl FileFold {
     /// whose copies `decide_page_copies` checks against other sessions'
     /// earlier main files, in one census walk per page.
     fn cross_session_candidate(&self, context: Option<&ReadContext<'_>>) -> bool {
-        self.first_own.is_none()
-            && self.physical.is_some()
+        self.first_own.is_none() && self.main_located(context)
+    }
+
+    /// A MAIN file (never a subagent, R3 L1) with a place in the copy order.
+    fn main_located(&self, context: Option<&ReadContext<'_>>) -> bool {
+        self.physical.is_some()
             && self.location.is_some()
             && context.is_some_and(|context| {
                 claude_index_path_member_ref(context.path)
@@ -1644,8 +1685,12 @@ impl FileFold {
     }
 
     /// One held copy whose proof failed counts after all: from the removal
-    /// back to its estimated grain, disclosed.
-    fn restore_one(&mut self, occurrence: &ClaudeTranscriptUsageOccurrence) {
+    /// back to its estimated grain, disclosed. Only a copy still held: a
+    /// second restore of one request is a no-op (R3 M1), never added twice.
+    fn restore_one(&mut self, occurrence: &ClaudeTranscriptUsageOccurrence, reason: &'static str) {
+        if !self.is_skipped(occurrence.sequence) {
+            return;
+        }
         let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
         let requests = occurrence.usage.request_count;
         let (Some(key), Some(removed), Some(removed_requests)) = (
@@ -1668,7 +1713,7 @@ impl FileFold {
             .add(key, &tokens, requests, None, None, at, account);
         self.unskip(occurrence.sequence);
         self.copied = self.copied.saturating_sub(1);
-        self.disclose("copy_uncovered", 1);
+        self.disclose(reason, 1);
     }
 
     /// Held id-less copies count: no census can prove them.
@@ -1986,7 +2031,7 @@ pub(crate) fn decide_page_copies(items: &mut [SnapshotItem], index: &ScanIndex) 
         let proof = fold.proof.clone();
         match proof {
             Some(CopyProof::Twin(witness)) => decide_twin(items, at, &witness, index),
-            Some(CopyProof::Holders(_)) => holders.push(at),
+            Some(CopyProof::Holders(_) | CopyProof::Strict) => holders.push(at),
             None => {}
         }
     }
@@ -2025,7 +2070,7 @@ fn decide_twin(items: &mut [SnapshotItem], at: usize, witness: &str, index: &Sca
             }),
     };
     match uncovered {
-        Some(uncovered) => restore_uncovered(&mut items[at], &uncovered),
+        Some(uncovered) => restore_uncovered(&mut items[at], &uncovered, "copy_uncovered"),
         None => hold_copies(&mut items[at], "held_twin_unproven"),
     }
 }
@@ -2058,15 +2103,84 @@ fn scan_evidence(
     key: &str,
     record: &super::super::claude_request_census::ClaudeRequestCensusRecord,
 ) -> Evidence {
+    holder_evidence(index, key, record, None).route
+}
+
+/// What a holder's census record proves for each copy rule, from ONE
+/// metadata probe of its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HolderEvidence {
+    /// The twin and all-pre-birth routes (`scan_evidence`).
+    route: Evidence,
+    /// Strict partial mode: a positive "this file holds the id NOW" claim.
+    /// Unlike `route`, a settled entry whose file is gone proves nothing
+    /// (R3 L3), and neither does a scan that is not source-verified (R3 L2).
+    /// A holder that only grew is current behind `GROWN_HOLDER_CURRENT`.
+    strict: Evidence,
+}
+
+/// `holder`: the holder's session, for the grown-object check.
+fn holder_evidence(
+    index: &ScanIndex,
+    key: &str,
+    record: &super::super::claude_request_census::ClaudeRequestCensusRecord,
+    holder: Option<&str>,
+) -> HolderEvidence {
     if !record.proves_scan() {
-        return Evidence::None;
+        return HolderEvidence {
+            route: Evidence::None,
+            strict: Evidence::None,
+        };
     }
     let settled = index
         .files
         .get(key)
         .filter(|entry| record.proves_current(&entry.source_file_fingerprint));
     let metadata = std::fs::metadata(key).ok().filter(|m| m.is_file());
-    if let Some(metadata) = &metadata {
+    let route = route_evidence(index, key, record, settled, metadata.as_ref());
+    // TODO(SOURCE ask g): drop `unverified` here if SOURCE rules that an
+    // unverified scan may prove membership.
+    let strict = if metadata.is_none() || record.unverified_or_twin() {
+        Evidence::None
+    } else if route != Evidence::Current
+        && grown_holder_current()
+        && grown(index, key, holder, settled, metadata.as_ref())
+    {
+        Evidence::Current
+    } else {
+        route
+    };
+    HolderEvidence { route, strict }
+}
+
+/// The settled holder file is the object its session recorded, and no
+/// shorter than the revision its census lists: appends kept every id.
+fn grown(
+    index: &ScanIndex,
+    key: &str,
+    holder: Option<&str>,
+    settled: Option<&ScanIndexEntry>,
+    metadata: Option<&std::fs::Metadata>,
+) -> bool {
+    let (Some(holder), Some(entry), Some(metadata)) = (holder, settled, metadata) else {
+        return false;
+    };
+    metadata.len() >= entry.size_bytes
+        && index.claude_money_birth_store.covers_object(
+            holder,
+            key,
+            ClaudeOpenedBirth::from_metadata(metadata),
+        )
+}
+
+fn route_evidence(
+    index: &ScanIndex,
+    key: &str,
+    record: &super::super::claude_request_census::ClaudeRequestCensusRecord,
+    settled: Option<&ScanIndexEntry>,
+    metadata: Option<&std::fs::Metadata>,
+) -> Evidence {
+    if let Some(metadata) = metadata {
         let now = metadata
             .modified()
             .ok()
@@ -2075,7 +2189,7 @@ fn scan_evidence(
             return Evidence::Stale;
         }
     }
-    let changed = match (settled, &metadata) {
+    let changed = match (settled, metadata) {
         (Some(entry), Some(metadata)) => metadata.len() != entry.size_bytes,
         (Some(_), None) => false,
         (None, Some(metadata)) => record.modified().is_some_and(|at| {
@@ -2174,6 +2288,10 @@ fn parent_proves(
 /// holds it (`scan_evidence`) and earlier in (effective birth, location).
 /// The walk deadline, a queued size change, a holder modified since its
 /// census read, and an unscanned other-session main file delay a decision.
+/// Strict partial files share the walk under stricter evidence
+/// (`HolderEvidence::strict`, no named parent); only a queued holder or an
+/// unscanned main file delays them (R3 H2a). A stale holder or the deadline
+/// counts their copies, the deadline under its own reason (R3 H1c).
 fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex) {
     struct Wanted {
         at: usize,
@@ -2187,6 +2305,8 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
         stale: BTreeSet<u64>,
         /// The original its `fork-context-ref` line names.
         parent: Option<String>,
+        /// Strict partial mode (`CopyProof::Strict`).
+        strict: bool,
     }
     let mut wanted = folds
         .iter()
@@ -2198,6 +2318,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                 Some(CopyProof::Holders(parent)) => parent.clone(),
                 _ => None,
             };
+            let strict = fold.proof == Some(CopyProof::Strict);
             let mut hashes = skipped_ids(item)
                 .map(|id| claude_request_hash(id))
                 .collect::<Vec<_>>();
@@ -2212,6 +2333,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                 waiting: false,
                 stale: BTreeSet::new(),
                 parent,
+                strict,
             })
         })
         .collect::<Vec<_>>();
@@ -2232,7 +2354,7 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
         |key, root, record, hits| {
             // Per holder record, each at most once and only when another
             // session wants one of its ids: evidence, then (birth, location).
-            let mut holder = None::<Option<(Evidence, (i128, LocationKey))>>;
+            let mut holder = None::<Option<(HolderEvidence, (i128, LocationKey))>>;
             for &hash in hits {
                 let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
                 for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
@@ -2241,11 +2363,19 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
                         continue;
                     }
                     let holder = *holder.get_or_insert_with(|| {
-                        let evidence = scan_evidence(index, key, record);
-                        if evidence == Evidence::None {
+                        let evidence = holder_evidence(index, key, record, Some(root));
+                        if evidence.route == Evidence::None && evidence.strict == Evidence::None {
                             return None;
                         }
                         Some((evidence, holder_order(store, root, key)?))
+                    });
+                    let holder = holder.map(|(evidence, order)| {
+                        let evidence = if file.strict {
+                            evidence.strict
+                        } else {
+                            evidence.route
+                        };
+                        (evidence, order)
                     });
                     match holder {
                         Some((evidence, holder)) if holder < file.order => match evidence {
@@ -2272,22 +2402,31 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
             .copied()
             .filter(|hash| !wanted.covered.contains(hash))
             .collect::<Vec<_>>();
+        if walked.is_none() && wanted.strict {
+            // No new hold or read for a partial copy: all its copies count.
+            let ids = skipped_ids(&items[wanted.at]).cloned().collect::<Vec<_>>();
+            restore_uncovered(&mut items[wanted.at], &ids, "copy_strict_deadline");
+            continue;
+        }
         if walked.is_none() {
             hold_copies(&mut items[wanted.at], "held_copy_deadline");
             continue;
         }
-        if wanted.waiting || uncovered.iter().any(|hash| wanted.stale.contains(hash)) {
+        if wanted.waiting
+            || (!wanted.strict && uncovered.iter().any(|hash| wanted.stale.contains(hash)))
+        {
             hold_copies(&mut items[wanted.at], "held_copy_stale_holder");
             continue;
         }
         if !uncovered.is_empty()
+            && !wanted.strict
             && wanted
                 .parent
                 .as_deref()
                 .is_some_and(|parent| parent_proves(index, parent, &wanted.session, wanted.order))
         {
             diag("copy_parent_ref", uncovered.len() as u64);
-            restore_uncovered(&mut items[wanted.at], &[]);
+            restore_uncovered(&mut items[wanted.at], &[], "copy_uncovered");
             continue;
         }
         if !uncovered.is_empty()
@@ -2303,7 +2442,12 @@ fn decide_holders(items: &mut [SnapshotItem], folds: &[usize], index: &ScanIndex
             .filter(|id| uncovered.binary_search(&claude_request_hash(id)).is_ok())
             .cloned()
             .collect::<Vec<_>>();
-        restore_uncovered(&mut items[wanted.at], &ids);
+        let reason = if wanted.strict {
+            "copy_strict_unproven"
+        } else {
+            "copy_uncovered"
+        };
+        restore_uncovered(&mut items[wanted.at], &ids, reason);
     }
 }
 
@@ -2315,8 +2459,9 @@ fn hold_copies(item: &mut SnapshotItem, reason: &'static str) {
     }
 }
 
-/// Decided: `uncovered` (and every id-less copy) counts, disclosed.
-fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
+/// Decided: `uncovered` (and every id-less copy) counts, disclosed under
+/// `reason`.
+fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String], reason: &'static str) {
     let SnapshotItem {
         claude_money: Some(fold),
         claude_usage_occurrences,
@@ -2330,7 +2475,7 @@ fn restore_uncovered(item: &mut SnapshotItem, uncovered: &[String]) {
             // Two responses claim it: no single grain to give back.
             fold.entity.certificate_ok = false;
         } else if let Some(occurrence) = claude_usage_occurrences.get(id) {
-            fold.restore_one(occurrence);
+            fold.restore_one(occurrence, reason);
         }
     }
     fold.restore_idless();

@@ -392,17 +392,25 @@ impl BirthStore {
             self.record_opened(session, path, i128::from(opened.birth), opened);
         }
         let valid = opened.is_some_and(|current| {
-            current.size >= indexed_size
-                && self
-                    .get(session)
-                    .and_then(|s| s.4.binary_search_by_key(&pk, |o| o.0).ok().map(|i| &s.4[i]))
-                    .is_some_and(|o| o.3.covers(current))
+            current.size >= indexed_size && self.covers_object(session, path, current)
         });
         let status = u8::from(opened.is_some()) | (u8::from(valid) << 1);
         match self.1.binary_search_by_key(&pk, |o| o.0) {
             Ok(i) => self.1[i].1 = status,
             Err(i) => self.1.insert(i, (pk, status)),
         }
+    }
+    /// `current` is the object recorded at `path`'s birth, no shorter.
+    pub(in crate::snapshots) fn covers_object(
+        &self,
+        session: &str,
+        path: &str,
+        current: ClaudeOpenedBirth,
+    ) -> bool {
+        let pk = location_key(path);
+        self.get(session)
+            .and_then(|s| s.4.binary_search_by_key(&pk, |o| o.0).ok().map(|i| &s.4[i]))
+            .is_some_and(|o| o.3.covers(current))
     }
     /// Remember the identity at birth, never rebind an old minimum to a replacement.
     pub(in crate::snapshots) fn record_opened(
