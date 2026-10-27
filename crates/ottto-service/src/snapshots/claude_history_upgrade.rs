@@ -524,7 +524,7 @@ fn holds_until_history_cutoff(inputs: &PolicyInputs<'_>) -> bool {
 pub(crate) struct HistoryPage {
     files: usize,
     bytes: u64,
-    reserved: BTreeSet<String>,
+    reserved: BTreeMap<String, u64>,
     /// Candidates classified as owed upgrades.
     pub(super) owed: u64,
     /// Owed upgrades permitted on this page.
@@ -589,36 +589,37 @@ impl HistoryPage {
         &mut self,
         key: &str,
         bytes: u64,
-        twins: Vec<(String, u64)>,
-        old_twin_bytes: u64,
+        mut twins: Vec<(String, u64)>,
     ) -> bool {
-        if self.reserved.contains(key) {
-            let Some(paid) = bytes.checked_add(old_twin_bytes) else {
-                return false;
-            };
-            let Some(remaining) = self.bytes.checked_sub(paid) else {
-                return false;
-            };
-            let removed = 1 + twins
-                .iter()
-                .filter(|(twin, _)| self.reserved.contains(twin))
-                .count();
-            let Some(files) = self.files.checked_sub(removed) else {
-                return false;
-            };
-            self.bytes = remaining;
-            self.files = files;
-            self.reserved.remove(key);
-            for (twin, _) in &twins {
-                self.reserved.remove(twin);
+        // Keep exact per-path funds: the reservation may have originated at
+        // another twin whose parser failed. Never infer its charge from a
+        // later candidate's size, nor release bytes already read after shrink.
+        let bytes = bytes.max(self.reserved.get(key).copied().unwrap_or(0));
+        for (twin, size) in &mut twins {
+            *size = (*size).max(self.reserved.get(twin).copied().unwrap_or(0));
+        }
+        let previous = (self.files, self.bytes);
+        let mut old = Vec::new();
+        for path in std::iter::once(key).chain(twins.iter().map(|(path, _)| path.as_str())) {
+            if let Some(size) = self.reserved.remove(path) {
+                self.files -= 1;
+                self.bytes -= size;
+                old.push((path.to_owned(), size));
             }
         }
         self.staged_twins = Some((key.to_owned(), twins));
-        self.reserve_within(key, bytes, false)
+        if self.reserve_within(key, bytes, false) {
+            return true;
+        }
+        // Refusal grants no new work and releases no earlier reservation.
+        self.files = previous.0;
+        self.bytes = previous.1;
+        self.reserved.extend(old);
+        false
     }
 
     fn reserve_within(&mut self, index_key: &str, size_bytes: u64, first_file: bool) -> bool {
-        if self.reserved.contains(index_key) {
+        if self.reserved.contains_key(index_key) {
             return true;
         }
         // E2 path twins settle as one entity, so they are reserved as one
@@ -631,7 +632,7 @@ impl HistoryPage {
         };
         let twins = twins
             .into_iter()
-            .filter(|(key, _)| !self.reserved.contains(key))
+            .filter(|(key, _)| !self.reserved.contains_key(key))
             .collect::<Vec<_>>();
         let files = 1 + twins.len();
         let bytes = twins
@@ -647,8 +648,8 @@ impl HistoryPage {
         }
         self.files += files;
         self.bytes = self.bytes.saturating_add(bytes);
-        self.reserved.insert(index_key.to_owned());
-        self.reserved.extend(twins.into_iter().map(|(key, _)| key));
+        self.reserved.insert(index_key.to_owned(), size_bytes);
+        self.reserved.extend(twins);
         true
     }
 
@@ -2196,18 +2197,31 @@ mod large_full_reservation_tests {
             assert!(page.reserve("small", 100));
             page.staged_twins = Some(("a".into(), vec![("b".into(), 200)]));
             assert!(page.reserve("a", 300));
-            assert!(page.reserve_large_full_group("a", 300, vec![("b".into(), 600)], 200));
+            assert!(page.reserve_large_full_group("a", 300, vec![("b".into(), 600)]));
             assert_eq!((page.files, page.bytes), (3, 1000));
             assert!(!page.reserve("one-more-byte", 1));
 
             let mut page = HistoryPage::default();
             assert!(page.reserve("small", 100));
             assert!(page.reserve("a", 300)); // new twin was not indexed/reserved
-            assert!(page.reserve_large_full_group("a", 300, vec![("new".into(), 500)], 0));
+            assert!(page.reserve_large_full_group("a", 300, vec![("new".into(), 500)]));
             assert_eq!((page.files, page.bytes), (3, 900), "every live path counts");
-            assert!(page.reserved.contains("small"));
-            assert!(page.reserved.contains("a"));
-            assert!(page.reserved.contains("new"));
+            assert!(page.reserved.contains_key("small"));
+            assert!(page.reserved.contains_key("a"));
+            assert!(page.reserved.contains_key("new"));
+
+            let mut page = HistoryPage::default();
+            page.staged_twins = Some(("new".into(), vec![("grown".into(), 1)]));
+            assert!(page.reserve("new", 100));
+            assert!(page.reserve("unrelated", 700));
+            let previous = (page.files, page.bytes, page.reserved.clone());
+            assert!(!page.reserve_large_full_group("grown", 700, vec![("new".into(), 100)]));
+            assert_eq!(
+                (page.files, page.bytes, page.reserved.clone()),
+                previous,
+                "a different twin cannot refund an invented old charge"
+            );
+            assert!(!page.reserve("over-cap", 200));
         });
     }
 }

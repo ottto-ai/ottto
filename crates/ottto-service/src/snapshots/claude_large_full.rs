@@ -369,7 +369,6 @@ pub(super) type Pass = Option<String>;
 struct Group {
     member: String,
     twins: Vec<(String, u64)>,
-    old_bytes: u64,
 }
 
 fn twin_group(
@@ -399,9 +398,8 @@ fn twin_group(
     let key = local_index_key(&candidate.path);
     let mut twins = Vec::new();
     let mut total = candidate.size_bytes;
-    let mut old_bytes = 0u64;
     let mut has_large = is_large(candidate);
-    for (other, stored_size) in keys {
+    for (other, _) in keys {
         if *other == key {
             continue;
         }
@@ -418,14 +416,9 @@ fn twin_group(
         if has_large && total > body_witness_adoption_byte_budget() {
             return Err(());
         }
-        old_bytes = old_bytes.checked_add(stored_size.unwrap_or(0)).ok_or(())?;
         twins.push((other.clone(), bytes));
     }
-    Ok((has_large && !twins.is_empty()).then_some(Group {
-        member,
-        twins,
-        old_bytes,
-    }))
+    Ok((has_large && !twins.is_empty()).then_some(Group { member, twins }))
 }
 
 pub(super) fn admit(
@@ -441,21 +434,12 @@ pub(super) fn admit(
     } else {
         match twin_group(index, candidate, page) {
             Err(()) => false,
-            Ok(Some(Group {
-                member,
-                twins,
-                old_bytes,
-            })) => {
+            Ok(Some(Group { member, twins })) => {
                 if unit.as_ref().is_some_and(|current| current != &member) {
                     false
                 } else if unit.is_some() {
                     true
-                } else if page.reserve_large_full_group(
-                    &key,
-                    candidate.size_bytes,
-                    twins,
-                    old_bytes,
-                ) {
+                } else if page.reserve_large_full_group(&key, candidate.size_bytes, twins) {
                     *unit = Some(member);
                     true
                 } else {
