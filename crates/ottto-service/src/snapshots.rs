@@ -6592,6 +6592,14 @@ fn claude_full_rearm_root_digest(root_session_id: &str) -> String {
     claude_full_rearm_digest(b"claude_full_rearm_root:v1", &[root_session_id.as_bytes()])
 }
 
+/// The shape of `claude_full_rearm_digest`: 32 lowercase hex characters.
+fn claude_full_rearm_digest_is_canonical(digest: &str) -> bool {
+    digest.len() == 32
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Held families one sweep may scope its `CompletedBlockingHolds` marker to.
 /// More fall back to the sweep-wide unchanged-proof veto.
 pub(crate) const MAX_SCOPED_HELD_FAMILY_ROOTS: usize = 64;
@@ -9565,17 +9573,18 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             unchanged_proof_roots.as_mut(),
             unsettled_families.as_ref().filter(|held| !held.is_empty()),
         ) {
-            let mut held_proven = 0_usize;
+            let mut held_with_retained_witness = 0_usize;
             for (root_session_id, unchanged) in roots.iter_mut() {
                 if held.contains(&claude_full_rearm_root_digest(root_session_id)) {
                     *unchanged = false;
-                    held_proven += 1;
+                    held_with_retained_witness += 1;
                 }
             }
             eprintln!(
                 "local snapshot census kept the proof re-arm of {} held Claude family/families \
-                 ({held_proven} proven here) as unsettled residue; other settled unchanged \
-                 families keep their unchanged-proof skip",
+                 ({held_with_retained_witness} with a retained witness, none settled) as \
+                 unsettled residue; other settled unchanged families keep their \
+                 unchanged-proof skip",
                 held.len()
             );
         }
@@ -42036,6 +42045,9 @@ impl ScanIndex {
     /// none while the sweep is settled, the held families while scoped
     /// `CompletedBlockingHolds` is its only cause, and `None` (every family
     /// keeps its proof re-arm) for any other cause or an unscoped stamp.
+    /// A loaded scope is trusted only in the shape the writer produces: not
+    /// empty, at most `MAX_SCOPED_HELD_FAMILY_ROOTS`, every entry a canonical
+    /// root digest. Anything else keeps the sweep-wide veto.
     pub(crate) fn unchanged_proof_unsettled_families(&self) -> Option<BTreeSet<String>> {
         if !self.bounded_sweep_had_unsettled_upload {
             return Some(BTreeSet::new());
@@ -42044,7 +42056,18 @@ impl ScanIndex {
         {
             return None;
         }
-        self.claude_full_rearm_progress.held_family_roots.clone()
+        self.claude_full_rearm_progress
+            .held_family_roots
+            .as_ref()
+            .filter(|scope| {
+                !scope.is_empty()
+                    && scope.len() <= MAX_SCOPED_HELD_FAMILY_ROOTS
+                    && scope
+                        .iter()
+                        .map(String::as_str)
+                        .all(claude_full_rearm_digest_is_canonical)
+            })
+            .cloned()
     }
 
     /// Diagnostics only. The flag is authoritative: no cause without it, and

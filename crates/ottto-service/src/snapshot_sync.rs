@@ -20149,6 +20149,110 @@ mod tests {
         );
     }
 
+    /// Review 797 P2: a loaded scope is trusted only in the shape its writer
+    /// produces. A saved index whose sweep still carries the sole
+    /// `completed_blocking_holds` cause, but whose scope is empty, over the
+    /// bound, holds a non-canonical digest, is missing, or has the wrong type,
+    /// takes the sweep-wide unchanged-proof veto. The flag and cause stay.
+    #[test]
+    fn saved_held_family_scope_outside_the_writer_shape_keeps_the_sweep_wide_veto() {
+        let entry = |source: &str, fingerprint: &str| {
+            serde_json::json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 2,
+                "source_file_fingerprint": source,
+                "last_snapshot_fingerprint": fingerprint,
+                "scan_identity_version": "semantic_sync:v2",
+            })
+        };
+        let committed = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
+        }));
+        let mut scoped = commit_completed_with_local_holds(
+            scanned,
+            &committed,
+            &test_upload_progress(),
+            &BTreeSet::from(["held-new".to_string()]),
+            &BTreeSet::new(),
+            true,
+            Some(&BTreeSet::from(["held-family".to_string()])),
+        );
+        let root = test_dir("saved-held-family-scope-shape");
+        std::fs::create_dir_all(&root).expect("create scope fixture root");
+        let index_path = root.join("scan-index.json");
+        scoped.save(&index_path).expect("save scan index");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index_path).expect("read saved index"))
+                .expect("decode saved index");
+        let written = saved["claude_full_rearm_progress"]["held_family_roots"].clone();
+        let valid = written[0].as_str().expect("one written digest").to_owned();
+        assert_eq!(
+            ScanIndex::load(&index_path)
+                .expect("reload scan index")
+                .unchanged_proof_unsettled_families()
+                .map(|held| held.len()),
+            Some(1),
+            "control: the writer's own scope is trusted"
+        );
+        let over_bound = (0..=crate::snapshots::MAX_SCOPED_HELD_FAMILY_ROOTS)
+            .map(|n| format!("{n:032x}"))
+            .collect::<Vec<_>>();
+        let key = valid.clone();
+        let damaged: [(&str, Option<serde_json::Value>); 8] = [
+            ("empty", Some(serde_json::json!([]))),
+            ("over the bound", Some(serde_json::json!(over_bound))),
+            (
+                "not a digest",
+                Some(serde_json::json!([valid, "not-a-digest"])),
+            ),
+            (
+                "uppercase digest",
+                Some(serde_json::json!([valid.to_uppercase()])),
+            ),
+            ("short digest", Some(serde_json::json!([&valid[1..]]))),
+            ("missing", None),
+            ("wrong type: number", Some(serde_json::json!(7))),
+            ("wrong type: object", Some(serde_json::json!({ key: true }))),
+        ];
+        for (case, value) in damaged {
+            let mut edited = saved.clone();
+            let progress = edited["claude_full_rearm_progress"]
+                .as_object_mut()
+                .expect("the scope is saved in the re-arm progress");
+            match value {
+                Some(value) => {
+                    progress.insert("held_family_roots".to_owned(), value);
+                }
+                None => {
+                    progress.remove("held_family_roots");
+                }
+            }
+            std::fs::write(
+                &index_path,
+                serde_json::to_vec(&edited).expect("encode edited index"),
+            )
+            .expect("write edited index");
+            let loaded = ScanIndex::load(&index_path).expect("reload edited index");
+            assert!(loaded.bounded_sweep_had_unsettled_upload(), "{case}");
+            assert_eq!(
+                loaded.bounded_sweep_unsettled_cause_names(),
+                ["completed_blocking_holds"],
+                "{case}"
+            );
+            assert_eq!(
+                loaded.unchanged_proof_unsettled_families(),
+                None,
+                "{case}: the sweep-wide veto"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// The backend's error-code set is closed and its forward tolerance covers
     /// unknown fields, never unknown values: `census_residue` against a backend
     /// that does not admit it would reject the ENTIRE receipt. So until the

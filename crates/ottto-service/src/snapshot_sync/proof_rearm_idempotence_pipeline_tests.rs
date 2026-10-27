@@ -2030,12 +2030,12 @@ fn c1a_changed_family_beside_unbound_hold_rearms_like_no_hold() {
     };
     let (_, control, _) = c1a_held_arm("c1a-changed-control", &[], gain);
     assert_eq!(control.family_reads, family);
-    assert!(
-        control.debt == family || !control.proven,
-        "a changed proven family never skips: {control:?}"
-    );
+    assert!(control.proven, "the changed family is proven: {control:?}");
+    assert_eq!(control.debt, family, "a changed proven family never skips");
     let (_, held, held_pages) = c1a_held_arm("c1a-changed-beside-hold", &[C1A_HELD], gain);
     c1a_assert_scoped_hold(&held_pages, "changed");
+    assert!(held.proven, "the changed family is proven: {held:?}");
+    assert_eq!(held.debt, family, "a changed proven family never skips");
     assert_eq!(c1a_census_as(&held, &control), control);
 }
 
