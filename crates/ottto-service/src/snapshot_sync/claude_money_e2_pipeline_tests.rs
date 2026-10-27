@@ -1828,8 +1828,14 @@ fn settle(
     mut page: Page,
     progress: &mut SnapshotUploadProgress,
 ) -> ScanIndex {
-    let holds = page.finish();
+    page.finish();
     upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    let holds = LocalHoldSettlement::classify(
+        SnapshotSource::ClaudeCode,
+        &mut page.index,
+        &mut page.scan,
+        &page.disposition,
+    );
     let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
     settle_index_after_upload(&mut settled.index, committed, progress);
     c.reload(&mut settled.index)
@@ -2571,6 +2577,21 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
     conflict_only(true);
 }
 
+// The held-read regression needs the classification from BEFORE finish
+// removes withheld items, matching production settlement. Existing fixtures
+// keep their original helper and their original assertions.
+fn settle_captured_holds(
+    c: &Corpus,
+    committed: &ScanIndex,
+    mut page: Page,
+    progress: &mut SnapshotUploadProgress,
+) -> ScanIndex {
+    let holds = page.finish();
+    upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
+    settle_index_after_upload(&mut settled.index, committed, progress);
+    c.reload(&mut settled.index)
+}
 /// A census deadline withholds a NEW copy. Every walk re-decides the hold;
 /// a healthy external census releases it without any transcript change.
 fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool) {
@@ -2581,10 +2602,10 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool) {
         let mut progress = e2_progress();
         let empty = ScanIndex::default();
         let original = ready(&c, &scanner, empty.clone(), 100, sampled);
-        let prior = settle(&c, &empty, original, &mut progress);
+        let prior = settle_captured_holds(&c, &empty, original, &mut progress);
         // Consume the existing one-time identity-contract re-arm.
         let warm = ready(&c, &scanner, prior.clone(), 100, sampled);
-        let prior = settle(&c, &prior, warm, &mut progress);
+        let prior = settle_captured_holds(&c, &prior, warm, &mut progress);
         let accepted_before = progress.accepted_fingerprints.clone();
         let path = c.write_at(
             &format!("{COPY}.jsonl"),
@@ -2596,11 +2617,13 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool) {
             first.enrich(&c);
         });
         assert_withheld(&first, COPY, "external census unavailable");
-        let prior = settle(&c, &prior, first, &mut progress);
+        let prior = settle_captured_holds(&c, &prior, first, &mut progress);
         assert_eq!(progress.accepted_fingerprints, accepted_before);
         assert_eq!(prior.current_snapshot_fingerprints(), accepted_before);
         if grow {
-            append(&path, &line(COPY, "own", "2026-08-02T07:04:00Z", 20));
+            // Keep every response pre-birth, so growth cannot itself resolve
+            // the all-copied main-file hold before external evidence arrives.
+            append(&path, &line(COPY, "own", "2026-08-02T07:01:00Z", 20));
         }
         let mut retry = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
         crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
@@ -2611,7 +2634,7 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool) {
             // These assertions run only in the macOS-specific tests below.
             assert_eq!(retry.modes, if grow { (0, 1, 0) } else { (0, 0, 1) });
         }
-        let prior = settle(&c, &prior, retry, &mut progress);
+        let prior = settle_captured_holds(&c, &prior, retry, &mut progress);
         assert_eq!(progress.accepted_fingerprints, accepted_before);
         let before = std::fs::metadata(&path).unwrap();
         let restored = ready(&c, &scanner, prior.clone(), 100, sampled);
@@ -2642,7 +2665,7 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool) {
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             before.modified().unwrap()
         );
-        let settled = settle(&c, &prior, restored, &mut progress);
+        let settled = settle_captured_holds(&c, &prior, restored, &mut progress);
         assert_eq!(
             progress.accepted_fingerprints.len(),
             accepted_before.len() + 1
