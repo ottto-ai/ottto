@@ -588,3 +588,73 @@ fn allowlist_digest_binds_source_and_field_classes() {
         );
     }
 }
+
+/// Full-fallback classes on a synthetic corpus, by the refusing field: a
+/// skill reference (E) and a first prompt past the 1 MiB head bound (not
+/// re-derivable) each read Full; plain sessions persist.
+#[test]
+fn fallback_classes_over_the_synthetic_corpus() {
+    let mut skill = claude_lines(1, 1);
+    skill.push(
+        json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"u-9","parentUuid":"u-3",
+            "timestamp":"2026-10-20T10:00:09Z","requestId":"req_skill",
+            "message":{"id":"msg_skill","type":"message","role":"assistant",
+                "model":"claude-opus-4-1","stop_reason":"tool_use",
+                "content":[{"type":"tool_use","id":"toolu_skill","name":"Bash",
+                    "input":{"command":"cat ~/.claude/skills/pdf/SKILL.md"}}],
+                "usage":{"input_tokens":1,"cache_creation_input_tokens":0,
+                    "cache_read_input_tokens":0,"output_tokens":1}}})
+        .to_string(),
+    );
+    let mut deep = claude_filler(0, 1100, 1024);
+    deep.extend(claude_lines(0, 0));
+    let corpus = [
+        (SnapshotSource::ClaudeCode, claude_lines(1, 1)),
+        (SnapshotSource::Codex, codex_lines()),
+        (SnapshotSource::ClaudeCode, skill),
+        (SnapshotSource::ClaudeCode, deep),
+    ];
+    let mut tally = BTreeMap::<&'static str, usize>::new();
+    for (source, lines) in corpus {
+        let scratch = Scratch::new("corpus");
+        let path = scratch.write("t.jsonl", &lines);
+        let (reduction, _) = full_read(&path, source);
+        let class = match encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        ) {
+            Ok(_) => "persisted",
+            Err(Refuse::NonEmpty(field) | Refuse::NotRederivable(field)) => field,
+            Err(Refuse::TooLarge) => "record_bytes",
+            Err(Refuse::UnknownLabel) => "static_label",
+        };
+        *tally.entry(class).or_default() += 1;
+    }
+    assert_eq!(
+        tally,
+        BTreeMap::from([
+            ("persisted", 2),
+            ("SnapshotAccumulator.activity_skills", 1),
+            ("SnapshotAccumulator.first_prompt_material", 1),
+        ])
+    );
+}
+
+/// Budget receipt (static): the bounds every restore and write is held to.
+#[test]
+fn budget_bounds_hold() {
+    use crate::durable_tail_store::{MAX_BATCH, MAX_RECORDS, RECORD_BYTES, STORE_BYTES};
+    // A restored copy is charged to the 31 MiB state budget like any
+    // retained copy; one record never exceeds one cache entry.
+    assert_eq!(RECORD_BYTES, crate::transcript_cache::ENTRY_BYTES);
+    assert_eq!(MAX_RECORDS, crate::transcript_cache::CACHE_ENTRIES);
+    // Disk: at most 32 MiB per source store.
+    assert_eq!(STORE_BYTES, 32 * 1024 * 1024);
+    // Per restore: one record read, two 4 KiB sample windows, a head
+    // re-parse of at most 1 MiB and at most NAMED_LINES capped lines.
+    assert_eq!(HEAD_BOUND, 1024 * 1024);
+    assert!(NAMED_LINES <= 4);
+    // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
+    assert_eq!(MAX_BATCH, 32);
+}

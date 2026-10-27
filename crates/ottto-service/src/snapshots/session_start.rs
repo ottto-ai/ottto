@@ -459,9 +459,11 @@ pub(super) struct SessionStartState {
     shell_moved: bool,
     /// An opening Claude response spanned several requests.
     collapsed_requests: bool,
-    /// End offset of the line that froze the window, when the reader knew it.
-    /// The re-derived opening content (M1 durable warm-cache) is final there.
-    frozen_at: Option<u64>,
+    /// End offset of the last line applied while the window was open (the
+    /// line that froze it, once frozen), when the reader knew it. The opening
+    /// content (M1 durable warm-cache) equals a re-parse of the file through
+    /// it; `None` after any line at an unknown position.
+    content_end: Option<u64>,
 }
 
 crate::heap_layout_bound::fields!(OpeningRequest; context_tokens, uncached_input_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, parts_reconcile, output_tokens);
@@ -506,7 +508,7 @@ crate::durable_tail_codec::durable_struct!(OpeningFileState {
     N client_loaded: [bool; 2],
     N truncated: [bool; 2],
 });
-crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests, frozen_at);
+crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests, content_end);
 crate::durable_tail_codec::durable_struct!(SessionStartState {
     U client_version: Option<String>,
     N user_turns: u8,
@@ -535,7 +537,7 @@ crate::durable_tail_codec::durable_struct!(SessionStartState {
     N held_bytes: usize,
     N shell_moved: bool,
     N collapsed_requests: bool,
-    N frozen_at: Option<u64>,
+    N content_end: Option<u64>,
 });
 
 impl SessionStartState {
@@ -555,9 +557,8 @@ impl SessionStartState {
     }
 
     fn freeze(&mut self) {
+        self.note_line_applied();
         self.frozen = true;
-        self.frozen_at = crate::durable_tail_codec::current_line()
-            .map(|(offset, len)| offset.saturating_add(len));
         if !self.parts_closed {
             self.parts_closed = true;
             self.parts_unmeasurable = true;
@@ -573,11 +574,20 @@ impl SessionStartState {
         self.recount_held();
     }
 
+    /// M1: after each applied line, while the window is open, the end of
+    /// that line: the opening content is final through it.
+    pub(super) fn note_line_applied(&mut self) {
+        if !self.frozen {
+            self.content_end = crate::durable_tail_codec::current_line()
+                .map(|(offset, len)| offset.saturating_add(len));
+        }
+    }
+
     /// M1 durable warm-cache reuse: the digest of the opening content a
     /// record never carries (instruction text, the Codex prelude with its cwd
-    /// and AGENTS.md, opening file paths), or `None` when there is none.
-    /// Content is re-derived from the file head, so it must be final: the
-    /// window froze on a known line within `bound`.
+    /// and AGENTS.md, opening file paths), or `None` when there is none. It
+    /// is re-derived by re-parsing the file head through `content_end`, which
+    /// must be known and within `bound`.
     pub(super) fn durable_content_digest(
         &self,
         bound: u64,
@@ -587,9 +597,9 @@ impl SessionStartState {
             return Ok(None);
         }
         let end = self
-            .frozen_at
-            .filter(|end| self.frozen && *end <= bound)
-            .ok_or(Refuse::NotRederivable("SessionStartState.frozen_at"))?;
+            .content_end
+            .filter(|end| *end <= bound)
+            .ok_or(Refuse::NotRederivable("SessionStartState.content_end"))?;
         Ok(Some((self.durable_content_hash()?, end)))
     }
 
@@ -613,9 +623,9 @@ impl SessionStartState {
         self.files = std::mem::take(&mut from.files);
     }
 
-    /// End of the line that froze the window, when known.
+    /// Where the opening content is final (`content_end`), when known.
     pub(super) fn durable_content_end(&self) -> Option<u64> {
-        self.frozen_at
+        self.content_end
     }
 
     fn charge(&mut self, bytes: usize) -> bool {

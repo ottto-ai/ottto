@@ -4,7 +4,7 @@
 //!
 //! The body holds the allowlisted fields (`N`/`H`/`U`/`L`, see
 //! `durable_tail_codec`) and, for each re-derived content field, the digest of
-//! its value. The marks (`DurableMarks`, `SessionStartState::frozen_at`) say
+//! its value. The marks (`DurableMarks`, `SessionStartState::content_end`) say
 //! where in the file each was last assigned. Restore re-parses the file head
 //! up to the latest mark, at most `HEAD_BOUND` bytes, and preads at most one
 //! named line (the title); every value must hash-equal its digest, else the
@@ -215,7 +215,7 @@ impl Decoded {
         if self.rederive.session_start.is_some() {
             end = end.max(head_mark(
                 acc.session_start.durable_content_end(),
-                "SessionStartState.frozen_at",
+                "SessionStartState.content_end",
             )?);
         }
         Ok(end)
@@ -307,7 +307,7 @@ impl Decoded {
         }
         if let Some(expected) = rederive.session_start {
             if fresh.session_start.durable_content_hash()? != expected {
-                return Err(refused("SessionStartState.frozen_at"));
+                return Err(refused("SessionStartState.content_end"));
             }
             acc.session_start
                 .adopt_durable_content(&mut fresh.session_start);

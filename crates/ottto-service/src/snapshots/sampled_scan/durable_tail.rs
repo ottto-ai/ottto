@@ -436,6 +436,7 @@ impl SharedCache {
         };
         let namespace = &namespace;
         let mut pending = Vec::new();
+        let mut offered = BTreeMap::new();
         let mut later = BTreeSet::new();
         let mut budget = WRITE_PASS_BYTES;
         let mut not_persisted = Vec::new();
@@ -479,6 +480,7 @@ impl SharedCache {
                     Ok(body) => {
                         budget = budget.saturating_sub(body.len());
                         peak = peak.max(body.len() as u64);
+                        offered.insert(expected.binding.key, key);
                         pending.push(PendingRecord {
                             binding: expected.binding,
                             certificate,
@@ -503,9 +505,17 @@ impl SharedCache {
             Counters::bump(&mut counters.not_persisted, class);
         }
         let slot = stores.slot(source).as_mut()?;
-        slot.store
+        let receipt = slot
+            .store
             .write_after_save(writer, index.generation, pending)
-            .ok()
+            .ok()?;
+        // Records past the batch limit are offered again after the next save.
+        for key in &receipt.deferred_keys {
+            if let Some(key) = offered.remove(key) {
+                stores.touched.insert(key);
+            }
+        }
+        Some(receipt)
     }
 
     /// Collects records the committed `index` no longer keeps, from another

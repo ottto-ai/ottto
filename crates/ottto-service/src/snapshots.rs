@@ -32726,6 +32726,7 @@ impl OwnedJsonlParser {
                 *positive_usage_evidence |= json_has_positive_usage_evidence(value);
             }
             apply_line(value, accumulator);
+            accumulator.session_start.note_line_applied();
         };
         drive(&mut self.reader, &mut sink)
     }

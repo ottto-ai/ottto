@@ -322,11 +322,14 @@ pub(crate) struct StoreCounters {
 }
 
 /// What one post-save batch did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BatchReceipt {
     pub(crate) written: usize,
     pub(crate) clean: usize,
     pub(crate) deferred: usize,
+    /// The deferred records' keys, so the caller offers them again after
+    /// its next save.
+    pub(crate) deferred_keys: Vec<Digest32>,
     pub(crate) budget_refused: usize,
     pub(crate) bytes_written: u64,
 }
@@ -446,6 +449,7 @@ impl DurableTailStore {
         for (record, content) in dirty {
             if receipt.written + receipt.budget_refused >= MAX_BATCH {
                 receipt.deferred += 1;
+                receipt.deferred_keys.push(record.binding.key);
                 continue;
             }
             let key = record.binding.key;
