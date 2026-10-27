@@ -321,7 +321,12 @@ fn oversized_keeps_complete_families_empty_and_refuses_absence_retirement_sweep_
     let fixture = c1a_fixture("oversized-absence-fence");
     let closed = c1b_generation(&fixture, "oversized", (8, 0));
     assert!(closed.census_complete && closed.proven);
+    // The first proof re-arms its members. Replay that real debt before
+    // binding quarantine to current, nonempty source revisions.
+    let replayed = c1b_generation(&fixture, "oversized", (8, 5));
+    assert!(replayed.census_complete && replayed.proven);
     let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+    assert_eq!(RearmFixture::family_rearm_debt(&index), 0);
     let witness = index
         .claude_usage_family_witness_digest_for_test(REARM_ROOT)
         .unwrap();
