@@ -282,7 +282,16 @@ impl SharedCache {
     ) -> Option<crate::transcript_acquisition::Checkpoint> {
         self.retained().ok()?.checkpoint(key)
     }
+    #[cfg(test)]
     pub(super) fn insert(
+        &self,
+        key: String,
+        completed: sampled_jsonl::CompletedNativeAcquisition,
+        live_bytes: usize,
+    ) {
+        self.insert_admitted(key, completed, live_bytes);
+    }
+    pub(super) fn insert_admitted(
         &self,
         key: String,
         completed: sampled_jsonl::CompletedNativeAcquisition,

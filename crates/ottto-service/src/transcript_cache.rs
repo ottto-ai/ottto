@@ -579,6 +579,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn claude_page_cache_evictions_partition_real_count_and_byte_pressure() {
+        use crate::local_resource_diagnostics::claude_reread::Scope;
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let scope = Scope::begin(true);
+        let mut count_limited = TranscriptCache::new(1024 * 1024, 128 * 1024, 1);
+        assert!(count_limited.insert("a".into(), retained("a".into())));
+        assert!(count_limited.insert("b".into(), retained("b".into())));
+        assert!(count_limited.take("a").is_none());
+        let counts = scope.finish().retained_cache_page_events;
+        assert_eq!(counts.events.insert_entries_evicted, 1);
+        assert_eq!(counts.insert_count_entries_evicted, 1);
+        assert_eq!(counts.insert_byte_entries_evicted, 0);
+        let scope = Scope::begin(true);
+        let mut byte_limited = TranscriptCache::new(80 * 1024, 40 * 1024, 256);
+        for n in 0..20 {
+            assert!(byte_limited.insert(n.to_string(), retained("x".repeat(16 * 1024))));
+        }
+        let counts = scope.finish().retained_cache_page_events;
+        assert!(counts.events.insert_entries_evicted > 0);
+        assert_eq!(counts.insert_count_entries_evicted, 0);
+        assert_eq!(
+            counts.insert_byte_entries_evicted,
+            counts.events.insert_entries_evicted
+        );
+        assert_eq!(counts.events.insert_admitted, 20);
+    }
+
     // Test states use the same accounting as production native accumulator
     // fields. Provider-native states are also exercised in the adapter fixtures.
     #[test]

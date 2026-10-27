@@ -29027,7 +29027,7 @@ impl OwnedSourceScan {
                             debug_assert!(file_sampling
                                 .as_ref()
                                 .map_or(true, |sampled| sampled.key.len() == key.len()));
-                            let admitted = context.cache.insert(
+                            let admitted = context.cache.insert_admitted(
                                 key,
                                 completed,
                                 finalization_charge.unwrap_or(0),
@@ -85267,6 +85267,75 @@ mod tests {
         let committable =
             fresh.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
         assert!(committable.files.is_empty());
+    }
+
+    #[test]
+    fn corrective_clear_diagnostics_distinguish_new_invalidation_from_existing_debt() {
+        use crate::local_resource_diagnostics::claude_reread::Scope;
+        let root = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let key = format!("/opaque/{root}.jsonl");
+        let mut account = ScanIndex::default();
+        account
+            .files
+            .insert(key.clone(), manifest_index_entry(Some("entity")));
+        let scope = Scope::begin(true);
+        for _ in 0..2 {
+            account.claude_account_family_witnesses.insert(
+                root.into(),
+                ClaudeAccountFamilyWitness {
+                    account_identifier_hash: "a".repeat(64),
+                    evidence_request_count: 1,
+                    members: BTreeMap::from([(root.into(), 1)]),
+                    member_request_id_fingerprints: BTreeMap::from([(
+                        root.into(),
+                        "invalid-version".into(),
+                    )]),
+                },
+            );
+            apply_claude_effort_evidence_with_index(
+                &mut [],
+                &BTreeMap::new(),
+                &mut account,
+                false,
+                "2026-08-20T10:02:00Z",
+            );
+        }
+        let counts = scope.finish().claude_reread;
+        assert_eq!(counts.account_reproof_calls, 2);
+        assert_eq!(counts.account_reproof_cleared, 1);
+        assert!(account.files[&key].source_file_fingerprint.is_empty());
+        assert!(!account.claude_account_family_witnesses.contains_key(root));
+
+        let mut owned = ScanIndex::default();
+        owned
+            .files
+            .insert(key.clone(), manifest_index_entry(Some("entity")));
+        owned.claude_owned_start_census.insert(
+            root.into(),
+            ClaudeOwnedStartCensusWitness {
+                marker_source_file_fingerprint: "source".into(),
+                verified_source_file_fingerprint: Some("source".into()),
+                emitted_source_file_fingerprint: None,
+            },
+        );
+        let scope = Scope::begin(true);
+        for _ in 0..2 {
+            apply_claude_reported_usage_with_index(
+                &mut [],
+                &Default::default(),
+                &Default::default(),
+                &mut owned,
+                false,
+                "2026-08-20T10:02:00Z",
+            );
+        }
+        let counts = scope.finish().claude_reread;
+        assert_eq!(counts.owned_start_calls, 2);
+        assert_eq!(counts.owned_start_cleared, 1);
+        assert!(owned.files[&key].source_file_fingerprint.is_empty());
+        assert!(owned.claude_owned_start_census[root]
+            .emitted_source_file_fingerprint
+            .is_none());
     }
 
     #[test]

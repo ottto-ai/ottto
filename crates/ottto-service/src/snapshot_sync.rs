@@ -5206,7 +5206,25 @@ impl SourcePreparation {
         Some(counter.bytes)
     }
 
-    fn step(mut self) -> SourcePreparationStep {
+    fn step(self) -> SourcePreparationStep {
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
+            self.source == SnapshotSource::ClaudeCode,
+        );
+        let result = self.step_inner();
+        let counts = diagnostics.finish();
+        let preparation = match &result {
+            SourcePreparationStep::Pending(preparation)
+            | SourcePreparationStep::Refused(preparation, _)
+            | SourcePreparationStep::Complete { preparation, .. } => preparation,
+        };
+        if let Some(lease) = preparation.native_comparison_lease.as_ref() {
+            lease.diagnostic.add_page_events(counts);
+        } else {
+            crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
+        }
+        result
+    }
+    fn step_inner(mut self) -> SourcePreparationStep {
         let mut state = self.scan.take().expect("active source preparation");
         if state.native_capture_active() {
             let initialize = self
