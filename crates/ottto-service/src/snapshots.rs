@@ -3068,7 +3068,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
 /// `index_path`) for the pass and binds the pass's sampled scope and
 /// identity-capture mode, which its records bind to. A freshly loaded index
 /// (absent, quarantined or undecodable) removes the store: its records bind
-/// to an index that no longer exists.
+/// to an index that no longer exists. Removal needs the state-directory
+/// lock; selecting the store and restoring from it need none.
 #[cfg(unix)]
 pub(crate) fn begin_durable_pass(
     cache: &sampled_scan::SharedCache,
@@ -3081,15 +3082,18 @@ pub(crate) fn begin_durable_pass(
 ) {
     cache.durable_begin_pass(source, index_path, namespace, identity_capture);
     if index_fresh {
-        let writer = sampled_scan::durable_tail::StateDirWriter(support_dir);
-        let _ = cache.durable_remove(&writer, source);
+        if let Some(writer) = crate::locked_state_dir::held_for(support_dir) {
+            let _ = cache.durable_remove(writer, source);
+        }
     }
 }
 
 /// M1: after the pass's final index save, writes this source's admitted,
 /// still-resident copies the save kept, then collects records it no longer
 /// keeps. A store failure is never a sync failure: the store is a cache, and
-/// a missing record only means a Full read.
+/// a missing record only means a Full read. Writes and GC require the
+/// daemon's held state-directory lock (#801); without it (not the daemon)
+/// nothing is written and the skip is counted.
 #[cfg(unix)]
 pub(crate) fn durable_after_save(
     cache: &sampled_scan::SharedCache,
@@ -3097,9 +3101,13 @@ pub(crate) fn durable_after_save(
     source: SnapshotSource,
     index: &ScanIndex,
 ) {
-    let writer = sampled_scan::durable_tail::StateDirWriter(support_dir);
-    let _ = cache.durable_write_after_save(&writer, source, index);
-    let _ = cache.durable_gc(&writer, source, index);
+    match crate::locked_state_dir::held_for(support_dir) {
+        Some(writer) => {
+            let _ = cache.durable_write_after_save(writer, source, index);
+            let _ = cache.durable_gc(writer, source, index);
+        }
+        None => cache.durable_note_unlocked(source),
+    }
     if let Some((counters, store)) = cache.durable_counters(source) {
         eprintln!("{}", counters.summary(source, &store));
     }

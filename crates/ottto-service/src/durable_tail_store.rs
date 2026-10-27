@@ -70,8 +70,9 @@ const CERTIFICATE_BYTES: usize = 8 * 3 // device, inode, length
     + 8; // debt
 const TRAILER_BYTES: usize = 32;
 
-/// The single-writer seam. The state-directory lock (#801's `StateDirLock`)
-/// implements it; nothing else may. A second daemon cannot take the lock,
+/// The single-writer seam. The state-directory lock (#801's `StateDirLock`,
+/// held as `crate::locked_state_dir::LockedStateDir`) implements it; nothing
+/// else may outside tests. A second daemon cannot take the lock,
 /// so it can never hold a writer for this store.
 pub(crate) trait SingleWriter {
     /// The locked state directory. The store must live inside it.

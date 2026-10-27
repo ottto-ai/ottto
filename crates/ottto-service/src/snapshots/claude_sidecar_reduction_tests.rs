@@ -836,7 +836,7 @@ fn identity_capture_mode_change_rereads_instead_of_reusing_a_markerless_prefix()
 #[cfg(unix)]
 mod durable_restart {
     use super::*;
-    use crate::snapshots::sampled_scan::durable_tail::StateDirWriter;
+    use crate::locked_state_dir::LockedStateDir;
     use std::os::unix::fs::PermissionsExt;
 
     struct State {
@@ -879,7 +879,9 @@ mod durable_restart {
         let first = Arc::new(SharedCache::default());
         state.begin(&first);
         let prior = seed_predecessor(f, &first);
-        first.durable_write_after_save(&StateDirWriter(&state.dir), SOURCE, &prior);
+        // The daemon's single-writer lock (#801) on this state directory.
+        let lock = LockedStateDir::acquire(&state.dir).unwrap();
+        first.durable_write_after_save(&lock, SOURCE, &prior);
         let expected = usize::from(crate::heap_layout_bound::layout_supported());
         assert_eq!(state.store_records(), expected);
         prior

@@ -491,6 +491,36 @@ impl ReofferPipeline {
         walk(&self.support);
     }
 
+    /// M1: this pipeline stands in for the daemon on its support directory,
+    /// holding #801's single-writer lock there, so the post-save durable
+    /// write runs.
+    #[cfg(unix)]
+    fn hold_state_dir_lock(&self) {
+        crate::locked_state_dir::test_locks::hold(&self.support);
+    }
+
+    /// M1: durable warm-cache records on disk under the support directory.
+    #[cfg(unix)]
+    fn durable_records(&self) -> usize {
+        fn walk(dir: &std::path::Path, inside: bool) -> usize {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let store = path.extension().is_some_and(|ext| ext == "durable-tail");
+                        walk(&path, inside || store)
+                    } else {
+                        usize::from(inside && path.extension().is_some_and(|ext| ext == "rec"))
+                    }
+                })
+                .sum()
+        }
+        walk(&self.support, false)
+    }
+
     fn transcript(&self) -> PathBuf {
         self.fixture
             .home
@@ -1396,8 +1426,23 @@ fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
 /// The refusal, a conflict on its due daily offer, and the conflict's
 /// ordinary retry made due: the state whose quiet cycles re-read the file.
 fn refused_then_conflicted(name: &str) -> (ReofferPipeline, String, u64, serde_json::Value) {
+    refused_then_conflicted_holding(name, false)
+}
+
+/// `refused_then_conflicted`, optionally holding the state-directory lock
+/// from the first cycle on (M1).
+fn refused_then_conflicted_holding(
+    name: &str,
+    locked: bool,
+) -> (ReofferPipeline, String, u64, serde_json::Value) {
     let t0 = current_unix_seconds();
     let mut pipeline = ReofferPipeline::new(name, Answer::Refuse(ORIGINAL_PAIR), t0);
+    #[cfg(unix)]
+    if locked {
+        pipeline.hold_state_dir_lock();
+    }
+    #[cfg(not(unix))]
+    let _ = locked;
     let first = pipeline.cycle(t0);
     assert!(first.result.is_ok(), "{:?}", first.result);
     let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
@@ -1415,6 +1460,48 @@ fn refused_then_conflicted(name: &str) -> (ReofferPipeline, String, u64, serde_j
     pipeline.make_conflict_retry_due(&fingerprint);
     pipeline.server.answer(Answer::Accept);
     (pipeline, fingerprint, t1, deadline)
+}
+
+/// M1 through the real sync caller, both ways. Without the daemon's
+/// single-writer lock (#801) on the support directory the post-save write
+/// writes nothing, and the due-day restart reads the file cold. Holding it,
+/// the earlier cycles write the retained copy after their saves, and the
+/// same restart restores it instead of re-reading the transcript. Either way
+/// the due day offers the same exact body once.
+#[cfg(unix)]
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn durable_store_is_written_only_under_the_state_dir_lock() {
+    if !supported("durable_store_is_written_only_under_the_state_dir_lock") {
+        return;
+    }
+    for locked in [false, true] {
+        let name = if locked {
+            "durable-locked"
+        } else {
+            "durable-unlocked"
+        };
+        let (mut pipeline, fingerprint, _, deadline) =
+            refused_then_conflicted_holding(name, locked);
+        let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
+        let records = pipeline.durable_records();
+        let due = deadline.as_u64().unwrap() + 60;
+        let (day2, _, bytes) = pipeline.measured_cycle(due, true);
+        assert!(day2.result.is_ok(), "{name}: {:?}", day2.result);
+        assert_eq!(day2.leased_offers, 1, "{name}");
+        let offered = pipeline.server.offered();
+        assert_eq!(offered.len(), 3, "{name}: one offer at the due time");
+        assert_eq!(fingerprint_of(&offered[2]), fingerprint, "{name}");
+        if locked {
+            assert!(records > 0, "{name}: written after the save");
+            assert!(bytes < size, "{name}: restored, {bytes} >= {size}");
+        } else {
+            assert_eq!(records, 0, "{name}: nothing written without the lock");
+            assert!(bytes >= size, "{name}: a cold re-read: {bytes} < {size}");
+        }
+    }
 }
 
 /// O1: quiet cycles before the reserved daily re-offer re-read

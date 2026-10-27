@@ -64,6 +64,9 @@ pub(crate) struct Counters {
     /// Write phase: entries not persisted, by the refusing field or class.
     pub(crate) not_persisted: BTreeMap<&'static str, u64>,
     pub(crate) write_deferred: u64,
+    /// Post-save writes skipped because this process does not hold the
+    /// state-directory lock (not the daemon).
+    pub(crate) write_unlocked: u64,
     pub(crate) peak_body_bytes: u64,
 }
 
@@ -86,7 +89,7 @@ impl Counters {
              refused_record={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
-             write_deferred={} peak_body_bytes={} disk_records={} disk_bytes={} \
+             write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} refused{{corrupt:{},newer:{},older:{},allowlist:{},unusable:{}}} \
              unusable{{errno:{},mode:{},shape:{}}} \
@@ -106,6 +109,7 @@ impl Counters {
             self.rederive_line_bytes,
             classes(&self.not_persisted),
             self.write_deferred,
+            self.write_unlocked,
             self.peak_body_bytes,
             store.disk_records,
             store.disk_bytes,
@@ -158,15 +162,14 @@ impl Stores {
     }
 }
 
-/// The single-writer proof for the daemon's state directory. #801 owns the
-/// lock (`StateDirLock`, flock before any state write); until it lands this
-/// names the support directory only. M1 lands after #801 or together with
-/// it, and then passes the held lock here instead (no new lock).
-pub(crate) struct StateDirWriter<'a>(pub(crate) &'a Path);
-
-impl SingleWriter for StateDirWriter<'_> {
+/// The single-writer proof for the daemon's state directory: #801's
+/// `StateDirLock`, held for the life of the daemon process. M1 adds no lock.
+/// The store's writes, GC and removal take it; restore only reads and takes
+/// nothing. #801's lock is close-only (released when its descriptor closes,
+/// no `LOCK_UN`); nothing here relies on when it is released.
+impl SingleWriter for crate::locked_state_dir::LockedStateDir {
     fn state_dir(&self) -> &Path {
-        self.0
+        self.dir()
     }
 }
 
@@ -624,6 +627,19 @@ impl SharedCache {
         match stores.slot(source).as_mut() {
             Some(slot) => slot.store.remove_all(writer),
             None => Ok(()),
+        }
+    }
+
+    /// A post-save pass in a process that does not hold the state-directory
+    /// lock: nothing is written or collected, and the admitted keys are
+    /// dropped (they would never be written).
+    pub(crate) fn durable_note_unlocked(&self, snapshot_source: SnapshotSource) {
+        if durable_source(snapshot_source).is_none() {
+            return;
+        }
+        if let Some(mut stores) = self.durable() {
+            stores.touched.clear();
+            stores.counters.write_unlocked += 1;
         }
     }
 

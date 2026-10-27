@@ -554,10 +554,13 @@ const HELD_STATE_LAUNCHD_BACKOFF: Duration = Duration::from_secs(10);
 /// to be held for the life of the process. When another daemon holds it, or
 /// it cannot be taken, prints why and exits without writing any state.
 #[cfg(unix)]
-fn hold_local_state_or_exit() -> ottto_service::state_dir_lock::StateDirLock {
-    use ottto_service::state_dir_lock::{StateDirLock, StateDirLockError};
-    match StateDirLock::acquire(&ottto_core::default_support_dir()) {
-        Ok(lock) => lock,
+fn hold_local_state_or_exit() -> &'static ottto_service::locked_state_dir::LockedStateDir {
+    use ottto_service::locked_state_dir::{hold_for_process, LockedStateDir};
+    use ottto_service::state_dir_lock::StateDirLockError;
+    match LockedStateDir::acquire(&ottto_core::default_support_dir()) {
+        // Held for the life of the process; the library's single-writer
+        // caches (the durable-tail store) write only while it is held.
+        Ok(locked) => hold_for_process(locked),
         Err(error) => {
             eprintln!("ottto-service: {error}; exiting without touching it");
             // launchd is the parent of every job it starts.

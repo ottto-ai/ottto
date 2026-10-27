@@ -7,7 +7,6 @@ use crate::snapshots::ScanIndex;
 use crate::transcript_acquisition::{DurableAdmission, FullReason, ReadPlan, Scope};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::fd::AsRawFd;
 
 /// The placeholder codec: two numbers, with a compiled field list.
 const PLACEHOLDER_FIELDS: &[&str] = &["placeholder.count", "placeholder.sum"];
@@ -22,43 +21,25 @@ fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
     body
 }
 
-/// Test stand-in for #801's `StateDirLock` (`ottto_core::state_dir_lock`),
-/// with the same acquire shape and the same file: an exclusive, non-blocking
-/// `flock` on `<support>/ottto-service.lock`. Production implements
-/// `SingleWriter` for #801's type once it lands; no lock is added here.
-struct StubStateDirLock {
-    dir: PathBuf,
-    _file: File,
-}
+/// #801's real lock: `StateDirLock` on the scratch state directory.
+use crate::locked_state_dir::LockedStateDir;
+use crate::state_dir_lock::StateDirLockError;
 
-#[derive(Debug, PartialEq, Eq)]
-enum StubLockError {
-    Held,
-}
-
-impl StubStateDirLock {
-    fn acquire(dir: &Path) -> Result<Self, StubLockError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(dir.join("ottto-service.lock"))
-            .expect("open lock file");
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(StubLockError::Held);
+/// Takes the lock after its previous holder was dropped. #801's lock is
+/// close-only (no `LOCK_UN`): the kernel releases it when every copy of its
+/// descriptor is closed, and a concurrently forked child can hold a copy
+/// until it execs. So this waits, bounded, instead of relying on the
+/// release happening at drop.
+fn acquire_released(dir: &Path) -> LockedStateDir {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match LockedStateDir::acquire(dir) {
+            Ok(lock) => return lock,
+            Err(StateDirLockError::Held { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("released lock still unavailable: {error:?}"),
         }
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            _file: file,
-        })
-    }
-}
-
-impl SingleWriter for StubStateDirLock {
-    fn state_dir(&self) -> &Path {
-        &self.dir
     }
 }
 
@@ -173,7 +154,7 @@ fn put_record(path: &Path, bytes: &[u8]) {
 #[test]
 fn envelope_round_trips_and_carries_no_path_or_raw_bytes() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{\"canary\":\"CANARY-HEAD-TEXT\"}\n");
     let mut store = scratch.store();
     let record = pending(
@@ -219,7 +200,7 @@ fn envelope_round_trips_and_carries_no_path_or_raw_bytes() {
 #[test]
 fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let index_path = scratch.index_path();
     let transcript = scratch.transcript("t.jsonl", b"{\"n\":1}\n");
     let mut index = ScanIndex::default();
@@ -344,7 +325,7 @@ fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
 #[test]
 fn every_binding_mismatch_refuses() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
     let mut store = scratch.store();
     let base = binding("acct", "scope", ("fp", None));
@@ -410,7 +391,7 @@ fn every_binding_mismatch_refuses() {
 #[test]
 fn interrupted_replacement_temp_present_keeps_the_old_record() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
     let mut store = scratch.store();
     let allowlist = placeholder_allowlist();
@@ -457,7 +438,7 @@ fn interrupted_replacement_temp_present_keeps_the_old_record() {
 #[test]
 fn interrupted_replacement_renamed_but_directory_not_synced() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
     let mut store = scratch.store();
     let allowlist = placeholder_allowlist();
@@ -510,7 +491,7 @@ fn set_version(bytes: &mut [u8], version: u16) {
 #[test]
 fn schema_both_ways_and_downgrade() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
     let mut store = scratch.store();
     let allowlist = placeholder_allowlist();
@@ -580,13 +561,13 @@ fn schema_both_ways_and_downgrade() {
 fn concurrent_writer_is_refused_through_the_single_writer_seam() {
     let scratch = Scratch::new();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
-    let first = StubStateDirLock::acquire(&scratch.root).unwrap();
-    assert_eq!(
-        StubStateDirLock::acquire(&scratch.root).err(),
-        Some(StubLockError::Held)
-    );
+    let first = LockedStateDir::acquire(&scratch.root).unwrap();
+    assert!(matches!(
+        LockedStateDir::acquire(&scratch.root),
+        Err(StateDirLockError::Held { .. })
+    ));
     let elsewhere = Scratch::new();
-    let foreign = StubStateDirLock::acquire(&elsewhere.root).unwrap();
+    let foreign = LockedStateDir::acquire(&elsewhere.root).unwrap();
     let mut store = scratch.store();
     let record = pending(
         binding("acct", "scope", ("fp", None)),
@@ -607,7 +588,7 @@ fn concurrent_writer_is_refused_through_the_single_writer_seam() {
         )
         .is_err());
     drop(first);
-    let second = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let second = acquire_released(&scratch.root);
     assert_eq!(
         store
             .write_after_save(&second, 1, vec![record])
@@ -622,7 +603,7 @@ fn concurrent_writer_is_refused_through_the_single_writer_seam() {
 #[test]
 fn only_dirty_records_are_written_in_bounded_batches() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{\"n\":1}\n");
     let certificate = certificate(&transcript);
     let mut store = scratch.store();
@@ -674,7 +655,7 @@ fn only_dirty_records_are_written_in_bounded_batches() {
 #[test]
 fn budget_refusal_writes_nothing_and_drops_the_stale_record() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
     let mut store = scratch.store();
     let b = binding("acct", "scope", ("fp", None));
@@ -701,7 +682,7 @@ fn budget_refusal_writes_nothing_and_drops_the_stale_record() {
 #[test]
 fn gc_drops_other_accounts_scopes_and_unkept_keys() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
     let mut store = scratch.store();
     let allowlist = placeholder_allowlist();
@@ -759,7 +740,7 @@ fn gc_drops_other_accounts_scopes_and_unkept_keys() {
 #[test]
 fn a_record_readable_by_others_is_refused() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
     let mut store = scratch.store();
     let b = binding("acct", "scope", ("fp", None));
@@ -896,7 +877,7 @@ fn certificate_ignores_ctime_and_refuses_content_changes() {
 #[test]
 fn certificate_survives_the_envelope() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let path = scratch.transcript("t.jsonl", b"{\"n\":1}\n");
     let mut cert = certificate(&path);
     cert.audit_debt_unix_seconds = Some(NOW + 60);
@@ -916,7 +897,7 @@ fn certificate_survives_the_envelope() {
 #[test]
 fn store_budget_receipt() {
     let scratch = Scratch::new();
-    let lock = StubStateDirLock::acquire(&scratch.root).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let path = scratch.transcript("t.jsonl", b"{\"n\":1}\n");
     let cert = certificate(&path);
     let mut store = scratch.store();

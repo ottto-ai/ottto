@@ -42,6 +42,8 @@ pub mod legacy_service;
 mod local_resource_diagnostics;
 #[cfg(unix)]
 mod local_state_sweep;
+#[cfg(unix)]
+pub mod locked_state_dir;
 pub mod macos_service;
 pub mod mcp_inventory;
 pub(crate) mod net_resilience;
