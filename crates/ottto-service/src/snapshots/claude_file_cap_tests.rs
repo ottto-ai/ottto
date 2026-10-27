@@ -378,3 +378,310 @@ fn large_claude_native_memory_and_append() {
         "no_resource_budget_inferred":true})
     );
 }
+
+// Drive the shipping cooperative scheduler with native scan frames, not a
+// reimplementation of candidate selection or a mocked parser. Refused parking
+// models an opaque/unaccountable frame; it grants no substitute positive bound.
+struct Rotation {
+    ready: Vec<(SnapshotSource, OwnedSourceScan)>,
+    completed: Vec<(SnapshotSource, ScanIndex, SourceScanResult)>,
+    starts: Vec<(PathBuf, Option<crate::transcript_acquisition::ReadMode>)>,
+    refuse_parking: bool,
+    refusals: std::cell::Cell<usize>,
+    started: std::time::Instant,
+}
+impl crate::source_rotation::Owner for Rotation {
+    type Source = SnapshotSource;
+    type Frame = OwnedSourceScan;
+    type Completed = (SnapshotSource, ScanIndex, SourceScanResult);
+    fn prepare(
+        &mut self,
+        source: SnapshotSource,
+        _: Option<usize>,
+    ) -> anyhow::Result<Option<Self::Frame>> {
+        Ok(self
+            .ready
+            .iter()
+            .position(|(s, _)| *s == source)
+            .map(|at| self.ready.remove(at).1))
+    }
+    fn validate(&mut self, _: &Self::Frame) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn step(
+        &mut self,
+        frame: Self::Frame,
+        _: Option<usize>,
+    ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
+        if let Some(active) = frame.active_file.as_deref() {
+            if active.parser.source_read_probe.is_some() {
+                self.starts.push((
+                    active.candidate.path.clone(),
+                    active.sampling.as_ref().map(|a| a.mode),
+                ));
+            }
+        }
+        let source = frame.source;
+        match frame.step(None) {
+            OwnedSourceScanStep::Pending(next) => crate::source_rotation::Step::Pending(next),
+            OwnedSourceScanStep::Complete { index, scan, .. } => {
+                crate::source_rotation::Step::Complete((source, index, scan))
+            }
+        }
+    }
+    fn bound(&self, frame: &Self::Frame, limit: usize) -> Option<usize> {
+        if self.refuse_parking {
+            self.refusals.set(self.refusals.get() + 1);
+            None
+        } else {
+            crate::heap_layout_bound::bound(frame, limit)
+        }
+    }
+    fn finish(&mut self, completed: Self::Completed, _: Option<usize>) -> anyhow::Result<()> {
+        self.completed.push(completed);
+        Ok(())
+    }
+    fn outcome(&mut self, _: SnapshotSource, result: anyhow::Result<()>) {
+        result.unwrap();
+    }
+    fn monotonic(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+}
+fn rotation_scan(
+    source: SnapshotSource,
+    root: &Path,
+    index: ScanIndex,
+    cache: &Arc<sampled_scan::SharedCache>,
+    hints: &[PathBuf],
+) -> OwnedSourceScan {
+    OwnedSourceScan::new(
+        source,
+        &[root.to_owned()],
+        index,
+        "2026-10-27T12:00:00Z",
+        BACKFILL_WINDOW_DAYS,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        false,
+        None,
+        hints,
+        false,
+        true,
+    )
+    .with_sampled_acquisition(
+        Arc::clone(cache),
+        crate::transcript_acquisition::Scope("large-full-scheduler".into()),
+    )
+}
+fn write_populated_large(path: &Path, session: &str) {
+    let mut out = BufWriter::new(File::create(path).unwrap());
+    let mut first = usage(0);
+    first["sessionId"] = json!(session);
+    first["requestId"] = json!(format!("req-{session}"));
+    first["message"]["id"] = json!(format!("msg-{session}"));
+    write_row(&mut out, &first);
+    // Actual JSON/text bytes, no sparse holes or invalid-zero padding. Keep
+    // the existing memory test's denser unique-request workload separately.
+    let mut row = serde_json::to_vec(&json!({"type":"user","sessionId":session,
+        "timestamp":AT,"message":{"role":"user","content":[{"type":"tool_result",
+        "tool_use_id":"tool-0","content":"Synthetic tool output. ".repeat(49152)}]}}))
+    .unwrap();
+    row.push(b'\n');
+    let mut bytes = first.to_string().len() as u64 + 1;
+    while bytes <= 256 * MIB {
+        out.write_all(&row).unwrap();
+        bytes += row.len() as u64;
+    }
+    out.flush().unwrap();
+    assert!(bytes > 256 * MIB && bytes < 258 * MIB);
+    assert_eq!(fs::metadata(path).unwrap().len(), bytes);
+}
+fn write_pi_progress(root: &Path, pass: usize) -> PathBuf {
+    let path = root.join(format!("pi-{pass}.jsonl"));
+    let mut out = File::create(&path).unwrap();
+    write_row(
+        &mut out,
+        &json!({"type":"session","id":format!("sibling-{pass}"),"timestamp":AT}),
+    );
+    write_row(
+        &mut out,
+        &json!({"type":"message","id":format!("message-{pass}"),"timestamp":AT,
+        "message":{"role":"assistant","model":"gpt-5.4","provider":"openai","api":"responses",
+        "content":[{"type":"text","text":"Synthetic sibling progress"}],"usage":{"input":12,"output":4}}}),
+    );
+    path
+}
+
+#[test]
+fn large_claude_fulls_rotate_with_sibling_and_audits() {
+    use crate::transcript_acquisition::{FullReason, ReadMode};
+    let claude = Fixture::new();
+    let pi = Fixture::new();
+    let large = (0..3)
+        .map(|n| {
+            let session = format!("019e2700-5555-7000-9000-{n:012}");
+            let path = claude.0.join(format!("{session}.jsonl"));
+            write_populated_large(&path, &session);
+            path
+        })
+        .collect::<Vec<_>>();
+    // These small files must all pass in the same initial pass, even after
+    // the large Full allowance has been spent.
+    let small = (3..6)
+        .map(|n| {
+            let session = format!("019e2700-5555-7000-9000-{n:012}");
+            let path = claude.0.join(format!("{session}.jsonl"));
+            let mut row = usage(n);
+            row["sessionId"] = json!(session);
+            fs::write(&path, format!("{row}\n")).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut pi_index = ScanIndex::default();
+    let mut read = BTreeSet::new();
+    let mut first_audit = None;
+    // Three first-admission passes, then three overdue-audit passes. Re-owe
+    // the first audit immediately and hint it: oldest deferrals still win.
+    for pass in 0..7 {
+        if pass == 3 {
+            assert_eq!(read.len(), 3);
+            for path in &large {
+                index
+                    .files
+                    .get_mut(&local_index_key(path))
+                    .unwrap()
+                    .set_unverified_deadline(1);
+            }
+            read.clear();
+        }
+        let hints = first_audit.iter().cloned().collect::<Vec<_>>();
+        let pi_path = write_pi_progress(&pi.0, pass);
+        let mut owner = Rotation {
+            ready: vec![
+                (
+                    SnapshotSource::ClaudeCode,
+                    rotation_scan(
+                        SnapshotSource::ClaudeCode,
+                        &claude.0,
+                        std::mem::take(&mut index),
+                        &cache,
+                        &hints,
+                    ),
+                ),
+                (
+                    SnapshotSource::Pi,
+                    rotation_scan(
+                        SnapshotSource::Pi,
+                        &pi.0,
+                        std::mem::take(&mut pi_index),
+                        &cache,
+                        &[],
+                    ),
+                ),
+            ],
+            completed: Vec::new(),
+            starts: Vec::new(),
+            // Exercise both ordinary bounded rotation and serial fallback.
+            refuse_parking: pass % 2 == 1,
+            refusals: std::cell::Cell::new(0),
+            started: std::time::Instant::now(),
+        };
+        let (_, acquisitions) = terminal_contract_retry::source_acquisitions(|| {
+            crate::source_rotation::run(
+                &mut owner,
+                &[SnapshotSource::ClaudeCode, SnapshotSource::Pi],
+                crate::source_rotation::PARKED_BUDGET,
+            );
+        });
+        assert_eq!(owner.completed.len(), 2, "both sources finish pass {pass}");
+        if owner.refuse_parking {
+            assert!(
+                owner.refusals.get() > 0,
+                "real scheduler attempted and refused parking"
+            );
+        }
+        let starts = owner
+            .starts
+            .iter()
+            .filter(|(path, _)| large.contains(path))
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 1, "exactly one large read in pass {pass}");
+        let (path, mode) = starts[0];
+        assert!(matches!(mode, Some(ReadMode::Full(_))));
+        if pass >= 3 {
+            assert_eq!(*mode, Some(ReadMode::Full(FullReason::AuditDue)));
+        }
+        if pass == 3 {
+            first_audit = Some(path.clone());
+        }
+        if pass < 6 {
+            assert!(
+                read.insert(path.clone()),
+                "oldest deferral wins over newly hinted audit in pass {pass}"
+            );
+        }
+        assert_eq!(acquisitions.get(path), Some(&1));
+        assert_eq!(
+            acquisitions.get(&pi_path),
+            Some(&1),
+            "Pi progresses on every pass"
+        );
+        for (source, mut next_index, mut scan) in owner.completed {
+            if source == SnapshotSource::ClaudeCode {
+                assert_eq!(scan.oversized_file_count, 0);
+                assert_eq!(scan.scanned_file_count, if pass == 0 { 4 } else { 1 });
+                for deferred in large.iter().filter(|p| !read.contains(*p)) {
+                    let key = local_index_key(deferred);
+                    if pass < 3 {
+                        assert!(
+                            !next_index.files.contains_key(&key),
+                            "deferred admission has no proof"
+                        );
+                        assert!(!next_index.file_snapshot_fingerprints.contains_key(&key));
+                    } else if pass < 6 {
+                        assert!(
+                            next_index.files[&key].audit_requires_full(sampled_scan::now_seconds()),
+                            "unread audit debt survives"
+                        );
+                    }
+                    if pass < 2 || (3..6).contains(&pass) {
+                        assert!(!acquisitions.contains_key(deferred));
+                    }
+                }
+                if pass == 0 {
+                    for path in &small {
+                        assert_eq!(acquisitions.get(path), Some(&1));
+                    }
+                }
+                if matches!(pass, 0 | 1 | 3 | 4 | 5) {
+                    assert!(!scan.census_complete);
+                    assert!(scan.scan_cap_hit);
+                    assert!(
+                        scan.skipped_file_count_due_to_limit > 0,
+                        "debt stays visible"
+                    );
+                }
+                finalize_scan_after_policy(source, &mut scan, &mut next_index);
+                // Exercise the same persisted scheduling order after restart.
+                index = serde_json::from_slice(&serde_json::to_vec(&next_index).unwrap()).unwrap();
+            } else {
+                assert_eq!(source, SnapshotSource::Pi);
+                assert_eq!(scan.scanned_file_count, 1);
+                assert_eq!(scan.snapshots.len(), 1);
+                assert_eq!(scan.snapshots[0].input_tokens, 12);
+                finalize_scan_after_policy(source, &mut scan, &mut next_index);
+                pi_index = next_index;
+            }
+        }
+        if pass == 3 {
+            index
+                .files
+                .get_mut(&local_index_key(first_audit.as_ref().unwrap()))
+                .unwrap()
+                .set_unverified_deadline(1);
+        }
+        println!("claude_large_full_scheduler_receipt: pass={pass} large_fulls=1 pi_reads=1 parking_refused={}", owner.refusals.get() > 0);
+    }
+}

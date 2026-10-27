@@ -7,9 +7,17 @@ A shrink below the relevant source threshold requires a successful native read
 before new read authority can be recorded.
 
 This interim admission change preserves all Full audits, reproof, rearm,
-cache admission and retry behavior. A selected Claude file without a retained
+cache admission and retry semantics. A selected Claude file without a retained
 native reduction can still require another Full read. The file limit does not
 bound native reduction memory or promise tail-only processing.
+
+Each Claude pass admits at most one Full read above 256 MiB, including first
+admission, audits and recovery reads. Other large Full candidates stay pending
+census debt and receive priority in oldest-deferral order on subsequent passes,
+including after restart. They contribute no read count or new source proof;
+pending debt remains visible through existing scan-cap/skipped-file counters
+and withholds census completeness. Tail reads and files at or below 256 MiB
+keep their existing admission. The oversized path still runs before this gate.
 
 The `large_claude_native_memory_and_append` regression creates synthetic
 200 MiB and 400 MiB transcripts containing unique usage-bearing responses,
