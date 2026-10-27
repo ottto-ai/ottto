@@ -903,9 +903,11 @@ mod durable_restart {
             .map_or(0, |(counters, _)| counters.restored)
     }
 
-    /// The pass's index after the scan's own post-policy finalization, and
-    /// the transcript's snapshot fingerprints in it: the hold set local-hold
-    /// settlement takes.
+    /// The pass's index after the scan's own post-policy finalization, with
+    /// the transcript's page entity held: the hold set local-hold settlement
+    /// takes. The fixture's history gate may keep its body off the page, so
+    /// the finalizer's record of the held entity is written here, as in
+    /// `authority_proof_correction_tests`.
     fn finalized_with_holds(mut run: Run, key: &str) -> (ScanIndex, BTreeSet<String>) {
         finalize_scan_after_policy_with_body_witness(
             SOURCE,
@@ -913,15 +915,16 @@ mod durable_restart {
             &mut run.index,
             snapshot_upload_body_witness,
         );
-        let mut held = run
-            .index
+        let entity = format!(
+            "held-entity:{}",
+            run.index.files[key].source_file_fingerprint
+        );
+        run.index
             .file_snapshot_fingerprints
-            .get(key)
-            .cloned()
-            .unwrap_or_default();
-        held.extend(run.index.files[key].last_snapshot_fingerprint.clone());
-        assert!(!held.is_empty(), "the transcript produced snapshots");
-        (run.index, held)
+            .entry(key.to_owned())
+            .or_default()
+            .insert(entity.clone());
+        (run.index, BTreeSet::from([entity]))
     }
 
     fn transcript_key(f: &Fixture, index: &ScanIndex) -> String {
