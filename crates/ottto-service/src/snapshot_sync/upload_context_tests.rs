@@ -27,7 +27,8 @@ fn durable_ack_before_index_crash_partial_error_retry_binds_selected_context() {
                     &snapshot_upload_body_witness(item),
                 );
             } else if outcome == "one-quarantined" {
-                let mut record = snapshot_quarantine_record(SnapshotSource::Codex);
+                let mut record =
+                    crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex);
                 record.upload_body_witness = Some(snapshot_upload_body_witness(item));
                 progress
                     .quarantined_fingerprints

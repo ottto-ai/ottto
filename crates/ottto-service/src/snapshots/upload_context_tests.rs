@@ -17,6 +17,54 @@ fn candidate(key: &str) -> CandidateFile {
     }
 }
 
+fn empty_scan(source: SnapshotSource) -> SourceScanResult {
+    SourceScanResult {
+        source,
+        backfill_window_days: 0,
+        backfill_file_limit: 0,
+        discovered_file_count: 0,
+        skipped_file_count_due_to_limit: 0,
+        scan_cap_hit: false,
+        scanned_file_count: 0,
+        scanned_session_count: 0,
+        semantic_noop_count: 0,
+        census_complete: false,
+        census_window_end: "2026-10-06T12:00:00Z".into(),
+        state_census_complete: false,
+        sidecar_census_complete: false,
+        symlink_rejected_count: 0,
+        directory_entry_cap_exceeded_count: 0,
+        unreadable_path_count: 0,
+        oversized_file_count: 0,
+        disappeared_file_count: 0,
+        malformed_json_line_count: 0,
+        invalid_utf8_line_count: 0,
+        over_line_cap_count: 0,
+        recognized_usage_drop_count: 0,
+        ownership_incomplete_file_count: 0,
+        zero_snapshot_confirmed_count: 0,
+        zero_snapshot_usage_evidence_count: 0,
+        dropped_usage_record_count: 0,
+        terminal_ownership_incomplete_file_count: 0,
+        terminal_zero_snapshot_usage_evidence_count: 0,
+        terminal_recognized_usage_drop_count: 0,
+        terminal_dropped_usage_record_count: 0,
+        terminal_over_line_cap_count: 0,
+        census_residue_index_key_count: 0,
+        census_residue_archived_rollout_count: 0,
+        census_residue_blocked_session_count: 0,
+        snapshots: Vec::new(),
+        pending_finalization: Vec::new(),
+        local_codex_diagnostics: None,
+        codex_counting_v2: None,
+        codex_join_validation: None,
+        codex_legacy_join_baselines: Vec::new(),
+        claude_request_census_shadow: None,
+        continuation_ticket: None,
+        continuation_committed: false,
+    }
+}
+
 pub(crate) fn project(
     index: &mut ScanIndex,
     source: SnapshotSource,
@@ -24,7 +72,7 @@ pub(crate) fn project(
     empty: bool,
 ) -> SourceScanResult {
     let file = candidate(key);
-    let mut scan = SourceScanResult::default();
+    let mut scan = empty_scan(source);
     if !empty {
         for ordinal in 0..2 {
             let mut item = cache_adapter_tests::cache_fixture_item();
@@ -290,6 +338,7 @@ fn legacy_context_inherits_persisted_acceptance_once_and_prunes_at_save() {
     assert_eq!(loaded.upload_contexts.as_ref().unwrap().len(), 1);
     let mut replay = loaded;
     replay.prepare_historical_replay("replay".into());
+    assert!(replay.files.contains_key("/synthetic/held.jsonl"));
     assert!(replay
         .files
         .values()
@@ -316,7 +365,8 @@ fn record_and_migrate_carry_context_without_normalizing_legacy() {
     assert_context(&index, key, Some("A"));
     assert!(!index.files[key].codex_counting_v2);
     // A state-only row has no pending file finalization, hence no marker.
-    let mut state_only = SourceScanResult::default();
+    let mut state_only = empty_scan(SnapshotSource::Codex);
+    state_only.state_census_complete = true;
     let mut item = cache_adapter_tests::cache_fixture_item();
     item.source_file_fingerprint = None;
     item.provenance.collector = "codex_state_sqlite".into();
@@ -330,5 +380,6 @@ fn record_and_migrate_carry_context_without_normalizing_legacy() {
         &BTreeSet::new(),
     );
     assert_eq!(index.files.len(), before);
+    assert_eq!(index.codex_state_only_snapshot_fingerprints.len(), 1);
     assert_context(&index, key, Some("A"));
 }

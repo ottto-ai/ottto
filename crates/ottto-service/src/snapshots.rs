@@ -42978,15 +42978,14 @@ impl ScanIndex {
 
     fn upload_context_held(&self, key: &str, source: &str) -> bool {
         self.decode_holds_file(key)
+            || self.claude_account_deferred_holds.contains_key(key)
             || self
                 .effective_upload_body_witness_revision_excluded_source_files
                 .contains(source)
             || self.claude_history_emission_held(source).is_some()
             || self.claude_history_emission.literal_denied(source)
-            || claude_index_path_family_member(Path::new(key)).is_some_and(|(root, _)| {
-                self.claude_usage_authority_quarantine.contains_key(&root)
-                    || self.claude_account_deferred_holds.contains_key(&root)
-            })
+            || claude_index_path_family_member(Path::new(key))
+                .is_some_and(|(root, _)| self.claude_usage_authority_quarantine.contains_key(&root))
     }
 
     fn migrate_upload_contexts(&mut self) {
