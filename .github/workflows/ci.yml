@@ -343,8 +343,19 @@ jobs:
           set -euo pipefail
           export OTTTO_E2_BENCH_ROOT="$RUNNER_TEMP/e2-bench"
           test_name="$(cat "$RUNNER_TEMP/e2-test-name.txt")"
+          run_w1_before() {
+            local round="$1"
+            OTTTO_E2_BENCH_MODE=arm OTTTO_E2_BENCH_ARM=on OTTTO_E2_BENCH_TAG="w1-before-$round" \
+              OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/e2-w1-before-$round.json" \
+              "$RUNNER_TEMP/bench-w1-before" "$test_name" --exact --ignored --nocapture --test-threads 1 2>&1 \
+              | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
+            rm -rf "$OTTTO_E2_BENCH_ROOT/runs/w1-before-$round"
+          }
           run_arm() {
             local arm="$1" round="$2" bin="$RUNNER_TEMP/bench-candidate"
+            # Counterbalance the matched main/on pair as well as the
+            # canonical arm order, without adding any measured runs.
+            if [ "$arm" = on ] && [ $((round % 2)) -eq 1 ]; then run_w1_before "$round"; fi
             [ "$arm" = reference ] && bin="$RUNNER_TEMP/bench-reference"
             # Each run is a fresh process with an empty state directory; the
             # corpus is shared and restored after the largest-file appends.
@@ -354,13 +365,7 @@ jobs:
               | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
             rm -rf "$OTTTO_E2_BENCH_ROOT/runs/$arm-$round"
             if [ "$arm" = on ]; then
-              for stage in before; do
-                OTTTO_E2_BENCH_MODE=arm OTTTO_E2_BENCH_ARM=on OTTTO_E2_BENCH_TAG="w1-$stage-$round" \
-                  OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/e2-w1-$stage-$round.json" \
-                  "$RUNNER_TEMP/bench-w1-$stage" "$test_name" --exact --ignored --nocapture --test-threads 1 2>&1 \
-                  | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
-                rm -rf "$OTTTO_E2_BENCH_ROOT/runs/w1-$stage-$round"
-              done
+              if [ $((round % 2)) -eq 0 ]; then run_w1_before "$round"; fi
               python3 - "$RUNNER_TEMP" "$round" <<'PYPARITY'
           import json,pathlib,sys
           root=pathlib.Path(sys.argv[1]); n=sys.argv[2]
