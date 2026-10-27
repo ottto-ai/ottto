@@ -480,13 +480,17 @@ crate::heap_layout_bound::fields!(ClaudeBlob; parts, unmeasurable, config_digest
 crate::durable_tail_codec::durable_struct!(ClaudeBlob {
     N parts: [u64; PARTS],
     N unmeasurable: bool,
-    H config_digest: Option<ConfigDigest>,
+    // A reversible rolling digest of instruction text (F1): content, never
+    // stored; re-derived with the opening content and hash-verified.
+    X config_digest: Option<ConfigDigest>,
 });
 crate::heap_layout_bound::fields!(ConfigDigest; a, b, len);
+// Not a cryptographic digest: its state reverses to short instruction text,
+// so it is content (X) everywhere and cannot be classed H (no `HDigest`).
 crate::durable_tail_codec::durable_struct!(ConfigDigest {
-    H a: u64,
-    H b: u64,
-    N len: u64,
+    X a: u64,
+    X b: u64,
+    X len: u64,
 });
 crate::heap_layout_bound::fields!(OpeningCall; response, tool, candidates, files, answered, truncated);
 crate::durable_tail_codec::durable_struct!(OpeningCall {
@@ -522,7 +526,7 @@ crate::durable_tail_codec::durable_struct!(SessionStartState {
     N parts_closed: bool,
     N parts_unmeasurable: bool,
     N codex_tools_logged: bool,
-    H config_digest: Option<ConfigDigest>,
+    X config_digest: Option<ConfigDigest>,
     L claude_shape: Option<(String, u64, u64)>,
     L claude_blobs: BTreeMap<String, ClaudeBlob>,
     N memory_units: Option<u64>,
@@ -593,7 +597,15 @@ impl SessionStartState {
         bound: u64,
     ) -> Result<Option<([u8; 32], u64)>, crate::durable_tail_codec::Refuse> {
         use crate::durable_tail_codec::Refuse;
-        if self.instructions.is_none() && self.codex_prelude.is_none() && self.files.is_empty() {
+        if self.instructions.is_none()
+            && self.codex_prelude.is_none()
+            && self.files.is_empty()
+            && self.config_digest.is_none()
+            && self
+                .claude_blobs
+                .values()
+                .all(|blob| blob.config_digest.is_none())
+        {
             return Ok(None);
         }
         let end = self
@@ -609,10 +621,16 @@ impl SessionStartState {
         &self,
     ) -> Result<[u8; 32], crate::durable_tail_codec::Refuse> {
         use crate::durable_tail_codec::{Durable, Enc};
-        let mut e = Enc::hash("ottto-dt-rederive:session_start:v1");
+        let mut e = Enc::hash("ottto-dt-rederive:session_start:v2");
         self.instructions.put(&mut e)?;
         self.codex_prelude.put(&mut e)?;
         self.files.put(&mut e)?;
+        self.config_digest.put(&mut e)?;
+        // The blobs' own digests, by key (their keys and parts are stored).
+        e.varint(self.claude_blobs.len() as u64)?;
+        for blob in self.claude_blobs.values() {
+            blob.config_digest.put(&mut e)?;
+        }
         Ok(e.finish_hash())
     }
 
@@ -621,6 +639,13 @@ impl SessionStartState {
         self.instructions = from.instructions.take();
         self.codex_prelude = from.codex_prelude.take();
         self.files = std::mem::take(&mut from.files);
+        self.config_digest = from.config_digest.take();
+        for (key, blob) in &mut self.claude_blobs {
+            blob.config_digest = from
+                .claude_blobs
+                .get_mut(key)
+                .and_then(|from| from.config_digest.take());
+        }
     }
 
     /// Where the opening content is final (`content_end`), when known.
@@ -3214,6 +3239,85 @@ mod tests {
                 quantile(&mut total.wire, 0.5),
                 quantile(&mut total.wire, 1.0),
             );
+        }
+    }
+
+    /// F1: `ConfigDigest` is a reversible rolling digest of instruction text,
+    /// so it is content (`X`) on both sources: an encoded record carries none
+    /// of its state (the body equals the body of the same state with every
+    /// config digest cleared), a decoded record has none, and the head
+    /// re-parse brings it back so the content hash verifies.
+    #[test]
+    fn config_digest_is_content_and_never_reaches_a_record_body() {
+        use crate::durable_tail_codec::{Dec, Durable, Enc};
+        let claude = || {
+            let mut state = SessionStartState::default();
+            for line in claude_fixture_lines().iter().take(6) {
+                state.observe_claude_line(line, 0, Some(Path::new("/w/repo")));
+            }
+            state
+        };
+        let codex = || {
+            let mut state = SessionStartState::default();
+            state.observe_codex_line(
+                &codex_message(
+                    "user",
+                    &[(
+                        codex_prelude_footprint::AGENTS_MD_KIND,
+                        "# AGENTS.md instructions for /w/repo\n\n<INSTRUCTIONS>\nSECRET_RULES\n</INSTRUCTIONS>",
+                    )],
+                ),
+                None,
+            );
+            state
+        };
+        let body = |state: &SessionStartState| {
+            let mut e = Enc::bytes(1 << 20);
+            state.put(&mut e).unwrap();
+            e.into_bytes()
+        };
+        let build: [(&str, &dyn Fn() -> SessionStartState); 2] =
+            [("claude", &claude), ("codex", &codex)];
+        for (name, build) in build {
+            let state = build();
+            let digest = state
+                .config_digest
+                .unwrap_or_else(|| panic!("{name}: instruction text folds a config digest"));
+            let recorded = state.durable_content_hash().unwrap();
+            let encoded = body(&state);
+            for word in [digest.a, digest.b] {
+                assert!(
+                    !encoded.windows(8).any(|w| w == word.to_le_bytes()),
+                    "{name}: a config digest word reached the body"
+                );
+            }
+            assert!(
+                !encoded.windows(12).any(|w| w == b"SECRET_RULES")
+                    && !encoded.windows(10).any(|w| w == b"guide.md f"),
+                "{name}: instruction text reached the body"
+            );
+            let mut cleared = state.clone();
+            cleared.config_digest = None;
+            for blob in cleared.claude_blobs.values_mut() {
+                blob.config_digest = None;
+            }
+            assert_eq!(body(&cleared), encoded, "{name}");
+            let mut decoded = SessionStartState::take(&mut Dec::new(&encoded)).unwrap();
+            assert!(decoded.config_digest.is_none(), "{name}");
+            assert!(
+                decoded
+                    .claude_blobs
+                    .values()
+                    .all(|blob| blob.config_digest.is_none()),
+                "{name}"
+            );
+            decoded.adopt_durable_content(&mut build());
+            assert_eq!(
+                decoded.config_digest.map(ConfigDigest::to_bytes),
+                Some(digest.to_bytes()),
+                "{name}"
+            );
+            assert_eq!(decoded.durable_content_hash().unwrap(), recorded, "{name}");
         }
     }
 }

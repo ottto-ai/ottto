@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::super::*;
 use super::SharedCache;
@@ -44,6 +45,18 @@ pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper bound of both stores' resident digest maps (two sources).
 pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 128;
+
+/// Head re-parse bytes of restores, per source, for the process lifetime.
+/// The re-parse bypasses the reread guard (bounded at `HEAD_BOUND`, on a RAM
+/// miss only), so the census pass line reports it beside the guard's own
+/// counters (SOURCE N1).
+static REDERIVE_HEAD_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
+    durable_source(source).map_or(0, |source| {
+        REDERIVE_HEAD_BYTES[source as usize].load(Ordering::Relaxed)
+    })
+}
 
 /// Content-free outcome counts, by class. Field paths are static names; no
 /// id, path or value is ever counted.
@@ -68,6 +81,9 @@ pub(crate) struct Counters {
     /// state-directory lock (not the daemon).
     pub(crate) write_unlocked: u64,
     pub(crate) peak_body_bytes: u64,
+    /// GC's largest keep map: index keys with a record on disk, at most the
+    /// store's `INVENTORY_BOUND`, whatever the index size.
+    pub(crate) gc_keep_peak: u64,
 }
 
 impl Counters {
@@ -93,7 +109,8 @@ impl Counters {
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} refused{{corrupt:{},newer:{},older:{},allowlist:{},unusable:{}}} \
              unusable{{errno:{},mode:{},shape:{}}} \
-             gc_records_deleted={} peak_codec_bytes={}",
+             gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
+             records_invalidated={} peak_codec_bytes={}",
             source.api_slug(),
             self.restore_attempts,
             self.restored,
@@ -127,6 +144,10 @@ impl Counters {
             store.unusable_mode,
             store.unusable_shape,
             store.gc_records_deleted,
+            store.gc_records_read,
+            store.gc_bytes_read,
+            self.gc_keep_peak,
+            store.records_invalidated,
             store.peak_codec_bytes,
         )
     }
@@ -150,6 +171,11 @@ pub(crate) struct Stores {
     codex: Option<Slot>,
     /// Keys admitted to the RAM cache since their source's last write.
     touched: BTreeSet<String>,
+    /// Selection provenance: the source-file fingerprint each admitted
+    /// reduction was acquired for. A write binds a reduction only to a
+    /// committed entry with this same fingerprint; local-hold settlement that
+    /// reverts or clears the entry makes it refuse (F2).
+    selected: BTreeMap<String, String>,
     counters: Counters,
 }
 
@@ -292,7 +318,7 @@ fn certificate_at(key: &str, checkpoint: &Checkpoint) -> Option<DurableCertifica
 
 fn refuse_class(refuse: Refuse) -> &'static str {
     match refuse {
-        Refuse::NonEmpty(field) | Refuse::NotRederivable(field) => field,
+        Refuse::NonEmpty(field) | Refuse::NotRederivable(field) | Refuse::NotDigest(field) => field,
         Refuse::UnknownLabel => "static_label",
         Refuse::TooLarge => "record_bytes",
     }
@@ -355,6 +381,16 @@ impl SharedCache {
         let record = {
             let mut stores = self.durable()?;
             stores.counters.restore_attempts += 1;
+            // A cleared fingerprint is reparse debt (a held or reverted
+            // selection): it always reads Full.
+            if index
+                .files
+                .get(key)
+                .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+            {
+                Counters::bump(&mut stores.counters.ineligible, "selection_cleared");
+                return None;
+            }
             let outcome = match stores.slot(source).as_mut() {
                 Some(slot) => slot.store.read(&expected.binding.key, &allowlist),
                 None => return None,
@@ -394,6 +430,7 @@ impl SharedCache {
             }
         };
         stores.counters.rederive_head_bytes += receipt.head_bytes;
+        REDERIVE_HEAD_BYTES[source as usize].fetch_add(receipt.head_bytes, Ordering::Relaxed);
         stores.counters.rederive_named_lines += receipt.named_lines;
         stores.counters.rederive_line_bytes += receipt.line_bytes;
         drop(stores);
@@ -464,6 +501,18 @@ impl SharedCache {
         }
     }
 
+    /// Records the selection `key`'s admitted reduction was acquired for:
+    /// the scanned source-file fingerprint the scan wrote into its entry.
+    pub(crate) fn durable_note_selection(&self, key: &str, source_file_fingerprint: &str) {
+        if let Some(mut stores) = self.durable() {
+            if stores.selected.len() < store::MAX_RECORDS * 2 || stores.selected.contains_key(key) {
+                stores
+                    .selected
+                    .insert(key.to_string(), source_file_fingerprint.to_string());
+            }
+        }
+    }
+
     /// Marks `key` admitted this pass: a write candidate after the next save.
     pub(super) fn durable_touch(&self, key: &str) {
         if let Some(mut stores) = self.durable() {
@@ -486,11 +535,16 @@ impl SharedCache {
     ) -> Option<store::BatchReceipt> {
         let source = durable_source(snapshot_source)?;
         let allowlist = codec::allowlist_digest(snapshot_source);
-        let (touched, namespace, identity_capture) = {
+        let (touched, mut selected, namespace, identity_capture) = {
             let mut stores = self.durable()?;
             let slot = stores.slot(source).as_ref()?;
             let pass = (slot.namespace.clone(), slot.identity_capture);
-            (std::mem::take(&mut stores.touched), pass.0, pass.1)
+            (
+                std::mem::take(&mut stores.touched),
+                std::mem::take(&mut stores.selected),
+                pass.0,
+                pass.1,
+            )
         };
         let namespace = &namespace;
         let mut pending = Vec::new();
@@ -498,16 +552,37 @@ impl SharedCache {
         let mut later = BTreeSet::new();
         let mut budget = WRITE_PASS_BYTES;
         let mut not_persisted = Vec::new();
+        let mut invalidate = BTreeSet::new();
         let mut peak = 0_u64;
         {
             let cache = self.retained().ok()?;
             for key in touched {
                 let Some(retained) = cache.peek(&key) else {
+                    selected.remove(&key);
                     continue;
                 };
                 if retained.state.source() != snapshot_source {
                     later.insert(key);
                     continue;
+                }
+                // Selection provenance: only a reduction acquired for the
+                // committed entry's own fingerprint binds to it. A held or
+                // reverted entry (local-hold settlement restored the prior
+                // entry or cleared its fingerprint), or a RAM reduction ahead
+                // of the saved selection, refuses, and any older record for
+                // the key is invalidated: it must never restore.
+                let acquired_for = selected.remove(&key);
+                match index.files.get(&key) {
+                    None => continue,
+                    Some(entry)
+                        if !entry.source_file_fingerprint.is_empty()
+                            && acquired_for.as_deref()
+                                == Some(entry.source_file_fingerprint.as_str()) => {}
+                    Some(_) => {
+                        invalidate.insert(store::key_digest(source, &key));
+                        not_persisted.push("selection");
+                        continue;
+                    }
                 }
                 let interpretation =
                     Interpretation::of(snapshot_source, &key, index, identity_capture, namespace);
@@ -555,6 +630,12 @@ impl SharedCache {
         }
         let mut stores = self.durable()?;
         let deferred = later.len() as u64;
+        // Deferred keys keep their provenance for the next save.
+        for key in &later {
+            if let Some(fingerprint) = selected.remove(key) {
+                stores.selected.insert(key.clone(), fingerprint);
+            }
+        }
         stores.touched.extend(later);
         let counters = &mut stores.counters;
         counters.write_deferred += deferred;
@@ -563,6 +644,9 @@ impl SharedCache {
             Counters::bump(&mut counters.not_persisted, class);
         }
         let slot = stores.slot(source).as_mut()?;
+        if !invalidate.is_empty() {
+            let _ = slot.store.remove_keys(writer, &invalidate);
+        }
         let receipt = slot
             .store
             .write_after_save(writer, index.generation, pending)
@@ -570,6 +654,11 @@ impl SharedCache {
         // Records past the batch limit are offered again after the next save.
         for key in &receipt.deferred_keys {
             if let Some(key) = offered.remove(key) {
+                if let Some(entry) = index.files.get(&key) {
+                    stores
+                        .selected
+                        .insert(key.clone(), entry.source_file_fingerprint.clone());
+                }
                 stores.touched.insert(key);
             }
         }
@@ -599,16 +688,34 @@ impl SharedCache {
             &namespace.0,
             index.active_upload_context_fingerprint.as_deref(),
         );
+        // Only keys with a record on disk (at most `INVENTORY_BOUND`) are
+        // looked up; the index is streamed, never copied.
+        let inventory = slot.store.inventory()?;
         let mut keep = BTreeMap::new();
-        for key in index.files.keys() {
-            let scope = slot.decided.get(key).and_then(|scope| {
-                let interpretation =
-                    Interpretation::of(snapshot_source, key, index, identity_capture, namespace);
-                expected(source, snapshot_source, key, scope, index, &interpretation)
-                    .map(|expected| expected.binding.scope)
-            });
-            keep.insert(store::key_digest(source, key), scope);
+        if !inventory.is_empty() {
+            for key in index.files.keys() {
+                let digest = store::key_digest(source, key);
+                if !inventory.contains(&digest) {
+                    continue;
+                }
+                let scope = slot.decided.get(key).and_then(|scope| {
+                    let interpretation = Interpretation::of(
+                        snapshot_source,
+                        key,
+                        index,
+                        identity_capture,
+                        namespace,
+                    );
+                    expected(source, snapshot_source, key, scope, index, &interpretation)
+                        .map(|expected| expected.binding.scope)
+                });
+                keep.insert(digest, scope);
+            }
         }
+        stores.counters.gc_keep_peak = stores.counters.gc_keep_peak.max(keep.len() as u64);
+        let Some(slot) = stores.slot(source).as_mut() else {
+            return Ok(());
+        };
         slot.store.gc(writer, &context, &allowlist, &keep)
     }
 
@@ -639,6 +746,7 @@ impl SharedCache {
         }
         if let Some(mut stores) = self.durable() {
             stores.touched.clear();
+            stores.selected.clear();
             stores.counters.write_unlocked += 1;
         }
     }
@@ -662,3 +770,7 @@ enum Failure {
     Corrupt,
     NotRederived(Refuse),
 }
+
+#[cfg(test)]
+#[path = "durable_tail_tests.rs"]
+mod tests;

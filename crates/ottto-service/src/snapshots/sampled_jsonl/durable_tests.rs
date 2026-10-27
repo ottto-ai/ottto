@@ -82,13 +82,54 @@ fn full_read(path: &Path, source: SnapshotSource) -> (CachedJsonlReduction, Chec
     (reduction, checkpoint)
 }
 
-/// The finished upload items of a parser that read to completion.
+/// The finished upload items of a parser that read to completion. Claude
+/// finishes with the money context the scan passes (the E2 fold's read
+/// context over an index holding the file), so the money fold is compared
+/// too.
 fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value {
     let identity = opened_object_identity(source, &mut File::open(path).unwrap()).unwrap();
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        local_index_key(path),
+        serde_json::from_value(
+            json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"}),
+        )
+        .unwrap(),
+    );
+    let twins = Default::default();
+    let money =
+        (source == SnapshotSource::ClaudeCode).then(|| claude_request_money::e2::ReadContext {
+            index: &index,
+            path,
+            twins: &twins,
+        });
     let parsed = parser
-        .finish(&identity, path, COLLECTED, "fp".into(), None, None, None)
+        .finish_with_repository_identity(
+            &identity,
+            path,
+            COLLECTED,
+            "fp".into(),
+            None,
+            None,
+            None,
+            None,
+            money,
+        )
         .unwrap();
-    serde_json::to_value(&parsed.snapshots).unwrap()
+    // The fold is not serialized (`serde(skip)`): compare its entity body.
+    let money = parsed
+        .snapshots
+        .iter()
+        .map(|item| {
+            item.claude_money
+                .as_deref()
+                .map(|fold| format!("{:?}", fold.entity))
+        })
+        .collect::<Vec<_>>();
+    if source == SnapshotSource::ClaudeCode {
+        assert!(money.iter().all(Option::is_some), "the money fold ran");
+    }
+    json!({"items": serde_json::to_value(&parsed.snapshots).unwrap(), "money": money})
 }
 
 /// The unsampled native oracle: a plain cold parse, no acquisition.
@@ -204,6 +245,14 @@ fn codex_lines() -> Vec<String> {
             "call_id":"call_CANARYL1cx","output":"CANARY_OUT_cx"}}),
         json!({"type":"event_msg","timestamp":at,
             "payload":{"type":"thread_name_updated","thread_name":"CANARY_TITLE_cx"}}),
+        // Open at the seal: a call and an MCP call with no output yet, so
+        // both call maps hold ids when the record is written.
+        json!({"type":"response_item","timestamp":at,"payload":{"type":"function_call",
+            "name":"shell","arguments":"{\"command\":[\"echo\",\"CANARY_OPEN_cx\"]}",
+            "call_id":"call_CANARYL2cx"}}),
+        json!({"type":"response_item","timestamp":at,"payload":{"type":"function_call",
+            "namespace":"mcp__canarysrv","name":"mcp__canarysrv__lookup",
+            "arguments":"{\"q\":\"CANARY_MCPARGS_cx\"}","call_id":"call_CANARYL3cx"}}),
         json!({"type":"event_msg","timestamp":"2026-10-20T10:00:01Z","payload":{"type":"token_count",
             "info":{"last_token_usage":codex_usage(100),"total_token_usage":codex_usage(100)}}}),
         json!({"type":"event_msg","timestamp":"2026-10-20T10:00:02Z",
@@ -231,44 +280,189 @@ fn codex_append() -> Vec<String> {
     .collect()
 }
 
+/// Private instruction text (Claude instructions attachment and its
+/// request-1 blob), around a plain session.
+fn claude_instruction_lines(secret: &str) -> Vec<String> {
+    let mut lines = vec![
+        json!({"type":"attachment","sessionId":CLAUDE_SESSION,"uuid":"a-1",
+        "timestamp":"2026-10-20T10:00:00Z","attachment":{"type":"instructions","files":[
+            {"type":"Project","content":format!("Project rules: {secret}")}]}})
+        .to_string(),
+    ];
+    let mut session = claude_lines(2, 2);
+    let request = [
+        json!({"type":"api-request-shape","sessionId":CLAUDE_SESSION,"shapeHash":"shape-dt",
+            "shape":{"system":[{"type":"text","text":"You are Claude."}],"tools":[{"name":"Bash"}]}}),
+        json!({"type":"api-request-blob","sessionId":CLAUDE_SESSION,"hash":"blob-dt",
+            "message":{"role":"user","content":[
+                {"type":"text","text":format!(
+                    "<system-reminder>\nCodebase and user instructions Project rules: {secret}")},
+                {"type":"text","text":"CANARY_PROMPT_dt please review"}]}}),
+        json!({"type":"api-request","sessionId":CLAUDE_SESSION,"shapeHash":"shape-dt",
+            "tail":["blob-dt"]}),
+    ];
+    // Before the first assistant line (two fillers, the prompt, two fillers).
+    session.splice(5..5, request.iter().map(Value::to_string));
+    lines.extend(session);
+    lines
+}
+
+/// Private AGENTS.md text, injected as a labeled request-1 user block.
+fn codex_instruction_lines(secret: &str) -> Vec<String> {
+    let mut lines = codex_lines();
+    lines.insert(
+        2,
+        json!({"type":"response_item","timestamp":"2026-10-20T10:00:00Z","payload":{
+            "type":"message","role":"user","content":[{"type":"input_text","text":format!(
+                "# AGENTS.md instructions for /tmp/CANARY_CWD_cx\n\n<INSTRUCTIONS>\n{secret}\n</INSTRUCTIONS>")}],
+            "internal_chat_message_metadata_passthrough":{
+                "content_item_kinds":[crate::codex_prelude_footprint::AGENTS_MD_KIND]}}})
+        .to_string(),
+    );
+    lines
+}
+
+const CANARY_EMAIL: &str = "canary.person@example-org.test";
+const CANARY_ORG: &str = "6a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+
+/// An email context and an org marker ahead of a plain session.
+fn claude_org_lines() -> Vec<String> {
+    let mut lines = vec![
+        json!({"type":"attachment","sessionId":CLAUDE_SESSION,"uuid":"a-1",
+            "timestamp":"2026-10-20T10:00:00Z",
+            "attachment":{"type":"session_context","context":{"userEmail":CANARY_EMAIL}}})
+        .to_string(),
+        json!({"type":"attachment","sessionId":CLAUDE_SESSION,"uuid":"a-2",
+            "timestamp":"2026-10-20T10:00:00Z",
+            "attachment":{"type":"credential_org","organizationUuid":CANARY_ORG}})
+        .to_string(),
+    ];
+    lines.extend(claude_lines(2, 2));
+    lines
+}
+
 struct Case {
     source: SnapshotSource,
     lines: Vec<String>,
     appended: Vec<String>,
     content: &'static [&'static str],
     provider_ids: &'static [&'static str],
+    /// Provider ids the sealed reduction still holds: each must be in the
+    /// body, inside its own leaf `L` field.
+    survivors: &'static [&'static str],
 }
 
+const CLAUDE_CONTENT: [&str; 6] = [
+    "CANARY_PROMPT_dt",
+    "CANARY_CWD_dt",
+    "CANARY_INPUT_dt",
+    "CANARY_OUTPUT_dt",
+    "CANARY_TITLE_dt",
+    "pppppppppppppppp",
+];
+const CLAUDE_IDS: [&str; 3] = ["req_CANARYL1dt", "msg_CANARYL2dt", "toolu_CANARYL3dt"];
+const CODEX_IDS: [&str; 3] = ["call_CANARYL1cx", "call_CANARYL2cx", "call_CANARYL3cx"];
+
+/// The canary matrix: plain sessions, private instruction text on both
+/// sources (its reversible `ConfigDigest` included), and an email context
+/// with an org marker. Artifacts and skill names are `E` (Full, never
+/// stored): `e_class_canaries_never_persist`.
 fn cases() -> Vec<Case> {
+    const CODEX_CONTENT: &[&str] = &[
+        "CANARY_PROMPT_cx",
+        "CANARY_CWD_cx",
+        "CANARY_ARGS_cx",
+        "CANARY_OUT_cx",
+        "CANARY_TITLE_cx",
+        "CANARY_OPEN_cx",
+        "CANARY_MCPARGS_cx",
+    ];
     vec![
         Case {
             source: SnapshotSource::ClaudeCode,
             lines: claude_lines(10, 10),
             appended: vec![claude_append()],
-            content: &[
-                "CANARY_PROMPT_dt",
-                "CANARY_CWD_dt",
-                "CANARY_INPUT_dt",
-                "CANARY_OUTPUT_dt",
-                "CANARY_TITLE_dt",
-                "pppppppppppppppp",
-            ],
-            provider_ids: &["req_CANARYL1dt", "msg_CANARYL2dt", "toolu_CANARYL3dt"],
+            content: &CLAUDE_CONTENT,
+            provider_ids: &CLAUDE_IDS,
+            survivors: &["req_CANARYL1dt"],
         },
         Case {
             source: SnapshotSource::Codex,
             lines: codex_lines(),
             appended: codex_append(),
+            content: CODEX_CONTENT,
+            provider_ids: &CODEX_IDS,
+            survivors: &["call_CANARYL2cx", "call_CANARYL3cx"],
+        },
+        Case {
+            source: SnapshotSource::ClaudeCode,
+            lines: claude_instruction_lines("CANARY_INSTR_A_dt"),
+            appended: vec![claude_append()],
             content: &[
+                "CANARY_INSTR_A_dt",
+                "Project rules",
+                "CANARY_PROMPT_dt",
+                "CANARY_CWD_dt",
+                "CANARY_TITLE_dt",
+            ],
+            provider_ids: &CLAUDE_IDS,
+            survivors: &["req_CANARYL1dt"],
+        },
+        Case {
+            source: SnapshotSource::Codex,
+            lines: codex_instruction_lines("CANARY_INSTR_A_cx"),
+            appended: codex_append(),
+            content: &[
+                "CANARY_INSTR_A_cx",
+                "AGENTS.md",
                 "CANARY_PROMPT_cx",
                 "CANARY_CWD_cx",
-                "CANARY_ARGS_cx",
-                "CANARY_OUT_cx",
-                "CANARY_TITLE_cx",
             ],
-            provider_ids: &["call_CANARYL1cx"],
+            provider_ids: &CODEX_IDS,
+            survivors: &["call_CANARYL2cx", "call_CANARYL3cx"],
+        },
+        Case {
+            source: SnapshotSource::ClaudeCode,
+            lines: claude_org_lines(),
+            appended: vec![claude_append()],
+            content: &[
+                CANARY_EMAIL,
+                "canary.person",
+                "example-org",
+                CANARY_ORG,
+                "6a1b2c3d4e5f",
+                "CANARY_PROMPT_dt",
+                "CANARY_TITLE_dt",
+            ],
+            provider_ids: &CLAUDE_IDS,
+            survivors: &["req_CANARYL1dt"],
         },
     ]
+}
+
+/// The leaf `L` fields each kind of provider id may sit in.
+fn id_leaves(id: &str) -> &'static [&'static str] {
+    if id.starts_with("toolu_") {
+        &[
+            "CompactClaudeResponseRecord.tool_uses",
+            "SnapshotAccumulator.seen_claude_capability_tool_uses",
+            "SessionStartState.calls",
+        ]
+    } else if id.starts_with("call_") {
+        &[
+            "SnapshotAccumulator.activity_call_tools",
+            "SnapshotAccumulator.activity_mcp_call_ids",
+            "SessionStartState.calls",
+            "SessionStartState.last_codex_call",
+        ]
+    } else {
+        // Request and message ids.
+        &[
+            "CompactClaudeResponseRecord.request_id",
+            "RequestSlot.request_ref",
+            "ClaudeResponseBook.index",
+        ]
+    }
 }
 
 fn occurrences(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
@@ -280,8 +474,11 @@ fn occurrences(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-/// Privacy canary (Amendment 1): no content of any kind is in the body; a
-/// raw provider id (class `L`) appears only inside an `L` field's bytes.
+/// Privacy canary (Amendment 1, F4): no content of any kind is in the body;
+/// every raw provider id (class `L`) sits inside the innermost `L` span of a
+/// leaf field for its kind (`id_leaves`), never merely inside an enclosing
+/// span; and the ids a sealed reduction still holds (open Codex call and MCP
+/// maps, Claude request ids) do survive into the body.
 #[test]
 fn record_body_holds_no_content_and_provider_ids_only_in_l_fields() {
     for case in cases() {
@@ -305,18 +502,161 @@ fn record_body_holds_no_content_and_provider_ids_only_in_l_fields() {
             );
         }
         for id in case.provider_ids {
-            for at in occurrences(&body, id.as_bytes()) {
-                let end = at + id.len();
+            let found = occurrences(&body, id.as_bytes());
+            if case.survivors.contains(id) {
                 assert!(
-                    spans
-                        .iter()
-                        .any(|(start, stop, _)| *start <= at && end <= *stop),
-                    "{:?}: provider id {id:?} at {at} outside every L field {spans:?}",
+                    !found.is_empty(),
+                    "{:?}: provider id {id:?} held at the seal is missing from the body",
+                    case.source
+                );
+            }
+            for at in found {
+                let end = at + id.len();
+                let leaf = spans
+                    .iter()
+                    .filter(|(start, stop, _)| *start <= at && end <= *stop)
+                    .min_by_key(|(start, stop, _)| stop - start)
+                    .map(|(_, _, path)| *path);
+                assert!(
+                    leaf.is_some_and(|leaf| id_leaves(id).contains(&leaf)),
+                    "{:?}: provider id {id:?} at {at} in {leaf:?}, not a leaf L field for it",
                     case.source
                 );
             }
         }
     }
+}
+
+/// F1 instruction canary, per source: two sessions differing only in
+/// private instruction text of equal length. Their retained copies differ
+/// (the text and its reversible `ConfigDigest` are content), yet the
+/// encoded reductions are byte-identical (nothing derived from the text is
+/// stored; only the verified content hash in the re-derivation marks
+/// differs), and each restores to its exact copy (the digest is re-derived
+/// from the head).
+#[test]
+fn instruction_text_and_its_config_digest_never_reach_the_body() {
+    type Build = fn(&str) -> Vec<String>;
+    for (source, build, secrets) in [
+        (
+            SnapshotSource::ClaudeCode,
+            claude_instruction_lines as Build,
+            ["CANARY_INSTR_A_dt", "CANARY_INSTR_B_dt"],
+        ),
+        (
+            SnapshotSource::Codex,
+            codex_instruction_lines as Build,
+            ["CANARY_INSTR_A_cx", "CANARY_INSTR_B_cx"],
+        ),
+    ] {
+        let mut reductions = Vec::new();
+        let mut retained = Vec::new();
+        for secret in secrets {
+            let scratch = Scratch::new("instructions");
+            let path = scratch.write("t.jsonl", &build(secret));
+            let (reduction, _) = full_read(&path, source);
+            let body = encode(
+                &reduction,
+                crate::durable_tail_store::RECORD_BYTES,
+                line_cap(),
+            )
+            .unwrap_or_else(|refuse| panic!("{source:?} not persisted: {refuse:?}"));
+            assert!(
+                occurrences(&body, secret.as_bytes()).is_empty(),
+                "{source:?}"
+            );
+            let (restored, _) = restore(&path, &body, source).unwrap();
+            assert_eq!(
+                full_digest(&restored),
+                full_digest(&reduction),
+                "{source:?}"
+            );
+            let mut e = Enc::bytes(crate::durable_tail_store::RECORD_BYTES);
+            reduction.put(&mut e).unwrap();
+            reductions.push(e.into_bytes());
+            retained.push(full_digest(&reduction));
+        }
+        assert_ne!(
+            retained[0], retained[1],
+            "{source:?}: the fixture must carry its instruction text"
+        );
+        assert_eq!(
+            reductions[0], reductions[1],
+            "{source:?}: something derived from instruction text reached the body"
+        );
+    }
+}
+
+/// F4: an email context is stored only as its domain-separated SHA-256 (32
+/// bytes, once), never as the address or its plain SHA-256.
+#[test]
+fn org_marker_email_is_stored_only_as_a_domain_separated_digest() {
+    use sha2::Digest as _;
+    let scratch = Scratch::new("org");
+    let path = scratch.write("t.jsonl", &claude_org_lines());
+    let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
+    let plain: [u8; 32] = sha2::Sha256::digest(CANARY_EMAIL.as_bytes()).into();
+    let separated: [u8; 32] = sha2::Sha256::new()
+        .chain_update(b"ottto-claude-org-marker-context:v1\0")
+        .chain_update(CANARY_EMAIL.as_bytes())
+        .finalize()
+        .into();
+    assert!(occurrences(&body, &plain).is_empty());
+    assert!(occurrences(&body, hex(plain).as_bytes()).is_empty());
+    assert!(occurrences(&body, hex(separated).as_bytes()).is_empty());
+    assert_eq!(occurrences(&body, &separated).len(), 1);
+}
+
+/// F4 matrix, `E` classes: an artifact or a skill name refuses the record
+/// (the entry reads Full), so neither is ever stored.
+#[test]
+fn e_class_canaries_never_persist() {
+    let scratch = Scratch::new("artifact");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let (mut reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    reduction.accumulator.artifacts.push(SessionArtifact {
+        kind: "pull_request".into(),
+        value: "https://example.test/CANARY_ARTIFACT/pull/1".into(),
+    });
+    assert_eq!(
+        encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap()
+        )
+        .err(),
+        Some(Refuse::NonEmpty("SnapshotAccumulator.artifacts"))
+    );
+    let mut skill = claude_lines(1, 1);
+    skill.push(
+        json!({"type":"assistant","sessionId":CLAUDE_SESSION,"uuid":"u-9","parentUuid":"u-3",
+            "timestamp":"2026-10-20T10:00:09Z","requestId":"req_skill",
+            "message":{"id":"msg_skill","type":"message","role":"assistant",
+                "model":"claude-opus-4-1","stop_reason":"tool_use",
+                "content":[{"type":"tool_use","id":"toolu_skill","name":"Bash",
+                    "input":{"command":"cat ~/.claude/skills/canary-skill/SKILL.md"}}],
+                "usage":{"input_tokens":1,"cache_creation_input_tokens":0,
+                    "cache_read_input_tokens":0,"output_tokens":1}}})
+        .to_string(),
+    );
+    let scratch = Scratch::new("skill");
+    let path = scratch.write("t.jsonl", &skill);
+    let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    assert_eq!(
+        encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap()
+        )
+        .err(),
+        Some(Refuse::NonEmpty("SnapshotAccumulator.activity_skills"))
+    );
 }
 
 /// Decode plus bounded re-derivation gives back exactly the retained copy,
@@ -595,6 +935,106 @@ fn allowlist_digest_binds_source_and_field_classes() {
     }
 }
 
+/// Every `H` field, by persisted type, with what fills it. `HDigest` makes
+/// `H` a fixed 32-byte type (a u64 word array, a rolling hash or a truncated
+/// hash cannot compile as `H`); this table pins the algorithm per field, so
+/// a new `H` field fails here until it is audited (F1).
+const H_AUDIT: &[(&str, &str)] = &[
+    (
+        "OrgMarkers.context_digest",
+        "SHA-256(\"ottto-claude-org-marker-context:v1\\0\" || lowercased email)",
+    ),
+    (
+        "OwnedRequest.configuration_witness",
+        "SnapshotAccumulator.cache_configuration_witness, copied",
+    ),
+    (
+        "Rederive.agent_label",
+        "Enc::hash(\"ottto-dt-rederive:agent_label:v1\")",
+    ),
+    (
+        "Rederive.first_prompt",
+        "Enc::hash(\"ottto-dt-rederive:first_prompt:v1\")",
+    ),
+    (
+        "Rederive.session_start",
+        "Enc::hash(\"ottto-dt-rederive:session_start:v2\")",
+    ),
+    (
+        "Rederive.title",
+        "Enc::hash(\"ottto-dt-rederive:title:v1\")",
+    ),
+    (
+        "Rederive.workspace",
+        "Enc::hash(\"ottto-dt-rederive:workspace:v1\")",
+    ),
+    (
+        "SnapshotAccumulator.activity_changed_file_hashes",
+        "sha256_hex([\"ottto-activity-changed-file:v1\", path])",
+    ),
+    (
+        "SnapshotAccumulator.cache_configuration_witness",
+        "sha256_hex([\"ottto-cache-configuration-witness:v1\", metadata json])",
+    ),
+    (
+        "SnapshotAccumulator.codex_last_usage_event_identity",
+        "sha256_hex([\"codex_usage_event:v1\", event])",
+    ),
+    (
+        "SnapshotAccumulator.codex_parent_ledger_identity_used",
+        "opened_object_identity_from: SHA-256, length-prefixed version domain",
+    ),
+    (
+        "SnapshotAccumulator.codex_parent_prefix_digest",
+        "SHA-256 chain seeded by SHA-256(CODEX_PARENT_PROOF_FORMAT)",
+    ),
+    (
+        "SnapshotAccumulator.codex_physical_signatures",
+        "codex_ownership_signature: sha256_hex with codex_parent_* domains",
+    ),
+    (
+        "SnapshotAccumulator.codex_proof_ledger_row",
+        "codex_ownership_signature: sha256_hex with codex_parent_* domains",
+    ),
+];
+
+/// The `Type.field` path of every `H` field in the allowlist shape text.
+fn h_paths(text: &str) -> BTreeSet<String> {
+    let mut stack = Vec::new();
+    let mut last = "";
+    let mut out = BTreeSet::new();
+    for token in text.split(';') {
+        let mut rest = token;
+        loop {
+            if let Some(next) = rest.strip_prefix('{') {
+                stack.push(last);
+                rest = next;
+            } else if let Some(next) = rest.strip_prefix('}') {
+                stack.pop();
+                rest = next;
+            } else {
+                break;
+            }
+        }
+        if let Some(field) = rest.strip_prefix("H ") {
+            out.insert(format!("{}.{field}", stack.last().copied().unwrap_or("?")));
+        }
+        if !rest.is_empty() {
+            last = rest;
+        }
+    }
+    out
+}
+
+#[test]
+fn h_fields_are_audited() {
+    let audited = H_AUDIT
+        .iter()
+        .map(|(path, _)| path.to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(h_paths(&shape_text()), audited);
+}
+
 /// Full-fallback classes on a synthetic corpus, by the refusing field: a
 /// skill reference (E) and a first prompt past the 1 MiB head bound (not
 /// re-derivable) each read Full; plain sessions persist.
@@ -631,7 +1071,9 @@ fn fallback_classes_over_the_synthetic_corpus() {
             line_cap(),
         ) {
             Ok(_) => "persisted",
-            Err(Refuse::NonEmpty(field) | Refuse::NotRederivable(field)) => field,
+            Err(
+                Refuse::NonEmpty(field) | Refuse::NotRederivable(field) | Refuse::NotDigest(field),
+            ) => field,
             Err(Refuse::TooLarge) => "record_bytes",
             Err(Refuse::UnknownLabel) => "static_label",
         };

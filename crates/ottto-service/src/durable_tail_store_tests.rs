@@ -737,6 +737,119 @@ fn gc_drops_other_accounts_scopes_and_unkept_keys() {
     assert!(!store.dir().exists());
 }
 
+/// F5: GC reads one header per record, never a body. A record whose body
+/// alone is damaged still binds by its header, so GC keeps it until a full
+/// read refuses (and condemns) it; the next GC deletes it without reading
+/// it again.
+#[test]
+fn gc_reads_headers_only_and_deletes_condemned_bodies_unread() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let allowlist = placeholder_allowlist();
+    let bindings = (0..4)
+        .map(|n| {
+            let mut b = binding("acct-a", "scope", ("fp", None));
+            b.key = key_digest(DurableSource::ClaudeCode, &format!("key-{n}"));
+            b
+        })
+        .collect::<Vec<_>>();
+    store
+        .write_after_save(
+            &lock,
+            1,
+            bindings
+                .iter()
+                .map(|b| pending(b.clone(), certificate(&transcript), 1))
+                .collect(),
+        )
+        .unwrap();
+    let keep = bindings
+        .iter()
+        .map(|b| (b.key, Some(b.scope)))
+        .collect::<BTreeMap<_, _>>();
+    let damaged = record_file(&store, &bindings[0].key);
+    let mut bytes = fs::read(&damaged).unwrap();
+    bytes[HEADER_BYTES] ^= 0xff;
+    put_record(&damaged, &bytes);
+    let context = bindings[0].context;
+
+    let before = store.counters();
+    store.gc(&lock, &context, &allowlist, &keep).unwrap();
+    let after = store.counters();
+    assert_eq!(after.gc_records_read - before.gc_records_read, 4);
+    assert_eq!(
+        after.gc_bytes_read - before.gc_bytes_read,
+        4 * HEADER_BYTES as u64
+    );
+    assert_eq!(after.bytes_read, before.bytes_read, "no body read");
+    assert!(damaged.exists(), "the header still binds");
+
+    assert!(matches!(
+        store.read(&bindings[0].key, &allowlist),
+        ReadOutcome::Refused(Refusal::Corrupt)
+    ));
+    store.gc(&lock, &context, &allowlist, &keep).unwrap();
+    let last = store.counters();
+    assert!(!damaged.exists(), "condemned by the full read");
+    assert_eq!(last.gc_records_read - after.gc_records_read, 3);
+    assert_eq!(last.disk_records, 3);
+    for b in &bindings[1..] {
+        found(store.read(&b.key, &allowlist));
+    }
+    println!(
+        "dt_gc_header_receipt: records=4 gc_records_read={} gc_bytes_read={} \
+         header_bytes={HEADER_BYTES} record_bytes={} peak_codec_bytes={}",
+        after.gc_records_read - before.gc_records_read,
+        after.gc_bytes_read - before.gc_bytes_read,
+        bytes.len(),
+        last.peak_codec_bytes,
+    );
+}
+
+/// F2: invalidating held or reverted selections deletes exactly their
+/// records; a later read of them is Missing.
+#[test]
+fn remove_keys_deletes_only_the_invalidated_records() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let allowlist = placeholder_allowlist();
+    let bindings = (0..3)
+        .map(|n| {
+            let mut b = binding("acct-a", "scope", ("fp", None));
+            b.key = key_digest(DurableSource::ClaudeCode, &format!("key-{n}"));
+            b
+        })
+        .collect::<Vec<_>>();
+    store
+        .write_after_save(
+            &lock,
+            1,
+            bindings
+                .iter()
+                .map(|b| pending(b.clone(), certificate(&transcript), 1))
+                .collect(),
+        )
+        .unwrap();
+    let held = std::collections::BTreeSet::from([
+        bindings[1].key,
+        key_digest(DurableSource::ClaudeCode, "never-written"),
+    ]);
+    assert_eq!(store.remove_keys(&lock, &held).unwrap(), 1);
+    assert_eq!(store.counters().records_invalidated, 1);
+    assert_eq!(store.counters().disk_records, 2);
+    assert!(matches!(
+        store.read(&bindings[1].key, &allowlist),
+        ReadOutcome::Missing
+    ));
+    found(store.read(&bindings[0].key, &allowlist));
+    found(store.read(&bindings[2].key, &allowlist));
+    assert_eq!(store.remove_keys(&lock, &held).unwrap(), 0);
+}
+
 #[test]
 fn a_record_readable_by_others_is_refused() {
     let scratch = Scratch::new();
@@ -930,12 +1043,27 @@ fn store_budget_receipt() {
         found(restarted.read(&record.binding.key, &placeholder_allowlist()));
     }
     let read_pass = restarted.take_pass();
+    // A full store's GC: headers only, and one reused header buffer.
+    let keep = records(None)
+        .into_iter()
+        .map(|record| (record.binding.key, Some(record.binding.scope)))
+        .collect::<BTreeMap<_, _>>();
+    restarted
+        .gc(
+            &lock,
+            &binding("acct", "scope", ("fp", None)).context,
+            &placeholder_allowlist(),
+            &keep,
+        )
+        .unwrap();
+    let gc_pass = restarted.take_pass();
     let envelope = (HEADER_BYTES + TRAILER_BYTES) as u64;
     println!(
         "dt_store_budget: envelope_bytes_per_record={envelope} placeholder_body_bytes={} \
          records={} disk_bytes_total={} fill_saves={saves} fill_bytes_written={} \
          one_dirty_save_bytes_written={} one_dirty_save_records_written={} \
          one_dirty_save_clean={} restore_pass_bytes_read={} restore_pass_records_read={} \
+         gc_records_read={} gc_bytes_read={} gc_body_bytes_read={} gc_peak_codec_bytes={} \
          peak_codec_bytes={}",
         placeholder_body(0, 0).len(),
         write_pass.disk_records,
@@ -946,8 +1074,16 @@ fn store_budget_receipt() {
         one_dirty.clean,
         read_pass.bytes_read,
         read_pass.records_read,
+        gc_pass.gc_records_read,
+        gc_pass.gc_bytes_read,
+        gc_pass.bytes_read,
+        gc_pass.peak_codec_bytes,
         fill.peak_codec_bytes.max(read_pass.peak_codec_bytes),
     );
+    assert_eq!(gc_pass.gc_records_read, MAX_RECORDS as u64);
+    assert_eq!(gc_pass.gc_bytes_read, (MAX_RECORDS * HEADER_BYTES) as u64);
+    assert_eq!(gc_pass.bytes_read, 0);
+    assert_eq!(gc_pass.disk_records, MAX_RECORDS as u64);
     assert_eq!(saves, MAX_RECORDS.div_ceil(MAX_BATCH));
     assert_eq!(one_dirty.written, 1);
     assert_eq!(

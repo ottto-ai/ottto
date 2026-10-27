@@ -29,7 +29,7 @@
 
 use crate::transcript_acquisition::DurableCertificate;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -51,7 +51,7 @@ const RECORD_SUFFIX: &str = ".rec";
 const TEMP_SUFFIX: &str = ".tmp";
 
 /// The fixed envelope size before the body (see `encode`).
-const HEADER_BYTES: usize = 8 // magic
+pub(crate) const HEADER_BYTES: usize = 8 // magic
     + 2 // format_version
     + 32 // allowlist_digest
     + 1 // source
@@ -323,6 +323,11 @@ pub(crate) struct StoreCounters {
     /// GC deletions: records and stale temp files.
     pub(crate) gc_records_deleted: u64,
     pub(crate) gc_temps_deleted: u64,
+    /// GC reads only record headers (`HEADER_BYTES` each), never bodies.
+    pub(crate) gc_records_read: u64,
+    pub(crate) gc_bytes_read: u64,
+    /// Records deleted because their selection was held or reverted.
+    pub(crate) records_invalidated: u64,
     /// Peak transient encode/decode buffer, in bytes.
     pub(crate) peak_codec_bytes: u64,
 }
@@ -345,14 +350,24 @@ pub(crate) struct BatchReceipt {
 pub(crate) struct DurableTailStore {
     dir: PathBuf,
     durable: BTreeMap<Digest32, Digest32>,
+    /// Records a full read refused (corrupt, older format, other allowlist):
+    /// GC deletes them without reading their bodies again. At most
+    /// `INVENTORY_BOUND` keys.
+    condemned: BTreeSet<Digest32>,
     counters: StoreCounters,
 }
+
+/// The most record files one GC or inventory pass looks at. Twice the
+/// admission cap, so a full store plus its replacements always fits; any
+/// file past it is not kept.
+pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
 
 impl DurableTailStore {
     pub(crate) fn new(dir: PathBuf) -> Self {
         Self {
             dir,
             durable: BTreeMap::new(),
+            condemned: BTreeSet::new(),
             counters: StoreCounters::default(),
         }
     }
@@ -406,7 +421,8 @@ impl DurableTailStore {
         self.counters.records_read += 1;
         self.counters.bytes_read += bytes.len() as u64;
         self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
-        self.note_codec(bytes.capacity());
+        // Live together while decoding: the record and its body copy.
+        self.note_codec(bytes.capacity() + bytes.len().saturating_sub(HEADER_BYTES));
         match decode(&bytes, allowlist) {
             Ok(record) if record.record.binding.key == *key => {
                 // A valid record on disk is the durable content for its key.
@@ -415,9 +431,13 @@ impl DurableTailStore {
             }
             Ok(_) => {
                 self.counters.refused_corrupt += 1;
+                self.condemn(*key);
                 ReadOutcome::Refused(Refusal::Corrupt)
             }
             Err(refusal) => {
+                if refusal != Refusal::NewerFormat {
+                    self.condemn(*key);
+                }
                 match refusal {
                     Refusal::Corrupt => self.counters.refused_corrupt += 1,
                     Refusal::NewerFormat => self.counters.refused_newer += 1,
@@ -444,6 +464,11 @@ impl DurableTailStore {
         self.check_writer(writer)?;
         let mut receipt = BatchReceipt::default();
         let mut dirty = Vec::new();
+        // The caller's bodies stay live for the whole batch.
+        let pending_bytes = pending
+            .iter()
+            .map(|record| record.body.len())
+            .sum::<usize>();
         for record in pending {
             let content = content_digest(&record);
             if self.durable.get(&record.binding.key) == Some(&content) {
@@ -472,7 +497,7 @@ impl DurableTailStore {
                 index_generation: committed_generation,
             };
             let bytes = encode(&stored);
-            self.note_codec(bytes.capacity());
+            self.note_codec(pending_bytes + bytes.capacity());
             let previous = on_disk.get(&key).copied().unwrap_or(0);
             let total = on_disk
                 .values()
@@ -534,6 +559,7 @@ impl DurableTailStore {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.durable.clear();
+                self.condemned.clear();
                 self.set_disk_level(&BTreeMap::new());
                 return Ok(());
             }
@@ -541,6 +567,8 @@ impl DurableTailStore {
         };
         let mut deleted = false;
         let mut on_disk = BTreeMap::new();
+        let mut header = Vec::with_capacity(HEADER_BYTES);
+        let mut seen = 0_usize;
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
@@ -557,27 +585,34 @@ impl DurableTailStore {
             let Some(key) = name.strip_suffix(RECORD_SUFFIX).and_then(parse_hex_digest) else {
                 continue;
             };
-            let verdict = match read_private(&path) {
-                Ok(Some(bytes)) => {
-                    let len = bytes.len() as u64;
-                    match decode(&bytes, allowlist) {
-                        Ok(record) => {
-                            let binding = &record.record.binding;
-                            let live = binding.key == key
-                                && binding.context == *live_context
-                                && match keep.get(&key) {
-                                    Some(Some(scope)) => *scope == binding.scope,
-                                    Some(None) => true,
-                                    None => false,
-                                };
-                            live.then_some(len)
+            seen += 1;
+            // Header only: the binding decides; a body a full read refused
+            // is already condemned.
+            let verdict = if seen > INVENTORY_BOUND || self.condemned.contains(&key) {
+                None
+            } else {
+                match read_private_header(&path, &mut header) {
+                    Ok(Some(len)) => {
+                        self.counters.gc_records_read += 1;
+                        self.counters.gc_bytes_read += header.len() as u64;
+                        match decode_header(&header, len, allowlist) {
+                            Ok(binding) => {
+                                let live = binding.key == key
+                                    && binding.context == *live_context
+                                    && match keep.get(&key) {
+                                        Some(Some(scope)) => *scope == binding.scope,
+                                        Some(None) => true,
+                                        None => false,
+                                    };
+                                live.then_some(len)
+                            }
+                            Err(Refusal::NewerFormat) => Some(len),
+                            Err(_) => None,
                         }
-                        Err(Refusal::NewerFormat) => Some(len),
-                        Err(_) => None,
                     }
+                    Ok(None) => continue,
+                    Err(_) => None,
                 }
-                Ok(None) => continue,
-                Err(_) => None,
             };
             match verdict {
                 Some(len) => {
@@ -591,12 +626,71 @@ impl DurableTailStore {
                 }
             }
         }
+        self.note_codec(header.capacity());
+        self.condemned.clear();
         self.durable.retain(|key, _| on_disk.contains_key(key));
         if deleted {
             sync_dir(&self.dir)?;
         }
         self.set_disk_level(&on_disk);
         Ok(())
+    }
+
+    /// The record keys on disk now, at most `INVENTORY_BOUND`: GC's caller
+    /// looks up only these keys, never materializing the whole index.
+    pub(crate) fn inventory(&self) -> io::Result<BTreeSet<Digest32>> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+            Err(error) => return Err(error),
+        };
+        let mut keys = BTreeSet::new();
+        for entry in entries {
+            let name = entry?.file_name();
+            if let Some(key) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(RECORD_SUFFIX))
+                .and_then(parse_hex_digest)
+            {
+                keys.insert(key);
+                if keys.len() >= INVENTORY_BOUND {
+                    break;
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Deletes the records of `keys` (held or reverted selections): a stale
+    /// record for them must never restore.
+    pub(crate) fn remove_keys<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        keys: &BTreeSet<Digest32>,
+    ) -> io::Result<usize> {
+        self.check_writer(writer)?;
+        let mut removed = 0;
+        for key in keys {
+            let path = self.record_path(key);
+            if fs::symlink_metadata(&path).is_ok() {
+                remove_if_present(&path)?;
+                removed += 1;
+            }
+            self.durable.remove(key);
+        }
+        if removed > 0 {
+            sync_dir(&self.dir)?;
+            self.counters.records_invalidated += removed as u64;
+            let on_disk = self.scan_disk()?;
+            self.set_disk_level(&on_disk);
+        }
+        Ok(removed)
+    }
+
+    fn condemn(&mut self, key: Digest32) {
+        if self.condemned.len() < INVENTORY_BOUND {
+            self.condemned.insert(key);
+        }
     }
 
     /// Index reset or uninstall: remove the whole store.
@@ -656,10 +750,15 @@ impl DurableTailStore {
 
 /// What makes a record dirty: everything but the generation stamp, so a
 /// later save of an unchanged entry rewrites nothing.
+/// Hashes the header and the body in place: no copy of the body (its only
+/// scratch is the `HEADER_BYTES` header).
 fn content_digest(record: &PendingRecord) -> Digest32 {
-    let mut bytes = Vec::with_capacity(HEADER_BYTES + record.body.len());
-    encode_parts(&mut bytes, record, 0);
-    digest("ottto-dt-content:v1", &[bytes.as_slice()])
+    let mut header = Vec::with_capacity(HEADER_BYTES);
+    encode_header(&mut header, record, 0);
+    digest(
+        "ottto-dt-content:v2",
+        &[header.as_slice(), record.body.as_slice()],
+    )
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -724,6 +823,76 @@ fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
+/// `read_private`'s checks, then only the first `HEADER_BYTES` into
+/// `header` (reused across records). Returns the file length.
+fn read_private_header(path: &Path, header: &mut Vec<u8>) -> io::Result<Option<u64>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if metadata.permissions().mode() & 0o077 != 0
+        || !metadata.is_file()
+        || metadata.len() > (RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES) as u64
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unusable durable store record",
+        ));
+    }
+    header.clear();
+    file.take(HEADER_BYTES as u64).read_to_end(header)?;
+    Ok(Some(metadata.len()))
+}
+
+/// The binding from a record header alone, for GC: format, allowlist,
+/// source and digests, and a body length consistent with the file length.
+/// The body and trailer are checked by a full read (`decode`) only.
+fn decode_header(header: &[u8], file_len: u64, allowlist: &Digest32) -> Result<Binding, Refusal> {
+    let mut cursor = Cursor(header);
+    if cursor.array::<8>() != Some(MAGIC) {
+        return Err(Refusal::Corrupt);
+    }
+    let version = cursor.u16().ok_or(Refusal::Corrupt)?;
+    if version > FORMAT_VERSION {
+        return Err(Refusal::NewerFormat);
+    }
+    if version < FORMAT_VERSION {
+        return Err(Refusal::OlderFormat);
+    }
+    if header.len() != HEADER_BYTES {
+        return Err(Refusal::Corrupt);
+    }
+    let record_allowlist = cursor.array::<32>().ok_or(Refusal::Corrupt)?;
+    let binding = (|| {
+        Some(Binding {
+            source: DurableSource::from_tag(cursor.u8()?)?,
+            key: cursor.array()?,
+            context: cursor.array()?,
+            scope: cursor.array()?,
+            entry: cursor.array()?,
+        })
+    })()
+    .ok_or(Refusal::Corrupt)?;
+    let body_len = u32::from_le_bytes(
+        header[HEADER_BYTES - 4..]
+            .try_into()
+            .map_err(|_| Refusal::Corrupt)?,
+    ) as u64;
+    if file_len != (HEADER_BYTES + TRAILER_BYTES) as u64 + body_len {
+        return Err(Refusal::Corrupt);
+    }
+    if record_allowlist != *allowlist {
+        return Err(Refusal::AllowlistChanged);
+    }
+    Ok(binding)
+}
+
 fn remove_if_present(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -779,6 +948,13 @@ fn encode(record: &DurableRecord) -> Vec<u8> {
 }
 
 fn encode_parts(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
+    encode_header(out, record, generation);
+    out.extend_from_slice(&record.body);
+}
+
+/// Everything before the body, ending with the body length: exactly
+/// `HEADER_BYTES`.
+fn encode_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
     let binding = &record.binding;
     let certificate = &record.certificate;
     out.extend_from_slice(&MAGIC);
@@ -813,7 +989,6 @@ fn encode_parts(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
             .to_le_bytes(),
     );
     out.extend_from_slice(&(record.body.len() as u32).to_le_bytes());
-    out.extend_from_slice(&record.body);
 }
 
 struct Cursor<'a>(&'a [u8]);

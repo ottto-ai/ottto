@@ -494,7 +494,7 @@ enum ClaudeRecordText {
 }
 crate::durable_tail_codec::durable_enum!(ClaudeRecordText {
     0 => SameAsFirstRecord,
-    1 => Own(L x0: Option<String>),
+    1 => Own(P x0: Option<String>),
 });
 
 impl ClaudeRecordText {
@@ -611,7 +611,7 @@ enum ClaudeSlot {
 }
 crate::durable_tail_codec::durable_enum!(ClaudeSlot {
     0 => Derived(N x0: ClaudeSlotTokens),
-    1 => Explicit(L x0: Box<RequestSlot>),
+    1 => Explicit(D x0: Box<RequestSlot>),
 });
 
 impl ClaudeSlot {
@@ -1061,7 +1061,7 @@ impl HeapLayoutBound for ClaudeSlot {
 crate::heap_layout_bound::fields!(ClaudeResponseBook; index, responses, selectors);
 crate::durable_tail_codec::durable_struct!(ClaudeResponseBook {
     L index: OwnedMap<String, u32>,
-    L responses: OwnedVec<ClaudeResponseObservation>,
+    D responses: OwnedVec<ClaudeResponseObservation>,
     U selectors: ClaudeSelectorTable,
 });
 crate::heap_layout_bound::fields!(ClaudeSelectorTable; selectors);
@@ -1091,7 +1091,7 @@ crate::durable_tail_codec::durable_struct!(ClaudeSlotTokens {
 crate::heap_layout_bound::fields!(CompactClaudeResponseRecord; usage, slot, physical_sequence, model, reasoning_effort, request_id, timestamp, computed_effective_input_context, selector, tool_uses);
 crate::durable_tail_codec::durable_struct!(CompactClaudeResponseRecord {
     N usage: CompactClaudeUsage,
-    L slot: ClaudeSlot,
+    D slot: ClaudeSlot,
     N physical_sequence: u16,
     U model: ClaudeRecordText,
     U reasoning_effort: ClaudeRecordText,

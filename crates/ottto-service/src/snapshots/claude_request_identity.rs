@@ -1408,7 +1408,14 @@ pub(crate) fn note_marker_line(
                 .and_then(Value::as_str)
                 .map(|text| text.trim().to_ascii_lowercase())
                 .unwrap_or_default();
-            let digest = format!("{:x}", sha2::Sha256::digest(text.as_bytes()));
+            // Domain-separated SHA-256 (an H value in the durable store).
+            let digest = format!(
+                "{:x}",
+                sha2::Sha256::new()
+                    .chain_update(b"ottto-claude-org-marker-context:v1\0")
+                    .chain_update(text.as_bytes())
+                    .finalize()
+            );
             let state = markers.get_or_insert_with(Box::default);
             if state.context_digest.as_deref() != Some(digest.as_str()) {
                 if state.context_digest.is_some() && state.context_flip_position.is_none() {

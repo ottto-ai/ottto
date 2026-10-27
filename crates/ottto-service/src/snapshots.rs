@@ -29784,6 +29784,12 @@ impl OwnedSourceScan {
                                 if let Some(active) = file_sampling.as_ref() {
                                     active.reinsertion.admitted();
                                 }
+                                // M1 selection provenance (F2): the
+                                // fingerprint this reduction was acquired for.
+                                #[cfg(unix)]
+                                context
+                                    .cache
+                                    .durable_note_selection(&index_key, &source_file_fingerprint);
                             }
                         }
                     }
@@ -35616,8 +35622,11 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 .map(|(field, value)| (field.clone(), value.clone()))
                 .collect::<serde_json::Map<_, _>>();
             if !metadata.is_empty() {
-                accumulator.cache_configuration_witness =
-                    Some(sha256_hex(&[Value::Object(metadata).to_string().as_str()]));
+                // Domain-separated SHA-256 (an H value in the durable store).
+                accumulator.cache_configuration_witness = Some(sha256_hex(&[
+                    "ottto-cache-configuration-witness:v1",
+                    Value::Object(metadata).to_string().as_str(),
+                ]));
             }
         }
     }
@@ -35975,7 +35984,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                     for (path, change) in changes {
                         accumulator
                             .activity_changed_file_hashes
-                            .insert(sha256_hex(&[path]));
+                            .insert(sha256_hex(&["ottto-activity-changed-file:v1", path]));
                         if let Some(diff) = change.get("unified_diff").and_then(Value::as_str) {
                             for line in diff.lines() {
                                 if line.starts_with('+') && !line.starts_with("+++") {
@@ -88612,7 +88621,7 @@ crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding
 crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
     N sequence: u64,
     N preceding_user_timestamp: Option<String>,
-    L records: crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
+    D records: crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
     N record_limit_exceeded: bool,
     N desktop_request: bool,
 });
@@ -88659,7 +88668,9 @@ crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paire
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(RowKey {
     U model: String,
-    H selector_hash: String,
+    // "base" or a 16-hex prefix of SHA-256 over `selector_context`, which
+    // the upload carries (U): not a 32-byte digest, so not H.
+    U selector_hash: String,
     U reasoning_effort: Option<String>,
     U auth_mode: Option<String>,
     U billing_channel: Option<String>,
@@ -88721,7 +88732,8 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     N started_at: Option<String>,
     N ended_at: Option<String>,
     N last_activity_at: Option<String>,
-    H workspace_hash: Option<String>,
+    // Uploaded verbatim (`SnapshotItem.workspace_hash`): U, not H.
+    U workspace_hash: Option<String>,
     X workspace_path: Option<PathBuf>,
     U latest_model: Option<String>,
     U latest_reasoning_effort: Option<String>,
@@ -88757,7 +88769,8 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     U codex_parent_session_ref: Option<String>,
     E codex_parent_signatures: Option<CodexParentPrefix>,
     H codex_parent_prefix_digest: PrefixDigest,
-    H codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
+    // (N offset, 32-byte domain-seeded SHA-256 chain digest, N flag).
+    D codex_parent_prefix_decided: Option<(u64, PrefixDigest, bool)>,
     E codex_parent_prefix_proof: Option<(CodexParentPrefixProof, PrefixDigest)>,
     E codex_parent_proof_used: Option<(CodexParentPrefixProof, Option<CodexParentUnresolvable>)>,
     N codex_parent_proof_mismatch: bool,

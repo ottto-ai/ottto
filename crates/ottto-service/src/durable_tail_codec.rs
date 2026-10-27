@@ -5,7 +5,8 @@
 //! with an admission class:
 //!
 //! - `N` non-content: number, count, timestamp, enum, bool;
-//! - `H` a digest used only for equality, membership or order;
+//! - `H` a fixed 32-byte domain-separated SHA-256 or HMAC value used only
+//!   for equality, membership or order. A type (`HDigest`), not a label;
 //! - `U` a value the upload body already carries in exactly this form;
 //! - `L` a provider-minted opaque id (request, response, message, tool-use,
 //!   call or MCP call id). Persisted only in the local 0600 durable-tail store;
@@ -16,6 +17,9 @@
 //!   record, and the entry reads in Full;
 //! - `I` a live input re-injected every pass. Never encoded;
 //! - `D` a nested persisted type, encoded by its own field classes.
+//! - `P` pass-through: a shared payload (an enum variant used by several
+//!   fields) whose class is the enclosing field's, so an `L` span is only
+//!   ever the leaf field that holds the id.
 //!
 //! The macros destructure exhaustively on encode and build the value with a
 //! struct literal on decode, so a field added to a persisted type without a
@@ -40,6 +44,9 @@ pub(crate) enum Refuse {
     TooLarge,
     /// An `X` field cannot be re-derived from the file under the bound.
     NotRederivable(&'static str),
+    /// An `H` text field that is not exactly 64 lower-case hex (a 32-byte
+    /// SHA-256 or HMAC value).
+    NotDigest(&'static str),
 }
 
 /// A record body that does not decode. Treated like any corrupt record.
@@ -226,6 +233,129 @@ pub(crate) trait Durable: Sized {
     fn put(&self, e: &mut Enc) -> Result<(), Refuse>;
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt>;
     fn shape(s: &mut Shape);
+}
+
+/// `H` is a type, not a label: only fixed 32-byte values (a raw
+/// `[u8; 32]`, or exactly 64 lower-case hex text, stored as its 32 bytes)
+/// and collections of them implement this, so a non-cryptographic digest
+/// (u64 words, a rolling hash, a truncated hash) cannot compile as `H`.
+/// Which algorithm produced each value (domain-separated SHA-256 or HMAC)
+/// is pinned per field by the H audit test (`h_fields_are_audited`).
+pub(crate) trait HDigest: Sized {
+    fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse>;
+    fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt>;
+    fn shape_h(s: &mut Shape);
+}
+
+impl HDigest for [u8; 32] {
+    fn put_h(&self, e: &mut Enc, _: &'static str) -> Result<(), Refuse> {
+        e.raw(self)
+    }
+    fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        d.raw(32)?.try_into().map_err(|_| Corrupt)
+    }
+    fn shape_h(s: &mut Shape) {
+        s.push("digest32");
+    }
+}
+
+impl HDigest for String {
+    fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse> {
+        let text = self.as_bytes();
+        if text.len() != 64 {
+            return Err(Refuse::NotDigest(path));
+        }
+        let mut bytes = [0_u8; 32];
+        for (byte, pair) in bytes.iter_mut().zip(text.chunks_exact(2)) {
+            let nibble = |c: u8| match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                _ => None,
+            };
+            *byte = match (nibble(pair[0]), nibble(pair[1])) {
+                (Some(high), Some(low)) => (high << 4) | low,
+                _ => return Err(Refuse::NotDigest(path)),
+            };
+        }
+        e.raw(&bytes)
+    }
+    fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        Ok(d.raw(32)?
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+    fn shape_h(s: &mut Shape) {
+        s.push("hex64");
+    }
+}
+
+impl<T: HDigest> HDigest for Option<T> {
+    fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse> {
+        match self {
+            None => e.varint(0),
+            Some(value) => {
+                e.varint(1)?;
+                value.put_h(e, path)
+            }
+        }
+    }
+    fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        match d.varint()? {
+            0 => Ok(None),
+            1 => Ok(Some(T::take_h(d)?)),
+            _ => Err(Corrupt),
+        }
+    }
+    fn shape_h(s: &mut Shape) {
+        s.push("Option<");
+        T::shape_h(s);
+        s.push(">");
+    }
+}
+
+impl<T: HDigest + Ord> HDigest for BTreeSet<T> {
+    fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse> {
+        e.varint(self.len() as u64)?;
+        self.iter().try_for_each(|value| value.put_h(e, path))
+    }
+    fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        let len = d.take_len()?;
+        let mut out = BTreeSet::new();
+        for _ in 0..len {
+            if !out.insert(T::take_h(d)?) {
+                return Err(Corrupt);
+            }
+        }
+        Ok(out)
+    }
+    fn shape_h(s: &mut Shape) {
+        s.push("BTreeSet<");
+        T::shape_h(s);
+        s.push(">");
+    }
+}
+
+impl<T: HDigest + crate::heap_layout_bound::HeapLayoutBound> HDigest
+    for crate::owned_heap::OwnedVec<T>
+{
+    fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse> {
+        e.varint(self.len() as u64)?;
+        self.iter().try_for_each(|value| value.put_h(e, path))
+    }
+    fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        let len = d.take_len()?;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(T::take_h(d)?);
+        }
+        Ok(Self::from(out))
+    }
+    fn shape_h(s: &mut Shape) {
+        s.push("OwnedVec<");
+        T::shape_h(s);
+        s.push(">");
+    }
 }
 
 /// The default value an `E` field must hold for the record to be written.
@@ -733,9 +863,10 @@ macro_rules! durable_field {
         let value: &$ty = $f;
         $crate::durable_tail_codec::Durable::put(value, $e)?;
     }};
-    (put H, $e:ident, $f:ident, $ty:ty, $path:expr) => {
-        $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
-    };
+    (put H, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+        let value: &$ty = $f;
+        $crate::durable_tail_codec::HDigest::put_h(value, $e, $path)?;
+    }};
     (put U, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
@@ -748,6 +879,9 @@ macro_rules! durable_field {
         $crate::durable_tail_codec::note_l_span($e, start, $path);
     }};
     (put D, $e:ident, $f:ident, $ty:ty, $path:expr) => {
+        $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
+    };
+    (put P, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
     (put X, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
@@ -769,7 +903,7 @@ macro_rules! durable_field {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
     (take H, $d:ident, $ty:ty) => {
-        <$ty as $crate::durable_tail_codec::Durable>::take($d)?
+        <$ty as $crate::durable_tail_codec::HDigest>::take_h($d)?
     };
     (take U, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
@@ -780,12 +914,19 @@ macro_rules! durable_field {
     (take D, $d:ident, $ty:ty) => {
         <$ty as $crate::durable_tail_codec::Durable>::take($d)?
     };
+    (take P, $d:ident, $ty:ty) => {
+        <$ty as $crate::durable_tail_codec::Durable>::take($d)?
+    };
     (take $other:ident, $d:ident, $ty:ty) => {
         <$ty as ::std::default::Default>::default()
     };
     (shape X, $s:ident, $f:ident, $ty:ty) => {{
         $s.push(concat!("X ", stringify!($f)));
         <$ty as $crate::durable_tail_codec::Durable>::shape($s);
+    }};
+    (shape H, $s:ident, $f:ident, $ty:ty) => {{
+        $s.push(concat!("H ", stringify!($f)));
+        <$ty as $crate::durable_tail_codec::HDigest>::shape_h($s);
     }};
     (shape E, $s:ident, $f:ident, $ty:ty) => {
         $s.push(concat!("E ", stringify!($f), ": ", stringify!($ty)))
@@ -1068,6 +1209,53 @@ mod tests {
     fn the_byte_cap_refuses_instead_of_growing() {
         let mut e = Enc::bytes(4);
         assert_eq!(String::from("too long").put(&mut e), Err(Refuse::TooLarge));
+    }
+
+    #[derive(Debug, Default, PartialEq)]
+    struct Digests {
+        text: Option<String>,
+        raw: [u8; 32],
+        set: BTreeSet<String>,
+    }
+    durable_struct!(Digests {
+        H text: Option<String>,
+        H raw: [u8; 32],
+        H set: BTreeSet<String>,
+    });
+
+    /// `H` is a 32-byte type: hex text is stored as its 32 bytes and comes
+    /// back exactly; anything else (short, long, upper-case, non-hex) refuses
+    /// the record. Non-digest types (u64 words, `ConfigDigest`) do not
+    /// implement `HDigest`, so they cannot be declared `H` at all.
+    #[test]
+    fn h_fields_hold_only_32_byte_digests() {
+        let hex = "0123456789abcdef".repeat(4);
+        let value = Digests {
+            text: Some(hex.clone()),
+            raw: [7; 32],
+            set: BTreeSet::from([hex.clone(), "f".repeat(64)]),
+        };
+        let mut e = Enc::bytes(1 << 10);
+        value.put(&mut e).expect("encode");
+        let bytes = e.into_bytes();
+        assert_eq!(bytes.len(), 1 + 32 + 32 + 1 + 2 * 32);
+        assert!(!bytes.windows(16).any(|w| w == b"0123456789abcdef"));
+        assert_eq!(Digests::take(&mut Dec::new(&bytes)).expect("decode"), value);
+        for bad in [
+            "abc".to_string(),
+            hex.to_uppercase(),
+            format!("{hex}00"),
+            "g".repeat(64),
+        ] {
+            let value = Digests {
+                text: Some(bad),
+                ..Digests::default()
+            };
+            assert_eq!(
+                value.put(&mut Enc::bytes(1 << 10)),
+                Err(Refuse::NotDigest("Digests.text"))
+            );
+        }
     }
 
     #[derive(Debug, Default, PartialEq)]

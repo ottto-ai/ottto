@@ -850,6 +850,9 @@ mod durable_restart {
     struct State {
         dir: PathBuf,
         index_path: PathBuf,
+        /// The daemon's single-writer lock (#801) on this state directory,
+        /// held for the rest of the test process like the daemon's.
+        lock: &'static LockedStateDir,
     }
     impl State {
         fn new(f: &Fixture) -> Self {
@@ -857,6 +860,7 @@ mod durable_restart {
             fs::create_dir_all(&dir).unwrap();
             Self {
                 index_path: dir.join("index.json"),
+                lock: crate::locked_state_dir::test_locks::hold(&dir),
                 dir,
             }
         }
@@ -887,9 +891,7 @@ mod durable_restart {
         let first = Arc::new(SharedCache::default());
         state.begin(&first);
         let prior = seed_predecessor(f, &first);
-        // The daemon's single-writer lock (#801) on this state directory.
-        let lock = LockedStateDir::acquire(&state.dir).unwrap();
-        first.durable_write_after_save(&lock, SOURCE, &prior);
+        first.durable_write_after_save(state.lock, SOURCE, &prior);
         let expected = usize::from(crate::heap_layout_bound::layout_supported());
         assert_eq!(state.store_records(), expected);
         prior
@@ -899,6 +901,179 @@ mod durable_restart {
         cache
             .durable_counters(SOURCE)
             .map_or(0, |(counters, _)| counters.restored)
+    }
+
+    fn transcript_key(f: &Fixture, index: &ScanIndex) -> String {
+        let key = local_index_key(&f.path);
+        assert!(
+            index.files.contains_key(&key),
+            "the fixture transcript is indexed"
+        );
+        key
+    }
+
+    /// F2 receipts after a write: the reduction was refused for its
+    /// selection and the key's older record was invalidated (only a
+    /// supported layout admits, and so selects, anything).
+    fn assert_selection_refused(cache: &SharedCache, state: &State) {
+        let supported = u64::from(crate::heap_layout_bound::layout_supported());
+        let (counters, store) = cache.durable_counters(SOURCE).unwrap();
+        println!("{}", counters.summary(SOURCE, &store));
+        assert_eq!(
+            counters
+                .not_persisted
+                .get("selection")
+                .copied()
+                .unwrap_or(0),
+            supported
+        );
+        assert_eq!(store.records_invalidated, supported);
+        assert_eq!(store.records_written, 0);
+        assert_eq!(state.store_records(), 0);
+    }
+
+    /// A fresh process after the settled save restores nothing for the key
+    /// and reads it Full, to the same bodies as a cold Full.
+    fn assert_fresh_restart_reads_full(f: &Fixture, state: &State, settled: ScanIndex) {
+        let fresh = Arc::new(SharedCache::default());
+        state.begin(&fresh);
+        let cached = enriched(f, raw_scan(f, settled.clone(), Some(fresh.clone()), |_| {}));
+        assert_eq!(restored(&fresh), 0);
+        assert_layout_mode(cached.modes, (1, 0, 0));
+        assert_oracle(f, &cached, settled);
+    }
+
+    /// F2, local-hold settlement on the real path: a pass admits a newer
+    /// reduction, the file is held, settlement reverts its entry to the
+    /// committed one. The held reduction is never bound to that entry, the
+    /// key's older record is invalidated, and a restart reads Full.
+    #[test]
+    fn a_held_reverted_selection_is_never_written_and_invalidates_the_old_record() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let key = transcript_key(&f, &prior);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let run = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        assert_ne!(
+            run.index.files[&key].source_file_fingerprint,
+            prior.files[&key].source_file_fingerprint
+        );
+        let settled = run.index.into_locally_held_keys_reverted(
+            &prior,
+            &BTreeSet::from([key.clone()]),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            settled.files[&key].source_file_fingerprint,
+            prior.files[&key].source_file_fingerprint
+        );
+        second.durable_write_after_save(state.lock, SOURCE, &settled);
+        assert_selection_refused(&second, &state);
+        assert_fresh_restart_reads_full(&f, &state, settled);
+    }
+
+    /// F2, the cleared-fingerprint reparse case: settlement clears the held
+    /// entry's fingerprint (reparse debt). A restore refuses it before any
+    /// record is read, the write refuses and invalidates, and a restart
+    /// reads Full.
+    #[test]
+    fn a_cleared_fingerprint_never_restores_or_writes() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let key = transcript_key(&f, &prior);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let run = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        let reparse = run
+            .index
+            .file_snapshot_fingerprints
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        assert!(!reparse.is_empty(), "the transcript produced snapshots");
+        let settled = run.index.into_locally_held_keys_reverted(
+            &prior,
+            &BTreeSet::from([key.clone()]),
+            &reparse,
+        );
+        assert!(settled.files[&key].source_file_fingerprint.is_empty());
+        // The record of the committed selection is still on disk here; the
+        // cleared selection refuses before it is read.
+        let fresh = SharedCache::default();
+        state.begin(&fresh);
+        let namespace = Scope("sidecar-fixture".into());
+        let interpretation = crate::snapshots::sampled_scan::durable_tail::Interpretation::of(
+            SOURCE,
+            &key,
+            &settled,
+            capture_by_default(),
+            &namespace,
+        );
+        assert!(fresh
+            .durable_restore(
+                SOURCE,
+                &key,
+                &f.path,
+                &namespace,
+                &mut File::open(&f.path).unwrap(),
+                &settled,
+                &interpretation,
+            )
+            .is_none());
+        let (counters, store) = fresh.durable_counters(SOURCE).unwrap();
+        assert_eq!(counters.ineligible.get("selection_cleared"), Some(&1));
+        assert_eq!(
+            (counters.missing, store.records_read, counters.restored),
+            (0, 0, 0)
+        );
+        second.durable_write_after_save(state.lock, SOURCE, &settled);
+        assert_selection_refused(&second, &state);
+        assert_fresh_restart_reads_full(&f, &state, settled);
+    }
+
+    /// F2, a RAM reduction ahead of the saved selection: two passes in one
+    /// process, then the save commits the first pass's entry. The resident
+    /// reduction (second pass) is never bound to it; the older record is
+    /// invalidated and a restart reads Full.
+    #[test]
+    fn a_reduction_ahead_of_the_saved_selection_is_never_written() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let key = transcript_key(&f, &prior);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let first_pass = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        f.append_transcript(2);
+        f.evidence(3);
+        state.begin(&second);
+        let ahead = raw_scan(&f, first_pass.index.clone(), Some(second.clone()), |_| {});
+        assert_ne!(
+            ahead.index.files[&key].source_file_fingerprint,
+            first_pass.index.files[&key].source_file_fingerprint
+        );
+        let saved = settle(first_pass);
+        second.durable_write_after_save(state.lock, SOURCE, &saved);
+        assert_selection_refused(&second, &state);
+        assert_fresh_restart_reads_full(&f, &state, saved);
     }
 
     #[test]

@@ -1314,6 +1314,131 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
         eprintln!("SAMPLED_LIVE_INPUTS inputs={inputs} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
     }
 }
+/// SOURCE B2: a Codex restart through the real scanner. A first process
+/// reads the rollout Full under an active counting cutover (the V2 view)
+/// with live turn traces and parent ledgers, saves, and writes its record
+/// under #801's lock. A restarted process (fresh RAM cache, same live inputs
+/// re-injected by the scan) restores the record, re-checks its observed
+/// priority turns against the traces, Tails the appended rows and publishes
+/// the cold Full's body. Refusal arms, each read Full to the cold Full's
+/// body: the counting view changes between write and restore (the record's
+/// scope no longer binds), and the traces now mark the observed turn
+/// priority (the restored copy's priority re-check refuses reuse).
+#[cfg(unix)]
+#[test]
+fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
+    let source = SnapshotSource::Codex;
+    let supported = crate::heap_layout_bound::layout_supported();
+    let _cutover = codex_counting_version::TestCutover::set(0);
+    let capture = claude_request_identity::capture_by_default();
+    let namespace = Scope("durable-codex".into());
+    for arm in ["restore", "view_changed", "priority_changed"] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(
+            &json!({"type":"turn_context","timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"turn_id":"turn-b2-1","model":"fixture-model"}}),
+        );
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let live = |priority: bool| {
+            move |scan: &mut OwnedSourceScan| {
+                let mut turns = (0..64)
+                    .map(|n| format!("unrelated-turn-{n}"))
+                    .collect::<BTreeSet<_>>();
+                if priority {
+                    turns.insert("turn-b2-1".into());
+                }
+                scan.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
+                    priority_turns: turns,
+                    incomplete: false,
+                }));
+                scan.codex_parent_ownership_ledgers =
+                    Some(Arc::new(Mutex::new(BTreeMap::from([(
+                        "unrelated-parent".to_string(),
+                        CodexParentOwnershipLedger {
+                            signatures: Vec::new(),
+                            scan_complete: true,
+                            opened_object_identity: "synthetic-unrelated".into(),
+                            unresolvable: None,
+                            opened_changed_nanos: 0,
+                            opened_modified_nanos: 0,
+                            opened_birth_nanos: 0,
+                        },
+                    )]))));
+            }
+        };
+        let state = fixture.dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let index_path = state.join("index.json");
+        let lock = crate::locked_state_dir::test_locks::hold(&state);
+        let first = Arc::new(sampled_scan::SharedCache::default());
+        first.durable_begin_pass(source, &index_path, &namespace, capture);
+        let (mut index, _, modes, _) = production_scan_at_with_setup(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(first.clone()),
+            &namespace.0,
+            NOW,
+            live(false),
+        );
+        assert_eq!(modes, (1, 0, 0), "{arm}");
+        index.save(&index_path).unwrap();
+        first.durable_write_after_save(lock, source, &index);
+        let records = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+            .map_or(0, |entries| entries.count());
+        assert_eq!(
+            records,
+            usize::from(supported),
+            "{arm}: written after the save"
+        );
+
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let mut loaded = ScanIndex::load(&index_path).unwrap();
+        let key = local_index_key(&fixture.file.0);
+        if arm == "view_changed" {
+            let entry = loaded.files.get_mut(&key).unwrap();
+            entry.codex_counting_v2 = !entry.codex_counting_v2;
+        }
+        let second = Arc::new(sampled_scan::SharedCache::default());
+        second.durable_begin_pass(source, &index_path, &namespace, capture);
+        let (_, scan, modes, _) = production_scan_at_with_setup(
+            &fixture,
+            source,
+            loaded.clone(),
+            Some(second.clone()),
+            &namespace.0,
+            NOW,
+            live(arm == "priority_changed"),
+        );
+        let (counters, store) = second.durable_counters(source).unwrap();
+        eprintln!("{arm}: {}", counters.summary(source, &store));
+        let restored = arm != "view_changed" && supported;
+        assert_eq!(counters.restored, u64::from(restored), "{arm}");
+        if supported && arm == "view_changed" {
+            assert_eq!(counters.ineligible.get("scope"), Some(&1), "{arm}");
+        }
+        let expected = if supported && arm == "restore" {
+            (0, 1, 0)
+        } else {
+            (1, 0, 0)
+        };
+        assert_eq!(modes, expected, "{arm}");
+        let (_, full, _, _) = production_scan_at_with_setup(
+            &fixture,
+            source,
+            loaded,
+            None,
+            &namespace.0,
+            NOW,
+            live(arm == "priority_changed"),
+        );
+        assert_eq!(
+            production_body(source, scan),
+            production_body(source, full),
+            "{arm}"
+        );
+    }
+}
 fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value {
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
     serde_json::to_value(scan.snapshots).unwrap()

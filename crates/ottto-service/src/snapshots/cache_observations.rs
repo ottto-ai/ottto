@@ -340,7 +340,7 @@ pub(crate) fn codex_slot(
 crate::heap_layout_bound::fields!(CacheObservations; schema_version, operations, coverage, omitted_observation_count);
 crate::heap_layout_bound::fields!(OwnedRequest; slot, ordering, compaction_before, configuration_changed, configuration_witness, idle_seconds);
 crate::durable_tail_codec::durable_struct!(OwnedRequest {
-    L slot: RequestSlot,
+    D slot: RequestSlot,
     N ordering: String,
     N compaction_before: bool,
     N configuration_changed: bool,

@@ -1598,6 +1598,90 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
         .accepted_snapshot_fingerprint_recorded(&fingerprint));
 }
 
+/// SOURCE B1: the cooldown test's twin with the durable store present.
+/// Both arms hold the state-directory lock, so their earlier cycles write
+/// the retained copy; the cold arm then drops the store, the warm arm keeps
+/// it. Across restarts that could restore the file, the quiet cycles still
+/// skip it; the daily re-offer still fires at the due time; and the warm
+/// arm's re-offer outcome equals the cold arm's. A restore never suppresses
+/// or postpones a due re-offer.
+#[cfg(unix)]
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore() {
+    if !supported("cooldown_reoffer_is_neither_suppressed_nor_postponed_by_a_durable_restore") {
+        return;
+    }
+    let mut outcomes = Vec::new();
+    for warm in [false, true] {
+        let name = if warm {
+            "reoffer-cooldown-warm"
+        } else {
+            "reoffer-cooldown-cold"
+        };
+        let (mut pipeline, fingerprint, t1, deadline) = refused_then_conflicted_holding(name, true);
+        let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
+        assert!(
+            pipeline.durable_records() > 0,
+            "{name}: written after the save"
+        );
+        for (now, restart) in [
+            (t1 + 3_600, false),
+            (t1 + 7_200, true),
+            (t1 + 13 * 3_600, true),
+            (t1 + DAY - 1, true),
+        ] {
+            pipeline.make_conflict_retry_due(&fingerprint);
+            let (quiet, parsed, bytes) = pipeline.measured_cycle(now, restart);
+            let at = now - t1;
+            assert_eq!((parsed, bytes), (0, 0), "{name}: no re-read at +{at}s");
+            assert_eq!(quiet.leased_offers, 0, "{name}: +{at}s");
+            assert_eq!(quiet.cooldown_deferred, 1, "{name}: +{at}s");
+            assert!(quiet.result.is_ok(), "{name}: {:?}", quiet.result);
+            assert_eq!(
+                pipeline.server.offered().len(),
+                2,
+                "{name}: no POST before the day"
+            );
+            assert_eq!(
+                reoffer_json(&quiet, &fingerprint)["retry_after_unix_seconds"],
+                deadline,
+                "{name}: +{at}s"
+            );
+        }
+        if !warm {
+            pipeline.drop_durable_stores();
+        }
+        let due = deadline.as_u64().unwrap() + 60;
+        let (day2, _, bytes) = pipeline.measured_cycle(due, true);
+        if warm {
+            assert!(bytes < size, "{name}: restored, {bytes} >= {size}");
+        } else {
+            assert!(bytes >= size, "{name}: a cold re-read: {bytes} < {size}");
+        }
+        let offered = pipeline.server.offered();
+        outcomes.push((
+            day2.result.is_ok(),
+            day2.leased_offers,
+            offered.len(),
+            offered.last().map(fingerprint_of) == Some(fingerprint.clone()),
+            day2.cooldown_deferred,
+            day2.progress
+                .permanent_rejections
+                .contains_key(&fingerprint),
+            day2.index
+                .accepted_snapshot_fingerprint_recorded(&fingerprint),
+        ));
+    }
+    assert_eq!(
+        outcomes[1], outcomes[0],
+        "warm re-offer equals the cold arm"
+    );
+    assert_eq!(outcomes[1], (true, 1, 3, true, 0, false, true));
+}
+
 /// O1 controls: a file that changes during the cooldown is re-read and its
 /// new body offered normally; an injected clock rollback re-clamps the
 /// reservation and still re-reads nothing for the unchanged file.

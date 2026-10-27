@@ -326,7 +326,7 @@ enum Closed {
 
 #[derive(Clone)]
 struct ClosedTurnFilter(Box<[u64; CLOSED_TURN_FILTER_WORDS]>);
-crate::durable_tail_codec::durable_struct!(ClosedTurnFilter(H x0: Box<[u64; CLOSED_TURN_FILTER_WORDS]>));
+crate::durable_tail_codec::durable_struct!(ClosedTurnFilter(L x0: Box<[u64; CLOSED_TURN_FILTER_WORDS]>));
 
 impl ClosedTurnFilter {
     fn new() -> Self {
@@ -1151,7 +1151,9 @@ crate::durable_tail_codec::durable_struct!(OccurrenceReducer {
     N line_ui: Option<(T6, T6)>,
     N turn: Option<BoundTurn>,
     L closed_turns: VecDeque<String>,
-    H closed_filter: Option<ClosedTurnFilter>,
+    // A membership filter over closed turn ids (class L, provider ids):
+    // it carries strictly less than the ids, so it is L, not H (F1).
+    L closed_filter: Option<ClosedTurnFilter>,
     N counters: OccurrenceCounters,
 });
 crate::heap_layout_bound::fields!(Epoch; base, hwm, first_id, contiguous);
