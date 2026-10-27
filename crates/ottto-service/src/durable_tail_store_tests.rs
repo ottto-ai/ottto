@@ -986,6 +986,66 @@ fn certificate_ignores_ctime_and_refuses_content_changes() {
     assert_eq!(admits(&replaced, &cert_r), Err(FullReason::Replaced));
 }
 
+/// SOURCE P2-5: both certificate samples are stored as the
+/// `ottto-dt-sample:v1` domain-separated SHA-256 of their window. For a file
+/// shorter than one window, the head sample is the whole file, yet neither
+/// digest is the file's plain SHA-256, and the envelope holds neither raw
+/// bytes nor the plain digest. The envelope's 32-byte digests are exactly the
+/// audited `ENVELOPE_H` list.
+#[test]
+fn certificate_samples_are_domain_separated_digests() {
+    use sha2::Digest as _;
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let content = b"{\"canary\":\"CANARY-SMALL-FILE\"}\n";
+    let path = scratch.transcript("t.jsonl", content);
+    let cert = certificate(&path);
+    assert_eq!(u64::from(cert.sample_len), content.len() as u64);
+    let plain: Digest32 = sha2::Sha256::digest(content).into();
+    let separated: Digest32 = sha2::Sha256::new()
+        .chain_update(b"ottto-dt-sample:v1\0")
+        .chain_update(content)
+        .finalize()
+        .into();
+    assert_eq!(
+        crate::transcript_acquisition::DURABLE_SAMPLE_DOMAIN,
+        b"ottto-dt-sample:v1\0"
+    );
+    assert_eq!(cert.head_sha256, separated);
+    assert_eq!(cert.boundary_sha256, separated);
+    assert_ne!(cert.head_sha256, plain);
+    let mut store = scratch.store();
+    let b = binding("acct", "scope", ("fp", None));
+    store
+        .write_after_save(&lock, 1, vec![pending(b.clone(), cert.clone(), 1)])
+        .unwrap();
+    let bytes = fs::read(record_file(&store, &b.key)).unwrap();
+    assert!(!bytes.windows(plain.len()).any(|window| window == plain));
+    assert!(!bytes
+        .windows(content.len())
+        .any(|window| window == content.as_slice()));
+    assert_eq!(
+        bytes
+            .windows(separated.len())
+            .filter(|window| *window == separated)
+            .count(),
+        2,
+        "head and boundary"
+    );
+    assert!(admits(&path, &cert).unwrap().unchanged);
+    // The envelope layout holds exactly the listed digests: allowlist, four
+    // binding digests and two samples.
+    assert_eq!(ENVELOPE_H.len(), 1 + 4 + 2);
+    assert_eq!(
+        HEADER_BYTES - CERTIFICATE_BYTES,
+        8 + 2 + 32 + 1 + 32 * 4 + 8 + 4
+    );
+    assert_eq!(
+        CERTIFICATE_BYTES,
+        8 * 3 + 8 * 2 + 8 + 8 + 4 + 32 * 2 + 8 + 1 + 8
+    );
+}
+
 /// A certificate survives the envelope byte for byte.
 #[test]
 fn certificate_survives_the_envelope() {

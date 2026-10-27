@@ -259,8 +259,64 @@ fn call_bytes(id: &str, call: &OpeningCall) -> usize {
         + call.files.iter().map(String::capacity).sum::<usize>()
 }
 
-fn blob_bytes(hash: &str) -> usize {
-    node_bytes::<ClaudeBlob>() + hash.len()
+/// A blob entry: its node plus its inline key, charged in full (the node
+/// estimate already holds a `String`-sized key slot).
+fn blob_bytes() -> usize {
+    node_bytes::<ClaudeBlob>() + std::mem::size_of::<ClaudeRequestKey>()
+}
+
+/// A Claude `api-request-shape` or `api-request-blob` key (`shapeHash`, blob
+/// `hash`): a client-minted content hash of instruction or system text, not a
+/// provider id. Held only as its domain-separated SHA-256 (M1, SOURCE P2-5:
+/// `H`, never `L`); every incoming key is hashed before any lookup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct ClaudeRequestKey([u8; 32]);
+
+impl ClaudeRequestKey {
+    const SHAPE_DOMAIN: &'static [u8] = b"ottto-dt-claude-shape-key:v1\0";
+    const BLOB_DOMAIN: &'static [u8] = b"ottto-dt-claude-blob-key:v1\0";
+
+    fn shape(raw: &str) -> Self {
+        Self::of(Self::SHAPE_DOMAIN, raw)
+    }
+
+    fn blob(raw: &str) -> Self {
+        Self::of(Self::BLOB_DOMAIN, raw)
+    }
+
+    fn of(domain: &[u8], raw: &str) -> Self {
+        use sha2::Digest as _;
+        Self(
+            sha2::Sha256::new()
+                .chain_update(domain)
+                .chain_update(raw.as_bytes())
+                .finalize()
+                .into(),
+        )
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestKey {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    // 32 inline bytes: no heap, one walker visit like the key it replaced.
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// An opening call's provider call or tool-use id, apart from the tool name
+/// its `OpeningCall` holds, so a record's `L` span is the id alone (M1,
+/// SOURCE P2-5).
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct OpeningCallId {
+    id: String,
+}
+
+impl std::borrow::Borrow<str> for OpeningCallId {
+    fn borrow(&self) -> &str {
+        &self.id
+    }
 }
 
 fn is_client_version(value: &str) -> bool {
@@ -435,8 +491,8 @@ pub(super) struct SessionStartState {
     parts_unmeasurable: bool,
     codex_tools_logged: bool,
     config_digest: Option<ConfigDigest>,
-    claude_shape: Option<(String, u64, u64)>,
-    claude_blobs: BTreeMap<String, ClaudeBlob>,
+    claude_shape: Option<(ClaudeRequestKey, u64, u64)>,
+    claude_blobs: BTreeMap<ClaudeRequestKey, ClaudeBlob>,
     memory_units: Option<u64>,
     instruction_load_cut: Option<bool>,
     /// Claude's request-1 instruction text, held for path matching.
@@ -447,7 +503,7 @@ pub(super) struct SessionStartState {
     /// Codex: the one prelude parser, which also holds the AGENTS.md text
     /// for path matching.
     codex_prelude: Option<Box<CodexPreludeParser>>,
-    calls: BTreeMap<String, OpeningCall>,
+    calls: BTreeMap<OpeningCallId, OpeningCall>,
     last_codex_call: Option<String>,
     files: BTreeMap<String, OpeningFileState>,
     /// Files refused by the memory budget, by the request they arrive in.
@@ -492,6 +548,9 @@ crate::durable_tail_codec::durable_struct!(ConfigDigest {
     X b: u64,
     X len: u64,
 });
+crate::durable_tail_codec::durable_struct!(ClaudeRequestKey(H digest: [u8; 32]));
+crate::heap_layout_bound::fields!(OpeningCallId; id);
+crate::durable_tail_codec::durable_struct!(OpeningCallId { L id: String });
 crate::heap_layout_bound::fields!(OpeningCall; response, tool, candidates, files, answered, truncated);
 crate::durable_tail_codec::durable_struct!(OpeningCall {
     N response: u8,
@@ -527,14 +586,14 @@ crate::durable_tail_codec::durable_struct!(SessionStartState {
     N parts_unmeasurable: bool,
     N codex_tools_logged: bool,
     X config_digest: Option<ConfigDigest>,
-    L claude_shape: Option<(String, u64, u64)>,
-    L claude_blobs: BTreeMap<String, ClaudeBlob>,
+    D claude_shape: Option<(ClaudeRequestKey, u64, u64)>,
+    D claude_blobs: BTreeMap<ClaudeRequestKey, ClaudeBlob>,
     N memory_units: Option<u64>,
     N instruction_load_cut: Option<bool>,
     X instructions: Option<String>,
     N instructions_capped: bool,
     X codex_prelude: Option<Box<CodexPreludeParser>>,
-    L calls: BTreeMap<String, OpeningCall>,
+    D calls: BTreeMap<OpeningCallId, OpeningCall>,
     L last_codex_call: Option<String>,
     X files: BTreeMap<String, OpeningFileState>,
     N files_untracked: [u64; 2],
@@ -671,17 +730,13 @@ impl SessionStartState {
             + self
                 .calls
                 .iter()
-                .map(|(id, call)| call_bytes(id, call))
+                .map(|(id, call)| call_bytes(&id.id, call))
                 .sum::<usize>()
-            + self
-                .claude_blobs
-                .keys()
-                .map(|hash| blob_bytes(hash))
-                .sum::<usize>()
+            + self.claude_blobs.len().saturating_mul(blob_bytes())
             + self
                 .claude_shape
                 .as_ref()
-                .map_or(0, |(hash, _, _)| hash.capacity());
+                .map_or(0, |_| std::mem::size_of::<ClaudeRequestKey>());
     }
 
     // ---- Claude Code ----------------------------------------------------
@@ -816,19 +871,20 @@ impl SessionStartState {
             .flatten()
             .map(json_units)
             .sum();
-        let hash = str_at(value, "shapeHash").unwrap_or("").to_string();
-        if !self.charge(hash.capacity()) {
+        let key = ClaudeRequestKey::shape(str_at(value, "shapeHash").unwrap_or(""));
+        if !self.charge(std::mem::size_of::<ClaudeRequestKey>()) {
             self.parts_unmeasurable = true;
             return;
         }
-        self.claude_shape = Some((hash, system, tools));
+        self.claude_shape = Some((key, system, tools));
     }
 
     fn claude_blob(&mut self, value: &Value) {
         let (Some(hash), Some(message)) = (str_at(value, "hash"), value.get("message")) else {
             return;
         };
-        if !self.claude_blobs.contains_key(hash) && !self.charge(blob_bytes(hash)) {
+        let key = ClaudeRequestKey::blob(hash);
+        if !self.claude_blobs.contains_key(&key) && !self.charge(blob_bytes()) {
             self.parts_unmeasurable = true;
             return;
         }
@@ -866,7 +922,7 @@ impl SessionStartState {
                 _ => blob.parts[Part::Other as usize] += json_units(item),
             }
         }
-        self.claude_blobs.insert(hash.to_string(), blob);
+        self.claude_blobs.insert(key, blob);
     }
 
     /// The first `api-request`: request 1's tail of measured blobs.
@@ -876,19 +932,24 @@ impl SessionStartState {
         let blobs = std::mem::take(&mut self.claude_blobs);
         self.recount_held();
         let tail = value.get("tail").and_then(Value::as_array);
-        let (Some((shape_hash, system, tools)), Some(tail)) = (shape, tail) else {
+        let (Some((shape_key, system, tools)), Some(tail)) = (shape, tail) else {
             self.parts_unmeasurable = true;
             return;
         };
         // A `base` continues an earlier request: history was copied in.
-        if value.get("base").is_some() || str_at(value, "shapeHash") != Some(shape_hash.as_str()) {
+        if value.get("base").is_some()
+            || str_at(value, "shapeHash").map(ClaudeRequestKey::shape) != Some(shape_key)
+        {
             self.parts_unmeasurable = true;
             return;
         }
         self.parts[Part::System as usize] += system;
         self.parts[Part::Tools as usize] += tools;
         for hash in tail {
-            match hash.as_str().and_then(|hash| blobs.get(hash)) {
+            match hash
+                .as_str()
+                .and_then(|hash| blobs.get(&ClaudeRequestKey::blob(hash)))
+            {
                 Some(blob) if !blob.unmeasurable => {
                     for (total, part) in self.parts.iter_mut().zip(blob.parts) {
                         *total += part;
@@ -1192,7 +1253,8 @@ impl SessionStartState {
             ..OpeningCall::default()
         };
         if self.charge(call_bytes(id, &call)) {
-            self.calls.insert(id.to_string(), call);
+            self.calls
+                .insert(OpeningCallId { id: id.to_string() }, call);
         }
     }
 
@@ -3240,6 +3302,58 @@ mod tests {
                 quantile(&mut total.wire, 1.0),
             );
         }
+    }
+
+    /// M1, SOURCE P2-5: an opening call's `L` span is its id alone, apart
+    /// from the tool name its `OpeningCall` holds (`U`); request-shape and
+    /// blob keys are held only as their domain-separated digests, and an
+    /// incoming raw key still finds its entry.
+    #[test]
+    fn opening_call_ids_are_the_only_l_span_and_request_keys_are_digests() {
+        use crate::durable_tail_codec::{take_l_spans, Durable, Enc};
+        let mut state = SessionStartState::default();
+        state.open_call("call_CANARYSPLITcx", 1, "call_NAMEHALFcx");
+        assert!(state.calls.contains_key("call_CANARYSPLITcx"));
+        state.claude_blob(&json!({"hash": "blob-RAWKEY", "message": {"role": "user",
+            "content": [{"type": "text", "text": "hello"}]}}));
+        state.claude_shape(
+            &json!({"shapeHash": "shape-RAWKEY", "shape": {"system": [], "tools": []}}),
+        );
+        assert!(state
+            .claude_blobs
+            .contains_key(&ClaudeRequestKey::blob("blob-RAWKEY")));
+        assert_eq!(
+            state.claude_shape.map(|(key, ..)| key),
+            Some(ClaudeRequestKey::shape("shape-RAWKEY"))
+        );
+        take_l_spans();
+        let mut e = Enc::bytes(1 << 20);
+        state.put(&mut e).unwrap();
+        let body = e.into_bytes();
+        let spans = take_l_spans();
+        let at = |needle: &str| {
+            body.windows(needle.len())
+                .position(|window| window == needle.as_bytes())
+        };
+        assert!(at("RAWKEY").is_none(), "a raw request key reached the body");
+        let id = at("call_CANARYSPLITcx").unwrap();
+        let leaf = spans
+            .iter()
+            .filter(|(start, end, _)| *start <= id && id + 18 <= *end)
+            .min_by_key(|(start, end, _)| end - start)
+            .map(|(_, _, path)| *path);
+        assert_eq!(leaf, Some("OpeningCallId.id"));
+        let label = tool_label("call_NAMEHALFcx");
+        let name = at(&label).unwrap();
+        assert!(
+            spans
+                .iter()
+                .all(|(start, end, _)| name >= *end || name + label.len() <= *start),
+            "the tool name sits inside an L span"
+        );
+        // The request then measures through the hashed keys.
+        state.claude_request(&json!({"shapeHash": "shape-RAWKEY", "tail": ["blob-RAWKEY"]}));
+        assert!(!state.parts_unmeasurable);
     }
 
     /// F1: `ConfigDigest` is a reversible rolling digest of instruction text,

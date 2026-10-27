@@ -281,7 +281,9 @@ fn codex_append() -> Vec<String> {
 }
 
 /// Private instruction text (Claude instructions attachment and its
-/// request-1 blob), around a plain session.
+/// request-1 blob), around a plain session. The request-shape and blob keys
+/// depend on the secret too, so a raw key reaching the body would show as
+/// the secret (SOURCE P2-5).
 fn claude_instruction_lines(secret: &str) -> Vec<String> {
     let mut lines = vec![
         json!({"type":"attachment","sessionId":CLAUDE_SESSION,"uuid":"a-1",
@@ -291,19 +293,39 @@ fn claude_instruction_lines(secret: &str) -> Vec<String> {
     ];
     let mut session = claude_lines(2, 2);
     let request = [
-        json!({"type":"api-request-shape","sessionId":CLAUDE_SESSION,"shapeHash":"shape-dt",
+        json!({"type":"api-request-shape","sessionId":CLAUDE_SESSION,"shapeHash":shape_key(secret),
             "shape":{"system":[{"type":"text","text":"You are Claude."}],"tools":[{"name":"Bash"}]}}),
-        json!({"type":"api-request-blob","sessionId":CLAUDE_SESSION,"hash":"blob-dt",
+        json!({"type":"api-request-blob","sessionId":CLAUDE_SESSION,"hash":blob_key(secret),
             "message":{"role":"user","content":[
                 {"type":"text","text":format!(
                     "<system-reminder>\nCodebase and user instructions Project rules: {secret}")},
                 {"type":"text","text":"CANARY_PROMPT_dt please review"}]}}),
-        json!({"type":"api-request","sessionId":CLAUDE_SESSION,"shapeHash":"shape-dt",
-            "tail":["blob-dt"]}),
+        json!({"type":"api-request","sessionId":CLAUDE_SESSION,"shapeHash":shape_key(secret),
+            "tail":[blob_key(secret)]}),
     ];
     // Before the first assistant line (two fillers, the prompt, two fillers).
     session.splice(5..5, request.iter().map(Value::to_string));
     lines.extend(session);
+    lines
+}
+
+fn shape_key(secret: &str) -> String {
+    format!("shape-{secret}")
+}
+
+fn blob_key(secret: &str) -> String {
+    format!("blob-{secret}")
+}
+
+/// `claude_instruction_lines` cut before its `api-request`: the request-1
+/// window still holds the shape and blob, keyed by the secret, at the seal.
+fn claude_held_request_lines(secret: &str) -> Vec<String> {
+    let mut lines = claude_instruction_lines(secret);
+    let blob = lines
+        .iter()
+        .position(|line| line.contains("\"api-request-blob\""))
+        .expect("blob line");
+    lines.truncate(blob + 1);
     lines
 }
 
@@ -444,15 +466,15 @@ fn cases() -> Vec<Case> {
 fn id_leaves(id: &str) -> &'static [&'static str] {
     if id.starts_with("toolu_") {
         &[
-            "CompactClaudeResponseRecord.tool_uses",
+            "ClaudeToolUse.id",
             "SnapshotAccumulator.seen_claude_capability_tool_uses",
-            "SessionStartState.calls",
+            "OpeningCallId.id",
         ]
     } else if id.starts_with("call_") {
         &[
-            "SnapshotAccumulator.activity_call_tools",
+            "ActivityCallId.id",
             "SnapshotAccumulator.activity_mcp_call_ids",
-            "SessionStartState.calls",
+            "OpeningCallId.id",
             "SessionStartState.last_codex_call",
         ]
     } else {
@@ -659,6 +681,110 @@ fn e_class_canaries_never_persist() {
         .err(),
         Some(Refuse::NonEmpty("SnapshotAccumulator.activity_skills"))
     );
+}
+
+/// SOURCE P2-5: request-shape and blob keys (client content hashes of
+/// instruction text) are stored only as their domain-separated SHA-256 (`H`),
+/// never raw, whatever the key holds. The fixture seals with the request-1
+/// window still holding both, keyed by the secret, so a raw key would show as
+/// the secret; the separated digests are each in the body exactly once, and
+/// the copy restores exactly.
+#[test]
+fn request_shape_and_blob_keys_are_stored_only_as_domain_separated_digests() {
+    use sha2::Digest as _;
+    let secret = "CANARY_KEYSECRET_dt";
+    let scratch = Scratch::new("request-keys");
+    let path = scratch.write("t.jsonl", &claude_held_request_lines(secret));
+    let (reduction, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
+    assert!(occurrences(&body, secret.as_bytes()).is_empty());
+    for (domain, raw) in [
+        (&b"ottto-dt-claude-shape-key:v1\0"[..], shape_key(secret)),
+        (&b"ottto-dt-claude-blob-key:v1\0"[..], blob_key(secret)),
+    ] {
+        let plain: [u8; 32] = sha2::Sha256::digest(raw.as_bytes()).into();
+        let separated: [u8; 32] = sha2::Sha256::new()
+            .chain_update(domain)
+            .chain_update(raw.as_bytes())
+            .finalize()
+            .into();
+        assert!(occurrences(&body, raw.as_bytes()).is_empty(), "{raw}");
+        assert!(occurrences(&body, &plain).is_empty(), "{raw}");
+        assert!(occurrences(&body, hex(separated).as_bytes()).is_empty());
+        assert_eq!(occurrences(&body, &separated).len(), 1, "{raw}");
+    }
+    let (restored, _) = restore(&path, &body, SnapshotSource::ClaudeCode).unwrap();
+    assert_eq!(full_digest(&restored), full_digest(&reduction));
+}
+
+/// SOURCE P2-5: an open Codex call is `{L id, U name}`. The encoded map's
+/// only `L` span is the id, so an id copied into the name half would sit
+/// outside every `L` span and fail the canary.
+#[test]
+fn open_call_l_span_is_the_id_alone() {
+    use crate::snapshots::{ActivityCallId, ActivityCallTool};
+    let map = BTreeMap::from([(
+        ActivityCallId {
+            id: "call_CANARYSPLITcx".into(),
+        },
+        ActivityCallTool {
+            name: "call_NAMEHALFcx".into(),
+        },
+    )]);
+    take_l_spans();
+    let mut e = Enc::bytes(1 << 10);
+    map.put(&mut e).unwrap();
+    let body = e.into_bytes();
+    let spans = take_l_spans();
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    let (start, end, path) = spans[0];
+    assert_eq!(path, "ActivityCallId.id");
+    let id = occurrences(&body, b"call_CANARYSPLITcx")[0];
+    assert!(start <= id && id + "call_CANARYSPLITcx".len() <= end);
+    let name = occurrences(&body, b"call_NAMEHALFcx")[0];
+    assert!(name >= end || name + "call_NAMEHALFcx".len() <= start);
+}
+
+/// P2-1 (SOURCE): a selector context holding any attribution capture key
+/// (raw skill, plugin, MCP or subagent names) is `E`: the record is refused
+/// under its own counted class and the entry reads Full. Any other context
+/// key persists (`U`).
+#[test]
+fn attribution_selector_context_refuses_the_record() {
+    let scratch = Scratch::new("attribution");
+    let path = scratch.write("t.jsonl", &claude_lines(1, 1));
+    let (plain, _) = full_read(&path, SnapshotSource::ClaudeCode);
+    let mut kept = plain.clone();
+    kept.accumulator.current_selector.insert(
+        "service_tier",
+        "priority".into(),
+        "derived_from_logs_2",
+    );
+    encode(&kept, crate::durable_tail_store::RECORD_BYTES, line_cap())
+        .expect("a non-attribution selector context persists");
+    for key in crate::snapshots::CLAUDE_ATTRIBUTION_SELECTOR_KEYS {
+        let mut captured = plain.clone();
+        captured.accumulator.current_selector.insert(
+            key,
+            "CANARY_SKILL_dt".into(),
+            "claude_code_attribution_field",
+        );
+        assert_eq!(
+            encode(
+                &captured,
+                crate::durable_tail_store::RECORD_BYTES,
+                line_cap()
+            )
+            .err(),
+            Some(Refuse::NonEmpty("SelectorCapture.context.attribution")),
+            "{key}"
+        );
+    }
 }
 
 /// Decode plus bounded re-derivation gives back exactly the retained copy,
@@ -923,8 +1049,23 @@ fn allowlist_digest_binds_source_and_field_classes() {
         "E provider_skills",
         "E activity_skills",
         "I codex_turn_traces",
-        "L activity_call_tools",
+        "D activity_call_tools",
         "L activity_mcp_call_ids",
+        "L id",
+        "U name",
+        "D tool_uses",
+        "D claude_shape",
+        "D claude_blobs",
+        "D calls",
+        "H digest",
+        "E context.attribution",
+        "D reducer",
+        "D epoch",
+        "D last_native",
+        "D turn",
+        "D closed_filter",
+        "L claude_compaction_link_tip",
+        "E claude_fork_parent",
         "D durable_marks",
         "H title",
     ] {
@@ -942,6 +1083,39 @@ fn allowlist_digest_binds_source_and_field_classes() {
 /// hash cannot compile as `H`); this table pins the algorithm per field, so
 /// a new `H` field fails here until it is audited (F1).
 const H_AUDIT: &[(&str, &str)] = &[
+    (
+        "Binding.context",
+        "durable_tail_store::digest(\"ottto-dt-context:v1\", [namespace, upload context])",
+    ),
+    (
+        "Binding.entry",
+        "digest(\"ottto-dt-replay-entry:v1\", [digest(\"ottto-dt-entry:v1\", ..), ..])",
+    ),
+    (
+        "Binding.key",
+        "durable_tail_store::digest(\"ottto-dt-key:v1\", [source tag, index key])",
+    ),
+    (
+        "Binding.scope",
+        "digest(\"ottto-dt-replay-scope:v1\", [digest(\"ottto-dt-scope:v1\", ..), ..])",
+    ),
+    (
+        "ClaudeRequestKey.digest",
+        "SHA-256(\"ottto-dt-claude-shape-key:v1\\0\" || shapeHash) or \
+         SHA-256(\"ottto-dt-claude-blob-key:v1\\0\" || blob hash)",
+    ),
+    (
+        "DurableCertificate.boundary_sha256",
+        "SHA-256(\"ottto-dt-sample:v1\\0\" || boundary window)",
+    ),
+    (
+        "DurableCertificate.head_sha256",
+        "SHA-256(\"ottto-dt-sample:v1\\0\" || head window)",
+    ),
+    (
+        "Envelope.allowlist",
+        "Shape::digest: SHA-256(\"ottto-durable-tail-shape:v1\" || shape text)",
+    ),
     (
         "OrgMarkers.context_digest",
         "SHA-256(\"ottto-claude-org-marker-context:v1\\0\" || lowercased email)",
@@ -1034,7 +1208,12 @@ fn h_fields_are_audited() {
         .iter()
         .map(|(path, _)| path.to_string())
         .collect::<BTreeSet<_>>();
-    assert_eq!(h_paths(&shape_text()), audited);
+    // The body's `H` fields and the envelope's digests (SOURCE P2-5).
+    let mut paths = h_paths(&shape_text());
+    for path in crate::durable_tail_store::ENVELOPE_H {
+        assert!(paths.insert(path.to_string()), "{path} listed twice");
+    }
+    assert_eq!(paths, audited);
 }
 
 /// Full-fallback classes on a synthetic corpus, by the refusing field: a

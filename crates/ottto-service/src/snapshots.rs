@@ -542,6 +542,22 @@ pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
 const CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD: &str = "attribution_mcp_tool";
+/// (raw CC key, canonical selector key). Subagent first (priority dimension).
+const CLAUDE_ATTRIBUTION_FIELDS: [(&str, &str); 5] = [
+    ("attributionAgent", "attribution_subagent"),
+    ("attributionSkill", "attribution_skill"),
+    ("attributionPlugin", "attribution_plugin"),
+    ("attributionMcpServer", "attribution_mcp_server"),
+    ("attributionMcpTool", CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD),
+];
+/// The selector keys attribution capture writes: raw names, never persisted.
+const CLAUDE_ATTRIBUTION_SELECTOR_KEYS: [&str; 5] = [
+    CLAUDE_ATTRIBUTION_FIELDS[0].1,
+    CLAUDE_ATTRIBUTION_FIELDS[1].1,
+    CLAUDE_ATTRIBUTION_FIELDS[2].1,
+    CLAUDE_ATTRIBUTION_FIELDS[3].1,
+    CLAUDE_ATTRIBUTION_FIELDS[4].1,
+];
 const MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS: usize = 100;
 
 /// Hash epoch of the policy-neutral `content_hash`.
@@ -17005,6 +17021,26 @@ crate::durable_tail_codec::durable_enum!(CodexOwnershipBoundary {
     6 => AmbiguousFork,
 });
 
+/// An open Codex call's provider call id, apart from its tool name, so a
+/// durable record's `L` span is the id alone (M1, SOURCE P2-5).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ActivityCallId {
+    id: String,
+}
+
+impl std::borrow::Borrow<str> for ActivityCallId {
+    fn borrow(&self) -> &str {
+        &self.id
+    }
+}
+
+/// The tool name an open Codex call was counted under (`U`: the activity
+/// tool counts upload it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActivityCallTool {
+    name: String,
+}
+
 #[derive(Clone)]
 struct SnapshotAccumulator {
     source: SnapshotSource,
@@ -17182,8 +17218,8 @@ struct SnapshotAccumulator {
     activity_tool_counts: BTreeMap<String, u64>,
     // Keyed by raw call id (class L): never uploaded except where the upload
     // contract already carries it; persisted only in the local durable-tail
-    // store.
-    activity_call_tools: BTreeMap<String, String>,
+    // store, apart from the tool name (U).
+    activity_call_tools: BTreeMap<ActivityCallId, ActivityCallTool>,
     activity_mcp_tool_counts: BTreeMap<String, u64>,
     // Codex MCP calls keyed by the backend's qualified `mcp__<server>__<tool>`
     // spelling. Fed by the same `mcp_tool_call_end` events as the activity map,
@@ -18422,7 +18458,7 @@ impl SnapshotAccumulator {
     }
 
     fn reclassify_activity_call_as_mcp(&mut self, call_id: &str) {
-        let Some(name) = self.activity_call_tools.remove(call_id) else {
+        let Some(ActivityCallTool { name }) = self.activity_call_tools.remove(call_id) else {
             return;
         };
         let Some(count) = self.activity_tool_counts.get_mut(&name) else {
@@ -34701,15 +34737,7 @@ fn capture_claude_attribution(value: &Value, selector: &mut SelectorCapture, ena
     if !enabled {
         return;
     }
-    // (raw CC key, canonical selector key). Subagent first (priority dimension).
-    const ATTRIBUTION_FIELDS: &[(&str, &str)] = &[
-        ("attributionAgent", "attribution_subagent"),
-        ("attributionSkill", "attribution_skill"),
-        ("attributionPlugin", "attribution_plugin"),
-        ("attributionMcpServer", "attribution_mcp_server"),
-        ("attributionMcpTool", "attribution_mcp_tool"),
-    ];
-    for (raw_key, canonical_key) in ATTRIBUTION_FIELDS {
+    for (raw_key, canonical_key) in &CLAUDE_ATTRIBUTION_FIELDS {
         let attribution = string_at(value, &[raw_key]).and_then(|attribution| {
             if *canonical_key == CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD {
                 normalized_claude_attribution_mcp_tool_name(&attribution)
@@ -35953,7 +35981,9 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 } else {
                     accumulator.note_activity_tool(&name);
                     if let Some(call_id) = call_id {
-                        accumulator.activity_call_tools.insert(call_id, name);
+                        accumulator
+                            .activity_call_tools
+                            .insert(ActivityCallId { id: call_id }, ActivityCallTool { name });
                     }
                 }
             }
@@ -35966,7 +35996,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         }
         if payload_type.as_deref() == Some("function_call_output") {
             if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
-                accumulator.activity_call_tools.remove(&call_id);
+                accumulator.activity_call_tools.remove(call_id.as_str());
                 accumulator.activity_mcp_call_ids.remove(&call_id);
             }
         }
@@ -88695,11 +88725,60 @@ crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);
 crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids, codex_inventory_hold);
 crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
+crate::heap_layout_bound::fields!(ActivityCallId; id);
+crate::durable_tail_codec::durable_struct!(ActivityCallId { L id: String });
+crate::heap_layout_bound::fields!(ActivityCallTool; name);
+crate::durable_tail_codec::durable_struct!(ActivityCallTool { U name: String });
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
-crate::durable_tail_codec::durable_struct!(SelectorCapture {
-    U context: BTreeMap<String, String>,
-    U sources: BTreeMap<String, String>,
-});
+// P2-1 (SOURCE): Claude attribution capture (`OTTTO_CLAUDE_ATTRIBUTION_CAPTURE`)
+// puts raw skill, plugin, MCP and subagent names into `context`. A context
+// holding any attribution key is class `E`: the record is refused (counted as
+// `not_persisted{SelectorCapture.context.attribution}`) and the entry reads
+// Full after a restart, so raw names never reach the store. Any other
+// context is `U`. Hand-written for that one conditional refusal; the shape
+// names both rules, so the allowlist binds them.
+impl crate::durable_tail_codec::Durable for SelectorCapture {
+    fn put(
+        &self,
+        e: &mut crate::durable_tail_codec::Enc,
+    ) -> Result<(), crate::durable_tail_codec::Refuse> {
+        use crate::durable_tail_codec::Durable as _;
+        let Self { context, sources } = self;
+        if context
+            .keys()
+            .any(|key| CLAUDE_ATTRIBUTION_SELECTOR_KEYS.contains(&key.as_str()))
+        {
+            return Err(crate::durable_tail_codec::Refuse::NonEmpty(
+                "SelectorCapture.context.attribution",
+            ));
+        }
+        context.put(e)?;
+        sources.put(e)
+    }
+    fn take(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<Self, crate::durable_tail_codec::Corrupt> {
+        type Map = BTreeMap<String, String>;
+        Ok(Self {
+            context: <Map as crate::durable_tail_codec::Durable>::take(d)?,
+            sources: <Map as crate::durable_tail_codec::Durable>::take(d)?,
+        })
+    }
+    fn shape(s: &mut crate::durable_tail_codec::Shape) {
+        type Map = BTreeMap<String, String>;
+        if s.enter("SelectorCapture") {
+            s.push("U context");
+            <Map as crate::durable_tail_codec::Durable>::shape(s);
+            s.push("E context.attribution");
+            for key in CLAUDE_ATTRIBUTION_SELECTOR_KEYS {
+                s.push(key);
+            }
+            s.push("U sources");
+            <Map as crate::durable_tail_codec::Durable>::shape(s);
+            s.leave();
+        }
+    }
+}
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 // Measurement only (#665, X_out family U3): the identity the release proof peeks.
 crate::heap_layout_bound::fields!(crate::context_footprint::RepositoryIdentity; repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind);
@@ -88809,7 +88888,7 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     N codex_spawn_depth: Option<u64>,
     X codex_agent_label: Option<String>,
     U activity_tool_counts: BTreeMap<String, u64>,
-    L activity_call_tools: BTreeMap<String, String>,
+    D activity_call_tools: BTreeMap<ActivityCallId, ActivityCallTool>,
     U activity_mcp_tool_counts: BTreeMap<String, u64>,
     U activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
     L activity_mcp_call_ids: BTreeMap<String, bool>,
@@ -88864,7 +88943,7 @@ crate::durable_tail_codec::durable_struct!(SnapshotAccumulator {
     D codex_compaction_sizes: CodexCompactionSizes,
     D local_context_points: LocalContextPoints,
     D claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
-    U claude_compaction_link_tip: Option<(u64, String)>,
+    L claude_compaction_link_tip: Option<(u64, String)>,
     D session_start: Box<session_start::SessionStartState>,
     D durable_marks: crate::durable_tail_codec::DurableMarks,
 });
@@ -88899,7 +88978,7 @@ crate::heap_layout_bound::fields!(TerminalJsonlDisposition; source_file_fingerpr
 crate::heap_layout_bound::fields!(TerminalJsonlLoss; over_line_cap_count, recognized_usage_drop_count, dropped_usage_record_count);
 crate::heap_layout_bound::fields!(UsageBucketState; rows, first_activity_at, last_activity_at);
 crate::durable_tail_codec::durable_struct!(UsageBucketState {
-    U rows: BTreeMap<RowKey, BucketRowAccumulator>,
+    D rows: BTreeMap<RowKey, BucketRowAccumulator>,
     N first_activity_at: Option<String>,
     N last_activity_at: Option<String>,
 });

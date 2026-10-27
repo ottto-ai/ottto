@@ -3905,8 +3905,8 @@ fn tag_item(
 
 crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
 crate::durable_tail_codec::durable_struct!(OrgMarkers {
-    U entries: Vec<OrgMarker>,
-    U starting_marker: Option<OrgMarker>,
+    D entries: Vec<OrgMarker>,
+    D starting_marker: Option<OrgMarker>,
     N overflowed: bool,
     H context_digest: Option<String>,
     N context_changed: bool,

@@ -1294,7 +1294,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for ReadMode {
 
 /// A `Checkpoint`'s certificate for the local durable warm-cache store: the
 /// `PrefixSeal` shape, but with the unnormalized length kept beside the
-/// sealed offset, both samples kept only as SHA-256, and the file birth.
+/// sealed offset, both samples kept only as their domain-separated SHA-256
+/// (`DURABLE_SAMPLE_DOMAIN`), and the file birth.
 /// ctime is deliberately absent: a metadata-only change (mode, xattr) is not
 /// a refusal input. mtime stays one: at an unchanged length a moved mtime is
 /// a same-size edit, exactly as `select_mode` decides for a RAM checkpoint.
@@ -1333,10 +1334,20 @@ pub(crate) struct DurableAdmission {
     pub(crate) sample_bytes_read: usize,
 }
 
+/// The certificate samples' digest domain (M1, SOURCE P2-5): a sample digest
+/// is never the plain SHA-256 of its window, so a file shorter than one
+/// window never yields the plain hash of the whole file.
+#[cfg(unix)]
+pub(crate) const DURABLE_SAMPLE_DOMAIN: &[u8] = b"ottto-dt-sample:v1\0";
+
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
-fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
+pub(crate) fn durable_sample_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(DURABLE_SAMPLE_DOMAIN)
+        .chain_update(bytes)
+        .finalize()
+        .into()
 }
 
 /// The opened object's birth in unix nanos, or 0 when the file system cannot
@@ -1376,8 +1387,8 @@ impl Checkpoint {
             birth_nanos,
             sealed_offset: self.samples.sealed_offset,
             sample_len: u32::try_from(self.samples.head.len()).ok()?,
-            head_sha256: sha256_bytes(&self.samples.head),
-            boundary_sha256: sha256_bytes(&self.samples.boundary),
+            head_sha256: durable_sample_digest(&self.samples.head),
+            boundary_sha256: durable_sample_digest(&self.samples.boundary),
             verified_unix_seconds: self.last_full_verified_unix_seconds,
             audit_debt_unix_seconds: self.audit_debt.map(|debt| debt.due_unix_seconds),
         })
@@ -1463,7 +1474,7 @@ impl DurableCertificate {
         let len = self.sample_len as usize;
         let mut read = 0;
         let head = read_sample(file, 0, len, &mut read).map_err(|_| FullReason::HeadChanged)?;
-        if sha256_bytes(&head) != self.head_sha256 {
+        if durable_sample_digest(&head) != self.head_sha256 {
             return Err(FullReason::HeadChanged);
         }
         let boundary = read_sample(
@@ -1473,7 +1484,7 @@ impl DurableCertificate {
             &mut read,
         )
         .map_err(|_| FullReason::BoundaryChanged)?;
-        if sha256_bytes(&boundary) != self.boundary_sha256 {
+        if durable_sample_digest(&boundary) != self.boundary_sha256 {
             return Err(FullReason::BoundaryChanged);
         }
         let after = file

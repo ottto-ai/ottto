@@ -1140,20 +1140,21 @@ crate::durable_tail_codec::durable_struct!(CodexCounting {
     N evidence: AckEvidence,
     N cutover_unix_ms: Option<i64>,
     N version: Option<CountingVersion>,
-    N reducer: Option<Box<OccurrenceReducer>>,
+    D reducer: Option<Box<OccurrenceReducer>>,
 });
 crate::heap_layout_bound::fields!(OccurrenceReducer; epoch, last_native, prev_ui, native_since_prev_ui, line_ui, turn, closed_turns, closed_filter, counters);
 crate::durable_tail_codec::durable_struct!(OccurrenceReducer {
-    N epoch: Option<Epoch>,
-    N last_native: Option<LastNative>,
+    D epoch: Option<Epoch>,
+    D last_native: Option<LastNative>,
     N prev_ui: Option<UiTuple>,
     N native_since_prev_ui: bool,
     N line_ui: Option<(T6, T6)>,
-    N turn: Option<BoundTurn>,
+    D turn: Option<BoundTurn>,
     L closed_turns: VecDeque<String>,
-    // A membership filter over closed turn ids (class L, provider ids):
-    // it carries strictly less than the ids, so it is L, not H (F1).
-    L closed_filter: Option<ClosedTurnFilter>,
+    // A membership filter over closed turn ids: a nested type whose one
+    // field is L (provider ids; it carries strictly less than the ids, so
+    // it is L, not H (F1)).
+    D closed_filter: Option<ClosedTurnFilter>,
     N counters: OccurrenceCounters,
 });
 crate::heap_layout_bound::fields!(Epoch; base, hwm, first_id, contiguous);
@@ -1182,7 +1183,7 @@ crate::durable_tail_codec::durable_struct!(BoundTurn {
     N native: bool,
     N ui_published: bool,
     N staged_events: u64,
-    U pending: OwnedMap<(String, RowKey), PendingRow>,
+    D pending: OwnedMap<(String, RowKey), PendingRow>,
 });
 crate::heap_layout_bound::fields!(PendingRow; selector_context, selector_sources, usage, events, first_activity_at, last_activity_at);
 crate::durable_tail_codec::durable_struct!(PendingRow {

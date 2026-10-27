@@ -70,6 +70,21 @@ const CERTIFICATE_BYTES: usize = 8 * 3 // device, inode, length
     + 8; // debt
 const TRAILER_BYTES: usize = 32;
 
+/// Every 32-byte digest in the envelope (outside the codec body), as
+/// `Type.field`. Each is a domain-separated SHA-256; the H audit
+/// (`h_fields_are_audited`) pins what fills each one alongside the body's
+/// `H` fields (M1, SOURCE P2-5). The SHA-256 trailer is an integrity
+/// checksum over the record's own bytes, not a value, so it is not listed.
+pub(crate) const ENVELOPE_H: [&str; 7] = [
+    "Envelope.allowlist",
+    "Binding.key",
+    "Binding.context",
+    "Binding.scope",
+    "Binding.entry",
+    "DurableCertificate.head_sha256",
+    "DurableCertificate.boundary_sha256",
+];
+
 /// The single-writer seam. The state-directory lock (#801's `StateDirLock`,
 /// held as `crate::locked_state_dir::LockedStateDir`) implements it; nothing
 /// else may outside tests. A second daemon cannot take the lock,

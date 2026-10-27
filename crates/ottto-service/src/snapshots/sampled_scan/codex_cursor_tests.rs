@@ -6154,6 +6154,179 @@ fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
     assert_eq!(replayed_census(&hit), replayed_census(&reread));
 }
 
+/// SOURCE 1(b), B2's scan-level case (M1 durable warm-cache reuse): restore +
+/// Tail beside a non-empty held-fork memo and a non-empty parent ledger. One
+/// sessions root holds P (a complete ledger of real signatures), its kind
+/// (iii) fork C (held, memoized with P's ledger as its dependency) and a
+/// plain singleton S. Process 1 settles, saves and writes S's record under
+/// the state-directory lock. S grows (an unchanged file never reaches the
+/// read path). Process 2 (a fresh `SharedCache`, the saved index loaded,
+/// P's persisted ledger re-validated and re-injected by the scan) restores
+/// and Tails S on its first page while C is re-read and memoized again. The
+/// RAM copies are then released (`clear`, which keeps the memo, K6) and S
+/// grows again: the next page restores S from the same record with the memo
+/// non-empty and Tails it while C hits its memo. Each page's body, census,
+/// ledgers and #660 maps equal a cold Full (no cache) of the same index and
+/// files.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn durable_restore_then_tail_beside_a_held_fork_memo_and_parent_ledger_matches_cold_full() {
+    const SINGLE: &str = "019fa111-2222-7333-8444-cccccccccccc";
+    let source = SnapshotSource::Codex;
+    let namespace = Scope("cursor-fixture".into());
+    let capture = crate::snapshots::claude_request_identity::capture_by_default();
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    fs::write(
+        home.fixture.file(SINGLE),
+        jsonl(&[
+            json!({"timestamp": "2026-10-07T08:40:00Z", "type": "session_meta",
+                "payload": {"id": SINGLE, "thread_source": "user"}}),
+            turn_record("2026-10-07T08:40:01Z", "single-turn-1"),
+            usage_record("2026-10-07T08:40:02Z", (100, 50, 10, 0), (100, 50, 10, 0)),
+        ]),
+    )
+    .unwrap();
+    let page = |index: ScanIndex, cache: Option<Arc<SharedCache>>, n: u64| {
+        let mut index = index;
+        index.traversal = None;
+        page_selections(
+            &home.fixture,
+            index,
+            cache,
+            "cursor-fixture",
+            &collected_at(n),
+            |_| {},
+            usize::MAX,
+        )
+    };
+    let body = |scan: &SourceScanResult| {
+        let mut snapshots = scan.snapshots.clone();
+        apply_upload_policy(source, &mut snapshots, SnapshotUploadPolicy::default());
+        serde_json::to_value(snapshots).unwrap()
+    };
+    // P's indexed ledger: complete, with real signatures.
+    let ledger_signed = |index: &ScanIndex| {
+        let ledger = index
+            .codex_parent_ownership_ledgers
+            .get(PARENT)
+            .expect("indexed parent ledger");
+        assert!(
+            ledger.scan_complete && !ledger.signatures.is_empty(),
+            "a non-empty complete parent ledger"
+        );
+        ledger.opened_object_identity.clone()
+    };
+    let parent_records = |index: &ScanIndex| {
+        (
+            serde_json::to_vec(&index.codex_parent_ownership_ledgers).unwrap(),
+            serde_json::to_vec(&index.codex_parent_side).unwrap(),
+            serde_json::to_vec(&index.codex_parent_side_requests).unwrap(),
+            serde_json::to_vec(&index.codex_parent_prefix_proofs).unwrap(),
+        )
+    };
+    let memo_depends_on = |cache: &SharedCache, identity: &str| {
+        let entry = home
+            .child_entry(cache)
+            .unwrap_or_else(|| panic!("C's hold is memoized: {}", counters(cache)));
+        let dep = entry.parent.as_ref().expect("parent dependency");
+        assert_eq!(
+            (dep.id.as_str(), dep.ledger.as_deref()),
+            (PARENT, Some(identity)),
+            "the memo used P's ledger"
+        );
+    };
+
+    // Process 1.
+    let state = home.fixture._dir.0.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let index_path = state.join("index.json");
+    let lock = crate::locked_state_dir::test_locks::hold(&state);
+    let first = Arc::new(SharedCache::default());
+    first.durable_begin_pass(source, &index_path, &namespace, capture);
+    let (mut index, settled, n) = home.settle(ScanIndex::default(), &first, 0);
+    let identity = ledger_signed(&index);
+    memo_depends_on(&first, &identity);
+    assert!(session_usage(&settled, CHILD).is_empty(), "C is held");
+    assert!(!session_usage(&settled, SINGLE).is_empty());
+    index.save(&index_path).unwrap();
+    first.durable_write_after_save(lock, source, &index);
+    let records = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+        .map_or(0, |entries| entries.count());
+    assert!(records >= 1, "S's record is written after the save");
+    drop(first);
+
+    // Process 2, first page: S restores and Tails (the restart) while C is
+    // re-read and memoized again against P's re-injected ledger.
+    let grow = |at: &str, total: (u64, u64, u64, u64)| {
+        home.fixture
+            .append(SINGLE, &jsonl(&[usage_record(at, total, (30, 20, 3, 0))]));
+    };
+    grow("2026-10-07T08:40:03Z", (130, 70, 13, 0));
+    let loaded = ScanIndex::load(&index_path).unwrap();
+    assert_eq!(ledger_signed(&loaded), identity, "the ledger persisted");
+    let second = Arc::new(SharedCache::default());
+    assert!(home.child_entry(&second).is_none(), "a restart has no memo");
+    second.durable_begin_pass(source, &index_path, &namespace, capture);
+    let (index_a, warm_a, selections_a) = page(loaded.clone(), Some(Arc::clone(&second)), n);
+    let (counters_a, store_a) = second.durable_counters(source).unwrap();
+    eprintln!(
+        "held-memo restart page: {}",
+        counters_a.summary(source, &store_a)
+    );
+    assert!(counters_a.restored >= 1, "S restores from its record");
+    assert!(selections_a.modes.1 >= 1, "S continues by Tail");
+    memo_depends_on(&second, &identity);
+    let (cold_index_a, cold_a, _) = page(loaded, None, n);
+    assert_eq!(body(&warm_a), body(&cold_a));
+    assert_eq!(census(&index_a, &warm_a), census(&cold_index_a, &cold_a));
+    assert_eq!(parent_records(&index_a), parent_records(&cold_index_a));
+
+    // Process 2 commits page A and rewrites S's record, which now binds the
+    // Tailed entry (a record never outlives its committed entry). Then the
+    // RAM copies are released (the memo survives) and S grows: the next page
+    // restores S again with the memo non-empty and Tails it; C hits.
+    let mut index_a = index_a;
+    index_a.save(&index_path).unwrap();
+    second.durable_write_after_save(lock, source, &index_a);
+    second.clear();
+    memo_depends_on(&second, &identity);
+    grow("2026-10-07T08:40:04Z", (160, 90, 16, 0));
+    assert_eq!(ledger_signed(&index_a), identity, "re-injected unchanged");
+    let hits = counter(&second, |c| c.memo_hits);
+    second.durable_begin_pass(source, &index_path, &namespace, capture);
+    let (warm_index, warm, selections) = page(index_a.clone(), Some(Arc::clone(&second)), n + 1);
+    let (counters_b, store_b) = second.durable_counters(source).unwrap();
+    eprintln!(
+        "held-memo tail page: {}",
+        counters_b.summary(source, &store_b)
+    );
+    assert_eq!(
+        counters_b.restored,
+        counters_a.restored + 1,
+        "S restores beside the memo"
+    );
+    assert_eq!(selections.modes.1, 1, "S continues by Tail");
+    assert_eq!(
+        counter(&second, |c| c.memo_hits),
+        hits + 1,
+        "C hits its memo: {}",
+        counters(&second)
+    );
+    let (cold_index, cold, _) = page(index_a, None, n + 1);
+    assert!(session_usage(&warm, CHILD).is_empty(), "C stays held");
+    assert!(session_usage(&cold, CHILD).is_empty(), "C stays held cold");
+    assert_ne!(
+        session_usage(&warm, SINGLE),
+        session_usage(&warm_a, SINGLE),
+        "S's second growth is published"
+    );
+    assert_eq!(session_usage(&warm, SINGLE), session_usage(&cold, SINGLE));
+    assert_eq!(body(&warm), body(&cold));
+    assert_eq!(census(&warm_index, &warm), census(&cold_index, &cold));
+    assert_eq!(ledger_signed(&warm_index), identity);
+    assert_eq!(parent_records(&warm_index), parent_records(&cold_index));
+}
+
 /// T15 (PR-P §2.4): a created thread never consults a parent ledger, so it
 /// records no parent ref, before or after an index reset; its memo hit
 /// re-requests nothing. P-T32 covers an ordinary fork's re-request.

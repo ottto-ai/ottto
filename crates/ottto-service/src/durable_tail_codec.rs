@@ -539,10 +539,15 @@ impl DurableEmpty for String {
     }
 }
 
-/// `X` only (workspace path): hashed, never stored. Decode exists for the
-/// trait and is never reached for an `X` field.
+/// `X` only (workspace path): hashed, never stored. `put` refuses unless the
+/// encoder is hashing, so a path declared `N`, `U`, `L` or `D` refuses its
+/// record instead of storing the path. Decode exists for the trait and is
+/// never reached for an `X` field.
 impl Durable for std::path::PathBuf {
     fn put(&self, e: &mut Enc) -> Result<(), Refuse> {
+        if !e.hashing() {
+            return Err(Refuse::NonEmpty("PathBuf"));
+        }
         e.len_prefixed(self.as_os_str().as_encoded_bytes())
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
@@ -1203,6 +1208,26 @@ mod tests {
     fn labels_outside_the_closed_table_refuse() {
         let mut e = Enc::bytes(64);
         assert_eq!("unlisted".put(&mut e), Err(Refuse::UnknownLabel));
+    }
+
+    /// A path is content: encoding one into a record body refuses, whatever
+    /// class a later declaration gives it; only the hash mode (`X`) takes it.
+    #[test]
+    fn a_path_is_only_ever_hashed() {
+        let path = std::path::PathBuf::from("/tmp/CANARY_PATH_dt");
+        assert_eq!(
+            path.put(&mut Enc::bytes(1 << 10)),
+            Err(Refuse::NonEmpty("PathBuf"))
+        );
+        assert_eq!(
+            Some(path).put(&mut Enc::bytes(1 << 10)),
+            Err(Refuse::NonEmpty("PathBuf"))
+        );
+        let mut e = Enc::hash("probe");
+        std::path::PathBuf::from("/tmp/CANARY_PATH_dt")
+            .put(&mut e)
+            .expect("hash mode takes a path");
+        assert_ne!(e.finish_hash(), Enc::hash("probe").finish_hash());
     }
 
     #[test]
