@@ -1154,10 +1154,11 @@ mod durable_restart {
     #[test]
     fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
         let _gate = claude_request_money::e2::GateForTest::set(true);
-        claude_request_money::e2::with_fixture_birth(0, || {
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             for append_native in [true, false] {
-                let f = Fixture::new(1);
-                // Initially only the first request's reported cost is known.
+                let f = Fixture::new(if append_native { 1 } else { 2 });
+                // Quiet arm's LAST native request exists but is still on
+                // estimates. Only the first request has reported money.
                 f.evidence(1);
                 let state = State::new(&f);
                 let first = Arc::new(SharedCache::default());
@@ -1179,9 +1180,10 @@ mod durable_restart {
                 if append_native {
                     f.append_transcript(1);
                 }
-                // Quiet arm: no more native lines, but a late telemetry row
-                // (a side call without a native owner) must still add its $1.
-                f.evidence(2);
+                // The second native request's late report replaces its
+                // estimate; req_3 is a side call without a native owner.
+                // Quiet arm changes neither transcript bytes nor extent.
+                f.evidence(3);
                 let prior = ScanIndex::load(&state.index_path).unwrap();
                 let restarted = Arc::new(SharedCache::default());
                 state.begin(&restarted);
@@ -1211,7 +1213,7 @@ mod durable_restart {
                         .unwrap()
                         .total_cost_usd
                         .as_deref(),
-                    Some("2")
+                    Some("3")
                 );
                 if !append_native {
                     assert_eq!(fs::read(&f.path).unwrap(), native_before);
