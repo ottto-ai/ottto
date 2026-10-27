@@ -43212,13 +43212,25 @@ impl ScanIndex {
             }
         };
         let kind = claude_history_upgrade::classify(
-            self.files.get(&key).map(|entry| {
-                extent(
-                    entry.size_bytes,
-                    entry.modified_unix_seconds,
-                    entry.modified_unix_nanos,
-                )
-            }),
+            self.files
+                .get(&key)
+                // Read identity is not prior delivery. An undelivered
+                // placeholder must classify exactly like a missing entry:
+                // fresh files stay fresh; pre-cutoff history stays owed.
+                .filter(|entry| {
+                    entry.last_snapshot_fingerprint.is_some()
+                        || entry.last_upload_body_witness.is_some()
+                        || entry.effective_upload_body_witness_revision != 0
+                        || self.file_snapshot_fingerprints.contains_key(&key)
+                        || self.confirmed_empty_files.contains(&key)
+                })
+                .map(|entry| {
+                    extent(
+                        entry.size_bytes,
+                        entry.modified_unix_seconds,
+                        entry.modified_unix_nanos,
+                    )
+                }),
             extent(
                 candidate.size_bytes,
                 candidate.modified_unix_seconds,

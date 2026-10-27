@@ -3183,7 +3183,7 @@ fn e2_withheld_new_file_keeps_only_read_identity_in_both_settlements() {
             decision(&saved, &matching_candidate(&saved, key)),
             (
                 CandidateDecision::Parse,
-                Some(CandidateParseReason::UnknownOutcome)
+                Some(CandidateParseReason::BodyWitnessAdoption)
             )
         );
         // Exercise the production lenient writer/reader, as an older binary
@@ -3209,4 +3209,38 @@ fn e2_withheld_new_file_keeps_only_read_identity_in_both_settlements() {
         ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
     );
     assert!(!scanned.locally_held_keys_restorable(&previous, &held, &BTreeSet::new()));
+}
+
+#[test]
+fn e2_provisional_read_identity_preserves_missing_entry_history_policy() {
+    with_max_gated_claude_revision(3, || {
+        for policy in [
+            NoListPolicy::Pace,
+            NoListPolicy::HoldUnverified,
+            NoListPolicy::HoldMoveNotFull,
+        ] {
+            for birth in [None, Some(500), Some(2_000)] {
+                let key = "/opaque/undelivered.jsonl";
+                let mut missing = ScanIndex::default();
+                missing.activate_effective_upload_body_witness_revision(3);
+                missing.claude_history_cutoff_unix_seconds = Some(1_000);
+                missing.claude_no_list_policy = policy;
+                let mut provisional = missing.clone();
+                index_file(&mut provisional, key, &hex64('a'), "unsent", WINDOW);
+                ScanIndex::clear_provisional_delivery_witnesses(
+                    provisional.files.get_mut(key).unwrap(),
+                );
+                provisional.file_snapshot_fingerprints.remove(key);
+                let mut candidate = matching_candidate(&provisional, key);
+                for grows in [false, true] {
+                    candidate.size_bytes += u64::from(grows);
+                    assert_eq!(
+                        provisional.claude_history_upgrade_decision(&candidate, birth, &mut HistoryPage::default()),
+                        missing.claude_history_upgrade_decision(&candidate, birth, &mut HistoryPage::default()),
+                        "read identity cannot change history policy: {policy:?}, birth={birth:?}, grows={grows}",
+                    );
+                }
+            }
+        }
+    });
 }
