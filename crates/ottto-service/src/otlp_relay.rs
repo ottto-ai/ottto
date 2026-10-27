@@ -136,7 +136,7 @@ pub fn spawn_claude_code_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
 }
 
 fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<SocketAddr> {
-    let listener = match bind_local_relay_listener(None) {
+    let listener = match bind_startup_local_relay_listener() {
         Ok(listener) => listener,
         Err(error) => {
             let _ = daemon.set_relay_state_for_trusted_client(RelayState {
@@ -513,8 +513,24 @@ fn relay_listener_failed_state(bound_addr: Option<SocketAddr>) -> RelayState {
     }
 }
 
-/// Binds the relay listener. `preferred_port` (the port a failed listener
-/// held) is tried first, then the default port and the per-user fallbacks.
+pub(crate) fn bind_startup_local_relay_listener() -> Result<TcpListener> {
+    let endpoint =
+        crate::control::approved_managed_claude_relay_endpoint().unwrap_or_else(|error| {
+            relay_log!("could not read approved Claude relay endpoint: {error}");
+            None
+        });
+    // Existing exporters keep their startup endpoint across daemon restarts.
+    // Only reuse an address the daemon itself could have selected for this user.
+    let preferred_port = endpoint
+        .as_deref()
+        .filter(|endpoint| endpoint.starts_with("http://127.0.0.1:"))
+        .and_then(local_relay_port_from_endpoint)
+        .filter(|port| candidate_relay_ports(current_uid()).contains(port));
+    bind_local_relay_listener(preferred_port)
+}
+
+/// Binds the relay listener. `preferred_port` (from approved settings or a
+/// failed listener) is tried first, then the default and per-user fallbacks.
 fn bind_local_relay_listener(preferred_port: Option<u16>) -> Result<TcpListener> {
     let mut ports = Vec::new();
     if let Some(port) = preferred_port {
@@ -529,9 +545,7 @@ fn bind_local_relay_listener(preferred_port: Option<u16>) -> Result<TcpListener>
         match TcpListener::bind(bind_addr) {
             Ok(listener) => {
                 if port != LOCAL_RELAY_DEFAULT_PORT {
-                    relay_log!(
-                        "local OTLP relay default port {LOCAL_RELAY_DEFAULT_PORT} is unavailable; using fallback port {port}"
-                    );
+                    relay_log!("local OTLP relay using per-user port {port}");
                 }
                 return Ok(listener);
             }
@@ -591,7 +605,7 @@ pub fn local_relay_port_from_state(relay: &RelayState) -> u16 {
         .unwrap_or(LOCAL_RELAY_DEFAULT_PORT)
 }
 
-fn candidate_relay_ports(uid: u32) -> Vec<u16> {
+pub(crate) fn candidate_relay_ports(uid: u32) -> Vec<u16> {
     let mut ports = Vec::with_capacity(usize::from(LOCAL_RELAY_FALLBACK_ATTEMPTS) + 1);
     push_unique_port(&mut ports, LOCAL_RELAY_DEFAULT_PORT);
     let start = fallback_relay_port_for_uid(uid);
