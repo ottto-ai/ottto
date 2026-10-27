@@ -940,7 +940,6 @@ fn large_history_upgrade_is_paced_and_owed_history_drains() {
             path
         })
         .collect::<Vec<_>>();
-    let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut index = ScanIndex::default();
     let mut pi_index = ScanIndex::default();
     let mut upgrades = BTreeSet::new();
@@ -950,6 +949,11 @@ fn large_history_upgrade_is_paced_and_owed_history_drains() {
     // Four first admissions at revision 2, switch on 3, then require two
     // quiet completed walks after every file has adopted. No gate override.
     for pass in 0..16 {
+        // Model a restart or a reduction refused by the retained-entry cap.
+        // This fixture must exercise native Full history reads on macOS too,
+        // rather than zero-byte Unchanged reuse of its tiny usage reduction.
+        // Durable revision, census and audit state still carry between passes.
+        let cache = Arc::new(sampled_scan::SharedCache::default());
         let revision = if pass < 4 { 2 } else { 3 };
         index.activate_upload_context("large-history-composition".into());
         index.activate_effective_upload_body_witness_revision(revision);
