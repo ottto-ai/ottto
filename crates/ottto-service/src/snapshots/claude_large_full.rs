@@ -4,11 +4,16 @@ use super::*;
 
 const LARGE_FULL_BYTES: u64 = 256 * 1024 * 1024;
 
+pub(super) fn is_large(candidate: &CandidateFile) -> bool {
+    candidate.size_bytes > LARGE_FULL_BYTES
+}
+
 pub(super) fn select_deferred(
     debt: &mut VecDeque<String>,
     pending: &mut VecDeque<ScanTraversalPath>,
     selected: &mut Vec<ScanTraversalPath>,
     limit: usize,
+    discovery_done: bool,
 ) {
     // Inspect the prior FIFO once. Missing paths lose scheduling priority,
     // never an index entry, audit obligation or absence/completeness fence.
@@ -18,6 +23,10 @@ pub(super) fn select_deferred(
             if selected.len() < limit {
                 selected.push(pending.remove(position).expect("pending position"));
             }
+            debt.push_back(key);
+        } else if !discovery_done {
+            // Not discovered yet in this walk. Preserve its older turn without
+            // injecting a path or authorizing a read before native discovery.
             debt.push_back(key);
         }
     }
@@ -30,7 +39,7 @@ pub(super) fn admit(
     started: &mut bool,
 ) -> bool {
     let key = local_index_key(&candidate.path);
-    if full && candidate.size_bytes > LARGE_FULL_BYTES {
+    if full && is_large(candidate) {
         if *started {
             let traversal = index.traversal.as_mut().expect("active Claude traversal");
             if let Some(pending) = traversal

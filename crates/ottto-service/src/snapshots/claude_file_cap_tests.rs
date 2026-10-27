@@ -556,6 +556,11 @@ fn large_claude_fulls_rotate_with_sibling_and_audits() {
             }
             read.clear();
         }
+        if pass == 4 {
+            // A forced fresh walk (including oversized periodic recovery)
+            // must preserve older deferrals ahead of the newly re-owed audit.
+            index.traversal = None;
+        }
         let hints = first_audit.iter().cloned().collect::<Vec<_>>();
         let pi_path = write_pi_progress(&pi.0, pass);
         let mut owner = Rotation {
@@ -665,7 +670,12 @@ fn large_claude_fulls_rotate_with_sibling_and_audits() {
                 }
                 finalize_scan_after_policy(source, &mut scan, &mut next_index);
                 // Exercise the same persisted scheduling order after restart.
-                index = serde_json::from_slice(&serde_json::to_vec(&next_index).unwrap()).unwrap();
+                index = lenient_decode::read(
+                    std::io::Cursor::new(serde_json::to_vec(&next_index).unwrap()),
+                    "load",
+                    "claude_code",
+                )
+                .unwrap();
             } else {
                 assert_eq!(source, SnapshotSource::Pi);
                 assert_eq!(scan.scanned_file_count, 1);

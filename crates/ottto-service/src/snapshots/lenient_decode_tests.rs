@@ -1986,7 +1986,8 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "codex_state_only_blocked_unattributed"
             | "codex_state_only_blocked_legacy"
             | "codex_parent_ownership_refs"
-            | "confirmed_empty_files" => serde_json::json!(["member"]),
+            | "confirmed_empty_files"
+            | "claude_large_full_deferred" => serde_json::json!(["member"]),
             "codex_state_only_snapshot_fingerprints" | "claude_account_deferred_holds" => {
                 serde_json::json!({"session":"value"})
             }
@@ -2123,9 +2124,15 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
 fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     // Main shipped audit progress first. The earlier E2 writer saved a named
     // map with birth storage but no audit progress. Neither may lose custody.
-    let seed = every_persisted_field_fixture();
+    let mut seed = every_persisted_field_fixture();
+    seed.claude_large_full_deferred.clear();
     let current = serde_json::to_value(&seed).unwrap();
-    let fields = lenient_decode::FIELDS;
+    // Keep every shipped positional slot; the scheduling leaf appends last.
+    assert_eq!(
+        lenient_decode::FIELDS.last(),
+        Some(&"claude_large_full_deferred")
+    );
+    let fields = &lenient_decode::FIELDS[..lenient_decode::FIELDS.len() - 1];
     assert_eq!(
         &fields[fields.len() - 3..],
         &[
@@ -4522,5 +4529,36 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
             serde_json::to_value(&reopened.traversal.as_ref().unwrap().counts).unwrap(),
             expected
         );
+    }
+}
+
+#[test]
+fn damaged_large_full_scheduling_leaf_preserves_native_custody() {
+    let seed = every_persisted_field_fixture();
+    let mut expected = serde_json::to_value(&seed).unwrap();
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_large_full_deferred");
+    for damage in [
+        serde_json::json!(null),
+        serde_json::json!({"unknown":true}),
+        serde_json::json!([1]),
+    ] {
+        let mut value = expected.clone();
+        value["claude_large_full_deferred"] = damage;
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let native: ScanIndex = serde_json::from_slice(&bytes).unwrap();
+        let restored =
+            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code").unwrap();
+        for index in [native, restored] {
+            assert!(index.decode_holds.is_empty());
+            assert!(index.claude_large_full_deferred.is_empty());
+            assert_eq!(
+                serde_json::to_value(&index).unwrap(),
+                expected,
+                "scheduling damage changes no source proof, ACK, quarantine or pending census path"
+            );
+        }
     }
 }

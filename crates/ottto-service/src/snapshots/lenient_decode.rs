@@ -328,6 +328,7 @@ impl Serialize for ScanIndex {
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
         );
+        field!(claude_large_full_deferred, VecDeque::is_empty);
         map.end()
     }
 }
@@ -419,6 +420,7 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
+    "claude_large_full_deferred",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1747,6 +1749,12 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_duplicate_fence_next_full_rearm_unix_seconds" => {
                             index.claude_duplicate_fence_next_full_rearm_unix_seconds =
                                 self.typed(value)?
+                        }
+                        "claude_large_full_deferred" => {
+                            // Scheduling damage costs ordering only. Preserve
+                            // every native proof, ACK and pending census path.
+                            index.claude_large_full_deferred =
+                                self.history_scalar(value, VecDeque::new())?;
                         }
                         "claude_full_rearm_progress" => {
                             // #720 scheduling-only memory: malformed progress

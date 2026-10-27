@@ -3471,9 +3471,6 @@ pub struct ScanIndex {
     /// when a later parse resolves it or a complete census proves it absent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     claude_account_deferred_holds: BTreeMap<String, String>,
-    /// Scheduling only. FIFO keys of pending large Full reads; never proof.
-    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
-    claude_large_full_deferred: VecDeque<String>,
     /// Scheduling-only backoff for full duplicate-fence re-arms while the
     /// fence stays closed. Losing either field schedules one immediate full
     /// re-arm; neither field can open the fence.
@@ -3792,6 +3789,13 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_default"
     )]
     pub(crate) claude_money_birth_store: claude_money_birth_store::BirthStore,
+    /// Scheduling only. FIFO keys of pending large Full reads; never proof.
+    #[serde(
+        default,
+        skip_serializing_if = "VecDeque::is_empty",
+        deserialize_with = "deserialize_lenient_default"
+    )]
+    claude_large_full_deferred: VecDeque<String>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -25669,6 +25673,7 @@ impl OwnedSourceScan {
                 &mut traversal.pending_candidates,
                 &mut pending_paths,
                 selection_limit,
+                traversal.pending_directories.is_empty(),
             );
         }
         // Recovery must be selected before audits consume the page. Only
@@ -30652,10 +30657,29 @@ impl OwnedSourceScan {
             if source == SnapshotSource::Codex {
                 census.note_codex_selection(decision, parse_reason, codex_selected_by);
             }
+            let large_claude =
+                source == SnapshotSource::ClaudeCode && claude_large_full::is_large(&candidate);
+            // A comparison target cannot sample, so its Full is already
+            // known. Defer it before any target-attempt or carry bookkeeping.
+            if large_claude && comparison_target && claude_large_full_started {
+                let admitted = claude_large_full::admit(
+                    index,
+                    &candidate,
+                    true,
+                    &mut claude_large_full_started,
+                );
+                debug_assert!(!admitted);
+                if let Some(reason) = parse_reason {
+                    census.parse_reasons[reason as usize] =
+                        census.parse_reasons[reason as usize].saturating_sub(1);
+                }
+                pending!();
+            }
             // A parse of a carried family's member cancels that family's
             // carry, so the family is co-observed in this window as BASE's
             // re-arm would observe it. A re-armed member is no new change.
             if source == SnapshotSource::ClaudeCode
+                && !large_claude
                 && decision == CandidateDecision::Parse
                 && parse_reason != Some(CandidateParseReason::Rearmed)
             {
@@ -30958,7 +30982,10 @@ impl OwnedSourceScan {
                     | sampled_scan::codex_cursor::StartPlan::Unpaged => {}
                 }
             }
-            if let Some(phase) = native_comparison.as_mut() {
+            if let Some(phase) = native_comparison
+                .as_mut()
+                .filter(|_| !large_claude || comparison_target)
+            {
                 // This is an actual native acquisition attempt, before parser
                 // construction can fail or complete with no emitted entity.
                 if let Some(credit) = capture_credit.as_deref_mut() {
@@ -31420,6 +31447,29 @@ impl OwnedSourceScan {
                         }
                     }
                     pending!();
+                }
+            }
+            // Large ordinary candidates have now passed actual Full/Tail
+            // admission. Deferral must neither cancel a family's carry nor
+            // label an unread path as a native comparison parse attempt.
+            if large_claude {
+                if decision == CandidateDecision::Parse
+                    && parse_reason != Some(CandidateParseReason::Rearmed)
+                {
+                    cancel_claude_family_carry_for_member_parse(
+                        index,
+                        &census_window_end,
+                        &candidate.path,
+                        &snapshots,
+                        &identified_candidates,
+                    );
+                }
+                if let Some(phase) = native_comparison.as_mut().filter(|_| !comparison_target) {
+                    if let Some(credit) = capture_credit.as_deref_mut() {
+                        phase.record_parse_attempt_paid(&candidate, credit);
+                    } else {
+                        phase.record_parse_attempt(&candidate);
+                    }
                 }
             }
             if index
@@ -40328,7 +40378,6 @@ fn ensure_bounded_traversal(
         ownership_incomplete_file_count: census.ownership_incomplete_file_count,
         ..ScanTraversalCounts::default()
     };
-    index.claude_large_full_deferred.clear();
     index.traversal = Some(ScanTraversalCheckpoint {
         context_fingerprint,
         census_window_end: collected_at.to_string(),
