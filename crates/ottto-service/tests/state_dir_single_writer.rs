@@ -42,6 +42,22 @@ fn tree(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Takes a lock its holder just released. The tests here spawn children
+/// concurrently, and a child forked before it execs shares every descriptor
+/// for that moment, so retry briefly instead of expecting it at once.
+fn acquire_released(support: &Path) -> StateDirLock {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match StateDirLock::acquire(support) {
+            Ok(lock) => return lock,
+            Err(StateDirLockError::Held { .. }) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("released lock still unavailable: {error:?}"),
+        }
+    }
+}
+
 fn wait_with_deadline(child: &mut Child, limit: Duration) -> ExitStatus {
     let deadline = Instant::now() + limit;
     loop {
@@ -135,7 +151,7 @@ fn second_daemon_refuses_a_held_state_dir_before_any_write() {
     }
 
     drop(held);
-    let restarted = StateDirLock::acquire(&support).expect("restart takes the lock");
+    let restarted = acquire_released(&support);
     drop(restarted);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -245,7 +261,7 @@ fn killed_holder_frees_the_state_dir_for_a_restart() {
     // SIGKILL: no destructor, no unlock. Only the kernel releases the lock.
     holder.kill().expect("kill holder");
     holder.wait().expect("reap holder");
-    let restarted = StateDirLock::acquire(&support).expect("restart after the holder died");
+    let restarted = acquire_released(&support);
     assert_eq!(
         std::fs::read_to_string(support.join(STATE_DIR_LOCK_FILE_NAME)).expect("read lock"),
         format!("{}\n", std::process::id())

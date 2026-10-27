@@ -1010,7 +1010,7 @@ identifier:                 net.ottto.Companion
         );
 
         drop(old_daemon);
-        let restarted = StateDirLock::acquire(&support).expect("restart after exit");
+        let restarted = crate::state_dir_lock::acquire_released(&support);
         assert_eq!(identity(&lock_path), lock_identity);
         drop(restarted);
         let _ = fs::remove_dir_all(root);
@@ -1054,7 +1054,7 @@ identifier:                 net.ottto.Companion
             "{restart:?}"
         );
         drop(claim);
-        drop(StateDirLock::acquire(&support).expect("restart after uninstall"));
+        drop(crate::state_dir_lock::acquire_released(&support));
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -184,6 +184,24 @@ pub(crate) fn scratch(prefix: &str) -> PathBuf {
     path
 }
 
+/// Takes a lock its holder just released. Tests in this process spawn
+/// children concurrently, and a child forked before it execs shares every
+/// descriptor, the lock's included, for that moment; so retry briefly
+/// instead of expecting the release to be visible at once.
+#[cfg(test)]
+pub(crate) fn acquire_released(support_dir: &Path) -> StateDirLock {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match StateDirLock::acquire(support_dir) {
+            Ok(lock) => return lock,
+            Err(StateDirLockError::Held { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("released lock still unavailable: {error:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,7 +253,7 @@ mod tests {
         );
 
         drop(first);
-        let restarted = StateDirLock::acquire(&support).expect("restart takes the lock");
+        let restarted = super::acquire_released(&support);
         drop(restarted);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -293,6 +311,7 @@ mod tests {
             "{refusal:?}"
         );
         drop(holder);
+        drop(super::acquire_released(&support));
         let claimed = StateDirLock::acquire_existing(&support).expect("free lock");
         assert!(claimed.is_some());
         let _ = std::fs::remove_dir_all(root);
