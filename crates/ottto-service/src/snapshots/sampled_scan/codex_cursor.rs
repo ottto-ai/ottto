@@ -514,6 +514,16 @@ impl OpenStamp {
         self.same_object(other) && self.extent == other.extent && self.modified == other.modified
     }
 
+    /// The memo and parked wake rule, on stamps `SharedCache::retained_stamp`
+    /// qualified: growth, or exactly the stamp. There a ctime-only change
+    /// whose content inputs and birth still match already carries the
+    /// stored ctime, and a birth or evidence mismatch keeps the live ctime,
+    /// so ctime is the birth witness here and stays compared. Not
+    /// `append_compatible`, which never compares ctime (E1 S3).
+    fn wake_compatible(&self, now: &Self) -> bool {
+        self.same_object(now) && (now.extent > self.extent || self == now)
+    }
+
     pub(in crate::snapshots) fn extent(&self) -> u64 {
         self.extent
     }
@@ -4843,9 +4853,9 @@ impl SharedCache {
             let parked = cursor.parked.get_mut(key)?;
             if let Some(now) = now.filter(|now| {
                 (if parked.exact {
-                    parked.stamp.same_content(now)
+                    parked.stamp == *now
                 } else {
-                    parked.stamp.append_compatible(now)
+                    parked.stamp.wake_compatible(now)
                 }) && parked.dependencies.as_deref() == dependencies
             }) {
                 parked.stamp = now;
@@ -4862,8 +4872,7 @@ impl SharedCache {
 
     /// Park a `ProbeBudgetOrder` group under its live member's boot stamp
     /// (round 3): strict debt disclosed again at zero replay bytes until a
-    /// member changes (`exact`: any live-member content change,
-    /// `OpenStamp::same_content`) or a
+    /// member changes (`exact`: any live-member stamp change) or a
     /// dependency does. Bounded like every parked record.
     pub(in crate::snapshots) fn park_group(
         &self,
@@ -6288,8 +6297,7 @@ pub(in crate::snapshots) struct MemoEntry {
     /// cure (`sidecar_wakes`).
     sidecar: Option<String>,
     /// The hold may be cured by the file catching up with its sidecar
-    /// extent (`growth_may_cure`): only the recorded stamp's content
-    /// (`OpenStamp::same_content`, never ctime) is a hit.
+    /// extent (`growth_may_cure`): only the exact recorded stamp is a hit.
     exact_stamp: bool,
     /// This parse produced a `scan_complete` ledger of its own, so a re-read
     /// as a referenced parent would insert it.
@@ -6415,9 +6423,9 @@ impl MemoEntry {
         now: OpenStamp,
     ) -> Option<OpenStamp> {
         let stamp_holds = if self.exact_stamp {
-            self.stamp.same_content(&now)
+            self.stamp == now
         } else {
-            self.stamp.append_compatible(&now)
+            self.stamp.wake_compatible(&now)
         };
         (stamp_holds && self.dependencies_hold(digest, file, parent_now, sidecar_now))
             .then_some(now)
@@ -6435,7 +6443,7 @@ impl MemoEntry {
         let now = OpenStamp::capture(file).ok()?;
         (self.exact_stamp
             && now.extent > self.stamp.extent
-            && self.stamp.append_compatible(&now)
+            && self.stamp.wake_compatible(&now)
             && self.dependencies_hold(digest, file, parent_now, sidecar_now))
         .then(|| now.extent())
     }
