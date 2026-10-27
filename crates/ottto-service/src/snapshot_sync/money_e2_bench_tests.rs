@@ -2191,11 +2191,27 @@ fn money_e2_bench_receipt() {
             let arm_name = env("OTTTO_E2_BENCH_ARM").unwrap_or_default();
             // OTTTO_E2_BENCH_STAGED_BIRTHS=0 keeps the file system's births
             // (Linux: every root then looks all-copied, a stress shape).
-            let births = std::fs::read(base.join(STAGED_BIRTHS))
+            let mut births = std::fs::read(base.join(STAGED_BIRTHS))
                 .ok()
                 .filter(|_| env("OTTTO_E2_BENCH_STAGED_BIRTHS").as_deref() != Some("0"))
                 .map(|bytes| serde_json::from_slice::<BTreeMap<String, u64>>(&bytes).unwrap())
                 .unwrap_or_default();
+            // Linux stages births by absolute path. Preserve that evidence
+            // for the relocated hard links too; full-corpus modes keep their
+            // original mapping. Natural-birth Mac runs bypass this branch.
+            if mode == "history" && !births.is_empty() {
+                let cohort: Vec<PathBuf> = serde_json::from_slice(
+                    &std::fs::read(base.join("history-cohort.json")).unwrap(),
+                )
+                .unwrap();
+                for relative in cohort {
+                    let source = projects(&base).join(&relative);
+                    if let Some(&birth) = births.get(source.to_string_lossy().as_ref()) {
+                        let target = base.join("history-cohort").join(relative);
+                        births.insert(target.to_string_lossy().into_owned(), birth);
+                    }
+                }
+            }
             let staged = births.len();
             let mut receipt = e2_hook::with_staged_births(births, || match mode.as_str() {
                 "arm" | "attribution" => arm(&base, &manifest, &arm_name),
