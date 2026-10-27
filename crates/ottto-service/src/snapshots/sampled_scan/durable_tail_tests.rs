@@ -173,24 +173,73 @@ fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
     }
 }
 
-/// Money rules re-owe only marked paths. Even a record freshly bound to the
-/// now-owed entry cannot satisfy that obligation: refusal precedes store I/O.
+/// A real native reduction and certificate, encoded even on layouts where
+/// RAM admission is unavailable. Positive restore/write controls still must
+/// run on the supported macOS layout.
+fn native_record(path: &Path, scope: &Scope) -> (CachedJsonlReduction, Checkpoint) {
+    let mut parser = OwnedJsonlParser::new(
+        File::open(path).unwrap(),
+        path,
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        None,
+        None,
+        None,
+        false,
+        true,
+    )
+    .unwrap();
+    parser
+        .prepare_acquisition(None, scope, None, 1_800_000_000)
+        .unwrap();
+    while !parser.step().unwrap() {}
+    let reduction = parser.durable_test_reduction_copy();
+    let checkpoint = match parser
+        .certify_without_retention(scope, 1_800_000_000)
+        .unwrap()
+    {
+        sampled_jsonl::SideCertificate::Certified { completed, .. } => completed.checkpoint,
+        _ => panic!("a clean native fixture is certified"),
+    };
+    (reduction, checkpoint)
+}
+
+fn native_fixture(path: &Path) {
+    std::fs::write(
+        path,
+        concat!(
+            "{\"type\":\"assistant\",\"sessionId\":\"11111111-2222-4333-8444-555555555555\",",
+            "\"timestamp\":\"2026-10-07T10:00:00Z\",\"requestId\":\"req-dt-owed\",",
+            "\"message\":{\"id\":\"msg-dt-owed\",\"model\":\"fixture-model\",",
+            "\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Money rules re-owe marked paths. Seed a usable record first, prove it
+/// restores, then prove revision/money debt refuses before record I/O and
+/// invalidates the existing record on the real post-save write path.
 #[test]
 fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
     let _gate = claude_request_money::e2::GateForTest::set(true);
     let root = crate::test_scratch::private_dir("ottto-dt-owed");
+    let lock = test_locks::hold(&root);
     let source = SnapshotSource::ClaudeCode;
     let namespace = Scope("owed-test".into());
+    let scope = Scope("owed-file".into());
+    let index_path = root.join("index.json");
     let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
-    std::fs::write(&path, b"{}\n").unwrap();
+    native_fixture(&path);
     let key = local_index_key(&path);
     for money in [false, true] {
         let mut index = ScanIndex::default();
         index.files.insert(
             key.clone(),
             serde_json::from_value(serde_json::json!({
-                "size_bytes":3,"modified_unix_seconds":1,"source_file_fingerprint":"fp",
-                "effective_upload_body_witness_revision": if money {3} else {2}
+                "size_bytes":std::fs::metadata(&path).unwrap().len(),
+                "modified_unix_seconds":1,"source_file_fingerprint":"fp",
+                "effective_upload_body_witness_revision":3
             }))
             .unwrap(),
         );
@@ -201,6 +250,61 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             index
                 .claude_money_birth_store
                 .set_money_marks(&key, claude_request_money::e2::money_mark::ESTIMATED);
+        }
+        assert!(!index.effective_upload_body_witness_revision_requires_adoption(&key));
+        index.save(&index_path).unwrap();
+        let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+        let binding = expected(
+            DurableSource::ClaudeCode,
+            source,
+            &key,
+            &scope,
+            &index,
+            &interpretation,
+        )
+        .unwrap()
+        .binding;
+        let (reduction, checkpoint) = native_record(&path, &scope);
+        let body = codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
+        let mut store = DurableTailStore::new(store::store_dir_for_index(&index_path));
+        store
+            .write_after_save(
+                lock,
+                index.generation,
+                vec![PendingRecord {
+                    binding,
+                    certificate: certificate(&path, &scope),
+                    body,
+                    allowlist: codec::allowlist_digest(source),
+                }],
+            )
+            .unwrap();
+        let records = || {
+            std::fs::read_dir(store::store_dir_for_index(&index_path))
+                .unwrap()
+                .count()
+        };
+        assert_eq!(records(), 1, "a real usable record exists");
+        let positive = SharedCache::default();
+        positive.durable_begin_pass(source, &index_path, &namespace, false);
+        let restored = positive.durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &index,
+            &interpretation,
+        );
+        let supported = crate::heap_layout_bound::layout_supported();
+        assert_eq!(restored.is_some(), supported);
+        assert_eq!(
+            positive.durable_counters(source).unwrap().0.restored,
+            u64::from(supported)
+        );
+        assert_eq!(positive.durable_counters(source).unwrap().1.records_read, 1);
+        drop(restored);
+        if money {
             claude_request_money::e2::with_money_rules(
                 &[(1, 0), (2, claude_request_money::e2::money_mark::ESTIMATED)],
                 || {
@@ -208,20 +312,22 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
                 },
             );
             assert_eq!(index.claude_money_birth_store.money_rule_version(), 2);
+        } else {
+            index.activate_effective_upload_body_witness_revision(4);
         }
         assert!(index.effective_upload_body_witness_revision_requires_adoption(&key));
         let cache = SharedCache::default();
-        cache.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
         let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
         assert!(cache
             .durable_restore(
                 source,
                 &key,
                 &path,
-                &namespace,
+                &scope,
                 &mut File::open(&path).unwrap(),
                 &index,
-                &interpretation
+                &interpretation,
             )
             .is_none());
         let (counts, disk) = cache.durable_counters(source).unwrap();
@@ -230,6 +336,134 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             (counts.restored, counts.missing, disk.records_read),
             (0, 0, 0)
         );
+        if supported {
+            assert!(cache.insert_admitted(
+                key.clone(),
+                sampled_jsonl::CompletedNativeAcquisition {
+                    checkpoint,
+                    reduction: Some(reduction),
+                    released: None,
+                    unsealed: false,
+                },
+                0
+            ));
+            cache.durable_note_selection(&key, "fp");
+            index.save(&index_path).unwrap();
+            cache.durable_write_after_save(lock, source, &index);
+            let (counts, disk) = cache.durable_counters(source).unwrap();
+            println!(
+                "owed_write money={money}: {}",
+                counts.summary(source, &disk)
+            );
+            assert_eq!(counts.not_persisted.get("history_owed"), Some(&1));
+            assert_eq!(disk.records_invalidated, 1);
+            assert_eq!(records(), 0);
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Capture is process-local in RAM, but a durable checkpoint crosses a
+/// restart. Both toggle directions must change Claude's binding (Codex is
+/// unaffected) and refuse the old record under the actual env setting.
+#[test]
+fn attribution_capture_toggle_refuses_the_previous_claude_record() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let root = crate::test_scratch::private_dir("ottto-dt-attribution");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("attribution-test".into());
+    let scope = Scope("attribution-file".into());
+    let index_path = root.join("index.json");
+    let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    index.save(&index_path).unwrap();
+    for before in [false, true] {
+        // Isolated child process: no concurrent test can observe the env.
+        std::env::set_var(
+            "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
+            if before { "1" } else { "0" },
+        );
+        let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+        let codex_before =
+            Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace);
+        let binding = expected(
+            DurableSource::ClaudeCode,
+            source,
+            &key,
+            &scope,
+            &index,
+            &interpretation,
+        )
+        .unwrap()
+        .binding;
+        let (reduction, _) = native_record(&path, &scope);
+        let mut store = DurableTailStore::new(store::store_dir_for_index(&index_path));
+        store
+            .write_after_save(
+                lock,
+                index.generation,
+                vec![PendingRecord {
+                    binding: binding.clone(),
+                    certificate: certificate(&path, &scope),
+                    body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
+                        .unwrap(),
+                    allowlist: codec::allowlist_digest(source),
+                }],
+            )
+            .unwrap();
+        std::env::set_var(
+            "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
+            if before { "0" } else { "1" },
+        );
+        let after = Interpretation::of(source, &key, &index, false, &namespace);
+        let changed = expected(
+            DurableSource::ClaudeCode,
+            source,
+            &key,
+            &scope,
+            &index,
+            &after,
+        )
+        .unwrap()
+        .binding;
+        assert_ne!(binding.scope, changed.scope);
+        assert_eq!(binding.entry, changed.entry);
+        assert_eq!(binding.key, changed.key);
+        assert_eq!(binding.context, changed.context);
+        assert_eq!(
+            codex_before.identity_contract,
+            Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace)
+                .identity_contract
+        );
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        assert!(cache
+            .durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &after
+            )
+            .is_none());
+        let (counts, disk) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.ineligible.get("scope"), Some(&1));
+        assert_eq!(counts.restored, 0);
+        assert_eq!(disk.records_read, 1);
     }
     let _ = std::fs::remove_dir_all(root);
 }

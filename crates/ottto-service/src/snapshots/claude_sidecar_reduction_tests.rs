@@ -1201,6 +1201,20 @@ mod durable_restart {
                     u64::from(crate::heap_layout_bound::layout_supported())
                 );
                 assert_eq!(exact_bodies(&warm), exact_bodies(&cold));
+                // These persist into the next replay and copy-proof pass.
+                // Compare the saved representation, not just today's body.
+                let money_state = |index: &ScanIndex| {
+                    serde_json::to_value((
+                        &index.claude_money_birth_store,
+                        &index.claude_usage_family_witnesses,
+                        &index.claude_usage_authority_quarantine,
+                        &index.accepted_snapshot_fingerprints,
+                        &index.file_snapshot_fingerprints,
+                        &index.quarantined_snapshot_fingerprints,
+                    ))
+                    .unwrap()
+                };
+                assert_eq!(money_state(&warm.index), money_state(&cold.index));
                 assert_ne!(
                     before.0,
                     exact_bodies(&warm).0,

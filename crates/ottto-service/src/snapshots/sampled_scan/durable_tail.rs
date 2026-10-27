@@ -209,7 +209,7 @@ pub(crate) fn durable_source(source: SnapshotSource) -> Option<DurableSource> {
 
 /// The interpretation inputs a record binds to beyond the file scope.
 pub(crate) struct Interpretation<'a> {
-    /// The Claude request-identity contract in force and the parse mode.
+    /// The Claude request-identity contract and identity/attribution parse modes.
     pub(crate) identity_contract: String,
     /// The Codex counting view (`codex_counting_version::singleton_view`).
     pub(crate) counting_view: String,
@@ -224,15 +224,19 @@ impl<'a> Interpretation<'a> {
         identity_capture: bool,
         namespace: &'a Scope,
     ) -> Self {
+        let mut identity_contract = format!(
+            "{}|changed={}|capture={identity_capture}",
+            index
+                .claude_request_identity_contract
+                .as_deref()
+                .unwrap_or("none"),
+            index.claude_request_identity_contract_changed,
+        );
+        if source == SnapshotSource::ClaudeCode {
+            identity_contract.push_str(&format!("|attr={}", claude_attribution_capture_enabled()));
+        }
         Self {
-            identity_contract: format!(
-                "{}|changed={}|capture={identity_capture}",
-                index
-                    .claude_request_identity_contract
-                    .as_deref()
-                    .unwrap_or("none"),
-                index.claude_request_identity_contract_changed,
-            ),
+            identity_contract,
             counting_view: if source == SnapshotSource::Codex {
                 codex_counting_version::singleton_view_of_key(key, index)
             } else {

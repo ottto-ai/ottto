@@ -367,6 +367,13 @@ impl OwnedJsonlParser {
         }
     }
 
+    /// Offline durable-record controls need a real reduction even when this
+    /// platform cannot admit a retained RAM copy.
+    #[cfg(test)]
+    pub(super) fn durable_test_reduction_copy(&mut self) -> CachedJsonlReduction {
+        self.reduction_copy()
+    }
+
     /// The charge of a copy beside its committed `checkpoint` (state,
     /// certificate and inline bytes), if it fits `limit`.
     fn certified_charge(&mut self, checkpoint: &Checkpoint, limit: usize) -> Option<usize> {

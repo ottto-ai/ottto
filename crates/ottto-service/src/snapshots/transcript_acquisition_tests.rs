@@ -1323,7 +1323,9 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
 /// the cold Full's body. Refusal arms, each read Full to the cold Full's
 /// body: the counting view changes between write and restore (the record's
 /// scope no longer binds), and the traces now mark the observed turn
-/// priority (the restored copy's priority re-check refuses reuse).
+/// priority (the restored copy's priority re-check refuses reuse), or the key
+/// becomes a referenced parent (no record I/O). Nonempty #660 maps are unchanged
+/// by restore + Tail and byte-equal to the cold Full maps.
 #[cfg(unix)]
 #[test]
 fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
@@ -1332,10 +1334,9 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
     let _cutover = codex_counting_version::TestCutover::set(0);
     let capture = claude_request_identity::capture_by_default();
     let namespace = Scope("durable-codex".into());
-    for (v2, arm) in [false, true]
-        .into_iter()
-        .flat_map(|v2| ["restore", "view_changed", "priority_changed"].map(|arm| (v2, arm)))
-    {
+    for (v2, arm) in [false, true].into_iter().flat_map(|v2| {
+        ["restore", "view_changed", "priority_changed", "parent_ref"].map(|arm| (v2, arm))
+    }) {
         let fixture = ScanFixture::new(source);
         // A dated origin selects real V2. The undated origin exercises
         // Legacy under the same active cutover (never infer V2 on restore).
@@ -1415,6 +1416,74 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
             let entry = loaded.files.get_mut(&key).unwrap();
             entry.codex_counting_v2 = !entry.codex_counting_v2;
         }
+        if arm == "parent_ref" {
+            loaded
+                .codex_parent_ownership_refs
+                .insert("019fa111-2222-7333-8444-555555555555".into());
+        }
+        // Nonempty #660 records for an unrelated parent/child must survive
+        // the main retained-copy path byte-for-byte, including its real seal.
+        let (mut proof_parser, _, proof_scope) = native_parser(&fixture.file, source);
+        proof_parser
+            .prepare_acquisition(None, &proof_scope, None, 1_791_374_400)
+            .unwrap();
+        while !proof_parser.step().unwrap() {}
+        let seal = match proof_parser
+            .certify_without_retention(&proof_scope, 1_791_374_400)
+            .unwrap()
+        {
+            sampled_jsonl::SideCertificate::Certified { completed, .. } => completed
+                .checkpoint
+                .seal_as(1_791_374_400, &codex_parent_side_scope()),
+            _ => panic!("fixture proof checkpoint"),
+        };
+        let stamp =
+            sampled_scan::codex_cursor::OpenStamp::capture(&File::open(&fixture.file.0).unwrap())
+                .unwrap();
+        loaded.codex_parent_side.insert(
+            "unrelated-parent-key".into(),
+            CodexParentSide {
+                verdict: SideVerdict::Settled,
+                seal,
+                parsed: stamp,
+                pace: None,
+                generation: 1,
+                referenced_epoch: 1,
+            },
+        );
+        loaded.codex_parent_side_requests.insert(
+            "unrelated-parent-key".into(),
+            SideRequest {
+                dev_ino: (0, 0),
+                needed_extent: 1,
+                state: SideRequestState::Live,
+                state_extent: 1,
+                state_ctime: (0, 0),
+                attempt_extent: 1,
+                attempt_ctime: (0, 0),
+                attempts: 1,
+                not_before_unix_seconds: u64::MAX,
+                needed_charge: None,
+                referenced_epoch: 1,
+            },
+        );
+        loaded.codex_parent_prefix_proofs.insert(
+            "unrelated-child-key".into(),
+            CodexParentProofState::Owed(CodexParentProofOwed::new(
+                "unrelated-parent".into(),
+                1,
+                CAUSE_NO_EVIDENCE,
+                OwedOrigin::Lineage,
+            )),
+        );
+        let parent_records = |index: &ScanIndex| {
+            (
+                serde_json::to_vec(&index.codex_parent_side).unwrap(),
+                serde_json::to_vec(&index.codex_parent_side_requests).unwrap(),
+                serde_json::to_vec(&index.codex_parent_prefix_proofs).unwrap(),
+            )
+        };
+        let before_parents = parent_records(&loaded);
         let second = Arc::new(sampled_scan::SharedCache::default());
         second.durable_begin_pass(source, &index_path, &namespace, capture);
         let (warm_index, scan, modes, _) = production_scan_at_with_setup(
@@ -1428,7 +1497,14 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         );
         let (counters, store) = second.durable_counters(source).unwrap();
         eprintln!("{arm}: {}", counters.summary(source, &store));
-        let restored = arm != "view_changed" && supported;
+        let restored = matches!(arm, "restore" | "priority_changed") && supported;
+        if arm == "parent_ref" {
+            assert_eq!(
+                counters.restore_attempts, 0,
+                "parent never attempts restore"
+            );
+            assert_eq!(store.records_read, 0, "parent never reads its record");
+        }
         assert_eq!(counters.restored, u64::from(restored), "{arm}");
         if supported && arm == "view_changed" {
             assert_eq!(counters.ineligible.get("scope"), Some(&1), "{arm}");
@@ -1452,8 +1528,14 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
             warm_index.files[&key].codex_counting_v2, cold_index.files[&key].codex_counting_v2,
             "restored counting decision: {arm}"
         );
+        assert_eq!(
+            warm_index.files[&key].codex_counting_v2,
+            if arm == "view_changed" { !v2 } else { v2 },
+            "never flip the loaded decision: {arm}",
+        );
         if arm == "restore" {
-            assert_eq!(warm_index.files[&key].codex_counting_v2, v2);
+            assert_eq!(parent_records(&warm_index), before_parents);
+            assert_eq!(parent_records(&warm_index), parent_records(&cold_index));
         }
         assert!(!scan.snapshots.is_empty(), "compare an emitted Codex body");
         assert_eq!(
