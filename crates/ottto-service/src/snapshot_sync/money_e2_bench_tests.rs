@@ -1056,6 +1056,9 @@ pub(in crate::snapshot_sync) fn bench_mark(label: &'static str, items: &[Snapsho
 }
 
 fn bench_timed<T>(label: &'static str, run: impl FnOnce() -> T) -> T {
+    if !ATTRIBUTION.with(|cell| cell.borrow().is_some()) {
+        return run();
+    }
     let cpu = thread_cpu_us();
     let start = Instant::now();
     let value = run();
@@ -1277,7 +1280,9 @@ impl crate::source_rotation::Owner for BenchOwner<'_> {
     ) -> crate::source_rotation::Step<SourcePreparation, Self::Completed> {
         let value = bench_timed("owner.step", || self.inner.step(frame, remaining));
         // Sample physical peaks at cooperative parser boundaries, at most 10 Hz.
-        if self.last_sample.elapsed() >= Duration::from_millis(100) {
+        if ATTRIBUTION.with(|cell| cell.borrow().is_some())
+            && self.last_sample.elapsed() >= Duration::from_millis(100)
+        {
             self.last_sample = Instant::now();
             let (now, peak) = footprint_sample(false);
             ATTRIBUTION.with(|cell| {
@@ -1460,7 +1465,10 @@ impl Harness {
     /// One production cycle (one page) with its process wall/CPU, the
     /// backend's CPU taken out, and its local_resources records.
     fn page(&mut self) -> serde_json::Value {
-        ATTRIBUTION.with(|cell| *cell.borrow_mut() = Some(BTreeMap::new()));
+        ATTRIBUTION.with(|cell| {
+            *cell.borrow_mut() =
+                (env("OTTTO_E2_BENCH_MODE").as_deref() == Some("attribution")).then(BTreeMap::new)
+        });
         bench_mark("page.begin", &[]);
         self.cadence.next_due_cycle();
         let witness = self.daemon.snapshot_scan_account_witness().unwrap();
@@ -1972,6 +1980,35 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+/// Fix the cohort before any arm runs. Use the candidate's actual paced
+/// selection (including twin-family co-scheduling), then owe just those same
+/// files in every history arm. All arms still start with the full stamped index.
+fn plan_history_cohort(base: &Path) {
+    let support = base.join("runs").join("history-plan");
+    let scan = HistoryScan::new(base);
+    let mut index = ScanIndex::default();
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        e2_hook::with_gate(false, || {
+            e2_hook::with_revision(2, || scan.stamp(&mut index, &support))
+        });
+        e2_hook::with_gate(true, || {
+            e2_hook::with_revision(3, || scan.upgrade_page(&mut index))
+        });
+    });
+    let keys = index
+        .files
+        .iter()
+        .filter(|(_, entry)| entry.effective_upload_body_witness_revision >= 3)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    assert!(!keys.is_empty(), "the planned history page reads files");
+    std::fs::write(
+        base.join("history-cohort.json"),
+        serde_json::to_vec(&keys).unwrap(),
+    )
+    .unwrap();
+}
+
 /// One whole-history page (the paced upgrade's largest page: up to 2,000
 /// files / 1 GiB) per arm, in a fresh process: stamp at revision 2, then one
 /// timed revision-3 page. Its folds are never released by a page finish here,
@@ -1996,6 +2033,26 @@ fn history(base: &Path, arm: &str) -> serde_json::Value {
                 0,
                 "history starts before the flip"
             );
+            let cohort: std::collections::BTreeSet<String> = serde_json::from_slice(
+                &std::fs::read(base.join("history-cohort.json"))
+                    .expect("prepare plans the matched history cohort"),
+            )
+            .unwrap();
+            for (key, entry) in &mut index.files {
+                if !cohort.contains(key) {
+                    entry.effective_upload_body_witness_revision = 3;
+                }
+            }
+            let mut keys = cohort
+                .iter()
+                .map(|key| {
+                    key.strip_prefix(scan.root.to_str().unwrap())
+                        .unwrap_or(key)
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            keys.sort();
+            let expected_digest = format!("{:x}", Sha256::digest(keys.join("\n")));
             let (footprint_before, _) = footprint();
             let _ = e2_hook::drain_counts();
             let _ = e2_hook::take_stages();
@@ -2005,6 +2062,20 @@ fn history(base: &Path, arm: &str) -> serde_json::Value {
             assert!(
                 page["files"].as_u64() > Some(0),
                 "MONEY_E2_BENCH history page upgraded no file: {page}"
+            );
+            assert_eq!(
+                page["files"].as_u64(),
+                Some(cohort.len() as u64),
+                "every arm upgrades the planned cohort"
+            );
+            assert_eq!(
+                page["reads"], page["files"],
+                "every history file is read once"
+            );
+            assert_eq!(
+                page["file_set_digest"].as_str(),
+                Some(expected_digest.as_str()),
+                "every arm reads the same file set"
             );
             let stages = e2_hook::take_stages();
             let e2 = e2_hook::drain_counts();
@@ -2059,9 +2130,12 @@ fn money_e2_bench_receipt() {
                 serde_json::to_vec_pretty(&manifest).unwrap(),
             )
             .unwrap();
+            let births =
+                serde_json::from_slice(&std::fs::read(base.join(STAGED_BIRTHS)).unwrap()).unwrap();
+            e2_hook::with_staged_births(births, || plan_history_cohort(&base));
             manifest
         }
-        "arm" | "reread" | "history" => {
+        "arm" | "attribution" | "reread" | "history" => {
             let manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&manifest_path).expect("prepare first"))
                     .unwrap();
@@ -2075,7 +2149,7 @@ fn money_e2_bench_receipt() {
                 .unwrap_or_default();
             let staged = births.len();
             let mut receipt = e2_hook::with_staged_births(births, || match mode.as_str() {
-                "arm" => arm(&base, &manifest, &arm_name),
+                "arm" | "attribution" => arm(&base, &manifest, &arm_name),
                 "history" => history(&base, &arm_name),
                 _ => reread(&base, &manifest),
             });
@@ -2092,6 +2166,34 @@ fn money_e2_bench_receipt() {
     eprintln!("\n{tag} {}", serde_json::to_string(&summary).unwrap());
     if let Some(output) = env("OTTTO_E2_BENCH_OUTPUT") {
         std::fs::write(output, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    }
+    // Exactly one separate diagnostic process per arm, after the canonical
+    // receipt was captured. Never feed these CPU/footprint values to the gate.
+    if mode == "arm" && env("OTTTO_E2_BENCH_TAG").is_some_and(|tag| tag.ends_with("-0")) {
+        let tag = env("OTTTO_E2_BENCH_TAG").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "snapshot_sync::tests::money_e2_bench_tests::money_e2_bench_receipt",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env("OTTTO_E2_BENCH_MODE", "attribution")
+            .env("OTTTO_E2_BENCH_TAG", format!("attribution-{tag}"));
+        if let Some(output) = env("OTTTO_E2_BENCH_OUTPUT") {
+            let path = PathBuf::from(output);
+            child.env(
+                "OTTTO_E2_BENCH_OUTPUT",
+                path.with_file_name(format!("e2-attribution-{tag}.json")),
+            );
+        }
+        assert!(
+            child.status().expect("start diagnostic process").success(),
+            "attribution process succeeds"
+        );
     }
     // After the receipt line and file: the gate reads both either way.
     assert!(
