@@ -30657,29 +30657,10 @@ impl OwnedSourceScan {
             if source == SnapshotSource::Codex {
                 census.note_codex_selection(decision, parse_reason, codex_selected_by);
             }
-            let large_claude =
-                source == SnapshotSource::ClaudeCode && claude_large_full::is_large(&candidate);
-            // A comparison target cannot sample, so its Full is already
-            // known. Defer it before any target-attempt or carry bookkeeping.
-            if large_claude && comparison_target && claude_large_full_started {
-                let admitted = claude_large_full::admit(
-                    index,
-                    &candidate,
-                    true,
-                    &mut claude_large_full_started,
-                );
-                debug_assert!(!admitted);
-                if let Some(reason) = parse_reason {
-                    census.parse_reasons[reason as usize] =
-                        census.parse_reasons[reason as usize].saturating_sub(1);
-                }
-                pending!();
-            }
             // A parse of a carried family's member cancels that family's
             // carry, so the family is co-observed in this window as BASE's
             // re-arm would observe it. A re-armed member is no new change.
             if source == SnapshotSource::ClaudeCode
-                && !large_claude
                 && decision == CandidateDecision::Parse
                 && parse_reason != Some(CandidateParseReason::Rearmed)
             {
@@ -30982,10 +30963,7 @@ impl OwnedSourceScan {
                     | sampled_scan::codex_cursor::StartPlan::Unpaged => {}
                 }
             }
-            if let Some(phase) = native_comparison
-                .as_mut()
-                .filter(|_| !large_claude || comparison_target)
-            {
+            if let Some(phase) = native_comparison.as_mut() {
                 // This is an actual native acquisition attempt, before parser
                 // construction can fail or complete with no emitted entity.
                 if let Some(credit) = capture_credit.as_deref_mut() {
@@ -31052,10 +31030,7 @@ impl OwnedSourceScan {
                 native_comparison
                     .as_mut()
                     .expect("checked target phase")
-                    .retain_target_metadata(
-                        bytes,
-                        capture_credit.as_deref_mut().expect("funded target input"),
-                    )?;
+                    .retain_target_metadata(bytes, capture_credit.expect("funded target input"))?;
             }
 
             let mut parser = match sampled_scan::new_source_parser(
@@ -31429,6 +31404,8 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            // Preserve the eager BASE revocations/rearm above. They withdraw
+            // old proof; they grant no read credit to a deferred acquisition.
             if source == SnapshotSource::ClaudeCode {
                 let full = file_sampling.as_ref().map_or(true, |acquisition| {
                     matches!(
@@ -31450,29 +31427,6 @@ impl OwnedSourceScan {
                         }
                     }
                     pending!();
-                }
-            }
-            // Large ordinary candidates have now passed actual Full/Tail
-            // admission. Deferral must neither cancel a family's carry nor
-            // label an unread path as a native comparison parse attempt.
-            if large_claude {
-                if decision == CandidateDecision::Parse
-                    && parse_reason != Some(CandidateParseReason::Rearmed)
-                {
-                    cancel_claude_family_carry_for_member_parse(
-                        index,
-                        &census_window_end,
-                        &candidate.path,
-                        &snapshots,
-                        &identified_candidates,
-                    );
-                }
-                if let Some(phase) = native_comparison.as_mut().filter(|_| !comparison_target) {
-                    if let Some(credit) = capture_credit {
-                        phase.record_parse_attempt_paid(&candidate, credit);
-                    } else {
-                        phase.record_parse_attempt(&candidate);
-                    }
                 }
             }
             if index

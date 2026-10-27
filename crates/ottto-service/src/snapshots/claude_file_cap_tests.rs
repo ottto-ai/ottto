@@ -388,6 +388,7 @@ struct Rotation {
     starts: Vec<(PathBuf, Option<crate::transcript_acquisition::ReadMode>)>,
     refuse_parking: bool,
     refusals: std::cell::Cell<usize>,
+    deferred_revocations: usize,
     started: std::time::Instant,
 }
 impl crate::source_rotation::Owner for Rotation {
@@ -410,9 +411,31 @@ impl crate::source_rotation::Owner for Rotation {
     }
     fn step(
         &mut self,
-        frame: Self::Frame,
+        mut frame: Self::Frame,
         _: Option<usize>,
     ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
+        if frame.native_comparison_ready() {
+            let api = BTreeMap::new();
+            let trace = BTreeMap::new();
+            let healthy_roots = BTreeSet::new();
+            let qualification =
+                frame.prepare_native_comparison(claude_native_comparison::PairedRows {
+                    api: &api,
+                    trace: &trace,
+                    healthy_roots: &healthy_roots,
+                });
+            let window = claude_native_comparison::Controller::new(qualification)
+                .into_window(&frame.census_window_end)
+                .expect("ordinary native window");
+            for key in &frame.index.claude_large_full_deferred {
+                let (root, _) = claude_index_path_family_member(Path::new(key)).unwrap();
+                assert!(
+                    window.root_revoked_for_test(&root),
+                    "deferral cannot revive old native-comparison eligibility"
+                );
+                self.deferred_revocations += 1;
+            }
+        }
         if let Some(active) = frame.active_file.as_deref() {
             if active.parser.source_read_probe.is_some() {
                 self.starts.push((
@@ -455,7 +478,7 @@ fn rotation_scan(
     cache: &Arc<sampled_scan::SharedCache>,
     hints: &[PathBuf],
 ) -> OwnedSourceScan {
-    OwnedSourceScan::new(
+    let mut scan = OwnedSourceScan::new(
         source,
         &[root.to_owned()],
         index,
@@ -471,7 +494,9 @@ fn rotation_scan(
     .with_sampled_acquisition(
         Arc::clone(cache),
         crate::transcript_acquisition::Scope("large-full-scheduler".into()),
-    )
+    );
+    scan.enable_native_comparison();
+    scan
 }
 fn write_populated_large(path: &Path, session: &str) {
     let mut out = BufWriter::new(File::create(path).unwrap());
@@ -591,6 +616,7 @@ fn large_claude_fulls_rotate_with_sibling_and_audits() {
             // Exercise both ordinary bounded rotation and serial fallback.
             refuse_parking: pass % 2 == 1,
             refusals: std::cell::Cell::new(0),
+            deferred_revocations: 0,
             started: std::time::Instant::now(),
         };
         let (_, acquisitions) = terminal_contract_retry::source_acquisitions(|| {
@@ -601,6 +627,11 @@ fn large_claude_fulls_rotate_with_sibling_and_audits() {
             );
         });
         assert_eq!(owner.completed.len(), 2, "both sources finish pass {pass}");
+        assert_eq!(
+            owner.deferred_revocations,
+            [2, 1, 0, 2, 2, 1, 0][pass],
+            "unread deferred roots retain BASE negative revocations"
+        );
         if owner.refuse_parking {
             assert!(
                 owner.refusals.get() > 0,
