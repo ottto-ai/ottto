@@ -13166,3 +13166,30 @@ fn retained_parent_witness_survives_ctime_only_change() {
         only(CodexParentUnresolvable::OutOfWindow, 1)
     );
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn retained_open_samples_cannot_be_reused_after_another_live_ctime_change() {
+    let home = CreatedThreadHome::new(10, true);
+    let cache = Arc::new(SharedCache::default());
+    let (index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    assert_eq!(counter(&cache, |c| c.memo_records), 1);
+    wake_chmod(&home.path);
+    let (_, _) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1);
+    let file = File::open(&home.path).unwrap();
+    let sampled = OpenStamp::capture(&file).unwrap();
+    wake_chmod(&home.path);
+    let now = OpenStamp::capture(&file).unwrap();
+    assert_ne!(sampled.changed, now.changed);
+    assert_eq!(
+        cache.retained_stamp(&home.path, now.clone()),
+        now,
+        "a change after sampling must keep its live stamp"
+    );
+    let (qualified, _, _) = cache.retained_open(&home.path, &file).unwrap();
+    assert_ne!(
+        qualified.changed, now.changed,
+        "a fresh equal-content sample pass can qualify the stored ctime"
+    );
+}

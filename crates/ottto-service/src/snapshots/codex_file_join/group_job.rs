@@ -404,7 +404,7 @@ impl GroupBoot {
             }
         }
         let mut census = ScanCensus::default();
-        let Some((opened, file)) = open_and_identify_scan_candidate(
+        let Some((opened, file)) = open_and_identify_scan_candidate_with_rescue(
             SnapshotSource::Codex,
             candidate,
             &mut census,
@@ -413,18 +413,18 @@ impl GroupBoot {
             // The entry's stored ctime lets a ctime-only change keep the
             // stored fingerprint (fresh samples hashed, no re-read).
             &index.files,
+            false,
+            cache,
         ) else {
             return Boot::Strict;
         };
         let Ok(stamp) = OpenStamp::capture(&file) else {
             return Boot::Strict;
         };
-        let identity = cache
-            .and_then(|cache| cache.retained_open(&opened.path, &file))
-            .map_or_else(
-                || opened.opened_object_identity.clone(),
-                |(_, identity, _)| identity,
-            );
+        let identity = cache.map_or_else(
+            || opened.opened_object_identity.clone(),
+            |cache| cache.retained_stamp_identity(&opened, &opened.opened_object_identity),
+        );
         self.wake_identities
             .insert(local_index_key(&opened.path), identity);
         self.group.members[i] = opened;

@@ -26830,16 +26830,21 @@ impl OwnedSourceScan {
                         context.cache.note_probe_bound();
                     }
                     let live_file = boot.live().and_then(|(live, _)| {
-                        open_candidate_file(SnapshotSource::Codex, &mut live.clone()).ok()
+                        open_candidate_file_stat_retained(
+                            SnapshotSource::Codex,
+                            &mut live.clone(),
+                            Some(&context.cache),
+                        )
+                        .ok()
+                        .map(|(file, _)| file)
                     });
                     let wake_stamp =
                         boot.live()
                             .zip(live_file.as_ref())
                             .and_then(|((live, _), file)| {
-                                context
-                                    .cache
-                                    .retained_open(&live.path, file)
-                                    .map(|(stamp, _, _)| stamp)
+                                sampled_scan::codex_cursor::OpenStamp::capture(file)
+                                    .ok()
+                                    .map(|stamp| context.cache.retained_stamp(&live.path, stamp))
                             });
                     let memo_key =
                         sampled_scan::codex_cursor::memo_key(&context.namespace, &boot.key);
@@ -30287,6 +30292,7 @@ impl OwnedSourceScan {
                 backfill_window_days,
                 &index.files,
                 verification_rescue,
+                sampling.as_ref().map(|context| context.cache.as_ref()),
             ) else {
                 pending!();
             };
@@ -30659,10 +30665,9 @@ impl OwnedSourceScan {
                 .as_ref()
                 .filter(|_| source == SnapshotSource::Codex)
             {
-                let wake_stamp = context
-                    .cache
-                    .retained_open(&candidate.path, &opened_file)
-                    .map(|(stamp, _, _)| stamp);
+                let wake_stamp = sampled_scan::codex_cursor::OpenStamp::capture(&opened_file)
+                    .ok()
+                    .map(|stamp| context.cache.retained_stamp(&candidate.path, stamp));
                 let key = local_index_key(&candidate.path);
                 // Keyed per namespace (R1-M1): the digest carries the upload
                 // context, so concurrent namespaces must not evict each other.
@@ -41294,8 +41299,19 @@ fn open_candidate_file_stat(
     source: SnapshotSource,
     candidate: &mut CandidateFile,
 ) -> std::io::Result<(File, Option<OpenedObjectStat>)> {
+    open_candidate_file_stat_retained(source, candidate, None)
+}
+
+fn open_candidate_file_stat_retained(
+    source: SnapshotSource,
+    candidate: &mut CandidateFile,
+    cache: Option<&sampled_scan::SharedCache>,
+) -> std::io::Result<(File, Option<OpenedObjectStat>)> {
     let mut file = open_candidate_beneath_root(candidate)?;
-    let (identity, stat) = opened_object_identity_and_stat(source, &mut file)?;
+    let retained = cache
+        .filter(|_| source == SnapshotSource::Codex)
+        .map(|cache| (cache, candidate.path.as_path()));
+    let (identity, stat) = opened_object_identity_and_stat_retained(source, &mut file, retained)?;
     candidate.opened_object_identity = identity;
     let tracked =
         stat.filter(|_| matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex));
@@ -41334,9 +41350,11 @@ fn open_and_identify_scan_candidate(
         backfill_window_days,
         files,
         false,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_and_identify_scan_candidate_with_rescue(
     source: SnapshotSource,
     mut candidate: CandidateFile,
@@ -41345,42 +41363,44 @@ fn open_and_identify_scan_candidate_with_rescue(
     backfill_window_days: u64,
     files: &BTreeMap<String, ScanIndexEntry>,
     verification_rescue: bool,
+    cache: Option<&sampled_scan::SharedCache>,
 ) -> Option<(CandidateFile, File)> {
-    let (mut opened_file, live) = match open_candidate_file_stat(source, &mut candidate) {
-        Ok(opened) => opened,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if claude_absence_is_removal(source, &candidate.path) {
-                // Removed after its candidate stat. Drop this page's
-                // observation too, so the page merge retires the key.
-                disappearance_diagnostics::not_found_removal(
-                    source,
-                    disappearance_diagnostics::Site::Open,
-                );
-                let index_key = local_index_key(&candidate.path);
-                census.observed_index_keys.remove(&index_key);
-                census.claude_vanished_index_keys.insert(index_key.clone());
-                census.removed_index_keys.insert(index_key);
-            } else {
-                disappearance_diagnostics::not_found(
-                    &mut census.disappeared_file_count,
-                    source,
-                    disappearance_diagnostics::Site::Open,
-                );
+    let (mut opened_file, live) =
+        match open_candidate_file_stat_retained(source, &mut candidate, cache) {
+            Ok(opened) => opened,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if claude_absence_is_removal(source, &candidate.path) {
+                    // Removed after its candidate stat. Drop this page's
+                    // observation too, so the page merge retires the key.
+                    disappearance_diagnostics::not_found_removal(
+                        source,
+                        disappearance_diagnostics::Site::Open,
+                    );
+                    let index_key = local_index_key(&candidate.path);
+                    census.observed_index_keys.remove(&index_key);
+                    census.claude_vanished_index_keys.insert(index_key.clone());
+                    census.removed_index_keys.insert(index_key);
+                } else {
+                    disappearance_diagnostics::not_found(
+                        &mut census.disappeared_file_count,
+                        source,
+                        disappearance_diagnostics::Site::Open,
+                    );
+                }
+                return None;
             }
-            return None;
-        }
-        Err(error)
-            if error.kind() == std::io::ErrorKind::InvalidData
-                && candidate.size_bytes > max_jsonl_file_bytes(source) =>
-        {
-            census.oversized_file_count += 1;
-            return None;
-        }
-        Err(_) => {
-            census.record_unreadable(UnreadableCause::OpenRead, 1);
-            return None;
-        }
-    };
+            Err(error)
+                if error.kind() == std::io::ErrorKind::InvalidData
+                    && candidate.size_bytes > max_jsonl_file_bytes(source) =>
+            {
+                census.oversized_file_count += 1;
+                return None;
+            }
+            Err(_) => {
+                census.record_unreadable(UnreadableCause::OpenRead, 1);
+                return None;
+            }
+        };
     if !verification_rescue
         && !sampled_audit::path_requires_verification(files, &candidate.path)
         && !opened_candidate_is_within_frozen_window(
@@ -41560,6 +41580,14 @@ fn opened_object_identity_and_stat(
     source: SnapshotSource,
     file: &mut File,
 ) -> std::io::Result<(String, Option<OpenedObjectStat>)> {
+    opened_object_identity_and_stat_retained(source, file, None)
+}
+
+fn opened_object_identity_and_stat_retained(
+    source: SnapshotSource,
+    file: &mut File,
+    retained: Option<(&sampled_scan::SharedCache, &Path)>,
+) -> std::io::Result<(String, Option<OpenedObjectStat>)> {
     file.seek(SeekFrom::Start(0))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -41588,6 +41616,9 @@ fn opened_object_identity_and_stat(
     #[cfg(not(unix))]
     let stat = None;
     let identity = opened_object_identity_from(len, stat.as_ref(), &samples);
+    if let Some((cache, path)) = retained {
+        cache.retained_sampled(path, file, &metadata, &samples);
+    }
     file.seek(SeekFrom::Start(0))?;
     Ok((identity, stat))
 }

@@ -527,14 +527,15 @@ impl crate::transcript_acquisition::StampIdentity for OpenStamp {
 }
 
 /// Compact cross-scan evidence. The first six words are ctime, birth,
-/// mtime, length, device and inode; the last four are the opened identity.
+/// mtime, length, device and inode; four hold the opened identity, and the
+/// last fences reuse of already-read samples at the most recent live ctime.
 /// No transcript bytes or heap allocation. Active-parser stamps stay live.
 #[derive(Clone, Copy)]
-struct WakeIdentity([u64; 10]);
+struct WakeIdentity([u64; 11]);
 
 impl WakeIdentity {
     fn identity(&self) -> String {
-        self.0[6..]
+        self.0[6..10]
             .iter()
             .map(|word| format!("{word:016x}"))
             .collect()
@@ -542,6 +543,7 @@ impl WakeIdentity {
 
     fn same_content_inputs(&self, stamp: &OpenStamp, birth: u64) -> bool {
         birth != 0
+            && self.0[2] != 0
             && self.0[1] == birth
             && self.0[2] == stamp_modified_nanos(stamp)
             && self.0[3] == stamp.extent
@@ -585,12 +587,38 @@ impl SharedCache {
         path: &Path,
         file: &File,
     ) -> Option<(OpenStamp, String, String)> {
+        let metadata = file.metadata().ok()?;
+        let width = FILE_CONTENT_SAMPLE_BYTES as u64;
+        let read = |at, len| {
+            let mut bytes = vec![0; len];
+            file.read_exact_at(&mut bytes, at).ok()?;
+            Some(bytes)
+        };
+        let samples = OpenedContentSamples {
+            head: read(0, metadata.len().min(width) as usize)?,
+            tail: if metadata.len() > width {
+                Some(read(metadata.len() - width, FILE_CONTENT_SAMPLE_BYTES)?)
+            } else {
+                None
+            },
+        };
+        self.retained_sampled(path, file, &metadata, &samples)
+    }
+
+    /// Reuse the candidate opener's samples. Its live identity and the
+    /// cross-scan identity are computed from exactly the same bytes.
+    pub(in crate::snapshots) fn retained_sampled(
+        &self,
+        path: &Path,
+        file: &File,
+        metadata: &fs::Metadata,
+        samples: &OpenedContentSamples,
+    ) -> Option<(OpenStamp, String, String)> {
         let key = local_index_key(path);
         let previous = self
             .with_cursor(|cursor| cursor.wake.0.get(&key).map(|entry| entry.0))
             .flatten();
-        let metadata = file.metadata().ok()?;
-        let mut stamp = OpenStamp::of(&metadata);
+        let mut stamp = OpenStamp::of(metadata);
         let birth = metadata
             .created()
             .ok()
@@ -604,21 +632,7 @@ impl SharedCache {
             birth_nanos: (birth != 0).then_some(birth),
             modified_nanos: Some(stamp_modified_nanos(&stamp)),
         };
-        let width = FILE_CONTENT_SAMPLE_BYTES as u64;
-        let read = |at, len| {
-            let mut bytes = vec![0; len];
-            file.read_exact_at(&mut bytes, at).ok()?;
-            Some(bytes)
-        };
-        let samples = OpenedContentSamples {
-            head: read(0, stamp.extent.min(width) as usize)?,
-            tail: if stamp.extent > width {
-                Some(read(stamp.extent - width, FILE_CONTENT_SAMPLE_BYTES)?)
-            } else {
-                None
-            },
-        };
-        let live_identity = opened_object_identity_from(stamp.extent, Some(&object), &samples);
+        let live_identity = opened_object_identity_from(stamp.extent, Some(&object), samples);
         let mut identity = live_identity.clone();
         if let Some(old) =
             previous.filter(|old| old.0[0] != 0 && old.same_content_inputs(&stamp, birth))
@@ -626,7 +640,7 @@ impl SharedCache {
             let qualified = opened_object_identity_from(
                 stamp.extent,
                 Some(&object.with_changed_unix_nanos(old.0[0])),
-                &samples,
+                samples,
             );
             if qualified == old.identity() {
                 stamp.changed = (
@@ -637,7 +651,7 @@ impl SharedCache {
             }
         }
         // Changes during sampling never establish a retained witness.
-        if OpenStamp::capture(file).ok()? != OpenStamp::of(&metadata)
+        if OpenStamp::capture(file).ok()? != OpenStamp::of(metadata)
             || file
                 .metadata()
                 .ok()?
@@ -666,8 +680,9 @@ impl SharedCache {
             0,
             0,
             0,
+            object.changed_unix_nanos(),
         ];
-        for (slot, hex) in words[6..]
+        for (slot, hex) in words[6..10]
             .iter_mut()
             .zip(identity.as_bytes().chunks_exact(16))
         {
@@ -735,7 +750,18 @@ impl SharedCache {
     ) -> OpenStamp {
         self.with_cursor(|cursor| {
             if let Some((hint, _)) = cursor.wake.0.get(&local_index_key(path)) {
-                if hint.0[2] == stamp_modified_nanos(&stamp)
+                let raw_changed = OpenedObjectStat {
+                    device: stamp.dev,
+                    inode: stamp.ino,
+                    changed_seconds: stamp.changed.0,
+                    changed_nanos: stamp.changed.1,
+                    birth_nanos: None,
+                    modified_nanos: None,
+                }
+                .changed_unix_nanos();
+                if raw_changed != 0
+                    && hint.0[10] == raw_changed
+                    && hint.0[2] == stamp_modified_nanos(&stamp)
                     && hint.0[3] == stamp.extent
                     && hint.0[4] == stamp.dev
                     && hint.0[5] == stamp.ino
