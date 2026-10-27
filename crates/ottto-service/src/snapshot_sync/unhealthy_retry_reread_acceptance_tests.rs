@@ -159,6 +159,8 @@ fn at_next_start(fixture: &RearmFixture, previous: &AtWindow) -> i64 {
 #[test]
 #[serial(source_manifests)]
 fn unhealthy_retries_reread_only_unsettled_files() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("unhealthy_retry_reread_acceptance") {
         return;
     }

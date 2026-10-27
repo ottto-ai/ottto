@@ -3150,6 +3150,8 @@ type IndexJsonDamage = fn(&mut serde_json::Value, &str);
 #[serial(source_manifests)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn returning_member_after_a_lost_tombstone_set_is_held_not_new() {
+    // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let session = PIPELINE_SESSIONS[2];
     let digest = crate::snapshots::claude_retired_family_digest_for_test(session);
@@ -3284,6 +3286,8 @@ fn assert_returning_member_held(pages: &[PipelinePage], session: &str, witness: 
 #[serial(source_manifests)]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
+    // Tombstone hold until reported proof is gate-off policy; an E2 body replaces its session.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
     let session = PIPELINE_SESSIONS[2];
     let shape = "partial-checkpoint";
