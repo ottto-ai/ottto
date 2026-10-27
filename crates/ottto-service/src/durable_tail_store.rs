@@ -155,6 +155,45 @@ pub(crate) fn scope_digest(
     )
 }
 
+/// Replay semantics layered over the format/codec scope. These are binding
+/// inputs, not codec fields: the existing tagged envelope can gain a later
+/// old-tag decoder without changing the reduction allowlist.
+pub(crate) fn replay_scope_digest(
+    scope: &Digest32,
+    effective_revision: u64,
+    active_revision: u64,
+    money_rule_version: u16,
+    money_e2: bool,
+) -> Digest32 {
+    digest(
+        "ottto-dt-replay-scope:v1",
+        &[
+            scope.as_slice(),
+            &effective_revision.to_le_bytes(),
+            &active_revision.to_le_bytes(),
+            &money_rule_version.to_le_bytes(),
+            &[u8::from(money_e2)],
+        ],
+    )
+}
+
+/// Per-file applied revision and money replay marks committed with the entry.
+/// An old reduction cannot inherit a new applied-rule/obligation marker.
+pub(crate) fn replay_entry_digest(
+    entry: &Digest32,
+    applied_revision: u64,
+    money_marks: u8,
+) -> Digest32 {
+    digest(
+        "ottto-dt-replay-entry:v1",
+        &[
+            entry.as_slice(),
+            &applied_revision.to_le_bytes(),
+            &[money_marks],
+        ],
+    )
+}
+
 /// The garbage-collection unit: the destination namespace and the account
 /// (upload context) in force. A record from another context is unreachable.
 pub(crate) fn context_digest(namespace: &str, upload_context: Option<&str>) -> Digest32 {

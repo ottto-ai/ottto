@@ -1332,8 +1332,19 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
     let _cutover = codex_counting_version::TestCutover::set(0);
     let capture = claude_request_identity::capture_by_default();
     let namespace = Scope("durable-codex".into());
-    for arm in ["restore", "view_changed", "priority_changed"] {
+    for (v2, arm) in [false, true]
+        .into_iter()
+        .flat_map(|v2| ["restore", "view_changed", "priority_changed"].map(|arm| (v2, arm)))
+    {
         let fixture = ScanFixture::new(source);
+        // A dated origin selects real V2. The undated origin exercises
+        // Legacy under the same active cutover (never infer V2 on restore).
+        if v2 {
+            let text = fs::read_to_string(&fixture.file.0).unwrap();
+            let mut meta: Value = serde_json::from_str(text.trim()).unwrap();
+            meta["payload"]["timestamp"] = json!("2026-10-07T10:00:00Z");
+            fs::write(&fixture.file.0, meta.to_string() + "\n").unwrap();
+        }
         fixture.file.append(
             &json!({"type":"turn_context","timestamp":"2026-10-07T10:00:00Z",
             "payload":{"turn_id":"turn-b2-1","model":"fixture-model"}}),
@@ -1382,6 +1393,11 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
             live(false),
         );
         assert_eq!(modes, (1, 0, 0), "{arm}");
+        let key = local_index_key(&fixture.file.0);
+        assert_eq!(
+            index.files[&key].codex_counting_v2, v2,
+            "seed decision: {arm}"
+        );
         index.save(&index_path).unwrap();
         first.durable_write_after_save(lock, source, &index);
         let records = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
@@ -1401,7 +1417,7 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         }
         let second = Arc::new(sampled_scan::SharedCache::default());
         second.durable_begin_pass(source, &index_path, &namespace, capture);
-        let (_, scan, modes, _) = production_scan_at_with_setup(
+        let (warm_index, scan, modes, _) = production_scan_at_with_setup(
             &fixture,
             source,
             loaded.clone(),
@@ -1423,7 +1439,7 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
             (1, 0, 0)
         };
         assert_eq!(modes, expected, "{arm}");
-        let (_, full, _, _) = production_scan_at_with_setup(
+        let (cold_index, full, _, _) = production_scan_at_with_setup(
             &fixture,
             source,
             loaded,
@@ -1432,6 +1448,14 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
             NOW,
             live(arm == "priority_changed"),
         );
+        assert_eq!(
+            warm_index.files[&key].codex_counting_v2, cold_index.files[&key].codex_counting_v2,
+            "restored counting decision: {arm}"
+        );
+        if arm == "restore" {
+            assert_eq!(warm_index.files[&key].codex_counting_v2, v2);
+        }
+        assert!(!scan.snapshots.is_empty(), "compare an emitted Codex body");
         assert_eq!(
             production_body(source, scan),
             production_body(source, full),

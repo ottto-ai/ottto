@@ -1111,6 +1111,121 @@ mod durable_restart {
         assert_oracle(&f, &cached, prior);
     }
 
+    /// The production evidence pipeline runs attach, side calls, account
+    /// reconciliation and finish before we serialize the upload request.
+    /// A nonempty E2 literal and reported price prevent vacuous equality of
+    /// held pages or pre-finalization accumulators.
+    fn enriched_e2(f: &Fixture, mut run: Run) -> Run {
+        let permit = claude_request_identity::emission_permit(
+            SOURCE,
+            Some(claude_request_identity::COHORT_HINT_TOKEN),
+        )
+        .unwrap();
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
+            &f.support,
+            &mut run.result,
+            &mut run.index,
+            Some(permit),
+        );
+        apply_upload_policy(
+            SOURCE,
+            &mut run.result.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        assert_eq!(
+            run.result.snapshots.len(),
+            1,
+            "an emitted body, never a held empty page"
+        );
+        let item = &run.result.snapshots[0];
+        assert_eq!(
+            item.usage_accounting_contract.as_deref(),
+            Some(claude_history_upgrade::REQUEST_OWNED_USAGE_CONTRACT)
+        );
+        assert!(
+            item.model_usage
+                .iter()
+                .any(|row| row.selector_context.contains_key("request_usage_origin")),
+            "telemetry attached before emission"
+        );
+        run
+    }
+
+    #[test]
+    fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
+        let _gate = claude_request_money::e2::GateForTest::set(true);
+        claude_request_money::e2::with_fixture_birth(0, || {
+            for append_native in [true, false] {
+                let f = Fixture::new(1);
+                // Initially only the first request's reported cost is known.
+                f.evidence(1);
+                let state = State::new(&f);
+                let first = Arc::new(SharedCache::default());
+                state.begin(&first);
+                let seed = enriched_e2(
+                    &f,
+                    raw_scan(&f, ScanIndex::default(), Some(first.clone()), |_| {}),
+                );
+                let before = exact_bodies(&seed);
+                let mut prior = settle(seed);
+                prior.save(&state.index_path).unwrap();
+                first.durable_write_after_save(state.lock, SOURCE, &prior);
+                assert_eq!(
+                    state.store_records(),
+                    usize::from(crate::heap_layout_bound::layout_supported())
+                );
+                drop(first);
+                let native_before = fs::read(&f.path).unwrap();
+                if append_native {
+                    f.append_transcript(1);
+                }
+                // Quiet arm: no more native lines, but a late telemetry row
+                // (a side call without a native owner) must still add its $1.
+                f.evidence(2);
+                let prior = ScanIndex::load(&state.index_path).unwrap();
+                let restarted = Arc::new(SharedCache::default());
+                state.begin(&restarted);
+                let warm = enriched_e2(
+                    &f,
+                    raw_scan(&f, prior.clone(), Some(restarted.clone()), |_| {}),
+                );
+                let cold = enriched_e2(&f, raw_scan(&f, prior, None, |_| {}));
+                assert_layout_mode(
+                    warm.modes,
+                    if append_native { (0, 1, 0) } else { (0, 0, 1) },
+                );
+                assert_eq!(
+                    restored(&restarted),
+                    u64::from(crate::heap_layout_bound::layout_supported())
+                );
+                assert_eq!(exact_bodies(&warm), exact_bodies(&cold));
+                assert_ne!(
+                    before.0,
+                    exact_bodies(&warm).0,
+                    "late telemetry changes the emitted body"
+                );
+                assert_eq!(
+                    warm.result.snapshots[0]
+                        .cost
+                        .as_ref()
+                        .unwrap()
+                        .total_cost_usd
+                        .as_deref(),
+                    Some("2")
+                );
+                if !append_native {
+                    assert_eq!(fs::read(&f.path).unwrap(), native_before);
+                    if crate::heap_layout_bound::layout_supported() {
+                        assert_eq!(
+                            warm.native_bytes, 0,
+                            "quiet sidecar does not reacquire native records"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     #[test]
     fn restart_after_a_metadata_only_touch_restores_unchanged() {
         let f = Fixture::new(2);

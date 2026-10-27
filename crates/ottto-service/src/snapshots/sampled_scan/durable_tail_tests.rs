@@ -105,3 +105,131 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
     assert_eq!(stats.disk_records, 3);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Replay bindings are independent of the field codec. A revision, rule or
+/// per-file marker change refuses even with unchanged scope, bytes and body.
+#[test]
+fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
+    let source = SnapshotSource::ClaudeCode;
+    let key = "/synthetic/claude/fixture.jsonl";
+    let scope = Scope("same-file-scope".into());
+    let namespace = Scope("same-account".into());
+    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({
+        "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp",
+        "effective_upload_body_witness_revision":3
+    }))
+    .unwrap();
+    let mut index = ScanIndex::default();
+    index.files.insert(key.into(), entry);
+    index.activate_effective_upload_body_witness_revision(3);
+    index.adopt_effective_upload_body_witness_revision_monotonically();
+    index.claude_money_birth_store.set_money_rule_version(1);
+    let binding = |index: &ScanIndex| {
+        let interpretation = Interpretation::of(source, key, index, false, &namespace);
+        expected(
+            DurableSource::ClaudeCode,
+            source,
+            key,
+            &scope,
+            index,
+            &interpretation,
+        )
+        .unwrap()
+        .binding
+    };
+    let prior = binding(&index);
+    assert!(!index.effective_upload_body_witness_revision_requires_adoption(key));
+    for arm in ["revision", "rule", "applied", "marks", "gate"] {
+        let mut changed = index.clone();
+        match arm {
+            "revision" => changed.activate_effective_upload_body_witness_revision(2),
+            "rule" => changed.claude_money_birth_store.set_money_rule_version(2),
+            "applied" => {
+                changed
+                    .files
+                    .get_mut(key)
+                    .unwrap()
+                    .effective_upload_body_witness_revision = 2
+            }
+            "marks" => changed
+                .claude_money_birth_store
+                .set_money_marks(key, claude_request_money::e2::money_mark::ESTIMATED),
+            "gate" => {}
+            _ => unreachable!(),
+        }
+        let after = if arm == "gate" {
+            claude_request_money::e2::with_disabled(|| binding(&changed))
+        } else {
+            binding(&changed)
+        };
+        assert_ne!(prior, after, "{arm}");
+        assert_eq!(prior.key, after.key, "{arm}");
+        assert_eq!(prior.context, after.context, "{arm}");
+        if matches!(arm, "applied" | "marks") {
+            assert_ne!(prior.entry, after.entry, "{arm}");
+        } else {
+            assert_ne!(prior.scope, after.scope, "{arm}");
+        }
+    }
+}
+
+/// Money rules re-owe only marked paths. Even a record freshly bound to the
+/// now-owed entry cannot satisfy that obligation: refusal precedes store I/O.
+#[test]
+fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::private_dir("ottto-dt-owed");
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("owed-test".into());
+    let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let key = local_index_key(&path);
+    for money in [false, true] {
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":3,"modified_unix_seconds":1,"source_file_fingerprint":"fp",
+                "effective_upload_body_witness_revision": if money {3} else {2}
+            }))
+            .unwrap(),
+        );
+        index.activate_effective_upload_body_witness_revision(3);
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        if money {
+            index.claude_money_birth_store.set_money_rule_version(1);
+            index
+                .claude_money_birth_store
+                .set_money_marks(&key, claude_request_money::e2::money_mark::ESTIMATED);
+            claude_request_money::e2::with_money_rules(
+                &[(1, 0), (2, claude_request_money::e2::money_mark::ESTIMATED)],
+                || {
+                    claude_request_money::e2::apply_money_rules(&mut index);
+                },
+            );
+            assert_eq!(index.claude_money_birth_store.money_rule_version(), 2);
+        }
+        assert!(index.effective_upload_body_witness_revision_requires_adoption(&key));
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
+        let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+        assert!(cache
+            .durable_restore(
+                source,
+                &key,
+                &path,
+                &namespace,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &interpretation
+            )
+            .is_none());
+        let (counts, disk) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.ineligible.get("history_owed"), Some(&1));
+        assert_eq!(
+            (counts.restored, counts.missing, disk.records_read),
+            (0, 0, 0)
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}

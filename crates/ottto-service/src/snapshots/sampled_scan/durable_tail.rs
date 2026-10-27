@@ -261,15 +261,35 @@ fn expected(
                 &interpretation.namespace.0,
                 index.active_upload_context_fingerprint.as_deref(),
             ),
-            scope: store::scope_digest(
-                &scope.0,
-                &allowlist,
-                &interpretation.identity_contract,
-                &interpretation.counting_view,
+            scope: store::replay_scope_digest(
+                &store::scope_digest(
+                    &scope.0,
+                    &allowlist,
+                    &interpretation.identity_contract,
+                    &interpretation.counting_view,
+                ),
+                crate::snapshot_sync::effective_upload_body_witness_revision(snapshot_source),
+                index.active_effective_upload_body_witness_revision,
+                if source == DurableSource::ClaudeCode {
+                    index.claude_money_birth_store.money_rule_version()
+                } else {
+                    0
+                },
+                source == DurableSource::ClaudeCode && claude_request_money::e2::enabled(),
             ),
-            entry: store::entry_digest(
-                &entry.source_file_fingerprint,
-                entry.last_upload_body_witness.as_deref(),
+            entry: store::replay_entry_digest(
+                &store::entry_digest(
+                    &entry.source_file_fingerprint,
+                    entry.last_upload_body_witness.as_deref(),
+                ),
+                entry.effective_upload_body_witness_revision,
+                if source == DurableSource::ClaudeCode {
+                    index
+                        .claude_money_birth_store
+                        .money_marks(claude_money_birth_store::location_key(key))
+                } else {
+                    0
+                },
             ),
         },
         committed_generation: index.generation,
@@ -389,6 +409,13 @@ impl SharedCache {
                 .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
             {
                 Counters::bump(&mut stores.counters.ineligible, "selection_cleared");
+                return None;
+            }
+            // Revision adoption and money-rule replay both use this debt.
+            // Check before disk I/O: an owed raw replay may never be served
+            // by an otherwise valid pre-replay reduction plus Tail.
+            if index.effective_upload_body_witness_revision_requires_adoption(key) {
+                Counters::bump(&mut stores.counters.ineligible, "history_owed");
                 return None;
             }
             let outcome = match stores.slot(source).as_mut() {
@@ -583,6 +610,11 @@ impl SharedCache {
                         not_persisted.push("selection");
                         continue;
                     }
+                }
+                if index.effective_upload_body_witness_revision_requires_adoption(&key) {
+                    invalidate.insert(store::key_digest(source, &key));
+                    not_persisted.push("history_owed");
+                    continue;
                 }
                 let interpretation =
                     Interpretation::of(snapshot_source, &key, index, identity_capture, namespace);
