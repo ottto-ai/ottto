@@ -28,6 +28,8 @@ fn content_witness(scan_root: &Path, path: &Path) -> std::io::Result<(u64, Strin
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     };
     let mut file = open_candidate_beneath_root(&candidate)?;
     let metadata = file.metadata()?;
