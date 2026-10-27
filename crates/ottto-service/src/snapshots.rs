@@ -21236,6 +21236,19 @@ fn codex_parent_open_match_witnessed(
     census: CodexParentCensus<'_>,
     found: CodexCensusMatch<'_>,
 ) -> Result<(PathBuf, String, Option<OpenedObjectStat>, File), CodexParentUnresolvable> {
+    use CodexParentUnresolvable::Absent;
+    let mut candidate = codex_parent_candidate_match(census, found)?;
+    let (file, stat) =
+        open_candidate_file_stat(SnapshotSource::Codex, &mut candidate).map_err(|_| Absent)?;
+    Ok((candidate.path, candidate.opened_object_identity, stat, file))
+}
+
+/// Resolve and validate the parent's path without sampling it. Shared by
+/// live proof opens and retained wake opens so each reads the samples once.
+fn codex_parent_candidate_match(
+    census: CodexParentCensus<'_>,
+    found: CodexCensusMatch<'_>,
+) -> Result<CandidateFile, CodexParentUnresolvable> {
     use CodexParentUnresolvable::*;
     // More than one physical rollout claiming the same source session id is
     // ambiguous evidence, even if one happens to match the old witness.
@@ -21268,7 +21281,7 @@ fn codex_parent_open_match_witnessed(
         .ok()
         .and_then(unix_nanos)
         .unwrap_or_else(|| modified_unix_seconds.saturating_mul(1_000_000_000));
-    let mut candidate = CandidateFile {
+    let candidate = CandidateFile {
         physical_identity: None,
         scan_root,
         path,
@@ -21282,9 +21295,26 @@ fn codex_parent_open_match_witnessed(
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
     };
-    let (file, stat) =
-        open_candidate_file_stat(SnapshotSource::Codex, &mut candidate).map_err(|_| Absent)?;
-    Ok((candidate.path, candidate.opened_object_identity, stat, file))
+    Ok(candidate)
+}
+
+fn codex_parent_open_match_retained(
+    census: CodexParentCensus<'_>,
+    found: CodexCensusMatch<'_>,
+    cache: &sampled_scan::SharedCache,
+) -> Result<(PathBuf, String, File), CodexParentUnresolvable> {
+    use CodexParentUnresolvable::*;
+    let candidate = codex_parent_candidate_match(census, found)?;
+    let file = open_candidate_beneath_root(&candidate).map_err(|_| Absent)?;
+    let metadata = file.metadata().map_err(|_| Absent)?;
+    if !metadata.is_file() {
+        return Err(NotRegular);
+    }
+    if metadata.len() > max_jsonl_file_bytes(SnapshotSource::Codex) {
+        return Err(Oversize);
+    }
+    let (_, identity, _) = cache.retained_open(&candidate.path, &file).ok_or(Absent)?;
+    Ok((candidate.path, identity, file))
 }
 
 /// Uncached: one census pass and one no-follow open of the parent's single
@@ -21296,6 +21326,39 @@ fn codex_parent_open(
     let session_id = resolve_codex_identity(session_id);
     let found = codex_parent_census_matches(census, &[session_id.as_str()]);
     codex_parent_open_match(census, found[0]).map(|(_path, identity, file)| (identity, file))
+}
+
+/// Cross-scan parent wake input. This never serves either after-parse
+/// fence: those continue to probe the live opened identity. One locate and
+/// one fresh head/tail read, charged by the caller like a normal probe.
+fn retained_codex_parent(
+    census: CodexParentCensus<'_>,
+    parent: &str,
+    cache: &sampled_scan::SharedCache,
+) -> (
+    Result<String, CodexParentUnresolvable>,
+    Option<(String, String)>,
+) {
+    let opened = codex_parent_locate(census, parent).and_then(|(key, file)| {
+        cache
+            .retained_open(Path::new(&key), &file)
+            .map(|(_, identity, live)| (identity, live))
+            .ok_or(CodexParentUnresolvable::Absent)
+    });
+    match opened {
+        Ok((identity, live)) => (Ok(identity.clone()), Some((live, identity))),
+        Err(cause) => (Err(cause), None),
+    }
+}
+
+fn retained_parent_ledger(
+    identity: Option<String>,
+    qualified: Option<&(String, String)>,
+) -> Option<String> {
+    identity.map(|identity| match qualified {
+        Some((live, retained)) if *live == identity => retained.clone(),
+        _ => identity,
+    })
 }
 
 /// U1a-2a (rev 2 §5.2(12)): budgeted mode, where proof work is owed: a
@@ -23497,7 +23560,11 @@ fn codex_parent_step_start(
             if matches!(found[at], CodexCensusMatch::One(_)) {
                 page.charge(false, SAMPLE_READ_BYTES);
             }
-            Some(codex_parent_open_match(census, found[at]))
+            Some(codex_parent_open_match_retained(
+                census,
+                found[at],
+                &context.cache,
+            ))
         };
         // 1. Re-validate every witness against this traversal's open.
         let mut dropped = Vec::new();
@@ -26790,7 +26857,11 @@ impl OwnedSourceScan {
                 boot.allow_probe_bytes(
                     codex_page.singleton_remaining(sampled_scan::codex_cursor::Limits::current()),
                 );
-                let outcome = boot.step(attribution_context, index);
+                let outcome = boot.step_with_cache(
+                    attribution_context,
+                    index,
+                    sampling.as_ref().map(|context| context.cache.as_ref()),
+                );
                 // Header and probe bytes are singleton-budget reads (§d.2).
                 codex_page.charge(false, boot.take_charge());
                 let members = boot.group.members.len();
@@ -26891,8 +26962,22 @@ impl OwnedSourceScan {
                         context.cache.note_probe_bound();
                     }
                     let live_file = boot.live().and_then(|(live, _)| {
-                        open_candidate_file(SnapshotSource::Codex, &mut live.clone()).ok()
+                        open_candidate_file_stat_retained(
+                            SnapshotSource::Codex,
+                            &mut live.clone(),
+                            Some(&context.cache),
+                        )
+                        .ok()
+                        .map(|(file, _)| file)
                     });
+                    let wake_stamp =
+                        boot.live()
+                            .zip(live_file.as_ref())
+                            .and_then(|((live, _), file)| {
+                                sampled_scan::codex_cursor::OpenStamp::capture(file)
+                                    .ok()
+                                    .map(|stamp| context.cache.retained_stamp(&live.path, stamp))
+                            });
                     let memo_key =
                         sampled_scan::codex_cursor::memo_key(&context.namespace, &boot.key);
                     if let Some(entry) = context.cache.memo_lookup(&memo_key) {
@@ -26901,7 +26986,9 @@ impl OwnedSourceScan {
                         let hit = boot
                             .memo_digest(index, &codex_title_metadata)
                             .zip(live_file.as_ref())
-                            .and_then(|(digest, file)| entry.matches(&digest, file, None, ""));
+                            .and_then(|(digest, file)| {
+                                entry.matches_stamp(&digest, file, None, "", wake_stamp.clone()?)
+                            });
                         if let Some(stamp) = hit {
                             // No wake dependency changed: the same terminal
                             // debt again, per member, at zero replay bytes.
@@ -26925,11 +27012,11 @@ impl OwnedSourceScan {
                         }
                         context.cache.memo_forget(&memo_key);
                     }
-                    let parked = live_file.as_ref().and_then(|file| {
-                        context
-                            .cache
-                            .cursor_parked(&boot.key, file, dependencies.as_deref())
-                    });
+                    let parked = context.cache.cursor_parked_stamp(
+                        &boot.key,
+                        wake_stamp,
+                        dependencies.as_deref(),
+                    );
                     if let Some(disclosure) = parked {
                         context.cache.cursor_unwait(&context.namespace, &boot.key);
                         codex_file_join::disclose_members(
@@ -26998,6 +27085,14 @@ impl OwnedSourceScan {
                 // like main's unpaged read: each member at most
                 // `MAX_CODEX_JSONL_FILE_BYTES`, the group's total uncapped
                 // (R2-N7, disclosed).
+                let active_dependencies = boot.live().map(|(live, _)| {
+                    sampled_scan::codex_cursor::group_dependencies(
+                        &boot.group.members,
+                        &live.path,
+                        &codex_title_metadata,
+                        |member| member.opened_object_identity.clone(),
+                    )
+                });
                 let owner = boot.group.owner.clone();
                 let group_members = boot.group.members.clone();
                 let boot_key = boot.key.clone();
@@ -27033,7 +27128,7 @@ impl OwnedSourceScan {
                     match context.cache.cursor_start_group(
                         &mut job,
                         &context.namespace,
-                        dependencies,
+                        active_dependencies,
                         state_census_complete && sidecar_census_complete,
                         index,
                     ) {
@@ -28786,7 +28881,11 @@ impl OwnedSourceScan {
                                         &session_id,
                                         sampled_scan::codex_cursor::ParentWitness {
                                             cause,
-                                            identity: Some(identity),
+                                            identity: Some(
+                                                context
+                                                    .cache
+                                                    .retained_stamp_identity(&candidate, &identity),
+                                            ),
                                             waits_on: None,
                                         },
                                     );
@@ -28805,7 +28904,11 @@ impl OwnedSourceScan {
                                         &session_id,
                                         sampled_scan::codex_cursor::ParentWitness {
                                             cause: CodexParentUnresolvable::DeferredRestart,
-                                            identity: Some(identity),
+                                            identity: Some(
+                                                context
+                                                    .cache
+                                                    .retained_stamp_identity(&candidate, &identity),
+                                            ),
                                             waits_on: parsed_file.codex_parent_session_ref.clone(),
                                         },
                                     );
@@ -28844,7 +28947,10 @@ impl OwnedSourceScan {
                                 &path_id,
                                 sampled_scan::codex_cursor::ParentWitness {
                                     cause: CodexParentUnresolvable::NoLedger,
-                                    identity: Some(candidate.opened_object_identity.clone()),
+                                    identity: Some(context.cache.retained_stamp_identity(
+                                        &candidate,
+                                        &candidate.opened_object_identity,
+                                    )),
                                     waits_on: None,
                                 },
                             );
@@ -28930,23 +29036,15 @@ impl OwnedSourceScan {
                                     .codex_parent_session_ref
                                     .as_deref()
                                     .map(|parent| {
-                                        let current = match used.clone() {
-                                            Some(used) => Some(used),
-                                            None => {
-                                                let (current, fresh) = codex_parent_identities
-                                                    .probe(
-                                                        codex_parent_identities.census(index),
-                                                        parent,
-                                                    );
-                                                if fresh {
-                                                    codex_page.charge(
-                                                    false,
-                                                    sampled_scan::codex_cursor::SAMPLE_READ_BYTES,
-                                                );
-                                                }
-                                                current.ok()
-                                            }
-                                        };
+                                        let (current, qualified) = retained_codex_parent(
+                                            codex_parent_identities.census(index),
+                                            parent,
+                                            &context.cache,
+                                        );
+                                        codex_page.charge(
+                                            false,
+                                            sampled_scan::codex_cursor::SAMPLE_READ_BYTES,
+                                        );
                                         sampled_scan::codex_cursor::ParentDep {
                                             id: parent.to_owned(),
                                             // An invalidation dependency only, never
@@ -28954,15 +29052,20 @@ impl OwnedSourceScan {
                                             // takes precedence; with none, the indexed
                                             // identity (main's term), so its arrival,
                                             // change or removal misses once.
-                                            ledger: used.clone().or_else(|| {
-                                                index
-                                                    .codex_parent_ownership_ledgers
-                                                    .get(resolve_codex_identity(parent).as_str())
-                                                    .map(|ledger| {
-                                                        ledger.opened_object_identity.clone()
-                                                    })
-                                            }),
-                                            current,
+                                            ledger: retained_parent_ledger(
+                                                used.clone().or_else(|| {
+                                                    index
+                                                        .codex_parent_ownership_ledgers
+                                                        .get(
+                                                            resolve_codex_identity(parent).as_str(),
+                                                        )
+                                                        .map(|ledger| {
+                                                            ledger.opened_object_identity.clone()
+                                                        })
+                                                }),
+                                                qualified.as_ref(),
+                                            ),
+                                            current: current.ok(),
                                             // PR-P: the step-map witness this
                                             // parse read, so its arrival, change
                                             // or removal misses once.
@@ -28981,7 +29084,7 @@ impl OwnedSourceScan {
                                 sampled_scan::codex_cursor::MemoEntry::new(
                                     digest,
                                     live,
-                                    stamp,
+                                    context.cache.retained_stamp(&candidate.path, stamp),
                                     parent,
                                     sidecar,
                                     sampled_scan::codex_cursor::Disclosure {
@@ -30332,6 +30435,7 @@ impl OwnedSourceScan {
                 backfill_window_days,
                 &index.files,
                 verification_rescue,
+                sampling.as_ref().map(|context| context.cache.as_ref()),
             ) else {
                 pending!();
             };
@@ -30604,7 +30708,10 @@ impl OwnedSourceScan {
                                 parent,
                                 sampled_scan::codex_cursor::ParentWitness {
                                     cause: CodexParentUnresolvable::ParentLossy,
-                                    identity: Some(candidate.opened_object_identity.clone()),
+                                    identity: Some(context.cache.retained_stamp_identity(
+                                        &candidate,
+                                        &candidate.opened_object_identity,
+                                    )),
                                     waits_on: None,
                                 },
                             );
@@ -30701,6 +30808,9 @@ impl OwnedSourceScan {
                 .as_ref()
                 .filter(|_| source == SnapshotSource::Codex)
             {
+                let wake_stamp = sampled_scan::codex_cursor::OpenStamp::capture(&opened_file)
+                    .ok()
+                    .map(|stamp| context.cache.retained_stamp(&candidate.path, stamp));
                 let key = local_index_key(&candidate.path);
                 // Keyed per namespace (R1-M1): the digest carries the upload
                 // context, so concurrent namespaces must not evict each other.
@@ -30740,16 +30850,20 @@ impl OwnedSourceScan {
                     // L4 (PR-1): the parent's index ledger identity, and its
                     // current opened identity (L-5 probe; charged when it opens).
                     let parent_now = entry.parent_ref().map(|parent| {
-                        let (current, fresh) = codex_parent_identities
-                            .probe(codex_parent_identities.census(index), parent);
-                        if fresh {
-                            codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
-                        }
+                        let (current, qualified) = retained_codex_parent(
+                            codex_parent_identities.census(index),
+                            parent,
+                            &context.cache,
+                        );
+                        codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                         sampled_scan::codex_cursor::ParentNow {
-                            ledger: index
-                                .codex_parent_ownership_ledgers
-                                .get(resolve_codex_identity(parent).as_str())
-                                .map(|ledger| ledger.opened_object_identity.clone()),
+                            ledger: retained_parent_ledger(
+                                index
+                                    .codex_parent_ownership_ledgers
+                                    .get(resolve_codex_identity(parent).as_str())
+                                    .map(|ledger| ledger.opened_object_identity.clone()),
+                                qualified.as_ref(),
+                            ),
                             current: current.ok(),
                             // PR-P: the step map's witness, as the classifier
                             // would read it now; an overflowing ref is
@@ -30788,7 +30902,13 @@ impl OwnedSourceScan {
                         )
                     });
                     let hit = digest.as_deref().and_then(|digest| {
-                        entry.matches(digest, &opened_file, parent_now.as_ref(), &sidecar_now)
+                        entry.matches_stamp(
+                            digest,
+                            &opened_file,
+                            parent_now.as_ref(),
+                            &sidecar_now,
+                            wake_stamp.clone()?,
+                        )
                     });
                     if let Some(stamp) = hit {
                         // An append cannot cure this hold and no wake
@@ -30858,9 +30978,9 @@ impl OwnedSourceScan {
                 let parked = side_plan
                     .is_none()
                     .then(|| {
-                        context.cache.cursor_parked(
+                        context.cache.cursor_parked_stamp(
                             &key,
-                            &opened_file,
+                            wake_stamp.clone(),
                             sampled_scan::reduction_dependencies(
                                 source,
                                 &candidate,
@@ -41460,8 +41580,19 @@ fn open_candidate_file_stat(
     source: SnapshotSource,
     candidate: &mut CandidateFile,
 ) -> std::io::Result<(File, Option<OpenedObjectStat>)> {
+    open_candidate_file_stat_retained(source, candidate, None)
+}
+
+fn open_candidate_file_stat_retained(
+    source: SnapshotSource,
+    candidate: &mut CandidateFile,
+    cache: Option<&sampled_scan::SharedCache>,
+) -> std::io::Result<(File, Option<OpenedObjectStat>)> {
     let mut file = open_candidate_beneath_root(candidate)?;
-    let (identity, stat) = opened_object_identity_and_stat(source, &mut file)?;
+    let retained = cache
+        .filter(|_| source == SnapshotSource::Codex)
+        .map(|cache| (cache, candidate.path.as_path()));
+    let (identity, stat) = opened_object_identity_and_stat_retained(source, &mut file, retained)?;
     candidate.opened_object_identity = identity;
     let tracked =
         stat.filter(|_| matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex));
@@ -41500,9 +41631,11 @@ fn open_and_identify_scan_candidate(
         backfill_window_days,
         files,
         false,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_and_identify_scan_candidate_with_rescue(
     source: SnapshotSource,
     mut candidate: CandidateFile,
@@ -41511,51 +41644,53 @@ fn open_and_identify_scan_candidate_with_rescue(
     backfill_window_days: u64,
     files: &BTreeMap<String, ScanIndexEntry>,
     verification_rescue: bool,
+    cache: Option<&sampled_scan::SharedCache>,
 ) -> Option<(CandidateFile, File)> {
-    let (mut opened_file, live) = match open_candidate_file_stat(source, &mut candidate) {
-        Ok(opened) => opened,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if claude_absence_is_removal(source, &candidate.path) {
-                // Removed after its candidate stat. Drop this page's
-                // observation too, so the page merge retires the key.
-                disappearance_diagnostics::not_found_removal(
-                    source,
-                    disappearance_diagnostics::Site::Open,
-                );
-                let index_key = local_index_key(&candidate.path);
-                census.observed_index_keys.remove(&index_key);
-                census.claude_vanished_index_keys.insert(index_key.clone());
-                census.removed_index_keys.insert(index_key);
-            } else {
-                disappearance_diagnostics::not_found(
-                    &mut census.disappeared_file_count,
-                    source,
-                    disappearance_diagnostics::Site::Open,
-                );
+    let (mut opened_file, live) =
+        match open_candidate_file_stat_retained(source, &mut candidate, cache) {
+            Ok(opened) => opened,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if claude_absence_is_removal(source, &candidate.path) {
+                    // Removed after its candidate stat. Drop this page's
+                    // observation too, so the page merge retires the key.
+                    disappearance_diagnostics::not_found_removal(
+                        source,
+                        disappearance_diagnostics::Site::Open,
+                    );
+                    let index_key = local_index_key(&candidate.path);
+                    census.observed_index_keys.remove(&index_key);
+                    census.claude_vanished_index_keys.insert(index_key.clone());
+                    census.removed_index_keys.insert(index_key);
+                } else {
+                    disappearance_diagnostics::not_found(
+                        &mut census.disappeared_file_count,
+                        source,
+                        disappearance_diagnostics::Site::Open,
+                    );
+                }
+                return None;
             }
-            return None;
-        }
-        Err(error)
-            if error.kind() == std::io::ErrorKind::InvalidData
-                && candidate.size_bytes > max_jsonl_file_bytes(source) =>
-        {
-            census.oversized_file_count += 1;
-            census
-                .observed_index_keys
-                .insert(local_index_key(&candidate.path));
-            oversized_discovery::record(
-                source,
-                &candidate.scan_root,
-                &candidate.path,
-                &mut census.oversized_discovery,
-            );
-            return None;
-        }
-        Err(_) => {
-            census.record_unreadable(UnreadableCause::OpenRead, 1);
-            return None;
-        }
-    };
+            Err(error)
+                if error.kind() == std::io::ErrorKind::InvalidData
+                    && candidate.size_bytes > max_jsonl_file_bytes(source) =>
+            {
+                census.oversized_file_count += 1;
+                census
+                    .observed_index_keys
+                    .insert(local_index_key(&candidate.path));
+                oversized_discovery::record(
+                    source,
+                    &candidate.scan_root,
+                    &candidate.path,
+                    &mut census.oversized_discovery,
+                );
+                return None;
+            }
+            Err(_) => {
+                census.record_unreadable(UnreadableCause::OpenRead, 1);
+                return None;
+            }
+        };
     if !verification_rescue
         && !sampled_audit::path_requires_verification(files, &candidate.path)
         && !opened_candidate_is_within_frozen_window(
@@ -41735,6 +41870,14 @@ fn opened_object_identity_and_stat(
     source: SnapshotSource,
     file: &mut File,
 ) -> std::io::Result<(String, Option<OpenedObjectStat>)> {
+    opened_object_identity_and_stat_retained(source, file, None)
+}
+
+fn opened_object_identity_and_stat_retained(
+    source: SnapshotSource,
+    file: &mut File,
+    retained: Option<(&sampled_scan::SharedCache, &Path)>,
+) -> std::io::Result<(String, Option<OpenedObjectStat>)> {
     file.seek(SeekFrom::Start(0))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -41763,6 +41906,9 @@ fn opened_object_identity_and_stat(
     #[cfg(not(unix))]
     let stat = None;
     let identity = opened_object_identity_from(len, stat.as_ref(), &samples);
+    if let Some((cache, path)) = retained {
+        cache.retained_sampled(path, file, &metadata, &samples);
+    }
     file.seek(SeekFrom::Start(0))?;
     Ok((identity, stat))
 }
