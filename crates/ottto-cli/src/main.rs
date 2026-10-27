@@ -2,9 +2,10 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use ottto_core::{
     client_control_token, default_socket_path, execute_local_uninstall,
     ingest_claude_statusline_payload, install_owner_for_path, kickstart_macos_launch_agent,
-    load_or_create_control_token, local_lifecycle_home_dir, request_unix_socket_with_timeout,
-    UninstallExecutionOptions, LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT,
-    OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
+    load_or_create_control_token_unless_daemon_owns, local_lifecycle_home_dir,
+    request_unix_socket_with_timeout, TokenStoreError, UninstallExecutionOptions,
+    LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT, OTTTO_SERVICE_BINARY_NAME,
+    OTTTO_SOCKET_ENV,
 };
 use ottto_protocol::{
     expected_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
@@ -2121,7 +2122,9 @@ fn print_error(error: CliError, output_mode: OutputMode, request_id: Option<&str
 fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
     let socket_overridden = cli.socket.is_some();
     let env_socket_present = std::env::var_os(OTTTO_SOCKET_ENV).is_some();
-    let token = cli.token.unwrap_or_else(default_cli_control_token);
+    let token = cli
+        .token
+        .unwrap_or_else(|| default_cli_control_token(output_mode));
     let socket = cli.socket.unwrap_or_else(default_socket_path);
     let command = local_command(cli.command);
     let cached = matches!(command, LocalControlCommand::AgentStatusCached { .. });
@@ -2146,11 +2149,28 @@ fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
     }
 }
 
-fn default_cli_control_token() -> String {
+fn default_cli_control_token(output_mode: OutputMode) -> String {
     match client_control_token() {
         Ok(token) => token,
-        Err(_) if !cfg!(debug_assertions) => load_or_create_control_token()
-            .unwrap_or_else(|_| "local-development-control-token".to_string()),
+        Err(_) if !cfg!(debug_assertions) => {
+            // Never creates a token while a daemon owns local state.
+            match load_or_create_control_token_unless_daemon_owns() {
+                Ok(token) => token,
+                Err(TokenStoreError::DaemonNotReady) => std::process::exit(print_error(
+                    CliError {
+                        code: CliErrorCode::DaemonUnavailable,
+                        message: format!(
+                            "{OTTTO_SERVICE_BINARY_NAME} is starting and has not created its control token yet; retry in a few seconds"
+                        ),
+                        retryable: true,
+                        details: BTreeMap::new(),
+                    },
+                    output_mode,
+                    None,
+                )),
+                Err(_) => "local-development-control-token".to_string(),
+            }
+        }
         Err(_) => "local-development-control-token".to_string(),
     }
 }

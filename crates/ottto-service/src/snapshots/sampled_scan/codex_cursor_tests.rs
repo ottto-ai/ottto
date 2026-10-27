@@ -12960,3 +12960,236 @@ fn ordinary_pages_after_a_worker_panic_under_any_lock_fail_closed() {
         });
     }
 }
+
+/// The cache and held entry are produced by the real sampled pipeline.
+fn wake_chmod(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let before = fs::metadata(path).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(before.permissions().mode() ^ 0o004),
+    )
+    .unwrap();
+    let after = fs::metadata(path).unwrap();
+    assert_eq!(before.len(), after.len());
+    assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    assert_eq!(before.created().unwrap(), after.created().unwrap());
+    assert_ne!(
+        (before.ctime(), before.ctime_nsec()),
+        (after.ctime(), after.ctime_nsec())
+    );
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn retained_held_singleton_ignores_ctime_but_wakes_on_content_birth_and_inode() {
+    for change in [
+        "chmod",
+        "append",
+        "edit",
+        "earlier_birth",
+        "later_birth",
+        "missing_birth",
+        "inode",
+    ] {
+        let home = CreatedThreadHome::new(10, true);
+        let cache = Arc::new(SharedCache::default());
+        let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
+        assert_eq!(
+            counter(&cache, |c| c.memo_records),
+            1,
+            "{change}: {}",
+            counters(&cache)
+        );
+        let before = counter(&cache, |c| c.memo_hits);
+        match change {
+            "append" => OpenOptions::new()
+                .append(true)
+                .open(&home.path)
+                .unwrap()
+                .write_all(b"{}\n")
+                .unwrap(),
+            "edit" => {
+                let bytes = fs::read(&home.path).unwrap();
+                let changed = String::from_utf8(bytes)
+                    .unwrap()
+                    .replace("grown-turn", "other-turn")
+                    .replace("gpt-5.6-sol", "gpt-5.7-sol");
+                assert_ne!(changed.as_bytes(), fs::read(&home.path).unwrap());
+                fs::write(&home.path, changed).unwrap();
+            }
+            "inode" => {
+                let replacement = home.path.with_extension("replacement");
+                fs::copy(&home.path, &replacement).unwrap();
+                assert_ne!(
+                    fs::metadata(&home.path).unwrap().ino(),
+                    fs::metadata(&replacement).unwrap().ino()
+                );
+                fs::rename(replacement, &home.path).unwrap();
+            }
+            _ => {
+                if change != "chmod" {
+                    cache.with_cursor(|cursor| {
+                        let hint = &mut cursor
+                            .wake
+                            .0
+                            .get_mut(&local_index_key(&home.path))
+                            .expect("retained content evidence")
+                            .0;
+                        assert_ne!(hint.0[1], 0);
+                        hint.0[1] = match change {
+                            "earlier_birth" => hint.0[1] - 1,
+                            "later_birth" => hint.0[1] + 1,
+                            "missing_birth" => 0,
+                            _ => unreachable!(),
+                        };
+                    });
+                }
+                wake_chmod(&home.path);
+            }
+        }
+        let parsed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let hook = {
+            let parsed = std::rc::Rc::clone(&parsed);
+            move |path: &Path| parsed.borrow_mut().push(path.to_path_buf())
+        };
+        let (_, scan) =
+            crate::snapshots::with_codex_before_parse(hook, || home.generation(index, &cache, 1));
+        if change == "chmod" {
+            assert!(
+                parsed.borrow().is_empty(),
+                "ctime-only must never replay: {}",
+                counters(&cache)
+            );
+            assert_eq!(counter(&cache, |c| c.memo_hits), before + 1);
+            assert_eq!(replayed_census(&scan), replayed_census(&held));
+        } else {
+            assert_eq!(
+                parsed.borrow().len(),
+                1,
+                "{change}: content/object change must wake"
+            );
+            assert_eq!(counter(&cache, |c| c.memo_hits), before, "{change}");
+        }
+        let mut count = crate::heap_layout_bound::Counter::new(STATE_BYTES);
+        cache
+            .heap_bound(&mut count)
+            .expect("shared cache remains bounded");
+        eprintln!(
+            "codex_wake_budget: case={change} bytes={} visits={} state_limit={STATE_BYTES}",
+            count.bytes,
+            count.visits_for_test()
+        );
+        assert!(count.visits_for_test() <= 4096);
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn retained_parent_dependency_ignores_ctime_but_wakes_on_parent_append() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let cache = Arc::new(SharedCache::default());
+    let (index, settled, n) = home.settle(ScanIndex::default(), &cache, 0);
+    assert!(home.child_entry(&cache).is_some());
+    let parent = home.fixture.file(PARENT);
+    let hits = counter(&cache, |c| c.memo_hits);
+    let records = counter(&cache, |c| c.memo_records);
+    wake_chmod(&parent);
+    let parsed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let hook = {
+        let parsed = std::rc::Rc::clone(&parsed);
+        move |path: &Path| parsed.borrow_mut().push(path.to_path_buf())
+    };
+    let (index, quiet) = crate::snapshots::with_codex_before_parse(hook.clone(), || {
+        home.generation(index, &cache, n)
+    });
+    assert!(
+        parsed.borrow().is_empty(),
+        "metadata-only parent change: {:?}",
+        parsed.borrow()
+    );
+    assert_eq!(counter(&cache, |c| c.memo_hits), hits + 1);
+    assert_eq!(counter(&cache, |c| c.memo_records), records);
+    assert_eq!(replayed_census(&quiet), replayed_census(&settled));
+    append_parent_turn(&parent, 1);
+    let _ =
+        crate::snapshots::with_codex_before_parse(hook, || home.generation(index, &cache, n + 1));
+    assert!(
+        parsed.borrow().contains(&parent),
+        "parent append must parse"
+    );
+    assert!(
+        parsed.borrow().contains(&home.fixture.file(CHILD)),
+        "changed dependency must wake child"
+    );
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn retained_parent_witness_survives_ctime_only_change() {
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    let parent = home.fixture.file(PARENT);
+    OpenOptions::new()
+        .write(true)
+        .open(&parent)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+        .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut last = None;
+    for n in 0..4 {
+        let (next, scan) = home.generation(index, &cache, n);
+        index = next;
+        last = Some(scan);
+    }
+    assert_eq!(
+        parent_causes(last.as_ref().unwrap()),
+        only(CodexParentUnresolvable::OutOfWindow, 1)
+    );
+    wake_chmod(&parent);
+    let parsed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let hook = {
+        let parsed = std::rc::Rc::clone(&parsed);
+        move |path: &Path| parsed.borrow_mut().push(path.to_path_buf())
+    };
+    let (_, scan) =
+        crate::snapshots::with_codex_before_parse(hook, || home.generation(index, &cache, 4));
+    assert!(
+        parsed.borrow().is_empty(),
+        "a ctime-only parent witness must not wake: {:?}",
+        parsed.borrow()
+    );
+    assert_eq!(
+        parent_causes(&scan),
+        only(CodexParentUnresolvable::OutOfWindow, 1)
+    );
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn retained_open_samples_cannot_be_reused_after_another_live_ctime_change() {
+    let home = CreatedThreadHome::new(10, true);
+    let cache = Arc::new(SharedCache::default());
+    let (index, _) = home.generation(ScanIndex::default(), &cache, 0);
+    assert_eq!(counter(&cache, |c| c.memo_records), 1);
+    wake_chmod(&home.path);
+    let (_, _) = home.generation(index, &cache, 1);
+    assert_eq!(counter(&cache, |c| c.memo_hits), 1);
+    let file = File::open(&home.path).unwrap();
+    let sampled = OpenStamp::capture(&file).unwrap();
+    wake_chmod(&home.path);
+    let now = OpenStamp::capture(&file).unwrap();
+    assert_ne!(sampled.changed, now.changed);
+    assert_eq!(
+        cache.retained_stamp(&home.path, now.clone()),
+        now,
+        "a change after sampling must keep its live stamp"
+    );
+    let (qualified, _, _) = cache.retained_open(&home.path, &file).unwrap();
+    assert_ne!(
+        qualified.changed, now.changed,
+        "a fresh equal-content sample pass can qualify the stored ctime"
+    );
+}

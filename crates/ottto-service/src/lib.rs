@@ -73,6 +73,8 @@ pub mod xpc_mach;
 
 #[cfg(unix)]
 pub use local_state_sweep::{run_local_state_sweep_command, sweep_local_state_at_startup};
+#[cfg(unix)]
+pub use ottto_core::state_dir_lock;
 
 use crate::control::TerminalRefreshRejection;
 use crate::detected_uses::{prune_stale_detected_uses, DETECTED_USE_RETENTION_DAYS};
