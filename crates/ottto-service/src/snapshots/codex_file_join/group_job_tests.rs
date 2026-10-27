@@ -1564,6 +1564,7 @@ fn group_with_legacy_tee_is_byte_charged() {
         retained_hint: Some((0, 0)),
         retained_finalization_charge: 0,
         retained_usage: None,
+        reinsertion: Default::default(),
     });
     let acquisition = active.parser.reader.acquisition.replace(plan);
     let replay = active.parser.accumulator.codex_tier_replay.take();
@@ -2415,6 +2416,7 @@ fn census_traversal(census: &[&str]) -> crate::snapshots::ScanTraversalCheckpoin
         pending_directories: std::collections::VecDeque::new(),
         pending_candidates: std::collections::VecDeque::new(),
         observed_index_keys: BTreeSet::new(),
+        oversized_discovery: Default::default(),
         codex_rollout_paths: census.iter().map(|key| (*key).to_owned()).collect(),
         codex_join_directory_census: None,
         reconciliation_upper_bound: None,
