@@ -894,6 +894,7 @@ fn large_history_upgrade_is_paced_and_owed_history_drains() {
     assert_eq!(claude_history_upgrade::max_gated_claude_revision(), 3);
     assert_eq!(body_witness_adoption_byte_budget(), 1024 * MIB);
     let fixture = Fixture::new();
+    let pi = Fixture::new();
     let support = Fixture::new();
     let list = ReemissionExclusions::path(&support.0);
     fs::create_dir_all(list.parent().unwrap()).unwrap();
@@ -920,6 +921,7 @@ fn large_history_upgrade_is_paced_and_owed_history_drains() {
         .collect::<Vec<_>>();
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut index = ScanIndex::default();
+    let mut pi_index = ScanIndex::default();
     let mut upgrades = BTreeSet::new();
     let mut peak = 0;
     let mut budget_held = false;
@@ -937,17 +939,30 @@ fn large_history_upgrade_is_paced_and_owed_history_drains() {
             .values()
             .filter(|entry| entry.effective_upload_body_witness_revision < revision)
             .count();
+        let pi_path = write_pi_progress(&pi.0, pass);
         let mut owner = Rotation {
-            ready: vec![(
-                SnapshotSource::ClaudeCode,
-                rotation_scan(
+            ready: vec![
+                (
                     SnapshotSource::ClaudeCode,
-                    &fixture.0,
-                    std::mem::take(&mut index),
-                    &cache,
-                    &[],
+                    rotation_scan(
+                        SnapshotSource::ClaudeCode,
+                        &fixture.0,
+                        std::mem::take(&mut index),
+                        &cache,
+                        &[],
+                    ),
                 ),
-            )],
+                (
+                    SnapshotSource::Pi,
+                    rotation_scan(
+                        SnapshotSource::Pi,
+                        &pi.0,
+                        std::mem::take(&mut pi_index),
+                        &cache,
+                        &[],
+                    ),
+                ),
+            ],
             completed: Vec::new(),
             starts: Vec::new(),
             refuse_parking: pass % 2 == 1,
@@ -959,11 +974,20 @@ fn large_history_upgrade_is_paced_and_owed_history_drains() {
         let (_, acquisitions) = terminal_contract_retry::source_acquisitions(|| {
             crate::source_rotation::run(
                 &mut owner,
-                &[SnapshotSource::ClaudeCode],
+                &[SnapshotSource::ClaudeCode, SnapshotSource::Pi],
                 crate::source_rotation::PARKED_BUDGET,
             );
         });
-        assert_eq!(owner.completed.len(), 1);
+        assert_eq!(
+            owner.completed.len(),
+            2,
+            "both sources complete each history pass"
+        );
+        assert_eq!(
+            acquisitions.get(&pi_path),
+            Some(&1),
+            "Pi progresses every history pass"
+        );
         if owner.refuse_parking {
             assert!(owner.refusals.get() > 0);
         }
@@ -980,7 +1004,19 @@ fn large_history_upgrade_is_paced_and_owed_history_drains() {
                 assert!(upgrades.insert(path.clone()), "no second upgrade read");
             }
         }
-        let (_, mut next, mut scan) = owner.completed.pop().unwrap();
+        let claude_at = owner
+            .completed
+            .iter()
+            .position(|(source, _, _)| *source == SnapshotSource::ClaudeCode)
+            .unwrap();
+        let (_, mut next, mut scan) = owner.completed.remove(claude_at);
+        let (pi_source, mut pi_next, mut pi_scan) = owner.completed.pop().unwrap();
+        assert_eq!(pi_source, SnapshotSource::Pi);
+        assert_eq!(pi_scan.scanned_file_count, 1);
+        assert_eq!(pi_scan.snapshots.len(), 1);
+        assert_eq!(pi_scan.snapshots[0].input_tokens, 12);
+        finalize_scan_after_policy(pi_source, &mut pi_scan, &mut pi_next);
+        pi_index = pi_next;
         assert_eq!(scan.oversized_file_count, 0);
         if pass < 4 {
             assert_eq!(started.len(), 1, "first admission is paced too");
@@ -1047,7 +1083,7 @@ fn large_history_upgrade_is_paced_and_owed_history_drains() {
         let receipt = owner.history_receipt.unwrap();
         peak = peak.max(receipt.visits_peak);
         budget_held |= receipt.budget_held > 0;
-        println!("claude_large_history_receipt: pass={pass} revision={revision} large_fulls={} owed_before={owed_before} owed_after={owed_after} history_upgrade_owed={} budget_held={} visits_peak={} bytes_peak={} census_complete={}",
+        println!("claude_large_history_receipt: pass={pass} revision={revision} large_fulls={} owed_before={owed_before} owed_after={owed_after} history_upgrade_owed={} budget_held={} pi_reads=1 visits_peak={} bytes_peak={} census_complete={}",
             started.len(), receipt.owed_seen, receipt.budget_held,
             receipt.visits_peak, receipt.bytes_peak, scan.census_complete);
         if revision == 3 && owed_before == 0 {
