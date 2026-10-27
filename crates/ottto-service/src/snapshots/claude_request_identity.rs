@@ -1764,6 +1764,59 @@ impl RequestAccounts {
         runs.last().map(|run| run.position)
     }
 
+    /// X_out's E term for a gate-on fold's accounts: the boxed
+    /// `request_accounts` for `markers` and a bound login of `login` bytes,
+    /// built twice while `finish_native` rebuilds beside the first, with
+    /// each build's scratch (the contradicted positions, the distinct-key
+    /// set, the excluded positions). Each `AccountPartition` is charged per
+    /// reference. Also what one grain key's partition costs, and the marker
+    /// runs (at most one inherited body each).
+    pub(crate) fn finish_heap_bound(
+        markers: Option<&OrgMarkers>,
+        login: usize,
+    ) -> Option<(usize, usize, usize)> {
+        use crate::heap_layout_bound::tree_node_bytes;
+        use std::mem::{align_of, size_of};
+        let (runs, org) = markers.map_or((0, 0), |markers| {
+            let org = markers
+                .entries
+                .iter()
+                .chain(&markers.starting_marker)
+                .filter_map(|marker| marker.org.as_ref().map(String::capacity))
+                .max()
+                .unwrap_or(0);
+            (markers.entries.len().max(1), org)
+        });
+        // Neither a login nor a marker: every partition is None.
+        let partition = if login == 0 && runs == 0 {
+            0
+        } else {
+            size_of::<AuthorityKey>()
+                .checked_add(align_of::<AuthorityKey>())?
+                .checked_add(2 * size_of::<usize>())?
+                .checked_add(login.max(org))?
+        };
+        // `push` growth from four slots.
+        let slots = if runs == 0 {
+            0
+        } else {
+            runs.checked_mul(2)?.checked_add(4)?
+        };
+        let build = slots
+            .checked_mul(size_of::<AccountRun>())?
+            // starting, fallback, bound, retained_root and every run's account
+            .checked_add(runs.checked_add(4)?.checked_mul(partition)?)?;
+        let scratch = slots.checked_mul(2 * size_of::<u64>())?.checked_add(
+            runs.checked_add(1)?
+                .checked_mul(tree_node_bytes::<&Arc<AuthorityKey>, ()>()?)?,
+        )?;
+        let bytes = size_of::<Self>()
+            .checked_add(align_of::<Self>())?
+            .checked_add(build.checked_mul(2)?)?
+            .checked_add(scratch)?;
+        Some((bytes, partition, runs))
+    }
+
     /// Rebuild only after the money owner confirms exclusion. Restored files
     /// keep every marker; excluded requests cannot lend a marker to own usage.
     pub(crate) fn finish_native(&mut self, markers: Option<&OrgMarkers>, prefix_excluded: bool) {

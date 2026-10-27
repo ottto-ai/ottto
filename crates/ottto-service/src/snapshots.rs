@@ -19048,7 +19048,8 @@ impl SnapshotAccumulator {
             (Some(_), None) => return None,
         };
         // R: the book, and what each resolved response's rows take from here.
-        let responses = self.claude_responses.completion_bounds(limit)?.output?;
+        let book_bounds = self.claude_responses.completion_bounds(limit)?;
+        let responses = book_bounds.output?;
         let resolved = self
             .claude_responses
             .values()
@@ -19163,22 +19164,9 @@ impl SnapshotAccumulator {
                 if attribution { 4 } else { 2 },
                 collected_at.len(),
             )?)?;
-        // E keeps aggregate grains and the rare skipped/ambiguous sequence
-        // sets; reserve their worst case before the finish releases input.
+        // E: the fold, itemized.
         let money_output = if claude_request_money::e2::enabled() {
-            size_of::<claude_request_money::e2::FileFold>()
-                .checked_add(current_selector)?
-                .checked_add(responses.checked_mul(2)?)?
-                .checked_add(resolved.checked_mul(per_response)?.checked_mul(2)?)?
-                .checked_add(resolved.checked_mul(
-                    2 * tree_node_bytes::<
-                        (
-                            claude_request_money::body::ClaudeLiveKey,
-                            Option<claude_request_money::body::ClaudeRequestUsageOrigin>,
-                        ),
-                        claude_request_money::body::ClaudeGrainSide,
-                    >()? + 2 * tree_node_bytes::<u64, ()>()?,
-                )?)?
+            self.e2_fold_output_bound(path, book_bounds.fold?, limit)?
         } else {
             // Dark retains totals per hour, plus copy sequence ranges. It
             // never builds live grain keys, selectors or per-response rows.
@@ -19213,6 +19201,83 @@ impl SnapshotAccumulator {
             out.add(bytes)?;
         }
         Some(out.bytes)
+    }
+
+    /// X_out's E term with the gate on: the fold
+    /// `finalize_claude_responses_e2` builds, from what it reads here
+    /// (`FileFold::finish_heap_bound`). A key's context copies the base
+    /// selector's context besides its response's.
+    fn e2_fold_output_bound(
+        &self,
+        path: &Path,
+        keys: claude_response_records::FoldKeys,
+        limit: usize,
+    ) -> Option<usize> {
+        use claude_response_records::KEY_CONTEXT_FIELDS;
+        let current_selector = completed_heap(&self.current_selector, limit)?;
+        let model_fallback = self
+            .latest_model
+            .as_ref()
+            .map_or(0, String::capacity)
+            .checked_add("unknown".len())?;
+        let base_context =
+            self.current_selector
+                .context
+                .iter()
+                .try_fold(0usize, |bytes, (key, value)| {
+                    bytes
+                        .checked_add(key.capacity())?
+                        .checked_add(value.capacity())
+                })?;
+        // `reasoning_effort` past the capped fields.
+        let base_entries = self.current_selector.context.len().min(KEY_CONTEXT_FIELDS) + 1;
+        let (accounts, partition, marker_runs) =
+            claude_request_identity::RequestAccounts::finish_heap_bound(
+                self.claude_org_markers.as_deref(),
+                self.account_identifier_hash
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )?;
+        let path_text = path.as_os_str().len();
+        // The twin's index key (lossy text of a path no longer than
+        // PATH_MAX) beside `original_witness`' own key and member; or
+        // the fork parent's key with its path and lossy copies.
+        let proof = usize::try_from(libc::PATH_MAX)
+            .ok()?
+            .checked_mul(3)?
+            .checked_add(path_text.checked_mul(7)?)?
+            .max(match self.claude_fork_parent.as_deref() {
+                Some(parent) if !parent.is_empty() => path_text
+                    .checked_add(parent.len())?
+                    .checked_add(".jsonl".len())?
+                    .checked_mul(8)?,
+                _ => 0,
+            });
+        claude_request_money::e2::FileFold::finish_heap_bound(
+            &claude_request_money::e2::FoldShape {
+                responses: keys.responses,
+                modelless: keys.modelless,
+                model: keys.max_model.max(model_fallback),
+                context_strings: keys
+                    .context_strings
+                    .checked_add(keys.responses.checked_mul(base_context)?)?,
+                context_entries: keys
+                    .context_entries
+                    .checked_add(keys.responses.checked_mul(base_entries)?)?,
+                base_selector: current_selector,
+                // `fallback_bucket_timestamp`'s clone.
+                bucket_fallback: self
+                    .last_activity_at
+                    .as_ref()
+                    .or(self.started_at.as_ref())
+                    .map_or(0, String::capacity)
+                    .max(claude_response_records::RFC3339_TEXT_BYTES),
+                partition,
+                accounts,
+                marker_runs,
+                proof,
+            },
+        )
     }
 
     fn apply_first_prompt_fallback(&mut self) {

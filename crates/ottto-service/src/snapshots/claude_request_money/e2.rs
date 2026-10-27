@@ -1031,6 +1031,131 @@ pub(crate) struct FileFold {
     pub(crate) accounts: Option<Box<RequestAccounts>>,
 }
 money_heap_fields!(FileFold; inline: [money_birth, role, copied, disclosed, e2_nanos, responses, root_fallbacks, side, side_requests]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, proof, prefix_inherited, ambiguous, telemetry, accounts]);
+
+/// What the finish hands a gate-on fold, sized for
+/// [`FileFold::finish_heap_bound`] (X_out's E term).
+#[derive(Debug, Default, Clone, Copy)]
+pub(in crate::snapshots) struct FoldShape {
+    /// Responses the fold observes, each its own grain in the worst case.
+    pub(in crate::snapshots) responses: usize,
+    /// Responses naming no model: each a `model_fallbacks` entry.
+    pub(in crate::snapshots) modelless: usize,
+    /// The largest model a key or fallback copies.
+    pub(in crate::snapshots) model: usize,
+    /// Summed over responses: the text and entries (roots apart) a key's
+    /// context can copy, the base selector's share included.
+    pub(in crate::snapshots) context_strings: usize,
+    pub(in crate::snapshots) context_entries: usize,
+    /// `base_selector`'s completed heap (a clone of the current selector),
+    /// and `bucket_fallback`'s text.
+    pub(in crate::snapshots) base_selector: usize,
+    pub(in crate::snapshots) bucket_fallback: usize,
+    /// One key's `AccountPartition`, and the accounts with their rebuild
+    /// (`RequestAccounts::finish_heap_bound`).
+    pub(in crate::snapshots) partition: usize,
+    pub(in crate::snapshots) accounts: usize,
+    /// Org marker runs: at most one inherited body each.
+    pub(in crate::snapshots) marker_runs: usize,
+    /// The copy proof's text with its scratch.
+    pub(in crate::snapshots) proof: usize,
+}
+
+impl FileFold {
+    /// X_out's E term (gate on): the fold `finalize_claude_responses_e2`
+    /// builds, at its peak, in the `completed_heap` convention. Every
+    /// response is its own grain: the key (bucket, model, context map,
+    /// partition), its slot and its bucket's activity entry. One moment
+    /// holds grains twice: `absorb_grains` clones a held body (pre-birth
+    /// copies, id-less copies, a marker's inherited usage) into the entity
+    /// while the body is alive, and every response can sit in one. The
+    /// accounts' rebuild is in their own term.
+    pub(in crate::snapshots) fn finish_heap_bound(shape: &FoldShape) -> Option<usize> {
+        use super::super::claude_response_records::RFC3339_TEXT_BYTES;
+        use crate::heap_layout_bound::tree_node_bytes;
+        use std::mem::{align_of, size_of};
+        let FoldShape {
+            responses,
+            modelless,
+            model,
+            context_strings,
+            context_entries,
+            base_selector,
+            bucket_fallback,
+            partition,
+            accounts,
+            marker_runs,
+            proof,
+        } = *shape;
+        let grain = tree_node_bytes::<
+            (
+                ClaudeLiveKey,
+                Option<ClaudeRequestUsageOrigin>,
+                AccountPartition,
+            ),
+            ClaudeGrainSide,
+        >()?;
+        let activity = tree_node_bytes::<String, (i128, i128)>()?;
+        let context = tree_node_bytes::<String, String>()?;
+        // A body's two maps keep a root each, even empty.
+        let body = grain.checked_add(activity)?;
+        let per_response = grain
+            .checked_add(activity)?
+            .checked_add(RFC3339_TEXT_BYTES.checked_mul(2)?)? // the key's and activity's bucket
+            .checked_add(model)?
+            .checked_add(partition)?
+            .checked_add(context)?; // the key's context root
+        let grains = responses
+            .checked_mul(per_response)?
+            .checked_add(context_entries.checked_mul(context)?)?
+            .checked_add(context_strings)?;
+        let absorb = grains;
+        // The held copy and id-less copy boxes.
+        let held = size_of::<ClaudeEntityBody>()
+            .checked_add(align_of::<ClaudeEntityBody>())?
+            .checked_add(body)?
+            .checked_mul(2)?;
+        let inherited = if marker_runs == 0 {
+            0
+        } else {
+            size_of::<BTreeMap<u64, ClaudeEntityBody>>()
+                .checked_add(align_of::<BTreeMap<u64, ClaudeEntityBody>>())?
+                .checked_add(marker_runs.checked_add(1)?.checked_mul(
+                    tree_node_bytes::<u64, ClaudeEntityBody>()?.checked_add(body)?,
+                )?)?
+        };
+        let fallbacks = modelless
+            .checked_add(1)?
+            .checked_mul(tree_node_bytes::<u64, String>()?)?
+            .checked_add(modelless.checked_mul(model)?)?;
+        // `push` growth from four slots, and `shrink_to_fit`'s copy.
+        let skipped = responses
+            .checked_mul(3)?
+            .checked_add(4)?
+            .checked_mul(size_of::<(u64, u64)>())?;
+        // A request id is noted on its second claim: at most half the
+        // responses.
+        let ambiguous = (responses / 2 + 1).checked_mul(tree_node_bytes::<u64, ()>()?)?;
+        let mut out = 0usize;
+        for bytes in [
+            size_of::<Self>().checked_add(align_of::<Self>())?, // `claude_money`'s box
+            body,                                               // the entity's roots
+            grains,
+            absorb,
+            held,
+            inherited,
+            base_selector,
+            bucket_fallback,
+            fallbacks,
+            skipped,
+            ambiguous,
+            accounts,
+            proof,
+        ] {
+            out = out.checked_add(bytes)?;
+        }
+        Some(out)
+    }
+}
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,

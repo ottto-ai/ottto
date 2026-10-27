@@ -1316,6 +1316,7 @@ fn x_out_t3_output_past_the_limit_keeps_the_peak() {
             Some(claude_response_records::CompletionBounds {
                 peak: full.peak,
                 output: None,
+                fold: None,
             }),
             "limit={limit}"
         );
@@ -1462,6 +1463,8 @@ struct FinishReceipt {
     /// The largest `snapshot_fingerprint` transient of a finished item, one
     /// item at a time (N1: its semantic JSON has no X_out term of its own).
     fingerprint_peak: usize,
+    /// Gate on: the kept fold's completed heap and X_out's E term.
+    fold: Option<(usize, usize)>,
 }
 
 /// A launch root with one launch event for `SESSION` in `fixture`'s home, as
@@ -1569,6 +1572,18 @@ fn assert_x_out_covers_finish_with(
             usize::MAX,
         )
         .unwrap_or_else(|| panic!("{label}: X_out refused"));
+    let money = claude_request_money::e2::enabled().then(|| {
+        let keys = parser
+            .accumulator
+            .claude_responses
+            .completion_bounds(usize::MAX)
+            .and_then(|bounds| bounds.fold)
+            .unwrap_or_else(|| panic!("{label}: fold keys refused"));
+        parser
+            .accumulator
+            .e2_fold_output_bound(&fixture.path, keys, usize::MAX)
+            .unwrap_or_else(|| panic!("{label}: E refused"))
+    });
     let (parsed, actual) = crate::retry_allocation_probe::measure_caller_thread(|| {
         parser
             .finish_with_repository_identity(
@@ -1643,6 +1658,22 @@ fn assert_x_out_covers_finish_with(
         );
     }
     assert!(output <= x_out, "{label}: output={output} > x_out={x_out}");
+    // E: the fold the finish keeps is within its itemized term.
+    let fold = money.map(|money| {
+        let measured = parsed
+            .snapshots
+            .iter()
+            .try_fold(0usize, |bytes, item| {
+                bytes.checked_add(completed_heap_only(&item.claude_money)?)
+            })
+            .expect("folds measured");
+        eprintln!("X_OUT_T1 case={label} family=E measured={measured} bound={money}");
+        assert!(
+            measured <= money,
+            "{label}: fold measured={measured} > E={money}"
+        );
+        (measured, money)
+    });
     // T6: everything born in finish coexists within X_out plus the decode peak.
     assert!(
         born <= x_out + peak,
@@ -1655,6 +1686,7 @@ fn assert_x_out_covers_finish_with(
             decode_peak: peak,
             born,
             fingerprint_peak,
+            fold,
         },
     )
 }
@@ -1852,6 +1884,129 @@ fn x_out_dark_covers_sparse_hours_and_copy_restoration() {
     );
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].request_count, 128);
+}
+
+/// E's worst shapes (gate on), at twice the largest X_out fixture (the
+/// allocation audit's 65,536 live slots overflow at 512): every response
+/// its own hour, selector and grain (every third naming no model, every
+/// fourth id-less); the same responses all copied in before the file's
+/// birth, so the finish restores them through `absorb_grains` (the moment a
+/// held body and its clone coexist); and org-marker runs split by the birth,
+/// so own requests inherit copied markers (inherited bodies, the accounts'
+/// rebuild). The kept fold is measured as T1 measures (its completed heap)
+/// against E, and everything born in finish against X_out (T6).
+#[test]
+fn x_out_e2_fold_worst_shapes_stay_within_e() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    const RESPONSES: usize = 256;
+    const START: i64 = 1_790_000_000;
+    let hour = |index: usize| {
+        time::OffsetDateTime::from_unix_timestamp(START + 3600 * index as i64)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let birth_at = |index: usize| i128::from(START + 3600 * index as i64) * 1_000_000_000;
+    let rows = |markers: bool| {
+        let mut rows = title_rows();
+        for index in 0..RESPONSES {
+            if markers && index % 32 == 0 {
+                rows.push(json!({"type": "attachment", "sessionId": SESSION,
+                    "timestamp": hour(index), "attachment": {"type": "credential_org",
+                    "organizationUuid": format!("{:08}-1111-4111-8111-111111111111", index / 32)}}));
+            }
+            rows.extend(edit_assistant(realistic_turn(index, &[SHELL]), |_, row| {
+                row["timestamp"] = json!(hour(index));
+                row["message"]["usage"]["inference_geo"] = json!(format!("geo-{index:04}"));
+                if index % 3 == 2 {
+                    row["message"].as_object_mut().unwrap().remove("model");
+                }
+                if index % 4 == 3 {
+                    row.as_object_mut().unwrap().remove("requestId");
+                }
+            }));
+        }
+        rows
+    };
+    // The fixture file is born now, after every response: name its birth.
+    let own = |accumulator: &mut SnapshotAccumulator| {
+        accumulator
+            .claude_file_birth
+            .set_birth_for_test(i128::from(START - 86_400) * 1_000_000_000);
+    };
+    let all_copied = |accumulator: &mut SnapshotAccumulator| {
+        accumulator
+            .claude_file_birth
+            .set_birth_for_test(birth_at(RESPONSES + 24));
+    };
+    let split = |accumulator: &mut SnapshotAccumulator| {
+        accumulator
+            .claude_file_birth
+            .set_birth_for_test(birth_at(RESPONSES / 2));
+    };
+    // (label, markers, prepare, grains at least, copies restored)
+    for (label, markers, prepare, grains, restored) in [
+        (
+            "e2-own-hours",
+            false,
+            Some(&own as &dyn Fn(&mut SnapshotAccumulator)),
+            RESPONSES,
+            0,
+        ),
+        (
+            "e2-all-copied",
+            false,
+            Some(&all_copied as &dyn Fn(&mut SnapshotAccumulator)),
+            RESPONSES,
+            RESPONSES,
+        ),
+        (
+            "e2-markers-split",
+            true,
+            Some(&split as &dyn Fn(&mut SnapshotAccumulator)),
+            RESPONSES / 2,
+            RESPONSES / 2,
+        ),
+    ] {
+        claude_request_money::e2::take_diag();
+        let (items, receipt) = assert_x_out_covers_finish_with(
+            label,
+            &with_cwd(rows(markers), &format!("/work/x-out-{label}")),
+            &ClaudeTitleMetadata::default(),
+            FinishCase {
+                prepare,
+                ..FinishCase::default()
+            },
+        );
+        let [item] = items.as_slice() else {
+            panic!("{label}: {} items", items.len());
+        };
+        let fold = item.claude_money.as_deref().expect("a gate-on fold");
+        let (measured, bound) = receipt.fold.expect("gate on");
+        let diag = claude_request_money::e2::take_diag();
+        eprintln!(
+            "X_OUT_E2 case={label} grains={} measured={measured} bound={bound} x_out={} born={} decode_peak={} diag={diag:?}",
+            fold.entity.grains.len(),
+            receipt.x_out,
+            receipt.born,
+            receipt.decode_peak,
+        );
+        // Exactly the copies came back through `absorb_grains`, disclosed.
+        assert_eq!(
+            diag.get("copy_unproven").copied().unwrap_or(0),
+            restored as u64,
+            "{label}: {diag:?}"
+        );
+        // The worst shape happened: every counted response its own grain.
+        assert!(
+            fold.entity.grains.len() >= grains,
+            "{label}: {} grains",
+            fold.entity.grains.len()
+        );
+    }
 }
 
 /// X_out U3 and U1 controls (c22 amendment 2): a workspace whose identity is
