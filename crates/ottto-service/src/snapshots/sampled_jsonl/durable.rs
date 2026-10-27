@@ -363,3 +363,7 @@ pub(crate) fn rederive_parser(
     parser.accumulator.claude_request_identity_capture = acc.claude_request_identity_capture;
     Ok(parser)
 }
+
+#[cfg(test)]
+#[path = "durable_tests.rs"]
+mod tests;

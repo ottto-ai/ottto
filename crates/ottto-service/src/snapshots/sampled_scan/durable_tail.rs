@@ -446,7 +446,7 @@ impl SharedCache {
                 let Some(retained) = cache.peek(&key) else {
                     continue;
                 };
-                if retained.state.accumulator.source != snapshot_source {
+                if retained.state.source() != snapshot_source {
                     later.insert(key);
                     continue;
                 }

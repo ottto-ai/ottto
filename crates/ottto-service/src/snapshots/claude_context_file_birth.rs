@@ -13,8 +13,9 @@
 //! they only veto: a kept request reported under another root, or a tagged
 //! request reported under this root, withholds that session's scalars.
 //!
-//! Everything here is local. Nothing is serialized, persisted or uploaded
-//! except the existing scalar fields and the content-free local counters.
+//! Everything here is local. Nothing is uploaded except the existing scalar
+//! fields and the content-free local counters; the content-free scalars are
+//! persisted only in the local durable-tail store (M1).
 use super::*;
 use std::hash::{Hash, Hasher};
 

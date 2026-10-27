@@ -390,7 +390,9 @@ const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // in local memory. Account attribution can then prove that every billed request
 // appears in one-account local OTLP evidence while safely tolerating auxiliary
 // requests (such as prompt suggestions) that Claude records only in OTLP under
-// the same root session. Raw request ids are never serialized or uploaded.
+// the same root session. Raw request ids are never uploaded except where the
+// upload contract already carries them; persisted only in the local
+// durable-tail store (class L).
 // v31 resolves Claude assistant content-block records as one complete provider
 // response before admitting usage. Claude Code sidechains progressively update
 // `output_tokens` across repeated (`message.id`, `requestId`) rows; taking the
@@ -16914,6 +16916,8 @@ struct SnapshotAccumulator {
     cache_configuration_witness: Option<String>,
     cache_task_complete_at: Option<String>,
     cache_pending_idle: Option<u64>,
+    // Raw turn ids (class L): never uploaded except where the upload contract
+    // already carries it; persisted only in the local durable-tail store.
     cache_active_turns: BTreeSet<String>,
     context_curve_enabled: bool,
     source_session_id: Option<String>,
@@ -16943,11 +16947,16 @@ struct SnapshotAccumulator {
     latest_reasoning_effort: Option<String>,
     // Most-recently-observed Codex turn id (from `turn_context.payload.turn_id`).
     // The token_count event carries no turn id, so the running turn id is what
-    // joins each usage row to its `logs_2` fast-mode signal.
+    // joins each usage row to its `logs_2` fast-mode signal. Raw id (class L):
+    // never uploaded except where the upload contract already carries it;
+    // persisted only in the local durable-tail store.
     latest_turn_id: Option<String>,
     // Per-turn fast-mode signal read once per scan from `logs_2.sqlite`. Shared
     // read-only across every session file in the cycle via `Arc`.
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    // Keyed by raw turn id (class L): never uploaded except where the upload
+    // contract already carries it; persisted only in the local durable-tail
+    // store.
     codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
     /// A paged cursor job keeps every turn witness, charged by bytes in its
     /// slot; every other reader keeps the cache-only witness caps.
@@ -17039,6 +17048,8 @@ struct SnapshotAccumulator {
     codex_created_thread_native_only: bool,
     codex_native_created_thread_header_nanos: Option<i128>,
     codex_native_created_thread_last_nanos: Option<i128>,
+    // Raw turn id (class L): never uploaded except where the upload contract
+    // already carries it; persisted only in the local durable-tail store.
     codex_native_created_thread_task_turn_id: Option<String>,
     codex_native_created_thread_first_turn_bound: bool,
     codex_physical_signatures: crate::owned_heap::OwnedVec<String>,
@@ -17074,6 +17085,9 @@ struct SnapshotAccumulator {
     // `/root/<task_name>` agent path. The raw path never enters SnapshotItem.
     codex_agent_label: Option<String>,
     activity_tool_counts: BTreeMap<String, u64>,
+    // Keyed by raw call id (class L): never uploaded except where the upload
+    // contract already carries it; persisted only in the local durable-tail
+    // store.
     activity_call_tools: BTreeMap<String, String>,
     activity_mcp_tool_counts: BTreeMap<String, u64>,
     // Codex MCP calls keyed by the backend's qualified `mcp__<server>__<tool>`
@@ -17084,9 +17098,15 @@ struct SnapshotAccumulator {
     // of its namespaced `function_call` and `mcp_tool_call_end` comes first.
     // The value records whether the completion event (and its capability) was
     // seen. Like `activity_call_tools`, entries end at `function_call_output`.
+    // Raw MCP call ids (class L): never uploaded except where the upload
+    // contract already carries it; persisted only in the local durable-tail
+    // store.
     activity_mcp_call_ids: BTreeMap<String, bool>,
     activity_capability_buckets: BTreeMap<(String, String, String), u64>,
     // Claude-only summary: the seen-tool-use walk does not grow with history.
+    // Raw tool-use ids (class L): never uploaded except where the upload
+    // contract already carries it; persisted only in the local durable-tail
+    // store.
     seen_claude_capability_tool_uses: crate::owned_heap::OwnedMap<String, ()>,
     activity_skills: BTreeSet<String>,
     // A SKILL.md reference whose skill could not be named (`cat SKILL.md`,

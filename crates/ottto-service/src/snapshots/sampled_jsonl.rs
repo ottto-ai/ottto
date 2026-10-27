@@ -48,6 +48,11 @@ impl CachedJsonlReduction {
     pub(super) fn usage_witness(&self) -> u64 {
         self.accumulator.usage_witness()
     }
+    /// The copy's source (M1: a durable record is written per source).
+    #[cfg(unix)]
+    pub(super) fn source(&self) -> SnapshotSource {
+        self.accumulator.source
+    }
 }
 impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
     fn supports_frozen_charge(&self) -> bool {

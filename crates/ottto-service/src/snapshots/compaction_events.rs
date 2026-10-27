@@ -66,8 +66,9 @@ pub(crate) fn bounded_compaction_events(
 const CLAUDE_IDLE_COMPACTION_GAP_SECONDS: i64 = 50 * 60;
 
 /// `compactMetadata.trigger` of a Claude Code `compact_boundary`, read on the
-/// boundary line only. Unknown values stay `None`. Local, never serialized;
-/// the upload carries the closed string from `wire`.
+/// boundary line only. Unknown values stay `None`. Local: never uploaded
+/// except where the upload contract already carries it (the closed string
+/// from `wire`); persisted only in the local durable-tail store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClaudeCompactionTrigger {
     Auto,

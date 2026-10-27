@@ -829,3 +829,172 @@ fn identity_capture_mode_change_rereads_instead_of_reusing_a_markerless_prefix()
     assert_layout_mode(steady.modes, (0, 1, 0));
     assert!(markers_trusted(&steady, &g));
 }
+
+/// M1: a restart (a new process cache) continues from the durable store
+/// instead of a Full read, and matches the unsampled oracle. Reuse needs the
+/// retained copy, so unsupported layouts write nothing and read Full.
+#[cfg(unix)]
+mod durable_restart {
+    use super::*;
+    use crate::snapshots::sampled_scan::durable_tail::StateDirWriter;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct State {
+        dir: PathBuf,
+        index_path: PathBuf,
+    }
+    impl State {
+        fn new(f: &Fixture) -> Self {
+            let dir = f.dir.with_extension("durable-state");
+            fs::create_dir_all(&dir).unwrap();
+            Self {
+                index_path: dir.join("index.json"),
+                dir,
+            }
+        }
+        fn begin(&self, cache: &SharedCache) {
+            cache.durable_begin_pass(
+                SOURCE,
+                &self.index_path,
+                &Scope("sidecar-fixture".into()),
+                capture_by_default(),
+            );
+        }
+        fn store_records(&self) -> usize {
+            fs::read_dir(crate::durable_tail_store::store_dir_for_index(
+                &self.index_path,
+            ))
+            .map_or(0, |entries| entries.count())
+        }
+    }
+    impl Drop for State {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Seeds a predecessor in one process cache and writes its record after
+    /// the "save"; returns the committed index.
+    fn seed_and_persist(f: &Fixture, state: &State) -> ScanIndex {
+        let first = Arc::new(SharedCache::default());
+        state.begin(&first);
+        let prior = seed_predecessor(f, &first);
+        first.durable_write_after_save(&StateDirWriter(&state.dir), SOURCE, &prior);
+        let expected = usize::from(crate::heap_layout_bound::layout_supported());
+        assert_eq!(state.store_records(), expected);
+        prior
+    }
+
+    fn restored(cache: &SharedCache) -> u64 {
+        cache
+            .durable_counters(SOURCE)
+            .map_or(0, |(counters, _)| counters.restored)
+    }
+
+    #[test]
+    fn restart_restores_then_tails_and_matches_cold_full() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let cached = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        assert_layout_mode(cached.modes, (0, 1, 0));
+        assert_eq!(
+            restored(&second),
+            u64::from(crate::heap_layout_bound::layout_supported())
+        );
+        assert_oracle(&f, &cached, prior);
+    }
+
+    #[test]
+    fn restart_after_a_metadata_only_touch_restores_unchanged() {
+        let f = Fixture::new(2);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::set_permissions(&f.path, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&f.path, fs::Permissions::from_mode(0o600)).unwrap();
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.evidence(2);
+        let cached = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        assert_layout_mode(cached.modes, (0, 0, 1));
+        assert_eq!(
+            restored(&second),
+            u64::from(crate::heap_layout_bound::layout_supported())
+        );
+        assert_oracle(&f, &cached, prior);
+    }
+
+    #[test]
+    fn an_index_from_another_context_never_restores() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let second = Arc::new(SharedCache::default());
+        // Another account or destination: the pass binds another scope.
+        second.durable_begin_pass(
+            SOURCE,
+            &state.index_path,
+            &Scope("another-account".into()),
+            capture_by_default(),
+        );
+        f.append_transcript(1);
+        let cached = enriched(
+            &f,
+            raw_scan_with_namespace(&f, prior.clone(), second.clone(), "another-account"),
+        );
+        assert_layout_mode(cached.modes, (1, 0, 0));
+        assert_eq!(restored(&second), 0);
+        assert_oracle(&f, &cached, prior);
+    }
+
+    fn raw_scan_with_namespace(
+        f: &Fixture,
+        index: ScanIndex,
+        cache: Arc<SharedCache>,
+        namespace: &str,
+    ) -> Run {
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            SOURCE,
+            std::slice::from_ref(&f.dir),
+            index,
+            COLLECTED,
+            BACKFILL_WINDOW_DAYS,
+            100,
+            false,
+            Some(&f.support),
+            &[],
+            false,
+            true,
+            capture_by_default(),
+        )
+        .with_sampled_acquisition(cache, Scope(namespace.into()));
+        loop {
+            let modes = scan.sampling.as_ref().map_or((0, 0, 0), |c| {
+                (c.full_files, c.tail_files, c.unchanged_files)
+            });
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                    return Run {
+                        index,
+                        result: scan,
+                        modes,
+                        reasons: [0; 11],
+                        native_bytes: 0,
+                    }
+                }
+            }
+        }
+    }
+}

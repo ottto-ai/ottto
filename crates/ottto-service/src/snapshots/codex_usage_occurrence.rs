@@ -1,5 +1,8 @@
 //! Codex usage counting V2: one billed request is counted once at its native
-//! usage. Local only; Legacy sessions never construct this state.
+//! usage. Local only: never uploaded except where the upload contract
+//! already carries it; persisted only in the local durable-tail store (raw
+//! response and turn ids are class `L`). Legacy sessions never construct this
+//! state.
 //!
 //! Native `token_usage_record`s are the authority for their turn. Coverage on
 //! the native thread counter (`[before, after)`, six dimensions) decides what

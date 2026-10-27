@@ -11,6 +11,10 @@
 //! is. Resolution decodes each record back to `ClaudeResponseRecord` before
 //! the unchanged response merge, so finalized output is identical by
 //! construction.
+//!
+//! Raw request, message and tool-use ids here (class `L`) are never uploaded
+//! except where the upload contract already carries them; persisted only in
+//! the local durable-tail store.
 use super::cache_observations::OwnedRequest;
 use super::{
     BucketRowAccumulator, ClaudeResponseObservation, ClaudeResponseRecord,

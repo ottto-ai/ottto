@@ -77,6 +77,14 @@ impl Enc {
     pub(crate) fn hashing(&self) -> bool {
         matches!(self.sink, Sink::Hash(_))
     }
+    /// Bytes written so far; `None` in hash mode. Tests only.
+    #[cfg(test)]
+    pub(crate) fn position(&self) -> Option<usize> {
+        match &self.sink {
+            Sink::Bytes { out, .. } => Some(out.len()),
+            Sink::Hash(_) => None,
+        }
+    }
     pub(crate) fn raw(&mut self, bytes: &[u8]) -> Result<(), Refuse> {
         match &mut self.sink {
             Sink::Bytes { out, limit } => {
@@ -731,9 +739,14 @@ macro_rules! durable_field {
     (put U, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
-    (put L, $e:ident, $f:ident, $ty:ty, $path:expr) => {
-        $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
-    };
+    (put L, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
+        let value: &$ty = $f;
+        #[cfg(test)]
+        let start = $e.position();
+        $crate::durable_tail_codec::Durable::put(value, $e)?;
+        #[cfg(test)]
+        $crate::durable_tail_codec::note_l_span($e, start, $path);
+    }};
     (put D, $e:ident, $f:ident, $ty:ty, $path:expr) => {
         $crate::durable_tail_codec::durable_field!(put N, $e, $f, $ty, $path)
     };
@@ -966,6 +979,28 @@ pub(crate) fn with_line<T>(line: Option<(u64, u64)>, apply: impl FnOnce() -> T) 
 
 pub(crate) fn current_line() -> Option<(u64, u64)> {
     LINE.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Byte spans of `L` fields in the bodies this thread encoded, with the
+    /// field path: the privacy canary checks every raw provider id lies in
+    /// one. Tests only.
+    static L_SPANS: std::cell::RefCell<Vec<(usize, usize, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_l_span(e: &Enc, start: Option<usize>, path: &'static str) {
+    if let (Some(start), Some(end)) = (start, e.position()) {
+        L_SPANS.with(|spans| spans.borrow_mut().push((start, end, path)));
+    }
+}
+
+/// The `L` spans noted since the last call. Tests only.
+#[cfg(test)]
+pub(crate) fn take_l_spans() -> Vec<(usize, usize, &'static str)> {
+    L_SPANS.with(|spans| std::mem::take(&mut *spans.borrow_mut()))
 }
 
 #[cfg(test)]
