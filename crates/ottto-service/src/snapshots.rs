@@ -1252,9 +1252,12 @@ fn rebuild_claude_context_posture(
 // RAM by the line reader (and cloned again by the artifact scraper), OOM-killing
 // the per-user daemon. Codex is source-special: long active sessions can exceed
 // the default file cap while still being safe to parse because its parser is
-// line-bounded and streaming. Keep the stricter cap for sources with heavier
-// artifact/session paths, and use the line cap as the real Codex OOM guard.
+// line-bounded and streaming. Claude has an interim 1 GiB file admission limit;
+// Pi keeps the default. File admission does not bound the native reduction heap.
+// Full audits, reproof, rearm and the line cap remain independent of this limit.
 pub const MAX_JSONL_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Interim Claude admission limit; audit/reproof and reduction budgets are unchanged.
+pub const MAX_CLAUDE_JSONL_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_CODEX_JSONL_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -41332,7 +41335,8 @@ fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
 fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
     match source {
         SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
-        SnapshotSource::ClaudeCode | SnapshotSource::Pi => MAX_JSONL_FILE_BYTES,
+        SnapshotSource::ClaudeCode => MAX_CLAUDE_JSONL_FILE_BYTES,
+        SnapshotSource::Pi => MAX_JSONL_FILE_BYTES,
     }
 }
 
@@ -48853,6 +48857,10 @@ mod tests {
     mod claude_request_identity_tests {
         include!("snapshots/claude_request_identity_tests.rs");
     }
+    #[cfg(unix)]
+    mod claude_file_cap_tests {
+        include!("snapshots/claude_file_cap_tests.rs");
+    }
     mod census_convergence_tests {
         include!("snapshots/census_convergence_tests.rs");
     }
@@ -55605,11 +55613,12 @@ mod tests {
         let oversized_path = root.join("session-oversized.jsonl");
         let oversized = File::create(&oversized_path).expect("create oversized");
         oversized
-            .set_len(MAX_JSONL_FILE_BYTES + 1)
+            .set_len(MAX_CLAUDE_JSONL_FILE_BYTES + 1)
             .expect("grow oversized");
         drop(oversized);
         assert!(
-            fs::metadata(&oversized_path).expect("stat oversized").len() > MAX_JSONL_FILE_BYTES
+            fs::metadata(&oversized_path).expect("stat oversized").len()
+                > MAX_CLAUDE_JSONL_FILE_BYTES
         );
 
         let mut index = ScanIndex::default();
@@ -56437,15 +56446,17 @@ mod tests {
 
     #[test]
     fn codex_allows_larger_streaming_transcripts_than_other_sources() {
-        assert!(max_jsonl_file_bytes(SnapshotSource::Codex) > MAX_JSONL_FILE_BYTES);
+        assert!(max_jsonl_file_bytes(SnapshotSource::Codex) > MAX_CLAUDE_JSONL_FILE_BYTES);
         assert_eq!(
             max_jsonl_file_bytes(SnapshotSource::ClaudeCode),
-            MAX_JSONL_FILE_BYTES,
+            1024 * 1024 * 1024
         );
+        assert_eq!(max_jsonl_file_bytes(SnapshotSource::Pi), 256 * 1024 * 1024);
         assert_eq!(
-            max_jsonl_file_bytes(SnapshotSource::Pi),
-            MAX_JSONL_FILE_BYTES,
+            max_jsonl_file_bytes(SnapshotSource::Codex),
+            2 * 1024 * 1024 * 1024
         );
+        assert_eq!(MAX_JSONL_LINE_BYTES, 16 * 1024 * 1024);
     }
 
     #[test]
