@@ -1744,14 +1744,21 @@ fn all_prebirth_copy(state: AllPrebirthState) {
                 .unwrap_or(0),
             u64::from(state == AllPrebirthState::Unavailable)
         );
+        page.finish();
         let receipt = page.receipt();
+        let finalized = stored_bodies(&page.index);
         let settled = settle_captured_holds(&c, &prior, page, &mut progress);
         for (session, fingerprint, witness) in receipt {
             if session == COPY {
                 assert_eq!(
+                    progress.accepted_body_witnesses.get(&fingerprint),
+                    Some(&witness),
+                    "copy's exact emitted body receives an ACK"
+                );
+                assert_eq!(
                     stored_bodies(&settled).get(copy.to_str().unwrap()),
-                    Some(&(Some(fingerprint), Some(witness))),
-                    "copy's exact body settles through ACK and reload"
+                    finalized.get(copy.to_str().unwrap()),
+                    "finalized file body survives ACK settlement and reload"
                 );
             }
         }
