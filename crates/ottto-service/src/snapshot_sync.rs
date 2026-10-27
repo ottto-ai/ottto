@@ -658,6 +658,10 @@ fn exclude_held_effective_body_witness_revision(
 /// treat the still-present family as vanished. A never-committed member bound
 /// by its committed family's terminal quarantine settles with a delivery-free
 /// membership entry instead, so the family census stays complete.
+///
+/// `held_family_roots` names the Claude families of this page's held
+/// entities, when known. The mark is then scoped to them for the terminal
+/// unchanged-proof skip only; `None` keeps the sweep-wide mark.
 fn commit_completed_with_local_holds(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -665,6 +669,7 @@ fn commit_completed_with_local_holds(
     locally_held_fingerprints: &BTreeSet<String>,
     account_deferred_held_fingerprints: &BTreeSet<String>,
     progress_blocking: bool,
+    held_family_roots: Option<&BTreeSet<String>>,
 ) -> ScanIndex {
     if !progress_blocking
         && index.locally_held_keys_restorable(
@@ -685,7 +690,7 @@ fn commit_completed_with_local_holds(
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
     let mut index =
         index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
-    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
+    index.mark_bounded_sweep_held_by_families(held_family_roots);
     index
 }
 
@@ -701,6 +706,10 @@ struct LocalHoldSettlement {
     held_fingerprints: BTreeSet<String>,
     account_deferred_fingerprints: BTreeSet<String>,
     progress_blocking: bool,
+    /// Claude only: every family a held entity of this page could count
+    /// under (`held_family_roots`). `None` for other sources or when a held
+    /// session cannot be placed.
+    held_family_roots: Option<BTreeSet<String>>,
 }
 
 impl LocalHoldSettlement {
@@ -729,6 +738,11 @@ impl LocalHoldSettlement {
             index,
             account_holds_recorded,
         );
+        let held_family_roots = if source == SnapshotSource::ClaudeCode && held_entity_count > 0 {
+            disposition.held_family_roots(&scan_result.snapshots, index)
+        } else {
+            None
+        };
         disposition.retain_uploadable(&mut scan_result.snapshots);
         let retry_pending_family_count = index.claude_usage_authority_pending_count();
         Self {
@@ -737,6 +751,7 @@ impl LocalHoldSettlement {
             held_fingerprints,
             account_deferred_fingerprints,
             progress_blocking: !progress_blocking_held_fingerprints.is_empty(),
+            held_family_roots,
         }
     }
 
@@ -787,6 +802,7 @@ fn settle_completed_upload(
         &holds.held_fingerprints,
         &holds.account_deferred_fingerprints,
         holds.progress_blocking,
+        holds.held_family_roots.as_ref(),
     );
     eprintln!(
         "local snapshot sync retained {} Claude usage family/families and {} revised \
@@ -19751,6 +19767,7 @@ mod tests {
             &held,
             &BTreeSet::new(),
             false,
+            None,
         );
         assert!(!settled.bounded_sweep_had_unsettled_upload());
         assert_eq!(
@@ -19780,6 +19797,7 @@ mod tests {
             &held,
             &held,
             false,
+            None,
         );
         assert!(!deferred.bounded_sweep_had_unsettled_upload());
         assert!(deferred.files["/opaque/held.jsonl"]
@@ -19793,6 +19811,7 @@ mod tests {
             &held,
             &BTreeSet::new(),
             true,
+            None,
         );
         assert!(blocked.bounded_sweep_had_unsettled_upload());
         assert_eq!(
@@ -19816,6 +19835,7 @@ mod tests {
             held_fingerprints: BTreeSet::new(),
             account_deferred_fingerprints: BTreeSet::new(),
             progress_blocking: false,
+            held_family_roots: None,
         };
         let progress = test_upload_progress();
         let completed =
@@ -19882,6 +19902,7 @@ mod tests {
             account_deferred_fingerprints: BTreeSet::new(),
             // Restorable non-blocking Rejected holds settle once H1 is composed.
             progress_blocking: !held_fingerprints.is_empty(),
+            held_family_roots: None,
         };
 
         let blocked = commit_completed_with_local_holds(
@@ -19891,6 +19912,7 @@ mod tests {
             &held,
             &BTreeSet::new(),
             true,
+            None,
         );
         assert!(blocked.bounded_sweep_had_unsettled_upload());
         assert_eq!(
@@ -19904,6 +19926,7 @@ mod tests {
             &held,
             &BTreeSet::new(),
             false,
+            None,
         );
         assert!(!restored.bounded_sweep_had_unsettled_upload());
         assert!(restored.bounded_sweep_unsettled_cause_names().is_empty());
@@ -20004,6 +20027,126 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    /// SOURCE 2026-10-27 (option A), conditions (2) and (3): a `Completed`
+    /// page's blocking holds scope the sweep marker to their own families for
+    /// the terminal unchanged-proof skip only. The flag and its cause names
+    /// are exactly as before. Scopes accumulate across the sweep's pages and
+    /// survive a reload. An unplaced hold, any other cause, an unscoped stamp
+    /// earlier in the sweep, or more families than the bound keeps the
+    /// sweep-wide veto.
+    #[test]
+    fn completed_blocking_holds_scope_the_unchanged_proof_veto_to_held_families() {
+        let entry = |source: &str, fingerprint: &str| {
+            serde_json::json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 2,
+                "source_file_fingerprint": source,
+                "last_snapshot_fingerprint": fingerprint,
+                "scan_identity_version": "semantic_sync:v2",
+            })
+        };
+        let committed = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
+        }));
+        let held = BTreeSet::from(["held-new".to_string()]);
+        let progress = test_upload_progress();
+        let families = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        let block = |index: ScanIndex, held_family_roots: Option<&BTreeSet<String>>| {
+            commit_completed_with_local_holds(
+                index,
+                &committed,
+                &progress,
+                &held,
+                &BTreeSet::new(),
+                true,
+                held_family_roots,
+            )
+        };
+        let scope = |index: &ScanIndex| {
+            index
+                .unchanged_proof_unsettled_families()
+                .map(|held| held.len())
+        };
+
+        assert_eq!(scope(&scanned), Some(0), "a settled sweep owes no family");
+        let first = block(scanned.clone(), Some(&families(&["held-family"])));
+        assert!(first.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            first.bounded_sweep_unsettled_cause_names(),
+            ["completed_blocking_holds"]
+        );
+        assert_eq!(scope(&first), Some(1));
+        let second = block(
+            first,
+            Some(&families(&["held-family", "other-held-family"])),
+        );
+        assert_eq!(
+            second.bounded_sweep_unsettled_cause_names(),
+            ["completed_blocking_holds"]
+        );
+        assert_eq!(scope(&second), Some(2), "a later page adds its families");
+        let root = test_dir("completed-blocking-holds-scope");
+        std::fs::create_dir_all(&root).expect("create scope fixture root");
+        let index_path = root.join("scan-index.json");
+        second.clone().save(&index_path).expect("save scan index");
+        let reloaded = ScanIndex::load(&index_path).expect("reload scan index");
+        assert_eq!(
+            reloaded.unchanged_proof_unsettled_families(),
+            second.unchanged_proof_unsettled_families(),
+            "the scope crosses the save/load boundary"
+        );
+        let _ = std::fs::remove_dir_all(root);
+
+        // Doubt keeps the sweep-wide veto.
+        assert_eq!(scope(&block(second.clone(), None)), None, "unplaced hold");
+        assert_eq!(
+            scope(&block(scanned.clone(), Some(&BTreeSet::new()))),
+            None,
+            "a hold that names no family"
+        );
+        assert_eq!(
+            scope(&block(
+                block(scanned.clone(), None),
+                Some(&families(&["held-family"]))
+            )),
+            None,
+            "a scoped page cannot rescope an unscoped sweep"
+        );
+        let mut shed = second.clone();
+        shed.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        assert_eq!(scope(&shed), None, "any other cause");
+        assert_eq!(
+            scope(&block(shed, Some(&families(&["held-family"])))),
+            None,
+            "a scoped page after another cause"
+        );
+        let numbered = |count: usize| {
+            (0..count)
+                .map(|n| format!("held-family-{n}"))
+                .collect::<BTreeSet<_>>()
+        };
+        let bound = crate::snapshots::MAX_SCOPED_HELD_FAMILY_ROOTS;
+        assert_eq!(
+            scope(&block(scanned.clone(), Some(&numbered(bound)))),
+            Some(bound)
+        );
+        assert_eq!(
+            scope(&block(scanned, Some(&numbered(bound + 1)))),
+            None,
+            "overflow"
+        );
     }
 
     /// The backend's error-code set is closed and its forward tolerance covers

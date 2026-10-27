@@ -2307,6 +2307,7 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
                 held_fingerprints: BTreeSet::new(),
                 account_deferred_fingerprints: BTreeSet::new(),
                 progress_blocking: false,
+                held_family_roots: None,
             };
             let selected = if outcome == "completed" {
                 settle_completed_upload(current, &committed, &progress, &holds)
