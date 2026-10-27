@@ -721,6 +721,8 @@ mod tests {
         let mut overflow_value = serde_json::to_value(&seed).unwrap();
         overflow_value["claude_large_full_deferred"]["overflow"] = serde_json::json!(true);
         let overflow_seed: ScanIndex = serde_json::from_value(overflow_value).unwrap();
+        let mut uncached_growth_seed = overflow_seed.clone();
+        uncached_growth_seed.claude_large_full_deferred = claude_large_full::Priority::fallback();
         let ordered = OwnedSourceScan::new(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&root),
@@ -798,6 +800,33 @@ mod tests {
                 .unwrap()
                 .due,
             50
+        );
+        let uncached_growth = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            uncached_growth_seed,
+            "2026-10-27T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            2,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(
+            Arc::new(sampled_scan::SharedCache::default()),
+            crate::transcript_acquisition::Scope("held-audit-uncached-growth".into()),
+        );
+        assert_eq!(uncached_growth.sampling.as_ref().unwrap().audit_slots, 1);
+        assert_eq!(
+            uncached_growth
+                .identified_candidates
+                .iter()
+                .map(|candidate| local_index_key(&candidate.path))
+                .collect::<Vec<_>>(),
+            vec![local_index_key(&older), held_key],
+            "an uncached grown held file cannot jump ahead as its old small size"
         );
     }
 
