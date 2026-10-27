@@ -1620,10 +1620,30 @@ fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Valu
     };
     // Input reset: a previous run that died mid-append left extra bytes.
     restore.now();
+    // Native stack sampling belongs only to the separate diagnostic process.
+    // A missing sampler is recorded, never changes a performance receipt.
+    let mut sampler = None;
+    if cfg!(target_os = "macos") && env("OTTTO_E2_BENCH_MODE").as_deref() == Some("attribution") {
+        if let Some(output) = env("OTTTO_E2_BENCH_OUTPUT") {
+            let path = PathBuf::from(output).with_file_name(format!("e2-sample-{tag}.txt"));
+            sampler = std::process::Command::new("/usr/bin/sample")
+                .args([
+                    std::process::id().to_string(),
+                    "60".into(),
+                    "10".into(),
+                    "-file".into(),
+                    path.to_string_lossy().into_owned(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
+        }
+    }
     let footprint_start = footprint();
     let mut harness = Harness::new(base, &base.join("runs").join(&tag), p1_off);
     let support = base.join("runs").join(&tag).join("support");
-    e2_hook::with_gate(arm == "on", || {
+    let receipt = e2_hook::with_gate(arm == "on", || {
         e2_hook::with_switch_on(arm == "on", &support, || {
             let mut pages = Vec::new();
             loop {
@@ -1706,7 +1726,11 @@ fn arm(base: &Path, manifest: &serde_json::Value, arm: &str) -> serde_json::Valu
                 "max_rss_bytes": max_rss,
             })
         })
-    })
+    });
+    if let Some(mut sampler) = sampler {
+        let _ = sampler.wait();
+    }
+    receipt
 }
 
 /// Scan-level history pages (the production activation reads the compiled
