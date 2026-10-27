@@ -7926,6 +7926,10 @@ pub fn finalize_scan_after_policy_with_body_witness(
             // Use the pre-replay fact: record() writes provisional new entries.
             && !pending.codex_pending_recovery
             && !quarantine_retry_required
+            && (index.active_upload_context_digest.is_none()
+                || index.files.get(&pending.index_key).is_some_and(|entry| {
+                    index.settled_upload_context(entry) == index.active_upload_context_digest
+                }))
         {
             noop_source_files.insert(pending.source_file_fingerprint.clone());
             result.semantic_noop_count = result
@@ -42986,10 +42990,18 @@ impl ScanIndex {
     }
 
     fn migrate_upload_contexts(&mut self) {
-        if self.upload_contexts.is_some() {
+        if let Some(contexts) = &self.upload_contexts {
+            for entry in self.files.values_mut() {
+                entry.settled_upload_context = entry
+                    .settled_upload_context
+                    .filter(|id| usize::from(*id) < contexts.len());
+            }
             return;
         }
         self.upload_contexts = Some(Vec::new());
+        for entry in self.files.values_mut() {
+            entry.settled_upload_context = None;
+        }
         let Some(global) = &self.upload_context_fingerprint else {
             return;
         };
@@ -89080,4 +89092,4 @@ crate::heap_layout_bound::fields!(ClaudeRemovedUsage; input_tokens, output_token
 crate::heap_layout_bound::fields!(UploadAckRetirementHandoff; destination_namespace_hash, committed_generation, bodies, pending_bodies);
 
 #[cfg(test)]
-mod upload_context_tests;
+pub(crate) mod upload_context_tests;

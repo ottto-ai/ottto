@@ -3200,6 +3200,38 @@ pub(super) mod tests {
             }
             replay.admitted(Some(("a".repeat(64), "derived_from_logs_2".into())));
             assert!(replay.finish().is_err());
+            let key = "/synthetic/protected.jsonl";
+            let mut index = ScanIndex::default();
+            index.activate_upload_context("protected-context".into());
+            let scan = super::super::upload_context_tests::project(
+                &mut index,
+                SnapshotSource::Codex,
+                key,
+                false,
+            );
+            let entry = index.files.get_mut(key).unwrap();
+            entry.codex_applied_tier_receipt = Some(receipt.clone());
+            entry.codex_applied_tier_receipt_required = true;
+            entry.codex_captured_tier_receipt_required = true;
+            let bodies = scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    (
+                        item.snapshot_fingerprint.clone(),
+                        snapshot_upload_body_witness(item),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let accepted = bodies.keys().cloned().collect();
+            index.settle_upload_contexts(&scan, &accepted, &bodies, &BTreeSet::new());
+            assert!(index.files[key].settled_upload_context.is_none());
+            assert_eq!(
+                index.files[key].codex_applied_tier_receipt.as_ref(),
+                Some(&receipt)
+            );
+            assert!(index.files[key].codex_applied_tier_receipt_required);
+            assert!(index.files[key].codex_captured_tier_receipt_required);
         }
         let mut replay = TierReplay::new(None, false, "scope".into());
         for i in 0..=MAX_APPLIED_TIERS {

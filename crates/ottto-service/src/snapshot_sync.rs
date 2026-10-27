@@ -11567,6 +11567,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod upload_context_tests {
+        include!("snapshot_sync/upload_context_tests.rs");
+    }
     use super::*;
     mod terminal_contract_retry_tests {
         include!("snapshot_sync/terminal_contract_retry_tests.rs");

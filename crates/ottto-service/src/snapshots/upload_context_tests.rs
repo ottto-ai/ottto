@@ -17,7 +17,7 @@ fn candidate(key: &str) -> CandidateFile {
     }
 }
 
-fn project(
+pub(crate) fn project(
     index: &mut ScanIndex,
     source: SnapshotSource,
     key: &str,
@@ -61,7 +61,7 @@ fn acks(scan: &SourceScanResult) -> (BTreeSet<String>, BTreeMap<String, String>)
     (bodies.keys().cloned().collect(), bodies)
 }
 
-fn assert_context(index: &ScanIndex, key: &str, expected: Option<&str>) {
+pub(crate) fn assert_context(index: &ScanIndex, key: &str, expected: Option<&str>) {
     assert_eq!(
         index.settled_upload_context(&index.files[key]),
         expected.map(|context| Sha256::digest(context.as_bytes()).into())
