@@ -2742,6 +2742,7 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
         "chmod_sealed",
         "append_sealed",
         "replace_sealed",
+        "poison_replace_sealed",
     ] {
         let root = paged_corpus("wake-content");
         let cache = Arc::new(SharedCache::default());
@@ -2760,9 +2761,19 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
                 "append_sealed" => {
                     append_rows(&path, &[turn("66666666-aaaa-4aaa-8aaa-666666666666")])
                 }
-                "replace_sealed" => {
+                "replace_sealed" | "poison_replace_sealed" => {
+                    let modified = fs::metadata(&path).unwrap().modified().unwrap();
                     let replacement = path.with_extension("replacement");
                     fs::copy(&path, &replacement).unwrap();
+                    File::options()
+                        .write(true)
+                        .open(&replacement)
+                        .unwrap()
+                        .set_modified(modified)
+                        .unwrap();
+                    if change == "poison_replace_sealed" {
+                        cache.poison_retained();
+                    }
                     assert_ne!(
                         fs::metadata(&path).unwrap().ino(),
                         fs::metadata(&replacement).unwrap().ino()

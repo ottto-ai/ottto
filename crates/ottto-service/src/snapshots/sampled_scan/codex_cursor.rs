@@ -616,7 +616,10 @@ impl SharedCache {
     ) -> Option<(OpenStamp, String, String)> {
         let key = local_index_key(path);
         let previous = self
-            .with_cursor(|cursor| cursor.wake.0.get(&key).map(|entry| entry.0))
+            // Remove the old row before any refresh can fail. Failed sampling,
+            // accounting or retained-lock acquisition must leave no eligible
+            // stale identity behind; the live fallback only costs a retry.
+            .with_cursor(|cursor| cursor.wake.0.remove(&key).map(|entry| entry.0))
             .flatten();
         let mut stamp = OpenStamp::of(metadata);
         let birth = metadata
@@ -690,7 +693,8 @@ impl SharedCache {
         }
         let witness = WakeIdentity(words);
         // Retained -> cursor is the shared-cache lock order. Optional admission
-        // never raises STATE_BYTES, claims proof headroom or discards witnesses.
+        // stays within the existing STATE_BYTES admission; failure leaves
+        // this path without a reusable witness.
         if let Ok(mut retained) = self.retained() {
             self.with_cursor(|cursor| {
                 let used = cursor.tick();
@@ -733,7 +737,11 @@ impl SharedCache {
                 .0
                 .get(&local_index_key(&candidate.path))
                 .filter(|(hint, _)| {
-                    hint.0[3] == candidate.size_bytes && hint.0[2] == candidate.modified_unix_nanos
+                    hint.0[3] == candidate.size_bytes
+                        && hint.0[2] == candidate.modified_unix_nanos
+                        && candidate.physical_identity == Some([hint.0[4], hint.0[5]])
+                        && candidate.fingerprint_birth_nanos != 0
+                        && hint.0[1] == candidate.fingerprint_birth_nanos
                 })
                 .map(|(hint, _)| hint.identity())
         })
