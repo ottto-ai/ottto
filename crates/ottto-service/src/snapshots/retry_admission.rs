@@ -30,6 +30,7 @@ fn claude_retry_due_family_exists(index: &ScanIndex, collected_at: &str) -> bool
         .any(|record| claude_retry_record_due(record, now, served))
 }
 
+#[cfg(test)]
 fn claude_retry_admit_batch(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
@@ -40,6 +41,27 @@ fn claude_retry_admit_batch(
     BTreeSet<String>,
     ClaudeRetryAdmission,
 ) {
+    claude_retry_admit_batch_observed(
+        index,
+        stale,
+        previous,
+        collected_at,
+        &mut Default::default(),
+    )
+}
+
+fn claude_retry_admit_batch_observed(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+    previous: Option<&ClaudeRetryAdmission>,
+    collected_at: &str,
+    diagnostics: &mut StaleCarryRejectionCounts,
+) -> (
+    ClaudeStaleFamilyCarry,
+    BTreeSet<String>,
+    ClaudeRetryAdmission,
+) {
+    *diagnostics = StaleCarryRejectionCounts::default();
     let mut state = previous
         .filter(|state| {
             !(state.complete
@@ -88,8 +110,10 @@ fn claude_retry_admit_batch(
             state.progressed = true;
             return (ClaudeStaleFamilyCarry::default(), batch, state);
         }
-        match claude_stream_accepted_retry_carry(index, &batch) {
+        let mut attempt = StaleCarryRejectionCounts::default();
+        match claude_stream_accepted_retry_carry_observed(index, &batch, &mut attempt) {
             Ok(carry) => {
+                *diagnostics = attempt;
                 state.after_root = batch.last().cloned();
                 state.roots_complete = state.after_root.as_ref().is_some_and(|after| {
                     !stale
@@ -111,6 +135,7 @@ fn claude_retry_admit_batch(
                 }
             }
             Err(ClaudeRetryAdmissionRefusal::Structure) => {
+                *diagnostics = attempt;
                 // One bounded, durable fallback at a time. Later fitting roots
                 // can advance while it is served; another oversized root waits
                 // here instead of losing its obligation or growing a debt map.
@@ -145,7 +170,10 @@ fn claude_retry_admit_batch(
                 eprintln!("local snapshot census retained one oversized Claude retry family for bounded ordinary service; coverage remains incomplete");
                 return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
             }
-            Err(_) => return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state),
+            Err(_) => {
+                *diagnostics = attempt;
+                return (ClaudeStaleFamilyCarry::default(), BTreeSet::new(), state);
+            }
         }
     }
 }
@@ -469,6 +497,7 @@ fn claude_retry_note_offered(
         if !offered(key) {
             break;
         }
+        crate::local_resource_diagnostics::claude_reread::retry_offered();
         oversized_after = Some(key.clone());
     }
     let oversized = state.oversized_root.clone();
@@ -506,6 +535,10 @@ fn claude_retry_note_offered(
                     .is_some_and(|after| key.as_str() <= after)
             {
                 if let Some(entry) = index.files.get_mut(&key) {
+                    crate::local_resource_diagnostics::claude_reread::clear(
+                        crate::local_resource_diagnostics::claude_reread::ClearSite::RetryAdmission,
+                        !entry.source_file_fingerprint.is_empty(),
+                    );
                     entry.source_file_fingerprint.clear();
                 }
             }

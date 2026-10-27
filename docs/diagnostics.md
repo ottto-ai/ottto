@@ -321,3 +321,129 @@ decisions for Rejected pages with non-progressing, restorable local holds.
 Recorded Claude account holds are included. It increments before the index
 save, so it does not count durable-save successes or unique pages; restarts
 reset it. See [counter scope and hold semantics](session-2026-10-22-terminal-bound-hold-settlement.md).
+
+## Claude Re-read Attribution Counters
+
+Schema 2's existing `native_collection_page` and `native_comparison_decision`
+records can include two sparse, counts-only objects for `source: claude_code`:
+`counts.claude_reread` and `counts.retained_cache_page_events`. Missing keys
+mean zero events in that observation. Counters saturate at `u64::MAX`. They
+add no wire fields, collected data kinds, persisted state or transcript reads.
+No paths, identifiers, fingerprints, bodies or content are emitted.
+
+Collection counters cover initialization and all cooperative steps of one page,
+including steps before a pause or a move to another worker thread. Comparison
+counters cover preparation (including load normalization) and post-collection
+finalization/save. These are disjoint event intervals: sum their events for the
+page; neither object is a gauge or a count of distinct files across pages.
+Nested operations, other sources and other threads cannot contribute to the
+active interval. Abandoned collection pages have no completed collection line.
+With comparison disabled, the existing `disabled_before_lease` decision still
+reports the gate; additional rows on that same decision stage report nonzero
+preparation/save events after work, without creating a comparison permit.
+
+`claude_reread` contains these closed keys:
+
+- `restored_empty_held`, `restored_nonempty_held`, `restored_empty_sibling`,
+  `restored_nonempty_sibling`: `committable_subset` replaced a working entry
+  with a nonempty parsed source fingerprint by its previous entry. Empty versus
+  nonempty describes the **previous** fingerprint. Held means a decode hold or
+  an entity/head in the caller's local hold set; sibling means neither. Existing
+  empty working debt and keys without a previous entry are excluded. A restored
+  previous nonempty fingerprint can equal the working fingerprint.
+- `sibling_exact_incidence_only`: subset of sibling restorations rejected by
+  the early exact-entity incidence branch whose legacy head/equality fallback
+  would have admitted them. This records the branch, not proof of settled body
+  equivalence, acceptance or permission to advance the checkpoint.
+- `owned_start_calls`, `owned_start_cleared`: corrective owned-start reparse
+  clear calls and actual nonempty-to-empty transitions.
+- `account_reproof_calls`, `account_reproof_cleared`: invalid account witness
+  reproof clear calls and actual nonempty-to-empty transitions.
+- `retry_admission_offered`, `retry_admission_cleared`: existing indexed members
+  in the actually offered oversized-family contiguous prefix, including offers
+  subsequently held by reread admission, and actual nonempty-to-empty clears.
+  This family reserve is distinct from the transcript file byte cap.
+- `authority_normalization_cleared`: nonempty-to-empty transitions while dropping
+  unbound authority records on working load/save. Discarded CAS probes are
+  excluded, matching the existing authority-drop totals.
+
+`retained_cache_page_events` reuses the existing cache lifecycle event keys and
+sites: `take_*`, `insert_*`, `cursor_reservation_entries_evicted`,
+`copy_refusal_*`, `clear_*`, `retention_*`, `prefix_excluded_bodies`, and
+`prefix_tag_clears`. Unlike `process_retained_cache_lifecycle_totals` (which stays
+cumulative, cross-source and labelled `unknown`), these are exact deltas from
+operations executed by the Claude page. Eviction/clear counts describe the
+causing page, **not** the source of each victim in the shared cache. No victim
+identity/history is retained. Existing refusal causes include entry/key/frozen
+charge, layout/disabled, live reservation, missing/invalid plan, incomplete or
+lossy reduction, unsealed EOF, clone/finalization bounds and poisoned locks.
+
+Three additional page-only keys refine those existing sites:
+
+- `insert_count_entries_evicted` and `insert_byte_entries_evicted` partition
+  `insert_entries_evicted`: each victim counts as count pressure when the count
+  cap is exceeded before removal, otherwise byte/layout-bound pressure. Entry
+  bound refusals remain `insert_entry_bound_refused`; they are not evictions.
+- `reinsert_failed`: one destructive cache hit whose acquisition ends without a
+  successful reinsertion, including eligibility/prepare/parse/retention failure
+  and refused insertion. A fixed boolean follows the active read across steps;
+  it stores no identity and disarms only after admission. Events are recorded
+  when that attempt ends, potentially on a later cooperative step. Process
+  termination cannot report an unfinished attempt.
+
+All diagnostics are best-effort local stderr observations. Their counters never
+feed collection, proof, save, memory admission, account attribution or upload
+decisions. Scopes and counters use fixed integers and inline storage, with no
+new locks, heap allocations, event history, lookups or background work.
+
+### Stale-start carry rejection histogram
+
+By design, `stale_carry_rejection_counts` rides the plain census re-arm stderr
+line, separate from the `local_resources` records.
+
+The existing local text line beginning `local snapshot census re-armed stale
+Claude request evidence:` appends `stale_carry_rejection_counts={...}`. This is
+**a text-line suffix**, not a new `local_resources` field or a wire field. The
+JSON object has eleven fixed `u64` keys, including explicit zeros:
+
+- `provenance_or_context`: retained provenance rewind or missing same-context
+  admission prevents this carry route. Valid legacy full-rearm-window carry
+  remains eligible through its existing separate route.
+- `contract`: missing identity contract or its changed latch.
+- `accepted_ledger`: accepted ledger version/reconciliation is not current.
+- `upload_context`: retained and active upload context differ.
+- `window_scratch`: active full-rearm window's combined Fix 2/C1b scratch price
+  refused, selecting the existing empty-carry fallback.
+- `ordinary_scratch`: selected ordinary carry scratch or streaming structural
+  admission refused.
+- `member_evidence`: membership, body/ACK, pending, legacy/fence or evidence
+  qualification refused after earlier route admission.
+- `cancellation_funding`: the selected cancellation price refused.
+- `reserve_allocation`: an actual member/replay vector reservation failed.
+- `eligible_before_funding`: roots that passed member/evidence qualification
+  before the selected route's cancellation reservation. Streaming pre-prices
+  cancellation before member qualification, so an early refusal can have zero
+  observed eligible roots; this is not a claim that no root could qualify.
+- `final_carried`: final carried roots after both cancellation funding passes.
+
+Counts are captured immediately before the existing stale-start fingerprint
+clear and appended where the existing re-arm text line is emitted. A resumed
+page, cadence wait, or start that emits no such line adds no log write or JSON
+serialization. These fixed counters add no retained graph, root history or
+extra source walks. Structured traversal-transition rows and their size budgets
+are unchanged. Integers saturate; no tokens, paths, sessions, hashes or content
+are included.
+
+Each stale root has one first rejection on its selected route or a final carry:
+the nine rejection buckets plus `final_carried` sum to the line's pending-family
+count. Window scratch is checked before entering ordinary carry; within an
+ordinary start-admission refusal, precedence is context, contract, ledger,
+upload context, then remaining legacy/member admission. A successful streaming
+alternate rescues ordinary scratch refusal. Failed whole-set/batch probes are
+discarded when a smaller batch succeeds; uncovered/deferred roots retain the
+first whole-set capacity refusal, while selected roots use their actual outcome.
+An existing admission cursor's whole-set deferral counts as structural scratch
+refusal. This describes carry admission, not unique families over multiple
+starts, proof completeness, actual rereads, or permission to change checkpoints.
+Capped roots retain their earlier carry rejection and cannot be counted again
+if the final combined cancellation funding refuses them.
