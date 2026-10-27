@@ -16,7 +16,13 @@ admission, audits and recovery reads. Other large Full candidates stay pending
 census debt and receive priority in oldest-deferral order on subsequent passes,
 including after restart. They contribute no read count or new source proof;
 pending debt remains visible through existing scan-cap/skipped-file counters
-and withholds census completeness. Tail reads and files at or below 256 MiB
+and withholds census completeness. Scheduling priority is capped at 256 unique
+absolute-path keys and 64 KiB, including conservative container/wire charges,
+with a 4 KiB key limit. Both production readers bound the raw leaf before string
+decoding; malformed or oversized state clears priority, logs a decode-drop counter
+and uses the independent pending census FIFO. Overflow also uses that queue,
+so losing cached priority never drops a read. Priority is collected when files
+shrink, disappear, exceed admission, or the scan/account scope changes. Tail reads and files at or below 256 MiB
 keep their existing admission. The oversized path still runs before this gate.
 
 The `large_claude_native_memory_and_append` regression creates synthetic

@@ -3792,10 +3792,10 @@ pub struct ScanIndex {
     /// Scheduling only. FIFO keys of pending large Full reads; never proof.
     #[serde(
         default,
-        skip_serializing_if = "VecDeque::is_empty",
-        deserialize_with = "deserialize_lenient_default"
+        skip_serializing_if = "claude_large_full::Priority::is_idle",
+        deserialize_with = "claude_large_full::Priority::deserialize"
     )]
-    claude_large_full_deferred: VecDeque<String>,
+    claude_large_full_deferred: claude_large_full::Priority,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -3991,7 +3991,7 @@ impl Default for ScanIndex {
             claude_duplicate_request_witness_overflowed: false,
             claude_owned_start_census: BTreeMap::new(),
             claude_account_deferred_holds: BTreeMap::new(),
-            claude_large_full_deferred: VecDeque::new(),
+            claude_large_full_deferred: claude_large_full::Priority::default(),
             claude_duplicate_fence_rearm_attempt: 0,
             claude_duplicate_fence_next_full_rearm_unix_seconds: None,
             claude_full_rearm_progress: ClaudeFullRearmProgress::default(),
@@ -25602,6 +25602,11 @@ impl OwnedSourceScan {
             });
         if source == SnapshotSource::ClaudeCode {
             index.observe_claude_request_identity_contract(claude_request_identity_capture);
+        }
+        if source == SnapshotSource::ClaudeCode {
+            let scope =
+                scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
+            index.claude_large_full_deferred.begin(&scope, roots);
         }
         ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
         let next_generation_hints;

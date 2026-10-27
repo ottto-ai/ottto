@@ -425,10 +425,20 @@ impl OwnedSourceScan {
             self.census.removed_index_keys.remove(&key);
         }
         self.census.observed_index_keys.insert(key.clone());
+        let prior_position = self
+            .identified_candidates
+            .iter()
+            .position(|candidate| local_index_key(&candidate.path) == key);
         self.identified_candidates
             .retain(|candidate| local_index_key(&candidate.path) != key);
         let large = claude_large_full::is_large(&candidate);
-        let position = if large {
+        let position = if large && self.index.claude_large_full_deferred.overflowing() {
+            // Retain an already selected held key's rank. A newly injected
+            // held audit cannot jump ahead of overflow's ordinary census FIFO.
+            prior_position
+                .unwrap_or(self.identified_candidates.len())
+                .min(self.identified_candidates.len())
+        } else if large {
             // A new rotating-slot audit cannot jump ahead of older deferred
             // large Fulls. Small held files keep their existing first position.
             self.identified_candidates
@@ -549,6 +559,15 @@ mod tests {
             Record::synthetic_for_test(&"a".repeat(64), 1, Shape::IdentityIncomplete, vec![1])
                 .with_unverified_for_test(true),
         );
+        let context = scan_traversal_context_fingerprint(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &index,
+            BACKFILL_WINDOW_DAYS,
+        );
+        index
+            .claude_large_full_deferred
+            .begin(&context, std::slice::from_ref(&root));
         index.claude_large_full_deferred.push_back(old_key.clone());
         index.held_audit_progress = Some(HeldAuditProgress {
             key: held_key.clone(),
@@ -605,7 +624,11 @@ mod tests {
         ));
         assert!(!scan.index.held_audit_progress.as_ref().unwrap().attempted);
         assert_eq!(
-            scan.index.claude_large_full_deferred,
+            scan.index
+                .claude_large_full_deferred
+                .iter()
+                .cloned()
+                .collect::<VecDeque<_>>(),
             VecDeque::from([old_key, held_key.clone()])
         );
         assert_eq!(restore_held_audit_deadlines(&mut scan.index, 100), 1);
@@ -624,7 +647,11 @@ mod tests {
         // the existing restoration slots so production with_sampled cannot
         // convert the plain-v2 hold before its rotating slot is scheduled.
         let newer_key = local_index_key(&older);
-        seed.claude_large_full_deferred = VecDeque::from([held_key.clone(), newer_key.clone()]);
+        seed.claude_large_full_deferred.clear();
+        seed.claude_large_full_deferred
+            .begin(&context, std::slice::from_ref(&root));
+        seed.claude_large_full_deferred.push_back(held_key.clone());
+        seed.claude_large_full_deferred.push_back(newer_key.clone());
         for n in 0..CACHE_ENTRIES - 1 {
             let mut pending = entry();
             pending.set_unverified_deadline(50);

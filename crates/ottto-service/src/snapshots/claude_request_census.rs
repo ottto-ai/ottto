@@ -1414,7 +1414,7 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
 /// Derive positional slots from Serde's own field metadata rather than pinning
 /// offsets to ScanIndex's declaration order. JSON struct sequences are accepted
 /// by the old reader too; they need the same evidence bounds as object fields.
-fn sequence_fields() -> (usize, usize) {
+fn sequence_fields() -> (usize, usize, usize) {
     struct Fields<'a>(&'a mut Option<&'static [&'static str]>);
     impl<'de> Deserializer<'de> for Fields<'_> {
         type Error = serde::de::value::Error;
@@ -1436,7 +1436,7 @@ fn sequence_fields() -> (usize, usize) {
             tuple_struct map enum identifier ignored_any
         }
     }
-    static SLOTS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    static SLOTS: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
     *SLOTS.get_or_init(|| {
         let mut fields = None;
         let _ = ScanIndex::deserialize(Fields(&mut fields));
@@ -1455,6 +1455,7 @@ fn sequence_fields() -> (usize, usize) {
         (
             slot("claude_request_census"),
             slot("claude_request_census_shadow"),
+            slot("claude_large_full_deferred"),
         )
     })
 }
@@ -1475,7 +1476,7 @@ struct CensusRead<R> {
     depth: usize,
     root_array: bool,
     array_index: usize,
-    sequence_fields: (usize, usize),
+    sequence_fields: (usize, usize, usize),
     quoted: bool,
     escaped: bool,
     expect_key: bool,
@@ -1485,6 +1486,9 @@ struct CensusRead<R> {
     duplicate_shadow: bool,
     shadow_key: bool,
     shadow_state: bool,
+    debt_key: bool,
+    seen_debt: bool,
+    duplicate_debt: bool,
     capture: bool,
     syntax_only: bool,
     #[cfg(test)]
@@ -1512,6 +1516,9 @@ impl<R: std::io::Read> CensusRead<R> {
             duplicate_shadow: false,
             shadow_key: false,
             shadow_state: false,
+            debt_key: false,
+            seen_debt: false,
+            duplicate_debt: false,
             capture: false,
             syntax_only: false,
             #[cfg(test)]
@@ -1530,6 +1537,9 @@ impl<R: std::io::Read> CensusRead<R> {
     }
 
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
+        if self.duplicate_debt {
+            index.claude_large_full_deferred = super::claude_large_full::Priority::fallback();
+        }
         if self.duplicate_census {
             index.claude_request_census = ClaudeRequestCensus::default();
         }
@@ -1559,9 +1569,18 @@ impl<R: std::io::Read> CensusRead<R> {
             }
         }
         self.shadow_key = false;
+        self.debt_key = false;
         if !self.quoted {
             if let Ok(name) = serde_json::from_slice::<String>(&key) {
                 let duplicate = match name.as_str() {
+                    "claude_large_full_deferred" => {
+                        self.shadow_key = true;
+                        self.debt_key = true;
+                        let duplicate = self.seen_debt;
+                        self.seen_debt = true;
+                        self.duplicate_debt |= duplicate;
+                        duplicate
+                    }
                     "claude_request_census" => {
                         self.shadow_key = true;
                         self.shadow_state = false;
@@ -1621,7 +1640,12 @@ impl<R: std::io::Read> CensusRead<R> {
                 break;
             }
             if !overflow {
-                if bytes.len() == MAX_RAW_BYTES {
+                let cap = if self.debt_key {
+                    super::claude_large_full::MAX_BYTES
+                } else {
+                    MAX_RAW_BYTES
+                };
+                if bytes.len() == cap {
                     bytes = Vec::new();
                     overflow = true;
                 } else {
@@ -1657,7 +1681,12 @@ impl<R: std::io::Read> CensusRead<R> {
         // Parsing is isolated from the enclosing index, including numeric
         // conversion and wrong-token errors. Only canonical, finite tokens
         // leave this reader. JSON syntax outside the optional field is intact.
-        Ok(if self.shadow_state {
+        Ok(if self.debt_key {
+            let priority = serde_json::from_slice::<super::claude_large_full::Priority>(&bytes)
+                .unwrap_or_else(|_| super::claude_large_full::Priority::fallback());
+            drop(bytes);
+            serde_json::to_vec(&priority).expect("scheduling serialization")
+        } else if self.shadow_state {
             let state = serde_json::from_slice::<ClaudeRequestCensusShadowState>(&bytes)
                 .unwrap_or_default();
             drop(bytes);
@@ -1697,8 +1726,10 @@ impl<R: std::io::Read> CensusRead<R> {
             && !byte.is_ascii_whitespace()
             && !matches!(byte, b',' | b']')
             && (self.array_index == self.sequence_fields.0
-                || self.array_index == self.sequence_fields.1)
+                || self.array_index == self.sequence_fields.1
+                || self.array_index == self.sequence_fields.2)
         {
+            self.debt_key = self.array_index == self.sequence_fields.2;
             self.shadow_state = self.array_index == self.sequence_fields.1;
             self.replay = Some(byte);
             self.output = std::io::Cursor::new(self.evidence()?);

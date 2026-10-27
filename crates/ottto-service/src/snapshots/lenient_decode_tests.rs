@@ -1986,8 +1986,8 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "codex_state_only_blocked_unattributed"
             | "codex_state_only_blocked_legacy"
             | "codex_parent_ownership_refs"
-            | "confirmed_empty_files"
-            | "claude_large_full_deferred" => serde_json::json!(["member"]),
+            | "confirmed_empty_files" => serde_json::json!(["member"]),
+            "claude_large_full_deferred" => serde_json::json!({"keys":["/synthetic/member.jsonl"]}),
             "codex_state_only_snapshot_fingerprints" | "claude_account_deferred_holds" => {
                 serde_json::json!({"session":"value"})
             }
@@ -4554,9 +4554,17 @@ fn damaged_large_full_scheduling_leaf_preserves_native_custody() {
         for index in [native, restored] {
             assert!(index.decode_holds.is_empty());
             assert!(index.claude_large_full_deferred.is_empty());
+            assert!(
+                index.claude_large_full_deferred.overflowing(),
+                "fallback owes ordinary FIFO service"
+            );
+            let mut actual = serde_json::to_value(&index).unwrap();
+            actual
+                .as_object_mut()
+                .unwrap()
+                .remove("claude_large_full_deferred");
             assert_eq!(
-                serde_json::to_value(&index).unwrap(),
-                expected,
+                actual, expected,
                 "scheduling damage changes no source proof, ACK, quarantine or pending census path"
             );
         }

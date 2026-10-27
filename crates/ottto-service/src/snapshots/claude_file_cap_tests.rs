@@ -726,3 +726,124 @@ fn large_claude_fulls_rotate_with_sibling_and_audits() {
         println!("claude_large_full_scheduler_receipt: pass={pass} large_fulls=1 pi_reads=1 parking_refused={}", owner.refusals.get() > 0);
     }
 }
+
+#[test]
+fn overflow_and_decode_fallback_eventually_read_every_large_file() {
+    let fixture = Fixture::new();
+    let large = (0..3)
+        .map(|n| {
+            let session = format!("019e2700-6666-7000-9000-{n:012}");
+            let path = fixture.0.join(format!("{session}.jsonl"));
+            write_populated_large(&path, &session);
+            path
+        })
+        .collect::<Vec<_>>();
+    for damaged in [false, true] {
+        let mut index = ScanIndex::default();
+        for n in 0..=claude_large_full::MAX_KEYS {
+            index
+                .claude_large_full_deferred
+                .push_back(local_index_key(&fixture.0.join(format!("stale-{n}.jsonl"))));
+        }
+        assert!(index.claude_large_full_deferred.overflowing());
+        let mut stored = serde_json::to_value(&index).unwrap();
+        if damaged {
+            stored["claude_large_full_deferred"] =
+                json!({"keys":["x".repeat(claude_large_full::MAX_BYTES+1)]});
+        }
+        index = lenient_decode::read(
+            std::io::Cursor::new(serde_json::to_vec(&stored).unwrap()),
+            "load",
+            "claude_code",
+        )
+        .unwrap();
+        assert!(index.claude_large_full_deferred.overflowing());
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut read = BTreeSet::new();
+        let mut hot = None;
+        for pass in 0..3 {
+            let hints = hot.iter().cloned().collect::<Vec<_>>();
+            let mut owner = Rotation {
+                ready: vec![(
+                    SnapshotSource::ClaudeCode,
+                    rotation_scan(
+                        SnapshotSource::ClaudeCode,
+                        &fixture.0,
+                        std::mem::take(&mut index),
+                        &cache,
+                        &hints,
+                    ),
+                )],
+                completed: Vec::new(),
+                starts: Vec::new(),
+                refuse_parking: true,
+                refusals: std::cell::Cell::new(0),
+                deferred_revocations: 0,
+                started: std::time::Instant::now(),
+            };
+            let (_, acquisitions) = terminal_contract_retry::source_acquisitions(|| {
+                crate::source_rotation::run(
+                    &mut owner,
+                    &[SnapshotSource::ClaudeCode],
+                    crate::source_rotation::PARKED_BUDGET,
+                );
+            });
+            let starts = owner
+                .starts
+                .iter()
+                .filter(|(path, _)| large.contains(path))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                starts.len(),
+                1,
+                "one native large Full, damaged={damaged} pass={pass}"
+            );
+            let (path, mode) = starts[0];
+            assert!(matches!(
+                mode,
+                Some(crate::transcript_acquisition::ReadMode::Full(_))
+            ));
+            assert!(
+                read.insert(path.clone()),
+                "a hot audit cannot starve overflow debt"
+            );
+            assert_eq!(acquisitions.get(path), Some(&1));
+            if hot.is_none() {
+                hot = Some(path.clone());
+            }
+            let (source, mut next, mut scan) = owner.completed.pop().unwrap();
+            assert_eq!(scan.scanned_file_count, 1);
+            for unread in large.iter().filter(|path| !read.contains(*path)) {
+                let key = local_index_key(unread);
+                assert!(
+                    !next.files.contains_key(&key),
+                    "unread overflow has no index/proof"
+                );
+                assert!(!next.file_snapshot_fingerprints.contains_key(&key));
+                assert!(!acquisitions.contains_key(unread));
+            }
+            if pass < 2 {
+                assert!(!scan.census_complete);
+                assert!(scan.scan_cap_hit);
+                assert!(scan.skipped_file_count_due_to_limit > 0);
+            }
+            finalize_scan_after_policy(source, &mut scan, &mut next);
+            next.files
+                .get_mut(&local_index_key(hot.as_ref().unwrap()))
+                .unwrap()
+                .set_unverified_deadline(1);
+            index = lenient_decode::read(
+                std::io::Cursor::new(serde_json::to_vec(&next).unwrap()),
+                "load",
+                "claude_code",
+            )
+            .unwrap();
+            assert!(
+                index.claude_large_full_deferred.is_empty(),
+                "overflow priority does not accumulate keys"
+            );
+            println!("claude_large_full_overflow_receipt: damaged={damaged} pass={pass} large_fulls=1 read={}",read.len());
+        }
+        assert_eq!(read.len(), 3);
+    }
+}

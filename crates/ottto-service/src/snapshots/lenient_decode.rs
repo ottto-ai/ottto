@@ -328,7 +328,10 @@ impl Serialize for ScanIndex {
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
         );
-        field!(claude_large_full_deferred, VecDeque::is_empty);
+        field!(
+            claude_large_full_deferred,
+            claude_large_full::Priority::is_idle
+        );
         map.end()
     }
 }
@@ -1754,7 +1757,27 @@ impl<R: BufRead + Seek> Decoder<R> {
                             // Scheduling damage costs ordering only. Preserve
                             // every native proof, ACK and pending census path.
                             index.claude_large_full_deferred =
-                                self.history_scalar(value, VecDeque::new())?;
+                                if value.len > claude_large_full::MAX_BYTES as u64 {
+                                    claude_large_full::Priority::fallback()
+                                } else {
+                                    // Raw span admitted before any key/escape buffer.
+                                    self.reader.seek(SeekFrom::Start(value.start))?;
+                                    let parsed =
+                                        serde_json::from_reader((&mut self.reader).take(value.len));
+                                    self.reader.seek(SeekFrom::Start(value.start + value.len))?;
+                                    match parsed {
+                                        Ok(priority) => priority,
+                                        Err(error) if error.is_io() => {
+                                            return Err(Error::Io(std::io::Error::new(
+                                                error
+                                                    .io_error_kind()
+                                                    .unwrap_or(std::io::ErrorKind::Other),
+                                                error,
+                                            )))
+                                        }
+                                        Err(_) => claude_large_full::Priority::fallback(),
+                                    }
+                                };
                         }
                         "claude_full_rearm_progress" => {
                             // #720 scheduling-only memory: malformed progress
