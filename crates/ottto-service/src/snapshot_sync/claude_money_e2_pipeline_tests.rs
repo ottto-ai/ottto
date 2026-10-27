@@ -2621,7 +2621,15 @@ fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool) {
         literal(&restored);
         // Cold Full is only the fixture's reference oracle. Production keeps
         // the retained read when the external census becomes available.
-        let full = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        let mut full_prior = prior.clone();
+        let unsent = full_prior
+            .files
+            .remove(path.to_string_lossy().as_ref())
+            .unwrap();
+        assert_eq!(unsent.last_snapshot_fingerprint, None);
+        // Today's settlement omits this NEW held key. Keep its other census
+        // evidence, and compare the resulting published body byte for byte.
+        let full = ready(&c, &E2ScanFixture::default(), full_prior, 100, false);
         assert_eq!(
             canonical(&request(&restored.scan.snapshots)),
             canonical(&request(&full.scan.snapshots))

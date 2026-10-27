@@ -3199,6 +3199,33 @@ fn e2_withheld_new_file_keeps_only_read_identity_in_both_settlements() {
         assert_eq!(loaded.files[key].last_snapshot_fingerprint, None);
         assert!(!loaded.accepted_snapshot_fingerprint_recorded("held"));
         assert!(loaded.claude_request_owned_held_sources.is_empty());
+        assert_eq!(
+            loaded
+                .manifest_for_window(
+                    SnapshotSource::ClaudeCode,
+                    "2026-08-01T00:00:00Z",
+                    "2026-08-03T00:00:00Z"
+                )
+                .unwrap()
+                .entity_count,
+            0
+        );
+        bind_authority_quarantine(
+            &mut loaded,
+            "e2-withheld",
+            "e2-withheld",
+            &revision,
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+        );
+        assert_eq!(
+            loaded.retire_absent_retry_pending_claude_families(
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                "synthetic"
+            ),
+            0
+        );
+        assert_eq!(loaded.claude_usage_authority_pending_count(), 1);
     }
     // Keeping read identity must not make a new authority family restorable.
     bind_authority_quarantine(
