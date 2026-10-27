@@ -94,24 +94,3 @@ jobs:
 
       - name: Connector package tests
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
-
-      # T9 TEMPORARY PROBE: removed before benchmark head / owner handoff.
-      - name: T9 touched-file clippy probe
-        if: always()
-        run: |
-          set -euo pipefail
-          rustup component add clippy
-          cargo clippy -p ottto-service --all-targets --locked --message-format=json > "$RUNNER_TEMP/t9-clippy.jsonl"
-          python3 - "$RUNNER_TEMP/t9-clippy.jsonl" <<'PY_CLIPPY'
-          import json, sys
-          bad = []
-          for line in open(sys.argv[1]):
-              r = json.loads(line)
-              if r.get('reason') != 'compiler-message': continue
-              m = r['message']
-              if m.get('level') not in ('warning', 'error'): continue
-              print(m.get('rendered', ''))
-              if any(s['file_name'].endswith(('snapshot_sync.rs', 'money_e2_bench_tests.rs')) for s in m['spans']): bad.append(m)
-          assert not bad, bad
-          print('T9_TOUCHED_FILE_CLIPPY_CLEAN')
-          PY_CLIPPY
