@@ -1,6 +1,7 @@
 // Compare emitted upload envelopes, never pre-finalization reductions. All input
 // files are synthetic. The dispatch overlays only this test harness on the base.
 use super::*;
+use serde_json::Value;
 
 fn supported(name: &str) -> bool {
     if !crate::heap_layout_bound::layout_supported() {
@@ -12,7 +13,7 @@ fn supported(name: &str) -> bool {
 
 fn corpus(name: &str) -> Corpus {
     // A shared absolute root gives base and candidate identical input paths.
-    // No PID, wall clock, random IDs or body-field normalization is allowed.
+    // No PID, wall clock or random IDs; raw within-build bodies stay exact.
     let base = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| test_dir("money-equivalence"))
@@ -83,18 +84,114 @@ fn save_inputs(c: &Corpus) {
     }
 }
 
-fn receipt(name: &str, bodies: &[Vec<u8>]) {
+// Retain the actual emitted items: SnapshotItem intentionally has no wire
+// deserializer, and production hashes must be recomputed from production types.
+struct ReceiptBody {
+    raw: Vec<u8>,
+    source: SnapshotSource,
+    items: Vec<SnapshotItem>,
+}
+
+impl ReceiptBody {
+    fn cross_build(&self) -> Vec<u8> {
+        let envelope = |bytes: &[u8]| {
+            let mut wire: Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(wire["source"], self.source.api_slug());
+            for snapshot in wire["snapshots"].as_array_mut().unwrap() {
+                let item = self
+                    .items
+                    .iter()
+                    .find(|item| snapshot["snapshot_fingerprint"] == item.snapshot_fingerprint)
+                    .expect("wire snapshot must have its emitted production item");
+                let raw = snapshot.clone();
+                let mut raw_item = raw.as_object().unwrap().clone();
+                raw_item.remove("semantic_envelope").unwrap();
+                assert_eq!(Value::Object(raw_item), serde_json::to_value(item).unwrap());
+                // These fixtures upload with this exact policy. Check the wire
+                // before using it rather than silently assuming a default.
+                let policy = SnapshotUploadPolicy::default();
+                assert_eq!(
+                    raw["semantic_envelope"],
+                    serde_json::to_value(crate::snapshots::snapshot_semantic_envelope(
+                        self.source,
+                        item,
+                        policy,
+                    ))
+                    .unwrap(),
+                );
+                let mut cross_item = item.clone();
+                cross_item.source_file_fingerprint = Some("physical-identity:excluded".into());
+                snapshot["source_file_fingerprint"] = json!(cross_item.source_file_fingerprint);
+                // Calls the same revision v1/v2 functions as real wire emission.
+                snapshot["semantic_envelope"] = serde_json::to_value(
+                    crate::snapshots::snapshot_semantic_envelope(self.source, &cross_item, policy),
+                )
+                .unwrap();
+                assert_cross_build_scope(&raw, snapshot);
+            }
+            canonical(&wire)
+        };
+        if self.source == SnapshotSource::ClaudeCode {
+            // Claude's real uploader returns a sequence of encoded envelopes.
+            let batches: Vec<Vec<u8>> = serde_json::from_slice(&self.raw).unwrap();
+            canonical(
+                &batches
+                    .iter()
+                    .map(|body| envelope(body))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            envelope(&self.raw)
+        }
+    }
+}
+
+fn assert_cross_build_scope(raw: &Value, cross: &Value) {
+    let mut restored = cross.clone();
+    // Assert existing paths: normalization must never add/delete fields or
+    // permit any other component, content hash, money or ordering drift.
+    for path in [
+        "/source_file_fingerprint",
+        "/semantic_envelope/revision_hash",
+        "/semantic_envelope/revision_v2_hash",
+    ] {
+        *restored
+            .pointer_mut(path)
+            .expect("existing cross-build path") =
+            raw.pointer(path).expect("existing raw path").clone();
+    }
+    assert_eq!(
+        &restored, raw,
+        "cross-build body changed outside identity paths"
+    );
+}
+
+fn receipt(name: &str, bodies: &[ReceiptBody]) {
     assert!(!bodies.is_empty(), "zero emitted bodies is no proof");
-    let bytes = serde_json::to_vec(bodies).unwrap();
+    let bytes = serde_json::to_vec(&bodies.iter().map(|b| &b.raw).collect::<Vec<_>>()).unwrap();
     let digest = format!("{:x}", Sha256::digest(&bytes));
+    let cross = serde_json::to_vec(
+        &bodies
+            .iter()
+            .map(ReceiptBody::cross_build)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let cross_digest = format!("{:x}", Sha256::digest(&cross));
     if let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") {
         let out = PathBuf::from(out);
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join(format!("{name}.json")), &bytes).unwrap();
         std::fs::write(out.join(format!("{name}.sha256")), &digest).unwrap();
+        std::fs::write(out.join(format!("{name}.cross-build.json")), &cross).unwrap();
+        std::fs::write(
+            out.join(format!("{name}.cross-build.sha256")),
+            &cross_digest,
+        )
+        .unwrap();
     }
     println!(
-        "MONEY_EQUIVALENCE {name} VERIFIED bytes={} sha256={digest}",
+        "MONEY_EQUIVALENCE {name} VERIFIED bytes={} sha256={digest} cross_build_sha256={cross_digest}",
         bytes.len()
     );
 }
@@ -106,7 +203,7 @@ fn compare_claude(
     retained: &E2ScanFixture,
     prior: ScanIndex,
     mode: (usize, usize, usize),
-) -> Vec<u8> {
+) -> ReceiptBody {
     compare_claude_pages(c, claude_pages(c, retained, [prior.clone(), prior], mode))
 }
 
@@ -131,7 +228,7 @@ fn claude_pages(
     [tail, full]
 }
 
-fn compare_claude_pages(c: &Corpus, [mut tail, mut full]: [Page; 2]) -> Vec<u8> {
+fn compare_claude_pages(c: &Corpus, [mut tail, mut full]: [Page; 2]) -> ReceiptBody {
     for page in [&mut tail, &mut full] {
         page.enrich(c); // attach, side calls, identity reconcile and emission
         page.finish(); // policy/body witnesses/holds, as in the real pipeline
@@ -139,7 +236,7 @@ fn compare_claude_pages(c: &Corpus, [mut tail, mut full]: [Page; 2]) -> Vec<u8> 
     compare_claude_uploads(&tail, &full)
 }
 
-fn compare_claude_uploads(tail: &Page, full: &Page) -> Vec<u8> {
+fn compare_claude_uploads(tail: &Page, full: &Page) -> ReceiptBody {
     let (a, wire_a, _) = upload(&tail.scan.snapshots, &mut e2_progress(), ack);
     let (b, wire_b, _) = upload(&full.scan.snapshots, &mut e2_progress(), ack);
     assert_eq!(a.unwrap(), ResumableUploadResult::Completed);
@@ -156,7 +253,11 @@ fn compare_claude_uploads(tail: &Page, full: &Page) -> Vec<u8> {
         Sha256::digest(canonical(&wire_a)),
         Sha256::digest(canonical(&wire_b))
     );
-    canonical(&wire_a)
+    ReceiptBody {
+        raw: canonical(&wire_a),
+        source: SnapshotSource::ClaudeCode,
+        items: tail.scan.snapshots.clone(),
+    }
 }
 
 fn claude_case(name: &str) {
@@ -365,7 +466,7 @@ fn claude_case(name: &str) {
                     );
                 }
                 assert_ne!(
-                    failed_wire, healthy_wire,
+                    failed_wire.raw, healthy_wire.raw,
                     "reported money replaces the estimate"
                 );
                 receipt(name, &[failed_wire, healthy_wire]);
@@ -487,7 +588,14 @@ fn codex_case(legacy: bool) {
     let (a, b) = (other_wire(source, &tail), other_wire(source, &full));
     assert_eq!(a, b);
     assert_eq!(Sha256::digest(&a), Sha256::digest(&b));
-    receipt(name, &[a]);
+    receipt(
+        name,
+        &[ReceiptBody {
+            raw: a,
+            source,
+            items: tail.snapshots.clone(),
+        }],
+    );
 }
 #[test]
 fn codex_v2_sticky() {

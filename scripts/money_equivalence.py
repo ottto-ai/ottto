@@ -91,19 +91,25 @@ def main():
             if len(verified) != len(expected) or set(verified) != expected or "UNEXECUTED" in result.stdout:
                 raise RuntimeError(f"incomplete native coverage: {verified}")
         left, right = receipts / "base", receipts / "head"
-        names = sorted(p.name for p in left.glob("*.json"))
-        if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json")):
+        names = sorted(p.name for p in left.glob("*.json") if not p.name.endswith(".cross-build.json"))
+        if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")):
             raise RuntimeError("missing or extra fixture receipts")
         for name in names:
             inputs = Path(name).with_suffix(".inputs")
             if (left / inputs).read_bytes() != (right / inputs).read_bytes():
                 raise RuntimeError(f"synthetic inputs differ across base/head: {inputs}")
-            a, b = (left / name).read_bytes(), (right / name).read_bytes()
+            # Raw bodies/digests remain artifact evidence. Only the separately
+            # guarded physical-identity exclusion is compared across builds.
+            cross_name = Path(name).with_suffix(".cross-build.json")
+            for directory in (left, right):
+                for body_name in (Path(name), cross_name):
+                    data = (directory / body_name).read_bytes()
+                    digest = directory / body_name.with_suffix(".sha256")
+                    if digest.read_text() != hashlib.sha256(data).hexdigest():
+                        raise RuntimeError(f"invalid saved digest: {directory}/{body_name}")
+            a, b = (left / cross_name).read_bytes(), (right / cross_name).read_bytes()
             if a != b or hashlib.sha256(a).digest() != hashlib.sha256(b).digest():
-                raise RuntimeError(f"base/head emitted bytes or digest differ: {name}")
-            for directory, data in [(left, a), (right, b)]:
-                if (directory / Path(name).with_suffix(".sha256")).read_text() != hashlib.sha256(data).hexdigest():
-                    raise RuntimeError(f"invalid saved digest: {directory}/{name}")
+                raise RuntimeError(f"base/head cross-build emitted bytes or digest differ: {name}")
         manifest.update(verdict="VERIFIED", fixtures=names, runtime_seconds=time.monotonic()-started)
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])

@@ -6,7 +6,20 @@ side-call resolution, identity reconciliation, policy and finish stages. The
 comparison covers complete emitted session bodies in upload envelopes, including
 body witnesses, plus SHA-256 digests. It never compares accumulators. Base and
 candidate compile independently with the same test harness and input clocks;
-exact saved input bytes and emitted bytes must match across both builds.
+exact saved input bytes must match across both builds. Within each build,
+retained versus Full raw bytes and digests remain exactly equal. Receipts keep
+those raw bodies and digests and add a cross-build body/digest. Only that second
+body replaces each wire snapshot's `source_file_fingerprint` with
+`physical-identity:excluded`, then recomputes its semantic envelope through the
+production revision v1/v2 functions. A guard requires every other field to match
+raw emission, including all other envelope fields and money. No hashes are
+removed or blanked; inode and ctime are not pinned.
+
+Accepted scope: cross-arm changes in scan-identity or sidecar version strings
+inside the file fingerprint are invisible to the cross-build step; these are
+re-read triggers, not money. Explicit version fields outside that fingerprint
+remain compared. All counts, tokens, costs, selectors, timestamps, IDs and
+ordering still participate. Raw bodies/digests remain available as evidence.
 
 Dispatch on a reader branch:
 
