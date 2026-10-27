@@ -2006,8 +2006,10 @@ fn reread(base: &Path, manifest: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Fix the cohort before any arm runs. Use the candidate's actual paced
-/// selection (including twin-family co-scheduling), then owe just those same
-/// files in every history arm. All arms still start with the full stamped index.
+/// selection, then expose exactly those files through a hard-linked scan root.
+/// A physical root restriction also works in the pre-E2 reference, where
+/// revision marks do not prevent unrelated pending traversal reads. Hard links
+/// preserve bytes, timestamps and opened-object birth without copying content.
 fn plan_history_cohort(base: &Path) {
     let support = base.join("runs").join("history-plan");
     let scan = HistoryScan::new(base);
@@ -2027,23 +2029,47 @@ fn plan_history_cohort(base: &Path) {
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     assert!(!keys.is_empty(), "the planned history page reads files");
+    let root = base.join("history-cohort");
+    assert!(!root.exists(), "prepare creates the history cohort once");
+    let source_root = projects(base);
+    let mut relative = Vec::new();
+    let mut bytes = 0u64;
+    for key in keys {
+        let source = Path::new(&key);
+        let path = source
+            .strip_prefix(&source_root)
+            .expect("a fixture transcript");
+        let target = root.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::hard_link(source, &target).unwrap();
+        bytes += std::fs::metadata(&target).unwrap().len();
+        relative.push(path.to_string_lossy().into_owned());
+    }
+    assert!(
+        relative.len() <= 2_000 && bytes <= 1 << 30,
+        "one paced history page"
+    );
     std::fs::write(
         base.join("history-cohort.json"),
-        serde_json::to_vec(&keys).unwrap(),
+        serde_json::to_vec(&relative).unwrap(),
     )
     .unwrap();
 }
 
 /// One whole-history page (the paced upgrade's largest page: up to 2,000
-/// files / 1 GiB) per arm, in a fresh process: stamp at revision 2, then one
-/// timed revision-3 page. Its folds are never released by a page finish here,
-/// so the peak footprint is the worst case of a history page.
+/// files / 1 GiB) per arm, in a fresh process: stamp the same physical cohort
+/// at revision 2, then one timed revision-3 page. This scanner microbenchmark
+/// measures identical transcript work, not full-corpus directory/index overhead.
+/// The full traversal and production-cycle reread still use the entire corpus.
 fn history(base: &Path, arm: &str) -> serde_json::Value {
     check_arm(arm);
     let tag = env("OTTTO_E2_BENCH_TAG").unwrap_or_else(|| arm.to_string());
     let support = base.join("runs").join(format!("history-{tag}"));
     assert!(!support.exists(), "every run starts from an empty state");
-    let scan = HistoryScan::new(base);
+    let scan = HistoryScan {
+        root: base.join("history-cohort"),
+        collected_at: current_rfc3339(),
+    };
     e2_hook::with_gate(arm == "on", || {
         crate::snapshots::with_no_list_cutoff(u64::MAX, || {
             let mut index = ScanIndex::default();
@@ -2063,18 +2089,14 @@ fn history(base: &Path, arm: &str) -> serde_json::Value {
                     .expect("prepare plans the matched history cohort"),
             )
             .unwrap();
-            for (key, entry) in &mut index.files {
-                if !cohort.contains(key) {
-                    entry.effective_upload_body_witness_revision = 3;
-                }
-            }
+            assert_eq!(
+                stamped,
+                cohort.len(),
+                "the stamped physical cohort is exact"
+            );
             let mut keys = cohort
                 .iter()
-                .map(|key| {
-                    key.strip_prefix(scan.root.to_str().unwrap())
-                        .unwrap_or(key)
-                        .to_owned()
-                })
+                .map(|path| format!("/{path}"))
                 .collect::<Vec<_>>();
             keys.sort();
             let expected_digest = format!("{:x}", Sha256::digest(keys.join("\n")));
