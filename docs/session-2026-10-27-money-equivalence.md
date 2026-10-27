@@ -32,9 +32,15 @@ Active fixtures, one test each:
 - Side call with a transcript owner.
 - Side call without a transcript owner.
 - Side call whose actual owner's directory is outside the listed scan root.
-- Failed telemetry read holds both arms with no upload (including no zero-cost
-  body), followed by a healthy read from each held index. Only the healthy
-  emissions enter the nonempty body, witness and digest equality assertions.
+- Failed or incomplete telemetry on a live session publishes a request-owned
+  token-only estimate on both arms: one request, input/output 10/10, cache read
+  3, cache creation 5m/1h 5/2, absent costs, false telemetry completeness and no
+  request-owned quarantine. Each arm continues from its own finished failed-step
+  index; a healthy read replaces the estimate with reported cost `0.0001`,
+  `telemetry_matched` origin and true completeness, conserving requests/tokens.
+  Both phases independently reach real upload and compare complete envelopes,
+  body witnesses and digests; both emissions enter the receipt. Cross-phase
+  cost/origin/completeness must differ. History-upgrade holds are separate.
 - Codex V2 counting remains selected after index reload and retained Tail.
 - Codex Legacy-ACK remains selected after index reload and retained Tail.
 

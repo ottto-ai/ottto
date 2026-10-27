@@ -136,6 +136,10 @@ fn compare_claude_pages(c: &Corpus, [mut tail, mut full]: [Page; 2]) -> Vec<u8> 
         page.enrich(c); // attach, side calls, identity reconcile and emission
         page.finish(); // policy/body witnesses/holds, as in the real pipeline
     }
+    compare_claude_uploads(&tail, &full)
+}
+
+fn compare_claude_uploads(tail: &Page, full: &Page) -> Vec<u8> {
     let (a, wire_a, _) = upload(&tail.scan.snapshots, &mut e2_progress(), ack);
     let (b, wire_b, _) = upload(&full.scan.snapshots, &mut e2_progress(), ack);
     assert_eq!(a.unwrap(), ResumableUploadResult::Completed);
@@ -222,8 +226,8 @@ fn claude_case(name: &str) {
                 mode = (0, 0, 1);
             }
             "failed_then_healthy_telemetry" => {
-                // A malformed sidecar is an actual failed read; then replace
-                // it with healthy telemetry while native bytes stay quiet.
+                // Incomplete telemetry on a live session publishes a token-only
+                // estimate; healthy telemetry later replaces its money fields.
                 let bad = c
                     .support
                     .join("local-otel/claude-code-effort")
@@ -240,36 +244,120 @@ fn claude_case(name: &str) {
                     !health.is_complete(),
                     "failed telemetry decode must be witnessed"
                 );
-                let mut failed = claude_pages(&c, &scanner, [prior.clone(), prior], (0, 0, 1));
-                for page in &mut failed {
-                    assert_eq!(page.scan.snapshots.len(), 1, "must scan the held session");
-                    page.enrich(&c);
-                    // This is a live E2 session, so its withheld body uses
-                    // request-owned quarantine, not the history-upgrade hold.
-                    assert_withheld(page, ROOT, "failed telemetry must hold this session");
-                    page.finish();
-                    assert!(page.scan.snapshots.is_empty(), "held session emits no body");
-                    let (result, wire, _) = upload(&page.scan.snapshots, &mut e2_progress(), ack);
-                    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-                    assert!(
-                        wire.is_empty(),
-                        "failed telemetry must never upload, even $0"
-                    );
+                fn counts(item: &SnapshotItem) -> [u64; 8] {
+                    [
+                        item.request_count,
+                        item.input_tokens,
+                        item.output_tokens,
+                        item.cache_read_tokens,
+                        item.cache_creation_5m_tokens,
+                        item.cache_creation_1h_tokens,
+                        item.unattributed_total_tokens,
+                        item.reasoning_output_tokens,
+                    ]
                 }
-                // Continue each arm from its held page's index. The retained
-                // arm keeps its scanner; the Full arm gets a fresh scanner.
+                let finish_phase = |pages: &mut [Page; 2], complete: bool| {
+                    for page in pages {
+                        assert_eq!(page.scan.snapshots.len(), 1, "must scan the live session");
+                        page.enrich(&c);
+                        assert!(
+                            page.disposition
+                                .quarantined_fingerprints(&page.scan.snapshots)
+                                .is_empty(),
+                            "live estimates must not be request-owned quarantined"
+                        );
+                        page.finish();
+                        literal(page);
+                        assert_eq!(page.scan.snapshots.len(), 1);
+                        let item = &page.scan.snapshots[0];
+                        assert_eq!(item.source_session_id, ROOT);
+                        assert_eq!(counts(item), [1, 10, 10, 3, 5, 2, 0, 0]);
+                        assert_eq!(item.telemetry_owned_complete, Some(complete));
+                        let expected_cost = complete.then_some("0.0001");
+                        if complete {
+                            let cost = item.cost.as_ref().expect("reported item cost");
+                            assert_eq!(cost.total_cost_usd.as_deref(), expected_cost);
+                            assert_eq!(cost.evidence_source, "claude_code_api_request");
+                            assert!(cost.input_cost_usd.is_none());
+                            assert!(cost.output_cost_usd.is_none());
+                            assert!(cost.cache_read_cost_usd.is_none());
+                            assert!(cost.cache_creation_cost_usd.is_none());
+                        } else {
+                            assert!(item.cost.is_none(), "unpriced estimate is never $0");
+                        }
+                        assert_eq!(item.model_usage.len(), 1);
+                        assert_eq!(item.usage_buckets.len(), 1);
+                        assert_eq!(item.usage_buckets[0].model_usage.len(), 1);
+                        for row in item.model_usage.iter().chain(
+                            item.usage_buckets
+                                .iter()
+                                .flat_map(|bucket| &bucket.model_usage),
+                        ) {
+                            assert_eq!(
+                                [
+                                    row.request_count,
+                                    row.input_tokens,
+                                    row.output_tokens,
+                                    row.cache_read_tokens,
+                                    row.cache_creation_5m_tokens,
+                                    row.cache_creation_1h_tokens,
+                                    row.unattributed_total_tokens,
+                                    row.reasoning_output_tokens
+                                ],
+                                counts(item),
+                            );
+                            assert_eq!(row.cost_usd.as_deref(), expected_cost);
+                            assert!(row.input_cost_usd.is_none());
+                            assert!(row.output_cost_usd.is_none());
+                            assert!(row.cache_read_cost_usd.is_none());
+                            assert!(row.cache_creation_cost_usd.is_none());
+                            assert_eq!(
+                                row.selector_context
+                                    .get("request_usage_origin")
+                                    .map(String::as_str),
+                                complete.then_some("telemetry_matched"),
+                            );
+                        }
+                    }
+                };
+                let mut failed = claude_pages(&c, &scanner, [prior.clone(), prior], (0, 0, 1));
+                finish_phase(&mut failed, false);
+                let failed_wire = compare_claude_uploads(&failed[0], &failed[1]);
+                let failed_items = failed.each_ref().map(|page| page.scan.snapshots[0].clone());
+                // Continue each arm from its own finished failed-step index.
+                // The retained scanner survives; the Full scanner is fresh.
                 let [tail_failed, full_failed] = failed;
                 c.evidence(&[api("r1", 10, 100)], &[]);
-                let healthy = compare_claude_pages(
+                let mut healthy = claude_pages(
                     &c,
-                    claude_pages(
-                        &c,
-                        &scanner,
-                        [tail_failed.index, full_failed.index],
-                        (0, 0, 1),
-                    ),
+                    &scanner,
+                    [tail_failed.index, full_failed.index],
+                    (0, 0, 1),
                 );
-                receipt(name, &[healthy]);
+                finish_phase(&mut healthy, true);
+                let healthy_wire = compare_claude_uploads(&healthy[0], &healthy[1]);
+                for (before, after) in failed_items.iter().zip(&healthy) {
+                    let after = &after.scan.snapshots[0];
+                    assert_eq!(counts(before), counts(after), "replacement conserves usage");
+                    assert_ne!(before.cost, after.cost);
+                    assert_ne!(
+                        before.telemetry_owned_complete,
+                        after.telemetry_owned_complete
+                    );
+                    assert_ne!(
+                        before.model_usage[0]
+                            .selector_context
+                            .get("request_usage_origin"),
+                        after.model_usage[0]
+                            .selector_context
+                            .get("request_usage_origin"),
+                    );
+                }
+                assert_ne!(
+                    failed_wire, healthy_wire,
+                    "reported money replaces the estimate"
+                );
+                receipt(name, &[failed_wire, healthy_wire]);
                 return;
             }
             _ => unreachable!(),
