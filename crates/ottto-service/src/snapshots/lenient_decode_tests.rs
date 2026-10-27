@@ -2274,6 +2274,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 legacy_source_file_fingerprint: String::new(),
                 legacy_config_reconciliation_required: false,
                 opened_object_identity: String::new(),
+                opened_witness: None,
             };
             assert_eq!(
                 loaded.candidate_decision_with_reason(&candidate),

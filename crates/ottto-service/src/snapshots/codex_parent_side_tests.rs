@@ -624,6 +624,7 @@ fn file_entry() -> ScanIndexEntry {
         codex_captured_uncommitted: false,
         codex_counting_v2: false,
         codex_counting_owner: None,
+        opened_witness: None,
     }
 }
 

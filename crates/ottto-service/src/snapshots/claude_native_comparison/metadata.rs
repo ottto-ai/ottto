@@ -406,6 +406,7 @@ mod tests {
                 legacy_source_file_fingerprint: String::new(),
                 legacy_config_reconciliation_required: false,
                 opened_object_identity: "descriptor-only".into(),
+                opened_witness: None,
             };
             roots.insert(
                 root.clone(),

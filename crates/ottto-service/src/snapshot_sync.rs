@@ -11635,6 +11635,7 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 effective_upload_body_witness_revision: 0,
+                opened_witness: None,
             },
         );
         index.file_snapshot_fingerprints.insert(

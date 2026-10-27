@@ -517,6 +517,8 @@ pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v30";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
+/// Content-only digest stored with a scan fingerprint (length plus samples).
+const OPENED_CONTENT_DIGEST_VERSION: &str = "opened_content:v1";
 // A terminal oversized-line disposition is reusable only under the exact
 // bounded reader semantics that created it. Advancing the bound or teaching
 // the reader to salvage a new shape changes this witness, starts one fresh
@@ -4204,6 +4206,11 @@ pub struct ScanIndexEntry {
         deserialize_with = "deserialize_codex_protected_owner"
     )]
     pub codex_counting_owner: Option<String>,
+    /// Non-content inputs and content digest of the open that produced
+    /// `source_file_fingerprint` (Claude and Codex only). Older binaries drop
+    /// it; an entry without it keeps the live-identity comparison once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) opened_witness: Option<OpenedObjectWitness>,
 }
 impl ScanIndexEntry {
     fn codex_recovery_is_pending(&self) -> bool {
@@ -21025,6 +21032,7 @@ fn codex_parent_open_match(
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        opened_witness: None,
     };
     let file = open_candidate_file(SnapshotSource::Codex, &mut candidate).map_err(|_| Absent)?;
     Ok((candidate.path, candidate.opened_object_identity, file))
@@ -21091,6 +21099,7 @@ fn codex_parent_locate(
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        opened_witness: None,
     };
     let file = open_candidate_beneath_root(&candidate).map_err(|_| Absent)?;
     let opened = file.metadata().map_err(|_| Absent)?;
@@ -36965,6 +36974,22 @@ struct CandidateFile {
     legacy_source_file_fingerprint: String,
     legacy_config_reconciliation_required: bool,
     opened_object_identity: String,
+    opened_witness: Option<OpenedObjectWitness>,
+}
+
+/// The non-content inputs of one opened-object identity (device, inode,
+/// ctime) and a digest of the content it sampled (length, head and tail
+/// samples). Stored with the scan fingerprint it produced so that a later
+/// open whose content samples still match reuses these inputs: a ctime,
+/// xattr, mode or mtime flip, or the same bytes under a new inode, is then
+/// re-validated by content and never triggers a re-read on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OpenedObjectWitness {
+    device: u64,
+    inode: u64,
+    changed_seconds: i64,
+    changed_nanos: i64,
+    content: String,
 }
 
 #[derive(Debug, Default)]
@@ -40537,6 +40562,7 @@ fn candidate_from_traversal_path_at(
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        opened_witness: None,
     })
 }
 
@@ -40728,6 +40754,7 @@ fn collect_recent_jsonl_files(
             legacy_source_file_fingerprint: String::new(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: String::new(),
+            opened_witness: None,
         });
     }
 }
@@ -40857,7 +40884,10 @@ fn open_candidate_file(
     candidate: &mut CandidateFile,
 ) -> std::io::Result<File> {
     let mut file = open_candidate_beneath_root(candidate)?;
-    candidate.opened_object_identity = opened_object_identity(source, &mut file)?;
+    let (identity, witness) = opened_object_identity_and_witness(source, &mut file)?;
+    candidate.opened_object_identity = identity;
+    candidate.opened_witness =
+        witness.filter(|_| matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex));
     let metadata = file.metadata()?;
     candidate.physical_identity = reread_guard::physical_identity(&metadata);
     let modified = metadata.modified().ok();
@@ -40901,7 +40931,7 @@ fn open_and_identify_scan_candidate_with_rescue(
     files: &BTreeMap<String, ScanIndexEntry>,
     verification_rescue: bool,
 ) -> Option<(CandidateFile, File)> {
-    let opened_file = match open_candidate_file(source, &mut candidate) {
+    let mut opened_file = match open_candidate_file(source, &mut candidate) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if claude_absence_is_removal(source, &candidate.path) {
@@ -40952,6 +40982,14 @@ fn open_and_identify_scan_candidate_with_rescue(
             .insert(local_index_key(&candidate.path));
         return None;
     }
+    // `opened_object_identity` stays the live identity: the parse-time TOCTOU
+    // check compares against it. Only the re-read trigger uses the adoption.
+    let Ok(adopted_identity) =
+        adopt_unchanged_content_witness(source, &mut candidate, files, &mut opened_file)
+    else {
+        census.record_unreadable(UnreadableCause::OpenRead, 1);
+        return None;
+    };
     let session_sidecar_fingerprint = std::mem::take(&mut candidate.source_file_fingerprint);
     candidate.source_file_fingerprint = scan_file_fingerprint_with_opened_identity(
         &candidate.path,
@@ -40959,7 +40997,9 @@ fn open_and_identify_scan_candidate_with_rescue(
         candidate.modified_unix_nanos,
         &candidate_scan_identity(source, candidate.modified_unix_nanos),
         &session_sidecar_fingerprint,
-        &candidate.opened_object_identity,
+        adopted_identity
+            .as_deref()
+            .unwrap_or(&candidate.opened_object_identity),
     );
     Some((candidate, opened_file))
 }
@@ -41045,6 +41085,78 @@ fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<Fil
 }
 
 fn opened_object_identity(source: SnapshotSource, file: &mut File) -> std::io::Result<String> {
+    opened_object_identity_and_witness(source, file).map(|(identity, _)| identity)
+}
+
+/// Bounded content samples of one opened object: the first and, past one
+/// sample, the last `FILE_CONTENT_SAMPLE_BYTES`.
+struct OpenedContentSamples {
+    head: Vec<u8>,
+    tail: Option<Vec<u8>>,
+}
+
+fn read_opened_content_samples(file: &mut File, len: u64) -> std::io::Result<OpenedContentSamples> {
+    let mut head = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
+    let first_len = file.read(&mut head)?;
+    head.truncate(first_len);
+    let tail = if len > FILE_CONTENT_SAMPLE_BYTES as u64 {
+        file.seek(SeekFrom::End(-(FILE_CONTENT_SAMPLE_BYTES as i64)))?;
+        let mut tail = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
+        let last_len = file.read(&mut tail)?;
+        tail.truncate(last_len);
+        Some(tail)
+    } else {
+        None
+    };
+    Ok(OpenedContentSamples { head, tail })
+}
+
+/// Content-only digest: length plus the bounded samples, nothing else.
+fn opened_content_digest(len: u64, samples: &OpenedContentSamples) -> String {
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, OPENED_CONTENT_DIGEST_VERSION.as_bytes());
+    update_length_prefixed(&mut digest, &len.to_be_bytes());
+    update_length_prefixed(&mut digest, &samples.head);
+    if let Some(tail) = &samples.tail {
+        update_length_prefixed(&mut digest, tail);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// The opened-object identity. `object` carries the unix device, inode and
+/// ctime; it is `None` exactly where those are unavailable.
+fn opened_object_identity_from(
+    len: u64,
+    object: Option<&OpenedObjectWitness>,
+    samples: &OpenedContentSamples,
+) -> String {
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, OPENED_OBJECT_IDENTITY_VERSION.as_bytes());
+    update_length_prefixed(&mut digest, &len.to_be_bytes());
+    if let Some(object) = object {
+        update_length_prefixed(&mut digest, &object.device.to_be_bytes());
+        update_length_prefixed(&mut digest, &object.inode.to_be_bytes());
+        // ctime is an opened-object mutation witness, not business time. It
+        // catches an in-place middle rewrite even when size and mtime are
+        // deliberately restored and the bounded first/last samples are
+        // unchanged (the parse-time TOCTOU check relies on that). Hash both
+        // signed fields byte-for-byte for nanosecond precision on
+        // macOS/Linux. The scan re-read trigger reuses stored values instead
+        // when content is unchanged; see `adopt_unchanged_content_witness`.
+        update_length_prefixed(&mut digest, &object.changed_seconds.to_be_bytes());
+        update_length_prefixed(&mut digest, &object.changed_nanos.to_be_bytes());
+    }
+    update_length_prefixed(&mut digest, &samples.head);
+    if let Some(tail) = &samples.tail {
+        update_length_prefixed(&mut digest, tail);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn opened_object_identity_and_witness(
+    source: SnapshotSource,
+    file: &mut File,
+) -> std::io::Result<(String, Option<OpenedObjectWitness>)> {
     file.seek(SeekFrom::Start(0))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -41059,32 +41171,76 @@ fn opened_object_identity(source: SnapshotSource, file: &mut File) -> std::io::R
             "snapshot candidate exceeds source file cap",
         ));
     }
-    let mut digest = Sha256::new();
-    update_length_prefixed(&mut digest, OPENED_OBJECT_IDENTITY_VERSION.as_bytes());
-    update_length_prefixed(&mut digest, &metadata.len().to_be_bytes());
+    let len = metadata.len();
+    let samples = read_opened_content_samples(file, len)?;
     #[cfg(unix)]
-    {
-        update_length_prefixed(&mut digest, &metadata.dev().to_be_bytes());
-        update_length_prefixed(&mut digest, &metadata.ino().to_be_bytes());
-        // ctime is an opened-object mutation witness, not business time. It
-        // catches an in-place middle rewrite even when size and mtime are
-        // deliberately restored and the bounded first/last samples are
-        // unchanged. Hash both signed fields byte-for-byte for nanosecond
-        // precision on macOS/Linux.
-        update_length_prefixed(&mut digest, &metadata.ctime().to_be_bytes());
-        update_length_prefixed(&mut digest, &metadata.ctime_nsec().to_be_bytes());
-    }
-    let mut sample = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
-    let first_len = file.read(&mut sample)?;
-    update_length_prefixed(&mut digest, &sample[..first_len]);
-    if metadata.len() > FILE_CONTENT_SAMPLE_BYTES as u64 {
-        file.seek(SeekFrom::End(-(FILE_CONTENT_SAMPLE_BYTES as i64)))?;
-        let last_len = file.read(&mut sample)?;
-        update_length_prefixed(&mut digest, &sample[..last_len]);
-    }
-    let identity = format!("{:x}", digest.finalize());
+    let witness = Some(OpenedObjectWitness {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        changed_seconds: metadata.ctime(),
+        changed_nanos: metadata.ctime_nsec(),
+        content: opened_content_digest(len, &samples),
+    });
+    #[cfg(not(unix))]
+    let witness = None;
+    let identity = opened_object_identity_from(len, witness.as_ref(), &samples);
     file.seek(SeekFrom::Start(0))?;
-    Ok(identity)
+    Ok((identity, witness))
+}
+
+/// Ron's re-read rule: only content (size, sampled bytes) or output-relevant
+/// inputs may trigger a re-read; ctime, xattr, mode and mtime flips and a
+/// same-bytes copy under a new inode never do. When this path's stored
+/// witness sampled the same length and head/tail bytes, the fingerprint
+/// reuses the stored device, inode, ctime and mtime, so it equals the stored
+/// fingerprint and the candidate gate skips. A mismatch of those non-content
+/// inputs therefore only costs this bounded sample re-read, never a Full
+/// read; any size or sampled-byte change keeps the live identity and reads.
+/// Returns the opened-object identity to fingerprint with, if adopted.
+fn adopt_unchanged_content_witness(
+    source: SnapshotSource,
+    candidate: &mut CandidateFile,
+    files: &BTreeMap<String, ScanIndexEntry>,
+    file: &mut File,
+) -> std::io::Result<Option<String>> {
+    if !matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
+        return Ok(None);
+    }
+    let Some(entry) = files.get(&local_index_key(&candidate.path)) else {
+        return Ok(None);
+    };
+    let (Some(stored), Some(current), Some(stored_nanos)) = (
+        entry.opened_witness.as_ref(),
+        candidate.opened_witness.as_ref(),
+        entry.modified_unix_nanos,
+    ) else {
+        return Ok(None);
+    };
+    if entry.size_bytes != candidate.size_bytes || stored.content != current.content {
+        return Ok(None);
+    }
+    if stored == current
+        && entry.modified_unix_seconds == candidate.modified_unix_seconds
+        && stored_nanos == candidate.modified_unix_nanos
+    {
+        // Nothing moved: the live identity already reproduces the stored one.
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let samples = read_opened_content_samples(file, candidate.size_bytes)?;
+    file.seek(SeekFrom::Start(0))?;
+    // Fresh samples, so bytes written after the open still force a read.
+    if opened_content_digest(candidate.size_bytes, &samples) != stored.content {
+        return Ok(None);
+    }
+    candidate.modified_unix_seconds = entry.modified_unix_seconds;
+    candidate.modified_unix_nanos = stored_nanos;
+    candidate.opened_witness = Some(stored.clone());
+    Ok(Some(opened_object_identity_from(
+        candidate.size_bytes,
+        Some(stored),
+        &samples,
+    )))
 }
 
 fn unix_seconds(value: SystemTime) -> Option<u64> {
@@ -46811,6 +46967,7 @@ impl ScanIndex {
                     .files
                     .get(&key)
                     .and_then(|entry| entry.codex_counting_owner.clone()),
+                opened_witness: candidate.opened_witness,
             },
         );
     }
@@ -46866,6 +47023,7 @@ impl ScanIndex {
                     .files
                     .get(&key)
                     .and_then(|entry| entry.codex_counting_owner.clone()),
+                opened_witness: candidate.opened_witness,
             },
         );
         match parse_outcome {
@@ -48067,6 +48225,10 @@ mod tests {
     }
     mod census_convergence_tests {
         include!("snapshots/census_convergence_tests.rs");
+    }
+    #[cfg(unix)]
+    mod reread_trigger_content_tests {
+        include!("snapshots/reread_trigger_content_tests.rs");
     }
     mod stale_family_carry_tests {
         include!("snapshots/stale_family_carry_tests.rs");
@@ -49987,6 +50149,7 @@ mod tests {
                     codex_captured_uncommitted: false,
                     codex_counting_v2: false,
                     codex_counting_owner: None,
+                    opened_witness: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -50834,6 +50997,7 @@ mod tests {
             legacy_source_file_fingerprint: String::new(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: String::new(),
+            opened_witness: None,
         }
     }
 
@@ -51343,6 +51507,7 @@ mod tests {
             legacy_source_file_fingerprint: "legacy".to_string(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: "opened".to_string(),
+            opened_witness: None,
         };
         let mut stale_witness = snapshot_quarantine_witness(SnapshotSource::Codex);
         stale_witness.collector_version.push_str("-old");
@@ -51368,6 +51533,7 @@ mod tests {
                     codex_captured_uncommitted: false,
                     codex_counting_v2: false,
                     codex_counting_owner: None,
+                    opened_witness: None,
                 },
             )]),
             file_snapshot_fingerprints: BTreeMap::from([(
@@ -51818,6 +51984,7 @@ mod tests {
                     codex_captured_uncommitted: false,
                     codex_counting_v2: false,
                     codex_counting_owner: None,
+                    opened_witness: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -51913,6 +52080,7 @@ mod tests {
                     codex_captured_uncommitted: false,
                     codex_counting_v2: false,
                     codex_counting_owner: None,
+                    opened_witness: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -51953,6 +52121,7 @@ mod tests {
             legacy_source_file_fingerprint: "legacy".to_string(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: "opened".to_string(),
+            opened_witness: None,
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -51976,6 +52145,7 @@ mod tests {
                     codex_captured_uncommitted: false,
                     codex_counting_v2: false,
                     codex_counting_owner: None,
+                    opened_witness: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -52003,6 +52173,7 @@ mod tests {
             legacy_source_file_fingerprint: "legacy-current-sidecar".to_string(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: "opened".to_string(),
+            opened_witness: None,
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -52026,6 +52197,7 @@ mod tests {
                     codex_captured_uncommitted: false,
                     codex_counting_v2: false,
                     codex_counting_owner: None,
+                    opened_witness: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -52050,6 +52222,7 @@ mod tests {
             legacy_source_file_fingerprint: "legacy-matching-sidecar".to_string(),
             legacy_config_reconciliation_required: true,
             opened_object_identity: "opened".to_string(),
+            opened_witness: None,
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -52073,6 +52246,7 @@ mod tests {
                     codex_captured_uncommitted: false,
                     codex_counting_v2: false,
                     codex_counting_owner: None,
+                    opened_witness: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -57850,6 +58024,7 @@ mod tests {
             codex_captured_uncommitted: false,
             codex_counting_v2: false,
             codex_counting_owner: None,
+            opened_witness: None,
         };
 
         let mut index = ScanIndex {
@@ -81759,6 +81934,7 @@ mod tests {
                 codex_captured_uncommitted: false,
                 codex_counting_v2: false,
                 codex_counting_owner: None,
+                opened_witness: None,
             },
         );
         let frozen_census_paths = BTreeSet::from([local_index_key(&parent_path)]);
@@ -83379,6 +83555,7 @@ mod tests {
                 codex_captured_uncommitted: false,
                 codex_counting_v2: false,
                 codex_counting_owner: None,
+                opened_witness: None,
             },
         );
         let a = binding(&home_a, "account-a");
@@ -84955,6 +85132,7 @@ mod tests {
             codex_captured_uncommitted: false,
             codex_counting_v2: false,
             codex_counting_owner: None,
+            opened_witness: None,
         }
     }
 
@@ -85858,6 +86036,7 @@ mod tests {
                 codex_captured_uncommitted: false,
                 codex_counting_v2: false,
                 codex_counting_owner: None,
+                opened_witness: None,
             },
         );
         let manifest = index
@@ -86820,7 +86999,8 @@ pub(crate) mod cache_adapter_tests {
 
 // Closed owned-field inventory for optional scan overlap admission.
 crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, selector_sources, usage, reasoning_effort);
-crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity);
+crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity, opened_witness);
+crate::heap_layout_bound::fields!(OpenedObjectWitness; device, inode, changed_seconds, changed_nanos, content);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; current, previous_windows, confirmed_absent_members);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPendingWindow; version, census_window_end, account_identifier_hash, evidence_request_count, census_complete, members, member_requests, invalid);
 crate::heap_layout_bound::fields!(ClaudeAccountRequestSet; prefixes, fingerprint, identity_revision);
@@ -86865,7 +87045,7 @@ crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paire
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, reread_guard, held_audit_progress, claude_money_birth_store);
-crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner);
+crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_witness);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; unchanged_reread_admitted, reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);

@@ -186,6 +186,7 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
         legacy_source_file_fingerprint: "synthetic-price".into(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: identity.clone(),
+        opened_witness: None,
     };
     let metadata = CodexTitleMetadata::default();
     let mut parser = sampled_scan::new_source_parser(
@@ -1024,6 +1025,7 @@ fn codex_counting_ack_bool_survives_twin_alias_and_rekeyed_entries() {
         legacy_source_file_fingerprint: "legacy".into(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        opened_witness: None,
     };
     let mut index = ScanIndex::default();
     index
