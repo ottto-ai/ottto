@@ -18,6 +18,14 @@
 //! a lock is never stale and there is nothing to clean up; the file stays.
 //! The descriptor is close-on-exec, so a child process (Claude, Codex, the
 //! composition worker) never keeps the lock past the daemon's own exit.
+//!
+//! Two other writers of daemon-owned state respect it without holding it for
+//! long: the CLI creates a missing control token only while it holds the
+//! lock (`load_or_create_control_token_unless_daemon_owns`), and uninstall
+//! keeps the lock file's inode in place, and after stopping the daemon holds
+//! the lock while it deletes state, so a restarted daemon can never take a
+//! fresh lock while the old one still runs. Delegated workers and input
+//! producers (statusline caches) write their own files and never take it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -71,17 +79,11 @@ impl std::fmt::Display for StateDirLockError {
                 if let Some(pid) = holder_pid {
                     write!(f, " (pid {pid})")?;
                 }
-                write!(
-                    f,
-                    " already owns local state at {}; exiting without touching it",
-                    dir.display()
-                )
+                write!(f, " already owns local state at {}", dir.display())
             }
-            Self::Failed { dir, error } => write!(
-                f,
-                "cannot lock local state at {}: {error}; exiting without touching it",
-                dir.display()
-            ),
+            Self::Failed { dir, error } => {
+                write!(f, "cannot lock local state at {}: {error}", dir.display())
+            }
         }
     }
 }
@@ -102,7 +104,7 @@ impl StateDirLock {
             .mode(0o700)
             .create(support_dir)
             .map_err(failed)?;
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -110,6 +112,27 @@ impl StateDirLock {
             .mode(0o600)
             .open(support_dir.join(STATE_DIR_LOCK_FILE_NAME))
             .map_err(failed)?;
+        Self::lock(file, support_dir)
+    }
+
+    /// Like [`Self::acquire`], but creates nothing: `Ok(None)` when the lock
+    /// file does not exist, so no daemon of this version owns the directory.
+    pub fn acquire_existing(support_dir: &Path) -> Result<Option<Self>, StateDirLockError> {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(support_dir.join(STATE_DIR_LOCK_FILE_NAME))
+        {
+            Ok(file) => Self::lock(file, support_dir).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(StateDirLockError::Failed {
+                dir: support_dir.to_path_buf(),
+                error,
+            }),
+        }
+    }
+
+    fn lock(mut file: File, support_dir: &Path) -> Result<Self, StateDirLockError> {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
@@ -118,7 +141,10 @@ impl StateDirLock {
                     holder_pid: read_holder_pid(&mut file),
                 });
             }
-            return Err(failed(error));
+            return Err(StateDirLockError::Failed {
+                dir: support_dir.to_path_buf(),
+                error,
+            });
         }
         // Best effort: the pid only names the holder in a later refusal.
         let _ = record_holder_pid(&mut file);
@@ -136,6 +162,26 @@ fn read_holder_pid(file: &mut File) -> Option<u32> {
     let mut text = String::new();
     Read::by_ref(file).take(32).read_to_string(&mut text).ok()?;
     text.trim().parse().ok()
+}
+
+#[cfg(test)]
+/// A fresh private directory under `$TMPDIR`; never adopts a leftover.
+pub(crate) fn scratch(prefix: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "ottto-core-{prefix}-{}-{}-{nanos}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .expect("fresh scratch dir");
+    path
 }
 
 #[cfg(test)]
@@ -159,7 +205,7 @@ mod tests {
 
     #[test]
     fn second_holder_is_refused_without_writing_and_lock_returns_on_drop() {
-        let root = crate::test_scratch::private_dir("state-dir-lock");
+        let root = super::scratch("state-dir-lock");
         let support = root.join("Ottto");
         let first = StateDirLock::acquire(&support).expect("first daemon takes the lock");
         let lock_path = support.join(STATE_DIR_LOCK_FILE_NAME);
@@ -197,7 +243,7 @@ mod tests {
     #[test]
     fn lock_creates_a_private_support_dir_and_file() {
         use std::os::unix::fs::PermissionsExt;
-        let root = crate::test_scratch::private_dir("state-dir-lock-mode");
+        let root = super::scratch("state-dir-lock-mode");
         let support = root.join("nested").join("Ottto");
         let lock = StateDirLock::acquire(&support).expect("take lock");
         // A umask only removes bits, so check that none reach group or other.
@@ -216,7 +262,7 @@ mod tests {
 
     #[test]
     fn unusable_support_dir_fails_closed() {
-        let root = crate::test_scratch::private_dir("state-dir-lock-file");
+        let root = super::scratch("state-dir-lock-file");
         let not_a_dir = root.join("Ottto");
         std::fs::write(&not_a_dir, b"").expect("plant a file");
         let error = StateDirLock::acquire(&not_a_dir).expect_err("cannot lock");
@@ -225,6 +271,30 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(error.exit_code(), STATE_DIR_LOCK_FAILED_EXIT_CODE);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acquire_existing_creates_nothing_and_contends_like_acquire() {
+        let root = super::scratch("state-dir-lock-existing");
+        let support = root.join("Ottto");
+        assert!(StateDirLock::acquire_existing(&support)
+            .expect("absent lock")
+            .is_none());
+        assert!(
+            !support.exists(),
+            "absent lock must not create the directory"
+        );
+
+        let holder = StateDirLock::acquire(&support).expect("daemon takes the lock");
+        let refusal = StateDirLock::acquire_existing(&support).expect_err("held");
+        assert!(
+            matches!(refusal, StateDirLockError::Held { .. }),
+            "{refusal:?}"
+        );
+        drop(holder);
+        let claimed = StateDirLock::acquire_existing(&support).expect("free lock");
+        assert!(claimed.is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 }

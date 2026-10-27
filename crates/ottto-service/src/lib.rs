@@ -58,8 +58,6 @@ pub mod snapshot_sync;
 pub mod snapshot_watcher;
 pub mod snapshots;
 mod source_rotation;
-#[cfg(unix)]
-pub mod state_dir_lock;
 pub mod telemetry_attach;
 #[cfg(test)]
 mod test_scratch;
@@ -72,6 +70,8 @@ pub mod xpc_mach;
 
 #[cfg(unix)]
 pub use local_state_sweep::{run_local_state_sweep_command, sweep_local_state_at_startup};
+#[cfg(unix)]
+pub use ottto_core::state_dir_lock;
 
 use crate::control::TerminalRefreshRejection;
 use crate::detected_uses::{prune_stale_detected_uses, DETECTED_USE_RETENTION_DAYS};

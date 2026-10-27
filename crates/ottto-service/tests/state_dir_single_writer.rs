@@ -140,6 +140,69 @@ fn second_daemon_refuses_a_held_state_dir_before_any_write() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// `status`, and the no-subcommand default, never create the control token
+/// or the machine binding: on a directory a daemon owns but has not
+/// initialized yet they report it and write nothing.
+#[test]
+fn status_on_a_held_uninitialized_state_dir_writes_nothing() {
+    let root = scratch("single-writer-status");
+    let support = root.join("Ottto");
+    let home = root.join("home");
+    std::fs::create_dir(&home).expect("create home");
+    let held = StateDirLock::acquire(&support).expect("daemon holds the state dir");
+    let lock_path = support.join(STATE_DIR_LOCK_FILE_NAME);
+    let lock_bytes = std::fs::read(&lock_path).expect("read lock file");
+    let before = tree(&root);
+
+    for args in [vec!["status", "--json"], vec!["status"], vec![]] {
+        let label = format!("{args:?}");
+        let mut status = Command::new(env!("CARGO_BIN_EXE_ottto-service"))
+            .args(args)
+            .env_clear()
+            .env("HOME", &home)
+            .env("TMPDIR", &home)
+            .env("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start status");
+        let exit = wait_with_deadline(&mut status, Duration::from_secs(30));
+        let mut output = String::new();
+        status
+            .stdout
+            .take()
+            .expect("stdout pipe")
+            .read_to_string(&mut output)
+            .expect("read stdout");
+        status
+            .stderr
+            .take()
+            .expect("stderr pipe")
+            .read_to_string(&mut output)
+            .expect("read stderr");
+        assert_eq!(exit.code(), Some(78), "{label}: {output}");
+        assert!(
+            output.contains("local state is not initialized"),
+            "{label}: {output}"
+        );
+        if label != "[\"status\"]" {
+            assert!(
+                output.contains("\"code\": \"local_state_not_initialized\""),
+                "{label}: {output}"
+            );
+        }
+        assert_eq!(tree(&root), before, "{label}");
+        assert_eq!(
+            std::fs::read(&lock_path).expect("reread lock"),
+            lock_bytes,
+            "{label}"
+        );
+    }
+    drop(held);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn killed_holder_frees_the_state_dir_for_a_restart() {
     if let Some(support) = std::env::var_os(HOLDER_ENV) {
