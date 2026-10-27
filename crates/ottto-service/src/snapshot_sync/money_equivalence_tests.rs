@@ -185,6 +185,11 @@ fn claude_case(name: &str) {
             input_clock(&agent);
         }
         input_clock(&path);
+        if name == "failed_then_healthy_telemetry" {
+            // A distinct finalized baseline keeps the failed estimate from
+            // being suppressed as an unchanged body before real upload.
+            c.evidence(&[api("r1", 10, 100)], &[]);
+        }
         let scanner = E2ScanFixture::default();
         let mut warm = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
         warm.enrich(&c);
@@ -234,6 +239,12 @@ fn claude_case(name: &str) {
                     .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
                 std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
                 std::fs::write(&bad, "{broken-json\n").unwrap();
+                // Preserve the failed phase's unpaired API-sidecar input.
+                let trace = c
+                    .support
+                    .join("local-otel/claude-code-trace-ownership")
+                    .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
+                std::fs::remove_file(trace).unwrap();
                 let health = crate::claude_local_otel::load_claude_api_request_evidence_report(
                     &c.support,
                     [ROOT.to_owned()],

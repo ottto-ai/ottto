@@ -40,7 +40,11 @@ Active fixtures, one test each:
   `telemetry_matched` origin and true completeness, conserving requests/tokens.
   Both phases independently reach real upload and compare complete envelopes,
   body witnesses and digests; both emissions enter the receipt. Cross-phase
-  cost/origin/completeness must differ. History-upgrade holds are separate.
+  cost/origin/completeness must differ. The warm-up finalizes healthy reported
+  telemetry so the failed estimate changes the effective body and survives
+  ordinary semantic no-op suppression. The failed phase removes the trace
+  sidecar to preserve its unpaired malformed API-sidecar input. History-upgrade
+  holds are separate.
 - Codex V2 counting remains selected after index reload and retained Tail.
 - Codex Legacy-ACK remains selected after index reload and retained Tail.
 
