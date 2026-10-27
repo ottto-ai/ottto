@@ -116,6 +116,39 @@ jobs:
           assert not bad, "touched-file clippy must be clean"
           print("W1_TOUCHED_FILE_CLIPPY_CLEAN")
           PYCLIPPY
+      - name: W1 clippy receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: w1-linux-clippy
+          path: ${{ runner.temp }}/w1-clippy.jsonl
+
+  w1-parity-probe:
+    name: W1 same-corpus probe
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install system packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev zsh
+      - name: Private temp directory
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/tmp"
+          echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: W1 same-corpus before after probe
         if: ${{ !cancelled() }}
         run: |
@@ -149,7 +182,7 @@ jobs:
           OTTTO_E2_BENCH_MODE=prepare OTTTO_E2_BENCH_SCALE=1 OTTTO_E2_BENCH_BYTES_SCALE=.05 "$RUNNER_TEMP/after" "$test" --exact --ignored --nocapture --test-threads 1 > "$RUNNER_TEMP/w1-prepare.log" 2>&1
           for name in before after-release after; do
             OTTTO_E2_BENCH_MODE=arm OTTTO_E2_BENCH_ARM=on OTTTO_E2_BENCH_TAG="$name" OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/w1-$name.json" "$RUNNER_TEMP/$name" "$test" --exact --ignored --nocapture --test-threads 1 > "$RUNNER_TEMP/w1-$name.log" 2>&1
-            grep '^MONEY_E2_BENCH ' "$RUNNER_TEMP/w1-$name.log"
+            grep '^MONEY_E2_BENCH_ARM ' "$RUNNER_TEMP/w1-$name.log"
           done
           python3 - "$RUNNER_TEMP" <<'PYPARITY'
           import pathlib,json,sys

@@ -2603,7 +2603,15 @@ fn e2_pipeline_cold_known_twins_read_once_across_page_boundary() {
         );
         let scanner = E2ScanFixture::default();
         let mut progress = e2_progress();
-        let prior = ScanIndex::default();
+        // A cold file inventory with the identity contract already adopted:
+        // the contract's independent one-time rearm must not masquerade as
+        // a duplicate queue acquisition in this scheduling test.
+        let mut state = serde_json::to_value(ScanIndex::default()).unwrap();
+        state["claude_request_identity_contract"] = json!(
+            crate::snapshots::claude_request_identity::cycle_contract(false)
+        );
+        let prior: ScanIndex = serde_json::from_value(state).unwrap();
+        assert!(!prior.claude_request_identity_contract_for_test().1);
         let page = ready(&c, &scanner, prior.clone(), 1, false);
         literal(&page);
         assert_eq!(page.scan.scanned_file_count, 2, "known family is complete");
