@@ -167,6 +167,10 @@ struct RearmFixture {
     native_file_limit: usize,
     serial_active_frame: bool,
     owned_base_preparation: bool,
+    /// Sessions every page holds locally after the fold, through the
+    /// production E2 hold (`hold_request_owned`): unbound, so
+    /// progress-blocking. Empty unless a test sets it.
+    local_holds: BTreeSet<String>,
     body_trace: std::cell::RefCell<RearmBodyTrace>,
     native_lifecycle:
         std::sync::Arc<crate::snapshots::claude_native_comparison::lifecycle::Lifecycle>,
@@ -193,6 +197,7 @@ impl RearmFixture {
             native_file_limit: REARM_PAGE_FILES,
             serial_active_frame: false,
             owned_base_preparation: false,
+            local_holds: BTreeSet::new(),
             body_trace: Default::default(),
             native_lifecycle: std::sync::Arc::new(Default::default()),
             index_path: base.join("claude-scan-index.json"),
@@ -582,6 +587,13 @@ impl RearmFixture {
             &disposition.mixed_uploads,
         );
         disposition.defer_sessions(deferred_accounts);
+        disposition.hold_request_owned(
+            scan.snapshots
+                .iter()
+                .filter(|item| self.local_holds.contains(&item.source_session_id))
+                .map(|item| item.source_session_id.clone())
+                .collect(),
+        );
         apply_upload_policy(
             SnapshotSource::ClaudeCode,
             &mut scan.snapshots,
@@ -1454,6 +1466,7 @@ fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture 
         native_file_limit: source.native_file_limit,
         serial_active_frame: source.serial_active_frame,
         owned_base_preparation: source.owned_base_preparation,
+        local_holds: source.local_holds.clone(),
         body_trace: Default::default(),
         native_lifecycle: std::sync::Arc::new(Default::default()),
     }

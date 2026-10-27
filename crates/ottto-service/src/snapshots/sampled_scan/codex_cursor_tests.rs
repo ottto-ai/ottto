@@ -649,6 +649,8 @@ fn strict_debt_is_never_settleable_residue_and_held_debt_is() {
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     };
     let disclose = |disclosure: &Disclosure| {
         let mut index = ScanIndex::default();
@@ -2664,6 +2666,8 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     }
 }
 
@@ -4703,6 +4707,8 @@ fn memo_wakes_on_the_conflicted_identity_set() {
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     };
     let digest = |codex: &CodexTitleMetadata| {
         memo_digest(
@@ -5717,6 +5723,8 @@ fn one_writer_attributes_and_replays_held_totals() {
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     };
     let key = local_index_key(&candidate.path);
     let mut index = ScanIndex::default();
@@ -7009,6 +7017,8 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     };
     let receipt = |tier: &str| -> AppliedTierReceipt {
         serde_json::from_value(json!({"version": 1, "derivation": "fixture",
@@ -7039,6 +7049,8 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
                 codex_captured_uncommitted: false,
                 codex_counting_v2: false,
                 codex_counting_owner: None,
+                opened_changed_nanos: 0,
+                opened_birth_nanos: 0,
             },
         );
         index
@@ -7402,6 +7414,8 @@ fn join_member(path: PathBuf) -> CandidateFile {
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     }
 }
 
