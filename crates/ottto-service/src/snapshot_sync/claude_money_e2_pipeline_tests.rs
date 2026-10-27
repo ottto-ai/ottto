@@ -1593,9 +1593,15 @@ fn all_prebirth_copy(state: AllPrebirthState) {
                     copy.to_str().unwrap(),
                     nanos(T0),
                 );
-                let saved = birth_store_bytes(&prior);
+                // Save prunes absent-path bookkeeping. The contract is the
+                // effective minimum, not byte identity before that pruning.
+                assert_eq!(
+                    prior
+                        .claude_money_birth_store
+                        .effective_cutoff(COPY, copy.to_str().unwrap()),
+                    Some(nanos(T0))
+                );
                 prior = c.reload(&mut prior);
-                assert_eq!(birth_store_bytes(&prior), saved);
                 assert_eq!(
                     prior
                         .claude_money_birth_store
