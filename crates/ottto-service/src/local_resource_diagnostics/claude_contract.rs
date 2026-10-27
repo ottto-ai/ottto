@@ -75,13 +75,10 @@ pub(crate) fn note(f: impl FnOnce(&mut Counts)) {
 }
 fn roots_digest(roots: &[PathBuf]) -> [u8; 32] {
     let mut hash = Sha256::new_with_prefix(b"ottto:traversal-roots:v1\0");
-    for root in roots
-        .iter()
-        .map(|root| root.components().collect::<PathBuf>())
-    {
-        let bytes = root.as_os_str().as_encoded_bytes();
-        hash.update((bytes.len() as u64).to_be_bytes());
-        hash.update(bytes);
+    for root in roots {
+        let root: PathBuf = root.components().collect();
+        hash.update((root.as_os_str().len() as u64).to_be_bytes());
+        hash.update(root.as_os_str().as_encoded_bytes());
     }
     hash.finalize().into()
 }
@@ -202,6 +199,13 @@ mod tests {
         );
         started_context("first", parts, &roots);
         compare(Some("first"), 1, Some("a"), Some("replay-a"), &roots);
+        compare(
+            Some("first"),
+            1,
+            Some("a"),
+            Some("replay-a"),
+            &[PathBuf::from("/synthetic//./a/")],
+        );
         prepare_context(b"policy-b", Some("epoch-b"), true);
         compare(Some("first"), 2, Some("b"), Some("replay-b"), &other);
         let changed = claude_reread::Counts::default()
