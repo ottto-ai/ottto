@@ -5856,7 +5856,8 @@ fn prepare_sync_source_inner(
     // window. Missing/malformed hints already fail JSON decoding; future
     // out-of-contract widths fail here before any scan or receipt can
     // manufacture a fallback policy. Zero is an explicit tombstone control.
-    let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)?;
+    let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)
+        .map_err(|error| count_failure(error, false))?;
     let context_curve_enabled = source != SnapshotSource::Pi
         && activity_hint.session_context_curve_contract.as_deref()
             == Some(CONTEXT_CURVE_CONTRACT_VERSION);

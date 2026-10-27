@@ -941,7 +941,9 @@ fn identity_permit_counts_each_success_and_denial_once_through_real_prepare() {
 fn identity_permit_transport_errors_reach_existing_carrier_without_contract_observation() {
     for leased in [false, true] {
         let _enabled = leased.then(crate::snapshots::claude_native_comparison::enable_for_test);
-        for fetch in [false, true] {
+        for failure in ["fetch", "hint", "invalid_hint"] {
+            let fetch = failure == "fetch";
+            let invalid_hint = failure == "invalid_hint";
             let fixture = IdentityPipelineHome::new();
             let _cadence = IdentityPipelineCadence::new();
             let support = fixture.base.join("failure-support");
@@ -957,10 +959,12 @@ fn identity_permit_transport_errors_reach_existing_carrier_without_contract_obse
                     let token = !fetch && step == 0;
                     let body = if token {
                         r#"{"token":"synthetic-token","expires_at":"2026-08-02T10:00:00Z"}"#
+                    } else if invalid_hint {
+                        r#"{"source":"claude_code","server_time":"2026-08-02T10:00:00Z","last_data_at":null,"record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":18446744073709551615,"recommended_scan_after":"2026-08-02T10:05:00Z"}"#
                     } else {
                         r#"{"error":"synthetic"}"#
                     };
-                    let status = if token {
+                    let status = if token || invalid_hint {
                         "200 OK"
                     } else {
                         "500 Internal Server Error"

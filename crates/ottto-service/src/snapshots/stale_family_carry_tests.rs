@@ -4240,3 +4240,88 @@ fn contract_start_status_preserves_resume_placeholder_and_reowes_only_once() {
         4
     );
 }
+
+#[test]
+fn contract_debt_scoped_hold_carries_only_settled_siblings() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = contract_debt_fixture(3);
+    let held = fixture.roots[0].clone();
+    fixture
+        .index
+        .mark_bounded_sweep_held_by_families(Some(&BTreeSet::from([held.clone()])));
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 2);
+    assert!(!fixture.index.claude_stale_family_carry.contains(&held));
+    assert!(fixture.roots[1..]
+        .iter()
+        .all(|root| fixture.index.claude_stale_family_carry.contains(root)));
+    assert!(fixture.index.claude_request_identity_contract_changed);
+}
+
+#[test]
+fn contract_debt_scratch_deferred_start_keeps_placeholder_and_old_window() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = contract_debt_fixture(2);
+    fixture.index.claude_request_identity_contract =
+        Some(CLAUDE_E2_IDENTITY_ADOPTION_PENDING.to_owned());
+    fixture
+        .index
+        .claude_usage_family_pending
+        .values_mut()
+        .next()
+        .unwrap()
+        .member_request_id_hashes
+        .values_mut()
+        .next()
+        .unwrap()
+        .extend((0..12000).map(|n| format!("{n:064x}")));
+    let before = serde_json::to_value(&fixture.index.files).unwrap();
+    let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+    assert_eq!(
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut fixture.index,
+            CARRY_RETRY,
+            BACKFILL_WINDOW_DAYS
+        ),
+        TraversalProgress::Resumed
+    );
+    assert_eq!(
+        fixture.index.claude_request_identity_contract.as_deref(),
+        Some(CLAUDE_E2_IDENTITY_ADOPTION_PENDING)
+    );
+    assert_eq!(
+        fixture.index.traversal.as_ref().unwrap().census_window_end,
+        CARRY_FAILED
+    );
+    assert_eq!(serde_json::to_value(&fixture.index.files).unwrap(), before);
+    assert!(fixture.index.claude_request_identity_contract_changed);
+}
+
+#[test]
+fn contract_observation_counts_empty_transitions_without_prepare_scan_duplicates() {
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let mut index = ScanIndex {
+        claude_request_identity_contract: Some(String::new()),
+        ..Default::default()
+    };
+    index.observe_claude_request_identity_contract(true);
+    index.observe_claude_request_identity_contract(true);
+    index.observe_claude_request_identity_contract(false);
+    index.observe_claude_request_identity_contract(false);
+    let counts = scope.finish().contract;
+    assert_eq!(
+        counts.request_identity_permit,
+        Default::default(),
+        "permit is prepare-only"
+    );
+    assert_eq!(counts.identity_contract_transition.from_empty, 1);
+    assert_eq!(counts.identity_contract_transition.to_empty, 1);
+    assert_eq!(counts.identity_contract_latch.set, 1);
+    assert_eq!(counts.identity_contract_latch.cleared, 0);
+}
