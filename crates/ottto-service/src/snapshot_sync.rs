@@ -8727,6 +8727,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     ),
     crate::source_rotation::LocalRefusal,
 > {
+    #[cfg(test)]
+    tests::money_e2_bench_tests::bench_mark("evidence.begin", &scan_result.snapshots);
     // Actual native occurrences are recorded once BEFORE emission filtering.
     // The authoritative fold still sees the actual terminal census decision.
     let observations = match comparison.as_deref_mut() {
@@ -8805,6 +8807,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             after_attach();
         }
     });
+    #[cfg(test)]
+    tests::money_e2_bench_tests::bench_mark("attach.done", &scan_result.snapshots);
     let telemetry_read_failed = stats.effort_evidence_load_failed;
     let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
@@ -8945,12 +8949,16 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
     }
     // E2 side calls need the trace-named owner, so they follow the trace read.
+    #[cfg(test)]
+    tests::money_e2_bench_tests::bench_mark("strict.done", &scan_result.snapshots);
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
         &mut scan_result.snapshots,
         &api_report,
         &trace_report,
         index,
     );
+    #[cfg(test)]
+    tests::money_e2_bench_tests::bench_mark("side_calls.done", &scan_result.snapshots);
     if request_owned_enabled {
         // Reuse the per-root read verdict before identity consumes it. Missing
         // sidecars are ordinary absence; partial pairs and failed strict reads
@@ -9035,6 +9043,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
         },
     );
+    #[cfg(test)]
+    tests::money_e2_bench_tests::bench_mark("finish_page.done", &scan_result.snapshots);
     disposition.hold_request_owned(withheld);
     if request_owned_enabled {
         for item in &mut scan_result.snapshots {
@@ -9092,6 +9102,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             &originals,
         ),
     };
+    #[cfg(test)]
+    tests::money_e2_bench_tests::bench_mark("accounts.before_release", &scan_result.snapshots);
     drop(identity_evidence);
     // E2 grains have served their last consumer: contract 5 and account
     // qualification now own the final rows. Do not retain or clone the fold
@@ -9106,6 +9118,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
         }
     }
+    #[cfg(test)]
+    tests::money_e2_bench_tests::bench_mark("accounts.done", &scan_result.snapshots);
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -22083,7 +22097,7 @@ mod tests {
     }
 
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
-    mod money_e2_bench_tests {
+    pub(super) mod money_e2_bench_tests {
         include!("snapshot_sync/money_e2_bench_tests.rs");
     }
     pub(super) mod permanent_finish_pipeline_tests {
