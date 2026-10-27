@@ -2200,6 +2200,13 @@ mod large_full_reservation_tests {
             assert!(page.reserve_large_full_group("a", 300, vec![("b".into(), 600)]));
             assert_eq!((page.files, page.bytes), (3, 1000));
             assert!(!page.reserve("one-more-byte", 1));
+            let prior = (page.files, page.bytes, page.reserved.clone());
+            assert!(!page.reserve_large_full_group("b", 700, vec![("a".into(), 300)]));
+            assert_eq!(
+                (page.files, page.bytes, page.reserved.clone()),
+                prior,
+                "a later contribution cannot grow past the funded page"
+            );
 
             let mut page = HistoryPage::default();
             assert!(page.reserve("small", 100));
@@ -2210,8 +2217,10 @@ mod large_full_reservation_tests {
             assert!(page.reserved.contains_key("a"));
             assert!(page.reserved.contains_key("new"));
 
-            let mut page = HistoryPage::default();
-            page.staged_twins = Some(("new".into(), vec![("grown".into(), 1)]));
+            let mut page = HistoryPage {
+                staged_twins: Some(("new".into(), vec![("grown".into(), 1)])),
+                ..HistoryPage::default()
+            };
             assert!(page.reserve("new", 100));
             assert!(page.reserve("unrelated", 700));
             let previous = (page.files, page.bytes, page.reserved.clone());

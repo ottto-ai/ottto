@@ -429,33 +429,30 @@ pub(super) fn admit(
     page: &mut HistoryPage,
 ) -> bool {
     let key = local_index_key(&candidate.path);
-    let admitted = if !full {
-        true
-    } else {
-        match twin_group(index, candidate, page) {
-            Err(()) => false,
-            Ok(Some(Group { member, twins })) => {
-                if unit.as_ref().is_some_and(|current| current != &member) {
-                    false
-                } else if unit.is_some() {
-                    true
-                } else if page.reserve_large_full_group(&key, candidate.size_bytes, twins) {
-                    *unit = Some(member);
-                    true
-                } else {
-                    false
-                }
+    let admitted = match twin_group(index, candidate, page) {
+        Err(()) => false,
+        Ok(Some(Group { member, twins })) => {
+            if unit.as_ref().is_some_and(|current| current != &member) {
+                false
+            } else if page.reserve_large_full_group(&key, candidate.size_bytes, twins) {
+                // Recheck every contribution: a later member may have grown
+                // since its sibling's reservation. Tail members use the same
+                // group gate, while unrelated tails keep their old admission.
+                *unit = Some(member);
+                true
+            } else {
+                false
             }
-            Ok(None) if is_large(candidate) => {
-                if unit.is_some() {
-                    false
-                } else {
-                    *unit = Some(key.clone());
-                    true
-                }
-            }
-            Ok(None) => true,
         }
+        Ok(None) if full && is_large(candidate) => {
+            if unit.is_some() {
+                false
+            } else {
+                *unit = Some(key.clone());
+                true
+            }
+        }
+        Ok(None) => true,
     };
     if !admitted {
         let traversal = index.traversal.as_mut().expect("active Claude traversal");
