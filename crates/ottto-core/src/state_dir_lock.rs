@@ -115,12 +115,17 @@ impl StateDirLock {
         Self::lock(file, support_dir)
     }
 
-    /// Like [`Self::acquire`], but creates nothing: `Ok(None)` when the lock
-    /// file does not exist, so no daemon of this version owns the directory.
-    pub fn acquire_existing(support_dir: &Path) -> Result<Option<Self>, StateDirLockError> {
+    /// Like [`Self::acquire`], but never creates `support_dir`: `Ok(None)`
+    /// when it does not exist. In an existing directory the lock file is
+    /// created when missing, so the caller owns the directory even if no
+    /// daemon ever ran there, and its inode stays for any later daemon.
+    pub fn acquire_in_existing_dir(support_dir: &Path) -> Result<Option<Self>, StateDirLockError> {
         match OpenOptions::new()
             .read(true)
             .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
             .open(support_dir.join(STATE_DIR_LOCK_FILE_NAME))
         {
             Ok(file) => Self::lock(file, support_dir).map(Some),
@@ -293,26 +298,36 @@ mod tests {
     }
 
     #[test]
-    fn acquire_existing_creates_nothing_and_contends_like_acquire() {
+    fn acquire_in_existing_dir_never_creates_the_dir_and_contends_like_acquire() {
         let root = super::scratch("state-dir-lock-existing");
         let support = root.join("Ottto");
-        assert!(StateDirLock::acquire_existing(&support)
-            .expect("absent lock")
+        assert!(StateDirLock::acquire_in_existing_dir(&support)
+            .expect("absent directory")
             .is_none());
-        assert!(
-            !support.exists(),
-            "absent lock must not create the directory"
-        );
+        assert!(!support.exists(), "an absent directory must not be created");
 
-        let holder = StateDirLock::acquire(&support).expect("daemon takes the lock");
-        let refusal = StateDirLock::acquire_existing(&support).expect_err("held");
+        // An existing directory without a lock file gets one and is owned.
+        std::fs::create_dir(&support).expect("support dir without a lock");
+        let owner = StateDirLock::acquire_in_existing_dir(&support)
+            .expect("lock an unlocked dir")
+            .expect("directory exists");
+        assert!(support.join(STATE_DIR_LOCK_FILE_NAME).is_file());
+        let refused = StateDirLock::acquire(&support).expect_err("owned");
+        assert!(
+            matches!(refused, StateDirLockError::Held { .. }),
+            "{refused:?}"
+        );
+        drop(owner);
+
+        let holder = super::acquire_released(&support);
+        let refusal = StateDirLock::acquire_in_existing_dir(&support).expect_err("held");
         assert!(
             matches!(refusal, StateDirLockError::Held { .. }),
             "{refusal:?}"
         );
         drop(holder);
         drop(super::acquire_released(&support));
-        let claimed = StateDirLock::acquire_existing(&support).expect("free lock");
+        let claimed = StateDirLock::acquire_in_existing_dir(&support).expect("free lock");
         assert!(claimed.is_some());
         let _ = std::fs::remove_dir_all(root);
     }

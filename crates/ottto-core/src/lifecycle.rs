@@ -318,44 +318,79 @@ pub fn execute_local_uninstall(
         report.warn("Daemon process stop was deferred until after the typed uninstall response");
     }
 
-    // The CLI just stopped the daemon: its local state is deleted only once
-    // the daemon has let go of it, and under its lock, so no new daemon can
-    // start on the directory meanwhile. The daemon's own uninstall is the
-    // holder and must not take its lock; the lock file it holds survives
-    // cleanup, so a daemon restarted before it exits is still refused.
+    // The CLI just stopped the daemon: its local state is deleted only while
+    // this process holds the state-directory lock, taken once the daemon let
+    // go of it, so no new daemon can start on the directory meanwhile. The
+    // daemon's own uninstall is the holder and must not take its lock; the
+    // lock file it holds survives cleanup, so a daemon restarted before it
+    // exits is still refused.
     let support_dir = home
         .join("Library")
         .join("Application Support")
         .join("Ottto");
-    #[cfg(unix)]
-    let (_state_claim, keep_state) = if options.stop_daemon_process {
-        match claim_state_after_daemon_exit(&support_dir, DAEMON_EXIT_WAIT) {
-            Ok(claim) => (claim, false),
-            Err(error) => {
-                report.fail(format!(
-                    "{error}; its local state was kept, stop it and retry uninstall"
-                ));
-                (None, true)
-            }
-        }
+    let support_claim = if options.stop_daemon_process {
+        claim_support_dir(&support_dir, DAEMON_EXIT_WAIT, &mut report)
     } else {
-        (None, false)
+        SupportDirClaim::HeldByThisDaemon
     };
-    #[cfg(not(unix))]
-    let keep_state = false;
 
     remove_keychain_tokens(&mut report);
 
     unregister_companion_apps(home, &mut report);
 
-    for target in uninstall_cleanup_targets(home) {
-        if keep_state && target.path == support_dir {
-            continue;
-        }
-        remove_cleanup_target(target, &mut report);
-    }
+    remove_cleanup_targets(
+        uninstall_cleanup_targets(home),
+        &support_dir,
+        &support_claim,
+        &mut report,
+    );
 
     execution_result(plan, report)
+}
+
+/// Who may delete the support directory during this uninstall.
+#[derive(Debug)]
+enum SupportDirClaim {
+    /// The daemon uninstalling itself: it holds the lock.
+    HeldByThisDaemon,
+    /// This process holds the lock for the rest of the uninstall.
+    #[cfg(unix)]
+    Owned(#[allow(dead_code)] crate::state_dir_lock::StateDirLock),
+    /// No directory when the claim was made. Anything created there later
+    /// belongs to someone else and is never deleted by this uninstall.
+    Absent,
+    /// A daemon kept it, or it could not be locked; recorded as a failure.
+    Refused,
+}
+
+impl SupportDirClaim {
+    fn may_remove(&self) -> bool {
+        match self {
+            Self::HeldByThisDaemon => true,
+            #[cfg(unix)]
+            Self::Owned(_) => true,
+            Self::Absent | Self::Refused => false,
+        }
+    }
+}
+
+/// Removes every target. The support directory is removed only when
+/// `support_claim` allows it, and then keeps its lock file.
+fn remove_cleanup_targets(
+    targets: Vec<CleanupTarget>,
+    support_dir: &Path,
+    support_claim: &SupportDirClaim,
+    report: &mut CleanupReport,
+) {
+    for target in targets {
+        if target.path == support_dir && !support_claim.may_remove() {
+            if matches!(support_claim, SupportDirClaim::Absent) {
+                report.missing_paths.push(target.path.display().to_string());
+            }
+            continue;
+        }
+        remove_cleanup_target(target, report);
+    }
 }
 
 fn unregister_companion_apps(home: &Path, report: &mut CleanupReport) {
@@ -708,27 +743,43 @@ fn remove_keychain_tokens(report: &mut CleanupReport) {
 }
 
 /// How long CLI uninstall waits for a stopped daemon to release local state.
-#[cfg(unix)]
 const DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
 
-/// Waits up to `wait` for the daemon to release `support_dir`, then holds its
-/// lock. `Ok(None)` when there is no lock file: no daemon of this version
-/// ever owned the directory.
+/// Waits up to `wait` for a stopped daemon to release `support_dir`, then
+/// holds its lock, creating the lock file in an existing directory that has
+/// none. An absent directory is never created or adopted.
 #[cfg(unix)]
-fn claim_state_after_daemon_exit(
+fn claim_support_dir(
     support_dir: &Path,
     wait: Duration,
-) -> Result<Option<crate::state_dir_lock::StateDirLock>, crate::state_dir_lock::StateDirLockError> {
+    report: &mut CleanupReport,
+) -> SupportDirClaim {
     use crate::state_dir_lock::{StateDirLock, StateDirLockError};
     let deadline = std::time::Instant::now() + wait;
     loop {
-        match StateDirLock::acquire_existing(support_dir) {
+        match StateDirLock::acquire_in_existing_dir(support_dir) {
+            Ok(Some(lock)) => return SupportDirClaim::Owned(lock),
+            Ok(None) => return SupportDirClaim::Absent,
             Err(StateDirLockError::Held { .. }) if std::time::Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(50));
             }
-            result => return result,
+            Err(error) => {
+                report.fail(format!(
+                    "{error}; its local state was kept, stop it and retry uninstall"
+                ));
+                return SupportDirClaim::Refused;
+            }
         }
     }
+}
+
+#[cfg(not(unix))]
+fn claim_support_dir(
+    _support_dir: &Path,
+    _wait: Duration,
+    _report: &mut CleanupReport,
+) -> SupportDirClaim {
+    SupportDirClaim::HeldByThisDaemon
 }
 
 /// Removes `dir`. A support directory's lock file stays, with the directory
@@ -1025,28 +1076,28 @@ identifier:                 net.ottto.Companion
         use crate::state_dir_lock::{scratch, StateDirLock, StateDirLockError};
         let root = scratch("uninstall-claim");
         let support = root.join("Ottto");
-        assert!(
-            claim_state_after_daemon_exit(&support, Duration::from_millis(100))
-                .expect("no lock file")
-                .is_none()
-        );
-        assert!(!support.exists(), "the claim creates nothing");
+        let mut report = CleanupReport::new();
+        let absent = claim_support_dir(&support, Duration::from_millis(100), &mut report);
+        assert!(matches!(absent, SupportDirClaim::Absent), "{absent:?}");
+        assert!(!support.exists(), "the claim creates no directory");
+        assert!(report.failed_operations.is_empty(), "{report:?}");
 
         let daemon = StateDirLock::acquire(&support).expect("daemon owns state");
-        let refused = claim_state_after_daemon_exit(&support, Duration::from_millis(200))
-            .expect_err("daemon never exited");
+        let refused = claim_support_dir(&support, Duration::from_millis(200), &mut report);
+        assert!(matches!(refused, SupportDirClaim::Refused), "{refused:?}");
+        assert_eq!(report.failed_operations.len(), 1, "{report:?}");
         assert!(
-            matches!(refused, StateDirLockError::Held { .. }),
-            "{refused:?}"
+            report.failed_operations[0].contains("already owns local state"),
+            "{report:?}"
         );
 
         let exiting = thread::spawn(move || {
             thread::sleep(Duration::from_millis(200));
             drop(daemon);
         });
-        let claim = claim_state_after_daemon_exit(&support, Duration::from_secs(10))
-            .expect("daemon exited")
-            .expect("lock file exists");
+        let mut report = CleanupReport::new();
+        let claim = claim_support_dir(&support, Duration::from_secs(10), &mut report);
+        assert!(matches!(claim, SupportDirClaim::Owned(_)), "{claim:?}");
         exiting.join().expect("daemon thread");
         let restart = StateDirLock::acquire(&support).expect_err("no restart mid-cleanup");
         assert!(
@@ -1055,6 +1106,141 @@ identifier:                 net.ottto.Companion
         );
         drop(claim);
         drop(crate::state_dir_lock::acquire_released(&support));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// First start racing CLI uninstall on a support directory that never had
+    /// a lock file: the claim creates and holds the lock, so a daemon start
+    /// injected between claim and cleanup is refused for the whole cleanup,
+    /// deletes nothing of a running daemon, and later takes the very inode
+    /// cleanup kept.
+    #[cfg(unix)]
+    #[test]
+    fn first_start_racing_cli_uninstall_never_loses_state_or_the_lock_inode() {
+        use crate::state_dir_lock::{scratch, StateDirLock, StateDirLockError};
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let root = scratch("uninstall-first-start");
+        let support = root.join("Ottto");
+        fs::create_dir_all(support.join("snapshots")).expect("state tree");
+        fs::write(support.join("control-token"), b"old").expect("old state");
+        let lock_path = support.join(crate::state_dir_lock::STATE_DIR_LOCK_FILE_NAME);
+        assert!(!lock_path.exists(), "no lock file before uninstall");
+        let identity = |path: &Path| {
+            let meta = fs::metadata(path).expect("lock metadata");
+            (meta.dev(), meta.ino())
+        };
+
+        let mut report = CleanupReport::new();
+        let claim = claim_support_dir(&support, Duration::from_secs(1), &mut report);
+        assert!(matches!(claim, SupportDirClaim::Owned(_)), "{claim:?}");
+        let claimed_inode = identity(&lock_path);
+
+        // A daemon start injected between the claim and the cleanup.
+        let refused = StateDirLock::acquire(&support).expect_err("start refused");
+        assert!(
+            matches!(refused, StateDirLockError::Held { .. }),
+            "{refused:?}"
+        );
+        // ...and one retrying for the whole cleanup.
+        let cleanup_done = Arc::new(AtomicBool::new(false));
+        let starter = {
+            let support = support.clone();
+            let cleanup_done = Arc::clone(&cleanup_done);
+            thread::spawn(move || loop {
+                match StateDirLock::acquire(&support) {
+                    Ok(lock) => {
+                        let entered_after_cleanup = cleanup_done.load(Ordering::SeqCst);
+                        fs::write(support.join("daemon-state"), b"new").expect("daemon state");
+                        return (entered_after_cleanup, lock);
+                    }
+                    Err(StateDirLockError::Held { .. }) => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error:?}"),
+                }
+            })
+        };
+
+        remove_cleanup_targets(
+            vec![CleanupTarget {
+                path: support.clone(),
+                kind: CleanupTargetKind::Directory,
+            }],
+            &support,
+            &claim,
+            &mut report,
+        );
+        assert!(report.failed_operations.is_empty(), "{report:?}");
+        assert_eq!(report.removed_paths, vec![support.display().to_string()]);
+        let left: Vec<_> = fs::read_dir(&support)
+            .expect("support dir kept")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            left,
+            vec![std::ffi::OsString::from(
+                crate::state_dir_lock::STATE_DIR_LOCK_FILE_NAME
+            )]
+        );
+        assert_eq!(identity(&lock_path), claimed_inode);
+
+        cleanup_done.store(true, Ordering::SeqCst);
+        drop(claim);
+        let (entered_after_cleanup, daemon) = starter.join().expect("starter");
+        assert!(entered_after_cleanup, "a daemon entered during cleanup");
+        assert_eq!(identity(&lock_path), claimed_inode, "live inode unlinked");
+        assert!(support.join("daemon-state").is_file());
+        drop(daemon);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A support directory absent at the claim is skipped for the rest of the
+    /// uninstall: a daemon that creates it afterwards keeps its state and its
+    /// lock, while every other target is still removed.
+    #[cfg(unix)]
+    #[test]
+    fn cli_uninstall_never_adopts_a_support_dir_created_after_its_claim() {
+        use crate::state_dir_lock::{scratch, StateDirLock, StateDirLockError};
+        let root = scratch("uninstall-absent");
+        let support = root.join("Ottto");
+        let logs = root.join("Logs");
+        fs::create_dir(&logs).expect("logs");
+        let mut report = CleanupReport::new();
+        let claim = claim_support_dir(&support, Duration::from_secs(1), &mut report);
+        assert!(matches!(claim, SupportDirClaim::Absent), "{claim:?}");
+
+        let daemon = StateDirLock::acquire(&support).expect("daemon starts afterwards");
+        fs::write(support.join("control-token"), b"daemon").expect("daemon state");
+        remove_cleanup_targets(
+            vec![
+                CleanupTarget {
+                    path: support.clone(),
+                    kind: CleanupTargetKind::Directory,
+                },
+                CleanupTarget {
+                    path: logs.clone(),
+                    kind: CleanupTargetKind::Directory,
+                },
+            ],
+            &support,
+            &claim,
+            &mut report,
+        );
+        assert!(report.failed_operations.is_empty(), "{report:?}");
+        assert_eq!(report.missing_paths, vec![support.display().to_string()]);
+        assert_eq!(report.removed_paths, vec![logs.display().to_string()]);
+        assert_eq!(
+            fs::read(support.join("control-token")).expect("state kept"),
+            b"daemon"
+        );
+        let restart = StateDirLock::acquire(&support).expect_err("daemon still owns it");
+        assert!(
+            matches!(restart, StateDirLockError::Held { .. }),
+            "{restart:?}"
+        );
+        drop(daemon);
         let _ = fs::remove_dir_all(root);
     }
 }
