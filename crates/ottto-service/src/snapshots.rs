@@ -12355,7 +12355,7 @@ fn reduce_claude_usage_ledger(
 /// The per-row checks of a strict Claude API sidecar row, in this order:
 /// revision, root session, request id, model, one request, evidence
 /// fingerprint, RFC 3339 clock. Duplicate request ids are the caller's check.
-/// Shared by the live reducer and the P1 money shadow.
+/// Shared by the live telemetry reducers.
 pub(crate) fn validate_claude_api_row(
     row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
     root_session_id: &str,
@@ -16825,7 +16825,7 @@ struct RowKey {
 }
 
 impl RowKey {
-    /// The hoisted billing fields by their selector names (P1 money shadow).
+    /// The hoisted billing fields by their selector names.
     fn billing_fields(&self) -> [(&'static str, Option<&str>); 6] {
         [
             ("auth_mode", self.auth_mode.as_deref()),
@@ -32990,8 +32990,6 @@ impl OwnedJsonlParser {
             accumulator.apply_first_prompt_fallback();
         }
         if source == SnapshotSource::ClaudeCode {
-            #[cfg(test)]
-            claude_native_delay_for_test(path);
             claude_request_money::e2::timed("claude.finalize", || {
                 accumulator.finalize_claude_responses_e2(money_context)
             });
@@ -36084,33 +36082,6 @@ fn claude_fork_line_provenance(value: &Value) -> ClaudeForkLineProvenance {
         ClaudeForkLineProvenance::Inherited
     } else {
         ClaudeForkLineProvenance::Invalid
-    }
-}
-
-/// Native scan time a test injects before each Claude finalizer under a
-/// root (a production-shaped slow native page: seconds of native I/O
-/// between money finalizers). Production scanning is unchanged.
-#[cfg(test)]
-static CLAUDE_NATIVE_DELAY_FOR_TEST: std::sync::Mutex<Option<(PathBuf, std::time::Duration)>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-pub(crate) fn set_claude_native_delay_for_test(delay: Option<(PathBuf, std::time::Duration)>) {
-    *CLAUDE_NATIVE_DELAY_FOR_TEST
-        .lock()
-        .expect("native delay control") = delay;
-}
-
-#[cfg(test)]
-fn claude_native_delay_for_test(path: &Path) {
-    let delay = CLAUDE_NATIVE_DELAY_FOR_TEST
-        .lock()
-        .expect("native delay control")
-        .as_ref()
-        .filter(|(root, _)| path.starts_with(root))
-        .map(|(_, delay)| *delay);
-    if let Some(delay) = delay {
-        std::thread::sleep(delay);
     }
 }
 
@@ -49241,6 +49212,9 @@ mod tests {
     }
     mod claude_request_census_tests {
         include!("snapshots/claude_request_census_tests.rs");
+    }
+    mod claude_census_money_invariant_tests {
+        include!("snapshots/claude_census_money_invariant_tests.rs");
     }
     mod e2_disposition_tests {
         include!("snapshots/e2_disposition_tests.rs");

@@ -173,3 +173,97 @@ pub(crate) fn valid(blob: &[u8], count: usize) -> bool {
     }
     facts.at_end()
 }
+
+/// Synthetic legacy blobs for the kept census-codec regression tests.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::super::ClaudeMoneyTokens;
+    use super::{ClaudeFact, ClaudeFactsHeader};
+
+    fn put(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    fn zigzag(value: i128) -> u64 {
+        let value = value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        ((value << 1) ^ (value >> 63)) as u64
+    }
+
+    fn encode_header(out: &mut Vec<u8>, header: &ClaudeFactsHeader) {
+        put(out, FACTS_VERSION);
+        put(out, header.session.len() as u64);
+        out.extend_from_slice(header.session.as_bytes());
+        put(out, header.base_clock);
+        put(out, header.conflicts);
+        put(out, header.refused);
+        put(out, header.styles.len() as u64);
+        for style in &header.styles {
+            put(out, style.len() as u64);
+            out.extend_from_slice(style.as_bytes());
+        }
+    }
+
+    fn encode_fact(out: &mut Vec<u8>, base_clock: u64, fact: &ClaudeFact) {
+        out.push(fact.style);
+        put(out, zigzag(i128::from(fact.clock) - i128::from(base_clock)));
+        put(
+            out,
+            fact.cost_micros.map_or(0, |cost| cost.saturating_add(1)),
+        );
+        let tokens = &fact.tokens;
+        for value in [
+            tokens.input,
+            tokens.output,
+            tokens.cache_read,
+            tokens.cache_5m,
+            tokens.cache_1h,
+            tokens.unattributed,
+            tokens.reasoning,
+        ] {
+            put(out, value);
+        }
+    }
+
+    fn encode<'f>(
+        header: &ClaudeFactsHeader,
+        facts: impl IntoIterator<Item = &'f ClaudeFact>,
+        capacity: usize,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(capacity);
+        encode_header(&mut out, header);
+        for fact in facts {
+            encode_fact(&mut out, header.base_clock, fact);
+        }
+        out
+    }
+
+    pub(crate) fn facts(session: &str, count: usize) -> Box<[u8]> {
+        let header = ClaudeFactsHeader {
+            session: session.to_owned(),
+            base_clock: 1_785_000_000,
+            styles: vec!["claude-haiku-4-5\u{1f}\u{1f}high".to_owned()],
+            ..ClaudeFactsHeader::default()
+        };
+        let rows = (0..count as u64)
+            .map(|number| ClaudeFact {
+                tokens: ClaudeMoneyTokens {
+                    input: 10 + number,
+                    output: 10,
+                    ..ClaudeMoneyTokens::default()
+                },
+                cost_micros: Some(100),
+                clock: 1_785_000_000 + number,
+                style: 0,
+            })
+            .collect::<Vec<_>>();
+        encode(&header, &rows, 0).into_boxed_slice()
+    }
+}

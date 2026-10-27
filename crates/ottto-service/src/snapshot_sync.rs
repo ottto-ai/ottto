@@ -4235,7 +4235,6 @@ fn sync_once_with_retry(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // The money shadow's kill switch, seen before this process's first parse.
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
