@@ -1632,6 +1632,7 @@ fn all_prebirth_copy(state: AllPrebirthState) {
             AllPrebirthState::Stale | AllPrebirthState::Queued | AllPrebirthState::Deadline
         );
         let scanner = E2ScanFixture::default();
+        e2::take_diag();
         let mut page = c.raw(
             &scanner,
             prior.clone(),
@@ -1663,7 +1664,6 @@ fn all_prebirth_copy(state: AllPrebirthState) {
         if state == AllPrebirthState::EmissionHold {
             observe::refuse_emission(&mut page.scan.snapshots, COPY);
         }
-        e2::take_diag();
         let (_, mut counts) = observe::capture_counts(|| {
             if state == AllPrebirthState::Deadline {
                 crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
@@ -1729,7 +1729,7 @@ fn all_prebirth_copy(state: AllPrebirthState) {
         literal(&page);
         let found = body(&page, COPY).expect("copy publishes a literal replacement");
         assert_eq!((found.request_count, found.removed_request_count), expected,
-            "{state:?}: baseline must use all-prebirth cross-session holder proof; failure is a money finding, not permission to change production");
+            "{state:?}: baseline must use all-prebirth cross-session holder proof; failure is a money finding, not permission to change production; native branch diagnostics={diag:?}");
         assert_eq!(
             counts
                 .get("copy_skipped")
