@@ -384,6 +384,7 @@ fn large_claude_native_memory_and_append() {
 // models an opaque/unaccountable frame; it grants no substitute positive bound.
 #[derive(Default)]
 struct HistoryReceipt {
+    turn_ticks: std::cell::Cell<u64>,
     visits_peak: usize,
     bytes_peak: usize,
     owed_seen: u64,
@@ -424,6 +425,11 @@ impl crate::source_rotation::Owner for Rotation {
         _: Option<usize>,
     ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
         if let Some(receipt) = self.history_receipt.as_mut() {
+            #[cfg(target_os = "macos")]
+            assert!(
+                crate::heap_layout_bound::layout_supported(),
+                "native layout receipt required"
+            );
             // Production accounting rejects Linux layouts. The native positive
             // receipt must be measured on the validated macOS toolchain; Linux
             // still executes every scheduling/revision/debt assertion below.
@@ -438,8 +444,6 @@ impl crate::source_rotation::Owner for Rotation {
                     counter.bytes, counter.visits_for_test());
                 receipt.visits_peak = receipt.visits_peak.max(counter.visits_for_test());
                 receipt.bytes_peak = receipt.bytes_peak.max(counter.bytes);
-            } else {
-                assert!(!cfg!(target_os = "macos"), "native layout receipt required");
             }
             receipt.owed_seen = receipt.owed_seen.max(frame.history_upgrade.owed);
             receipt.budget_held = receipt
@@ -447,6 +451,16 @@ impl crate::source_rotation::Owner for Rotation {
                 .max(frame.history_upgrade.denied_for(&[HistoryHold::Budget]));
         }
         if frame.native_comparison_ready() {
+            for key in &frame.index.claude_large_full_deferred {
+                assert!(
+                    !frame
+                        .native_comparison
+                        .as_ref()
+                        .unwrap()
+                        .has_skip_for_test(key),
+                    "a deferred file earns no actual unchanged-proof skip"
+                );
+            }
             let api = BTreeMap::new();
             let trace = BTreeMap::new();
             let healthy_roots = BTreeSet::new();
@@ -500,6 +514,13 @@ impl crate::source_rotation::Owner for Rotation {
         result.unwrap();
     }
     fn monotonic(&self) -> std::time::Duration {
+        if let Some(receipt) = self.history_receipt.as_ref() {
+            // A deterministic owner clock exercises parking on quiet walks
+            // too, without changing the scheduler's shipping turn budget.
+            let tick = receipt.turn_ticks.get() + 1;
+            receipt.turn_ticks.set(tick);
+            return std::time::Duration::from_secs(tick);
+        }
         self.started.elapsed()
     }
 }
@@ -1112,4 +1133,91 @@ fn large_history_upgrade_is_paced_and_owed_history_drains() {
         "claude_large_history_visit_peak: {peak}/4096 layout_supported={}",
         crate::heap_layout_bound::layout_supported()
     );
+}
+
+/// SOURCE condition: real deferred reads keep the census incomplete and
+/// preserve existing session/family custody, including absence-retirement debt.
+#[test]
+fn deferred_large_full_keeps_census_family_and_no_skip_credit() {
+    let fixture = Fixture::new();
+    let paths = (0..3)
+        .map(|n| {
+            let session = format!("019e2700-8888-7000-9000-{n:012}");
+            let path = fixture.0.join(format!("{session}.jsonl"));
+            let mut row = usage(n);
+            row["sessionId"] = json!(session);
+            fs::write(&path, format!("{row}\n")).unwrap();
+            (session, path)
+        })
+        .collect::<Vec<_>>();
+    let mut index = ScanIndex::default();
+    let mut baseline = fixture.scan(SnapshotSource::ClaudeCode, &mut index, 9);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut baseline, &mut index);
+    assert_eq!(index.files.len(), 3);
+    for (session, path) in &paths {
+        assert!(
+            index
+                .file_snapshot_fingerprints
+                .get(&local_index_key(path))
+                .is_some_and(|members| !members.is_empty()),
+            "baseline membership is real"
+        );
+        let revision = index.files[&local_index_key(path)]
+            .source_file_fingerprint
+            .clone();
+        index.insert_retry_pending_claude_authority_at_revision_for_test(session, &revision);
+        index.insert_claude_usage_family_pending_for_test(session, "2026-10-27T09:00:00Z");
+        write_populated_large(path, session);
+    }
+    let previous = index.clone();
+    let before = claude_absence_counters_for_test();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut owner = Rotation {
+        ready: vec![(
+            SnapshotSource::ClaudeCode,
+            rotation_scan(SnapshotSource::ClaudeCode, &fixture.0, index, &cache, &[]),
+        )],
+        completed: Vec::new(),
+        starts: Vec::new(),
+        refuse_parking: false,
+        refusals: std::cell::Cell::new(0),
+        deferred_revocations: 0,
+        history_receipt: None,
+        started: std::time::Instant::now(),
+    };
+    let (_, reads) = terminal_contract_retry::source_acquisitions(|| {
+        crate::source_rotation::run(
+            &mut owner,
+            &[SnapshotSource::ClaudeCode],
+            crate::source_rotation::PARKED_BUDGET,
+        );
+    });
+    assert_eq!(reads.len(), 1);
+    assert_eq!(
+        owner.deferred_revocations, 2,
+        "no comparison eligibility for either deferral"
+    );
+    let (_, next, scan) = owner.completed.pop().unwrap();
+    assert!(!scan.census_complete);
+    assert!(scan.skipped_file_count_due_to_limit >= 2);
+    assert_eq!(
+        claude_absence_counters_for_test().absent_families_retired,
+        before.absent_families_retired
+    );
+    assert_eq!(next.files.len(), 3, "no session source disappears");
+    for (session, path) in paths.iter().filter(|(_, p)| !reads.contains_key(p)) {
+        let key = local_index_key(path);
+        assert!(next.claude_usage_family_pending_retained_for_test(session));
+        assert!(next.claude_authority_record_for_test(session).is_some());
+        assert!(
+            !next.claude_root_tombstoned(session),
+            "no absence retirement"
+        );
+        assert_eq!(
+            next.file_snapshot_fingerprints.get(&key),
+            previous.file_snapshot_fingerprints.get(&key),
+            "no session membership retraction"
+        );
+    }
+    println!("claude_large_full_source_receipt: deferred=2 census_complete=false absence_retirements=0 membership_retractions=0 unchanged_skip_credit=0");
 }

@@ -582,6 +582,34 @@ impl HistoryPage {
         self.reserve_within(index_key, size_bytes, true)
     }
 
+    /// The large-Full scheduling exception uses this same byte/file gate for
+    /// every reason (audits too). Reconcile an earlier history reservation's
+    /// indexed twin extents with the live extents before granting the unit.
+    pub(super) fn reserve_large_full_group(
+        &mut self,
+        key: &str,
+        bytes: u64,
+        twins: Vec<(String, u64)>,
+        old_twin_bytes: u64,
+    ) -> bool {
+        if self.reserved.contains(key) {
+            let Some(paid) = bytes.checked_add(old_twin_bytes) else {
+                return false;
+            };
+            let Some(remaining) = self.bytes.checked_sub(paid) else {
+                return false;
+            };
+            self.bytes = remaining;
+            self.files = self.files.saturating_sub(1 + twins.len());
+            self.reserved.remove(key);
+            for (twin, _) in &twins {
+                self.reserved.remove(twin);
+            }
+        }
+        self.staged_twins = Some((key.to_owned(), twins));
+        self.reserve_within(key, bytes, false)
+    }
+
     fn reserve_within(&mut self, index_key: &str, size_bytes: u64, first_file: bool) -> bool {
         if self.reserved.contains(index_key) {
             return true;

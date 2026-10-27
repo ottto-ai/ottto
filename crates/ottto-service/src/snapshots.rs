@@ -25158,7 +25158,7 @@ pub(crate) struct OwnedSourceScan {
     semantic_noop_count: usize,
     /// This page's history-upgrade budget and count-only gate diagnostics.
     history_upgrade: HistoryPage,
-    claude_large_full_started: bool,
+    claude_large_full_unit: claude_large_full::Pass,
     codex_state_only_blocked_session_ids: BTreeSet<String>,
     codex_parent_resolution_retry_required: bool,
     residue_index_keys: BTreeSet<String>,
@@ -26385,7 +26385,7 @@ impl OwnedSourceScan {
             scanned_session_count,
             semantic_noop_count,
             history_upgrade: HistoryPage::with_twin_groups(claude_twin_groups),
-            claude_large_full_started: false,
+            claude_large_full_unit: None,
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
@@ -26565,7 +26565,7 @@ impl OwnedSourceScan {
             mut scanned_session_count,
             mut semantic_noop_count,
             mut history_upgrade,
-            mut claude_large_full_started,
+            mut claude_large_full_unit,
             mut codex_state_only_blocked_session_ids,
             mut codex_parent_resolution_retry_required,
             mut residue_index_keys,
@@ -30799,7 +30799,11 @@ impl OwnedSourceScan {
                 // denied), so a held correction-only member is unchanged.
                 match history {
                     HistoryDecision::Held(hold)
-                        if (adoption_only || correction_only) && !comparison_target =>
+                        if (adoption_only || correction_only)
+                            && !comparison_target
+                            && !(hold == HistoryHold::Budget
+                                && source == SnapshotSource::ClaudeCode
+                                && claude_large_full::is_large(&candidate)) =>
                     {
                         if source == SnapshotSource::ClaudeCode {
                             let carried = index
@@ -31774,7 +31778,8 @@ impl OwnedSourceScan {
                     index,
                     &candidate,
                     full,
-                    &mut claude_large_full_started,
+                    &mut claude_large_full_unit,
+                    &mut history_upgrade,
                 ) {
                     scanned_file_count = scanned_file_count.saturating_sub(1);
                     if decision == CandidateDecision::Parse {
@@ -31994,7 +31999,7 @@ impl OwnedSourceScan {
             scanned_session_count,
             semantic_noop_count,
             history_upgrade,
-            claude_large_full_started,
+            claude_large_full_unit,
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
@@ -88508,7 +88513,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reread_required, reread_ticket, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, claude_large_full_started, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, claude_large_full_unit, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);

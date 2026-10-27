@@ -495,6 +495,10 @@ struct WindowImportPlan {
 
 impl NativePhase {
     #[cfg(test)]
+    pub(super) fn has_skip_for_test(&self, key: &str) -> bool {
+        self.skips.contains_key(key)
+    }
+    #[cfg(test)]
     pub(super) fn capture_count_for_test(&self) -> usize {
         self.skips.len()
     }

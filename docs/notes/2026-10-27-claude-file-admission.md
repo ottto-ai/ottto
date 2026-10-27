@@ -11,8 +11,12 @@ cache admission and retry semantics. A selected Claude file without a retained
 native reduction can still require another Full read. The file limit does not
 bound native reduction memory or promise tail-only processing.
 
-Each Claude pass admits at most one Full read above 256 MiB, including first
-admission, audits and recovery reads. Other large Full candidates stay pending
+Each Claude pass admits at most one large-Full scheduling unit, including
+first admission, audits and recovery reads. An ordinary file above 256 MiB is
+one unit. All live path twins of a session may share one unit only when the
+whole group fits the existing 1 GiB history page reservation; all contributions
+still need native reading and E2 complete-twin proof in that pass. An over-budget
+group stays visible deferred debt, with no partial money or new proof. Other large Full candidates stay pending
 census debt and receive priority in oldest-deferral order on subsequent passes,
 including after restart. They contribute no read count or new source proof;
 pending debt remains visible through existing scan-cap/skipped-file counters

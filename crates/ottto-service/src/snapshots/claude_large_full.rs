@@ -362,48 +362,139 @@ pub(super) fn select_deferred(
     }
 }
 
+// One process-local unit per owned pass. A twin member id (never a path)
+// shares its allowance; an ordinary file uses its absolute index path.
+pub(super) type Pass = Option<String>;
+
+struct Group {
+    member: String,
+    twins: Vec<(String, u64)>,
+    old_bytes: u64,
+}
+
+fn twin_group(
+    index: &ScanIndex,
+    candidate: &CandidateFile,
+    page: &HistoryPage,
+) -> Result<Option<Group>, ()> {
+    let Some((_, member)) = claude_index_path_family_member(&candidate.path) else {
+        return Ok(None);
+    };
+    let groups = page
+        .twin_groups()
+        .get_or_init(|| claude_history_upgrade::claude_path_twin_groups(index, &BTreeSet::new()));
+    let Some(keys) = groups.get(&member) else {
+        return Ok(None);
+    };
+    let key = local_index_key(&candidate.path);
+    let mut twins = Vec::new();
+    let mut total = candidate.size_bytes;
+    let mut old_bytes = 0u64;
+    let mut has_large = is_large(candidate);
+    for (other, stored_size) in keys {
+        if *other == key {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(other) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            _ if has_large => return Err(()), // Unknown membership earns no exception.
+            _ => return Ok(None),             // Ordinary small twins retain their existing policy.
+        };
+        let bytes = metadata.len();
+        has_large |= bytes > LARGE_FULL_BYTES;
+        total = total.checked_add(bytes).ok_or(())?;
+        // Check live native sizes, never stale indexed sizes alone.
+        if has_large && total > body_witness_adoption_byte_budget() {
+            return Err(());
+        }
+        old_bytes = old_bytes.checked_add(stored_size.unwrap_or(0)).ok_or(())?;
+        twins.push((other.clone(), bytes));
+    }
+    Ok((has_large && !twins.is_empty()).then_some(Group {
+        member,
+        twins,
+        old_bytes,
+    }))
+}
+
 pub(super) fn admit(
     index: &mut ScanIndex,
     candidate: &CandidateFile,
     full: bool,
-    started: &mut bool,
+    unit: &mut Pass,
+    page: &mut HistoryPage,
 ) -> bool {
     let key = local_index_key(&candidate.path);
-    if full && is_large(candidate) {
-        if *started {
-            let traversal = index.traversal.as_mut().expect("active Claude traversal");
-            if let Some(pending) = traversal
-                .pending_candidates
-                .iter_mut()
-                .find(|pending| pending.path == candidate.path)
-            {
-                pending.census_member = true;
-            } else {
-                traversal.pending_candidates.push_back(ScanTraversalPath {
-                    scan_root: candidate.scan_root.clone(),
-                    path: candidate.path.clone(),
-                    // Even a previously processed hinted/audited path holds
-                    // this generation open until its scheduled read happens.
-                    census_member: true,
-                    watcher_hint: false,
-                });
+    let admitted = if !full {
+        true
+    } else {
+        match twin_group(index, candidate, page) {
+            Err(()) => false,
+            Ok(Some(Group {
+                member,
+                twins,
+                old_bytes,
+            })) => {
+                if unit.as_ref().is_some_and(|current| current != &member) {
+                    false
+                } else if unit.is_some() {
+                    true
+                } else if page.reserve_large_full_group(
+                    &key,
+                    candidate.size_bytes,
+                    twins,
+                    old_bytes,
+                ) {
+                    *unit = Some(member);
+                    true
+                } else {
+                    false
+                }
             }
-            if let Some(slot) = index
-                .held_audit_progress
-                .as_mut()
-                .filter(|slot| slot.key == key)
-            {
-                // Queueing was not an audit attempt. Keep its original turn
-                // and deadline until native acquisition can actually start.
-                slot.attempted = false;
-                slot.large_full_deferred = true;
+            Ok(None) if is_large(candidate) => {
+                if unit.is_some() {
+                    false
+                } else {
+                    *unit = Some(key.clone());
+                    true
+                }
             }
-            if !index.claude_large_full_deferred.contains(&key) {
-                index.claude_large_full_deferred.push_back(key);
-            }
-            return false;
+            Ok(None) => true,
         }
-        *started = true;
+    };
+    if !admitted {
+        let traversal = index.traversal.as_mut().expect("active Claude traversal");
+        if let Some(pending) = traversal
+            .pending_candidates
+            .iter_mut()
+            .find(|pending| pending.path == candidate.path)
+        {
+            pending.census_member = true;
+        } else {
+            traversal.pending_candidates.push_back(ScanTraversalPath {
+                scan_root: candidate.scan_root.clone(),
+                path: candidate.path.clone(),
+                // Even a previously processed hinted/audited path holds
+                // this generation open until its scheduled read happens.
+                census_member: true,
+                watcher_hint: false,
+            });
+        }
+        if let Some(slot) = index
+            .held_audit_progress
+            .as_mut()
+            .filter(|slot| slot.key == key)
+        {
+            // Queueing was not an audit attempt. Keep its original turn
+            // and deadline until native acquisition can actually start.
+            slot.attempted = false;
+            slot.large_full_deferred = true;
+        }
+        if !index.claude_large_full_deferred.contains(&key) {
+            index.claude_large_full_deferred.push_back(key);
+        }
+        return false;
     }
     index.claude_large_full_deferred.remove(&key);
     if let Some(slot) = index

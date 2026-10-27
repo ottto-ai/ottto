@@ -679,12 +679,13 @@ mod tests {
         scan.index.held_audit_progress.as_mut().unwrap().attempted = true;
         // The actual file grew, while committed metadata is still small.
         scan.index.files.get_mut(&held_key).unwrap().size_bytes = 1;
-        let mut full_spent = true;
+        let mut full_spent = Some("older-unit".to_owned());
         assert!(!claude_large_full::admit(
             &mut scan.index,
             &candidate,
             true,
-            &mut full_spent
+            &mut full_spent,
+            &mut HistoryPage::default()
         ));
         assert!(!scan.index.held_audit_progress.as_ref().unwrap().attempted);
         assert_eq!(
@@ -726,12 +727,13 @@ mod tests {
             "source"
         );
 
-        let mut fresh_allowance = false;
+        let mut fresh_allowance = None;
         assert!(claude_large_full::admit(
             &mut scan.index,
             &candidate,
             true,
-            &mut fresh_allowance
+            &mut fresh_allowance,
+            &mut HistoryPage::default()
         ));
         assert!(
             !scan
