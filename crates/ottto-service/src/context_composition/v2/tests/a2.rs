@@ -1,366 +1,17 @@
-//! Daily run health, the audit sample and the upload metrics.
+//! Daily run health and upload metrics.
 
-use super::super::audit::{self, AuditRun};
 use super::super::checkpoint::Backlog;
-use super::super::harvest::tests::{set_cut_audit, set_skew_forward};
 use super::super::health::{self, HealthEntry, HealthLog, HealthPoster, PostCounts, WorkerCounts};
 use super::*;
-use crate::composition_kinds::Part;
-
-impl Env {
-    /// One run with an audit allowance; the rotation is kept in `audit`.
-    fn run_audited(
-        &self,
-        source: Source,
-        now: OffsetDateTime,
-        audit: &mut AuditRun,
-    ) -> SourceStats {
-        self.run_audited_with(source, now, audit, None)
-    }
-
-    fn run_audited_with(
-        &self,
-        source: Source,
-        now: OffsetDateTime,
-        audit: &mut AuditRun,
-        capture: Option<&mut dyn Uploader>,
-    ) -> SourceStats {
-        let mut resolver = FolderResolver::default();
-        let mut run = Run {
-            start_verdicts: Default::default(),
-            state_dir: self.state.clone(),
-            now,
-            deadline: Instant::now() + Duration::from_secs(120),
-            resolver: &mut resolver,
-            repair_left: REPAIR_BYTES_PER_DAY,
-            audit: std::mem::take(audit),
-        };
-        let target = capture.map(|uploader| UploadTarget {
-            uploader,
-            machine_id: "machine-test",
-            destination: "device|machine|api",
-            labels_enabled: true,
-            details_enabled: false,
-        });
-        fs::create_dir_all(&self.root).unwrap();
-        let stats = run_source(&mut run, source, std::slice::from_ref(&self.root), target);
-        *audit = std::mem::take(&mut run.audit);
-        stats
-    }
-}
-
-fn full_budget() -> AuditRun {
-    AuditRun::with_budget(AUDIT_BYTES_PER_DAY, BTreeMap::new())
-}
 
 /// A file created after the install, so its first run reads it whole as
-/// new bytes; appended and read forward, it is eligible for the audit.
+/// new bytes.
 fn whole_file(env: &Env, name: &str, now: OffsetDateTime) -> PathBuf {
     let cwd = env.cwd();
     let path = env.root.join(format!("p/{name}.jsonl"));
     let n = name.bytes().map(u32::from).sum::<u32>() % 9 + 1;
     write_records(&path, &claude_turn(&cwd, now.date(), n));
     path
-}
-
-#[test]
-fn audit_rereads_a_whole_file_and_keeps_matching_numbers() {
-    let env = Env::new("composition-a2-audit-match");
-    let now = base_now();
-    let path = whole_file(&env, "a", now);
-    let first = env.run(Source::Claude, now, None);
-    assert_eq!(
-        (first.bytes_new, first.bytes_repair),
-        (fs::metadata(&path).unwrap().len(), 0),
-        "read whole as new bytes"
-    );
-    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
-    let second = env.run(Source::Claude, now + time::Duration::hours(1), None);
-    assert!(second.bytes_new > 0);
-    let before = env.scope(Source::Claude);
-    let checkpoint = before.files.values().next().unwrap().clone();
-    assert_eq!(checkpoint.origin, Some(0));
-    // Request 1 closed under the verdict it was counted with.
-    assert_eq!(checkpoint.parse.request1_verdict(), Some(false));
-
-    let mut audit = full_budget();
-    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut audit);
-    let size = fs::metadata(&path).unwrap().len();
-    assert_eq!(stats.audit_files, 1);
-    assert_eq!(stats.bytes_audit, size);
-    assert_eq!(stats.audit_differences, 0);
-    // Nothing else is read and nothing commits for a matching sample.
-    assert_eq!(
-        (stats.bytes_new, stats.bytes_repair, stats.files_read),
-        (0, 0, 0)
-    );
-    assert_eq!(stats.scopes_committed, 0);
-    assert_eq!(
-        audit.left,
-        AUDIT_BYTES_PER_DAY - audit::read_allowance(size)
-    );
-    let after = env.scope(Source::Claude);
-    assert_eq!(after.generation, before.generation);
-    assert_eq!(after.agg.days, before.agg.days);
-    env.cleanup();
-}
-
-#[test]
-fn audit_samples_files_created_after_install_and_recovers_their_pins() {
-    let env = Env::new("composition-a2-audit-new-file");
-    let now = base_now();
-    env.run(Source::Claude, now, None);
-
-    let next = now + time::Duration::days(1);
-    let path = whole_file(&env, "new", next);
-    let size = fs::metadata(&path).unwrap().len();
-    // Commit the new file, but stop before its pin is saved. Recovery must
-    // keep its whole-file origin so it can be audited without counting twice.
-    harvest::tests::set_crash_after(Some(1));
-    let first = env.run(Source::Claude, next, None);
-    harvest::tests::set_crash_after(None);
-    assert_eq!((first.bytes_new, first.bytes_repair), (size, 0));
-    assert_eq!(first.scopes_committed, 1);
-    let before = env.scope(Source::Claude);
-    assert_eq!(before.files.values().next().unwrap().origin, Some(0));
-
-    let mut audit = full_budget();
-    let stats = env.run_audited(Source::Claude, next + time::Duration::hours(1), &mut audit);
-    assert_eq!(stats.pins_rebuilt, 1);
-    assert_eq!((stats.audit_files, stats.bytes_audit), (1, size));
-    assert_eq!((stats.audit_differences, stats.audit_skipped), (0, 0));
-    assert_eq!((stats.bytes_new, stats.bytes_repair), (0, 0));
-    assert_eq!(stats.scopes_committed, 0);
-    let after = env.scope(Source::Claude);
-    assert_eq!(after.generation, before.generation);
-    assert_eq!(after.agg.days, before.agg.days);
-    assert_eq!(
-        audit.left,
-        AUDIT_BYTES_PER_DAY - audit::read_allowance(size)
-    );
-    env.cleanup();
-}
-
-#[test]
-fn audit_difference_replaces_the_file_share_and_counts_it() {
-    let env = Env::new("composition-a2-audit-replace");
-    let control = Env::new("composition-a2-audit-control");
-    let now = base_now();
-    let path = whole_file(&env, "a", now);
-    env.run(Source::Claude, now, None);
-    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
-    // A faulty forward read counts 1000 tokens its lines do not hold.
-    set_skew_forward(Some(&path), 1000);
-    env.run(Source::Claude, now + time::Duration::hours(1), None);
-    set_skew_forward(None, 0);
-    let skewed = env.scope(Source::Claude);
-
-    // The same transcript read whole in one piece.
-    let same = control.root.join("p/a.jsonl");
-    fs::create_dir_all(same.parent().unwrap()).unwrap();
-    let text = fs::read_to_string(&path).unwrap();
-    fs::write(&same, text.replace(&env.cwd(), &control.cwd())).unwrap();
-    control.run(Source::Claude, now, None);
-    let truth = control.scope(Source::Claude).agg.days;
-    assert_eq!(total_tokens(&skewed.agg), total_tokens_of(&truth) + 1000);
-
-    let mut audit = full_budget();
-    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut audit);
-    assert_eq!(stats.audit_files, 1);
-    assert_eq!(stats.audit_differences, 1);
-    assert_eq!(stats.scopes_committed, 1);
-    let fixed = env.scope(Source::Claude);
-    // The sample's own result replaced the file's share: no second read.
-    assert_eq!(fixed.agg.days, truth);
-    assert_eq!(stats.bytes_audit, fs::metadata(&path).unwrap().len());
-    assert_eq!((stats.bytes_new, stats.bytes_repair), (0, 0));
-
-    // The replaced file now matches on its next sample.
-    let mut audit = full_budget();
-    let again = env.run_audited(Source::Claude, now + time::Duration::hours(3), &mut audit);
-    assert_eq!((again.audit_files, again.audit_differences), (1, 0));
-    env.cleanup();
-    control.cleanup();
-}
-
-fn total_tokens_of(days: &BTreeMap<(Day, Kind), super::super::aggregate::Bucket>) -> u64 {
-    days.values().map(|bucket| bucket.tokens).sum()
-}
-
-#[test]
-fn audit_stays_within_budget_and_rotates_through_every_file() {
-    let env = Env::new("composition-a2-audit-rotation");
-    let now = base_now();
-    let paths: Vec<PathBuf> = ["a", "b", "c"]
-        .iter()
-        .map(|name| whole_file(&env, name, now))
-        .collect();
-    env.run(Source::Claude, now, None);
-    let size = fs::metadata(&paths[0]).unwrap().len();
-    assert!(paths
-        .iter()
-        .all(|path| fs::metadata(path).unwrap().len() == size));
-
-    let allowance = audit::read_allowance(size);
-    // A day's budget for two complete audits, including auxiliary reads.
-    let mut sampled = BTreeSet::new();
-    let mut audit = AuditRun::with_budget(2 * allowance + 1, BTreeMap::new());
-    harvest::tests::AUDIT_READ_BYTES.with(|bytes| bytes.set(0));
-    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(1), &mut audit);
-    let actual = harvest::tests::AUDIT_READ_BYTES.with(|bytes| bytes.get());
-    assert!(
-        actual > stats.bytes_audit,
-        "includes head and fingerprint reads"
-    );
-    assert!(actual <= 2 * allowance + 1, "combined audit I/O: {actual}");
-    assert!(actual <= AUDIT_BYTES_PER_DAY);
-    assert_eq!(stats.audit_files, 2);
-    assert!(stats.bytes_audit + stats.bytes_head <= 2 * allowance + 1);
-    assert_eq!(audit.left, 1);
-    sampled.insert(audit.after["claude-code"].clone());
-
-    // Too little budget for any file: no read, the cursor stays.
-    let cursor = audit.after.clone();
-    let mut short = AuditRun::with_budget(allowance - 1, cursor.clone());
-    let none = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut short);
-    assert_eq!((none.audit_files, none.bytes_audit), (0, 0));
-    assert_eq!(short.after, cursor);
-
-    // The next day starts after the last pick: the third file, then around.
-    let mut next = AuditRun::with_budget(allowance, cursor);
-    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(3), &mut next);
-    assert_eq!(stats.audit_files, 1);
-    sampled.insert(next.after["claude-code"].clone());
-    let mut wrap = AuditRun::with_budget(allowance, next.after.clone());
-    env.run_audited(Source::Claude, now + time::Duration::hours(4), &mut wrap);
-    sampled.insert(wrap.after["claude-code"].clone());
-    assert_eq!(sampled.len(), 3, "every file sampled in turn");
-    env.cleanup();
-}
-
-#[test]
-fn audit_never_samples_files_counted_from_the_middle_or_changed() {
-    let env = Env::uninstalled("composition-a2-audit-eligible");
-    let now = base_now();
-    let cwd = env.cwd();
-    // Old at install: counting starts at its end, so it is never sampled.
-    let old = env.root.join("p/old.jsonl");
-    write_records(&old, &claude_turn(&cwd, now.date(), 1));
-    let old_time = std::time::SystemTime::now() - Duration::from_secs(40 * 24 * 3600);
-    File::options()
-        .write(true)
-        .open(&old)
-        .unwrap()
-        .set_modified(old_time)
-        .unwrap();
-    env.run(Source::Claude, now - time::Duration::days(1), None);
-    let live = whole_file(&env, "live", now);
-    env.run(Source::Claude, now, None);
-    append_records(&old, &claude_turn(&cwd, now.date(), 2));
-    env.run(Source::Claude, now + time::Duration::hours(1), None);
-
-    // The live file grew since its commit: it is read forward, not sampled.
-    append_records(&live, &claude_turn(&cwd, now.date(), 3));
-    let mut audit = full_budget();
-    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut audit);
-    assert_eq!(stats.audit_files, 0);
-    assert_eq!(audit.left, AUDIT_BYTES_PER_DAY);
-    assert!(stats.bytes_new > 0);
-    env.cleanup();
-}
-
-fn eligible_checkpoint() -> Checkpoint {
-    let state = ParseState {
-        session: "s".into(),
-        request1_closed: true,
-        request1_start_measured: Some(true),
-        ..Default::default()
-    };
-    Checkpoint {
-        path: String::new(),
-        dev: 0,
-        ino: 0,
-        created: 0,
-        offset: 100,
-        skipping: false,
-        head: Default::default(),
-        tail: Default::default(),
-        size: 100,
-        mtime: (0, 0),
-        parser_version: PARSER_VERSION.to_string(),
-        status: Status::Live,
-        parse: StoredParse::from_state(&state),
-        contribution: Default::default(),
-        last_seen: 0,
-        cold: None,
-        origin: Some(0),
-    }
-}
-
-#[test]
-fn audit_eligibility_needs_a_whole_read_under_this_parser_and_a_recorded_verdict() {
-    let base = eligible_checkpoint();
-    assert_eq!(audit::eligible(&base, 100), Some(true));
-    assert_eq!(audit::eligible(&base, 99), None, "over its reserved bytes");
-    let mut older = base.clone();
-    older.parser_version = "an-older-parser".into();
-    assert_eq!(audit::eligible(&older, 100), None);
-    let mut middle = base.clone();
-    middle.origin = Some(10);
-    assert_eq!(audit::eligible(&middle, 100), None);
-    let mut cold = base.clone();
-    cold.compact();
-    assert_eq!(audit::eligible(&cold, 100), None);
-    let mut done = base.clone();
-    done.status = Status::Done;
-    assert_eq!(audit::eligible(&done, 100), None);
-    let open = ParseState {
-        session: "s".into(),
-        request1_start_measured: Some(false),
-        ..Default::default()
-    };
-    let mut open_checkpoint = base.clone();
-    open_checkpoint.parse = StoredParse::from_state(&open);
-    assert_eq!(
-        audit::eligible(&open_checkpoint, 100),
-        None,
-        "request 1 still open"
-    );
-    let unrecorded = ParseState {
-        session: "s".into(),
-        request1_closed: true,
-        ..Default::default()
-    };
-    let mut unrecorded_checkpoint = base;
-    unrecorded_checkpoint.parse = StoredParse::from_state(&unrecorded);
-    assert_eq!(audit::eligible(&unrecorded_checkpoint, 100), None);
-}
-
-#[test]
-fn audit_compares_dated_contributions_per_day_and_kind() {
-    use super::super::aggregate::{Bucket, Contribution};
-    let slot = Slot::plain(Kind::CommandOutput, Part::Git);
-    let other = Slot::plain(Kind::CommandOutput, Part::Search);
-    let bucket = |tokens| Bucket {
-        events: 1,
-        tokens,
-        residency: 0,
-        images: 0,
-    };
-    let mut stored = Contribution::default();
-    stored.parts.insert((1, slot.clone()), bucket(10));
-    // Same kind and day, split over parts differently: no difference.
-    let mut split = Contribution::default();
-    split.parts.insert((1, other.clone()), bucket(10));
-    assert!(!audit::differs(Some(&stored), &split));
-    // Moving a dated contribution to another day is always a difference.
-    let mut moved = Contribution::default();
-    moved.parts.insert((2, slot.clone()), bucket(10));
-    assert!(audit::differs(Some(&stored), &moved));
-    let mut more = Contribution::default();
-    more.parts.insert((1, slot), bucket(11));
-    assert!(audit::differs(Some(&stored), &more));
-    assert!(audit::differs(None, &more));
 }
 
 // -------------------------------------------------------------------------
@@ -394,14 +45,12 @@ const SERVER_FIELDS: [&str; 20] = [
 fn sample_stats() -> SourceStats {
     SourceStats {
         files_checked: 9200,
-        audit_differences: 1,
         full_read_waiting_files: 3,
         full_read_backlog_bytes: 4096,
         bytes_new: 1000,
         bytes_repair: 200,
         bytes_head: 30,
         bytes_failed: 4,
-        bytes_audit: 500,
         cpu_micros: 2_600_000,
         wall_micros: 7_000_000,
         peak_accounted_bytes: 12345,
@@ -443,11 +92,11 @@ fn health_body_has_exactly_the_server_fields() {
             "run_date": "2026-10-22",
             "scan_completed_at": "2026-10-22T12:00:00Z",
             "files_checked": 9200,
-            "audit_differences": 1,
+            "audit_differences": 0,
             "full_read_waiting_files": 3,
             "full_read_backlog_bytes": 4096,
             "backlog_growth_days": 2,
-            "bytes_read": 1734,
+            "bytes_read": 1234,
             "cpu_seconds": 3,
             "duration_ms": 7000,
             "accounted_bytes": 12345,
@@ -587,7 +236,7 @@ fn health_carries_worker_counters_even_for_a_killed_run() {
     let claude = &poster.calls[0].1;
     assert_eq!(claude["scopes_quarantined"], 1);
     assert_eq!(claude["checkpoint_restarts"], 5);
-    assert_eq!(claude["audit_differences"], 1);
+    assert_eq!(claude["audit_differences"], 0);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -641,13 +290,7 @@ fn upload_metrics_count_payload_bytes_and_rows_written() {
     let now = base_now();
     whole_file(&env, "a", now);
     let mut receipts = Receipts::default();
-    let mut audit = AuditRun::default();
-    let stats = env.run_audited_with(
-        Source::Claude,
-        now,
-        &mut audit,
-        Some(&mut receipts as &mut dyn Uploader),
-    );
+    let stats = env.run(Source::Claude, now, Some(&mut receipts));
     assert_eq!(stats.uploaded, 1);
     assert_eq!(receipts.payloads, 1);
     assert_eq!(stats.upload_rows_written, 7);
@@ -731,76 +374,6 @@ fn run_health_client_sends_one_request_for_a_refusal() {
 }
 
 #[test]
-fn an_audit_cut_by_the_wall_cap_keeps_the_stored_share() {
-    let env = Env::new("composition-a2-audit-cut");
-    let now = base_now();
-    let path = whole_file(&env, "a", now);
-    env.run(Source::Claude, now, None);
-    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
-    set_skew_forward(Some(&path), 1000);
-    env.run(Source::Claude, now + time::Duration::hours(1), None);
-    set_skew_forward(None, 0);
-    let before = env.scope(Source::Claude);
-
-    // The re-read would differ, but it was cut: nothing is replaced.
-    set_cut_audit(Some(&path));
-    let mut audit = full_budget();
-    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut audit);
-    set_cut_audit(None);
-    assert_eq!((stats.audit_files, stats.audit_failed), (1, 1));
-    assert_eq!(stats.audit_differences, 0);
-    assert!(stats.cut);
-    assert_eq!(stats.scopes_committed, 0);
-    let after = env.scope(Source::Claude);
-    assert_eq!(after.generation, before.generation);
-    assert_eq!(after.agg.days, before.agg.days);
-    let checkpoint = |scope: &super::super::scope::Scope| {
-        let checkpoint = scope.files.values().next().unwrap();
-        (checkpoint.offset, total_share(checkpoint))
-    };
-    assert_eq!(checkpoint(&after), checkpoint(&before));
-    env.cleanup();
-}
-
-fn total_share(checkpoint: &Checkpoint) -> u64 {
-    checkpoint
-        .contribution
-        .clone()
-        .into_share()
-        .unwrap()
-        .parts
-        .values()
-        .map(|bucket| bucket.tokens)
-        .sum()
-}
-
-#[test]
-fn request_one_read_under_two_verdicts_is_never_audited() {
-    let mut state = ParseState {
-        session: "s".into(),
-        ..Default::default()
-    };
-    // A first read saw only the session header under one verdict; a later
-    // read counted request 1 under another.
-    state.note_request1_verdict(false);
-    state.note_request1_verdict(false);
-    state.request1_closed = true;
-    assert_eq!(
-        StoredParse::from_state(&state).request1_verdict(),
-        Some(false)
-    );
-    state.note_request1_verdict(true);
-    let stored = StoredParse::from_state(&state);
-    assert_eq!(stored.request1_verdict(), None);
-    // Kept across checkpoints.
-    let round = StoredParse::from_state(&stored.into_state().unwrap());
-    assert_eq!(round.request1_verdict(), None);
-    let mut checkpoint = eligible_checkpoint();
-    checkpoint.parse = round;
-    assert_eq!(audit::eligible(&checkpoint, 100), None);
-}
-
-#[test]
 fn health_for_another_destination_is_dropped_unsent() {
     let dir = scratch("composition-a2-health-destination");
     let day = day_of(base_now().date());
@@ -853,47 +426,6 @@ fn backlog_counts_a_waiting_file_at_its_current_size() {
     assert!(grown > first.full_read_backlog_bytes);
     assert_eq!(second.full_read_waiting_files, 1);
     assert_eq!(second.full_read_backlog_bytes, grown);
-    env.cleanup();
-}
-
-#[test]
-fn audit_leaves_files_idle_long_enough_to_go_cold() {
-    let env = Env::new("composition-a2-audit-cold-age");
-    let now = base_now();
-    let path = whole_file(&env, "a", now);
-    env.run(Source::Claude, now, None);
-    // Last written three days before the next run: its share is (or is
-    // about to be) dropped, so it could not be replaced.
-    let idle = std::time::SystemTime::UNIX_EPOCH
-        + Duration::from_secs((now.unix_timestamp() - 3 * 86_400) as u64);
-    File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_modified(idle)
-        .unwrap();
-    env.run(Source::Claude, now + time::Duration::hours(1), None);
-    let mut audit = full_budget();
-    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut audit);
-    assert_eq!((stats.audit_files, stats.audit_skipped), (0, 0));
-    assert_eq!(audit.left, AUDIT_BYTES_PER_DAY);
-    env.cleanup();
-}
-
-#[test]
-fn audit_file_cap_is_shared_by_the_agents() {
-    let env = Env::new("composition-a2-audit-file-cap");
-    let now = base_now();
-    for name in ["a", "b", "c"] {
-        whole_file(&env, name, now);
-    }
-    env.run(Source::Claude, now, None);
-    // The other agent already used all but one of today's picks.
-    let mut audit = full_budget();
-    audit.files = AUDIT_FILES_PER_DAY - 1;
-    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(1), &mut audit);
-    assert_eq!(stats.audit_files, 1);
-    assert_eq!(audit.files, AUDIT_FILES_PER_DAY);
     env.cleanup();
 }
 
@@ -980,148 +512,6 @@ fn run_health_client_bounds_a_stalled_response() {
         elapsed < Duration::from_secs(2),
         "health deadline took {elapsed:?}"
     );
-}
-
-#[test]
-fn an_unrecorded_opening_prefix_stays_ineligible_after_a_forward_read() {
-    let env = Env::new("composition-audit-old-verdict");
-    let now = base_now();
-    let path = env.root.join("p/a.jsonl");
-    write_records(
-        &path,
-        &[
-            json!({"type":"user","sessionId":"s1","cwd":env.cwd(),"timestamp":ts(now.date(),1),"message":{"content":"opening instructions"}}),
-        ],
-    );
-    env.run(Source::Claude, now, None);
-    let mut scope = env.scope(Source::Claude);
-    let (key, checkpoint) = scope.files.iter_mut().next().unwrap();
-    let shard = super::super::scope::shard_id(key);
-    let mut old = serde_json::to_value(&checkpoint.parse).unwrap();
-    old.as_object_mut()
-        .unwrap()
-        .remove("request1_start_measured");
-    old.as_object_mut()
-        .unwrap()
-        .remove("request1_verdict_mixed");
-    checkpoint.parse = serde_json::from_value(old).unwrap();
-    assert_eq!(checkpoint.parse.request1_verdict(), None);
-    let manifest = scope_path(&env.state, Source::Claude, &scope.scope_id);
-    scope
-        .save_shard(&manifest, shard, scope.generation)
-        .unwrap();
-    super::super::scope::save_scope(&manifest, Source::Claude, &scope).unwrap();
-    append_records(
-        &path,
-        &[
-            json!({"type":"assistant","sessionId":"s1","timestamp":ts(now.date(),2),"message":{"id":"m"}}),
-        ],
-    );
-    env.run(Source::Claude, now + time::Duration::hours(1), None);
-    let resumed = env.scope(Source::Claude);
-    let checkpoint = resumed.files.values().next().unwrap();
-    assert!(
-        checkpoint
-            .parse
-            .clone()
-            .into_state()
-            .unwrap()
-            .request1_closed
-    );
-    assert_eq!(checkpoint.parse.request1_verdict(), None);
-    let mut audit = full_budget();
-    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(2), &mut audit);
-    assert_eq!(
-        (stats.audit_files, stats.bytes_audit, stats.audit_skipped),
-        (0, 0, 1)
-    );
-    assert_eq!(env.scope(Source::Claude).agg, resumed.agg);
-    env.cleanup();
-}
-
-#[test]
-fn audit_does_not_restore_expired_undated_records() {
-    let env = Env::new("composition-audit-expired-undated");
-    let now = base_now();
-    let path = env.root.join("p/a.jsonl");
-    write_records(
-        &path,
-        &[
-            json!({"type":"user","sessionId":"s1","cwd":env.cwd(),"message":{"content":"undated opening"}}),
-            json!({"type":"assistant","sessionId":"s1","timestamp":ts(now.date(),1),"message":{"id":"m"}}),
-        ],
-    );
-    env.run(Source::Claude, now, None);
-    let later = now + time::Duration::days(93);
-    append_records(&path, &claude_turn(&env.cwd(), later.date(), 2));
-    File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_modified(
-            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(later.unix_timestamp() as u64),
-        )
-        .unwrap();
-    env.run(Source::Claude, later, None);
-    let before = env.scope(Source::Claude);
-    let mut audit = full_budget();
-    let stats = env.run_audited(Source::Claude, later + time::Duration::hours(1), &mut audit);
-    assert_eq!(
-        (
-            stats.audit_files,
-            stats.audit_skipped,
-            stats.audit_differences
-        ),
-        (1, 1, 0)
-    );
-    assert_eq!(stats.audit_skipped_undated, 1);
-    assert_eq!(stats.scopes_committed, 0);
-    let after = env.scope(Source::Claude);
-    assert_eq!(after.generation, before.generation);
-    assert_eq!(after.agg, before.agg);
-    assert_eq!(stats.bytes_audit, fs::metadata(&path).unwrap().len());
-    env.cleanup();
-}
-
-#[test]
-fn audit_mixed_dated_and_undated_contributions_never_move_days() {
-    let env = Env::new("composition-audit-mixed-days");
-    let now = base_now();
-    let path = env.root.join("p/a.jsonl");
-    write_records(
-        &path,
-        &[
-            json!({"type":"user","sessionId":"s1","cwd":env.cwd(),"message":{"content":"undated opening"}}),
-            json!({"type":"assistant","sessionId":"s1","timestamp":ts(now.date(),1),"message":{"id":"m"}}),
-        ],
-    );
-    env.run(Source::Claude, now, None);
-    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
-    // Force a total difference too: this must still never permit replacement.
-    set_skew_forward(Some(&path), 1000);
-    env.run(Source::Claude, now + time::Duration::hours(1), None);
-    set_skew_forward(None, 0);
-    let before = env.scope(Source::Claude);
-    assert!(total_tokens(&before.agg) > 1000);
-    let checkpoints = serde_json::to_value(&before.files).unwrap();
-    for days in [1, 2] {
-        let later = now + time::Duration::days(days);
-        let mut audit = full_budget();
-        let stats = env.run_audited(Source::Claude, later, &mut audit);
-        assert_eq!((stats.audit_files, stats.audit_skipped_undated), (1, 1));
-        assert!(stats.lines.undated > 0);
-        assert_eq!((stats.audit_differences, stats.scopes_committed), (0, 0));
-        let after = env.scope(Source::Claude);
-        assert_eq!(after.agg, before.agg, "no dated or undated day moves");
-        assert_eq!(after.generation, before.generation);
-        assert_eq!(serde_json::to_value(&after.files).unwrap(), checkpoints);
-        assert!(!after
-            .agg
-            .days
-            .keys()
-            .any(|(day, _)| *day == day_of(later.date())));
-    }
-    env.cleanup();
 }
 
 fn health_device() -> ottto_core::LocalDeviceBinding {
@@ -1365,45 +755,138 @@ fn health_fresh_org_opt_out_removes_the_attempt_before_parent_post() {
 }
 
 #[test]
-fn audit_daily_cap_includes_full_identity_head_and_all_fingerprint_reads() {
-    use std::io::{Seek, SeekFrom};
-    let env = Env::new("composition-audit-total-read-cap");
+fn old_audit_state_loads_without_reset_and_omits_removed_keys() {
+    let env = Env::new("composition-old-audit-state");
     let now = base_now();
-    let mut sample_bytes = 0;
-    for name in ["a", "b", "c"] {
-        let path = env.root.join(format!("p/{name}.jsonl"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut file = File::create(&path).unwrap();
-        // Sparse oversized line: no early identity, so each audit must pay
-        // for its entire 8 MiB head probe as well as the full sample.
-        file.write_all(format!("{}\n", json!({"type":"progress","cwd":env.cwd()})).as_bytes())
-            .unwrap();
-        file.set_len(32 * 1024 * 1024).unwrap();
-        file.seek(SeekFrom::End(0)).unwrap();
-        file.write_all(b"\n").unwrap();
-        file.write_all(body(&claude_turn(&env.cwd(), now.date(), 1)).as_bytes())
-            .unwrap();
-        sample_bytes += file.metadata().unwrap().len();
-    }
-    assert!(sample_bytes > 100_000_000);
-    env.run(Source::Claude, now, None);
-    let mut audit = full_budget();
-    harvest::tests::AUDIT_READ_BYTES.with(|bytes| bytes.set(0));
-    let stats = env.run_audited(Source::Claude, now + time::Duration::hours(1), &mut audit);
-    let actual = harvest::tests::AUDIT_READ_BYTES.with(|bytes| bytes.get());
+    whole_file(&env, "a", now);
+    assert_eq!(env.run(Source::Claude, now, None).new_files, 1);
+    let scope = env.scope(Source::Claude);
+    let checkpoint = scope.files.values().next().unwrap();
+    let expected = serde_json::to_value(checkpoint).unwrap();
+    let mut old = expected.clone();
+    old["origin"] = json!(0);
+    old["parse"]["request1_start_measured"] = json!(true);
+    old["parse"]["request1_verdict_mixed"] = json!(false);
+    let loaded: Checkpoint = serde_json::from_value(old).unwrap();
+    assert!(loaded.ids_known());
+    assert!(loaded.parse.clone().into_state().is_some());
+    assert_eq!(serde_json::to_value(&loaded).unwrap(), expected);
+    assert_eq!(loaded.parser_version, PARSER_VERSION);
+    let pin = read_index(&env.state, Source::Claude)
+        .files
+        .into_values()
+        .next()
+        .unwrap();
+    let expected = serde_json::to_value(&pin).unwrap();
+    let mut old = expected.clone();
+    old["origin"] = json!(0);
+    let loaded: super::super::checkpoint::Pin = serde_json::from_value(old).unwrap();
+    assert_eq!(serde_json::to_value(loaded).unwrap(), expected);
+
+    let day = day_of(now.date());
+    let old = json!({
+        "schema": STATE_SCHEMA, "last_run_day": day,
+        "last_run_started": now.unix_timestamp(),
+        "repair_day": day, "repair_used": 123,
+        "audit_day": day, "audit_used": 456, "audit_after": {"claude-code": "a"},
+        "backlog": {"claude-code": {"day": day, "bytes": 789, "growth_days": 2}}
+    });
+    super::super::checkpoint::write_json(&env.state.join("run.json"), &old).unwrap();
+    let loaded: super::super::checkpoint::RunRecord = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!((loaded.schema, loaded.repair_used), (STATE_SCHEMA, 123));
+    assert_eq!(loaded.last_run_started, Some(now.unix_timestamp()));
+    assert!(begin_run(&env.state, now).unwrap().is_none());
+    let loaded = begin_run(&env.state, now + time::Duration::days(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!((loaded.repair_day, loaded.repair_used), (day + 1, 0));
+    assert_eq!(loaded.last_run_day, Some(day + 1));
     assert_eq!(
-        stats.audit_files, 2,
-        "third sample cannot fit with its overhead"
+        serde_json::to_value(&loaded.backlog).unwrap(),
+        old["backlog"]
     );
-    assert!(
-        actual > stats.bytes_audit + 16 * 1024 * 1024,
-        "head and both fingerprint passes: {actual}"
-    );
-    assert!(
-        actual <= AUDIT_BYTES_PER_DAY,
-        "combined audit reads: {actual}"
-    );
-    assert!(actual <= AUDIT_BYTES_PER_DAY - audit.left);
-    assert!(audit.left > 0);
+    let saved = serde_json::to_value(loaded).unwrap();
+    for key in ["audit_day", "audit_used", "audit_after"] {
+        assert!(saved.get(key).is_none());
+    }
     env.cleanup();
+}
+
+#[test]
+fn unchanged_warm_files_read_zero_transcript_bytes_the_next_day() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new(&format!("composition-no-daily-reread-{source:?}"));
+        let now = base_now();
+        let (path, _) = write_session(&env, source, "a", now.date());
+        let stats = env.run(source, now, None);
+        assert_eq!(
+            (stats.new_files, stats.bytes_new),
+            (1, fs::metadata(path).unwrap().len())
+        );
+        let before = env.scope(source);
+        let checkpoint = before.files.values().next().unwrap();
+        assert!(checkpoint.cold.is_none());
+        assert!(
+            checkpoint
+                .parse
+                .clone()
+                .into_state()
+                .unwrap()
+                .request1_closed
+        );
+        assert!(!checkpoint
+            .contribution
+            .clone()
+            .into_share()
+            .unwrap()
+            .parts
+            .is_empty());
+        super::super::checkpoint::TRANSCRIPT_BYTES.with(|bytes| bytes.set(0));
+        let stats = env.run(source, now + time::Duration::days(1), None);
+        assert_eq!(
+            super::super::checkpoint::TRANSCRIPT_BYTES.with(|bytes| bytes.get()),
+            0
+        );
+        assert_eq!(
+            (
+                stats.bytes_new + stats.bytes_repair + stats.bytes_head,
+                stats.scopes_committed
+            ),
+            (0, 0)
+        );
+        let after = env.scope(source);
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.agg, before.agg);
+        env.cleanup();
+    }
+}
+
+#[test]
+fn pending_old_health_keeps_positive_audit_differences_and_posts_once() {
+    let dir = scratch("composition-old-audit-health");
+    let day = day_of(base_now().date());
+    let old = json!({
+        "schema": STATE_SCHEMA, "run_day": day, "destination": "device|machine|api",
+        "posted": false, "entries": [{"agent_source": "claude-code", "finished": true,
+            "scan_completed_at": base_now().unix_timestamp(), "audit_differences": 7, "bytes_read": 1734}]
+    });
+    super::super::checkpoint::write_json(&dir.join("health.json"), &old).unwrap();
+    let record = health::take_pending(&dir, day + 1).unwrap();
+    assert_eq!(record.entries[0].audit_differences, 7);
+    let mut poster = Poster::default();
+    assert_eq!(
+        health::send(
+            &record,
+            "device|machine|api",
+            "machine-test",
+            WorkerCounts::default(),
+            &mut poster
+        ),
+        PostCounts { sent: 1, failed: 0 }
+    );
+    assert_eq!(poster.calls.len(), 1);
+    assert_eq!(poster.calls[0].1["audit_differences"], 7);
+    assert_eq!(poster.calls[0].1["bytes_read"], 1734);
+    assert!(health::take_pending(&dir, day + 1).is_none());
+    fs::remove_dir_all(dir).unwrap();
 }

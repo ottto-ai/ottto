@@ -517,12 +517,6 @@ type ScaleResults = Vec<(Source, SourceStats, Counting)>;
 
 fn run_both(layout: &Layout, now: OffsetDateTime) -> ScaleResults {
     let mut out = Vec::new();
-    // The daily audit sample, shared by the agents as in a daily run.
-    let mut audit = if std::env::var_os("COMPOSITION_SCALE_AUDIT").is_some() {
-        super::super::audit::AuditRun::with_budget(AUDIT_BYTES_PER_DAY, BTreeMap::new())
-    } else {
-        Default::default()
-    };
     for (source, root) in [
         (Source::Claude, layout.claude()),
         (Source::Codex, layout.codex()),
@@ -536,7 +530,6 @@ fn run_both(layout: &Layout, now: OffsetDateTime) -> ScaleResults {
             deadline: Instant::now() + RUN_WALL_CAP,
             resolver: &mut resolver,
             repair_left: REPAIR_BYTES_PER_DAY,
-            audit: std::mem::take(&mut audit),
         };
         let mut counting = Counting::default();
         let target = UploadTarget {
@@ -561,7 +554,6 @@ fn run_both(layout: &Layout, now: OffsetDateTime) -> ScaleResults {
         } else {
             scan()
         };
-        audit = std::mem::take(&mut run.audit);
         out.push((source, stats, counting));
     }
     out
@@ -621,8 +613,7 @@ fn report(
         println!(
             "[{phase}] {}: bytes_new_mib={:.1} bytes_repair_mib={:.1} files_read={} lines={} cpu_s={:.2} wall_s={:.2} \
              peak_accounted_mib={:.1} state_written_mib={:.2} scopes_committed={} uploads={} upload_kib={:.1} \
-             unnamed_files={} name_lookups_skipped={} cut={} bytes_audit_mib={:.1} audit_files={} \
-             audit_differences={} audit_skipped={}",
+             unnamed_files={} name_lookups_skipped={} cut={}",
             source.label(),
             stats.bytes_new as f64 / 1048576.0,
             stats.bytes_repair as f64 / 1048576.0,
@@ -638,10 +629,6 @@ fn report(
             stats.lines.unnamed_files,
             stats.name_lookups_skipped,
             stats.cut,
-            stats.bytes_audit as f64 / 1048576.0,
-            stats.audit_files,
-            stats.audit_differences,
-            stats.audit_skipped,
         );
     }
     for (name, (bytes, _)) in state_files(layout) {

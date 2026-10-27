@@ -904,7 +904,7 @@ impl Env {
         &self,
         source: Source,
         now: OffsetDateTime,
-        capture: Option<&mut Capture>,
+        capture: Option<&mut dyn Uploader>,
     ) -> SourceStats {
         self.run_with(
             source,
@@ -919,7 +919,7 @@ impl Env {
         &self,
         source: Source,
         now: OffsetDateTime,
-        capture: Option<&mut Capture>,
+        capture: Option<&mut dyn Uploader>,
         repair_left: u64,
         resolver: &mut dyn ScopeResolver,
     ) -> SourceStats {
@@ -934,10 +934,9 @@ impl Env {
             deadline: Instant::now() + Duration::from_secs(120),
             resolver,
             repair_left,
-            audit: Default::default(),
         };
         let target = capture.map(|capture| UploadTarget {
-            uploader: capture as &mut dyn Uploader,
+            uploader: capture,
             machine_id: "machine-test",
             destination: "device|machine|api",
             labels_enabled: true,
@@ -1107,10 +1106,7 @@ fn fresh_opening_without_verdict_waits_then_reads_all_new_bytes() {
             let scope = env.scope(source);
             assert!(opening_tokens(&scope.agg) > 0);
             let checkpoint = scope.files.values().next().unwrap();
-            assert_eq!(
-                (checkpoint.origin, checkpoint.offset),
-                (Some(0), stats.bytes_new)
-            );
+            assert_eq!(checkpoint.offset, stats.bytes_new);
             assert_eq!(capture.payloads.len(), 1);
             // Late activity keeps its original day when read tomorrow.
             assert!(scope
@@ -1329,7 +1325,6 @@ fn opening_verdict_probe_respects_expired_deadline_and_keeps_new_bytes() {
             deadline,
             resolver: &mut resolver,
             repair_left: 0,
-            audit: Default::default(),
             start_verdicts: Default::default(),
         };
         let stats = run_source(&mut run, source, std::slice::from_ref(&env.root), None);
@@ -1507,10 +1502,7 @@ fn install_reads_nothing_from_files_still_being_written() {
                 .find(|pin| Path::new(&pin.path) == path.as_path())
                 .unwrap();
             let size = fs::metadata(path).unwrap().len();
-            assert_eq!(
-                (pin.start, pin.origin, pin.waiting),
-                (size, Some(size), false)
-            );
+            assert_eq!((pin.start, pin.waiting), (size, false));
         }
         assert!(index.scope_generations.is_empty(), "nothing counted");
 
@@ -1563,7 +1555,7 @@ fn file_created_after_install_is_read_from_its_start() {
                 .cloned()
         };
         let read = checkpoint(&born).unwrap();
-        assert_eq!((read.origin, read.offset), (Some(0), size));
+        assert_eq!(read.offset, size);
         assert!(checkpoint(&live).is_none(), "unchanged since install");
         env.cleanup();
     }
@@ -1623,10 +1615,14 @@ fn earlier_build_install_backlog_keeps_draining() {
         (0, 0)
     );
     let scope = env.scope(Source::Claude);
-    assert!(scope
-        .files
-        .values()
-        .all(|checkpoint| checkpoint.origin == Some(0)));
+    for path in [&older, &newer] {
+        let checkpoint = scope
+            .files
+            .values()
+            .find(|c| Path::new(&c.path) == path)
+            .unwrap();
+        assert_eq!(checkpoint.offset, fs::metadata(path).unwrap().len());
+    }
     assert_eq!(v2_rows(&scope.agg), whole_rows_of(&[&older, &newer]));
     env.cleanup();
 }
@@ -1641,7 +1637,6 @@ fn agent_reset_starts_files_still_being_written_at_their_end() {
     env.run(Source::Claude, now, None);
     // Still being written when the index is lost.
     append_records(&path, &claude_turn(&cwd, now.date(), 2));
-    let at_reset = fs::metadata(&path).unwrap().len();
     fs::remove_file(harvest::index_path(&env.state, Source::Claude)).unwrap();
     let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
     assert_eq!(
@@ -1670,10 +1665,7 @@ fn agent_reset_starts_files_still_being_written_at_their_end() {
         (body(std::slice::from_ref(&line)).len() as u64, 0, 0)
     );
     let checkpoint = &env.scope(Source::Claude).files["a.jsonl"];
-    assert_eq!(
-        (checkpoint.origin, checkpoint.offset),
-        (Some(at_reset), fs::metadata(&path).unwrap().len())
-    );
+    assert_eq!(checkpoint.offset, fs::metadata(&path).unwrap().len());
     env.cleanup();
 }
 
@@ -2424,7 +2416,6 @@ fn scope_key_is_stable_across_worktrees() {
             deadline: Instant::now() + Duration::from_secs(120),
             resolver,
             repair_left: REPAIR_BYTES_PER_DAY,
-            audit: Default::default(),
         };
         run_source(
             &mut run,
@@ -2928,7 +2919,6 @@ fn compaction_keeps_open_tokens_per_day_and_kind() {
         contribution: Default::default(),
         last_seen: 0,
         cold: None,
-        origin: None,
     };
     assert!(checkpoint.compact());
     let open: BTreeSet<(Day, Kind, Part, u64)> = checkpoint
@@ -3098,7 +3088,6 @@ fn earlier_build_install_backlog(env: &Env, source: Source, paths: &[&Path]) {
             .unwrap();
         assert!(pin.scope.is_none() && pin.start == pin.size && !pin.waiting);
         pin.start = 0;
-        pin.origin = Some(0);
         pin.waiting = true;
     }
     super::checkpoint::write_json(&harvest::index_path(&env.state, source), &index).unwrap();
@@ -3136,7 +3125,6 @@ fn worktree_removed_before_its_first_read_counts_in_its_repository() {
             deadline: Instant::now() + Duration::from_secs(120),
             resolver: &mut resolver,
             repair_left: REPAIR_BYTES_PER_DAY,
-            audit: Default::default(),
         };
         run_source(&mut run, Source::Claude, std::slice::from_ref(&root), None)
     };
@@ -5317,7 +5305,10 @@ fn crash_during_install_before_index_save_resets_without_replay() {
     );
     let scope = env.scope(Source::Claude);
     for (name, size) in ["a.jsonl", "b.jsonl"].iter().zip(at_reset) {
-        assert_eq!(scope.files[*name].origin, Some(size));
+        assert_eq!(
+            scope.files[*name].offset,
+            size + body(&appended).len() as u64
+        );
     }
     env.cleanup();
 }

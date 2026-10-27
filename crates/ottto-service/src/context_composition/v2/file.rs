@@ -49,8 +49,6 @@ pub(super) struct LineStats {
     /// Codex `web_search_end` events inside an open call: the call's output
     /// holds the search, so it counts once, there.
     pub(super) web_search_in_call: u64,
-    /// Lines with no timestamp: they count on the day they are read.
-    pub(super) undated: u64,
 }
 
 /// How the file paths a transcript names become the names kept in state:
@@ -439,17 +437,6 @@ pub(super) fn new_parse_state_before(
     deadline: Instant,
 ) -> std::io::Result<(ParseState, u64)> {
     let (lines, bytes) = head_lines_before(source, path, Some(deadline), HEAD_BYTES)?;
-    Ok((parse_head(source, path, 0, &lines), bytes))
-}
-
-/// An audit identity probe cannot prefetch beyond the reserved transcript end.
-pub(super) fn new_audit_parse_state(
-    source: Source,
-    path: &Path,
-    end: u64,
-    deadline: Instant,
-) -> std::io::Result<(ParseState, u64)> {
-    let (lines, bytes) = head_lines_before(source, path, Some(deadline), end)?;
     Ok((parse_head(source, path, 0, &lines), bytes))
 }
 

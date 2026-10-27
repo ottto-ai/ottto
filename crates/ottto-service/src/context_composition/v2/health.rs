@@ -91,15 +91,14 @@ impl HealthEntry {
             finished: true,
             scan_completed_at: completed.unix_timestamp(),
             files_checked: stats.files_checked,
-            audit_differences: stats.audit_differences,
+            audit_differences: 0,
             full_read_waiting_files: stats.full_read_waiting_files,
             full_read_backlog_bytes: stats.full_read_backlog_bytes,
             backlog_growth_days: u64::from(backlog_growth_days),
             bytes_read: stats.bytes_new
                 + stats.bytes_repair
                 + stats.bytes_head
-                + stats.bytes_failed
-                + stats.bytes_audit,
+                + stats.bytes_failed,
             // Nearest whole second of the reading thread's own CPU time.
             cpu_seconds: (stats.cpu_micros + 500_000) / 1_000_000,
             duration_ms: stats.wall_micros / 1000,
