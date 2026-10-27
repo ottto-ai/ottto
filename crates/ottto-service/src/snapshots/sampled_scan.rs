@@ -15,6 +15,8 @@ const STATE_BYTES: usize =
     CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES;
 
 pub(super) mod codex_cursor;
+#[cfg(unix)]
+pub(super) mod durable_tail;
 pub(super) mod side_ledger;
 
 /// The retained-copy cache behind `SharedCache::retained`.
@@ -98,6 +100,11 @@ pub(crate) struct SharedCache {
     /// lock (retained, then cursor, then side; nothing is locked under it).
     /// Charged as the fixed `side_ledger::SIDE_LEDGER_BYTES`, never walked.
     side: Mutex<side_ledger::SideLedger>,
+    /// M1 durable warm-cache stores and write candidates. A leaf lock, never
+    /// held while taking another. Not part of the state budget: bounded by
+    /// `durable_tail::STORES_RESIDENT_BOUND` and never walked.
+    #[cfg(unix)]
+    durable: Mutex<durable_tail::Stores>,
 }
 impl Default for SharedCache {
     fn default() -> Self {
@@ -105,6 +112,8 @@ impl Default for SharedCache {
             inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
             side: Mutex::new(side_ledger::SideLedger::default()),
+            #[cfg(unix)]
+            durable: Mutex::new(durable_tail::Stores::default()),
         }
     }
 }
@@ -317,6 +326,8 @@ impl SharedCache {
                 // release ran is admitted at exactly the rank that release
                 // ranked residents against.
                 let live_bytes_in = live_bytes;
+                #[cfg(unix)]
+                let touched = key.clone();
                 let reserved = live_bytes
                     .saturating_add(self.cursor_resident_for_main())
                     .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
@@ -331,6 +342,12 @@ impl SharedCache {
                     completed.released,
                 );
                 self.drop_suspended_proof_if_over(&cache, live_bytes_in);
+                // M1: an admitted copy is a durable write candidate after the
+                // next successful index save (the durable lock is a leaf).
+                #[cfg(unix)]
+                if admitted {
+                    self.durable_touch(&touched);
+                }
                 return admitted;
             } else {
                 record(Event::InsertPoisonedLock);

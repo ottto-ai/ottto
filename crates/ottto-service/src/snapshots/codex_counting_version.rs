@@ -600,11 +600,14 @@ pub(super) fn prepare_moved_evidence(
 }
 
 fn candidate_evidence(candidate: &CandidateFile, index: &ScanIndex) -> AckEvidence {
-    let key = local_index_key(&candidate.path);
-    AckEvidence::of_view(index.files.get(&key)).combine(
+    key_evidence(&local_index_key(&candidate.path), index)
+}
+
+fn key_evidence(key: &str, index: &ScanIndex) -> AckEvidence {
+    AckEvidence::of_view(index.files.get(key)).combine(
         index
             .codex_counting_moved_evidence
-            .get(&key)
+            .get(key)
             .copied()
             .unwrap_or(AckEvidence::None),
     )
@@ -703,6 +706,17 @@ pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> St
     };
     let evidence = candidate_evidence(candidate, index);
     view(evidence, cutover)
+}
+
+/// `singleton_view` by index key: the counting view an M1 durable record
+/// binds to (written after a save and checked at restore, without a
+/// candidate).
+#[cfg(unix)]
+pub(super) fn singleton_view_of_key(key: &str, index: &ScanIndex) -> String {
+    let Some(cutover) = cutover_unix_ms() else {
+        return INACTIVE_VIEW.to_owned();
+    };
+    view(key_evidence(key, index), cutover)
 }
 
 /// The counting view of a joined group (cursor K8): what

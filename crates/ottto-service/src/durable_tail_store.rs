@@ -501,14 +501,16 @@ impl DurableTailStore {
     /// Garbage collection after a successful save: delete stale temp files,
     /// corrupt, older-format and other-allowlist records, records from
     /// another context (account or namespace change) and records whose key
-    /// is not kept or whose scope is not the kept one. Newer-format records
-    /// are left for the binary that wrote them.
+    /// is not kept or whose scope is not the kept one. A key kept with an
+    /// unknown scope (`None`: its file was not decided this pass) keeps its
+    /// record; restore still refuses it on a scope mismatch. Newer-format
+    /// records are left for the binary that wrote them.
     pub(crate) fn gc<W: SingleWriter>(
         &mut self,
         writer: &W,
         live_context: &Digest32,
         allowlist: &Digest32,
-        keep: &BTreeMap<Digest32, Digest32>,
+        keep: &BTreeMap<Digest32, Option<Digest32>>,
     ) -> io::Result<()> {
         self.check_writer(writer)?;
         let entries = match fs::read_dir(&self.dir) {
@@ -546,7 +548,11 @@ impl DurableTailStore {
                             let binding = &record.record.binding;
                             let live = binding.key == key
                                 && binding.context == *live_context
-                                && keep.get(&key) == Some(&binding.scope);
+                                && match keep.get(&key) {
+                                    Some(Some(scope)) => *scope == binding.scope,
+                                    Some(None) => true,
+                                    None => false,
+                                };
                             live.then_some(len)
                         }
                         Err(Refusal::NewerFormat) => Some(len),

@@ -1357,6 +1357,11 @@ pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
 impl Checkpoint {
     /// This checkpoint as a content-free durable certificate. `None` when its
     /// samples are not valid for its stamp (such a checkpoint never admits).
+    /// The interpretation scope this checkpoint was made under.
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
     pub(crate) fn durable_certificate(&self, birth_nanos: u64) -> Option<DurableCertificate> {
         if !self.samples.valid_for(self.stamp.length)
             || self.samples.head.len() != self.samples.boundary.len()
@@ -1390,6 +1395,50 @@ impl DurableCertificate {
     /// the read must be Full; no partial state exists to undo. It seeks the
     /// FD; the caller's read plan positions it again before any native read.
     pub(crate) fn admits(&self, file: &mut File) -> Result<DurableAdmission, FullReason> {
+        self.admit_samples(file).map(|(admission, ..)| admission)
+    }
+
+    /// `admits`, then the RAM checkpoint a restore continues from: this
+    /// certificate's stamp (with the current ctime, which is never a refusal
+    /// input), `scope`, the sample windows just re-read and verified from the
+    /// held FD, and the certified audit clock and debt. `select_mode` then
+    /// decides Unchanged, Tail or Full exactly as for a RAM checkpoint.
+    pub(crate) fn restore(
+        &self,
+        file: &mut File,
+        scope: Scope,
+    ) -> Result<(Checkpoint, DurableAdmission), FullReason> {
+        let (admission, head, boundary, current) = self.admit_samples(file)?;
+        let checkpoint = Checkpoint {
+            stamp: FileStamp {
+                length: self.length,
+                device: self.device,
+                inode: self.inode,
+                modified: self.modified,
+                changed: current.changed,
+            },
+            scope,
+            samples: Samples {
+                sealed_offset: self.sealed_offset,
+                head,
+                boundary,
+            },
+            last_full_verified_unix_seconds: self.verified_unix_seconds,
+            audit_debt: self
+                .audit_debt_unix_seconds
+                .map(|due_unix_seconds| AuditDebt { due_unix_seconds }),
+        };
+        if !checkpoint.samples.valid_for(checkpoint.stamp.length) {
+            return Err(FullReason::InvalidCheckpoint);
+        }
+        Ok((checkpoint, admission))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn admit_samples(
+        &self,
+        file: &mut File,
+    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), FullReason> {
         let metadata = file.metadata().map_err(|_| FullReason::Replaced)?;
         let stamp = FileStamp::capture(metadata.clone()).map_err(|_| FullReason::Replaced)?;
         if u64::from(self.sample_len) != self.sealed_offset.min(SAMPLE_BYTES as u64)
@@ -1413,10 +1462,8 @@ impl DurableCertificate {
         }
         let len = self.sample_len as usize;
         let mut read = 0;
-        let head = read_sample(file, 0, len, &mut read)
-            .map_err(|_| FullReason::HeadChanged)
-            .map(|bytes| sha256_bytes(&bytes))?;
-        if head != self.head_sha256 {
+        let head = read_sample(file, 0, len, &mut read).map_err(|_| FullReason::HeadChanged)?;
+        if sha256_bytes(&head) != self.head_sha256 {
             return Err(FullReason::HeadChanged);
         }
         let boundary = read_sample(
@@ -1425,9 +1472,8 @@ impl DurableCertificate {
             len,
             &mut read,
         )
-        .map_err(|_| FullReason::BoundaryChanged)
-        .map(|bytes| sha256_bytes(&bytes))?;
-        if boundary != self.boundary_sha256 {
+        .map_err(|_| FullReason::BoundaryChanged)?;
+        if sha256_bytes(&boundary) != self.boundary_sha256 {
             return Err(FullReason::BoundaryChanged);
         }
         let after = file
@@ -1441,10 +1487,15 @@ impl DurableCertificate {
         {
             return Err(FullReason::Replaced);
         }
-        Ok(DurableAdmission {
-            unchanged,
-            sample_bytes_read: read,
-        })
+        Ok((
+            DurableAdmission {
+                unchanged,
+                sample_bytes_read: read,
+            },
+            head,
+            boundary,
+            after,
+        ))
     }
 }
 

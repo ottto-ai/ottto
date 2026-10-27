@@ -6224,6 +6224,23 @@ fn prepare_sync_source_inner(
     } else {
         None
     };
+    let sampled_scope = cycle_sampled_scope(
+        &account_witness,
+        &upload_destination_namespace,
+        &index_path,
+        context_curve_enabled,
+        request_identity_capture,
+    );
+    #[cfg(unix)]
+    crate::snapshots::begin_durable_pass(
+        &daemon.transcript_cache,
+        support_dir,
+        source,
+        &index_path,
+        claude_index_loaded_fresh,
+        &sampled_scope,
+        request_identity_capture,
+    );
     let mut scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,
         &roots,
@@ -6243,16 +6260,7 @@ fn prepare_sync_source_inner(
         request_identity_capture,
     )
     .with_reread_persistence()
-    .with_sampled_acquisition(
-        daemon.transcript_cache.clone(),
-        cycle_sampled_scope(
-            &account_witness,
-            &upload_destination_namespace,
-            &index_path,
-            context_curve_enabled,
-            request_identity_capture,
-        ),
-    )
+    .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_codex_side_pass(codex_side_pass);
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
@@ -7963,6 +7971,8 @@ fn finish_sync_source(
         &manifest_window_end,
     )?;
     note_codex_side_saved(daemon, &index_path, true, side_mark);
+    #[cfg(unix)]
+    crate::snapshots::durable_after_save(&daemon.transcript_cache, support_dir, source, &index);
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("native_receipt")?;
     if upload_fully_settled

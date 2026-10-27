@@ -3062,6 +3062,44 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
     }
 }
 
+/// M1 durable warm-cache reuse: selects this source's store (beside
+/// `index_path`) for the pass and binds the pass's sampled scope and
+/// identity-capture mode, which its records bind to. A freshly loaded index
+/// (absent, quarantined or undecodable) removes the store: its records bind
+/// to an index that no longer exists.
+#[cfg(unix)]
+pub(crate) fn begin_durable_pass(
+    cache: &sampled_scan::SharedCache,
+    support_dir: &Path,
+    source: SnapshotSource,
+    index_path: &Path,
+    index_fresh: bool,
+    namespace: &crate::transcript_acquisition::Scope,
+    identity_capture: bool,
+) {
+    cache.durable_begin_pass(source, index_path, namespace, identity_capture);
+    if index_fresh {
+        let writer = sampled_scan::durable_tail::StateDirWriter(support_dir);
+        let _ = cache.durable_remove(&writer, source);
+    }
+}
+
+/// M1: after the pass's final index save, writes this source's admitted,
+/// still-resident copies the save kept, then collects records it no longer
+/// keeps. A store failure is never a sync failure: the store is a cache, and
+/// a missing record only means a Full read.
+#[cfg(unix)]
+pub(crate) fn durable_after_save(
+    cache: &sampled_scan::SharedCache,
+    support_dir: &Path,
+    source: SnapshotSource,
+    index: &ScanIndex,
+) {
+    let writer = sampled_scan::durable_tail::StateDirWriter(support_dir);
+    let _ = cache.durable_write_after_save(&writer, source, index);
+    let _ = cache.durable_gc(&writer, source, index);
+}
+
 /// U1a-2a (C14), Codex only: open the pass's side-ledger gate, then prune
 /// and hydrate this index's ledger entries into the index as loaded. Touches
 /// only side requests.
@@ -31268,6 +31306,45 @@ impl OwnedSourceScan {
                             context_curve_enabled,
                             index,
                         );
+                        // M1: on a RAM miss, a durable record may restore
+                        // the copy (charged to the RAM cache, then taken as
+                        // a retained copy); any refusal leaves the read Full.
+                        #[cfg(unix)]
+                        context.cache.durable_note_scope(source, &key, &scope);
+                        #[cfg(unix)]
+                        let (retained, taken_admission) = match retained {
+                            None if allow_sample && !parser.reader.reader.is_compressed() => {
+                                let interpretation = sampled_scan::durable_tail::Interpretation::of(
+                                    source,
+                                    &key,
+                                    index,
+                                    claude_request_identity_capture,
+                                    &context.namespace,
+                                );
+                                match context.cache.durable_restore(
+                                    source,
+                                    &key,
+                                    &candidate.path,
+                                    &scope,
+                                    parser.reader.reader.get_mut(),
+                                    index,
+                                    &interpretation,
+                                ) {
+                                    Some(taken) => {
+                                        retained_offset =
+                                            Some(taken.retained.checkpoint.sealed_offset());
+                                        let admission = (
+                                            taken.modified_hint,
+                                            taken.finalization_charge,
+                                            taken.retained.state.usage_witness(),
+                                        );
+                                        (Some(taken.retained), Some(admission))
+                                    }
+                                    None => (None, taken_admission),
+                                }
+                            }
+                            retained => (retained, taken_admission),
+                        };
                         let old = retained.filter(|_| allow_sample);
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);

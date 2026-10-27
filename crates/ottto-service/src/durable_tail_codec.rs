@@ -1011,13 +1011,13 @@ mod tests {
             &[2_u8][..],
         ] {
             let mut d = Dec::new(bytes);
-            assert!(Vec::<String>::take(&mut d).is_err() || d.remaining() == 0);
+            assert!(<Vec<String> as Durable>::take(&mut d).is_err() || d.remaining() == 0);
             let mut d = Dec::new(bytes);
-            assert!(Option::<u8>::take(&mut d).is_err() || d.remaining() <= bytes.len());
+            assert!(<Option<u8> as Durable>::take(&mut d).is_err() || d.remaining() <= bytes.len());
         }
         let mut d = Dec::new(&[3, 1, 1, 1]);
         assert_eq!(
-            BTreeSet::<u8>::take(&mut d),
+            <BTreeSet<u8> as Durable>::take(&mut d),
             Err(Corrupt),
             "duplicate set member"
         );

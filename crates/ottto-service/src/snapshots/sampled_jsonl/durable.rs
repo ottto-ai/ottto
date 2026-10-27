@@ -236,8 +236,8 @@ impl Decoded {
     }
 
     /// Re-derives the content fields with `parser`, a fresh parser for the
-    /// same source and options on a fresh descriptor of the same file
-    /// (positioned at 0), and `file` for the named-line pread. Every value
+    /// same source and options on a descriptor of the same file positioned at
+    /// 0 (`rederive_parser`), and `file` for the named-line pread. Every value
     /// must hash-equal its digest. The decoded copy is consumed either way: a
     /// refusal leaves nothing behind.
     pub(crate) fn rederive(
@@ -306,11 +306,7 @@ impl Decoded {
             acc.codex_agent_label = fresh.codex_agent_label.take();
         }
         if let Some(expected) = rederive.session_start {
-            let found = fresh
-                .session_start
-                .durable_content_digest(HEAD_BOUND)?
-                .map(|(digest, _)| digest);
-            if found != Some(expected) {
+            if fresh.session_start.durable_content_hash()? != expected {
                 return Err(refused("SessionStartState.frozen_at"));
             }
             acc.session_start
@@ -342,10 +338,12 @@ fn pread_line(file: &mut File, offset: u64, len: u64) -> std::io::Result<Vec<u8>
 /// record's, no title metadata and no live inputs (no re-derived field reads
 /// them), and no reread binding (a bounded head read, not a Full).
 pub(crate) fn rederive_parser(
-    file: File,
+    mut file: File,
     path: &Path,
     decoded: &Decoded,
 ) -> Result<OwnedJsonlParser> {
+    // A duplicated descriptor shares the held one's offset: start at 0.
+    file.seek(SeekFrom::Start(0))?;
     let acc = &decoded.reduction.accumulator;
     let mut parser = OwnedJsonlParser::new(
         file,

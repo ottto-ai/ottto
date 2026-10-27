@@ -445,7 +445,7 @@ fn interrupted_replacement_temp_present_keeps_the_old_record() {
     assert_eq!(record.record.binding, old);
     assert_eq!(record.index_generation, 1);
     let mut keep = BTreeMap::new();
-    keep.insert(old.key, old.scope);
+    keep.insert(old.key, Some(old.scope));
     store.gc(&lock, &old.context, &allowlist, &keep).unwrap();
     assert_eq!(store.counters().gc_temps_deleted, 1);
     assert_eq!(found(store.read(&old.key, &allowlist)).record.binding, old);
@@ -551,7 +551,7 @@ fn schema_both_ways_and_downgrade() {
     );
     let keep = [&newer, &other, &third]
         .into_iter()
-        .map(|binding| (binding.key, binding.scope))
+        .map(|binding| (binding.key, Some(binding.scope)))
         .collect::<BTreeMap<_, _>>();
     store.gc(&lock, &newer.context, &changed, &keep).unwrap();
     assert!(
@@ -711,24 +711,33 @@ fn gc_drops_other_accounts_scopes_and_unkept_keys() {
         b
     };
     let (kept, rescoped, dropped) = (make("kept"), make("rescoped"), make("dropped"));
+    let undecided = make("undecided");
     store
         .write_after_save(
             &lock,
             1,
-            [&kept, &rescoped, &dropped]
+            [&kept, &rescoped, &dropped, &undecided]
                 .into_iter()
                 .map(|b| pending(b.clone(), certificate(&transcript), 1))
                 .collect(),
         )
         .unwrap();
     let mut keep = BTreeMap::new();
-    keep.insert(kept.key, kept.scope);
+    keep.insert(kept.key, Some(kept.scope));
     keep.insert(
         rescoped.key,
-        scope_digest("scope-after-upgrade", &allowlist, "identity:v1", "legacy"),
+        Some(scope_digest(
+            "scope-after-upgrade",
+            &allowlist,
+            "identity:v1",
+            "legacy",
+        )),
     );
+    // Kept by the index, file not decided this pass: its scope is unknown.
+    keep.insert(undecided.key, None);
     store.gc(&lock, &kept.context, &allowlist, &keep).unwrap();
     assert!(record_file(&store, &kept.key).exists());
+    assert!(record_file(&store, &undecided.key).exists());
     assert!(!record_file(&store, &rescoped.key).exists());
     assert!(!record_file(&store, &dropped.key).exists());
     // An account switch makes every record unreachable; GC deletes them.
@@ -741,6 +750,7 @@ fn gc_drops_other_accounts_scopes_and_unkept_keys() {
         )
         .unwrap();
     assert!(!record_file(&store, &kept.key).exists());
+    assert!(!record_file(&store, &undecided.key).exists());
     assert_eq!(store.counters().disk_records, 0);
     store.remove_all(&lock).unwrap();
     assert!(!store.dir().exists());

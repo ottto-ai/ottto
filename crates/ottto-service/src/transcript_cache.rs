@@ -307,6 +307,12 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             .get(key)
             .map(|entry| entry.retained.checkpoint.sealed_offset())
     }
+    /// A retained entry without taking it (M1 durable write after an index
+    /// save encodes it in place under the retained lock).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn peek(&self, key: &str) -> Option<&Retained<S>> {
+        self.entries.get(key).map(|entry| &entry.retained)
+    }
     #[cfg(test)]
     pub(crate) fn checkpoint(&self, key: &str) -> Option<Checkpoint> {
         self.entries

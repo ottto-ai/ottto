@@ -582,7 +582,7 @@ impl SessionStartState {
         &self,
         bound: u64,
     ) -> Result<Option<([u8; 32], u64)>, crate::durable_tail_codec::Refuse> {
-        use crate::durable_tail_codec::{Durable, Enc, Refuse};
+        use crate::durable_tail_codec::Refuse;
         if self.instructions.is_none() && self.codex_prelude.is_none() && self.files.is_empty() {
             return Ok(None);
         }
@@ -590,11 +590,20 @@ impl SessionStartState {
             .frozen_at
             .filter(|end| self.frozen && *end <= bound)
             .ok_or(Refuse::NotRederivable("SessionStartState.frozen_at"))?;
+        Ok(Some((self.durable_content_hash()?, end)))
+    }
+
+    /// The opening content's digest alone, for a head re-parse (which has no
+    /// line positions) to compare with the recorded one.
+    pub(super) fn durable_content_hash(
+        &self,
+    ) -> Result<[u8; 32], crate::durable_tail_codec::Refuse> {
+        use crate::durable_tail_codec::{Durable, Enc};
         let mut e = Enc::hash("ottto-dt-rederive:session_start:v1");
         self.instructions.put(&mut e)?;
         self.codex_prelude.put(&mut e)?;
         self.files.put(&mut e)?;
-        Ok(Some((e.finish_hash(), end)))
+        Ok(e.finish_hash())
     }
 
     /// Moves the re-derived opening content from a head re-parse.
