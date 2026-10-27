@@ -382,6 +382,14 @@ fn large_claude_native_memory_and_append() {
 // Drive the shipping cooperative scheduler with native scan frames, not a
 // reimplementation of candidate selection or a mocked parser. Refused parking
 // models an opaque/unaccountable frame; it grants no substitute positive bound.
+#[derive(Default)]
+struct HistoryReceipt {
+    visits_peak: usize,
+    bytes_peak: usize,
+    owed_seen: u64,
+    budget_held: u64,
+}
+
 struct Rotation {
     ready: Vec<(SnapshotSource, OwnedSourceScan)>,
     completed: Vec<(SnapshotSource, ScanIndex, SourceScanResult)>,
@@ -389,6 +397,7 @@ struct Rotation {
     refuse_parking: bool,
     refusals: std::cell::Cell<usize>,
     deferred_revocations: usize,
+    history_receipt: Option<HistoryReceipt>,
     started: std::time::Instant,
 }
 impl crate::source_rotation::Owner for Rotation {
@@ -414,6 +423,22 @@ impl crate::source_rotation::Owner for Rotation {
         mut frame: Self::Frame,
         _: Option<usize>,
     ) -> crate::source_rotation::Step<Self::Frame, Self::Completed> {
+        if let Some(receipt) = self.history_receipt.as_mut() {
+            use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+            let mut counter = Counter::new(crate::source_rotation::PARKED_BUDGET);
+            let measured = counter
+                .add(std::mem::size_of_val(&frame))
+                .and_then(|()| frame.heap_bound(&mut counter));
+            assert!(measured.is_some(),
+                "combined history/large-Full frame must fit existing bytes and visits: bytes={} visits={}",
+                counter.bytes, counter.visits_for_test());
+            receipt.visits_peak = receipt.visits_peak.max(counter.visits_for_test());
+            receipt.bytes_peak = receipt.bytes_peak.max(counter.bytes);
+            receipt.owed_seen = receipt.owed_seen.max(frame.history_upgrade.owed);
+            receipt.budget_held = receipt
+                .budget_held
+                .max(frame.history_upgrade.denied_for(&[HistoryHold::Budget]));
+        }
         if frame.native_comparison_ready() {
             let api = BTreeMap::new();
             let trace = BTreeMap::new();
@@ -617,6 +642,7 @@ fn large_claude_fulls_rotate_with_sibling_and_audits() {
             refuse_parking: pass % 2 == 1,
             refusals: std::cell::Cell::new(0),
             deferred_revocations: 0,
+            history_receipt: None,
             started: std::time::Instant::now(),
         };
         let (_, acquisitions) = terminal_contract_retry::source_acquisitions(|| {
@@ -779,6 +805,7 @@ fn overflow_and_decode_fallback_eventually_read_every_large_file() {
                 refuse_parking: true,
                 refusals: std::cell::Cell::new(0),
                 deferred_revocations: 0,
+                history_receipt: None,
                 started: std::time::Instant::now(),
             };
             let (_, acquisitions) = terminal_contract_retry::source_acquisitions(|| {
@@ -846,4 +873,197 @@ fn overflow_and_decode_fallback_eventually_read_every_large_file() {
         }
         assert_eq!(read.len(), 3);
     }
+}
+
+// Shipping revision-3 history policy and the real 1 GiB history page budget:
+// four populated >256 MiB files cannot all reserve on one page. Both gates
+// must compose without granting a deferred file a revision, blocking small
+// files, or losing the switch-on re-read when the census walk closes.
+#[test]
+fn large_history_upgrade_is_paced_and_owed_history_drains() {
+    use crate::transcript_acquisition::ReadMode;
+    use claude_reemission_exclusions::ReemissionExclusions;
+    assert!(claude_request_money::e2::enabled());
+    assert_eq!(claude_history_upgrade::max_gated_claude_revision(), 3);
+    assert_eq!(body_witness_adoption_byte_budget(), 1024 * MIB);
+    let fixture = Fixture::new();
+    let support = Fixture::new();
+    let list = ReemissionExclusions::path(&support.0);
+    fs::create_dir_all(list.parent().unwrap()).unwrap();
+    fs::write(&list, "").unwrap();
+    let large = (0..4)
+        .map(|n| {
+            let session = format!("019e2700-7777-7000-9000-{n:012}");
+            let path = fixture.0.join(format!("{session}.jsonl"));
+            write_populated_large(&path, &session);
+            path
+        })
+        .collect::<Vec<_>>();
+    let small = (4..7)
+        .map(|n| {
+            let session = format!("019e2700-7777-7000-9000-{n:012}");
+            let path = fixture.0.join(format!("{session}.jsonl"));
+            let mut row = usage(n);
+            row["sessionId"] = json!(session);
+            row["requestId"] = json!(format!("req-{session}"));
+            row["message"]["id"] = json!(format!("msg-{session}"));
+            fs::write(&path, format!("{row}\n")).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut index = ScanIndex::default();
+    let mut upgrades = BTreeSet::new();
+    let mut peak = 0;
+    let mut budget_held = false;
+    let mut quiet_walks = 0;
+    // Four first admissions at revision 2, switch on 3, then require two
+    // quiet completed walks after every file has adopted. No gate override.
+    for pass in 0..16 {
+        let revision = if pass < 4 { 2 } else { 3 };
+        index.activate_upload_context("large-history-composition".into());
+        index.activate_effective_upload_body_witness_revision(revision);
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        index.load_claude_reemission_exclusions(&support.0);
+        let owed_before = index
+            .files
+            .values()
+            .filter(|entry| entry.effective_upload_body_witness_revision < revision)
+            .count();
+        let mut owner = Rotation {
+            ready: vec![(
+                SnapshotSource::ClaudeCode,
+                rotation_scan(
+                    SnapshotSource::ClaudeCode,
+                    &fixture.0,
+                    std::mem::take(&mut index),
+                    &cache,
+                    &[],
+                ),
+            )],
+            completed: Vec::new(),
+            starts: Vec::new(),
+            refuse_parking: pass % 2 == 1,
+            refusals: std::cell::Cell::new(0),
+            deferred_revocations: 0,
+            history_receipt: Some(HistoryReceipt::default()),
+            started: std::time::Instant::now(),
+        };
+        let (_, acquisitions) = terminal_contract_retry::source_acquisitions(|| {
+            crate::source_rotation::run(
+                &mut owner,
+                &[SnapshotSource::ClaudeCode],
+                crate::source_rotation::PARKED_BUDGET,
+            );
+        });
+        assert_eq!(owner.completed.len(), 1);
+        if owner.refuse_parking {
+            assert!(owner.refusals.get() > 0);
+        }
+        let started = owner
+            .starts
+            .iter()
+            .filter(|(path, _)| large.contains(path))
+            .collect::<Vec<_>>();
+        assert!(started.len() <= 1, "one large Full per history pass {pass}");
+        if let Some((path, mode)) = started.first() {
+            assert!(matches!(mode, Some(ReadMode::Full(_))));
+            assert_eq!(acquisitions.get(path), Some(&1));
+            if revision == 3 {
+                assert!(upgrades.insert(path.clone()), "no second upgrade read");
+            }
+        }
+        let (_, mut next, mut scan) = owner.completed.pop().unwrap();
+        assert_eq!(scan.oversized_file_count, 0);
+        if pass < 4 {
+            assert_eq!(started.len(), 1, "first admission is paced too");
+            for path in &large {
+                if !acquisitions.contains_key(path)
+                    && !next.files.contains_key(&local_index_key(path))
+                {
+                    assert!(!next
+                        .file_snapshot_fingerprints
+                        .contains_key(&local_index_key(path)));
+                }
+            }
+        }
+        if pass == 4 {
+            assert_eq!(owed_before, 7);
+            assert_eq!(started.len(), 1);
+            for path in &small {
+                assert_eq!(
+                    acquisitions.get(path),
+                    Some(&1),
+                    "small upgrade progresses immediately"
+                );
+            }
+        }
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut next);
+        next.record_accepted_snapshot_fingerprints(
+            &scan
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        if pass == 3 {
+            assert_eq!(next.files.len(), 7);
+            assert!(next
+                .files
+                .values()
+                .all(|e| e.effective_upload_body_witness_revision == 2));
+        }
+        if revision == 3 {
+            for path in &large {
+                let stamp =
+                    next.files[&local_index_key(path)].effective_upload_body_witness_revision;
+                assert_eq!(
+                    stamp,
+                    if upgrades.contains(path) { 3 } else { 2 },
+                    "unread upgrade keeps its prior revision"
+                );
+            }
+            if pass == 4 {
+                for path in &small {
+                    assert_eq!(
+                        next.files[&local_index_key(path)].effective_upload_body_witness_revision,
+                        3
+                    );
+                }
+            }
+        }
+        let owed_after = next
+            .files
+            .values()
+            .filter(|entry| entry.effective_upload_body_witness_revision < revision)
+            .count();
+        let receipt = owner.history_receipt.unwrap();
+        peak = peak.max(receipt.visits_peak);
+        budget_held |= receipt.budget_held > 0;
+        println!("claude_large_history_receipt: pass={pass} revision={revision} large_fulls={} owed_before={owed_before} owed_after={owed_after} history_upgrade_owed={} budget_held={} visits_peak={} bytes_peak={} census_complete={}",
+            started.len(), receipt.owed_seen, receipt.budget_held,
+            receipt.visits_peak, receipt.bytes_peak, scan.census_complete);
+        if revision == 3 && owed_before == 0 {
+            assert_eq!(scan.scanned_file_count, 0, "no second history re-read");
+            assert_eq!(receipt.owed_seen, 0, "history_upgrade_owed drains");
+            quiet_walks += usize::from(scan.census_complete);
+        }
+        index = lenient_decode::read(
+            std::io::Cursor::new(serde_json::to_vec(&next).unwrap()),
+            "load",
+            "claude_code",
+        )
+        .unwrap();
+        if quiet_walks == 2 {
+            break;
+        }
+    }
+    assert_eq!(upgrades.len(), 4, "all large history eventually upgrades");
+    assert_eq!(quiet_walks, 2, "two quiet completed walks");
+    assert!(
+        budget_held,
+        "exercise #805's real paced history byte gate too"
+    );
+    assert!(peak <= 4096);
+    println!("claude_large_history_visit_peak: {peak}/4096");
 }
