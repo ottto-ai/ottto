@@ -234,6 +234,37 @@ impl SharedCache {
             }
         }
     }
+    /// Capture after E2 finish_page, before identity/policy changes fingerprints.
+    /// The committed index is the pre-scan authority: new held keys remain
+    /// absent there and in settlement. Each flag shares its reduction's scope
+    /// and is useful only after the ordinary checkpoint/scope validation.
+    pub(crate) fn record_e2_held_new_files(
+        &self,
+        committed: &ScanIndex,
+        scanned: &ScanIndex,
+        items: &[SnapshotItem],
+        withheld: &BTreeSet<String>,
+    ) {
+        if let Ok(mut cache) = self.retained() {
+            cache.update_e2_held(|key| {
+                if committed.files.contains_key(key) {
+                    return Some(false);
+                }
+                let entry = scanned.files.get(key)?;
+                let mut visited = false;
+                let mut held = false;
+                for item in items {
+                    if item.source_file_fingerprint.as_deref()
+                        == Some(entry.source_file_fingerprint.as_str())
+                    {
+                        visited = true;
+                        held |= withheld.contains(&item.source_session_id);
+                    }
+                }
+                visited.then_some(held)
+            });
+        }
+    }
     pub(super) fn retained_sealed_offset(&self, key: &str) -> Option<u64> {
         self.retained().ok()?.sealed_offset(key)
     }

@@ -137,3 +137,38 @@ pub(crate) fn before_release(items: &[SnapshotItem]) {
         }
     });
 }
+
+/// Both #813 regressions against an actually settled, omitted held NEW key.
+/// No process-cache witness is supplied to either money reader.
+pub(crate) fn assert_held_new_file_has_no_money_authority(index: &ScanIndex, path: &Path) {
+    let key = local_index_key(path);
+    assert!(!index.files.contains_key(&key));
+    assert!(!path.exists(), "vanished withheld original scenario");
+    let record = index
+        .claude_request_census
+        .get(&key)
+        .expect("held native scan");
+    assert!(
+        record.proves_scan(),
+        "exercise matching native census evidence"
+    );
+    assert_eq!(scan_evidence(index, &key, record), Evidence::None);
+
+    let mut nonproving = index.clone();
+    let mut record = nonproving.claude_request_census.take(&key).unwrap();
+    record.retire();
+    assert!(!record.proves_scan());
+    nonproving.claude_request_census.insert(key.clone(), record);
+    assert!(holder_order(
+        &nonproving.claude_money_birth_store,
+        claude_index_path_member_ref(path).unwrap().root,
+        &key
+    )
+    .is_some());
+    assert!(!parent_proves(
+        &nonproving,
+        &key,
+        "other-session",
+        (i128::MAX, location_key(&key))
+    ));
+}
