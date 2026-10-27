@@ -1444,7 +1444,7 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
             "unrelated-parent-key".into(),
             CodexParentSide {
                 verdict: SideVerdict::Settled,
-                seal,
+                seal: seal.clone(),
                 parsed: stamp,
                 pace: None,
                 generation: 1,
@@ -1469,13 +1469,23 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         );
         loaded.codex_parent_prefix_proofs.insert(
             "unrelated-child-key".into(),
-            CodexParentProofState::Owed(CodexParentProofOwed::new(
-                "unrelated-parent".into(),
-                1,
-                CAUSE_NO_EVIDENCE,
-                OwedOrigin::Lineage,
-            )),
+            CodexParentProofState::Proven(CodexParentPrefixProof {
+                parent: "unrelated-parent".into(),
+                parent_seal: seal,
+                matched: 0,
+                child_digest: sha256_hex(&["unrelated-child-prefix"]),
+                owned: false,
+                published: false,
+            }),
         );
+        // These are indexed records outside this scan root. Keep the side
+        // sweep from legitimately deleting an orphan, and use a completed
+        // proof so the proof job has no new work to perform in this control.
+        for record_key in ["unrelated-parent-key", "unrelated-child-key"] {
+            loaded
+                .files
+                .insert(record_key.into(), loaded.files[&key].clone());
+        }
         let parent_records = |index: &ScanIndex| {
             (
                 serde_json::to_vec(&index.codex_parent_side).unwrap(),
