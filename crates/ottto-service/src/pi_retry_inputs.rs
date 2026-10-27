@@ -47,7 +47,7 @@ fn identify(root: &Path, path: &Path) -> Option<String> {
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
-        opened_witness: None,
+        fingerprint_changed_nanos: 0,
     };
     let _file = open_candidate_file(SnapshotSource::Pi, &mut candidate).ok()?;
     Some(scan_file_fingerprint_with_opened_identity(

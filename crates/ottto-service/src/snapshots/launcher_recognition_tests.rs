@@ -635,7 +635,7 @@ fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membersh
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
-        opened_witness: None,
+        fingerprint_changed_nanos: 0,
     };
     let physical = candidate.source_file_fingerprint.clone();
     candidate.source_file_fingerprint = sha256_hex(&[

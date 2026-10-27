@@ -48,18 +48,15 @@ impl Fixture {
             minute: 2,
         };
         assert_eq!(fixture.rescan(), 1, "{name}: first scan reads the file");
-        // The daemon persists the index as JSON; the witness round-trips.
-        let witness = fixture.entry().opened_witness.clone();
-        assert!(
-            witness.is_some(),
-            "{name}: the read stores its opened witness"
-        );
+        // The daemon persists the index as JSON; the stored ctime round-trips.
+        let changed = fixture.entry().opened_changed_nanos;
+        assert_ne!(changed, 0, "{name}: the read stores its opened ctime");
         let reloaded: ScanIndexEntry =
             serde_json::from_value(serde_json::to_value(fixture.entry()).expect("encode"))
                 .expect("decode");
         assert_eq!(
-            reloaded.opened_witness, witness,
-            "{name}: witness round-trip"
+            reloaded.opened_changed_nanos, changed,
+            "{name}: stored ctime round-trip"
         );
         assert_eq!(fixture.rescan(), 0, "{name}: unchanged control rescan");
         fixture
@@ -259,10 +256,10 @@ fn same_bytes_under_a_new_inode_read_once_for_its_object_inputs() {
                 "{name} (preserve mtime {preserve_mtime}): new object is read once"
             );
             assert_ne!(fixture.fingerprint(), stored, "{name}: new object");
-            assert_eq!(
-                fixture.entry().opened_witness.as_ref().map(|w| w.inode),
-                Some(replaced.ino()),
-                "{name}: the read stores the live witness"
+            assert_ne!(
+                fixture.entry().opened_changed_nanos,
+                0,
+                "{name}: the read stores the ctime its fingerprint used"
             );
             assert_eq!(fixture.rescan(), 0, "{name}: then settled, no loop");
             // A ctime-only change on the new object reads nothing.
@@ -522,7 +519,11 @@ fn codex_parent_ctime_only_change_keeps_its_ledger_for_a_changed_child() {
     let mut index = ScanIndex::default();
     codex_fork_child_usage(&root, &mut index, 9);
     let ledger = index.codex_parent_ownership_ledgers[FORK_PARENT].clone();
-    assert!(ledger.scan_complete && ledger.opened_witness.is_some());
+    assert!(
+        ledger.scan_complete
+            && ledger.opened_changed_nanos != 0
+            && ledger.opened_modified_nanos != 0
+    );
     let settled = scan_source_roots(
         SnapshotSource::Codex,
         std::slice::from_ref(&root),

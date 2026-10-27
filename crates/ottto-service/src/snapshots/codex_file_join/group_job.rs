@@ -397,8 +397,8 @@ impl GroupBoot {
             &mut census,
             None,
             0,
-            // The stored opened witness lets a ctime/inode-only change keep
-            // the stored fingerprint (content re-validated, no re-read).
+            // The entry's stored ctime lets a ctime-only change keep the
+            // stored fingerprint (fresh samples hashed, no re-read).
             &index.files,
         ) else {
             return Boot::Strict;

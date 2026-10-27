@@ -185,7 +185,8 @@ fn complete_ledger() -> BTreeMap<String, CodexParentOwnershipLedger> {
             scan_complete: true,
             opened_object_identity: String::new(),
             unresolvable: None,
-            opened_witness: None,
+            opened_changed_nanos: 0,
+            opened_modified_nanos: 0,
         },
     )])
 }
@@ -502,7 +503,7 @@ impl Scene {
                 legacy_source_file_fingerprint: String::new(),
                 legacy_config_reconciliation_required: false,
                 opened_object_identity: String::new(),
-                opened_witness: None,
+                fingerprint_changed_nanos: 0,
             },
             index,
         };
