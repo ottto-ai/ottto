@@ -41163,6 +41163,8 @@ fn advance_bounded_directory_traversal_with_budget(
 /// the NotFound as loss.
 fn claude_absence_parent(path: &Path) -> local_resource_diagnostics::claude_absence::Parent {
     use local_resource_diagnostics::claude_absence::Parent;
+    #[cfg(test)]
+    disappearance_diagnostics::before_absence_parent_probe();
     match path.parent().map(fs::symlink_metadata) {
         Some(Ok(parent)) if parent.file_type().is_symlink() => Parent::Symlink,
         Some(Ok(parent)) if parent.is_dir() => Parent::Live,
