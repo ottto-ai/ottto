@@ -115,7 +115,8 @@ pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
         self.claude_reread.merge(other.claude_reread);
-        self.absence.merge(other.absence);
+        self.absence.0 =
+            std::array::from_fn(|i| self.absence.0[i].saturating_add(other.absence.0[i]));
         self.retained_cache_page_events
             .merge(other.retained_cache_page_events);
     }

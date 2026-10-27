@@ -1,4 +1,4 @@
-use serde::{Serialize, Serializer};
+use serde::{ser::SerializeMap, Serialize, Serializer};
 use std::path::Path;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Parent {
@@ -23,26 +23,15 @@ impl Parent {
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Counts([u64; 8]);
-impl Counts {
-    pub(crate) fn merge(&mut self, other: Self) {
-        for (count, incoming) in self.0.iter_mut().zip(other.0) {
-            *count = count.saturating_add(incoming);
-        }
-    }
-}
+pub(crate) struct Counts(pub(super) [u64; 8]);
 impl Serialize for Counts {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_map(
-            self.0
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| **n != 0)
-                .map(|(i, n)| {
-                    let split = if i < 4 { "" } else { "subagent_" };
-                    let class = ["missing", "symlink", "not_directory", "metadata_error"][i % 4];
-                    (format!("claude_absence_parent_{split}{class}"), n)
-                }),
-        )
+        let mut map = serializer.serialize_map(None)?;
+        for (i, n) in self.0.iter().enumerate().filter(|(_, n)| **n != 0) {
+            let split = if i < 4 { "" } else { "subagent_" };
+            let class = ["missing", "symlink", "not_directory", "metadata_error"][i % 4];
+            map.serialize_entry(&format!("claude_absence_parent_{split}{class}"), n)?;
+        }
+        map.end()
     }
 }
