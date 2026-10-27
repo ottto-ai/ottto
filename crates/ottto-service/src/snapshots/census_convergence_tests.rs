@@ -3134,3 +3134,79 @@ fn returning_family_grown_held_counts_only_tombstoned_retry_pending_roots() {
     assert_eq!(index.claude_usage_authority_pending_count(), 2);
     assert_eq!(index.claude_returning_family_grown_held_count(), 0);
 }
+
+/// Read identity survives both settlements, but cannot stand in for delivery.
+#[test]
+fn e2_withheld_new_file_keeps_only_read_identity_in_both_settlements() {
+    let key = "/opaque/e2-withheld.jsonl";
+    let revision = hex64('e');
+    let previous = ScanIndex::default();
+    let mut scanned = previous.clone();
+    index_file(&mut scanned, key, &revision, "held", WINDOW);
+    scanned.activate_effective_upload_body_witness_revision(3);
+    scanned.files.get_mut(key).unwrap().last_upload_body_witness = Some("unsent".into());
+    scanned
+        .files
+        .get_mut(key)
+        .unwrap()
+        .effective_upload_body_witness_revision = 3;
+    scanned
+        .claude_request_owned_held_sources
+        .insert(revision.clone());
+    let held = BTreeSet::from(["held".to_string()]);
+    let borrowed = scanned.with_locally_held_keys_reverted(&previous, &held, &BTreeSet::new());
+    let owned = scanned
+        .clone()
+        .into_locally_held_keys_reverted(&previous, &held, &BTreeSet::new());
+    assert_eq!(
+        serde_json::to_value(&borrowed).unwrap(),
+        serde_json::to_value(&owned).unwrap()
+    );
+    let partial = scanned.committable_subset_with_local_holds(
+        &previous,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        &held,
+    );
+    for mut saved in [owned, partial] {
+        let entry = &saved.files[key];
+        assert_eq!(entry.source_file_fingerprint, revision);
+        assert_eq!(entry.last_snapshot_fingerprint, None);
+        assert_eq!(entry.last_upload_body_witness, None);
+        assert_eq!(entry.effective_upload_body_witness_revision, 0);
+        assert!(!saved.file_snapshot_fingerprints.contains_key(key));
+        assert!(!saved.confirmed_empty_files.contains(key));
+        assert!(!saved.snapshot_activity_at.contains_key("held"));
+        assert!(!saved.accepted_snapshot_fingerprint_recorded("held"));
+        assert!(saved.current_snapshot_fingerprints().is_empty());
+        assert_eq!(
+            decision(&saved, &matching_candidate(&saved, key)),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::UnknownOutcome)
+            )
+        );
+        // Exercise the production lenient writer/reader, as an older binary
+        // does: only the already-supported delivery-free entry is persisted.
+        let scratch = crate::test_scratch::ScratchDir::new("e2-provisional-index");
+        let path = scratch.join("index.json");
+        saved.save(&path).unwrap();
+        let wire = fs::read_to_string(&path).unwrap();
+        assert!(!wire.contains("claude_request_owned_held_sources"));
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        loaded.activate_effective_upload_body_witness_revision(3);
+        assert!(loaded.effective_upload_body_witness_revision_requires_adoption(key));
+        assert_eq!(loaded.files[key].last_snapshot_fingerprint, None);
+        assert!(!loaded.accepted_snapshot_fingerprint_recorded("held"));
+        assert!(loaded.claude_request_owned_held_sources.is_empty());
+    }
+    // Keeping read identity must not make a new authority family restorable.
+    bind_authority_quarantine(
+        &mut scanned,
+        "e2-withheld",
+        "e2-withheld",
+        &revision,
+        ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+    );
+    assert!(!scanned.locally_held_keys_restorable(&previous, &held, &BTreeSet::new()));
+}

@@ -9161,6 +9161,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
         },
     );
+    index.record_claude_request_owned_holds(&withheld, &scan_result.snapshots);
     disposition.hold_request_owned(withheld);
     if request_owned_enabled {
         for item in &mut scan_result.snapshots {

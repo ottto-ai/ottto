@@ -2575,3 +2575,71 @@ fn e2_pipeline_root_conflict_only_file_publishes_its_disclosure() {
 fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
     conflict_only(true);
 }
+
+/// An unread external telemetry file withholds a NEW transcript. Every walk
+/// re-decides the hold; repairing telemetry needs no transcript change.
+fn withheld_new_file_retries_from_retained_read(grow: bool) {
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-held-new-tail-{grow}"));
+        let path = c.root(ROOT, &line(ROOT, "root", AT, 10));
+        c.evidence(&[api("root", 10, 100)], &[]);
+        let evidence_path = c
+            .support
+            .join("local-otel/claude-code-effort")
+            .join(format!("{:x}.jsonl", Sha256::digest(ROOT.as_bytes())));
+        std::fs::write(&evidence_path, "{broken-json\n").unwrap();
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let empty = ScanIndex::default();
+        let mut first = c.raw(&scanner, empty.clone(), 100, true, &[]);
+        first.enrich(&c);
+        assert_withheld(&first, ROOT, "unread external telemetry");
+        assert_mode(first.modes, (1, 0, 0));
+        let prior = settle(&c, &empty, first, &mut progress);
+        assert!(progress.accepted_fingerprints.is_empty());
+        assert!(prior.current_snapshot_fingerprints().is_empty());
+        if grow {
+            append(&path, &line(ROOT, "root2", "2026-08-02T07:01:00Z", 20));
+        }
+        let mut retry = c.raw(&scanner, prior.clone(), 100, true, &[]);
+        retry.enrich(&c);
+        assert_withheld(&retry, ROOT, "external blocker still present");
+        assert_mode(retry.modes, if grow { (0, 1, 0) } else { (0, 0, 1) });
+        let prior = settle(&c, &prior, retry, &mut progress);
+        assert!(progress.accepted_fingerprints.is_empty());
+        let before = std::fs::metadata(&path).unwrap();
+        let mut rows = vec![api("root", 10, 100)];
+        if grow {
+            rows.push(api("root2", 20, 200));
+        }
+        c.evidence(&rows, &[]);
+        let restored = ready(&c, &scanner, prior.clone(), 100, true);
+        assert_mode(restored.modes, (0, 0, 1));
+        literal(&restored);
+        // Cold Full is only the fixture's reference oracle. Production never
+        // discards the retained read when external evidence clears the hold.
+        let full = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        assert_eq!(
+            canonical(&request(&restored.scan.snapshots)),
+            canonical(&request(&full.scan.snapshots))
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before.len());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        let settled = settle(&c, &prior, restored, &mut progress);
+        assert_eq!(progress.accepted_fingerprints.len(), 1);
+        assert_eq!(settled.current_snapshot_fingerprints().len(), 1);
+    });
+}
+
+#[test]
+fn e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
+    withheld_new_file_retries_from_retained_read(false);
+}
+
+#[test]
+fn e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
+    withheld_new_file_retries_from_retained_read(true);
+}
