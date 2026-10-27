@@ -337,6 +337,8 @@ fn native_comparison_paid_capture_population_reports_guard_viability_without_byp
                 legacy_source_file_fingerprint: String::new(),
                 legacy_config_reconciliation_required: false,
                 opened_object_identity: "synthetic-descriptor-not-opened-evidence".into(),
+                fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: 0,
             }
         })
         .collect::<Vec<_>>();

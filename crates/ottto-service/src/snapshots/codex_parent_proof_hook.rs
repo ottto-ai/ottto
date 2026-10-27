@@ -502,6 +502,8 @@ fn start_codex_proof_job(
                     legacy_source_file_fingerprint: String::new(),
                     legacy_config_reconciliation_required: false,
                     opened_object_identity: String::new(),
+                    fingerprint_changed_nanos: 0,
+                    fingerprint_birth_nanos: 0,
                 })
                 .ok()
             })

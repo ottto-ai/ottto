@@ -3670,6 +3670,14 @@ fn accepted_carry_streams_when_request_graph_refuses_even_a_small_family_set() {
         0
     ));
     let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    let counts = stale_carry_diagnostics::take_for_test().unwrap();
+    assert_eq!(
+        counts.ordinary_scratch, 0,
+        "streaming rescued the refused ordinary scratch"
+    );
+    assert_eq!(counts.rejected(), 0);
+    assert_eq!(counts.eligible_before_funding, 2);
+    assert_eq!(counts.final_carried, 2);
     assert_eq!(row["carried_pending_families"], 2);
     assert_eq!(row["rearmed_index_files"], 0);
     assert_eq!(
@@ -3779,3 +3787,93 @@ fn deferred_retry_resumes_after_transient_funding_refusal() {
 }
 
 include!("retry_admission_tests.rs");
+
+// Round 2 diagnostics must distinguish first refusal without another corpus
+// walk, changing the actual carry, or adding fields to the old transition row.
+#[test]
+fn stale_carry_rejection_histogram_reports_first_start_gate() {
+    for (stage, mutate) in [
+        ("provenance_or_context", 0),
+        ("contract", 1),
+        ("accepted_ledger", 2),
+        ("upload_context", 3),
+    ] {
+        let mut index = carry_index();
+        match mutate {
+            0 => {
+                index.traversal = None;
+                index.claude_request_identity_contract = None;
+                index.accepted_snapshot_fingerprint_ledger_version = 0;
+            }
+            1 => {
+                index.claude_request_identity_contract_changed = true;
+                index.accepted_snapshot_fingerprint_ledger_version = 0;
+                index.upload_context_fingerprint = Some("other".into());
+            }
+            2 => {
+                index.accepted_snapshot_fingerprint_ledger_version = 0;
+                index.upload_context_fingerprint = Some("other".into());
+            }
+            _ => index.upload_context_fingerprint = Some("other".into()),
+        }
+        let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        let counts = stale_carry_diagnostics::take_for_test().unwrap();
+        assert_eq!(serde_json::to_value(counts).unwrap()[stage], 2, "{stage}");
+        assert_eq!(counts.rejected(), 2, "one first refusal per stale root");
+        assert_eq!(counts.eligible_before_funding, 0);
+        assert_eq!(counts.final_carried, 0);
+        assert_eq!(row["rearmed_index_files"], 3);
+    }
+}
+
+#[test]
+fn stale_carry_rejection_histogram_separates_window_and_ordinary_scratch() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for window in [false, true] {
+        let mut index = if window {
+            window_index()
+        } else {
+            carry_index()
+        };
+        let _refuse = RefuseClaudeStaleFamilyCarryBudgetForTest::new();
+        let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        let counts = stale_carry_diagnostics::take_for_test().unwrap();
+        assert_eq!(counts.window_scratch, if window { 2 } else { 0 });
+        assert_eq!(counts.ordinary_scratch, if window { 0 } else { 2 });
+        assert_eq!(counts.rejected(), 2);
+        assert_eq!(counts.final_carried, 0);
+        assert_eq!(row["rearmed_index_files"], 3);
+    }
+}
+
+#[test]
+fn stale_carry_rejection_histogram_separates_qualification_funding_and_reserve() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for failure in ["none", "funding", "allocation"] {
+        let mut index = carry_index();
+        let start = |index: &mut ScanIndex| carry_start(index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        let row = match failure {
+            "funding" => {
+                let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+                start(&mut index)
+            }
+            "allocation" => stale_carry_diagnostics::refusing_reserve(|| start(&mut index)),
+            _ => start(&mut index),
+        };
+        let counts = stale_carry_diagnostics::take_for_test().unwrap();
+        assert_eq!(counts.member_evidence, 1);
+        assert_eq!(counts.eligible_before_funding, 1);
+        assert_eq!(counts.cancellation_funding, u64::from(failure == "funding"));
+        assert_eq!(
+            counts.reserve_allocation,
+            u64::from(failure == "allocation")
+        );
+        assert_eq!(counts.final_carried, u64::from(failure == "none"));
+        assert_eq!(counts.rejected() + counts.final_carried, 2);
+        assert_eq!(row["carried_pending_families"], counts.final_carried);
+    }
+}

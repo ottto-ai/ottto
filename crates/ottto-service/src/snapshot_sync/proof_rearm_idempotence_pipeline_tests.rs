@@ -1844,3 +1844,261 @@ fn returning_family_grown_held_census_line_encoding_is_bounded() {
         assert!(line.len() <= 4096, "{} bytes", line.len());
     }
 }
+
+// SOURCE 2026-10-27, option A: a `Completed` page that holds an entity locally
+// scopes the sweep's unsettled marker to the held entity's own families for
+// the terminal unchanged-proof skip. These arms run with native comparison on,
+// as in production: the hold withholds the scan census, but the native census
+// still completes, so the terminal fold runs its proof re-arm. Every held arm
+// is compared with the same steps and no hold. Holds use the production E2
+// hold (`hold_request_owned`), which no authority record binds.
+
+/// Two unrelated single-session transcripts in their own directory. The
+/// breadth-first walk puts them alone on the second page, between the family
+/// root's page and the subagents' page, so a hold there touches no family key.
+const C1A_HELD: &str = "d7000000-0000-4000-8000-000000000007";
+const C1A_HELD_NEIGHBOR: &str = "d8000000-0000-4000-8000-000000000008";
+/// Pages of one held-arm window: root and sibling, the held page, both
+/// subagents, then the invalid and terminal transcripts.
+const C1A_HELD_ARM_PAGES: usize = 4;
+
+/// One arm: 08:00 closes the fence and proves the family with every file read
+/// (a full re-arm). The held transcript then gains a request in every arm, so
+/// its 08:10 body is a real change rather than a semantic no-op (finalization
+/// drops a no-op before any hold applies). 08:10 reads every file again and
+/// re-proves the family, with `holds` held on every page that reads them.
+/// `before` runs before every later 08:10 page with that page's number.
+fn c1a_held_arm(
+    case: &'static str,
+    holds: &[&str],
+    mut before: impl FnMut(&RearmFixture, usize),
+) -> (RearmFixture, C1aWindow, Vec<RearmPage>) {
+    let mut fixture = c1a_fixture(case);
+    for session in [C1A_HELD, C1A_HELD_NEIGHBOR] {
+        RearmFixture::append(
+            &fixture
+                .root
+                .join("held-project")
+                .join(format!("{session}.jsonl")),
+            &rearm_transcript_line(session, None, &format!("req_{session}"), 0),
+        );
+    }
+    let closing = c1a_window(&c1a_generation(&fixture, "fix", (8, 0)));
+    assert!(
+        closing.census_complete && closing.fence_after && closing.full_rearm && closing.proven,
+        "{case}: {closing:?}"
+    );
+    RearmFixture::append(
+        &fixture
+            .root
+            .join("held-project")
+            .join(format!("{C1A_HELD}.jsonl")),
+        &rearm_transcript_line(C1A_HELD, None, "req_held_2", 1),
+    );
+    fixture.local_holds = holds.iter().map(|session| (*session).to_owned()).collect();
+    let pages = c1a_generation_with(&fixture, "fix", (8, 10), None, |number| {
+        before(&fixture, number)
+    });
+    assert_eq!(pages.len(), C1A_HELD_ARM_PAGES, "{case}: page layout");
+    let window = c1a_window(&pages);
+    (fixture, window, pages)
+}
+
+/// Exactly one page held, before the terminal page, and its saved marker is
+/// `completed_blocking_holds` alone, scoped to the families it names.
+fn c1a_assert_scoped_hold(pages: &[RearmPage], arm: &str) {
+    let held = pages
+        .iter()
+        .enumerate()
+        .filter(|(_, page)| !page.held.is_empty())
+        .map(|(number, _)| number)
+        .collect::<Vec<_>>();
+    assert_eq!(held.len(), 1, "{arm}: one page holds");
+    assert!(held[0] + 1 < pages.len(), "{arm}: before the terminal page");
+    let index = &pages[held[0]].index;
+    assert_eq!(
+        index.bounded_sweep_unsettled_cause_names(),
+        ["completed_blocking_holds"],
+        "{arm}"
+    );
+    assert!(
+        index
+            .unchanged_proof_unsettled_families()
+            .is_some_and(|families| !families.is_empty()),
+        "{arm}: the saved marker names its held families"
+    );
+}
+
+/// The window an arm would have without its census withhold. Only the
+/// census status may differ between a held arm and its no-hold arm.
+fn c1a_census_as(window: &C1aWindow, control: &C1aWindow) -> C1aWindow {
+    C1aWindow {
+        census_complete: control.census_complete,
+        ..window.clone()
+    }
+}
+
+/// Make an account hold for the first subagent durable once its page is
+/// behind (before every page from the subagents' page on, so the terminal
+/// fold sees it), as `c1a_account_held_member_keeps_base_rearm` does.
+fn c1a_account_hold_after_subagents(fixture: &RearmFixture, number: usize) {
+    if number >= 2 {
+        let index = ScanIndex::load(&fixture.index_path).unwrap();
+        let key =
+            RearmFixture::family_keys(&index)[&rearm_member_session(Some(REARM_AGENTS[0]))].clone();
+        let revision = index.files[&key].source_file_fingerprint.clone();
+        c1a_edit_index(fixture, |saved| {
+            saved.insert(
+                "claude_account_deferred_holds".to_owned(),
+                serde_json::json!({ key: revision }),
+            );
+        });
+    }
+}
+
+/// SOURCE option A, tests (b) and (c), unbound hold: an entity no authority
+/// record binds, held on a page with no family key, neither blocks nor
+/// unlocks another family. The proven family skips exactly as without the
+/// hold, and an account-held member keeps its family's re-arm exactly as
+/// without the hold. The held entity stays held, is re-offered at the next
+/// read, and keeps the census from completing (condition 1).
+#[test]
+#[serial(source_manifests)]
+fn c1a_unbound_hold_neither_blocks_nor_unlocks_another_family() {
+    if !c1a_layout_supported("c1a_unbound_hold") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let family = rearm_family_sessions().len();
+
+    let (_, control, control_pages) = c1a_held_arm("c1a-hold-control", &[], |_, _| {});
+    assert!(control_pages.iter().all(|page| page.held.is_empty()));
+    assert!(control.census_complete && control.proven, "{control:?}");
+    assert_eq!(control.family_reads, family);
+    assert_eq!(control.debt, 0, "the settled unchanged re-proof skips");
+
+    let (held_fixture, held, held_pages) =
+        c1a_held_arm("c1a-hold-unrelated", &[C1A_HELD], |_, _| {});
+    c1a_assert_scoped_hold(&held_pages, "unrelated");
+    assert!(rearm_parsed(&held_pages).contains(C1A_HELD));
+    assert!(
+        !held.census_complete,
+        "the held entity withholds the census"
+    );
+    // FLIPS on the sweep-wide marker, which re-armed every member here.
+    assert_eq!(
+        c1a_census_as(&held, &control),
+        control,
+        "the unrelated hold does not block the proven family's skip"
+    );
+    // Its revision was never committed, so the next window reads and holds
+    // it again; the skipped family stays unread and owes nothing.
+    let next = c1a_generation(&held_fixture, "fix", (8, 20));
+    assert!(rearm_parsed(&next).contains(C1A_HELD), "re-offered");
+    assert!(next.iter().any(|page| !page.held.is_empty()), "held again");
+    let next = c1a_window(&next);
+    assert_eq!((next.family_reads, next.debt), (0, 0));
+
+    let (_, account, _) = c1a_held_arm(
+        "c1a-hold-account-control",
+        &[],
+        c1a_account_hold_after_subagents,
+    );
+    assert!(account.proven, "{account:?}");
+    assert!(account.debt > 0, "an account-held member keeps the re-arm");
+    let (_, held_account, held_account_pages) = c1a_held_arm(
+        "c1a-hold-account",
+        &[C1A_HELD],
+        c1a_account_hold_after_subagents,
+    );
+    c1a_assert_scoped_hold(&held_account_pages, "account");
+    assert_eq!(
+        c1a_census_as(&held_account, &account),
+        account,
+        "the unrelated hold does not unlock a family whose own member is unsettled"
+    );
+}
+
+/// SOURCE option A, test (b), changed member: beside an unbound hold, a
+/// proven family skips only while its own members are unchanged. A subagent
+/// gains a request after the family pages and before the terminal page; the
+/// window reads, proves and re-arms exactly as without the hold.
+#[test]
+#[serial(source_manifests)]
+fn c1a_changed_family_beside_unbound_hold_rearms_like_no_hold() {
+    if !c1a_layout_supported("c1a_changed_beside_hold") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let family = rearm_family_sessions().len();
+    let gain = |fixture: &RearmFixture, number: usize| {
+        if number == 3 {
+            fixture.append_family_request(Some(REARM_AGENTS[0]), "req_agent_a_2", 4, 5);
+        }
+    };
+    let (_, control, _) = c1a_held_arm("c1a-changed-control", &[], gain);
+    assert_eq!(control.family_reads, family);
+    assert!(control.proven, "the changed family is proven: {control:?}");
+    assert_eq!(control.debt, family, "a changed proven family never skips");
+    let (_, held, held_pages) = c1a_held_arm("c1a-changed-beside-hold", &[C1A_HELD], gain);
+    c1a_assert_scoped_hold(&held_pages, "changed");
+    assert!(held.proven, "the changed family is proven: {held:?}");
+    assert_eq!(held.debt, family, "a changed proven family never skips");
+    assert_eq!(c1a_census_as(&held, &control), control);
+}
+
+/// SOURCE option A, test (a): a held family still re-arms its own members,
+/// even when its held member's committed revision passes every per-member
+/// settlement check. After the skip is active, the root transcript gains a
+/// user turn (a changed body, no new request) and both subagents are re-armed,
+/// so 08:20 reads and re-proves the whole family with an unchanged witness.
+/// Without a hold the changed root body is accepted and the re-proof skips;
+/// with the root held, its committed revision (accepted, non-empty) is
+/// restored and the family re-arms every member.
+#[test]
+#[serial(source_manifests)]
+fn c1a_held_family_rearms_its_own_members() {
+    if !c1a_layout_supported("c1a_held_family") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let family = rearm_family_sessions().len();
+    let run = |case: &'static str, holds: &[&str]| {
+        let (mut fixture, reproved, _) = c1a_held_arm(case, &[], |_, _| {});
+        assert_eq!(reproved.debt, 0, "{case}: the skip is active");
+        let keys = RearmFixture::family_keys(&ScanIndex::load(&fixture.index_path).unwrap());
+        c1a_edit_index(&fixture, |saved| {
+            for (session, key) in &keys {
+                if session != REARM_ROOT {
+                    saved["files"][key.as_str()]["source_file_fingerprint"] = serde_json::json!("");
+                }
+            }
+        });
+        RearmFixture::append(
+            &fixture.member_path(None),
+            &format!(
+                "{{\"timestamp\":\"2026-08-02T07:00:30Z\",\"type\":\"user\",\"sessionId\":\"{REARM_ROOT}\",\"message\":{{\"role\":\"user\",\"content\":\"continue\"}}}}\n"
+            ),
+        );
+        fixture.local_holds = holds.iter().map(|session| (*session).to_owned()).collect();
+        let pages = c1a_generation(&fixture, "fix", (8, 20));
+        (c1a_window(&pages), pages)
+    };
+    let (control, control_pages) = run("c1a-held-family-control", &[]);
+    assert!(control_pages.iter().all(|page| page.held.is_empty()));
+    assert_eq!(control.family_reads, family);
+    assert!(control.census_complete && control.proven, "{control:?}");
+    assert_eq!(control.debt, 0, "the unchanged re-proof skips");
+    let (held, held_pages) = run("c1a-held-family", &[REARM_ROOT]);
+    c1a_assert_scoped_hold(&held_pages, "held family");
+    assert_eq!(held.family_reads, family);
+    assert!(held.proven, "{held:?}");
+    assert!(
+        !held.census_complete,
+        "the held member withholds the census"
+    );
+    assert_eq!(held.debt, family, "the held family re-arms every member");
+}

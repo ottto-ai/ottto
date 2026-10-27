@@ -328,6 +328,8 @@ impl HeaderInventory {
                 legacy_source_file_fingerprint: String::new(),
                 legacy_config_reconciliation_required: false,
                 opened_object_identity: String::new(),
+                fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: 0,
             };
             prepare_owned_scan_candidate(
                 SnapshotSource::Codex,
@@ -3681,15 +3683,10 @@ pub(super) mod tests {
                 .iter()
                 .map(|item| snapshot_fingerprint(SnapshotSource::Codex, item))
                 .collect::<BTreeSet<_>>();
-            let mut digest = Sha256::new();
-            update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
-            for fingerprint in &fingerprints {
-                update_length_prefixed(&mut digest, fingerprint.as_bytes());
-            }
             let key = local_index_key(&member.path);
             index.record(
                 member,
-                Some(format!("{:x}", digest.finalize())),
+                Some(snapshot_file_entity_set_hex(&fingerprints)),
                 ScanParseOutcome::Snapshot,
             );
             index.file_snapshot_fingerprints.insert(key, fingerprints);

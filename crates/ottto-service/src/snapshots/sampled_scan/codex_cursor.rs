@@ -526,6 +526,265 @@ impl crate::transcript_acquisition::StampIdentity for OpenStamp {
     }
 }
 
+/// Compact cross-scan evidence. The first six words are ctime, birth,
+/// mtime, length, device and inode; four hold the opened identity, and the
+/// last fences reuse of already-read samples at the most recent live ctime.
+/// No transcript bytes or heap allocation. Active-parser stamps stay live.
+#[derive(Clone, Copy)]
+struct WakeIdentity([u64; 11]);
+
+impl WakeIdentity {
+    fn identity(&self) -> String {
+        self.0[6..10]
+            .iter()
+            .map(|word| format!("{word:016x}"))
+            .collect()
+    }
+
+    fn same_content_inputs(&self, stamp: &OpenStamp, birth: u64) -> bool {
+        birth != 0
+            && self.0[2] != 0
+            && self.0[1] == birth
+            && self.0[2] == stamp_modified_nanos(stamp)
+            && self.0[3] == stamp.extent
+            && self.0[4] == stamp.dev
+            && self.0[5] == stamp.ino
+    }
+}
+
+fn stamp_modified_nanos(stamp: &OpenStamp) -> u64 {
+    stamp
+        .modified
+        .0
+        .try_into()
+        .ok()
+        .and_then(|seconds: u64| seconds.checked_mul(1_000_000_000))
+        .and_then(|seconds| seconds.checked_add(stamp.modified.1.try_into().ok()?))
+        .unwrap_or_default()
+}
+
+/// Each key owns exactly its capacity; values are inline. A walk charges
+/// container nodes and all key capacities in two visits, independent of count.
+#[derive(Default)]
+struct WakeIdentities(BTreeMap<String, (WakeIdentity, u64)>);
+impl HeapLayoutBound for WakeIdentities {
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        crate::heap_layout_bound::tree_nodes::<String, (WakeIdentity, u64)>(self.0.len(), c)?;
+        let keys = self
+            .0
+            .keys()
+            .try_fold(0usize, |sum, key| sum.checked_add(key.capacity()))?;
+        c.add(keys)
+    }
+}
+
+impl SharedCache {
+    /// A cheap content-qualified identity for retained wake decisions only.
+    /// Missing/evicted evidence or any content/object mismatch keeps live ctime.
+    /// Samples use pread so neither a parser nor a boot reader is repositioned.
+    pub(in crate::snapshots) fn retained_open(
+        &self,
+        path: &Path,
+        file: &File,
+    ) -> Option<(OpenStamp, String, String)> {
+        let metadata = file.metadata().ok()?;
+        let width = FILE_CONTENT_SAMPLE_BYTES as u64;
+        let read = |at, len| {
+            let mut bytes = vec![0; len];
+            file.read_exact_at(&mut bytes, at).ok()?;
+            Some(bytes)
+        };
+        let samples = OpenedContentSamples {
+            head: read(0, metadata.len().min(width) as usize)?,
+            tail: if metadata.len() > width {
+                Some(read(metadata.len() - width, FILE_CONTENT_SAMPLE_BYTES)?)
+            } else {
+                None
+            },
+        };
+        self.retained_sampled(path, file, &metadata, &samples)
+    }
+
+    /// Reuse the candidate opener's samples. Its live identity and the
+    /// cross-scan identity are computed from exactly the same bytes.
+    pub(in crate::snapshots) fn retained_sampled(
+        &self,
+        path: &Path,
+        file: &File,
+        metadata: &fs::Metadata,
+        samples: &OpenedContentSamples,
+    ) -> Option<(OpenStamp, String, String)> {
+        let key = local_index_key(path);
+        let previous = self
+            // Remove the old row before any refresh can fail. Failed sampling,
+            // accounting or retained-lock acquisition must leave no eligible
+            // stale identity behind; the live fallback only costs a retry.
+            .with_cursor(|cursor| cursor.wake.0.remove(&key).map(|entry| entry.0))
+            .flatten();
+        let mut stamp = OpenStamp::of(metadata);
+        let birth = metadata
+            .created()
+            .ok()
+            .and_then(unix_nanos)
+            .unwrap_or_default();
+        let object = OpenedObjectStat {
+            device: stamp.dev,
+            inode: stamp.ino,
+            changed_seconds: stamp.changed.0,
+            changed_nanos: stamp.changed.1,
+            birth_nanos: (birth != 0).then_some(birth),
+            modified_nanos: Some(stamp_modified_nanos(&stamp)),
+        };
+        let live_identity = opened_object_identity_from(stamp.extent, Some(&object), samples);
+        let mut identity = live_identity.clone();
+        if let Some(old) =
+            previous.filter(|old| old.0[0] != 0 && old.same_content_inputs(&stamp, birth))
+        {
+            let qualified = opened_object_identity_from(
+                stamp.extent,
+                Some(&object.with_changed_unix_nanos(old.0[0])),
+                samples,
+            );
+            if qualified == old.identity() {
+                stamp.changed = (
+                    (old.0[0] / 1_000_000_000) as i64,
+                    (old.0[0] % 1_000_000_000) as i64,
+                );
+                identity = qualified;
+            }
+        }
+        // Changes during sampling never establish a retained witness.
+        if OpenStamp::capture(file).ok()? != OpenStamp::of(metadata)
+            || file
+                .metadata()
+                .ok()?
+                .created()
+                .ok()
+                .and_then(unix_nanos)
+                .unwrap_or_default()
+                != birth
+        {
+            return None;
+        }
+        let changed = OpenedObjectStat {
+            changed_seconds: stamp.changed.0,
+            changed_nanos: stamp.changed.1,
+            ..object
+        }
+        .changed_unix_nanos();
+        let mut words = [
+            changed,
+            birth,
+            stamp_modified_nanos(&stamp),
+            stamp.extent,
+            stamp.dev,
+            stamp.ino,
+            0,
+            0,
+            0,
+            0,
+            object.changed_unix_nanos(),
+        ];
+        for (slot, hex) in words[6..10]
+            .iter_mut()
+            .zip(identity.as_bytes().chunks_exact(16))
+        {
+            *slot = u64::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+        }
+        let witness = WakeIdentity(words);
+        // Retained -> cursor is the shared-cache lock order. Optional admission
+        // stays within the existing STATE_BYTES admission; failure leaves
+        // this path without a reusable witness.
+        if let Ok(mut retained) = self.retained() {
+            self.with_cursor(|cursor| {
+                let used = cursor.tick();
+                if let Some(entry) = cursor.wake.0.get_mut(&key) {
+                    *entry = (witness, used);
+                    return;
+                }
+                if cursor.wake.0.len() >= MEMO_ENTRIES {
+                    if let Some(oldest) = cursor
+                        .wake
+                        .0
+                        .iter()
+                        .min_by_key(|(_, (_, tick))| tick)
+                        .map(|(key, _)| key.clone())
+                    {
+                        cursor.wake.0.remove(&oldest);
+                    }
+                }
+                let charge =
+                    crate::heap_layout_bound::tree_node_bytes::<String, (WakeIdentity, u64)>()
+                        .and_then(|node| node.checked_add(key.capacity()));
+                if charge.is_some_and(|charge| {
+                    admit_locked(&mut retained, cursor, charge, false, Admitter::Main)
+                }) {
+                    cursor.wake.0.insert(key, (witness, used));
+                }
+            });
+        }
+        Some((stamp, identity, live_identity))
+    }
+
+    pub(in crate::snapshots) fn retained_stamp_identity(
+        &self,
+        candidate: &CandidateFile,
+        fallback: &str,
+    ) -> String {
+        self.with_cursor(|cursor| {
+            cursor
+                .wake
+                .0
+                .get(&local_index_key(&candidate.path))
+                .filter(|(hint, _)| {
+                    hint.0[3] == candidate.size_bytes
+                        && hint.0[2] == candidate.modified_unix_nanos
+                        && candidate.physical_identity == Some([hint.0[4], hint.0[5]])
+                        && candidate.fingerprint_birth_nanos != 0
+                        && hint.0[1] == candidate.fingerprint_birth_nanos
+                })
+                .map(|(hint, _)| hint.identity())
+        })
+        .flatten()
+        .unwrap_or_else(|| fallback.to_owned())
+    }
+
+    /// A stamp just proved live by the parser/boot; canonicalize only its
+    /// cross-scan copy. The cache's witness was established by retained_open.
+    pub(in crate::snapshots) fn retained_stamp(
+        &self,
+        path: &Path,
+        mut stamp: OpenStamp,
+    ) -> OpenStamp {
+        self.with_cursor(|cursor| {
+            if let Some((hint, _)) = cursor.wake.0.get(&local_index_key(path)) {
+                let raw_changed = OpenedObjectStat {
+                    device: stamp.dev,
+                    inode: stamp.ino,
+                    changed_seconds: stamp.changed.0,
+                    changed_nanos: stamp.changed.1,
+                    birth_nanos: None,
+                    modified_nanos: None,
+                }
+                .changed_unix_nanos();
+                if raw_changed != 0
+                    && hint.0[10] == raw_changed
+                    && hint.0[2] == stamp_modified_nanos(&stamp)
+                    && hint.0[3] == stamp.extent
+                    && hint.0[4] == stamp.dev
+                    && hint.0[5] == stamp.ino
+                {
+                    stamp.changed = (
+                        (hint.0[0] / 1_000_000_000) as i64,
+                        (hint.0[0] % 1_000_000_000) as i64,
+                    );
+                }
+            }
+        });
+        stamp
+    }
+}
+
 /// The identity a cursor job proved against its held FD when its prefix
 /// certificate passed (S12). Only `finish_job` sets it, and only on
 /// `Certified` (never on a lossy `Uncertified`); `finish` then accepts a grown
@@ -1994,6 +2253,7 @@ pub(in crate::snapshots) struct CursorState {
     /// LRU clock shared by the invalidation and parked records (L1).
     clock: u64,
     memo: SingletonMemo,
+    wake: WakeIdentities,
     invalidations: BTreeMap<String, (u32, u64)>,
     parked: BTreeMap<String, Parked>,
     rotation: Rotation,
@@ -2032,6 +2292,7 @@ impl Default for CursorState {
             next_token: 1,
             clock: 0,
             memo: SingletonMemo::default(),
+            wake: WakeIdentities::default(),
             invalidations: BTreeMap::new(),
             parked: BTreeMap::new(),
             rotation: Rotation::default(),
@@ -2061,6 +2322,7 @@ impl HeapLayoutBound for CursorState {
             next_token,
             clock,
             memo,
+            wake,
             invalidations,
             parked,
             rotation,
@@ -2092,6 +2354,7 @@ impl HeapLayoutBound for CursorState {
         next_token.heap_bound(c)?;
         clock.heap_bound(c)?;
         memo.heap_bound(c)?;
+        wake.heap_bound(c)?;
         invalidations.heap_bound(c)?;
         parked.heap_bound(c)?;
         rotation.heap_bound(c)?;
@@ -2620,6 +2883,20 @@ impl CursorLease {
             }
             let owner = job.cursor.as_ref().and_then(|meta| meta.owner.clone());
             let disclosure = strict_disclosure(&job, owner, DebtReason::JoinStateBound);
+            let stamp = job
+                .group
+                .as_ref()
+                .and_then(|group| group.stamps.last())
+                .or_else(|| job.cursor.as_ref().map(|meta| &meta.stamp_open))
+                .cloned();
+            let path = job
+                .group
+                .as_ref()
+                .and_then(|group| group.members.last())
+                .unwrap_or(&job.candidate)
+                .path
+                .as_path();
+            let stamp = stamp.map(|stamp| self.cache.retained_stamp(path, stamp));
             self.end(|cursor| {
                 cursor.counters.jobs_state_bound += 1;
                 if let Some(meta) = job.cursor.as_ref() {
@@ -2629,18 +2906,17 @@ impl CursorLease {
                     // A group parks under its live member's boot stamp, the
                     // file its lookup opens (R2-H1); sealed members wake it
                     // through the identities in its dependencies.
-                    let stamp = job
-                        .group
-                        .as_ref()
-                        .and_then(|group| group.stamps.last())
-                        .unwrap_or(&meta.stamp_open)
-                        .clone();
+                    let stamp = stamp.expect("a cursor job has a boot stamp");
                     park(
                         cursor,
                         meta.key.clone(),
                         Parked {
                             stamp,
-                            dependencies: meta.dependencies.clone(),
+                            dependencies: job
+                                .group
+                                .as_ref()
+                                .and_then(|group| group.dependencies.clone())
+                                .or_else(|| meta.dependencies.clone()),
                             disclosure: disclosure.clone(),
                             used,
                             exact: false,
@@ -3274,6 +3550,7 @@ pub(in crate::snapshots) fn group_memo_digest(
     index: &ScanIndex,
     codex: &CodexTitleMetadata,
     receipt_scope: &str,
+    identity: impl Fn(&CandidateFile) -> String,
 ) -> String {
     let mut parts = vec![
         "codex_group_memo:v1".to_owned(),
@@ -3299,7 +3576,7 @@ pub(in crate::snapshots) fn group_memo_digest(
     for (i, member) in members.iter().enumerate() {
         parts.push(local_index_key(&member.path));
         if i < sealed {
-            parts.push(member.opened_object_identity.clone());
+            parts.push(identity(member));
         }
         parts.push(codex.path_reduction_fingerprint(&member.path));
     }
@@ -3315,6 +3592,7 @@ pub(in crate::snapshots) fn group_dependencies(
     members: &[CandidateFile],
     live: &Path,
     codex: &CodexTitleMetadata,
+    identity: impl Fn(&CandidateFile) -> String,
 ) -> String {
     // Keyed by member path, so boot and canonical order agree.
     let mut members = members
@@ -3326,7 +3604,7 @@ pub(in crate::snapshots) fn group_dependencies(
                 if member.path == live {
                     String::new()
                 } else {
-                    member.opened_object_identity.clone()
+                    identity(member)
                 },
             )
         })
@@ -4531,13 +4809,22 @@ impl SharedCache {
     /// object, unshrunk and unedited (growth keeps it parked), with the same
     /// reduction dependencies. Anything else wakes it: the record is dropped
     /// and the file is attempted again.
+    #[cfg(test)]
     pub(in crate::snapshots) fn cursor_parked(
         &self,
         key: &str,
         file: &File,
         dependencies: Option<&str>,
     ) -> Option<Disclosure> {
-        let now = OpenStamp::capture(file).ok();
+        self.cursor_parked_stamp(key, OpenStamp::capture(file).ok(), dependencies)
+    }
+
+    pub(in crate::snapshots) fn cursor_parked_stamp(
+        &self,
+        key: &str,
+        now: Option<OpenStamp>,
+        dependencies: Option<&str>,
+    ) -> Option<Disclosure> {
         self.with_cursor(|cursor| {
             let used = cursor.tick();
             let parked = cursor.parked.get_mut(key)?;
@@ -5637,7 +5924,11 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
     let live = group.members.last().map(|member| member.path.as_path());
     if meta.dependencies.as_deref()
         != live
-            .map(|live| group_dependencies(&group.members, live, inputs.codex))
+            .map(|live| {
+                group_dependencies(&group.members, live, inputs.codex, |member| {
+                    member.opened_object_identity.clone()
+                })
+            })
             .as_deref()
     {
         return changed;
@@ -6085,6 +6376,7 @@ impl MemoEntry {
     /// Every wake dependency is unchanged, the held file is untouched since
     /// its stamp (or only grew, for a non-exact group entry), and the live
     /// witness still holds. Returns the current stamp on a hit.
+    #[cfg(test)]
     pub(in crate::snapshots) fn matches(
         &self,
         digest: &str,
@@ -6093,6 +6385,17 @@ impl MemoEntry {
         sidecar_now: &str,
     ) -> Option<OpenStamp> {
         let now = OpenStamp::capture(file).ok()?;
+        self.matches_stamp(digest, file, parent_now, sidecar_now, now)
+    }
+
+    pub(in crate::snapshots) fn matches_stamp(
+        &self,
+        digest: &str,
+        file: &File,
+        parent_now: Option<&ParentNow>,
+        sidecar_now: &str,
+        now: OpenStamp,
+    ) -> Option<OpenStamp> {
         let stamp_holds = if self.exact_stamp {
             self.stamp == now
         } else {

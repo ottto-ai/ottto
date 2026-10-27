@@ -275,9 +275,16 @@ fn main() -> Result<()> {
             }
         }
         Command::Status { json } => {
-            let token = load_or_create_control_token()?;
+            // Diagnostic only: never creates or replaces the control token or
+            // the machine binding, which belong to the daemon.
+            let (Some(token), Some(machine)) =
+                (existing_control_token()?, existing_local_machine()?)
+            else {
+                report_local_state_not_initialized(json);
+                std::process::exit(STATUS_NOT_INITIALIZED_EXIT_CODE);
+            };
             let daemon = LocalDaemon::new(
-                local_machine(),
+                machine,
                 ControlToken::new(token.clone())?,
                 current_rfc3339_timestamp(),
             )
@@ -298,6 +305,7 @@ fn main() -> Result<()> {
         Command::Serve { socket, once } => {
             #[cfg(unix)]
             {
+                let _local_state = hold_local_state_or_exit();
                 // Before the relays start, so the first check-in already
                 // reports the transport.
                 ottto_service::control_plane_health::mark_serving(
@@ -333,6 +341,8 @@ fn main() -> Result<()> {
             mach_service,
             socket,
         } => {
+            #[cfg(unix)]
+            let _local_state = hold_local_state_or_exit();
             // Before the relays start, so the first check-in already reports
             // the transport. Off macOS there is no XPC and only the socket
             // serves.
@@ -528,6 +538,33 @@ impl ServiceCommand {
             | ServiceCommand::InstallPlan { json, .. }
             | ServiceCommand::WriteLaunchAgent { json, .. }
             | ServiceCommand::Bootstrap { json, .. } => *json,
+        }
+    }
+}
+
+/// How long a daemon launchd started waits before it exits on a held state
+/// directory. A `KeepAlive` job (the Homebrew service) is restarted as soon
+/// as it exits, and an on-demand Mach service on its next connection; this
+/// keeps either from respawning faster than once per interval.
+#[cfg(unix)]
+const HELD_STATE_LAUNCHD_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Takes the single-writer lock on the local state directory before
+/// anything in `serve` or `serve-xpc` can read or write it, and returns it
+/// to be held for the life of the process. When another daemon holds it, or
+/// it cannot be taken, prints why and exits without writing any state.
+#[cfg(unix)]
+fn hold_local_state_or_exit() -> ottto_service::state_dir_lock::StateDirLock {
+    use ottto_service::state_dir_lock::{StateDirLock, StateDirLockError};
+    match StateDirLock::acquire(&ottto_core::default_support_dir()) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("ottto-service: {error}; exiting without touching it");
+            // launchd is the parent of every job it starts.
+            if matches!(error, StateDirLockError::Held { .. }) && unsafe { libc::getppid() } == 1 {
+                std::thread::sleep(HELD_STATE_LAUNCHD_BACKOFF);
+            }
+            std::process::exit(error.exit_code());
         }
     }
 }
@@ -740,6 +777,64 @@ fn local_machine() -> MachineIdentity {
             let _ = FileMachineStore::default().save(&binding);
         }
     }
+    machine_identity(binding, hostname)
+}
+
+/// `EX_CONFIG`: `status` found no control token or machine binding.
+const STATUS_NOT_INITIALIZED_EXIT_CODE: i32 = 78;
+
+/// The saved control token, without creating one.
+fn existing_control_token() -> Result<Option<String>> {
+    use ottto_core::ControlTokenStore;
+    if let Ok(token) = std::env::var(ottto_core::OTTTO_CONTROL_TOKEN_ENV) {
+        return Ok(Some(token));
+    }
+    match ottto_core::token_store::FileControlTokenStore::default().load() {
+        Ok(token) => Ok(Some(token)),
+        Err(ottto_core::TokenStoreError::Missing) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The saved machine binding, without creating, replacing or completing it.
+fn existing_local_machine() -> Result<Option<MachineIdentity>> {
+    let Some(mut binding) = FileMachineStore::default().load()? else {
+        return Ok(None);
+    };
+    if !ottto_core::is_persistent_machine_id(&binding.machine_id)
+        || !ottto_core::is_persistent_installation_id(&binding.installation_id)
+    {
+        return Ok(None);
+    }
+    if binding.hardware_uuid.is_none() {
+        binding.hardware_uuid = platform_hardware_uuid();
+    }
+    Ok(Some(machine_identity(binding, local_hostname())))
+}
+
+fn report_local_state_not_initialized(json: bool) {
+    let message = format!(
+        "{OTTTO_SERVICE_BINARY_NAME} local state is not initialized (no control token or machine binding); start the service to create it"
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": false,
+                "error": {
+                    "code": "local_state_not_initialized",
+                    "message": message,
+                    "retryable": true
+                }
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        eprintln!("{message}");
+    }
+}
+
+fn machine_identity(binding: LocalMachineBinding, hostname: String) -> MachineIdentity {
     let account_scope = local_account_scope(&binding.machine_id);
     MachineIdentity {
         machine_id: binding.machine_id,
@@ -1009,6 +1104,75 @@ mod tests {
             assert!(at(prepare) < at("LocalDaemon::new("), "{arm}");
             assert!(at(prepare) < at("start_builtin_relays(&daemon)"), "{arm}");
             assert!(!arm.contains("sweep_local_state_at_startup"), "{arm}");
+        }
+    }
+
+    /// Every daemon entry point takes the state-directory lock before it
+    /// marks itself serving, runs a startup step or touches any state.
+    #[test]
+    fn state_dir_lock_is_the_first_step_of_serve_commands() {
+        let source = include_str!("main.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let arm = |start: &str, end: &str| {
+            let from = source.find(start).expect("command arm");
+            &source[from..from + source[from..].find(end).expect("next arm")]
+        };
+        for arm in [
+            arm("Command::Serve { socket, once } =>", "Command::ServeXpc {"),
+            arm("Command::ServeXpc {", "Command::Service { command } =>"),
+        ] {
+            let at = |needle: &str| arm.find(needle).unwrap_or_else(|| panic!("{needle}"));
+            assert_eq!(
+                arm.matches("hold_local_state_or_exit()").count(),
+                1,
+                "{arm}"
+            );
+            let lock = at("let _local_state = hold_local_state_or_exit();");
+            assert!(lock < at("mark_serving("), "{arm}");
+            assert!(lock < at("prepare_to_serve("), "{arm}");
+            assert!(lock < at("load_or_create_control_token()"), "{arm}");
+            assert!(lock < at("LocalDaemon::new("), "{arm}");
+        }
+        // One binding per arm and no other caller.
+        assert_eq!(
+            source
+                .matches("let _local_state = hold_local_state_or_exit();")
+                .count(),
+            2
+        );
+    }
+
+    /// `status` is a diagnostic: it reads the token and machine binding the
+    /// daemon created and never creates, replaces or completes either.
+    #[test]
+    fn status_never_creates_the_control_token_or_machine_binding() {
+        let source = include_str!("main.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let from = source
+            .find("Command::Status { json } =>")
+            .expect("status arm");
+        let arm = &source[from..from + source[from..].find("Command::Serve {").unwrap()];
+        assert!(arm.contains("existing_control_token()?"), "{arm}");
+        assert!(arm.contains("existing_local_machine()?"), "{arm}");
+        for creating in ["load_or_create_control_token", ".save("] {
+            assert!(!arm.contains(creating), "{creating}: {arm}");
+        }
+        assert_eq!(
+            arm.matches("local_machine()").count(),
+            arm.matches("existing_local_machine()").count(),
+            "{arm}"
+        );
+        let readers = &source[source.find("fn existing_control_token()").unwrap()
+            ..source
+                .find("fn report_local_state_not_initialized(")
+                .unwrap()];
+        for creating in [
+            "load_or_create",
+            "generate_control_token",
+            ".save(",
+            "persistent_machine_binding",
+        ] {
+            assert!(!readers.contains(creating), "{creating}: {readers}");
         }
     }
 

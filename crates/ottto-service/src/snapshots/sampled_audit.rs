@@ -333,33 +333,25 @@ impl OwnedSourceScan {
             return;
         }
         let previous = self.index.held_audit_progress.as_ref();
+        // A held key the slot may serve: bounded, still awaiting restoration,
+        // and owned by a scan root, so the Full below can be queued.
+        let eligible = |key: &str| {
+            key.len() <= 4096
+                && awaits_hold_deadline_restoration(&self.index, key)
+                && self.index.traversal.as_ref().is_some_and(|traversal| {
+                    traversal.first_matching_scan_root(Path::new(key)).is_some()
+                })
+        };
         let keep = previous.is_some_and(|slot| {
             !slot.attempted
-                && slot.key.len() <= 4096
                 && slot.due > 0
                 && now
                     .checked_add(AUDIT_INTERVAL_SECONDS)
                     .is_some_and(|latest| slot.due <= latest)
-                && awaits_hold_deadline_restoration(&self.index, &slot.key)
-                && self.index.traversal.as_ref().is_some_and(|traversal| {
-                    traversal
-                        .scan_roots
-                        .iter()
-                        .any(|root| Path::new(&slot.key).starts_with(root))
-                })
+                && eligible(slot.key.as_str())
         });
         if !keep {
             let after = previous.map(|slot| slot.key.as_str());
-            let eligible = |key: &&String| {
-                key.len() <= 4096
-                    && awaits_hold_deadline_restoration(&self.index, key)
-                    && self.index.traversal.as_ref().is_some_and(|traversal| {
-                        traversal
-                            .scan_roots
-                            .iter()
-                            .any(|root| Path::new(key).starts_with(root))
-                    })
-            };
             // BTreeMap order plus a persisted cursor gives every held path a
             // turn, including when a prior turn failed its secure open/cap.
             let key = self
@@ -367,14 +359,14 @@ impl OwnedSourceScan {
                 .claude_request_census
                 .records()
                 .map(|(key, _)| key)
-                .filter(eligible)
+                .filter(|key| eligible(key.as_str()))
                 .find(|key| after.map_or(true, |after| key.as_str() > after))
                 .or_else(|| {
                     self.index
                         .claude_request_census
                         .records()
                         .map(|(key, _)| key)
-                        .find(eligible)
+                        .find(|key| eligible(key.as_str()))
                 })
                 .cloned();
             self.index.held_audit_progress =
@@ -392,13 +384,13 @@ impl OwnedSourceScan {
             return;
         }
         let path = PathBuf::from(&slot.key);
-        let Some(root) = self.index.traversal.as_ref().and_then(|traversal| {
-            traversal
-                .scan_roots
-                .iter()
-                .find(|root| path.starts_with(root))
-                .cloned()
-        }) else {
+        // First match, not deepest: the root enters the sampled scope hash.
+        let Some(root) = self
+            .index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.first_matching_scan_root(&path).cloned())
+        else {
             return;
         };
         let key = slot.key.clone();
@@ -416,6 +408,8 @@ impl OwnedSourceScan {
             legacy_source_file_fingerprint: String::new(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: String::new(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         };
         // Mirror candidate conversion's census observation. An old queued
         // age rejection must not delete a successful recovery at settlement.
@@ -468,6 +462,8 @@ mod tests {
             legacy_source_file_fingerprint: "legacy".into(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: "opened".into(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         }
     }
     fn index() -> ScanIndex {
@@ -874,6 +870,8 @@ mod provenance_tests {
             legacy_source_file_fingerprint: "legacy".into(),
             legacy_config_reconciliation_required: false,
             opened_object_identity: "opened".into(),
+            fingerprint_changed_nanos: 0,
+            fingerprint_birth_nanos: 0,
         };
         let key = local_index_key(&candidate.path);
         for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {

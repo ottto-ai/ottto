@@ -34,6 +34,9 @@ pub enum TokenStoreError {
     Store(String),
     #[error("control token is not valid UTF-8")]
     InvalidUtf8,
+    /// A daemon owns local state but has not saved its control token yet.
+    #[error("ottto-service is starting and has not created its control token yet")]
+    DaemonNotReady,
 }
 
 pub trait ControlTokenStore {
@@ -547,6 +550,52 @@ pub fn load_or_create_control_token() -> Result<String, TokenStoreError> {
     }
 
     let store = FileControlTokenStore::default();
+    match store.load() {
+        Ok(token) => Ok(token),
+        Err(TokenStoreError::Missing) => {
+            let token = generate_control_token().map_err(TokenStoreError::Store)?;
+            store.save(&token)?;
+            Ok(token)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Client-side fallback when the control token cannot be read. A missing
+/// token is created only while this process holds the daemon's
+/// state-directory lock, so a client and a starting daemon can never each
+/// save a different token. When a daemon holds the lock it creates the token
+/// itself: the existing token is used, or `DaemonNotReady` is returned and
+/// nothing is written.
+#[cfg(unix)]
+pub fn load_or_create_control_token_unless_daemon_owns() -> Result<String, TokenStoreError> {
+    if let Ok(token) = std::env::var(OTTTO_CONTROL_TOKEN_ENV) {
+        return Ok(token);
+    }
+    load_or_create_control_token_unless_owned_in(&default_support_dir())
+}
+
+#[cfg(not(unix))]
+pub fn load_or_create_control_token_unless_daemon_owns() -> Result<String, TokenStoreError> {
+    load_or_create_control_token()
+}
+
+#[cfg(unix)]
+fn load_or_create_control_token_unless_owned_in(
+    support_dir: &Path,
+) -> Result<String, TokenStoreError> {
+    use crate::state_dir_lock::{StateDirLock, StateDirLockError};
+    let store = FileControlTokenStore::new(support_dir.join(CONTROL_TOKEN_FILE_NAME));
+    let _lock = match StateDirLock::acquire(support_dir) {
+        Ok(lock) => lock,
+        Err(StateDirLockError::Held { .. }) => {
+            return match store.load() {
+                Err(TokenStoreError::Missing) => Err(TokenStoreError::DaemonNotReady),
+                other => other,
+            };
+        }
+        Err(error) => return Err(TokenStoreError::Store(error.to_string())),
+    };
     match store.load() {
         Ok(token) => Ok(token),
         Err(TokenStoreError::Missing) => {
@@ -1190,5 +1239,115 @@ mod tests {
         assert_eq!(result, Err(ERR_SEC_NO_SUCH_KEYCHAIN));
         assert_eq!(attempts.get(), 2);
         assert_eq!(reresolves.get(), 1);
+    }
+
+    /// A daemon holding local state and still creating its token: the CLI
+    /// fallback reports not-ready and writes nothing, then uses the token
+    /// the daemon saves.
+    #[cfg(unix)]
+    #[test]
+    fn cli_token_fallback_never_creates_while_a_daemon_owns_state() {
+        use crate::state_dir_lock::{scratch, StateDirLock, STATE_DIR_LOCK_FILE_NAME};
+        let root = scratch("cli-token-held");
+        let support = root.join("Ottto");
+        let daemon = StateDirLock::acquire(&support).expect("daemon owns state");
+        let lock_bytes = fs::read(support.join(STATE_DIR_LOCK_FILE_NAME)).expect("lock");
+
+        let result = load_or_create_control_token_unless_owned_in(&support);
+        assert!(
+            matches!(result, Err(TokenStoreError::DaemonNotReady)),
+            "{result:?}"
+        );
+        let names: Vec<_> = fs::read_dir(&support)
+            .expect("support dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from(STATE_DIR_LOCK_FILE_NAME)]
+        );
+        assert_eq!(
+            fs::read(support.join(STATE_DIR_LOCK_FILE_NAME)).expect("lock"),
+            lock_bytes
+        );
+
+        let store = FileControlTokenStore::new(support.join(CONTROL_TOKEN_FILE_NAME));
+        store.save("daemon-token").expect("daemon saves its token");
+        assert_eq!(
+            load_or_create_control_token_unless_owned_in(&support).expect("existing token"),
+            "daemon-token"
+        );
+        assert_eq!(store.load().expect("token kept"), "daemon-token");
+        drop(daemon);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Daemons and CLI fallbacks starting together on a fresh directory end
+    /// with exactly one saved token, and every caller that got one got it.
+    #[cfg(unix)]
+    #[test]
+    fn simultaneous_first_start_saves_one_token() {
+        use crate::state_dir_lock::{scratch, StateDirLock};
+        const STARTERS: usize = 8;
+        for round in 0..16 {
+            let root = scratch(&format!("token-first-start-{round}"));
+            let support = root.join("Ottto");
+            let barrier = Arc::new(std::sync::Barrier::new(STARTERS));
+            let threads: Vec<_> = (0..STARTERS)
+                .map(|starter| {
+                    let support = support.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if starter % 2 == 0 {
+                            // serve: lock for life, then load or create.
+                            let Ok(lock) = StateDirLock::acquire(&support) else {
+                                return (None, None);
+                            };
+                            let store =
+                                FileControlTokenStore::new(support.join(CONTROL_TOKEN_FILE_NAME));
+                            let token = match store.load() {
+                                Ok(token) => token,
+                                Err(TokenStoreError::Missing) => {
+                                    let token = generate_control_token().expect("token");
+                                    store.save(&token).expect("save token");
+                                    token
+                                }
+                                Err(error) => panic!("{error}"),
+                            };
+                            (Some(token), Some(lock))
+                        } else {
+                            match load_or_create_control_token_unless_owned_in(&support) {
+                                Ok(token) => (Some(token), None),
+                                Err(TokenStoreError::DaemonNotReady) => (None, None),
+                                Err(error) => panic!("{error}"),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let results: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().expect("starter"))
+                .collect();
+            let saved = FileControlTokenStore::new(support.join(CONTROL_TOKEN_FILE_NAME))
+                .load()
+                .expect("one token saved");
+            let tokens: Vec<_> = results
+                .iter()
+                .filter_map(|(token, _)| token.clone())
+                .collect();
+            assert!(!tokens.is_empty(), "round {round}");
+            assert!(
+                tokens.iter().all(|token| *token == saved),
+                "round {round}: {tokens:?} vs {saved}"
+            );
+            assert!(
+                results.iter().filter(|(_, lock)| lock.is_some()).count() <= 1,
+                "round {round}: two daemons owned state"
+            );
+            drop(results);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }
