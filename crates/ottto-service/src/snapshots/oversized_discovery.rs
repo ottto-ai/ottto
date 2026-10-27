@@ -120,9 +120,9 @@ pub(super) fn floor_retry_due(
     const FLOOR_SECONDS: u64 = 6 * 60 * 60;
     source == SnapshotSource::ClaudeCode
         && !traversal.oversized_discovery.is_empty()
-        && rfc3339_unix_seconds(collected_at).is_some_and(|now| {
+        && rfc3339_unix_seconds(collected_at).map_or(true, |now| {
             rfc3339_unix_seconds(&traversal.census_window_end)
-                .is_some_and(|started| now >= started.saturating_add(FLOOR_SECONDS))
+                .map_or(true, |started| now >= started.saturating_add(FLOOR_SECONDS))
         })
 }
 

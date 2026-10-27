@@ -48365,6 +48365,40 @@ mod tests {
     }
 
     #[test]
+    fn oversized_floor_retries_malformed_clocks_and_keeps_six_hour_cadence() {
+        let mut traversal = terminal_unhealthy_traversal(String::new());
+        traversal.oversized_discovery = serde_json::from_value(serde_json::json!({
+            "synthetic_path_hash": { "content_hash": "synthetic_content_hash", "observations": 1 }
+        }))
+        .unwrap();
+        for (anchor, collected_at, due) in [
+            ("2026-07-31T00:00:00Z", "malformed", true),
+            ("malformed", "2026-07-31T00:00:00Z", true),
+            ("malformed", "malformed", true),
+            ("2026-07-31T00:00:00Z", "2026-07-31T05:59:59Z", false),
+            ("2026-07-31T00:00:00Z", "2026-07-31T06:00:00Z", true),
+            ("2026-07-31T00:00:00Z", "2026-07-31T07:00:00Z", true),
+        ] {
+            traversal.census_window_end = anchor.to_string();
+            assert_eq!(
+                oversized_discovery::floor_retry_due(
+                    SnapshotSource::ClaudeCode,
+                    &traversal,
+                    collected_at,
+                ),
+                due,
+                "anchor={anchor}, collected_at={collected_at}"
+            );
+        }
+        traversal.oversized_discovery.clear();
+        assert!(!oversized_discovery::floor_retry_due(
+            SnapshotSource::ClaudeCode,
+            &traversal,
+            "malformed",
+        ));
+    }
+
+    #[test]
     fn scan_root_lookups_keep_deepest_and_first_match_rules_under_nested_roots() {
         let outer = PathBuf::from("/synthetic/projects");
         let nested = outer.join("team").join("projects");
