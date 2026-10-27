@@ -1853,9 +1853,11 @@ const C1A_HELD_NEIGHBOR: &str = "d8000000-0000-4000-8000-000000000008";
 const C1A_HELD_ARM_PAGES: usize = 4;
 
 /// One arm: 08:00 closes the fence and proves the family with every file read
-/// (a full re-arm). 08:10 reads every file again and re-proves the family,
-/// with `holds` held on every page that reads them. `before` runs before every
-/// later 08:10 page with that page's number.
+/// (a full re-arm). The held transcript then gains a request in every arm, so
+/// its 08:10 body is a real change rather than a semantic no-op (finalization
+/// drops a no-op before any hold applies). 08:10 reads every file again and
+/// re-proves the family, with `holds` held on every page that reads them.
+/// `before` runs before every later 08:10 page with that page's number.
 fn c1a_held_arm(
     case: &'static str,
     holds: &[&str],
@@ -1875,6 +1877,13 @@ fn c1a_held_arm(
     assert!(
         closing.census_complete && closing.fence_after && closing.full_rearm && closing.proven,
         "{case}: {closing:?}"
+    );
+    RearmFixture::append(
+        &fixture
+            .root
+            .join("held-project")
+            .join(format!("{C1A_HELD}.jsonl")),
+        &rearm_transcript_line(C1A_HELD, None, "req_held_2", 1),
     );
     fixture.local_holds = holds.iter().map(|session| (*session).to_owned()).collect();
     let pages = c1a_generation_with(&fixture, "fix", (8, 10), None, |number| {
@@ -2032,12 +2041,12 @@ fn c1a_changed_family_beside_unbound_hold_rearms_like_no_hold() {
 
 /// SOURCE option A, test (a): a held family still re-arms its own members,
 /// even when its held member's committed revision passes every per-member
-/// settlement check. After the skip is active, the root's committed entry
-/// names a stale but non-empty revision (so the next read re-selects it as
-/// source-changed) and both subagents are re-armed, so 08:20 reads and
-/// re-proves the whole family with an unchanged witness. Without a hold the
-/// re-proof skips; with the root held, its committed revision is restored and
-/// the family re-arms every member.
+/// settlement check. After the skip is active, the root transcript gains a
+/// user turn (a changed body, no new request) and both subagents are re-armed,
+/// so 08:20 reads and re-proves the whole family with an unchanged witness.
+/// Without a hold the changed root body is accepted and the re-proof skips;
+/// with the root held, its committed revision (accepted, non-empty) is
+/// restored and the family re-arms every member.
 #[test]
 #[serial(source_manifests)]
 fn c1a_held_family_rearms_its_own_members() {
@@ -2053,15 +2062,17 @@ fn c1a_held_family_rearms_its_own_members() {
         let keys = RearmFixture::family_keys(&ScanIndex::load(&fixture.index_path).unwrap());
         c1a_edit_index(&fixture, |saved| {
             for (session, key) in &keys {
-                let revision = if session == REARM_ROOT {
-                    "c1a-stale-revision"
-                } else {
-                    ""
-                };
-                saved["files"][key.as_str()]["source_file_fingerprint"] =
-                    serde_json::json!(revision);
+                if session != REARM_ROOT {
+                    saved["files"][key.as_str()]["source_file_fingerprint"] = serde_json::json!("");
+                }
             }
         });
+        RearmFixture::append(
+            &fixture.member_path(None),
+            &format!(
+                "{{\"timestamp\":\"2026-08-02T07:00:30Z\",\"type\":\"user\",\"sessionId\":\"{REARM_ROOT}\",\"message\":{{\"role\":\"user\",\"content\":\"continue\"}}}}\n"
+            ),
+        );
         fixture.local_holds = holds.iter().map(|session| (*session).to_owned()).collect();
         let pages = c1a_generation(&fixture, "fix", (8, 20));
         (c1a_window(&pages), pages)
