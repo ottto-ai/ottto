@@ -6247,7 +6247,15 @@ fn durable_restore_then_tail_beside_a_held_fork_memo_and_parent_ledger_matches_c
     let identity = ledger_signed(&index);
     memo_depends_on(&first, &identity);
     assert!(session_usage(&settled, CHILD).is_empty(), "C is held");
-    assert!(!session_usage(&settled, SINGLE).is_empty());
+    // S published on its first generation; the settled page is quiet for it.
+    let single_key = local_index_key(&home.fixture.file(SINGLE));
+    assert!(
+        index
+            .files
+            .get(&single_key)
+            .is_some_and(|entry| entry.last_snapshot_fingerprint.is_some()),
+        "S is indexed and published"
+    );
     index.save(&index_path).unwrap();
     first.durable_write_after_save(lock, source, &index);
     let records = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
@@ -6279,6 +6287,7 @@ fn durable_restore_then_tail_beside_a_held_fork_memo_and_parent_ledger_matches_c
     let (cold_index_a, cold_a, _) = page(loaded, None, n);
     assert_eq!(body(&warm_a), body(&cold_a));
     assert_eq!(census(&index_a, &warm_a), census(&cold_index_a, &cold_a));
+    assert_eq!(replayed_census(&warm_a), replayed_census(&cold_a));
     assert_eq!(parent_records(&index_a), parent_records(&cold_index_a));
 
     // Process 2 commits page A and rewrites S's record, which now binds the
@@ -6323,6 +6332,7 @@ fn durable_restore_then_tail_beside_a_held_fork_memo_and_parent_ledger_matches_c
     assert_eq!(session_usage(&warm, SINGLE), session_usage(&cold, SINGLE));
     assert_eq!(body(&warm), body(&cold));
     assert_eq!(census(&warm_index, &warm), census(&cold_index, &cold));
+    assert_eq!(replayed_census(&warm), replayed_census(&cold));
     assert_eq!(ledger_signed(&warm_index), identity);
     assert_eq!(parent_records(&warm_index), parent_records(&cold_index));
 }
