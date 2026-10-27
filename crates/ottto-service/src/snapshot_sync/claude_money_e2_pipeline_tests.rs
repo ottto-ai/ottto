@@ -2591,6 +2591,25 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 fn e2_pipeline_cold_known_twins_read_once_across_page_boundary() {
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-cold-known-twins-once");
+        // A settled unrelated path keeps a continuation page queued after the
+        // cold twins. Measure one traversal, not a new walk's independent
+        // bootstrap/proof rearm. Warm it through real scan/ACK/reload cycles.
+        c.write_at(
+            &format!("zz/{COPY}.jsonl"),
+            &line(COPY, "sentinel", AT, 5),
+            "2026-08-02T07:00:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let mut prior = ScanIndex::default();
+        for round in 0..3 {
+            let committed = prior.clone();
+            let page = ready(&c, &scanner, prior, 100, false);
+            if round == 2 {
+                assert_eq!(page.scan.scanned_file_count, 0, "unrelated path is settled");
+            }
+            prior = settle(&c, &committed, page, &mut progress);
+        }
         c.write_at(
             &format!("a/{ROOT}.jsonl"),
             &line(ROOT, "r1", AT, 10),
@@ -2601,19 +2620,12 @@ fn e2_pipeline_cold_known_twins_read_once_across_page_boundary() {
             &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
             "2026-08-02T07:03:00Z",
         );
-        let scanner = E2ScanFixture::default();
-        let mut progress = e2_progress();
-        // A cold file inventory with the identity contract already adopted:
-        // the contract's independent one-time rearm must not masquerade as
-        // a duplicate queue acquisition in this scheduling test.
-        let mut state = serde_json::to_value(ScanIndex::default()).unwrap();
-        state["claude_request_identity_contract"] = json!(
-            crate::snapshots::claude_request_identity::cycle_contract(false)
-        );
-        let prior: ScanIndex = serde_json::from_value(state).unwrap();
-        assert!(!prior.claude_request_identity_contract_for_test().1);
         let page = ready(&c, &scanner, prior.clone(), 1, false);
         literal(&page);
+        assert!(
+            !page.scan.census_complete,
+            "continuation remains in this traversal"
+        );
         assert_eq!(page.scan.scanned_file_count, 2, "known family is complete");
         assert_eq!(total(&page), 2, "copy skipped; own new request preserved");
         let first_reads = scanner.paths().len();
@@ -2625,6 +2637,10 @@ fn e2_pipeline_cold_known_twins_read_once_across_page_boundary() {
             "queued sibling was consumed once"
         );
         assert!(page.scan.snapshots.is_empty());
+        assert!(
+            page.scan.census_complete,
+            "the same traversal now completes"
+        );
         let prior = settle(&c, &prior, page, &mut progress);
         assert_eq!(stored_bodies(&prior), stored);
         assert_eq!(
