@@ -98,7 +98,7 @@ fn items(parser: OwnedJsonlParser, path: &Path, source: SnapshotSource) -> Value
     );
     let twins = Default::default();
     let money =
-        (source == SnapshotSource::ClaudeCode).then(|| claude_request_money::e2::ReadContext {
+        (source == SnapshotSource::ClaudeCode).then_some(claude_request_money::e2::ReadContext {
             index: &index,
             path,
             twins: &twins,
@@ -527,8 +527,8 @@ fn record_body_holds_no_content_and_provider_ids_only_in_l_fields() {
     }
 }
 
-/// F1 instruction canary, per source: two sessions differing only in
-/// private instruction text of equal length. Their retained copies differ
+/// F1 instruction canary, per source: two sessions (one file rewritten in
+/// place) differing only in private instruction text of equal length. Their retained copies differ
 /// (the text and its reversible `ConfigDigest` are content), yet the
 /// encoded reductions are byte-identical (nothing derived from the text is
 /// stored; only the verified content hash in the re-derivation marks
@@ -551,8 +551,10 @@ fn instruction_text_and_its_config_digest_never_reach_the_body() {
     ] {
         let mut reductions = Vec::new();
         let mut retained = Vec::new();
+        // One file rewritten in place: the same inode and birth, which the
+        // Claude birth scope records.
+        let scratch = Scratch::new("instructions");
         for secret in secrets {
-            let scratch = Scratch::new("instructions");
             let path = scratch.write("t.jsonl", &build(secret));
             let (reduction, _) = full_read(&path, source);
             let body = encode(
@@ -882,11 +884,11 @@ fn edits_after_the_checkpoint_refuse_restore() {
 const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
     (
         SnapshotSource::ClaudeCode,
-        "7ea88246ba250e95c14f82d325fbe9f409880596266df3beb7b3037cde17e9ae",
+        "1d22fd3753c5f21d4e4fe99b87a956955f3d12b2d2685f3fbab7adcdc0bd3108",
     ),
     (
         SnapshotSource::Codex,
-        "30caaeb4917de977c599d40219ba3a8e7911ec668aa2f60c42641d60e3a4ffbc",
+        "99914949cd94b9fdb9c36861658b41ded453998a3d4c2f5721bb1e211f2c8e1d",
     ),
 ];
 

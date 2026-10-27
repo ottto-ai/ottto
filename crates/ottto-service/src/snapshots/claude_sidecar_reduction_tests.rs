@@ -903,6 +903,27 @@ mod durable_restart {
             .map_or(0, |(counters, _)| counters.restored)
     }
 
+    /// The pass's index after the scan's own post-policy finalization, and
+    /// the transcript's snapshot fingerprints in it: the hold set local-hold
+    /// settlement takes.
+    fn finalized_with_holds(mut run: Run, key: &str) -> (ScanIndex, BTreeSet<String>) {
+        finalize_scan_after_policy_with_body_witness(
+            SOURCE,
+            &mut run.result,
+            &mut run.index,
+            snapshot_upload_body_witness,
+        );
+        let mut held = run
+            .index
+            .file_snapshot_fingerprints
+            .get(key)
+            .cloned()
+            .unwrap_or_default();
+        held.extend(run.index.files[key].last_snapshot_fingerprint.clone());
+        assert!(!held.is_empty(), "the transcript produced snapshots");
+        (run.index, held)
+    }
+
     fn transcript_key(f: &Fixture, index: &ScanIndex) -> String {
         let key = local_index_key(&f.path);
         assert!(
@@ -961,15 +982,12 @@ mod durable_restart {
             &f,
             raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
         );
+        let (scanned, held) = finalized_with_holds(run, &key);
         assert_ne!(
-            run.index.files[&key].source_file_fingerprint,
+            scanned.files[&key].source_file_fingerprint,
             prior.files[&key].source_file_fingerprint
         );
-        let settled = run.index.into_locally_held_keys_reverted(
-            &prior,
-            &BTreeSet::from([key.clone()]),
-            &BTreeSet::new(),
-        );
+        let settled = scanned.into_locally_held_keys_reverted(&prior, &held, &BTreeSet::new());
         assert_eq!(
             settled.files[&key].source_file_fingerprint,
             prior.files[&key].source_file_fingerprint
@@ -997,18 +1015,8 @@ mod durable_restart {
             &f,
             raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
         );
-        let reparse = run
-            .index
-            .file_snapshot_fingerprints
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
-        assert!(!reparse.is_empty(), "the transcript produced snapshots");
-        let settled = run.index.into_locally_held_keys_reverted(
-            &prior,
-            &BTreeSet::from([key.clone()]),
-            &reparse,
-        );
+        let (scanned, held) = finalized_with_holds(run, &key);
+        let settled = scanned.into_locally_held_keys_reverted(&prior, &held, &held);
         assert!(settled.files[&key].source_file_fingerprint.is_empty());
         // The record of the committed selection is still on disk here; the
         // cleared selection refuses before it is read.
