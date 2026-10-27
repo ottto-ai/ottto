@@ -178,7 +178,7 @@ pub(crate) fn valid(blob: &[u8], count: usize) -> bool {
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::super::ClaudeMoneyTokens;
-    use super::{ClaudeFact, ClaudeFactsHeader};
+    use super::{ClaudeFact, ClaudeFactsHeader, FACTS_VERSION};
 
     fn put(out: &mut Vec<u8>, mut value: u64) {
         loop {
