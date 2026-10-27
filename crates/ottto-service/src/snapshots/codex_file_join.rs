@@ -252,6 +252,13 @@ pub(super) struct HeaderInventory {
     /// directory census. Only a fresh walk can change that.
     pub(super) bounded_out: bool,
 }
+
+/// A group's key in `HeaderInventory::groups`, which is also the order the
+/// inventory reads groups in.
+fn group_key(home: &Path, owner: &str) -> String {
+    sha256_hex(&["codex_file_group:v1", &local_index_key(home), owner])
+}
+
 impl HeaderInventory {
     pub(super) fn new(
         roots: &[PathBuf],
@@ -372,11 +379,7 @@ impl HeaderInventory {
     pub(super) fn groups(&self) -> BTreeMap<String, Group> {
         let mut groups = BTreeMap::<String, Group>::new();
         for header in &self.headers {
-            let key = sha256_hex(&[
-                "codex_file_group:v1",
-                &local_index_key(&header.home),
-                &header.owner,
-            ]);
+            let key = group_key(&header.home, &header.owner);
             groups
                 .entry(key)
                 .or_insert_with(|| Group {
