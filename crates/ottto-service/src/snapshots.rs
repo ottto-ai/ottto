@@ -25851,25 +25851,11 @@ impl OwnedSourceScan {
                 .iter()
                 .map(|candidate| local_index_key(&candidate.path))
                 .collect::<BTreeSet<_>>();
-            // A known twin can still be unindexed on a cold walk. Pull its
-            // discovered family from the same traversal queue now, before any
-            // original is parsed alone and then pulled back on a later page.
-            // Other forced retries keep their existing membership boundary.
-            let family_index_keys = if claude_family_membership_is_authoritative
-                || (claude_request_money::e2::twin_scheduling_enabled()
-                    && !claude_twin_only_family_reparses.is_empty())
-            {
+            let family_index_keys = if claude_family_membership_is_authoritative {
                 index
                     .traversal
                     .as_ref()
-                    .map(|traversal| {
-                        let mut keys = traversal.observed_index_keys.clone();
-                        if !claude_family_membership_is_authoritative {
-                            // Indexed siblings can be outside the walk frontier.
-                            keys.extend(index.files.keys().cloned());
-                        }
-                        keys
-                    })
+                    .map(|traversal| traversal.observed_index_keys.clone())
                     .unwrap_or_default()
             } else {
                 index.files.keys().cloned().collect()
@@ -25885,12 +25871,9 @@ impl OwnedSourceScan {
                 .filter_map(|index_key| {
                     let path = PathBuf::from(&index_key);
                     let (root_session_id, _) = claude_index_path_family_member(&path)?;
-                    (forced_claude_family_reparses.contains(&root_session_id)
-                        && (claude_family_membership_is_authoritative
-                            || index.files.contains_key(&index_key)
-                            || (claude_request_money::e2::twin_scheduling_enabled()
-                                && claude_twin_only_family_reparses.contains(&root_session_id))))
-                    .then_some(path)
+                    forced_claude_family_reparses
+                        .contains(&root_session_id)
+                        .then_some(path)
                 })
                 .collect::<BTreeSet<_>>();
             if let Some(traversal) = index.traversal.as_mut() {

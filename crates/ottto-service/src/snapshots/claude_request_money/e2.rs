@@ -115,34 +115,6 @@ fn with_gate_for_test<T>(on: bool, f: impl FnOnce() -> T) -> T {
 pub(crate) fn with_enabled<T>(f: impl FnOnce() -> T) -> T {
     with_gate_for_test(true, f)
 }
-// The scheduling comparison can run both owners in one test binary. This
-// switch has no shipped state, environment read or runtime configuration.
-#[cfg(test)]
-thread_local! {
-    static TWIN_SCHEDULING_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-pub(in crate::snapshots) fn twin_scheduling_enabled() -> bool {
-    #[cfg(test)]
-    {
-        TWIN_SCHEDULING_FOR_TEST.with(std::cell::Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        true
-    }
-}
-#[cfg(test)]
-pub(crate) fn with_twin_scheduling_for_test<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            TWIN_SCHEDULING_FOR_TEST.with(|value| value.set(self.0));
-        }
-    }
-    let _restore = Restore(TWIN_SCHEDULING_FOR_TEST.with(|value| value.replace(enabled)));
-    run()
-}
-
 /// Owner B (SOURCE Amendment 14): revision 3 keeps a listed family, and
 /// every family while the list pauses adoption, on ordinary (pre-E2)
 /// money. With the gate on, E2 applies to every other family; a family it
@@ -3124,21 +3096,10 @@ pub(in crate::snapshots) fn defer_roots_of_queued_families(
         return;
     }
     let queued = directory_names(&traversal.pending_directories);
-    // Another unlisted project can still contain a path twin. Keep native
-    // candidates in this SAME queue until the project frontier is closed;
-    // otherwise a large original is parsed before its twin is discoverable.
-    // Once closed, the existing twin inventory/forced-family owner consumes
-    // each discovered group intact. Directory/history budgets are unchanged.
-    let projects_pending = twin_scheduling_enabled()
-        && traversal.pending_directories.iter().any(|directory| {
-            traversal.scan_roots.iter().any(|root| {
-                directory.path == *root || directory.path.parent() == Some(root.as_path())
-            })
-        });
     let (deferred, kept): (Vec<_>, Vec<_>) =
         std::mem::take(selected).into_iter().partition(|candidate| {
             claude_index_path_member_ref(&candidate.path).is_some_and(|member| {
-                projects_pending || (member.subagent_stem.is_none() && queued.contains(member.root))
+                member.subagent_stem.is_none() && queued.contains(member.root)
             })
         });
     *selected = kept;
