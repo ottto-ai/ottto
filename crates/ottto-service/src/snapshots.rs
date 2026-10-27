@@ -21136,6 +21136,19 @@ fn codex_parent_open_match_witnessed(
     census: CodexParentCensus<'_>,
     found: CodexCensusMatch<'_>,
 ) -> Result<(PathBuf, String, Option<OpenedObjectStat>, File), CodexParentUnresolvable> {
+    use CodexParentUnresolvable::Absent;
+    let mut candidate = codex_parent_candidate_match(census, found)?;
+    let (file, stat) =
+        open_candidate_file_stat(SnapshotSource::Codex, &mut candidate).map_err(|_| Absent)?;
+    Ok((candidate.path, candidate.opened_object_identity, stat, file))
+}
+
+/// Resolve and validate the parent's path without sampling it. Shared by
+/// live proof opens and retained wake opens so each reads the samples once.
+fn codex_parent_candidate_match(
+    census: CodexParentCensus<'_>,
+    found: CodexCensusMatch<'_>,
+) -> Result<CandidateFile, CodexParentUnresolvable> {
     use CodexParentUnresolvable::*;
     // More than one physical rollout claiming the same source session id is
     // ambiguous evidence, even if one happens to match the old witness.
@@ -21168,7 +21181,7 @@ fn codex_parent_open_match_witnessed(
         .ok()
         .and_then(unix_nanos)
         .unwrap_or_else(|| modified_unix_seconds.saturating_mul(1_000_000_000));
-    let mut candidate = CandidateFile {
+    let candidate = CandidateFile {
         physical_identity: None,
         scan_root,
         path,
@@ -21182,9 +21195,26 @@ fn codex_parent_open_match_witnessed(
         fingerprint_changed_nanos: 0,
         fingerprint_birth_nanos: 0,
     };
-    let (file, stat) =
-        open_candidate_file_stat(SnapshotSource::Codex, &mut candidate).map_err(|_| Absent)?;
-    Ok((candidate.path, candidate.opened_object_identity, stat, file))
+    Ok(candidate)
+}
+
+fn codex_parent_open_match_retained(
+    census: CodexParentCensus<'_>,
+    found: CodexCensusMatch<'_>,
+    cache: &sampled_scan::SharedCache,
+) -> Result<(PathBuf, String, File), CodexParentUnresolvable> {
+    use CodexParentUnresolvable::*;
+    let candidate = codex_parent_candidate_match(census, found)?;
+    let file = open_candidate_beneath_root(&candidate).map_err(|_| Absent)?;
+    let metadata = file.metadata().map_err(|_| Absent)?;
+    if !metadata.is_file() {
+        return Err(NotRegular);
+    }
+    if metadata.len() > max_jsonl_file_bytes(SnapshotSource::Codex) {
+        return Err(Oversize);
+    }
+    let (_, identity, _) = cache.retained_open(&candidate.path, &file).ok_or(Absent)?;
+    Ok((candidate.path, identity, file))
 }
 
 /// Uncached: one census pass and one no-follow open of the parent's single
@@ -23430,15 +23460,11 @@ fn codex_parent_step_start(
             if matches!(found[at], CodexCensusMatch::One(_)) {
                 page.charge(false, SAMPLE_READ_BYTES);
             }
-            Some(
-                codex_parent_open_match(census, found[at]).map(|(path, identity, file)| {
-                    let identity = context
-                        .cache
-                        .retained_open(&path, &file)
-                        .map_or(identity, |(_, retained, _)| retained);
-                    (path, identity, file)
-                }),
-            )
+            Some(codex_parent_open_match_retained(
+                census,
+                found[at],
+                &context.cache,
+            ))
         };
         // 1. Re-validate every witness against this traversal's open.
         let mut dropped = Vec::new();

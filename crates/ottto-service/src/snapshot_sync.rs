@@ -5535,8 +5535,9 @@ fn try_collect_native_preparation_with_rotation_observed(
             if self.require_bound {
                 let mut receipt =
                     crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
-                let measured =
-                    crate::heap_layout_bound::HeapLayoutBound::heap_bound(&frame, &mut receipt);
+                let measured = receipt.add(std::mem::size_of_val(&frame)).and_then(|()| {
+                    crate::heap_layout_bound::HeapLayoutBound::heap_bound(&frame, &mut receipt)
+                });
                 eprintln!(
                     "codex_wake_frame: step={} bytes={} visits={} bounded={}",
                     self.steps,
