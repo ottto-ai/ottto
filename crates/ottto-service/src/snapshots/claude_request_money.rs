@@ -488,7 +488,8 @@ fn shadow_scope(support_dir: &Path) -> PathBuf {
 /// cycle before its first parse, `seed_shadow_off`) saw the local kill
 /// switch. In tests: a transcript under the parent of an enabled
 /// support directory (fixtures keep both side by side); in production:
-/// always.
+/// never. The shadow page is off in production since E2 (#781), so nothing
+/// would take a production capture; arming it only held memory and CPU.
 pub(crate) fn capture_armed(path: &Path) -> Option<PathBuf> {
     if SHADOW_PANICKED.load(Ordering::Acquire) {
         return None;
@@ -501,9 +502,9 @@ pub(crate) fn capture_armed(path: &Path) -> Option<PathBuf> {
         .find(|dir| dir.parent().is_some_and(|base| path.starts_with(base)))
         .cloned();
     #[cfg(not(test))]
-    let scope = {
+    let scope: Option<PathBuf> = {
         let _ = path;
-        Some(PathBuf::new())
+        None
     };
     scope.filter(|scope| !SHADOW_OFF.lock().is_ok_and(|off| off.contains_key(scope)))
 }
