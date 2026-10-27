@@ -316,7 +316,9 @@ fn oversized_keeps_complete_families_empty_and_refuses_absence_retirement_sweep_
         .is_none());
     // Remove every readable member of a previously proven family while an
     // unrelated oversized file could still hide another member or copy.
-    let (fixture, _) = oversized_seed("oversized-absence-fence");
+    let fixture = c1a_fixture("oversized-absence-fence");
+    let closed = c1b_generation(&fixture, "oversized", (8, 0));
+    assert!(closed.census_complete && closed.proven);
     let mut index = ScanIndex::load(&fixture.index_path).unwrap();
     let witness = index
         .claude_usage_family_witness_digest_for_test(REARM_ROOT)
@@ -326,7 +328,11 @@ fn oversized_keeps_complete_families_empty_and_refuses_absence_retirement_sweep_
     let before = c1a_saved(&fixture);
     std::fs::remove_file(fixture.root.join(format!("{REARM_ROOT}.jsonl"))).unwrap();
     std::fs::remove_dir_all(fixture.root.join(REARM_ROOT)).unwrap();
-    let page = oversized_tick(&fixture, oversized_deadline(&before) + 3600);
+    oversized_create(&fixture);
+    let red = c1b_generation(&fixture, "oversized", (8, 10));
+    assert!(red.red && !red.census_complete);
+    let saved = c1a_saved(&fixture);
+    let page = oversized_tick(&fixture, oversized_deadline(&saved) + 3600);
     assert!(!page.scan.census_complete);
     assert_eq!(page.scan.oversized_file_count, 1);
     assert_eq!(

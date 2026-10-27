@@ -39249,17 +39249,6 @@ fn ensure_bounded_traversal(
         .traversal
         .as_ref()
         .is_some_and(|traversal| traversal.context_fingerprint == context_fingerprint);
-    // An oversized admission refusal remains sweep-wide loss. Only its
-    // content can wake its discovery; it must not re-arm unrelated families.
-    if source == SnapshotSource::ClaudeCode
-        && prior_traversal_context_matches
-        && prior_admission.is_none()
-        && index.claude_stale_family_carry.replay.is_empty()
-    {
-        if let Some(traversal) = index.traversal.as_mut() {
-            oversized_discovery::retry_changed(traversal, collected_at);
-        }
-    }
     let retry_attempt = if let Some(traversal) = index
         .traversal
         .as_ref()
@@ -39327,6 +39316,19 @@ fn ensure_bounded_traversal(
         Some(0)
     };
     let Some(retry_attempt) = retry_attempt else {
+        // Serve scoped oversized changes only after deciding that no ordinary
+        // retry starts. A simultaneous bound-family wake keeps its old cadence.
+        // An oversized admission refusal remains sweep-wide loss. Only its
+        // content can wake its discovery; it must not re-arm unrelated families.
+        if source == SnapshotSource::ClaudeCode
+            && prior_traversal_context_matches
+            && prior_admission.is_none()
+            && index.claude_stale_family_carry.replay.is_empty()
+        {
+            if let Some(traversal) = index.traversal.as_mut() {
+                oversized_discovery::retry_changed(traversal, collected_at);
+            }
+        }
         // This page resumes the traversal. Before it selects anything, the
         // carry's replay buffer is funded again; a carry that cannot be is
         // uncarried, and if the walk already passed one of its members the

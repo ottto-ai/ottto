@@ -71,7 +71,13 @@ pub(super) fn record(
     }
     // A failed witness stays untracked retryable loss; never suppress its
     // existing clock recovery without the content evidence needed to wake it.
-    if let Ok((_, content_hash)) = content_witness(scan_root, path) {
+    if let Ok((size, content_hash)) = content_witness(scan_root, path) {
+        // It may have shrunk between discovery's stat and this no-follow
+        // sample. Leave that sighting on ordinary recovery, so a small-file
+        // marker cannot suppress the parse that is now possible.
+        if size <= MAX_JSONL_FILE_BYTES {
+            return;
+        }
         let key = path_hash(path);
         let observations = debts
             .get(&key)
