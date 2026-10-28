@@ -3421,36 +3421,6 @@ fn transcript_requests(item: &SnapshotItem, mut place: impl FnMut(Request<'_>)) 
     Some(())
 }
 
-/// Scheduling-only qualification before the native fold's terminal decision.
-/// Reuse reported classifications, including telemetry-only requests, and the
-/// canonical transcript sink for other items. Missing identity remains healthy;
-/// every refusal kind and grouping failure keeps the due rearm enabled. This
-/// neither tags an item nor changes attribution/ownership settlement.
-pub(super) fn full_rearm_requests_refused(
-    item: &SnapshotItem,
-    evidence: &ScanEvidence<'_>,
-    reported: Option<&Grouping>,
-    duplicates: &Duplicates,
-) -> bool {
-    let refused = |grouping: &Grouping| {
-        grouping.failed.is_some()
-            || grouping.unowned_request
-            || grouping.keys_over_cap
-            || grouping.rows().any(|(_, group)| group.refused)
-    };
-    if let Some(grouping) = reported {
-        return refused(grouping);
-    }
-    let Some(sink) = RequestSink::for_item(evidence, item, bucket_row_count(item)) else {
-        return false;
-    };
-    let mut sink = sink.with_duplicates(duplicates);
-    // An unplaceable own-byte structural shape is already handled by the
-    // native census. Preserve any refusals produced before placement stopped.
-    let _ = transcript_requests(item, |request| sink.add(item, request));
-    refused(&sink.finish())
-}
-
 /// The transcript path's request-count guard: the parser counted exactly the
 /// owned occurrences that carry usage, each under its own request id. A
 /// response whose every usage field is zero (an API-error record with a
