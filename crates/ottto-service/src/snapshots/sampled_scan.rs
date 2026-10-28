@@ -3,6 +3,7 @@
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::local_resource_diagnostics::cache_lifecycle::{record, Event};
+use crate::local_resource_diagnostics::{codex_zst_refused, traversal_point};
 use crate::transcript_acquisition::{ReadMode, Scope};
 use crate::transcript_cache::{Release, TranscriptCache, CACHE_BYTES, CACHE_ENTRIES, ENTRY_BYTES};
 use sampled_jsonl::CachedJsonlReduction;
@@ -2005,9 +2006,7 @@ pub(super) fn new_source_parser(
             let input = match cache {
                 Some(cache) => OpenedInput::funded(file, cache)?,
                 None => {
-                    crate::local_resource_diagnostics::codex_zst_refused(
-                        CodexZstCause::AdmissionRefused,
-                    );
+                    codex_zst_refused(CodexZstCause::AdmissionRefused);
                     None
                 }
             };
@@ -2015,11 +2014,8 @@ pub(super) fn new_source_parser(
                 let yields = index.compressed_admission_yields.entry(key).or_default();
                 *yields = yields.saturating_add(1).min(13);
                 if *yields == 12 {
-                    crate::local_resource_diagnostics::traversal_point(
-                        "codex_zst_admission_alarm",
-                        "codex",
-                        &serde_json::json!({"consecutive_yields": 12}),
-                    );
+                    let counts = serde_json::json!({"consecutive_yields": 12});
+                    traversal_point("codex_zst_admission_alarm", "codex", &counts);
                 }
                 anyhow::bail!("compressed rollout admission yielded");
             };

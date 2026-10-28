@@ -790,6 +790,7 @@ Decoder admission keeps fixed headroom of one 8 MiB primary entry plus side-ledg
 bytes; the resident cache is charged once. Each admission yield increments the
 cumulative `codex_zst_refused` counter once per attempted archive per pass. After
 12 consecutive yields for an archive, `codex_zst_admission_alarm` discloses the
-starvation once, with `consecutive_yields: 12`. Runtime-only counts reset on
-admission or process restart; they never change archive evidence. Decoder input
+starvation once, with `consecutive_yields: 12`. Diagnostic-only counts in the
+existing ScanIndex survive reloads and reset on admission; they never change
+archive evidence. Decoder input
 and leaked-release fields are per-event counts, not cumulative totals.

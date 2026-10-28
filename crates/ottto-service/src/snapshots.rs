@@ -3341,9 +3341,6 @@ pub(crate) struct UploadAckRetirementHandoff {
 pub struct ScanIndex {
     #[serde(skip)]
     decode_holds: lenient_decode::Holds,
-    /// Runtime-only admission starvation counts; never body or completion authority.
-    #[serde(skip)]
-    compressed_admission_yields: BTreeMap<String, u8>,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
@@ -3902,6 +3899,9 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_default"
     )]
     pub(crate) claude_money_birth_store: claude_money_birth_store::BirthStore,
+    /// Diagnostic-only admission streaks survive scan reload; never body authority.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    compressed_admission_yields: BTreeMap<String, u8>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.

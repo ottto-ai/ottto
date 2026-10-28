@@ -103,8 +103,7 @@ pub(crate) enum ArchiveDisposition {
 }
 impl ArchiveEvidence {
     pub(super) fn begin(file: &File, path: &Path, previous: Option<&Self>) -> io::Result<Self> {
-        let logical = path.with_extension("");
-        let logical_id = super::codex_session_id_candidates_from_path(&logical)
+        let logical_id = super::codex_session_id_candidates_from_path(&path.with_extension(""))
             .into_iter()
             .next()
             .ok_or_else(|| invalid("compressed rollout logical id unavailable"))?;
@@ -140,9 +139,8 @@ impl ArchiveEvidence {
         parsed: &super::ParsedJsonlFile,
     ) -> bool {
         use ArchiveDisposition::*;
-        let logical = path.with_extension("");
-        self.owner = owner
-            .filter(|owner| super::codex_session_id_candidates_from_path(&logical).contains(owner));
+        let candidates = super::codex_session_id_candidates_from_path(&path.with_extension(""));
+        self.owner = owner.filter(|owner| candidates.contains(owner));
         if let Some(owner) = &self.owner {
             self.logical_id = owner.clone();
         }
@@ -865,9 +863,11 @@ pub(in crate::snapshots) mod tests {
         // Neither an unsettled in-memory pass nor its durable checkpoint can
         // consume another decode before six hours; neither fabricates a body.
         for state in [index.clone(), saved] {
+            let missing_body = state.files[&key].last_snapshot_fingerprint.is_none();
             let (mut state, result, rows, _) = archive_pass(&f, state, true, None);
             assert_eq!(decodes(&rows), 0);
             assert!(result.snapshots.is_empty());
+            assert_eq!(result.unreadable_path_count > 0, missing_body);
             retry_due(&mut state, &key);
             let (mut state, offered, rows, _) = archive_pass(&f, state, true, None);
             assert_eq!(decodes(&rows), 1);
@@ -1569,7 +1569,10 @@ pub(in crate::snapshots) mod tests {
         let f =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
         let mut index = ScanIndex::default();
+        let saved_index = f.0.parent().unwrap().join("index.json");
         for pass in 1..=14 {
+            index.save(&saved_index).unwrap();
+            index = ScanIndex::load(&saved_index).unwrap();
             let (next, result, rows, _) = archive_pass(&f, index, false, None);
             assert!(next.files.is_empty());
             assert_eq!(decodes(&rows), 0);
