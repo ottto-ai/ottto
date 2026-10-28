@@ -13,6 +13,51 @@ pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
 
+/// Closed, content-free refusal labels; cumulative process counters on #799.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) enum CodexZstCause {
+    #[serde(rename = "CompressedReplayNotAuthorized")]
+    ReplayNotAuthorized,
+    #[serde(rename = "CompressedProofParentUnsupported")]
+    ProofParentUnsupported,
+    #[serde(rename = "CompressedProofChildUnsupported")]
+    ProofChildUnsupported,
+    #[serde(rename = "CompressedParentSideUnsupported")]
+    ParentSideUnsupported,
+    #[serde(rename = "CompressedDurableTailUnsupported")]
+    DurableTailUnsupported,
+    #[serde(rename = "CompressedGroupProbeUnsupported")]
+    GroupProbeUnsupported,
+    #[serde(rename = "CompressedGroupReadUnsupported")]
+    GroupReadUnsupported,
+    #[serde(rename = "CompressedParentLedgerUnbound")]
+    ParentLedgerUnbound,
+    #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
+    PhysicalOffsetUnsupported,
+    #[serde(rename = "CompressedHeaderUnfunded")]
+    HeaderUnfunded,
+    #[serde(rename = "CompressedCompatibilityUnfunded")]
+    CompatibilityUnfunded,
+}
+const CODEX_ZST_CAUSES: usize = CodexZstCause::CompatibilityUnfunded as usize + 1;
+static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
+    [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
+
+pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
+    let counter = &CODEX_ZST_REFUSED[cause as usize];
+    let previous = counter
+        .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+        .unwrap_or_else(|n| n);
+    traversal_point(
+        "codex_zst_refused",
+        "codex",
+        &BTreeMap::from([(
+            "codex_zst_refused",
+            BTreeMap::from([(cause, previous.saturating_add(1))]),
+        )]),
+    );
+}
+
 /// Nonzero-only counters on the existing native_collection_page line.
 #[derive(Default, Serialize)]
 struct ClaudeRecordCaps {

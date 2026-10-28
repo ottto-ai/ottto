@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES;
 use crate::transcript_cache::ENTRY_BYTES;
 
+fn plain_path() -> &'static Path {
+    Path::new("fixture.jsonl")
+}
+
 const NOW: &str = "2026-10-07T12:00:00Z";
 const SESSION: &str = "019fa111-2222-7333-8444-555555555555";
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -280,7 +284,7 @@ fn grew_past_exact_needs_growth_and_wakes_keep_the_qualified_stamp() {
     let entry = |exact: bool| {
         MemoEntry::new(
             "digest".into(),
-            LiveWitness::read(&file, 8).unwrap(),
+            LiveWitness::read(plain_path(), &file, 8).unwrap(),
             opened.clone(),
             None,
             None,
@@ -308,13 +312,15 @@ fn grew_past_exact_needs_growth_and_wakes_keep_the_qualified_stamp() {
     let chmodded = OpenStamp::capture(&file).unwrap();
     assert!(chmodded != opened && chmodded.same_content(&opened));
     assert_eq!(
-        entry(true).grew_past_exact("digest", &file, None, ""),
+        entry(true).grew_past_exact(plain_path(), "digest", &file, None, ""),
         None,
         "a ctime-only change never only grew"
     );
     for exact in [true, false] {
         assert!(
-            entry(exact).matches("digest", &file, None, "").is_none(),
+            entry(exact)
+                .matches(plain_path(), "digest", &file, None, "")
+                .is_none(),
             "memo, exact={exact}: unqualified live ctime"
         );
         park_with(exact);
@@ -330,7 +336,7 @@ fn grew_past_exact_needs_growth_and_wakes_keep_the_qualified_stamp() {
     };
     for exact in [true, false] {
         assert!(entry(exact)
-            .matches_stamp("digest", &file, None, "", qualified.clone())
+            .matches_stamp(plain_path(), "digest", &file, None, "", qualified.clone())
             .is_some());
         park_with(exact);
         assert!(cache
@@ -345,17 +351,24 @@ fn grew_past_exact_needs_growth_and_wakes_keep_the_qualified_stamp() {
         .unwrap()
         .set_modified(std::time::UNIX_EPOCH)
         .unwrap();
-    assert_eq!(entry(true).grew_past_exact("digest", &file, None, ""), None);
+    assert_eq!(
+        entry(true).grew_past_exact(plain_path(), "digest", &file, None, ""),
+        None
+    );
 
     // Growth: an exact entry misses and reports the grown extent; a
     // non-exact one still hits.
     temp.append(b"{\"n\":3}\n");
-    assert!(entry(true).matches("digest", &file, None, "").is_none());
+    assert!(entry(true)
+        .matches(plain_path(), "digest", &file, None, "")
+        .is_none());
     assert_eq!(
-        entry(true).grew_past_exact("digest", &file, None, ""),
+        entry(true).grew_past_exact(plain_path(), "digest", &file, None, ""),
         Some(24)
     );
-    assert!(entry(false).matches("digest", &file, None, "").is_some());
+    assert!(entry(false)
+        .matches(plain_path(), "digest", &file, None, "")
+        .is_some());
 }
 
 fn reader_input() -> (Vec<u8>, u64, u64) {
@@ -858,7 +871,7 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     let entry = |sidecar: Option<String>| {
         MemoEntry::new(
             "digest".into(),
-            LiveWitness::read(&file, 8).unwrap(),
+            LiveWitness::read(plain_path(), &file, 8).unwrap(),
             OpenStamp::capture(&file).unwrap(),
             None,
             sidecar,
@@ -866,7 +879,9 @@ fn held_singleton_memo_woken_by_sidecar_change() {
         )
     };
     let created = entry(sidecar_wakes(&held).then(|| recorded.clone()));
-    assert!(created.matches("digest", &file, None, &recorded).is_some());
+    assert!(created
+        .matches(plain_path(), "digest", &file, None, &recorded)
+        .is_some());
     // The sidecar rollout extent catches up with the file: the cure is
     // visible, the entry wakes and the file is re-read.
     codex.rollout_extents.insert(
@@ -878,7 +893,9 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     );
     let caught_up = sidecar_fingerprint(&codex, &path);
     assert_ne!(caught_up, recorded);
-    assert!(created.matches("digest", &file, None, &caught_up).is_none());
+    assert!(created
+        .matches(plain_path(), "digest", &file, None, &caught_up)
+        .is_none());
     // An identity conflict on the path's session also wakes it.
     let mut conflicted = codex.clone();
     conflicted.identity_conflicts.insert(SESSION.into());
@@ -886,18 +903,22 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     assert_ne!(conflict, caught_up);
     let caught_up_entry = entry(Some(caught_up.clone()));
     assert!(caught_up_entry
-        .matches("digest", &file, None, &conflict)
+        .matches(plain_path(), "digest", &file, None, &conflict)
         .is_none());
     // R1-H1: a missing projection may also mean the sidecar extent is ahead
     // of the flushed file, which an append cures: that entry hits only on
     // its exact stamp, and any growth re-reads it.
     assert!(growth_may_cure(&held));
     let ahead = entry(Some(caught_up.clone())).growth_may_cure(growth_may_cure(&held));
-    assert!(ahead.matches("digest", &file, None, &caught_up).is_some());
+    assert!(ahead
+        .matches(plain_path(), "digest", &file, None, &caught_up)
+        .is_some());
     temp.append(b"{\"n\":3}\n");
-    assert!(ahead.matches("digest", &file, None, &caught_up).is_none());
+    assert!(ahead
+        .matches(plain_path(), "digest", &file, None, &caught_up)
+        .is_none());
     assert!(caught_up_entry
-        .matches("digest", &file, None, &caught_up)
+        .matches(plain_path(), "digest", &file, None, &caught_up)
         .is_some());
     // An ordinary (not created-thread) fork hold is cured by peer parent
     // evidence only.
@@ -906,7 +927,9 @@ fn held_singleton_memo_woken_by_sidecar_change() {
     assert!(!growth_may_cure(&held));
     assert!(!sidecar_wakes(&held));
     let fork = entry(sidecar_wakes(&held).then(|| recorded.clone()));
-    assert!(fork.matches("digest", &file, None, &caught_up).is_some());
+    assert!(fork
+        .matches(plain_path(), "digest", &file, None, &caught_up)
+        .is_some());
 }
 
 /// C2: no time-based expiry. A memo entry wakes on cheap changed evidence
@@ -922,9 +945,9 @@ fn held_singleton_memo_woken_by_sidecar_change() {
 fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
     let temp = Temp::new("memo", b"{\"n\":1}\n{\"n\":2}\n");
     let file = File::open(&temp.0).unwrap();
-    assert!(LiveWitness::read(&file, 0).is_none());
-    assert!(LiveWitness::read(&file, 10_000).is_none());
-    let live = LiveWitness::read(&file, 8).unwrap();
+    assert!(LiveWitness::read(plain_path(), &file, 0).is_none());
+    assert!(LiveWitness::read(plain_path(), &file, 10_000).is_none());
+    let live = LiveWitness::read(plain_path(), &file, 8).unwrap();
     let stamp = OpenStamp::capture(&file).unwrap();
     let parent = Some(ParentDep {
         id: "parent".into(),
@@ -940,18 +963,35 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
     let now_1 = now("ledger-1", "p-1");
     let entry = MemoEntry::new("digest".into(), live, stamp, parent, None, disclosure());
     assert_eq!(entry.parent_ref(), Some("parent"));
-    assert!(entry.matches("digest", &file, Some(&now_1), "").is_some());
-    assert!(entry.matches("other", &file, Some(&now_1), "").is_none());
+    assert!(entry
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .is_some());
+    assert!(entry
+        .matches(plain_path(), "other", &file, Some(&now_1), "")
+        .is_none());
     // PR-1 L4: a changed ledger and, separately, a changed parent object
     // each miss.
     assert!(entry
-        .matches("digest", &file, Some(&now("ledger-2", "p-1")), "")
-        .is_none());
-    assert!(entry
-        .matches("digest", &file, Some(&now("ledger-1", "p-2")), "")
+        .matches(
+            plain_path(),
+            "digest",
+            &file,
+            Some(&now("ledger-2", "p-1")),
+            ""
+        )
         .is_none());
     assert!(entry
         .matches(
+            plain_path(),
+            "digest",
+            &file,
+            Some(&now("ledger-1", "p-2")),
+            ""
+        )
+        .is_none());
+    assert!(entry
+        .matches(
+            plain_path(),
             "digest",
             &file,
             Some(&ParentNow {
@@ -962,19 +1002,21 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
             ""
         )
         .is_none());
-    assert!(entry.matches("digest", &file, None, "").is_none());
+    assert!(entry
+        .matches(plain_path(), "digest", &file, None, "")
+        .is_none());
     // Growth past the refused offset cannot cure the hold: still a hit, and
     // the hit returns the grown stamp for the entry to keep.
     temp.append(b"{\"n\":3}\n");
     let grown = entry
-        .matches("digest", &file, Some(&now_1), "")
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
         .expect("growth is a hit");
     assert!(grown.extent > entry.stamp.extent);
     let mut refreshed = entry.clone();
     refreshed.stamp = grown;
     // No timer: an entry whose evidence is unchanged keeps matching.
     assert!(refreshed
-        .matches("digest", &file, Some(&now_1), "")
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
         .is_some());
     // A same-length stamp change (an in-place write elsewhere) wakes it.
     OpenOptions::new()
@@ -984,11 +1026,13 @@ fn memo_entry_matches_growth_but_not_prefix_or_parent_change() {
         .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
         .unwrap();
     assert!(refreshed
-        .matches("digest", &file, Some(&now_1), "")
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
         .is_none());
     // A rewritten prefix is a miss (re-read).
     fs::write(&temp.0, b"{\"n\":9}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
-    assert!(entry.matches("digest", &file, Some(&now_1), "").is_none());
+    assert!(entry
+        .matches(plain_path(), "digest", &file, Some(&now_1), "")
+        .is_none());
 }
 
 #[test]
@@ -1000,7 +1044,7 @@ fn singleton_memo_is_bounded_lru_with_frozen_charges() {
     let file = File::open(&temp.0).unwrap();
     let entry = MemoEntry::new(
         "digest".into(),
-        LiveWitness::read(&file, 8).unwrap(),
+        LiveWitness::read(plain_path(), &file, 8).unwrap(),
         OpenStamp::capture(&file).unwrap(),
         None,
         None,
@@ -13497,4 +13541,26 @@ fn retained_open_samples_cannot_be_reused_after_another_live_ctime_change() {
         qualified.changed, now.changed,
         "a fresh equal-content sample pass can qualify the stored ctime"
     );
+}
+
+#[test]
+fn compressed_memo_rechecks_refuse_decoded_offsets() {
+    let temp = Temp::new("zst-memo", b"{\"n\":1}\n");
+    let file = File::open(&temp.0).unwrap();
+    let live = LiveWitness::read(plain_path(), &file, 8).unwrap();
+    let stamp = OpenStamp::capture(&file).unwrap();
+    let entry = MemoEntry::new(
+        "digest".into(),
+        live,
+        stamp.clone(),
+        None,
+        None,
+        disclosure(),
+    );
+    let path = Path::new("rollout.jsonl.zst");
+    codex_zst_refusal_tests::assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
+        assert!(entry
+            .matches_stamp(path, "digest", &file, None, "", stamp)
+            .is_none());
+    });
 }

@@ -1590,3 +1590,97 @@ fn certificate_sample_truncation_is_shrunk_for_both_windows() {
     }
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
+    let root = crate::test_scratch::private_dir("zst-record-refusal");
+    let plain = root.join("plain.jsonl");
+    std::fs::write(&plain, b"{\"n\":1}\n").unwrap();
+    let scope = Scope("fixture".into());
+    let compressed = root.join("rollout.jsonl.zst");
+    let key = local_index_key(&compressed);
+    let binding = Binding {
+        source: DurableSource::Codex,
+        key: store::key_digest(DurableSource::Codex, &key),
+        context: [0; 32],
+        scope: [0; 32],
+        entry: [0; 32],
+    };
+    let expected = Expected {
+        binding: binding.clone(),
+        committed_generation: 1,
+    };
+    let record = store::DurableRecord {
+        record: PendingRecord {
+            binding,
+            certificate: certificate(&plain, &scope),
+            body: Vec::new(),
+            allowlist: [0; 32],
+        },
+        index_generation: 1,
+    };
+    let mut held = File::open(&plain).unwrap();
+    codex_zst_refusal_tests::assert_refused(CodexZstCause::DurableTailUnsupported, || {
+        assert!(matches!(
+            SharedCache::default().durable_restore_record(
+                SnapshotSource::Codex,
+                &record,
+                &expected,
+                &compressed,
+                &scope,
+                &mut held
+            ),
+            Err(Failure::NotRederived(_))
+        ));
+    });
+    // #830's wrapper rechecks holds on a restore miss. The compressed
+    // refusal must precede that record IO too, not just restore_known.
+    let lock = test_locks::hold(&root);
+    let index_path = root.join("index.json");
+    let mut disk = DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        DurableSource::Codex,
+    );
+    disk.write_after_save(lock, 1, vec![record.record.clone()])
+        .unwrap();
+    let record_path = disk.dir().join(format!(
+        "{}.rec",
+        expected
+            .binding
+            .key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ));
+    let before_bytes = std::fs::read(&record_path).unwrap();
+    let cache = SharedCache::default();
+    let source = SnapshotSource::Codex;
+    cache.durable_begin_pass(source, &index_path, &scope, false);
+    let index = ScanIndex::default();
+    let interpretation = Interpretation::of(source, "fixture", &index, false, &scope);
+    let before_counters = cache.durable_counters(source).unwrap();
+    let before_offset = std::io::Seek::stream_position(&mut held).unwrap();
+    codex_zst_refusal_tests::assert_refused(CodexZstCause::DurableTailUnsupported, || {
+        assert!(matches!(
+            cache.durable_restore(
+                source,
+                &key,
+                &compressed,
+                &scope,
+                &mut held,
+                &index,
+                &interpretation
+            ),
+            RestoreOutcome::Miss(MissClass::Failure(Failure::NotRederived(
+                Refuse::NotRederivable("compressed")
+            )))
+        ));
+    });
+    assert_eq!(cache.durable_counters(source).unwrap(), before_counters);
+    assert_eq!(
+        std::io::Seek::stream_position(&mut held).unwrap(),
+        before_offset
+    );
+    assert_eq!(std::fs::read(record_path).unwrap(), before_bytes);
+    std::fs::remove_dir_all(root).unwrap();
+}
