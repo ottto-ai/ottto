@@ -1621,6 +1621,12 @@ fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies
     }
 }
 
+fn source_latch_clear_count(rows: &[serde_json::Value]) -> u64 {
+    rows.iter()
+        .filter_map(|row| row["counts"]["identity_contract_latch"]["cleared"].as_u64())
+        .sum()
+}
+
 // SOURCE T1: a genuine Started record must not make a later mid-walk flip
 // eligible for terminal clearing, even when the last page runs under B.
 #[test]
@@ -1749,14 +1755,14 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 let (retry, rows) = source_latch_generation(&fixture, 30, upload, Some(REARM_ROOT));
                 let carried = rows
                     .iter()
-                    .filter_map(|row| {
-                        (row["stage"] == "bounded_traversal_transition"
-                            && row["counts"]["event"] == "starting")
-                            .then(|| {
-                                row["counts"]["carried_pending_families"]
-                                    .as_u64()
-                                    .unwrap_or(0)
-                            })
+                    .filter(|row| {
+                        row["stage"] == "bounded_traversal_transition"
+                            && row["counts"]["event"] == "starting"
+                    })
+                    .map(|row| {
+                        row["counts"]["carried_pending_families"]
+                            .as_u64()
+                            .unwrap_or(0)
                     })
                     .sum::<u64>();
                 assert_eq!(carried, 1, "only invariant G can be carried");
@@ -1818,18 +1824,18 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                         held["files"][&f_key]["effective_upload_body_witness_revision"],
                         2
                     );
-                    // snapshots.rs:9730 (e2_identity_owed) and :9722
-                    // (sweep_fully_settled) veto this complete terminal.
-                    let cleared: u64 = rows
-                        .iter()
-                        .filter_map(|row| {
-                            row["counts"]["identity_contract_latch"]["cleared"].as_u64()
-                        })
-                        .sum();
+                    // snapshots.rs:9730 (e2_identity_owed) vetoes; :9722
+                    // adds a veto when an earlier page recorded F's hold.
+                    let cleared = source_latch_clear_count(&rows);
                     assert_eq!(cleared, 0, "partial-save OR cannot mask an in-memory clear");
                     fixture.local_holds.clear();
-                    let accepted =
-                        source_latch_generation(&fixture, 40, RearmUpload::Accept, None).0;
+                    let (accepted, release_rows) =
+                        source_latch_generation(&fixture, 40, RearmUpload::Accept, None);
+                    assert_eq!(
+                        source_latch_clear_count(&release_rows),
+                        1,
+                        "positive control: the real fold clear is observable"
+                    );
                     let body = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
                     let fp = body["snapshot_fingerprint"].as_str().unwrap();
                     assert_ne!(body["snapshot_fingerprint"], old_f["snapshot_fingerprint"]);
