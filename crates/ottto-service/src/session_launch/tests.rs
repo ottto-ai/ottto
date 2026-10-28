@@ -2,6 +2,19 @@ use super::*;
 use ottto_core::{billing_identity_hash, session_launch::LaunchUser, ClaudeConfigDirSlot};
 use std::os::unix::fs::symlink;
 
+fn write_login(home: &Path) {
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::write(home.join(".claude/.credentials.json"), serde_json::to_vec(&serde_json::json!({"claudeAiOauth":{
+        "accessToken":"synthetic-access", "refreshToken":"synthetic-refresh", "expiresAt":4102444800000_i64,
+        "refreshTokenExpiresAt":4102444800000_i64, "scopes":["user:inference","user:profile"]
+    }})).unwrap()).unwrap();
+    fs::set_permissions(
+        home.join(".claude/.credentials.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+}
+
 fn fixture_binding(home: &Path) -> Binding {
     Binding {
         provider: Provider::ClaudeCode,
@@ -30,6 +43,7 @@ fn fixture_entry(root: &Path) -> Entry {
         program_identity: program_identity(Path::new("/bin/false")).unwrap(),
         secret: Sha256::digest(b"secret").into(),
         created: Instant::now(),
+        created_wall: std::time::SystemTime::now(),
         state: State::Pending,
         block: None,
         attempt: None,
@@ -97,6 +111,10 @@ fn expiry_cancel_wrong_secret_and_attempt_bound_failure() {
     let mut expired = fixture_entry(scratch.as_ref());
     expired.created = Instant::now() - TTL;
     registry.entries.insert("expired".into(), expired);
+    let mut slept = fixture_entry(scratch.as_ref());
+    slept.created_wall = std::time::SystemTime::now() - Duration::from_secs(3600);
+    registry.entries.insert("slept".into(), slept);
+    assert_eq!(registry.status("slept", false).state, Some(State::Expired));
     assert_eq!(
         registry.status("expired", false).state,
         Some(State::Expired)
@@ -237,6 +255,8 @@ fn fresh_identity_switch_and_needs_login_are_refused_without_spawning() {
         r#"{"oauthAccount":{"accountUuid":"account-one","organizationUuid":"org-one"}}"#,
     )
     .unwrap();
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    write_login(root);
     let mut collection = ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
         state: ottto_protocol::ClaudeConfigSlotCollectionStateV1::Fresh,
         account_identifier_hash: Some(account.clone()),
@@ -266,6 +286,27 @@ fn fresh_identity_switch_and_needs_login_are_refused_without_spawning() {
         user.clone(),
     )
     .unwrap();
+    fs::remove_file(root.join(".claude/.credentials.json")).unwrap();
+    assert_eq!(
+        binding::recheck(&binding).unwrap_err().reason,
+        Reason::SlotNeedsLogin
+    );
+    fs::write(
+        root.join(".claude/.credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#,
+    )
+    .unwrap();
+    fs::set_permissions(
+        root.join(".claude/.credentials.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert_eq!(
+        binding::recheck(&binding).unwrap_err().reason,
+        Reason::SlotNeedsLogin
+    );
+    write_login(root);
+
     fs::write(
         root.join(".claude.json"),
         r#"{"oauthAccount":{"accountUuid":"account-two","organizationUuid":"org-one"}}"#,
@@ -305,6 +346,7 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
     fs::create_dir(home.join(".claude")).unwrap();
     std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
     std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin);
+    write_login(&home);
     let cli = bin.join("claude");
     fs::write(
         &cli,
@@ -362,13 +404,12 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
         .to_owned();
     let result = registry.consume(&id, &secret);
     assert_eq!(result.state, Some(State::Starting));
-    assert!(result
+    assert!(!result
         .plan
         .unwrap()
         .env_set
         .unwrap()
-        .get("CLAUDE_CONFIG_DIR")
-        .is_none());
+        .contains_key("CLAUDE_CONFIG_DIR"));
     assert_eq!(
         registry.consume(&id, &secret).block.unwrap().reason,
         Reason::LaunchAlreadyUsed
@@ -385,7 +426,30 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
             .reason,
         Reason::ExecFailed
     );
+    let pending = prepare(&mut registry);
+    let old_id = pending.launch_id.unwrap();
+    let old_path = pending.launcher_path.unwrap();
+    let bad = registry.prepare_for_user(
+        Provider::ClaudeCode,
+        "default",
+        &account,
+        &organization,
+        SessionLaunchFolderV1 {
+            path: Some(root.join("missing").to_string_lossy().into_owned()),
+            recent_id: None,
+        },
+        Some(PathBuf::from("/bin/true")),
+        &support,
+        user.clone(),
+    );
+    assert_eq!(bad.err().unwrap().reason, Reason::FolderMissing);
+    assert!(!Path::new(&old_path).exists());
+    assert_eq!(
+        registry.status(&old_id, false).block.unwrap().reason,
+        Reason::LaunchCancelled
+    );
     for reason in [
+        Reason::SlotNeedsLogin,
         Reason::SettingsEnvOverride,
         Reason::AccountMismatch,
         Reason::FolderChanged,
@@ -399,6 +463,9 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
             .unwrap()
             .to_owned();
         match reason {
+            Reason::SlotNeedsLogin => {
+                fs::remove_file(home.join(".claude/.credentials.json")).unwrap();
+            }
             Reason::SettingsEnvOverride => fs::write(
                 home.join(".claude/settings.json"),
                 r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid"}}"#,
@@ -416,6 +483,7 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
         }
         assert_eq!(registry.consume(&id, &secret).block.unwrap().reason, reason);
         let _ = fs::remove_file(home.join(".claude/settings.json"));
+        write_login(&home);
         fs::write(
             home.join(".claude.json"),
             r#"{"oauthAccount":{"accountUuid":"account-one","organizationUuid":"org-one"}}"#,
@@ -424,4 +492,140 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
     }
     std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
     std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH");
+}
+
+#[test]
+fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let scratch = crate::test_scratch::ScratchDir::new("codex-launch");
+    let root = scratch.as_ref();
+    let home = root.join("home");
+    let codex = home.join(".codex");
+    let support = root.join("support");
+    let project = root.join("project");
+    let bin = root.join("bin");
+    for path in [&home, &codex, &support, &project, &bin] {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let claims = serde_json::json!({"iss":"https://auth.openai.com","aud":"synthetic","exp":now+3600,
+        "https://api.openai.com/auth":{"chatgpt_user_id":"user-one","chatgpt_account_id":"workspace-one"}});
+    let token = format!(
+        "{}.{}.synthetic-signature",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    fs::write(codex.join("auth.json"), serde_json::to_vec(&serde_json::json!({"auth_mode":"chatgpt","tokens":{"account_id":"workspace-one","access_token":token}})).unwrap()).unwrap();
+    fs::set_permissions(codex.join("auth.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    let account = billing_identity_hash("openai", "account", "user-one").unwrap();
+    let org = billing_identity_hash("openai", "workspace", "workspace-one").unwrap();
+    let mut hash = Sha256::new();
+    hash.update(b"ottto:codex-quota-home:v1\0");
+    hash.update(codex.as_os_str().as_encoded_bytes());
+    let home_key = format!("{:x}", hash.finalize());
+    let saved_dir = support.join("codex-quota/homes").join(&home_key);
+    fs::create_dir_all(&saved_dir).unwrap();
+    let window = ottto_protocol::AgentQuotaWindow {
+        freshness: ottto_protocol::AgentQuotaWindowFreshness::Fresh,
+        ..Default::default()
+    };
+    fs::write(saved_dir.join("saved-quota.json"), serde_json::to_vec(&serde_json::json!({
+        "schema_version":1,"home_key":home_key,"reading":{"observed_at_epoch_seconds":now,"login":{"binding":format!("{account}:{org}")},
+        "identity":{"account_identifier_hash":account,"workspace_identifier_hash":org},"provider_account_signed_in":true,"quota_windows":[window]}
+    })).unwrap()).unwrap();
+    let witness = root.join("commands");
+    let quoted = quote_launch_executable(witness.to_str().unwrap()).unwrap();
+    let cli = bin.join("codex");
+    let write_cli = |version: &str| {
+        fs::write(&cli, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted}\n[ \"$1\" = --version ] || exit 99\nprintf 'codex-cli {version}\\n'\n")).unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    write_cli("0.170.0");
+    let user = LaunchUser {
+        home: home.clone(),
+        name: "synthetic".into(),
+    };
+    let pair = ottto_protocol::AccountNicknamePairV1 {
+        source: Provider::Codex,
+        account_identifier_hash: Some(account.clone()),
+        organization_identifier_hash: Some(org.clone()),
+    };
+    assert!(nickname_target_is_current_for_user(&pair, user.clone()));
+    assert!(!witness.exists());
+    let mut registry = Registry::default();
+    let prepare = |registry: &mut Registry| {
+        registry.prepare_for_user(
+            Provider::Codex,
+            "default",
+            &account,
+            &org,
+            SessionLaunchFolderV1 {
+                path: Some(project.to_string_lossy().into_owned()),
+                recent_id: None,
+            },
+            Some(PathBuf::from("/bin/true")),
+            &support,
+            user.clone(),
+        )
+    };
+    let result = prepare(&mut registry).unwrap();
+    let secret = fs::read_to_string(result.launcher_path.unwrap())
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        registry.consume(&result.launch_id.unwrap(), &secret).state,
+        Some(State::Starting)
+    );
+    assert_eq!(fs::read_to_string(&witness).unwrap(), "--version\n");
+    write_cli("1.0.0");
+    assert_eq!(
+        prepare(&mut registry).err().unwrap().reason,
+        Reason::CliVersionUnsupported
+    );
+    assert_eq!(
+        fs::read_to_string(&witness).unwrap(),
+        "--version\n--version\n"
+    );
+    fs::remove_file(codex.join("auth.json")).unwrap();
+    assert!(!nickname_target_is_current_for_user(&pair, user));
+    assert_eq!(
+        fs::read_to_string(&witness).unwrap(),
+        "--version\n--version\n"
+    );
+    std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
+    std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH");
+}
+
+#[test]
+fn version_probe_finds_the_selected_installs_shebang_interpreter() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("launch-probe-path");
+    let root = scratch.as_ref();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    symlink("/bin/sh", bin.join("ottto-synthetic-interpreter")).unwrap();
+    let cli = bin.join("claude");
+    fs::write(
+        &cli,
+        "#!/usr/bin/env ottto-synthetic-interpreter\nprintf '2.1.310 (Claude Code)\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    std::env::set_var("PATH", "/usr/bin:/bin");
+    let path = crate::command_env::interactive_probe_path(root, &cli);
+    assert_eq!(
+        supported_version(&cli, &fixture_binding(root), root, path.as_ref()).unwrap(),
+        "2.1.310"
+    );
 }

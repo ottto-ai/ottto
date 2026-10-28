@@ -64,6 +64,7 @@ struct Entry {
     program_identity: ProgramIdentity,
     secret: [u8; 32],
     created: Instant,
+    created_wall: std::time::SystemTime,
     state: State,
     block: Option<Block>,
     attempt: Option<SecretString>,
@@ -99,7 +100,7 @@ impl Registry {
 
     fn sweep(&mut self, now: Instant) {
         for entry in self.entries.values_mut() {
-            if entry.state == State::Pending && now.duration_since(entry.created) >= TTL {
+            if entry.state == State::Pending && expired(entry, now) {
                 entry.state = State::Expired;
                 entry.block = Some(block(Reason::LaunchExpired));
                 let _ = fs::remove_file(&entry.launcher);
@@ -174,6 +175,17 @@ impl Registry {
     ) -> Result<SessionLaunchPrepareResultV1, Block> {
         let now = Instant::now();
         self.sweep(now);
+        // Retrying a slot invalidates its older handoffs, including ones the
+        // app may still have open in another terminal window.
+        for entry in self.entries.values_mut().filter(|entry| {
+            entry.binding.provider == provider
+                && entry.binding.slot_id == slot_id
+                && entry.state == State::Pending
+        }) {
+            entry.state = State::Blocked;
+            entry.block = Some(block(Reason::LaunchCancelled));
+            let _ = fs::remove_file(&entry.launcher);
+        }
         let generation = crate::account_nicknames::launch_generation();
         if crate::control::identity_mutation_in_progress() {
             return Err(block(Reason::AccountMismatch));
@@ -187,8 +199,11 @@ impl Registry {
                 .ok_or_else(|| block(Reason::FolderInvalid))?,
             _ => return Err(block(Reason::FolderInvalid)),
         };
-        let cwd = validate_folder(&selected, &binding.user.home, support)?;
-        let metadata = fs::metadata(&cwd).map_err(|_| block(Reason::FolderMissing))?;
+        let ValidatedFolder {
+            path: cwd,
+            dev,
+            ino,
+        } = validate_folder(&selected, &binding.user.home, support)?;
         preflight::evaluate(&binding, &cwd)?;
         let program = crate::command_env::interactive_cli_path(
             match provider {
@@ -199,29 +214,19 @@ impl Registry {
             &binding.user.home,
         )
         .ok_or_else(|| block(Reason::CliNotFound))?;
+        let probe_path = crate::command_env::interactive_probe_path(&binding.user.home, &program);
         let program = program
             .canonicalize()
             .map_err(|_| block(Reason::CliNotFound))?;
         let program_identity =
             program_identity(&program).ok_or_else(|| block(Reason::CliNotFound))?;
-        let cli_version = supported_version(&program, &binding, &cwd)?;
+        let cli_version = supported_version(&program, &binding, &cwd, probe_path.as_ref())?;
         if self::program_identity(&program).as_ref() != Some(&program_identity) {
             return Err(block(Reason::CliVersionUnsupported));
         }
         let ottto = ottto
             .filter(|path| executable(path))
             .ok_or_else(|| block(Reason::CliNotFound))?;
-        // Retrying a slot invalidates its older handoffs, including ones the
-        // app may still have open in another terminal window.
-        for entry in self.entries.values_mut().filter(|entry| {
-            entry.binding.provider == provider
-                && entry.binding.slot_id == slot_id
-                && entry.state == State::Pending
-        }) {
-            entry.state = State::Blocked;
-            entry.block = Some(block(Reason::LaunchCancelled));
-            let _ = fs::remove_file(&entry.launcher);
-        }
         if self
             .entries
             .values()
@@ -236,10 +241,13 @@ impl Registry {
             let oldest = self
                 .entries
                 .iter()
+                .filter(|(_, entry)| entry.state != State::Pending)
                 .min_by_key(|(_, entry)| entry.created)
                 .map(|(id, _)| id.clone());
             if let Some(id) = oldest {
-                self.entries.remove(&id);
+                if let Some(entry) = self.entries.remove(&id) {
+                    let _ = fs::remove_file(entry.launcher);
+                }
             } else {
                 break;
             }
@@ -270,12 +278,13 @@ impl Registry {
             Entry {
                 binding,
                 cwd,
-                dev: metadata.dev(),
-                ino: metadata.ino(),
+                dev,
+                ino,
                 program,
                 program_identity,
                 secret: Sha256::digest(secret.as_bytes()).into(),
                 created: Instant::now(),
+                created_wall: std::time::SystemTime::now(),
                 state: State::Pending,
                 block: None,
                 attempt: None,
@@ -389,8 +398,17 @@ impl Registry {
 /// A display nickname may be edited only for a currently verified local
 /// login. Remembered/historical rows never become write authority.
 pub(crate) fn nickname_target_is_current(pair: &ottto_protocol::AccountNicknamePairV1) -> bool {
-    let (Some(user), Some(account), Some(org)) = (
-        launch_user(),
+    let Some(user) = launch_user() else {
+        return false;
+    };
+    nickname_target_is_current_for_user(pair, user)
+}
+
+fn nickname_target_is_current_for_user(
+    pair: &ottto_protocol::AccountNicknamePairV1,
+    user: ottto_core::session_launch::LaunchUser,
+) -> bool {
+    let (Some(account), Some(org)) = (
         pair.account_identifier_hash.as_deref(),
         pair.organization_identifier_hash.as_deref(),
     ) else {
@@ -407,7 +425,9 @@ pub(crate) fn nickname_target_is_current(pair: &ottto_protocol::AccountNicknameP
                 Err(_) => return false,
             }
         }
-        Provider::Codex => match ottto_core::FileCodexAccountSlotSettingsStore::default().load() {
+        Provider::Codex => match ottto_core::FileCodexAccountSlotSettingsStore::default()
+            .load_for_session_launch()
+        {
             Ok(status) => std::iter::once(status.default_slot)
                 .chain(status.managed_slots)
                 .map(|slot| slot.slot_id)
@@ -419,6 +439,11 @@ pub(crate) fn nickname_target_is_current(pair: &ottto_protocol::AccountNicknameP
     ids.iter()
         .take(10)
         .any(|id| binding::resolve(pair.source, id, account, org, user.clone()).is_ok())
+}
+
+fn expired(entry: &Entry, now: Instant) -> bool {
+    now.duration_since(entry.created) >= TTL
+        || entry.created_wall.elapsed().is_ok_and(|age| age >= TTL)
 }
 
 fn consume_block(error: Block) -> SessionLaunchConsumeResultV1 {
@@ -441,7 +466,7 @@ fn check_entry(entry: &Entry, secret: &str) -> Result<SessionLaunchExecPlanV1, B
     if !constant_eq(&entry.secret, &Sha256::digest(secret.as_bytes())) {
         return Err(block(Reason::LaunchUnknown));
     }
-    if entry.created.elapsed() >= TTL {
+    if expired(entry, Instant::now()) {
         return Err(block(Reason::LaunchExpired));
     }
     if entry.generation != crate::account_nicknames::launch_generation()
@@ -507,7 +532,12 @@ fn executable(path: &Path) -> bool {
             .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
 }
 
-fn supported_version(program: &Path, binding: &Binding, cwd: &Path) -> Result<String, Block> {
+fn supported_version(
+    program: &Path,
+    binding: &Binding,
+    cwd: &Path,
+    path: Option<&std::ffi::OsString>,
+) -> Result<String, Block> {
     let (unset, set) = environment(binding);
     let mut command = Command::new(program);
     command
@@ -524,6 +554,9 @@ fn supported_version(program: &Path, binding: &Binding, cwd: &Path) -> Result<St
     command.envs(environment(binding).1);
     use std::os::unix::process::CommandExt;
     command.process_group(0);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
     let mut child = command
         .spawn()
         .map_err(|_| block(Reason::CliVersionUnsupported))?;
@@ -599,7 +632,13 @@ fn parse_version(bytes: &[u8], provider: Provider) -> Option<String> {
     Some(version.into())
 }
 
-fn validate_folder(path: &Path, home: &Path, support: &Path) -> Result<PathBuf, Block> {
+struct ValidatedFolder {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+fn validate_folder(path: &Path, home: &Path, support: &Path) -> Result<ValidatedFolder, Block> {
     if !path.is_absolute()
         || path
             .to_str()
@@ -610,6 +649,12 @@ fn validate_folder(path: &Path, home: &Path, support: &Path) -> Result<PathBuf, 
     let path = path
         .canonicalize()
         .map_err(|_| block(Reason::FolderMissing))?;
+    if path
+        .to_str()
+        .is_none_or(|path| path.chars().any(char::is_control))
+    {
+        return Err(block(Reason::FolderInvalid));
+    }
     if !path.is_dir() {
         return Err(block(Reason::FolderNotDirectory));
     }
@@ -640,7 +685,14 @@ fn validate_folder(path: &Path, home: &Path, support: &Path) -> Result<PathBuf, 
     if !local {
         return Err(block(Reason::FolderNotLocal));
     }
-    Ok(path)
+    let metadata = directory
+        .metadata()
+        .map_err(|_| block(Reason::FolderMissing))?;
+    Ok(ValidatedFolder {
+        path,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
 }
 
 fn launcher_directory(support: &Path, create: bool) -> Result<File, Block> {

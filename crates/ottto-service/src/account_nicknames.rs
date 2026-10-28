@@ -37,6 +37,8 @@ struct Cache {
     capability: bool,
     #[serde(skip)]
     rejected: bool,
+    #[serde(skip)]
+    persisted_at: i64,
 }
 
 /// Call while the identity lifecycle lock is held. The epoch fences requests
@@ -88,12 +90,21 @@ pub(crate) fn launch_generation() -> (u64, Option<Generation>) {
     (EPOCH.load(Ordering::Acquire), generation_locked())
 }
 
-pub(crate) fn generation_for_device(device: &LocalDeviceBinding) -> Option<Generation> {
-    let _lock = crate::control::try_lock_setup_run_binding()?;
+fn generation_for_device_locked(device: &LocalDeviceBinding) -> Option<Generation> {
     if FileDeviceStore::default().load().ok().flatten().as_ref() != Some(device) {
         return None;
     }
     generation_locked()
+}
+
+fn generation_for_device_blocking(device: &LocalDeviceBinding) -> Option<Generation> {
+    let _lock = crate::control::lock_setup_run_binding();
+    generation_for_device_locked(device)
+}
+
+pub(crate) fn generation_for_device(device: &LocalDeviceBinding) -> Option<Generation> {
+    let _lock = crate::control::try_lock_setup_run_binding()?;
+    generation_for_device_locked(device)
 }
 
 fn load_cache(generation: &Generation) -> Cache {
@@ -116,7 +127,8 @@ fn load_cache(generation: &Generation) -> Cache {
         file.take(2 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)
             .ok()?;
-        let cache: Cache = serde_json::from_slice(&bytes).ok()?;
+        let mut cache: Cache = serde_json::from_slice(&bytes).ok()?;
+        cache.persisted_at = cache.refreshed;
         (cache.generation == generation.binding && cache.entries.len() <= MAX_ENTRIES)
             .then_some(cache)
     };
@@ -215,10 +227,15 @@ pub(crate) fn apply_upload(generation: Option<&Generation>, entries: Option<&[En
         *state = Some(load_cache(generation));
     }
     let cache = state.as_mut().expect("cache initialized");
-    merge(cache, entries);
+    let changed = merge(cache, entries);
+    let first_capability = !cache.capability;
     cache.capability = true;
     cache.refreshed = time::OffsetDateTime::now_utc().unix_timestamp();
-    let _ = persist(cache, &default_support_dir());
+    if (changed || first_capability || cache.refreshed.saturating_sub(cache.persisted_at) >= 900)
+        && persist(cache, &default_support_dir()).is_ok()
+    {
+        cache.persisted_at = cache.refreshed;
+    }
 }
 
 fn valid_pair(pair: &Pair) -> bool {
@@ -240,7 +257,8 @@ fn strong_hash(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn merge(cache: &mut Cache, entries: &[Entry]) {
+fn merge(cache: &mut Cache, entries: &[Entry]) -> bool {
+    let mut changed = false;
     for entry in entries.iter().take(MAX_ENTRIES) {
         let (Some(pair), Some(revision)) = (&entry.pair, entry.revision) else {
             continue;
@@ -261,11 +279,14 @@ fn merge(cache: &mut Cache, entries: &[Entry]) {
         {
             if revision > current.revision.unwrap_or(0) {
                 *current = entry.clone();
+                changed = true;
             }
         } else if cache.entries.len() < MAX_ENTRIES {
             cache.entries.push(entry.clone());
+            changed = true;
         }
     }
+    changed
 }
 
 pub(crate) fn normalize(text: Option<&str>) -> Result<Option<String>, ()> {
@@ -314,22 +335,21 @@ pub(crate) fn set(
     };
     let status = read();
     if status.connected != Some(true) {
-        return finish(
-            if status
-                .entries
-                .as_ref()
-                .is_some_and(|entries| !entries.is_empty())
-            {
-                Outcome::NotConnected
-            } else {
-                Outcome::Unavailable
-            },
-        );
+        let rejected = CACHE
+            .lock()
+            .ok()
+            .and_then(|state| state.as_ref().map(|cache| cache.rejected))
+            .unwrap_or(false);
+        return finish(if rejected {
+            Outcome::NotConnected
+        } else {
+            Outcome::Unavailable
+        });
     }
     let Ok((device, secret)) = crate::snapshot_client::load_snapshot_device_credentials() else {
         return finish(Outcome::NotConnected);
     };
-    if generation_for_device(&device).as_ref() != Some(&generation) {
+    if generation_for_device_blocking(&device).as_ref() != Some(&generation) {
         return finish(Outcome::NotConnected);
     }
     let Ok(Some(machine_id)) = crate::snapshot_sync::snapshot_machine_id(&device) else {
@@ -366,7 +386,7 @@ pub(crate) fn set(
             return finish(Outcome::Unavailable);
         }
     };
-    if generation_for_device(&device).as_ref() != Some(&generation) {
+    if generation_for_device_blocking(&device).as_ref() != Some(&generation) {
         return finish(Outcome::NotConnected);
     }
     let mut payload = serde_json::json!({ "machine_id":machine_id, "source":pair.source,

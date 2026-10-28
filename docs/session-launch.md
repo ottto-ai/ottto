@@ -21,6 +21,12 @@ or move a binding. Missing, mismatched, duplicate, or unverified logins refuse
 the launch. Prepare and consume perform this check independently. Retry,
 cancel, account mutation and restart invalidate pending handoffs.
 
+Claude also needs a currently usable exact-slot OAuth credential, classified
+locally without refresh or provider commands. Missing, cleared or unreadable
+credentials cannot fall back to a stored Console key. Codex reads only the
+existing saved provider-verified collection and current credential claims; this
+projection performs no login/model probes, provider reads or scheduler wakeup.
+
 The folder must be absolute, canonical, a directory on a local filesystem,
 and outside the Ottto support directory. Filesystem root and the effective
 user's home root are refused. The handoff records the folder's device and inode.
@@ -36,7 +42,7 @@ Startup removes stale launcher files after acquiring the daemon state lock.
 
 Consume is token-authenticated and CLI-only. The registry claims the first
 attempt atomically, even on failure. It rechecks the secret, monotonic
-120-second deadline, local binding, effective-auth settings, folder identity
+120-second deadline (also bounded by wall time across system sleep), local binding, effective-auth settings, folder identity
 and the pinned CLI. A successful consume returns an optional typed exec plan
 and an attempt secret. Status becomes `starting`; the UI must never call it
 `started`. `SessionLaunchReport` accepts only the exact attempt secret and a
@@ -52,6 +58,11 @@ failures are reported before exit. Launch blocks use exit 60, malformed plans
 use 2, and an unavailable daemon uses 10. It never runs provider doctor, auth
 or login commands. The daemon runs only a bounded, three-second `--version`
 probe at prepare; unknown versions refuse with `cli_version_unsupported`.
+Lookup searches the inherited daemon PATH first, then known per-user install
+prefixes; Codex app bundles come last, and Claude Desktop's private binary is
+excluded. The version probe includes the selected install's bin directory in
+PATH so npm/nvm shebang interpreters work under launchd. A terminal's interactive
+PATH can differ from the daemon's inherited PATH.
 
 ## Effective environment and settings
 
@@ -131,6 +142,10 @@ organization/user authority and uploaded-pair eligibility. Requests follow no
 redirects, parse success bodies only after 2xx, and never log body/error text.
 401/403 makes editing not connected; no retry, offline queue or registration
 is attempted. An older backend's absent upload field is a no-op.
+Successful ordinary uploads do not clear a nickname authorization rejection;
+reconnecting or reclaiming establishes new authority. Repeated unchanged
+uploads update in-memory freshness and persist it at most every fifteen minutes;
+changed revisions persist immediately.
 
 Values are trimmed, at most forty Unicode codepoints, with empty meaning
 delete. Controls, bidi override/isolate characters and email-shaped text are

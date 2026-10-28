@@ -72,10 +72,10 @@ pub fn execute_launch_plan(plan: &SessionLaunchExecPlanV1) -> Reason {
         &plan.env_unset,
         &plan.env_set,
     ) else {
-        return Reason::Unknown;
+        return Reason::ExecFailed;
     };
     if !std::path::Path::new(program).is_absolute() || !std::path::Path::new(cwd).is_absolute() {
-        return Reason::Unknown;
+        return Reason::ExecFailed;
     }
     let Ok(dir) = std::fs::OpenOptions::new()
         .read(true)
@@ -134,7 +134,7 @@ mod tests {
     fn missing_exec_fields_are_inert() {
         assert_eq!(
             execute_launch_plan(&SessionLaunchExecPlanV1::default()),
-            Reason::Unknown
+            Reason::ExecFailed
         );
     }
 

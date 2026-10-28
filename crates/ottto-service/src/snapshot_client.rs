@@ -1646,13 +1646,13 @@ fn require_cloud_session_success(
     }
 }
 
+type NicknameGenerations = std::sync::Arc<
+    std::sync::Mutex<std::collections::BTreeMap<[u8; 32], crate::account_nicknames::Generation>>,
+>;
+
 #[derive(Debug, Clone)]
 pub struct SnapshotApiClient {
-    nickname_generations: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::BTreeMap<[u8; 32], crate::account_nicknames::Generation>,
-        >,
-    >,
+    nickname_generations: NicknameGenerations,
     api_base_url: String,
     #[cfg(test)]
     bounded_retry_loopback_http_for_test: bool,
@@ -3417,6 +3417,51 @@ mod tests {
             assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
             assert_never_logged(&secret);
         }
+    }
+
+    #[test]
+    fn nickname_write_keeps_relay_principal_body_private_and_rejects_redirects() {
+        use crate::retry_tls::credential_test_support::{
+            assert_never_logged, install_host_logger, RedirectingBackend,
+        };
+        install_host_logger();
+        let body = json!({"machine_id":"machine-synthetic","source":"codex", "account_identifier_hash":"a".repeat(64), "organization_identifier_hash":"", "nickname":"כינוי 🚀", "base_revision":2});
+        for status in ["302 Found", "307 Temporary Redirect", "401 Unauthorized"] {
+            let backend = RedirectingBackend::start(status);
+            let code = SnapshotApiClient::new(backend.base_url.clone())
+                .put_account_nickname("synthetic-private-relay", &body)
+                .unwrap_err();
+            assert_eq!(code.to_string(), &status[..3]);
+            let request = backend.finish();
+            assert!(request.starts_with("PUT /api/v1/agent-status/account-nickname "));
+            assert!(request.contains("Authorization: Bearer synthetic-private-relay"));
+            assert!(!request.contains("X-Ottto-Device-Secret"));
+            let sent: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(sent, body);
+            assert_never_logged("synthetic-private-relay");
+            assert_never_logged("כינוי 🚀");
+        }
+    }
+
+    #[test]
+    fn optional_nickname_metadata_cannot_fail_ingest() {
+        for extra in [
+            json!(null),
+            json!("unsupported"),
+            json!([{"pair":"malformed"}]),
+            json!([{"revision":1}]),
+        ] {
+            let response: AgentStatusSnapshotUploadResponse = serde_json::from_value(json!({"accepted":1,"machine_id":"synthetic","sources":["codex"],"account_nicknames":extra})).unwrap();
+            assert!(response
+                .account_nicknames
+                .is_none_or(|entries| entries.is_empty()));
+        }
+        let response: AgentStatusSnapshotUploadResponse = serde_json::from_value(
+            json!({"accepted":1,"machine_id":"synthetic","sources":["codex"]}),
+        )
+        .unwrap();
+        assert!(response.account_nicknames.is_none());
     }
 
     #[test]

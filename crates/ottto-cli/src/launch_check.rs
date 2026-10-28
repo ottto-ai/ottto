@@ -60,7 +60,7 @@ pub(crate) fn run(args: &Args, socket: PathBuf, token: Option<&str>) -> i32 {
     };
     execute(
         response,
-        |plan| ottto_core::session_launch::execute_launch_plan(plan),
+        ottto_core::session_launch::execute_launch_plan,
         |attempt, reason| {
             let command = LocalControlCommand::SessionLaunchReport {
                 schema_version: 1,
@@ -111,9 +111,32 @@ fn execute(
         );
         return CliErrorCode::NeedsUserAction.exit_code();
     }
-    let (Some(plan), Some(attempt)) = (result.plan, result.attempt_id) else {
+    let Some(attempt) = result.attempt_id else {
         return 2;
     };
+    let complete = result.plan.as_ref().is_some_and(|plan| {
+        plan.program
+            .as_ref()
+            .is_some_and(|path| std::path::Path::new(path).is_absolute())
+            && plan
+                .cwd
+                .as_ref()
+                .is_some_and(|path| std::path::Path::new(path).is_absolute())
+            && plan.argv.is_some()
+            && plan.cwd_dev.is_some()
+            && plan.cwd_ino.is_some()
+            && plan.env_unset.is_some()
+            && plan.env_set.is_some()
+    });
+    if !complete {
+        report(
+            attempt,
+            ottto_protocol::SessionLaunchBlockReasonV1::ExecFailed,
+        );
+        eprintln!("Ottto returned an unsupported session handoff.");
+        return 2;
+    }
+    let plan = result.plan.expect("complete plan checked");
     let reason = executor(&plan);
     report(attempt, reason);
     eprintln!("Session launch failed before the agent could start.");
@@ -123,6 +146,42 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_check_is_hidden_requires_exec_and_has_no_autostart_invocation() {
+        use clap::{CommandFactory, Parser};
+        assert!(!super::super::Cli::command()
+            .render_help()
+            .to_string()
+            .contains("launch-check"));
+        assert!(
+            super::super::Cli::try_parse_from(["ottto", "launch-check", "id", "secret"]).is_err()
+        );
+        let args = Args {
+            exec: true,
+            launch_id: "synthetic-id".into(),
+            secret: SecretString::new("synthetic-secret"),
+        };
+        let missing =
+            std::env::temp_dir().join(format!("missing-launch-socket-{}", std::process::id()));
+        assert!(!missing.exists());
+        assert_eq!(
+            run(&args, missing.join("socket"), Some("synthetic-control")),
+            10
+        );
+        assert!(!missing.exists());
+        let request = request(
+            LocalControlCommand::SessionLaunchConsume {
+                schema_version: 1,
+                launch_id: args.launch_id,
+                secret: args.secret,
+            },
+            "synthetic-control",
+        );
+        assert_eq!(request.protocol_version, 28);
+        assert_eq!(request.client_kind, Some(LocalClientKind::Cli));
+        assert!(!format!("{request:?}").contains("synthetic-secret"));
+    }
     #[test]
     fn unknown_state_never_executes_and_failure_reports_exact_attempt() {
         let response = |payload| LocalControlResponse {
@@ -140,7 +199,9 @@ mod tests {
             60
         );
         let code = execute(
-            response(serde_json::json!({"state":"starting","plan":{},"attempt_id":"attempt"})),
+            response(
+                serde_json::json!({"state":"starting","plan":{"program":"/agent","argv":[],"cwd":"/project","cwd_dev":1,"cwd_ino":1,"env_unset":[],"env_set":{}},"attempt_id":"attempt"}),
+            ),
             |_| ottto_protocol::SessionLaunchBlockReasonV1::ExecFailed,
             |attempt, reason| {
                 assert_eq!(attempt.expose_secret(), "attempt");
@@ -151,5 +212,19 @@ mod tests {
             },
         );
         assert_eq!(code, 60);
+        let code = execute(
+            response(
+                serde_json::json!({"state":"starting","plan":{},"attempt_id":"malformed-attempt"}),
+            ),
+            |_| panic!("incomplete plans must not reach the executor"),
+            |attempt, reason| {
+                assert_eq!(attempt.expose_secret(), "malformed-attempt");
+                assert_eq!(
+                    reason,
+                    ottto_protocol::SessionLaunchBlockReasonV1::ExecFailed
+                );
+            },
+        );
+        assert_eq!(code, 2);
     }
 }

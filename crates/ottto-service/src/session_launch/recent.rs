@@ -15,15 +15,17 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+type SavedProjection = (
+    Instant,
+    Option<Provider>,
+    Option<String>,
+    Option<crate::account_nicknames::Generation>,
+    Response,
+);
+
 #[derive(Default)]
 pub(super) struct Cache {
-    saved: Option<(
-        Instant,
-        Option<Provider>,
-        Option<String>,
-        Option<crate::account_nicknames::Generation>,
-        Response,
-    )>,
+    saved: Option<SavedProjection>,
     key: Option<String>,
 }
 
@@ -151,7 +153,7 @@ fn roots() -> Vec<Root> {
         }
     }
     let store = FileCodexAccountSlotSettingsStore::default();
-    if let Ok(status) = store.load() {
+    if let Ok(status) = store.load_for_session_launch() {
         roots.push(Root {
             path: user.home.join(".codex"),
             provider: Provider::Codex,
@@ -256,6 +258,12 @@ fn collect(
             .path
             .canonicalize()
             .unwrap_or_else(|_| candidate.path.clone());
+        if canonical
+            .to_str()
+            .is_none_or(|text| text.chars().any(char::is_control))
+        {
+            continue;
+        }
         let exists = Some(canonical.is_dir());
         let label = canonical
             .file_name()

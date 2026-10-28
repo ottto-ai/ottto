@@ -372,6 +372,7 @@ pub fn handle_request_with_peer(
     let client_install_owner = request
         .client_install_owner
         .unwrap_or(InstallOwner::Unknown);
+    let cli_session_exec = request.client_kind == Some(LocalClientKind::Cli);
     let status_refresh_quota_source =
         status_refresh_quota_source(request.client_kind, request.protocol_version);
     match handle_command(
@@ -380,6 +381,7 @@ pub fn handle_request_with_peer(
         request.command,
         client_install_owner,
         status_refresh_quota_source,
+        cli_session_exec,
     ) {
         Ok(payload) => LocalControlResponse {
             request_id,
@@ -871,6 +873,7 @@ fn handle_command(
     command: LocalControlCommand,
     client_install_owner: InstallOwner,
     status_refresh_quota_source: Option<SourceKind>,
+    cli_session_exec: bool,
 ) -> Result<serde_json::Value, LocalApiError> {
     // Invalidate pending handoffs before any explicit account/slot mutation.
     // Existing mutation handlers retain all of their authorization and order.
@@ -932,7 +935,7 @@ fn handle_command(
             require_authorized_local_client(daemon, &authorization)?;
             // Only the token-authenticated CLI owns the exec plan. The trusted
             // Companion can prepare/poll/cancel, but never consume a handoff.
-            if !matches!(&authorization, RequestAuthorization::Token(_)) {
+            if !cli_session_exec || !matches!(&authorization, RequestAuthorization::Token(_)) {
                 return Err(LocalApiError::Unauthorized);
             }
             require_session_launch_schema(schema_version)?;
@@ -951,7 +954,7 @@ fn handle_command(
             reason,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            if !matches!(&authorization, RequestAuthorization::Token(_)) {
+            if !cli_session_exec || !matches!(&authorization, RequestAuthorization::Token(_)) {
                 return Err(LocalApiError::Unauthorized);
             }
             require_session_launch_schema(schema_version)?;
@@ -17458,6 +17461,53 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_exec_commands_require_cli_kind_and_authorized_token() {
+        let daemon = daemon();
+        let command = || LocalControlCommand::SessionLaunchConsume {
+            schema_version: 1,
+            launch_id: "synthetic".into(),
+            secret: SecretString::new("synthetic"),
+        };
+        for (kind, token) in [
+            (Some(LocalClientKind::CompanionApp), Some("token")),
+            (None, Some("token")),
+            (Some(LocalClientKind::Cli), None),
+        ] {
+            let response = handle_request(
+                &daemon,
+                LocalControlRequest {
+                    request_id: "launch-auth".into(),
+                    protocol_version: 28,
+                    token: token.map(str::to_owned),
+                    client_kind: kind,
+                    client_install_owner: None,
+                    command: command(),
+                },
+            );
+            assert!(!response.ok);
+            assert_eq!(response.error.unwrap().code, CliErrorCode::LocalAuthFailed);
+        }
+        let response = handle_request(
+            &daemon,
+            LocalControlRequest {
+                request_id: "launch-auth".into(),
+                protocol_version: 28,
+                token: Some("token".into()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: command(),
+            },
+        );
+        assert!(response.ok);
+        let result: ottto_protocol::SessionLaunchConsumeResultV1 =
+            serde_json::from_value(response.payload.unwrap()).unwrap();
+        assert_eq!(
+            result.block.unwrap().reason,
+            ottto_protocol::SessionLaunchBlockReasonV1::LaunchUnknown
+        );
+    }
+
     #[test]
     fn codex_status_read_reuses_only_fresh_annotation_of_unchanged_settings() {
         let annotated_at = std::time::Instant::now();

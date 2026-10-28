@@ -2114,6 +2114,66 @@ fn codex_source_health_snapshot(
     source_health_snapshot
 }
 
+/// Read-only launch projection: only saved provider-verified evidence and
+/// current local claims. No CLI detection/probes, provider reads, or wakeups.
+pub(crate) fn session_launch_codex_accounts_status(
+    mut status: CodexAccountsStatusV1,
+    default_home: &Path,
+) -> CodexAccountsStatusV1 {
+    let captured = crate::current_rfc3339_timestamp();
+    let mut candidates = Vec::new();
+    for mut slot in codex_home_slots_checked(&status).0 {
+        if slot.ownership == CodexAccountSlotOwnershipV1::Default {
+            slot.home = default_home.into();
+        }
+        let trust = if slot.ownership == CodexAccountSlotOwnershipV1::Default {
+            CodexHomeTrust::ProviderDefault
+        } else {
+            CodexHomeTrust::Managed
+        };
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Degraded,
+            AgentStatusCollectionMethod::ConfigFile,
+            captured.clone(),
+            captured.clone(),
+        );
+        if session_launch_codex_identity(&slot.home, trust).is_none() {
+            snapshot.status = AgentStatusState::AuthRequired;
+        } else if let Ok(probe) =
+            codex_saved_quota::serve_saved_for_launch(&slot.home, trust, current_unix_seconds())
+        {
+            if !probe.credential_read_failed {
+                snapshot.account = probe.account;
+                if let (Some(account), Some(identity)) =
+                    (snapshot.account.as_mut(), probe.saved_identity)
+                {
+                    account.account_identifier_hash = Some(identity.account_identifier_hash);
+                    account.organization_identifier_hash = Some(identity.workspace_identifier_hash);
+                    snapshot.quota_windows = probe.quota_windows;
+                    snapshot.credit_balances = probe.credit_balances;
+                    snapshot.status = AgentStatusState::Available;
+                }
+            }
+        }
+        let mut collection = codex_collection_status_from_snapshot(&snapshot);
+        let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut collection);
+        let quality = codex_snapshot_quality(&snapshot, &collection);
+        candidates.push(CodexSlotCandidate {
+            slot,
+            snapshot,
+            status: collection,
+            binding,
+            workspace_targets: Vec::new(),
+            quality,
+            auth_modified_at: None,
+        });
+    }
+    canonicalize_codex_candidates(&mut candidates);
+    apply_codex_candidate_statuses(&mut status, &candidates);
+    status
+}
+
 pub(crate) fn annotate_codex_accounts_status(
     status: CodexAccountsStatusV1,
 ) -> CodexAccountsStatusV1 {
@@ -13539,6 +13599,13 @@ enum ClaudeKeychainRead {
 const SECURITY_ITEM_NOT_FOUND_EXIT_CODE: i32 = 44;
 
 fn read_claude_oauth_credential_from_keychain(slot: &ClaudeConfigDirSlot) -> ClaudeKeychainRead {
+    read_claude_oauth_credential_from_keychain_with_timeout(slot, COMMAND_TIMEOUT)
+}
+
+fn read_claude_oauth_credential_from_keychain_with_timeout(
+    slot: &ClaudeConfigDirSlot,
+    timeout: Duration,
+) -> ClaudeKeychainRead {
     if crate::command_env::executable_path("security").is_none() {
         // Without the keychain tool the stored login cannot be confirmed
         // either way: fail closed, never "no login".
@@ -13551,7 +13618,7 @@ fn read_claude_oauth_credential_from_keychain(slot: &ClaudeConfigDirSlot) -> Cla
         return ClaudeKeychainRead::Failed;
     };
     let argument_refs: Vec<_> = arguments.iter().map(String::as_str).collect();
-    let output = run_command_capture("security", &argument_refs, COMMAND_TIMEOUT);
+    let output = run_command_capture("security", &argument_refs, timeout);
     if output.success {
         return ClaudeKeychainRead::Found(output.stdout);
     }
@@ -17452,6 +17519,65 @@ fn require_claude_auth_identity_agreement(
 }
 
 /// Local claims only: compare with the accepted slot binding, never adopt.
+/// Use the established local login classifier before granting launch or
+/// nickname authority. The exact passwd home is used for file fallback.
+/// No provider executable is invoked. Test reads are scratch-only and never
+/// consult the real Keychain, including on the native CI lane.
+pub(crate) fn session_launch_claude_login_state(
+    slot: &ClaudeConfigDirSlot,
+    home: &Path,
+) -> ClaudeLocalLoginState {
+    let read_file = || {
+        let path = slot.credentials_path(home);
+        if !crate::provider_calls::readable_for_account(&path) {
+            return ClaudeCredentialRead::Unreadable;
+        }
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ClaudeCredentialRead::Absent
+            }
+            Err(_) => return ClaudeCredentialRead::Unreadable,
+        };
+        let Ok(metadata) = file.metadata() else {
+            return ClaudeCredentialRead::Unreadable;
+        };
+        if !metadata.is_file()
+            || metadata.len() > 1024 * 1024
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            return ClaudeCredentialRead::Unreadable;
+        }
+        let mut body = String::new();
+        if file
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut body)
+            .is_err()
+            || body.len() > 1024 * 1024
+        {
+            return ClaudeCredentialRead::Unreadable;
+        }
+        parse_claude_oauth_credential_read(&body)
+    };
+    #[cfg(all(target_os = "macos", not(test)))]
+    let read =
+        match read_claude_oauth_credential_from_keychain_with_timeout(slot, Duration::from_secs(2))
+        {
+            ClaudeKeychainRead::Found(payload) => parse_claude_oauth_credential_read(&payload),
+            ClaudeKeychainRead::NotFound => read_file(),
+            ClaudeKeychainRead::Failed => ClaudeCredentialRead::Unreadable,
+        };
+    #[cfg(any(not(target_os = "macos"), test))]
+    let read = read_file();
+    claude_local_login_state(&read, OffsetDateTime::now_utc())
+}
+
 pub(crate) fn session_launch_claude_identity(
     slot: &ClaudeConfigDirSlot,
     home: &Path,

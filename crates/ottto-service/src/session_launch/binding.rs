@@ -48,6 +48,15 @@ pub(super) fn resolve(
                 .chain(&status.external_slots)
                 .find(|slot| slot.slot_id == slot_id)
                 .ok_or_else(|| block(Reason::SlotNotFound))?;
+            if matches!(
+                descriptor.collection.relationship,
+                Some(
+                    ottto_protocol::ClaudeConfigSlotRelationshipV1::ShadowedByAnchor
+                        | ottto_protocol::ClaudeConfigSlotRelationshipV1::DuplicateAnchor
+                )
+            ) {
+                return Err(block(Reason::AccountMismatch));
+            }
             match descriptor.collection.state {
                 ClaudeState::NeedsLogin | ClaudeState::CredentialUnavailable => {
                     return Err(block(Reason::SlotNeedsLogin))
@@ -60,6 +69,16 @@ pub(super) fn resolve(
                 | ClaudeState::UpkeepNotConsented
                 | ClaudeState::ReloginApproaching => {}
                 _ => return Err(block(Reason::SlotNotVerified)),
+            }
+            if descriptor.collection.account_identifier_hash.as_deref() != Some(account)
+                || descriptor
+                    .collection
+                    .organization_identifier_hash
+                    .as_deref()
+                    .unwrap_or("")
+                    != organization
+            {
+                return Err(block(Reason::AccountMismatch));
             }
             let slot = match &descriptor.config_dir {
                 Some(dir) => ClaudeConfigDirSlot::registered(dir.clone())
@@ -77,6 +96,13 @@ pub(super) fn resolve(
                 {
                     return Err(block(Reason::AccountMismatch));
                 }
+            }
+            match crate::agent_status::session_launch_claude_login_state(&slot, &user.home) {
+                crate::agent_status::ClaudeLocalLoginState::AccessValid => {}
+                crate::agent_status::ClaudeLocalLoginState::RefreshPending => {
+                    return Err(block(Reason::SlotNotVerified))
+                }
+                _ => return Err(block(Reason::SlotNeedsLogin)),
             }
             let current = crate::agent_status::session_launch_claude_identity(&slot, &user.home)
                 .ok_or_else(|| block(Reason::SlotNeedsLogin))?;
@@ -100,13 +126,25 @@ pub(super) fn resolve(
         }
         Provider::Codex => {
             let store = FileCodexAccountSlotSettingsStore::default();
-            let status = crate::agent_status::annotate_codex_accounts_status(
-                store.load().map_err(|_| block(Reason::SlotNotFound))?,
+            let status = crate::agent_status::session_launch_codex_accounts_status(
+                store
+                    .load_for_session_launch()
+                    .map_err(|_| block(Reason::SlotNotFound))?,
+                &user.home.join(".codex"),
             );
             let descriptor = std::iter::once(&status.default_slot)
                 .chain(&status.managed_slots)
                 .find(|slot| slot.slot_id == slot_id)
                 .ok_or_else(|| block(Reason::SlotNotFound))?;
+            if matches!(
+                descriptor.collection.relationship,
+                Some(
+                    ottto_protocol::CodexAccountSlotRelationshipV1::ShadowedByAnchor
+                        | ottto_protocol::CodexAccountSlotRelationshipV1::DuplicateAnchor
+                )
+            ) {
+                return Err(block(Reason::AccountMismatch));
+            }
             match descriptor.collection.state {
                 CodexState::NeedsLogin => return Err(block(Reason::SlotNeedsLogin)),
                 CodexState::IdentityMismatch | CodexState::DuplicateAccount => {
