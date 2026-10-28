@@ -250,8 +250,12 @@ impl PiLiveFixture {
             .unwrap(),
         )
         .unwrap();
-        self.progress.destination_namespace_hash =
-            snapshot_upload_destination_namespace(device, "synthetic-secret");
+        // A destination gets a fresh checkpoint, never a cross-destination CAS.
+        self.progress_path = self.support.join("bound-progress.json");
+        self.progress = SnapshotUploadProgress::new(
+            snapshot_upload_destination_namespace(device, "synthetic-secret"),
+            snapshot_quarantine_witness(SnapshotSource::Pi),
+        );
         self.progress.save(&self.progress_path).unwrap();
         self.live = Some(
             live_snapshot_retry::LiveAuthority::capture(
