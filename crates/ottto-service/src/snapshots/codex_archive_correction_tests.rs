@@ -806,13 +806,17 @@ fn correction_ack_debt_survives_restart_without_regranting_full() {
     assert!(!correction.snapshots.is_empty());
     assert_eq!(archive_evidence(&index, &f).user_generation, 1);
     assert_eq!(archive_evidence(&index, &f).user_change_spent, 1);
-    // Transport loss / Deferred / Shed: no terminal failure, exact ACK withheld.
-    index.settle_archive_outcome(&BTreeMap::new(), false, None);
+    // Transport loss / Deferred / Shed hold the same debt without a terminal count.
+    let mut deferred = index.clone();
+    deferred.settle_archive_outcome(&BTreeMap::new(), false, None);
+    assert!(deferred.files[&key].archive.as_ref().unwrap().user_change);
+    assert_eq!(archive_evidence(&deferred, &f).terminal_failures, 0);
+    // No response/ACK callback at all: persist Pending and expire its deadline on restart.
     let path = f.0.parent().unwrap().join("correction-debt.json");
     index.save(&path).unwrap();
     let mut restored = ScanIndex::load(&path).unwrap();
-    restored.activate_archive_user_context(user_context("B"));
     retry_due(&mut restored, &key);
+    restored.activate_archive_user_context(user_context("B"));
     for _ in 0..5 {
         let (next, result, rows, _) =
             archive_pass_with(&f, restored, true, None, &[], synthetic_permission);
@@ -830,8 +834,8 @@ fn correction_ack_debt_survives_restart_without_regranting_full() {
             }
         ));
         restored = ScanIndex::load(&path).unwrap();
-        restored.activate_archive_user_context(user_context("B"));
         retry_due(&mut restored, &key);
+        restored.activate_archive_user_context(user_context("B"));
     }
     let witness = archive_evidence(&restored, &f).body_witness.clone();
     assert!(witness.is_some());
@@ -900,8 +904,8 @@ fn correction_crash_after_reservation_spends_grant_before_any_byte() {
         1,
         "A1 counter unchanged"
     );
-    restored.activate_archive_user_context(user_context("B"));
     retry_due(&mut restored, &key);
+    restored.activate_archive_user_context(user_context("B"));
     let (mut held, result, rows, _) =
         archive_pass_with(&f, restored, true, None, &[], synthetic_permission);
     assert_eq!(decodes(&rows), 0);
