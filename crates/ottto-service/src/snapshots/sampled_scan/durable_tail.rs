@@ -32,6 +32,7 @@ use crate::durable_tail_store::{
     self as store, Binding, DurableSource, DurableTailStore, Expected, PendingRecord, ReadOutcome,
     SingleWriter,
 };
+use crate::snapshot_sync::effective_upload_body_witness_revision as effective_revision;
 use crate::transcript_acquisition::{
     birth_unix_nanos, Checkpoint, DurableCertificate, FullReason, Scope,
 };
@@ -65,12 +66,16 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
 pub(crate) struct Counters {
     pub(crate) restore_attempts: u64,
     pub(crate) restored: u64,
+    pub(crate) original_v1_mapped: u64,
+    pub(crate) durable_restore_after_selection_clear: u64,
+    pub(crate) objects: [u64; 3],
+    pub(crate) s2_skipped_object_changed: u64,
     pub(crate) retail_attempts: u64,
     pub(crate) retail_keys: u64,
     pub(crate) missing: u64,
     pub(crate) upgrade_state_missing: u64,
     pub(crate) refused_record: u64,
-    pub(crate) durable_held: [u64; 6],
+    pub(crate) durable_held: [u64; 7],
     pub(crate) held_census: [u64; 2],
     pub(crate) ineligible: BTreeMap<&'static str, u64>,
     pub(crate) certificate_refused: BTreeMap<&'static str, u64>,
@@ -107,13 +112,13 @@ impl Counters {
                 .join(",")
         };
         format!(
-            "ottto-service: durable_tail source={} restore_attempts={} restored={} missing={} \
+            "ottto-service: durable_tail source={} restore_attempts={} restored={} original_v1_mapped={} durable_restore_after_selection_clear={} objects[same,unknown,changed]={:?} s2_skipped_object_changed={} missing={} \
              retail_attempts={} retail_keys={} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
-             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,upgrade_missing]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
+             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,upgrade_missing,behind_accepted]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
@@ -121,6 +126,10 @@ impl Counters {
             source.api_slug(),
             self.restore_attempts,
             self.restored,
+            self.original_v1_mapped,
+            self.durable_restore_after_selection_clear,
+            self.objects,
+            self.s2_skipped_object_changed,
             self.missing,
             self.retail_attempts,
             self.retail_keys,
@@ -228,8 +237,41 @@ pub(crate) fn durable_source(source: SnapshotSource) -> Option<DurableSource> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct AcceptedFloor {
+    pub(crate) end: u64,
+    revision: u64,
+    birth: u64,
+    generation: u64,
+    entry: store::Digest32,
+    strict: bool,
+}
+impl AcceptedFloor {
+    pub(crate) fn of(index: &ScanIndex, key: &str) -> Option<Self> {
+        let e = index.files.get(key)?;
+        Some(Self {
+            end: e.size_bytes,
+            revision: e.effective_upload_body_witness_revision,
+            birth: e.opened_birth_nanos,
+            generation: index.generation,
+            strict: !e.source_file_fingerprint.is_empty(),
+            entry: store::replay_entry_digest(
+                &store::entry_digest(
+                    &e.source_file_fingerprint,
+                    e.last_upload_body_witness.as_deref(),
+                ),
+                e.effective_upload_body_witness_revision,
+                index
+                    .claude_money_birth_store
+                    .money_marks(claude_money_birth_store::location_key(key)),
+            ),
+        })
+    }
+}
+
 /// The interpretation inputs a record binds to beyond the file scope.
 pub(crate) struct Interpretation<'a> {
+    pub(crate) accepted: Option<AcceptedFloor>,
     /// The Claude request-identity contract and identity/attribution parse modes.
     pub(crate) identity_contract: String,
     /// The Codex counting view (`codex_counting_version::singleton_view`).
@@ -257,6 +299,9 @@ impl<'a> Interpretation<'a> {
             identity_contract.push_str(&format!("|attr={}", claude_attribution_capture_enabled()));
         }
         Self {
+            accepted: (source == SnapshotSource::ClaudeCode)
+                .then(|| AcceptedFloor::of(index, key))
+                .flatten(),
             identity_contract,
             counting_view: if source == SnapshotSource::Codex {
                 codex_counting_version::singleton_view_of_key(key, index)
@@ -276,13 +321,14 @@ fn expected(
     scope: &Scope,
     index: &ScanIndex,
     interpretation: &Interpretation<'_>,
-    representation: Option<(u16, store::Digest32)>,
+    representation: Option<(u16, store::Digest32, u64)>,
 ) -> Option<Expected> {
     let entry = index.files.get(key)?;
-    let (format, allowlist) = representation.unwrap_or_else(|| {
+    let (format, allowlist, revision) = representation.unwrap_or_else(|| {
         (
             store::FORMAT_VERSION,
             codec::allowlist_digest(snapshot_source),
+            effective_revision(snapshot_source),
         )
     });
     Some(Expected {
@@ -301,7 +347,7 @@ fn expected(
                     &interpretation.identity_contract,
                     &interpretation.counting_view,
                 ),
-                crate::snapshot_sync::effective_upload_body_witness_revision(snapshot_source),
+                revision,
                 index.active_effective_upload_body_witness_revision,
                 if source == DurableSource::ClaudeCode {
                     index.claude_money_birth_store.money_rule_version()
@@ -357,6 +403,68 @@ fn scope_for(
         },
         source == DurableSource::ClaudeCode && claude_request_money::e2::enabled(),
     )
+}
+
+fn claude_expected(
+    key: &str,
+    scope: &Scope,
+    index: &ScanIndex,
+    interpretation: &Interpretation<'_>,
+    record: &store::DurableRecord,
+) -> Result<(Expected, u64), &'static str> {
+    if record.format != 1
+        || record.record.allowlist != codec::allowlist_digest(SnapshotSource::ClaudeCode)
+    {
+        return Err("old_binding_representation");
+    }
+    let current = effective_revision(SnapshotSource::ClaudeCode);
+    // NAMED_REVISION_CANDIDATES: record/entry applied, current code, explicitly retained active.
+    let applied = index
+        .files
+        .get(key)
+        .ok_or("accepted_floor_missing")?
+        .effective_upload_body_witness_revision;
+    let revisions = [
+        applied,
+        current,
+        index.active_effective_upload_body_witness_revision,
+    ];
+    let candidates: BTreeSet<_> = revisions.into_iter().collect();
+    let mut matched = None;
+    for revision in candidates {
+        let expected = expected(
+            DurableSource::ClaudeCode,
+            SnapshotSource::ClaudeCode,
+            key,
+            scope,
+            index,
+            interpretation,
+            Some((record.format, record.record.allowlist, revision)),
+        )
+        .ok_or("accepted_floor_missing")?;
+        if expected.binding.context != record.record.binding.context {
+            return Err("context");
+        }
+        if expected.binding.scope != record.record.binding.scope {
+            continue;
+        }
+        if matched.is_some() {
+            return Err("old_binding_ambiguous");
+        }
+        matched = Some((expected, revision));
+    }
+    let mut proof = matched.ok_or("old_binding_no_match")?;
+    if proof.1 != current {
+        return Err(if proof.1 > current {
+            "revision_downgrade"
+        } else {
+            "revision_adoption_required"
+        });
+    }
+    // Historical entry/generation are not acquisition gates; mutation binds to this exact R.
+    proof.0.binding.entry = record.record.binding.entry;
+    proof.0.committed_generation = record.index_generation;
+    Ok(proof)
 }
 
 fn ineligible_class(reason: store::Ineligible) -> &'static str {
@@ -537,6 +645,8 @@ fn authorize_strict(
     key: &str,
     index: &ScanIndex,
 ) {
+    slot.store
+        .revoke(&store::key_digest(DurableSource::ClaudeCode, key));
     let Some(scope) = slot.decided.get(key) else {
         return;
     };
@@ -555,15 +665,7 @@ fn authorize_strict(
         slot.identity_capture,
         &slot.namespace,
     );
-    if let Some(expected) = expected(
-        source,
-        snapshot_source,
-        key,
-        scope,
-        index,
-        &interpretation,
-        Some((record.format, record.record.allowlist)),
-    ) {
+    if let Ok((expected, _)) = claude_expected(key, scope, index, &interpretation, &record) {
         slot.store.authorize(&record, &expected);
     }
 }
@@ -755,8 +857,6 @@ impl SharedCache {
         index: &mut ScanIndex,
         candidate: &CandidateFile,
     ) {
-        let kept = source == SnapshotSource::ClaudeCode
-            && claude_request_census::retain_held(index, candidate);
         if let Some(mut stores) = self.durable() {
             Counters::bump(
                 &mut stores.counters.ineligible,
@@ -766,6 +866,18 @@ impl SharedCache {
                     RetailHold::Ineligible => "retail_hold.ineligible",
                 },
             );
+        }
+        self.durable_stale_hold(source, index, candidate);
+    }
+    pub(in crate::snapshots) fn durable_stale_hold(
+        &self,
+        source: SnapshotSource,
+        index: &mut ScanIndex,
+        candidate: &CandidateFile,
+    ) {
+        let kept = source == SnapshotSource::ClaudeCode
+            && claude_request_census::retain_held(index, candidate);
+        if let Some(mut stores) = self.durable() {
             stores.counters.held_census[usize::from(!kept)] += 1;
             if let Some(ds) = durable_source(source) {
                 if let Some(slot) = stores.slot(ds).as_mut() {
@@ -783,6 +895,13 @@ impl SharedCache {
         candidate: &CandidateFile,
         census: &mut ScanCensus,
     ) {
+        if reason == store::Refusal::BehindAccepted {
+            if let Some(mut stores) = self.durable() {
+                stores.counters.durable_held[reason as usize] += 1;
+            }
+            self.durable_stale_hold(source, index, candidate);
+            return;
+        }
         let kept = source == SnapshotSource::ClaudeCode
             && claude_request_census::retain_held(index, candidate);
         if let Some(mut stores) = self.durable() {
@@ -799,8 +918,19 @@ impl SharedCache {
         census.record_unreadable(UnreadableCause::Reduction, 1);
     }
 
+    fn stale(&self, reason: &'static str) -> RestoreOutcome {
+        if let Some(mut stores) = self.durable() {
+            Counters::bump(&mut stores.counters.ineligible, reason);
+        }
+        if reason == "behind_accepted.legacy" {
+            RestoreOutcome::Held(store::Refusal::BehindAccepted)
+        } else {
+            RestoreOutcome::Stale(reason)
+        }
+    }
+
     /// Restores `key` from the durable store into the RAM cache and takes it,
-    /// or `None` (the read is then Full, with nothing left behind). `held` is
+    /// or a typed stale/integrity hold. A missing record keeps its existing Full path. `held` is
     /// the parser's opened FD for `path`, not yet read; a duplicate of it
     /// serves the bounded re-derivation, and the read plan repositions it.
     #[allow(clippy::too_many_arguments)]
@@ -824,7 +954,8 @@ impl SharedCache {
             index,
             interpretation,
         ) {
-            Some(taken) => RestoreOutcome::Restored(Box::new(taken)),
+            Some(Ok(taken)) => RestoreOutcome::Restored(Box::new(taken)),
+            Some(Err(hold)) => hold,
             None => self
                 .durable_hold(snapshot_source, key)
                 .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
@@ -841,19 +972,19 @@ impl SharedCache {
         held: &mut File,
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
-    ) -> Option<Taken<CachedJsonlReduction>> {
+    ) -> Option<Result<Taken<CachedJsonlReduction>, RestoreOutcome>> {
         let source = durable_source(snapshot_source)?;
         let store_key = store::key_digest(source, key);
         let allowlist = codec::allowlist_digest(snapshot_source);
         let record = {
             let mut stores = self.durable()?;
             stores.counters.restore_attempts += 1;
-            // A cleared fingerprint is reparse debt (a held or reverted
-            // selection): it always reads Full.
-            if index
-                .files
-                .get(key)
-                .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+            // Codex keeps its predecessor selection gate; Claude first proves the original binding.
+            if source == DurableSource::Codex
+                && index
+                    .files
+                    .get(key)
+                    .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
             {
                 Counters::bump(&mut stores.counters.ineligible, "selection_cleared");
                 return None;
@@ -881,15 +1012,53 @@ impl SharedCache {
                 }
             }
         };
-        let expected = expected(
+        if source == DurableSource::ClaudeCode && interpretation.accepted.is_none() {
+            return Some(Err(self.stale("accepted_floor_missing")));
+        }
+        let mut expected = expected(
             source,
             snapshot_source,
             key,
             scope,
             index,
             interpretation,
-            Some((record.format, record.record.allowlist)),
+            Some((
+                record.format,
+                record.record.allowlist,
+                effective_revision(snapshot_source),
+            )),
         )?;
+        if source == DurableSource::ClaudeCode {
+            let (original, revision) =
+                match claude_expected(key, scope, index, interpretation, &record) {
+                    Ok(proof) => proof,
+                    Err(reason) => return Some(Err(self.stale(reason))),
+                };
+            let Some(a) = interpretation.accepted else {
+                return Some(Err(self.stale("accepted_floor_missing")));
+            };
+            let Ok(current) = held.metadata() else {
+                return Some(Err(self.stale("accepted_floor_metadata")));
+            };
+            let verdict = accepted_object(
+                &record,
+                &a,
+                current.dev(),
+                current.ino(),
+                birth_unix_nanos(&current),
+            );
+            let behind = revision < a.revision || current.len() < a.end;
+            if let Some(mut stores) = self.durable() {
+                stores.counters.original_v1_mapped += 1;
+                stores.counters.objects[verdict as usize] += 1;
+                stores.counters.s2_skipped_object_changed +=
+                    u64::from(behind && verdict == ObjectVerdict::Changed);
+            }
+            if behind && verdict != ObjectVerdict::Changed {
+                return Some(Err(self.stale("behind_accepted.legacy")));
+            }
+            expected = original;
+        }
         let restored = self.durable_restore_record(
             snapshot_source,
             &record,
@@ -916,7 +1085,13 @@ impl SharedCache {
                         Counters::bump(&mut counters.not_rederived, refuse_class(refuse))
                     }
                 }
-                return None;
+                return if source == DurableSource::ClaudeCode
+                    && !matches!(class, Failure::Certificate(_))
+                {
+                    Some(Err(RestoreOutcome::Stale("restore_semantics")))
+                } else {
+                    None
+                };
             }
         };
         if let Some(slot) = stores.slot(source).as_mut() {
@@ -929,6 +1104,13 @@ impl SharedCache {
         drop(stores);
         // The restored copy is charged to the RAM cache exactly as a retained
         // copy is admitted; a refused charge leaves the read Full.
+        if source == DurableSource::ClaudeCode
+            && interpretation
+                .accepted
+                .is_some_and(|a| !held.metadata().is_ok_and(|m| m.len() >= a.end))
+        {
+            return Some(Err(self.stale("behind_accepted.legacy")));
+        }
         let admitted = self.insert_admitted(
             key.to_string(),
             sampled_jsonl::CompletedNativeAcquisition {
@@ -945,8 +1127,15 @@ impl SharedCache {
             return None;
         }
         stores.counters.restored += 1;
+        stores.counters.durable_restore_after_selection_clear += u64::from(
+            source == DurableSource::ClaudeCode
+                && index
+                    .files
+                    .get(key)
+                    .is_some_and(|e| e.source_file_fingerprint.is_empty()),
+        );
         drop(stores);
-        self.take(key)
+        self.take(key).map(Ok)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -968,6 +1157,9 @@ impl SharedCache {
             .map_err(Failure::Certificate)?;
         let decoded = codec::decode(&record.record.body, source).map_err(|_| Failure::Corrupt)?;
         let counting = decoded.counting();
+        if source == SnapshotSource::ClaudeCode && counting.is_some() {
+            return Err(Failure::Corrupt);
+        }
         let cutover = interpretation
             .counting_view
             .split(':')
@@ -1073,8 +1265,8 @@ impl SharedCache {
                 // committed entry's own fingerprint binds to it. A held or
                 // reverted entry (local-hold settlement restored the prior
                 // entry or cleared its fingerprint), or a RAM reduction ahead
-                // of the saved selection, refuses, and any older record for
-                // the key is invalidated: it must never restore.
+                // of the saved selection, refuses. Claude preserves the
+                // predecessor; Codex keeps its existing invalidation.
                 let acquired_for = selected.remove(&key);
                 match index.files.get(&key) {
                     None => continue,
@@ -1083,7 +1275,9 @@ impl SharedCache {
                             && acquired_for.as_deref()
                                 == Some(entry.source_file_fingerprint.as_str()) => {}
                     Some(_) => {
-                        invalidate.insert(store::key_digest(source, &key));
+                        if source == DurableSource::Codex {
+                            invalidate.insert(store::key_digest(source, &key));
+                        }
                         not_persisted.push("selection");
                         continue;
                     }
@@ -1210,7 +1404,11 @@ impl SharedCache {
         // Only keys with a record on disk (at most `INVENTORY_BOUND`) are
         // looked up; the index is streamed, never copied.
         let inventory = slot.store.inventory()?;
+        if source == DurableSource::ClaudeCode {
+            slot.store.revoke_all();
+        }
         let mut keep = BTreeMap::new();
+        let mut mapping_holds = BTreeMap::new();
         if !inventory.is_empty() {
             for key in index.files.keys() {
                 let digest = store::key_digest(source, key);
@@ -1225,6 +1423,23 @@ impl SharedCache {
                         identity_capture,
                         namespace,
                     );
+                    if source == DurableSource::ClaudeCode {
+                        let ReadOutcome::Found(record) = slot.store.read(&digest, &allowlist)
+                        else {
+                            return None;
+                        };
+                        let (original, _) =
+                            match claude_expected(key, scope, index, &interpretation, &record) {
+                                Ok(proof) => proof,
+                                Err(reason) => {
+                                    Counters::bump(&mut mapping_holds, reason);
+                                    slot.held += 1;
+                                    return None;
+                                }
+                            };
+                        slot.store.authorize(&record, &original);
+                        return Some(original.binding.scope);
+                    }
                     let (format, allowlist) = slot.store.representation(&digest)?;
                     expected(
                         source,
@@ -1233,20 +1448,15 @@ impl SharedCache {
                         scope,
                         index,
                         &interpretation,
-                        Some((format, allowlist)),
+                        Some((format, allowlist, effective_revision(snapshot_source))),
                     )
-                    .map(|e| {
-                        if source == DurableSource::ClaudeCode {
-                            if let ReadOutcome::Found(record) = slot.store.read(&digest, &allowlist)
-                            {
-                                slot.store.authorize(&record, &e);
-                            }
-                        }
-                        e.binding.scope
-                    })
+                    .map(|e| e.binding.scope)
                 });
                 keep.insert(digest, scope);
             }
+        }
+        for (reason, n) in mapping_holds {
+            *stores.counters.ineligible.entry(reason).or_default() += n;
         }
         stores.counters.gc_keep_peak = stores.counters.gc_keep_peak.max(keep.len() as u64);
         let Some(slot) = stores.slot(source).as_mut() else {
@@ -1268,12 +1478,17 @@ impl SharedCache {
             return Ok(());
         };
         match stores.slot(source).as_mut() {
-            Some(slot) => slot.store.gc(
-                writer,
-                &[0; 32],
-                &codec::allowlist_digest(snapshot_source),
-                &BTreeMap::new(),
-            ),
+            Some(slot) => {
+                if source == DurableSource::ClaudeCode {
+                    slot.store.revoke_all();
+                }
+                slot.store.gc(
+                    writer,
+                    &[0; 32],
+                    &codec::allowlist_digest(snapshot_source),
+                    &BTreeMap::new(),
+                )
+            }
             None => Ok(()),
         }
     }
@@ -1358,6 +1573,43 @@ pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>),
     Miss,
     Held(store::Refusal),
+    Stale(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectVerdict {
+    Same,
+    Unknown,
+    Changed,
+}
+fn accepted_object(
+    record: &store::DurableRecord,
+    a: &AcceptedFloor,
+    device: u64,
+    inode: u64,
+    birth: u64,
+) -> ObjectVerdict {
+    let r = &record.record.certificate;
+    let bridge = record.format == 1
+        && a.strict
+        && record.record.binding.entry == a.entry
+        && record.index_generation <= a.generation
+        && a.birth != 0
+        && a.birth == r.birth_nanos;
+    if !bridge || birth == 0 {
+        return ObjectVerdict::Unknown;
+    }
+    if (r.device, r.inode) != (device, inode) {
+        if birth != a.birth {
+            ObjectVerdict::Changed
+        } else {
+            ObjectVerdict::Unknown
+        }
+    } else if birth == a.birth {
+        ObjectVerdict::Same
+    } else {
+        ObjectVerdict::Unknown
+    } // Equal inode/different birth is reuse ambiguity.
 }
 
 enum Failure {
@@ -1365,6 +1617,11 @@ enum Failure {
     Certificate(FullReason),
     Corrupt,
     NotRederived(Refuse),
+}
+
+#[cfg(test)]
+pub(crate) fn record_consumed(bytes: u64) {
+    tests::record_consumed(bytes);
 }
 
 #[cfg(test)]

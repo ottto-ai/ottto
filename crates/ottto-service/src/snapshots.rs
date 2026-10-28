@@ -31570,6 +31570,15 @@ impl OwnedSourceScan {
                     dev_ino: at.dev_ino,
                 });
             }
+            #[cfg(unix)]
+            let durable_accepted = (source == SnapshotSource::ClaudeCode)
+                .then(|| {
+                    sampled_scan::durable_tail::AcceptedFloor::of(
+                        index,
+                        &local_index_key(&candidate.path),
+                    )
+                })
+                .flatten();
             let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
             let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
             let projection_adoption_required = index
@@ -31815,13 +31824,15 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let (retained, taken_admission) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
-                                let interpretation = sampled_scan::durable_tail::Interpretation::of(
-                                    source,
-                                    &key,
-                                    index,
-                                    claude_request_identity_capture,
-                                    &context.namespace,
-                                );
+                                let mut interpretation =
+                                    sampled_scan::durable_tail::Interpretation::of(
+                                        source,
+                                        &key,
+                                        index,
+                                        claude_request_identity_capture,
+                                        &context.namespace,
+                                    );
+                                interpretation.accepted = durable_accepted;
                                 match context.cache.durable_restore(
                                     source,
                                     &key,
@@ -31833,8 +31844,9 @@ impl OwnedSourceScan {
                                 ) {
                                     sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => {
                                         if source == SnapshotSource::ClaudeCode {
-                                            let accepted_end =
-                                                index.files.get(&key).map_or(0, |e| e.size_bytes);
+                                            let accepted_end = durable_accepted
+                                                .expect("restored accepted floor")
+                                                .end;
                                             match context.cache.begin_retail(
                                                 source,
                                                 &key,
@@ -31860,6 +31872,10 @@ impl OwnedSourceScan {
                                             taken.retained.state.usage_witness(),
                                         );
                                         (Some(taken.retained), Some(admission))
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Stale(_reason) => {
+                                        context.cache.durable_stale_hold(source, index, &candidate);
+                                        pending!();
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss => {
                                         (None, taken_admission)
@@ -31901,6 +31917,26 @@ impl OwnedSourceScan {
                                 pending!();
                             }
                         };
+                        #[cfg(unix)]
+                        if source == SnapshotSource::ClaudeCode
+                            && !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                            && durable_accepted.is_some_and(|a| {
+                                parser
+                                    .reader
+                                    .acquisition
+                                    .as_ref()
+                                    .map_or(true, |p| p.frozen_length() < a.end)
+                            })
+                        {
+                            context.cache.durable_hold_exit(
+                                source,
+                                crate::durable_tail_store::Refusal::BehindAccepted,
+                                index,
+                                &candidate,
+                                &mut census,
+                            );
+                            pending!();
+                        }
                         #[cfg(unix)]
                         if let Some(attempt) = retail_attempt {
                             if mode == crate::transcript_acquisition::ReadMode::Tail {
@@ -34224,6 +34260,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         acquisition.observe_record_fragment(&available[..offset + 1], true)?;
                     }
                     reader.consume(offset + 1);
+                    #[cfg(all(test, unix))]
+                    sampled_scan::durable_tail::record_consumed((offset + 1) as u64);
                     self.consumed += (offset + 1) as u64;
                     self.last_line_end = self.consumed;
                     line_complete = true;
@@ -34242,6 +34280,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         acquisition.observe_record_fragment(available, false)?;
                     }
                     reader.consume(len);
+                    #[cfg(all(test, unix))]
+                    sampled_scan::durable_tail::record_consumed(len as u64);
                     self.consumed += len as u64;
                     if overflowed {
                         skipped_this_step = skipped_this_step.saturating_add(len);

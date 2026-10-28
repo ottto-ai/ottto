@@ -298,6 +298,7 @@ pub(crate) enum Refusal {
     Unbindable,
     Corrupt,
     UpgradeMissing,
+    BehindAccepted,
 }
 
 /// The outcome of reading one key.
@@ -348,9 +349,11 @@ impl DurableRecord {
             Err(Ineligible::Context)
         } else if have.scope != want.scope {
             Err(Ineligible::Scope)
-        } else if self.index_generation > expected.committed_generation {
+        } else if have.source == DurableSource::Codex
+            && self.index_generation > expected.committed_generation
+        {
             Err(Ineligible::GenerationAhead)
-        } else if have.entry != want.entry {
+        } else if have.source == DurableSource::Codex && have.entry != want.entry {
             Err(Ineligible::EntryChanged)
         } else {
             Ok(())
@@ -382,7 +385,7 @@ pub(crate) struct StoreCounters {
     pub(crate) records_read: u64,
     pub(crate) mutation_unproved: u64,
     pub(crate) missing: u64,
-    pub(crate) format_hold: [u64; 6],
+    pub(crate) format_hold: [u64; 7],
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
@@ -464,9 +467,7 @@ impl DurableTailStore {
     /// A new pass: the directory is checked again and the T14 breaker resets.
     pub(crate) fn begin_pass(&mut self) {
         self.checked = false;
-        for (_, _, allowed) in self.durable.values_mut() {
-            *allowed = false;
-        }
+        self.revoke_all();
         self.pass = [0; 2];
         self.rebuilt.clear();
     }
@@ -682,9 +683,23 @@ impl DurableTailStore {
         }
     }
 
+    pub(crate) fn revoke(&mut self, key: &Digest32) {
+        if let Some((_, _, allowed)) = self.durable.get_mut(key) {
+            *allowed = false;
+        }
+    }
+    pub(crate) fn revoke_all(&mut self) {
+        for (_, _, allowed) in self.durable.values_mut() {
+            *allowed = false;
+        }
+    }
+
     /// Only a fully verified original binding may authorize a Claude mutation.
     pub(crate) fn authorize(&mut self, record: &DurableRecord, expected: &Expected) {
-        if record.eligible(expected).is_err() {
+        if record.eligible(expected).is_err()
+            || record.record.binding.entry != expected.binding.entry
+            || record.index_generation > expected.committed_generation
+        {
             return;
         }
         let key = record.record.binding.key;

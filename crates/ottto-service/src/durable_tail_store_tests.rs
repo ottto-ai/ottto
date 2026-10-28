@@ -288,9 +288,12 @@ fn crash_matrix_index_old_new_by_checkpoint_old_new_torn_missing() {
             let record = found(store.read(&key, &allowlist));
             assert_eq!(
                 record.eligible(&expected),
-                want,
+                Ok(()),
                 "index {index_label} x checkpoint {checkpoint_label}"
             );
+            // Historical save facts still gate mutation; acquisition now uses P11 in DT.
+            store.authorize(&record, &expected);
+            assert_eq!(store.authorized(&key), want.is_ok());
         }
         for bytes in torn(&new_record) {
             put_record(&record_file(&store, &key), &bytes);
@@ -382,17 +385,24 @@ fn every_binding_mismatch_refuses() {
     ] {
         assert_eq!(check(&|b| b.scope = scope), Err(Ineligible::Scope));
     }
-    assert_eq!(
-        check(&|b| b.entry = entry_digest("fp", Some("w"))),
-        Err(Ineligible::EntryChanged)
-    );
+    assert_eq!(check(&|b| b.entry = entry_digest("fp", Some("w"))), Ok(()));
     assert_eq!(
         record.eligible(&Expected {
             binding: base.clone(),
-            committed_generation: 3,
+            committed_generation: 3
         }),
-        Err(Ineligible::GenerationAhead)
+        Ok(())
     );
+    let mut codex = record.clone();
+    codex.record.binding.source = DurableSource::Codex;
+    let mut want = Expected {
+        binding: codex.record.binding.clone(),
+        committed_generation: 3,
+    };
+    assert_eq!(codex.eligible(&want), Err(Ineligible::GenerationAhead));
+    want.committed_generation = 4;
+    want.binding.entry = entry_digest("changed", None);
+    assert_eq!(codex.eligible(&want), Err(Ineligible::EntryChanged));
 }
 
 /// A crash after the temp file is written and synced but before the rename
@@ -485,7 +495,12 @@ fn interrupted_replacement_renamed_but_directory_not_synced() {
     put_record(&record_file(&store, &new.key), &old_bytes);
     let reverted = found(store.read(&new.key, &allowlist));
     assert_eq!(reverted.index_generation, 1);
-    assert_eq!(reverted.eligible(&committed), Err(Ineligible::EntryChanged));
+    assert_eq!(reverted.eligible(&committed), Ok(()));
+    store.authorize(&reverted, &committed);
+    assert!(
+        !store.authorized(&new.key),
+        "reverted historical entry is not mutation proof"
+    );
 }
 
 fn set_version(bytes: &mut [u8], version: u16) {
@@ -909,7 +924,7 @@ fn store_mode_faults_are_repaired_without_rebuilds() {
     let counters = cold.counters();
     assert_eq!(counters.mode_repaired, 3);
     assert_eq!(counters.t14_rebuild, 0);
-    assert_eq!(counters.format_hold, [0; 6]);
+    assert_eq!(counters.format_hold, [0; 7]);
     assert_eq!(cold.disabled(), None);
 }
 
@@ -1640,6 +1655,14 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
     }
     // Fresh process: no RAM memo of the known record.
     let mut store = scratch.store();
+    let verified = found(store.read(&b.key, &placeholder_allowlist()));
+    store.authorize(
+        &verified,
+        &Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        },
+    );
     let mut new = b.clone();
     new.key = key_digest(DurableSource::ClaudeCode, "new-session");
     new.entry = entry_digest("fp-new", None);

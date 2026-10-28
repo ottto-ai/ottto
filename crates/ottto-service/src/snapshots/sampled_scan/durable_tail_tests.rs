@@ -782,7 +782,7 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
     ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
         match self {
             Self::Restored(taken) => Some(*taken),
-            Self::Miss => None,
+            Self::Miss | Self::Stale(_) | Self::Held(store::Refusal::BehindAccepted) => None,
             Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }
     }
@@ -1112,7 +1112,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 } else {
-                    assert_eq!(counts.durable_held, [0; 6]);
+                    assert_eq!(counts.durable_held, [0; 7]);
                 }
                 assert_eq!(counts.restored, 0);
                 let _ = std::fs::remove_dir_all(root);
@@ -1367,7 +1367,13 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                     &changed,
                 )
                 .into_test_option();
-            assert_eq!(result.is_some(), arm == "equal", "{source:?} {arm}");
+            assert_eq!(
+                result.is_some(),
+                arm == "equal"
+                    || (source == SnapshotSource::ClaudeCode
+                        && matches!(arm, "entry" | "generation")),
+                "{source:?} {arm}"
+            );
             assert_eq!(
                 std::fs::read(&disk).unwrap(),
                 bytes,
@@ -1394,16 +1400,25 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 let mut disk_store = DurableTailStore::new(dir.clone(), ds);
                 let predecessor =
                     store::tests::found(disk_store.read(&pending.binding.key, &pending.allowlist));
-                let proof = expected(
+                let mut proof = expected(
                     ds,
                     source,
                     &key,
                     &scope,
                     &index,
                     &interp,
-                    Some((predecessor.format, predecessor.record.allowlist)),
+                    Some((
+                        predecessor.format,
+                        predecessor.record.allowlist,
+                        effective_revision(source),
+                    )),
                 )
                 .unwrap();
+                if source == SnapshotSource::ClaudeCode {
+                    proof = claude_expected(&key, &scope, &index, &interp, &predecessor)
+                        .unwrap()
+                        .0;
+                }
                 assert_eq!(predecessor.eligible(&proof), Ok(()));
                 disk_store.authorize(&predecessor, &proof);
                 assert!(disk_store
@@ -1516,7 +1531,11 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 &scope,
                 &index,
                 &interpretation,
-                Some((1, codec::allowlist_digest(source))),
+                Some((
+                    1,
+                    codec::allowlist_digest(source),
+                    effective_revision(source),
+                )),
             )
             .unwrap()
             .binding,
@@ -1619,7 +1638,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 &scope,
                 &index,
                 &changed,
-                Some((1, pending.allowlist)),
+                Some((1, pending.allowlist, effective_revision(source))),
             )
             .unwrap()
             .binding;
@@ -1994,4 +2013,891 @@ fn q11_complete_map_is_paid_before_the_first_key() {
         SharedCache::default().durable().unwrap().retail_spent.len(),
         0
     );
+}
+
+thread_local! {
+    static CONSUMED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+pub(super) fn record_consumed(bytes: u64) {
+    CONSUMED.with(|total| {
+        if let Some(n) = total.get() {
+            total.set(Some(n + bytes));
+        }
+    });
+}
+fn observe_consumed<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CONSUMED.with(|n| n.set(None));
+        }
+    }
+    CONSUMED.with(|n| assert!(n.replace(Some(0)).is_none()));
+    let _reset = Reset;
+    let value = f();
+    (value, CONSUMED.with(|n| n.get().unwrap()))
+}
+
+#[test]
+fn q8_strict_v1_bridge_keeps_unknown_same_and_inode_reuse_conservative() {
+    let root = crate::test_scratch::private_dir("ottto-q8-bridge");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let scope = Scope("q8".into());
+    let mut record = store::DurableRecord {
+        format: 1,
+        index_generation: 9,
+        record: PendingRecord {
+            binding: Binding {
+                source: DurableSource::ClaudeCode,
+                key: [1; 32],
+                context: [2; 32],
+                scope: [3; 32],
+                entry: [4; 32],
+            },
+            certificate: certificate(&path, &scope),
+            body: Vec::new(),
+            allowlist: codec::allowlist_digest(SnapshotSource::ClaudeCode),
+        },
+    };
+    record.record.certificate.birth_nanos = 123_456_789_001;
+    let r = &record.record.certificate;
+    let floor = AcceptedFloor {
+        end: r.length,
+        revision: effective_revision(SnapshotSource::ClaudeCode),
+        birth: r.birth_nanos,
+        generation: 9,
+        entry: record.record.binding.entry,
+        strict: true,
+    };
+    let (dev, ino, birth) = (r.device, r.inode, r.birth_nanos);
+    assert_eq!(
+        accepted_object(&record, &floor, dev, ino, birth),
+        ObjectVerdict::Same
+    );
+    assert_eq!(
+        accepted_object(&record, &floor, dev, ino, birth + 1),
+        ObjectVerdict::Unknown,
+        "inode reuse, ns differ"
+    );
+    assert_eq!(
+        accepted_object(&record, &floor, dev + 1, ino, birth + 1),
+        ObjectVerdict::Changed
+    );
+    assert_eq!(
+        accepted_object(&record, &floor, dev + 1, ino, 0),
+        ObjectVerdict::Unknown
+    );
+    assert_eq!(
+        accepted_object(&record, &floor, dev + 1, ino, birth),
+        ObjectVerdict::Unknown,
+        "Changed requires differing nonzero births"
+    );
+    for arm in ["clear", "missing_birth", "seconds_alias", "entry", "ahead"] {
+        let mut a = floor;
+        match arm {
+            "clear" => a.strict = false,
+            "missing_birth" => a.birth = 0,
+            "seconds_alias" => a.birth = birth - 1,
+            "entry" => a.entry = [7; 32],
+            "ahead" => a.generation = 8,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            accepted_object(&record, &a, dev + 1, ino, birth + 1),
+            ObjectVerdict::Unknown,
+            "{arm}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+// Movable native transition rows; no replacement money reducer/comparator.
+// Compare the exact production SnapshotBatchRequest serialization on the same physical file.
+fn a1a_wire(support: &Path, index: &mut ScanIndex, scan: &mut SourceScanResult) -> Vec<u8> {
+    let source = SnapshotSource::ClaudeCode;
+    crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, scan, index);
+    index.veto_claude_history_emission(source, &mut scan.snapshots);
+    index.bind_session_accounts(source, "a1a-fixture-machine", &mut scan.snapshots, &[]);
+    apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
+    finalize_scan_after_policy(source, scan, index);
+    assert!(!scan.snapshots.is_empty(), "nonempty emitted money premise");
+    let request = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: source.api_slug().into(),
+        machine_id: "a".repeat(64),
+        collector_version: Some("fixture".into()),
+        snapshots: scan.snapshots.clone(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    validate_snapshot_batch_request(&request).unwrap();
+    serde_json::to_vec(&request).unwrap()
+}
+
+fn a1a_row(request: &str, tokens: u64) -> String {
+    serde_json::json!({"type":"assistant","sessionId":"1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+        "timestamp":"2026-08-02T07:00:10Z","requestId":request,
+        "message":{"id":request,"model":"claude-sonnet-4-5","usage":{"input_tokens":tokens,"output_tokens":10}}}).to_string() + "\n"
+}
+
+fn a1a_scan_at(
+    owner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
+    roots: &[PathBuf],
+    support: &Path,
+    index: ScanIndex,
+    at: &str,
+) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+    let mut scan = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        roots,
+        index,
+        at,
+        183,
+        100,
+        false,
+        Some(support),
+        &[],
+        false,
+        true,
+        false,
+    )
+    .with_sampled_acquisition(owner.cache.clone(), Scope("e2-pipeline".into()));
+    for _ in 0..100_000 {
+        let context = scan.sampling.as_ref().unwrap();
+        let modes = (
+            context.full_files,
+            context.tail_files,
+            context.unchanged_files,
+        );
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan, modes),
+        }
+    }
+    panic!("native transition did not finish");
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn a1a_859_and_restart_with_active_carry_restore_tail_zero_full_fresh_census() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use std::io::Write;
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    for (arm, grow) in [
+        ("859", true),
+        ("carry", true),
+        ("capped", true),
+        ("replay", true),
+        ("quiet-old-writer", false),
+    ] {
+        for pin in ["72205c6c", "ffc6c846"] {
+            let root = crate::test_scratch::private_dir("ottto-a1a-transition");
+            let lock = test_locks::hold(&root);
+            let projects = root.join("projects");
+            std::fs::create_dir_all(&projects).unwrap();
+            let path = projects.join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+            std::fs::write(&path, a1a_row("first", 100)).unwrap();
+            let index_path = root.join("index.json");
+            let roots = vec![projects.clone()];
+            let source = SnapshotSource::ClaudeCode;
+            let key = local_index_key(&path);
+            let warm = E2ScanFixture::default();
+            warm.begin_durable(source, &root, &index_path);
+            let (mut index, mut scan, modes) = a1a_scan_at(
+                &warm,
+                &roots,
+                &root,
+                ScanIndex::default(),
+                "2026-08-02T08:00:00Z",
+            );
+            assert_eq!(modes.0, 1, "warm Full premise");
+            a1a_wire(&root, &mut index, &mut scan);
+            index.record_accepted_snapshot_fingerprints(
+                &scan
+                    .snapshots
+                    .iter()
+                    .map(|s| s.snapshot_fingerprint.clone())
+                    .collect(),
+            );
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                warm.cache
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            let bytes = seed_pinned_v1(&warm.cache, source, &key, &index, pin);
+            let sealed = warm
+                .cache
+                .retained_checkpoint(&key)
+                .unwrap()
+                .sealed_offset();
+            let dir = store::store_dir_for_index(&index_path);
+            let disk_path = std::fs::read_dir(&dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+            assert!(!index.files[&key].source_file_fingerprint.is_empty());
+            assert!(
+                index.claude_request_census.get(&key).is_some(),
+                "warm census proof"
+            );
+            drop(warm);
+            if grow {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(a1a_row("second", 200).as_bytes())
+                    .unwrap();
+            }
+            for restart in 0..2 {
+                let mut prior = ScanIndex::load(&index_path).unwrap();
+                if arm == "859" || arm == "quiet-old-writer" {
+                    prior
+                        .files
+                        .get_mut(&key)
+                        .unwrap()
+                        .source_file_fingerprint
+                        .clear();
+                } else {
+                    // Real process-invalid active carry invokes ensure_bounded_traversal's clear.
+                    ensure_bounded_traversal(
+                        source,
+                        &roots,
+                        &mut prior,
+                        "2026-08-02T08:00:00Z",
+                        183,
+                    );
+                    let context = prior
+                        .traversal
+                        .as_ref()
+                        .unwrap()
+                        .context_fingerprint
+                        .clone();
+                    prior.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+                        context_fingerprint: context,
+                        process: claude_full_rearm_process().wrapping_add(1),
+                        full_rearm_window: arm == "capped",
+                        admission: None,
+                    });
+                    match arm {
+                        "carry" => {
+                            prior
+                                .claude_stale_family_carry
+                                .roots
+                                .insert("1338a80a-f36e-4cbc-a5bb-50fc66430ba5".into());
+                        }
+                        "capped" => {
+                            prior
+                                .claude_stale_family_carry
+                                .capped_roots
+                                .insert("1338a80a-f36e-4cbc-a5bb-50fc66430ba5".into());
+                        }
+                        "replay" => {
+                            prior
+                                .claude_stale_family_carry
+                                .replay
+                                .push(ScanTraversalPath {
+                                    scan_root: projects.clone(),
+                                    path: path.clone(),
+                                    census_member: true,
+                                    watcher_hint: false,
+                                })
+                        }
+                        _ => unreachable!(),
+                    }
+                    ensure_bounded_traversal(
+                        source,
+                        &roots,
+                        &mut prior,
+                        "2026-08-02T08:01:00Z",
+                        183,
+                    );
+                    assert!(prior.claude_stale_family_carry.is_empty());
+                    assert!(
+                        prior.files[&key].source_file_fingerprint.is_empty(),
+                        "actual carry clear: {arm}"
+                    );
+                }
+                let owner = E2ScanFixture::default();
+                owner.begin_durable(source, &root, &index_path);
+                let ((page, consumed), samples) =
+                    crate::transcript_acquisition::capture_sample_reads(|| {
+                        observe_consumed(|| {
+                            a1a_scan_at(
+                                &owner,
+                                &roots,
+                                &root,
+                                prior.clone(),
+                                if restart == 0 {
+                                    "2026-08-02T08:01:00Z"
+                                } else {
+                                    "2026-08-02T08:02:00Z"
+                                },
+                            )
+                        })
+                    });
+                let (mut restored_index, mut restored, modes) = page;
+                assert_eq!(
+                    modes,
+                    if grow { (0, 1, 0) } else { (0, 0, 1) },
+                    "{arm} {pin} restart {restart}"
+                );
+                assert_eq!(
+                    consumed,
+                    if grow {
+                        a1a_row("second", 200).len() as u64
+                    } else {
+                        0
+                    }
+                );
+                let window = sealed.min(4096);
+                let copies = if grow { 4 } else { 2 }; // certificate, then Tail prepare's cheap guards
+                assert_eq!(samples.len(), copies);
+                for pair in samples.chunks_exact(2) {
+                    assert_eq!(pair[0].offset, Ok(0));
+                    assert_eq!(pair[1].offset, Ok(sealed - window));
+                    assert!(
+                        pair.iter()
+                            .all(|r| r.requested == window as usize
+                                && r.result == Ok(window as usize))
+                    );
+                }
+                let cheap_checks: u64 = samples.iter().map(|r| r.result.unwrap() as u64).sum();
+                let certificate_checks: u64 =
+                    samples[..2].iter().map(|r| r.result.unwrap() as u64).sum();
+                assert_eq!(certificate_checks, 2 * sealed.min(4096));
+                assert!(certificate_checks <= 8192);
+                assert_eq!(
+                    cheap_checks - certificate_checks,
+                    if grow { 2 * window } else { 0 }
+                );
+                assert_eq!(cheap_checks, copies as u64 * window);
+                assert!(cheap_checks <= if grow { 16384 } else { 8192 });
+                let counts = owner.cache.durable_counters(source).unwrap().0;
+                assert_eq!(counts.restored, 1);
+                assert_eq!(counts.durable_restore_after_selection_clear, 1);
+                assert!(restored.census_complete, "fresh-window census: {arm}");
+                assert_eq!(
+                    restored.census_window_end,
+                    if restart == 0 {
+                        "2026-08-02T08:01:00Z"
+                    } else {
+                        "2026-08-02T08:02:00Z"
+                    }
+                );
+                assert!(restored_index.claude_request_census.get(&key).is_some());
+                let cold = E2ScanFixture::default();
+                let (mut cold_index, mut cold_scan, cold_modes) = a1a_scan_at(
+                    &cold,
+                    &roots,
+                    &root,
+                    prior,
+                    if restart == 0 {
+                        "2026-08-02T08:01:00Z"
+                    } else {
+                        "2026-08-02T08:02:00Z"
+                    },
+                );
+                assert_eq!(cold_modes.0, 1);
+                assert_eq!(
+                    a1a_wire(&root, &mut restored_index, &mut restored),
+                    a1a_wire(&root, &mut cold_index, &mut cold_scan),
+                    "exact production emitted body: {arm} {pin}"
+                );
+                // First GC and second process must retain the exact old image; no write is invoked.
+                owner
+                    .cache
+                    .durable_gc(lock, source, &restored_index)
+                    .unwrap();
+                assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+            }
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
+#[test]
+fn a1a_finite_named_revisions_do_not_enumerate_or_mutate_future_records() {
+    let root = crate::test_scratch::private_dir("ottto-a1a-candidates");
+    let lock = test_locks::hold(&root);
+    let path = root.join("t.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let scope = Scope("candidates".into());
+    let namespace = Scope("namespace".into());
+    let source = SnapshotSource::ClaudeCode;
+    let current = effective_revision(source);
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":std::fs::metadata(&path).unwrap().len(), "source_file_fingerprint":"fp",
+            "modified_unix_seconds":1,"effective_upload_body_witness_revision":current
+        }))
+        .unwrap(),
+    );
+    let i = Interpretation::of(source, &key, &index, false, &namespace);
+    let make = |revision| {
+        let want = expected(
+            DurableSource::ClaudeCode,
+            source,
+            &key,
+            &scope,
+            &index,
+            &i,
+            Some((1, codec::allowlist_digest(source), revision)),
+        )
+        .unwrap();
+        store::DurableRecord {
+            format: 1,
+            index_generation: 1,
+            record: PendingRecord {
+                binding: want.binding,
+                certificate: certificate(&path, &scope),
+                body: codec::encode(
+                    &native_record(&path, &scope).0,
+                    store::RECORD_BYTES,
+                    jsonl_line_cap() as u64,
+                )
+                .unwrap(),
+                allowlist: codec::allowlist_digest(source),
+            },
+        }
+    };
+    let valid = make(current);
+    assert_eq!(
+        claude_expected(&key, &scope, &index, &i, &valid).unwrap().1,
+        current,
+        "duplicate named values are one candidate"
+    );
+    let future = make(current + 17);
+    assert_eq!(
+        claude_expected(&key, &scope, &index, &i, &future).err(),
+        Some("old_binding_no_match"),
+        "no range enumeration"
+    );
+    drop(i);
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .effective_upload_body_witness_revision = current + 17;
+    let i = Interpretation::of(source, &key, &index, false, &namespace);
+    assert_eq!(
+        claude_expected(&key, &scope, &index, &i, &future).err(),
+        Some("revision_downgrade")
+    );
+    drop(i);
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .effective_upload_body_witness_revision = current - 1;
+    let i = Interpretation::of(source, &key, &index, false, &namespace);
+    let lower = expected(
+        DurableSource::ClaudeCode,
+        source,
+        &key,
+        &scope,
+        &index,
+        &i,
+        Some((1, codec::allowlist_digest(source), current - 1)),
+    )
+    .unwrap();
+    let mut old = valid.clone();
+    old.record.binding.scope = lower.binding.scope;
+    assert_eq!(
+        claude_expected(&key, &scope, &index, &i, &old).err(),
+        Some("revision_adoption_required")
+    );
+    drop(i);
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .effective_upload_body_witness_revision = current + 17;
+    index.save(&root.join("index.json")).unwrap();
+    let mut disk = DurableTailStore::new(
+        store::store_dir_for_index(&root.join("index.json")),
+        DurableSource::ClaudeCode,
+    );
+    assert_eq!(
+        disk.write_after_save(lock, index.generation, vec![future.record.clone()])
+            .unwrap()
+            .written,
+        1
+    );
+    let disk_path = std::fs::read_dir(disk.dir())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let bytes = std::fs::read(&disk_path).unwrap();
+    for _ in 0..5 {
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
+        cache.durable_note_scope(source, &key, &scope);
+        let i = Interpretation::of(source, &key, &index, false, &namespace);
+        let ((outcome, consumed), samples) =
+            crate::transcript_acquisition::capture_sample_reads(|| {
+                observe_consumed(|| {
+                    cache.durable_restore(
+                        source,
+                        &key,
+                        &path,
+                        &scope,
+                        &mut File::open(&path).unwrap(),
+                        &index,
+                        &i,
+                    )
+                })
+            });
+        assert!(matches!(
+            outcome,
+            RestoreOutcome::Stale("revision_downgrade")
+        ));
+        assert_eq!(consumed, 0);
+        assert!(samples.is_empty());
+        cache.durable_gc(lock, source, &index).unwrap();
+        cache.durable_remove(lock, source).unwrap();
+        assert_eq!(std::fs::read(&disk_path).unwrap(), bytes);
+        assert_eq!(
+            cache
+                .durable_counters(source)
+                .unwrap()
+                .0
+                .upgrade_state_missing,
+            0
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a1a_frozen_floor_holds_before_certificate_even_after_working_entry_clear() {
+    let root = crate::test_scratch::private_dir("ottto-a1a-floor");
+    let lock = test_locks::hold(&root);
+    let path = root.join("t.jsonl");
+    native_fixture(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let key = local_index_key(&path);
+    let scope = Scope("floor".into());
+    let ns = Scope("floor-account".into());
+    let mut index = ScanIndex::default();
+    let len = std::fs::metadata(&path).unwrap().len();
+    index.files.insert(key.clone(),serde_json::from_value(serde_json::json!({"size_bytes":len,"modified_unix_seconds":1,"source_file_fingerprint":"old"})).unwrap());
+    index.save(&root.join("index.json")).unwrap();
+    let i = Interpretation::of(source, &key, &index, false, &ns);
+    let binding = expected(
+        DurableSource::ClaudeCode,
+        source,
+        &key,
+        &scope,
+        &index,
+        &i,
+        None,
+    )
+    .unwrap()
+    .binding;
+    let mut disk = DurableTailStore::new(
+        store::store_dir_for_index(&root.join("index.json")),
+        DurableSource::ClaudeCode,
+    );
+    disk.write_after_save(
+        lock,
+        index.generation,
+        vec![PendingRecord {
+            binding,
+            certificate: certificate(&path, &scope),
+            body: codec::encode(
+                &native_record(&path, &scope).0,
+                store::RECORD_BYTES,
+                jsonl_line_cap() as u64,
+            )
+            .unwrap(),
+            allowlist: codec::allowlist_digest(source),
+        }],
+    )
+    .unwrap();
+    for arm in ["extent", "revision", "missing"] {
+        let mut accepted = index.clone();
+        if arm == "extent" {
+            accepted.files.get_mut(&key).unwrap().size_bytes = len + 100;
+        }
+        if arm == "revision" {
+            accepted
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .effective_upload_body_witness_revision = effective_revision(source) + 1;
+        }
+        let mut interpretation = Interpretation::of(source, &key, &accepted, false, &ns);
+        if arm == "missing" {
+            interpretation.accepted = None;
+        }
+        let mut working = index.clone();
+        working
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &root.join("index.json"), &ns, false);
+        let (outcome, samples) = crate::transcript_acquisition::capture_sample_reads(|| {
+            cache.durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &working,
+                &interpretation,
+            )
+        });
+        assert!(
+            samples.is_empty(),
+            "floor dominates actual sample reads: {arm}"
+        );
+        if arm == "missing" {
+            assert!(matches!(
+                outcome,
+                RestoreOutcome::Stale("accepted_floor_missing")
+            ));
+        } else {
+            assert!(matches!(
+                outcome,
+                RestoreOutcome::Held(store::Refusal::BehindAccepted)
+            ));
+        }
+        assert_eq!(cache.durable_counters(source).unwrap().0.restored, 0);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn a1a_strict_writer_preserves_cleared_and_reverted_predecessors_after_restore_permission() {
+    for arm in ["cleared", "reverted"] {
+        let root = crate::test_scratch::private_dir("ottto-a1a-writer");
+        let lock = test_locks::hold(&root);
+        let path = root.join("t.jsonl");
+        native_fixture(&path);
+        let key = local_index_key(&path);
+        let source = SnapshotSource::ClaudeCode;
+        let scope = Scope("writer".into());
+        let ns = Scope("writer-account".into());
+        let index_path = root.join("index.json");
+        let mut index = ScanIndex::default();
+        index.files.insert(key.clone(),serde_json::from_value(serde_json::json!({"size_bytes":std::fs::metadata(&path).unwrap().len(),"modified_unix_seconds":1,"source_file_fingerprint":"old"})).unwrap());
+        index.save(&index_path).unwrap();
+        let i = Interpretation::of(source, &key, &index, false, &ns);
+        let binding = expected(
+            DurableSource::ClaudeCode,
+            source,
+            &key,
+            &scope,
+            &index,
+            &i,
+            None,
+        )
+        .unwrap()
+        .binding;
+        let mut disk = DurableTailStore::new(
+            store::store_dir_for_index(&index_path),
+            DurableSource::ClaudeCode,
+        );
+        disk.write_after_save(
+            lock,
+            index.generation,
+            vec![PendingRecord {
+                binding,
+                certificate: certificate(&path, &scope),
+                body: codec::encode(
+                    &native_record(&path, &scope).0,
+                    store::RECORD_BYTES,
+                    jsonl_line_cap() as u64,
+                )
+                .unwrap(),
+                allowlist: codec::allowlist_digest(source),
+            }],
+        )
+        .unwrap();
+        let disk_path = std::fs::read_dir(disk.dir())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let before = std::fs::read(&disk_path).unwrap();
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &ns, false);
+        cache.durable_note_scope(source, &key, &scope);
+        let taken = cache
+            .durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &i,
+            )
+            .into_test_option()
+            .unwrap();
+        assert_eq!(
+            cache.durable_counters(source).unwrap().0.restored,
+            1,
+            "restore earned exact record permission"
+        );
+        assert!(cache.insert_admitted(
+            key.clone(),
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: taken.retained.checkpoint,
+                reduction: Some(taken.retained.state),
+                released: None,
+                unsealed: false
+            },
+            0
+        ));
+        cache.durable_note_selection(&key, "new-working-selection");
+        if arm == "cleared" {
+            index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .source_file_fingerprint
+                .clear();
+        }
+        index.save(&index_path).unwrap();
+        let receipt = cache
+            .durable_write_after_save(lock, source, &index)
+            .unwrap();
+        assert_eq!(receipt.written, 0);
+        let (counts, store) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.not_persisted.get("selection"), Some(&1));
+        assert_eq!(store.records_invalidated, 0);
+        cache.durable_gc(lock, source, &index).unwrap();
+        assert_eq!(std::fs::read(&disk_path).unwrap(), before, "{arm}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn a1a_supported_unprovable_migration_holds_on_growth_without_o3() {
+    use std::io::Write;
+    let root = crate::test_scratch::private_dir("ottto-a1a-unprovable");
+    let lock = test_locks::hold(&root);
+    let path = root.join("t.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let scope = Scope("migration".into());
+    let ns = Scope("migration-account".into());
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index.files.insert(key.clone(),serde_json::from_value(serde_json::json!({"size_bytes":std::fs::metadata(&path).unwrap().len(),"modified_unix_seconds":1,"source_file_fingerprint":"old","last_upload_body_witness":"accepted-lineage"})).unwrap());
+    index.save(&index_path).unwrap();
+    let i = Interpretation::of(source, &key, &index, false, &ns);
+    let mut binding = expected(
+        DurableSource::ClaudeCode,
+        source,
+        &key,
+        &scope,
+        &index,
+        &i,
+        None,
+    )
+    .unwrap()
+    .binding;
+    binding.scope = [91; 32]; // Verified known representation, unavailable old semantic inputs.
+    let mut disk = DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        DurableSource::ClaudeCode,
+    );
+    disk.write_after_save(
+        lock,
+        index.generation,
+        vec![PendingRecord {
+            binding,
+            certificate: certificate(&path, &scope),
+            body: codec::encode(
+                &native_record(&path, &scope).0,
+                store::RECORD_BYTES,
+                jsonl_line_cap() as u64,
+            )
+            .unwrap(),
+            allowlist: codec::allowlist_digest(source),
+        }],
+    )
+    .unwrap();
+    let disk_path = std::fs::read_dir(disk.dir())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let before = std::fs::read(&disk_path).unwrap();
+    for pass in 0..5 {
+        if pass == 2 {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"{}\n")
+                .unwrap();
+        }
+        let mut loaded = ScanIndex::load(&index_path).unwrap();
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &ns, false);
+        cache.durable_note_scope(source, &key, &scope);
+        let interp = Interpretation::of(source, &key, &loaded, false, &ns);
+        let ((outcome, body_bytes), samples) =
+            crate::transcript_acquisition::capture_sample_reads(|| {
+                observe_consumed(|| {
+                    cache.durable_restore(
+                        source,
+                        &key,
+                        &path,
+                        &scope,
+                        &mut File::open(&path).unwrap(),
+                        &loaded,
+                        &interp,
+                    )
+                })
+            });
+        assert!(matches!(
+            outcome,
+            RestoreOutcome::Stale("old_binding_no_match")
+        ));
+        assert_eq!(body_bytes, 0);
+        assert!(samples.is_empty());
+        assert!(
+            !loaded.reread_guard.needs_save(),
+            "no A1b reservation in A1a"
+        );
+        assert_eq!(
+            loaded.files[&key].last_upload_body_witness.as_deref(),
+            Some("accepted-lineage")
+        );
+        cache.durable_gc(lock, source, &loaded).unwrap();
+        let (counts, _) = cache.durable_counters(source).unwrap();
+        assert_eq!(
+            counts.ineligible.get("old_binding_no_match"),
+            Some(&2),
+            "restore and GC disclosed"
+        );
+        assert_eq!(counts.upgrade_state_missing, 0);
+        assert_eq!(std::fs::read(&disk_path).unwrap(), before);
+        loaded.save(&index_path).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(root);
 }
