@@ -1746,6 +1746,7 @@ fn pi_h_keys_are_fixed_width_and_length_prefixes_are_unambiguous() {
 }
 
 /// The former reducer representation, kept only as an emitted-body oracle.
+/// Delete it once SOURCE and Lead B accept the representation change.
 fn legacy_pi_apply(value: &Value, acc: &mut SnapshotAccumulator) {
     let shape = match value.get("type").and_then(Value::as_str) {
         Some("message") if pi_message_role(value).as_deref() == Some("assistant") => {
