@@ -333,6 +333,7 @@ fn census_pre_hold_bodies(
         SnapshotSource::ClaudeCode,
         &mut scan,
         &mut index,
+        true,
         |item| {
             effective_snapshot_upload_body_witness(
                 item,

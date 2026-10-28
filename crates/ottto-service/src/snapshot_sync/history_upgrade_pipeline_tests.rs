@@ -321,6 +321,7 @@ impl HistoryFixture {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
+            cycle.request_identity,
             |snapshot| {
                 effective_snapshot_upload_body_witness(
                     snapshot,
@@ -2584,7 +2585,8 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_money::e2::{money_mark, with_money_rules};
     use crate::snapshots::{history_local_count, HistoryLocalCount};
-    const RELEASE: &[(u16, u8)] = &[(1, 0), (2, money_mark::ESTIMATED)];
+    // Version 2 is the permit-mark migration row (zero mask, E3).
+    const RELEASE: &[(u16, u8)] = &[(1, 0), (2, 0), (3, money_mark::ESTIMATED)];
     let fixture = HistoryFixture::new("e2-switch-on-once");
     fixture.baseline();
     let at_two = fixture.cycle("2026-08-02T08:30:00Z", HISTORY_REVISION_2);
@@ -2618,7 +2620,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
             assert!(again.uploaded.is_empty());
             let index = &again.index;
             let store = &index.claude_money_birth_store;
-            assert_eq!(store.money_rule_version(), 1);
+            assert_eq!(store.money_rule_version(), 2);
             let estimated = money_mark::DISCLOSED | money_mark::ESTIMATED;
             for (session, marks) in
                 HISTORY_SESSIONS
@@ -2627,7 +2629,12 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
             {
                 let key = HistoryFixture::key(index, session);
                 assert_eq!(index.files[&key].effective_upload_body_witness_revision, 3);
-                assert_eq!(store.money_marks(location_key(&key)), marks, "{session}");
+                // These cycles hold no identity permit (`request_identity`).
+                assert_eq!(
+                    store.money_marks(location_key(&key)),
+                    marks | money_mark::STAMPED_WITHOUT_PERMIT,
+                    "{session}"
+                );
             }
 
             // A later money fix: only the two estimated files are re-owed and
@@ -2642,7 +2649,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
                     .iter()
                     .all(|(uploaded, _)| !uploaded.contains(HISTORY_SESSIONS[0])));
                 let index = &done.index;
-                assert_eq!(index.claude_money_birth_store.money_rule_version(), 2);
+                assert_eq!(index.claude_money_birth_store.money_rule_version(), 3);
                 assert!(index
                     .files
                     .values()
@@ -3164,83 +3171,204 @@ fn e2_stem_listed_before_root_indexing_counts_each_session_request_once() {
     });
 }
 
+/// E3 (B17 path A), Ron's routine re-read rule (design §12) and card G
+/// option (b): a late cohort permit (`""` → `E2_GROUPING`) after revision 3
+/// re-owes nothing. The files stamped without it keep their revision-3
+/// bodies and `STAMPED_WITHOUT_PERMIT`, which the page gauge discloses. Was
+/// `e2_late_identity_permit_reowes_revision_three_once_paced` (3 paced reads).
 #[test]
-fn e2_late_identity_permit_reowes_revision_three_once_paced() {
+fn e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps() {
+    use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
-    for shed_first in [false, true] {
-        let fixture = HistoryFixture::new("e2-late-cohort-permit");
-        fixture.baseline();
-        fixture.install_list(&[]);
-        with_e2_history(&fixture, || {
-            let before = fixture.cycle("2026-08-02T08:30:00Z", E2_HISTORY_UPGRADE);
-            assert!(before
+    use crate::snapshots::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
+    use crate::snapshots::{history_local_count, HistoryLocalCount};
+    let fixture = HistoryFixture::new("e2-late-cohort-permit");
+    fixture.baseline();
+    fixture.install_list(&[]);
+    with_e2_history(&fixture, || {
+        let before = fixture.cycle("2026-08-02T08:30:00Z", E2_HISTORY_UPGRADE);
+        assert!(before
+            .index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
+        let witnesses = |index: &ScanIndex| {
+            index
+                .files
+                .iter()
+                .map(|(key, entry)| {
+                    (
+                        key.clone(),
+                        (
+                            entry.effective_upload_body_witness_revision,
+                            entry.last_upload_body_witness.clone(),
+                            index
+                                .claude_money_birth_store
+                                .money_marks(location_key(key))
+                                & STAMPED_WITHOUT_PERMIT,
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let stamped = witnesses(&before.index);
+        assert!(stamped
+            .values()
+            .all(|(_, _, mark)| *mark == STAMPED_WITHOUT_PERMIT));
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+        saved["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
+        saved["claude_duplicate_fence_next_full_rearm_unix_seconds"] =
+            serde_json::json!(1785711600u64);
+        std::fs::write(&fixture.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let reowed = history_local_count(HistoryLocalCount::Reowed);
+        with_cycle_contract_for_test(E2_GROUPING, || {
+            crate::snapshots::with_body_witness_adoption_page_budget(1, || {
+                let cycle = HistoryCycle {
+                    request_identity: true,
+                    ..E2_HISTORY_UPGRADE
+                };
+                for hour in 9..15 {
+                    let scope =
+                        crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                    let page = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), cycle);
+                    let counts = scope.finish().claude_reread;
+                    assert_eq!(page.scan.scanned_file_count, 0, "hour={hour}: no re-read");
+                    assert!(page.uploaded.is_empty(), "hour={hour}: no body change");
+                    assert_eq!(witnesses(&page.index), stamped, "hour={hour}");
+                    assert_eq!(
+                        counts.stamped_without_permit,
+                        HISTORY_SESSIONS.len() as u64,
+                        "hour={hour}: the gauge discloses every unpermitted stamp"
+                    );
+                    if hour == 14 {
+                        assert_eq!(
+                            page.index.claude_request_identity_contract_for_test(),
+                            (Some(E2_GROUPING), false)
+                        );
+                    }
+                }
+            })
+        });
+        assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed);
+    });
+}
+
+/// E3: off/on/off/on. Each permitted restamp clears its file's bit and each
+/// unpermitted one sets it, in the same save as its stamp; no flip re-owes
+/// or re-sends anything, also with the duplicate prepare/start observation.
+#[test]
+fn e2_permit_flips_reowe_nothing_and_restamps_maintain_the_permit_mark() {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
+    use crate::snapshots::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
+    use crate::snapshots::{history_local_count, HistoryLocalCount};
+    let fixture = HistoryFixture::new("e2-permit-flips");
+    fixture.baseline();
+    fixture.cycle("2026-08-02T08:00:00Z", HISTORY_REVISION_2);
+    let on = HistoryCycle {
+        request_identity: true,
+        ..E2_HISTORY_UPGRADE
+    };
+    let page = |hour: u32, permitted: bool| {
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        let at = format!("2026-08-02T{hour:02}:00:00Z");
+        let outcome = if permitted {
+            with_cycle_contract_for_test(E2_GROUPING, || fixture.cycle(&at, on))
+        } else {
+            fixture.cycle(&at, E2_HISTORY_UPGRADE)
+        };
+        let gauge = scope.finish().claude_reread.stamped_without_permit;
+        let marked = HISTORY_SESSIONS
+            .iter()
+            .filter(|session| {
+                let key = HistoryFixture::key(&outcome.index, session);
+                outcome
+                    .index
+                    .claude_money_birth_store
+                    .money_marks(location_key(&key))
+                    & STAMPED_WITHOUT_PERMIT
+                    != 0
+            })
+            .map(|session| session.to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(gauge, marked.len() as u64, "hour={hour}");
+        assert!(
+            outcome
+                .index
+                .files
+                .values()
+                .all(|entry| entry.effective_upload_body_witness_revision == 3),
+            "hour={hour}: no revision is lowered"
+        );
+        (outcome.uploaded, marked)
+    };
+    let all = HISTORY_SESSIONS
+        .iter()
+        .map(|session| session.to_string())
+        .collect::<BTreeSet<_>>();
+    let first = HISTORY_SESSIONS[0];
+    with_e2_history(&fixture, || {
+        assert_eq!(page(9, false), (all.clone(), all.clone()));
+        let reowed = history_local_count(HistoryLocalCount::Reowed);
+        assert_eq!(page(10, true), (BTreeSet::new(), all.clone()), "first flip");
+        fixture.append(first, "req_0_2");
+        let (uploaded, marked) = page(11, true);
+        assert_eq!(uploaded, BTreeSet::from([first.to_string()]));
+        let mut unpermitted = all.clone();
+        unpermitted.remove(first);
+        assert_eq!(marked, unpermitted, "a permitted restamp clears its bit");
+        fixture.append(first, "req_0_3");
+        assert_eq!(
+            page(12, false),
+            (BTreeSet::from([first.to_string()]), all.clone()),
+            "an unpermitted restamp sets it again"
+        );
+        assert_eq!(
+            page(13, true),
+            (BTreeSet::new(), all.clone()),
+            "second flip"
+        );
+        assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed);
+    });
+}
+
+/// E3: history stamped only under the permit carries no bit, and flipping
+/// the permit off and back with no stamps in between keeps the gauge at 0.
+#[test]
+fn e2_permitted_history_has_no_permit_mark_across_flips() {
+    use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
+    let fixture = HistoryFixture::new("e2-permitted-history");
+    fixture.baseline();
+    fixture.cycle("2026-08-02T08:00:00Z", HISTORY_REVISION_2);
+    let on = HistoryCycle {
+        request_identity: true,
+        ..E2_HISTORY_UPGRADE
+    };
+    with_e2_history(&fixture, || {
+        for (hour, permitted) in [(9, true), (10, false), (11, true), (12, true)] {
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            let at = format!("2026-08-02T{hour:02}:00:00Z");
+            let page = if permitted {
+                with_cycle_contract_for_test(E2_GROUPING, || fixture.cycle(&at, on))
+            } else {
+                fixture.cycle(&at, E2_HISTORY_UPGRADE)
+            };
+            assert_eq!(
+                scope.finish().claude_reread.stamped_without_permit,
+                0,
+                "hour={hour}"
+            );
+            if hour == 9 {
+                assert_eq!(page.uploaded.len(), HISTORY_SESSIONS.len());
+            } else {
+                assert!(page.uploaded.is_empty(), "hour={hour}");
+            }
+            assert!(page
                 .index
                 .files
                 .values()
                 .all(|entry| entry.effective_upload_body_witness_revision == 3));
-            let mut saved: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
-            saved["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
-            saved["claude_duplicate_fence_next_full_rearm_unix_seconds"] =
-                serde_json::json!(1785711600u64);
-            std::fs::write(&fixture.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
-            with_cycle_contract_for_test(E2_GROUPING, || {
-                crate::snapshots::with_body_witness_adoption_page_budget(1, || {
-                    let cycle = HistoryCycle {
-                        request_identity: true,
-                        ..E2_HISTORY_UPGRADE
-                    };
-                    let mut sent = BTreeMap::<String, usize>::new();
-                    let mut reads = 0;
-                    for hour in 9..15 {
-                        let page = fixture.cycle(
-                            &format!("2026-08-02T{hour:02}:00:00Z"),
-                            HistoryCycle {
-                                shed_upload: shed_first && hour == 9,
-                                ..cycle
-                            },
-                        );
-                        assert!(
-                            page.scan.scanned_file_count <= 1,
-                            "hour={hour}, reads={}, uploaded={:?}",
-                            page.scan.scanned_file_count,
-                            page.uploaded
-                        );
-                        if shed_first && hour == 9 {
-                            assert!(page.uploaded.is_empty());
-                            assert!(
-                                page.index
-                                    .files
-                                    .values()
-                                    .all(|entry| entry.effective_upload_body_witness_revision == 2),
-                                "partial checkpoint preserves paced debt"
-                            );
-                            assert_eq!(
-                                page.index.claude_request_identity_contract_for_test(),
-                                (Some(E2_GROUPING), true)
-                            );
-                        }
-                        reads += page.scan.scanned_file_count;
-                        for session in page.uploaded {
-                            *sent.entry(session).or_default() += 1;
-                        }
-                        if hour == 14 {
-                            assert_eq!(page.scan.scanned_file_count, 0);
-                            assert_eq!(
-                                page.index.claude_request_identity_contract_for_test(),
-                                (Some(E2_GROUPING), false)
-                            );
-                        }
-                    }
-                    assert_eq!(reads, if shed_first { 4 } else { 3 });
-                    assert!(
-                        HISTORY_SESSIONS
-                            .iter()
-                            .all(|session| sent.get(*session) == Some(&1)),
-                        "{sent:?}"
-                    );
-                })
-            });
-        });
-    }
+        }
+    });
 }

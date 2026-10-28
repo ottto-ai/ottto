@@ -632,6 +632,7 @@ impl RearmFixture {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
+            true,
             |snapshot| {
                 let witness = effective_snapshot_upload_body_witness(
                     snapshot,
