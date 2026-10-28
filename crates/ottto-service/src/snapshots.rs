@@ -41247,7 +41247,7 @@ fn enqueue_watcher_hints(
         .map(|(position, candidate)| (candidate.path.clone(), position))
         .collect::<BTreeMap<_, _>>();
     for path in hinted_paths.iter().take(MAX_BACKFILL_FILES_PER_SOURCE) {
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        if !snapshot_transcript_path(source, path)
             || (source == SnapshotSource::ClaudeCode
                 && claude_transcript_excluded_from_snapshots(path))
         {
@@ -41381,9 +41381,7 @@ fn refresh_retained_codex_roster(
                 }
                 continue;
             }
-            if !file_type.is_file()
-                || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-            {
+            if !file_type.is_file() || !snapshot_transcript_path(source, &path) {
                 continue;
             }
             let key = local_index_key(&path);
@@ -41711,9 +41709,7 @@ fn advance_bounded_directory_traversal_with_budget(
                 });
                 continue;
             }
-            if !file_type.is_file()
-                || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-            {
+            if !file_type.is_file() || !snapshot_transcript_path(source, &path) {
                 continue;
             }
             if source == SnapshotSource::ClaudeCode
@@ -42072,7 +42068,7 @@ fn collect_recent_jsonl_files(
         if !file_type.is_file() {
             continue;
         }
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        if !snapshot_transcript_path(source, &path) {
             continue;
         }
         // Claude's Workflow-tool journal is bookkeeping, never a session. Drop
@@ -49262,7 +49258,8 @@ fn resolve_codex_identity_option(value: Option<String>) -> Option<String> {
 /// yields both the complete legacy remainder and the modern remainder. Callers
 /// with trusted state/header evidence must select the unique supported key.
 fn codex_session_id_candidates_from_path(path: &Path) -> Vec<String> {
-    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+    let logical_path = codex_logical_rollout_path(path);
+    let Some(stem) = logical_path.file_stem().and_then(|stem| stem.to_str()) else {
         return Vec::new();
     };
     let Some(raw_identity) = stem.strip_prefix("rollout-") else {
@@ -49987,10 +49984,34 @@ fn sha256_hex_owned(parts: &[String]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<PathBuf> {
+/// Encoding normalization is for logical locators only. Opens, index keys and
+/// object witnesses must keep the physical archive path.
+fn codex_logical_rollout_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    if codex_archive_path(path) {
+        std::borrow::Cow::Owned(path.with_extension(""))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
+fn codex_archive_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl.zst"))
+}
+
+fn snapshot_transcript_path(source: SnapshotSource, path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+        || (source == SnapshotSource::Codex && codex_archive_path(path))
+}
+
+pub fn paths_from_events(
+    source: SnapshotSource,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> BTreeSet<PathBuf> {
     paths
         .into_iter()
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+        .filter(|path| snapshot_transcript_path(source, path))
         .collect()
 }
 
@@ -50001,6 +50022,7 @@ pub(crate) mod envelope_selection_experiment {
 
 #[cfg(test)]
 mod tests {
+    include!("snapshots/codex_archive_discovery_tests.rs");
     include!("snapshots/claude_request_account_tests.rs");
     mod claude_request_identity_tests {
         include!("snapshots/claude_request_identity_tests.rs");

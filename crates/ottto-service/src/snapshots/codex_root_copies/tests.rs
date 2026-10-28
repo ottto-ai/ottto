@@ -426,3 +426,23 @@ fn parsed_state_evidence_comes_from_the_physical_home_even_if_a_stale_home_claim
         before.snapshots[0].snapshot_fingerprint
     );
 }
+
+#[test]
+fn archive_copy_locator_matches_plain_without_changing_physical_row() {
+    let fixture = Fixture::new(1);
+    fixture.update(
+        2,
+        "UPDATE threads SET rollout_path = rollout_path || '.zst'",
+    );
+    let metadata = fixture.metadata();
+    let id = &fixture.ids[0];
+    assert!(!metadata.identity_conflicts.contains(id));
+    let copied = &metadata.root_sidecars[fixture.roots[2].parent().unwrap()].threads[id];
+    let path = Path::new(copied.rollout_path.as_deref().unwrap());
+    assert!(codex_archive_path(path));
+    assert!(codex_session_id_candidates_from_path(path).contains(id));
+    assert_ne!(
+        local_index_key(path),
+        local_index_key(&path.with_extension(""))
+    );
+}
