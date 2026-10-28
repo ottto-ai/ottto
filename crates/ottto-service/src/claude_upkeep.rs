@@ -8,28 +8,25 @@
 //! and either collects, waits while the refresher runs, stays paused when
 //! "Keep my Claude accounts signed in" is off, or asks for sign-in when the
 //! refresh grant is gone or the refresher could not advance the expiry. The
-//! background `doctor` worker below is retained but its production process
-//! runner never spawns anything, and nothing enqueues it.
+//! retired background `doctor` worker is no longer part of production.
 
-use crate::agent_status::{
-    read_claude_oauth_credential_metadata_for_slot, ClaudeLiveLogin, ClaudeLocalLoginState,
-    ClaudeOAuthCredentialMetadata,
-};
+use crate::agent_status::{ClaudeLiveLogin, ClaudeLocalLoginState, ClaudeOAuthCredentialMetadata};
 use crate::claude_refresher::RefreshDecision;
-use ottto_core::{
-    default_support_dir, write_owner_only_file_atomic, ClaudeConfigDirSlot,
-    FileClaudeConfigSlotSettingsStore,
-};
+use ottto_core::{default_support_dir, write_owner_only_file_atomic};
+#[cfg(test)]
+use ottto_core::{ClaudeConfigDirSlot, FileClaudeConfigSlotSettingsStore};
 use ottto_protocol::{
     ClaudeAccountUpkeepConsentState, ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotUpkeepResultV1,
     ClaudeConfigSlotUpkeepStatusV1,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
 use std::thread;
+#[cfg(test)]
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
@@ -38,21 +35,16 @@ const UPKEEP_STATE_FILE: &str = "claude-background-upkeep-state.json";
 const UPKEEP_STATE_LOCK_FILE: &str = ".claude-background-upkeep-state.lock";
 /// Operational stop: absent means normal consent/network-gated GA behavior.
 pub(crate) const UPKEEP_DISABLED_FILE: &str = "claude-background-upkeep-disabled";
+#[cfg(test)]
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(20);
 
 const RELLOGIN_APPROACHING_SECONDS: i64 = 72 * 60 * 60;
+#[cfg(test)]
 const INITIAL_BACKOFF_SECONDS: i64 = 5 * 60;
+#[cfg(test)]
 const MAX_BACKOFF_SECONDS: i64 = 6 * 60 * 60;
 
 static UPKEEP_STATE_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();
-static PRODUCTION_UPKEEP_QUEUE: OnceLock<Mutex<ProductionUpkeepQueue>> = OnceLock::new();
-
-#[derive(Default)]
-struct ProductionUpkeepQueue {
-    running: bool,
-    queued_slot_ids: BTreeSet<String>,
-    descriptors: VecDeque<ClaudeConfigSlotDescriptorV1>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClaudeUpkeepObservation {
@@ -98,6 +90,7 @@ struct PersistedUpkeepWitnessV1 {
     consecutive_failures: u32,
 }
 
+#[cfg(test)]
 impl PersistedUpkeepWitnessV1 {
     fn local_status(&self) -> ClaudeConfigSlotUpkeepStatusV1 {
         ClaudeConfigSlotUpkeepStatusV1 {
@@ -126,6 +119,7 @@ impl Drop for UpkeepStateGuard {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaimToken {
     slot_id: String,
@@ -134,50 +128,35 @@ struct ClaimToken {
     previous_failures: u32,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClaimOutcome {
     Claimed(ClaimToken, ClaudeConfigSlotUpkeepStatusV1),
     Deferred(ClaudeConfigSlotUpkeepStatusV1),
 }
 
-// Only test runners construct the process outcomes now that the production
-// runner never spawns (Phase 0).
-#[cfg_attr(not(test), allow(dead_code))]
+// Legacy algorithm fixtures only; removed with the remaining DC2/DC3 tests.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorProcessResult {
     ExitZero,
-    /// Phase 0: the production runner never spawns `claude doctor`.
-    Disabled,
     MissingBinary,
     SpawnFailed,
     TimedOut,
     NonzeroExit,
 }
 
+#[cfg(test)]
 trait UpkeepClock {
     fn now(&self) -> OffsetDateTime;
 }
 
-struct SystemClock;
-
-impl UpkeepClock for SystemClock {
-    fn now(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
-    }
-}
-
+#[cfg(test)]
 trait CredentialMetadataReader {
     fn read(&self, slot: &ClaudeConfigDirSlot) -> Option<ClaudeOAuthCredentialMetadata>;
 }
 
-struct ProductionCredentialMetadataReader;
-
-impl CredentialMetadataReader for ProductionCredentialMetadataReader {
-    fn read(&self, slot: &ClaudeConfigDirSlot) -> Option<ClaudeOAuthCredentialMetadata> {
-        read_claude_oauth_credential_metadata_for_slot(slot)
-    }
-}
-
+#[cfg(test)]
 trait DoctorProcessRunner {
     fn run(&self, config_dir: &str, timeout: Duration) -> DoctorProcessResult;
 
@@ -186,10 +165,12 @@ trait DoctorProcessRunner {
     }
 }
 
+#[cfg(test)]
 enum DoctorProcessStart {
     Finished(DoctorProcessResult),
 }
 
+#[cfg(test)]
 impl DoctorProcessStart {
     fn wait(self, _timeout: Duration) -> DoctorProcessResult {
         match self {
@@ -198,6 +179,7 @@ impl DoctorProcessStart {
     }
 }
 
+#[cfg(test)]
 trait FinalSpawnGate {
     fn start_if_allowed(
         &self,
@@ -274,8 +256,10 @@ impl FinalSpawnGate for FixedFinalSpawnGate<'_> {
     }
 }
 
+#[cfg(test)]
 struct ProductionFinalSpawnGate;
 
+#[cfg(test)]
 impl FinalSpawnGate for ProductionFinalSpawnGate {
     fn publish_preclaim_failure(
         &self,
@@ -388,10 +372,8 @@ fn slot_is_still_registered(
         })
 }
 
-struct ProductionDoctorProcessRunner;
-
 /// Shared final consent/registration/suppression fence for local status writes;
-/// process spawning keeps its existing typed refusal owner above.
+/// used by the native refresher and foreground publication helpers.
 pub(crate) fn registered_slot_publication_allowed(
     registry: &ottto_protocol::ClaudeAccountsStatusV1,
     descriptor: &ClaudeConfigSlotDescriptorV1,
@@ -403,19 +385,6 @@ pub(crate) fn registered_slot_publication_allowed(
         && !crate::agent_status::claude_slot_login_unapproved(descriptor)
         && !crate::agent_status::claude_oauth_usage_network_disabled()
         && !support_dir.join(UPKEEP_DISABLED_FILE).is_file()
-}
-
-/// Phase 0: `claude doctor` is never spawned. A short `doctor` run after
-/// access expiry starts a token refresh and can exit before the rotated token
-/// is saved, signing the login out.
-impl DoctorProcessRunner for ProductionDoctorProcessRunner {
-    fn run(&self, _config_dir: &str, _timeout: Duration) -> DoctorProcessResult {
-        DoctorProcessResult::Disabled
-    }
-
-    fn start(&self, _config_dir: &str) -> DoctorProcessStart {
-        DoctorProcessStart::Finished(DoctorProcessResult::Disabled)
-    }
 }
 
 /// Foreground upkeep decision for one registered slot, from the live local
@@ -543,8 +512,8 @@ fn observe_registered_slot_upkeep_reading(
 /// remain unreachable.
 // Phase 0: the foreground no longer reads worker witnesses (an old
 // `Backoff`/`InProgress` witness must not be resurrected for an expired
-// slot). Kept for the dormant worker and its tests until Phase 1 replaces it.
-#[cfg_attr(not(test), allow(dead_code))]
+// slot). Kept only for legacy algorithm fixtures until DC2 removes them.
+#[cfg(test)]
 fn persisted_production_upkeep_observation(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     now: OffsetDateTime,
@@ -580,143 +549,7 @@ fn persisted_production_upkeep_observation(
     })
 }
 
-// Phase 0: nothing enqueues the background worker. It is kept, dormant and
-// unable to spawn (`ProductionDoctorProcessRunner` returns `Disabled`), until
-// Phase 1 replaces it with a consented, waiting refresher.
-#[allow(dead_code)]
-fn enqueue_production_upkeep(
-    descriptor: ClaudeConfigSlotDescriptorV1,
-) -> Result<(), OffsetDateTime> {
-    enqueue_production_upkeep_with(descriptor, || {
-        thread::Builder::new()
-            .name("ottto-claude-upkeep".to_string())
-            .spawn(run_production_upkeep_queue)
-    })
-}
-
-fn enqueue_production_upkeep_with(
-    descriptor: ClaudeConfigSlotDescriptorV1,
-    spawn: impl FnOnce() -> std::io::Result<thread::JoinHandle<()>>,
-) -> Result<(), OffsetDateTime> {
-    let started_at = OffsetDateTime::now_utc();
-    let queue =
-        PRODUCTION_UPKEEP_QUEUE.get_or_init(|| Mutex::new(ProductionUpkeepQueue::default()));
-    let should_spawn = {
-        let mut queue = queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if queue.queued_slot_ids.insert(descriptor.slot_id.clone()) {
-            queue.descriptors.push_back(descriptor);
-        }
-        if queue.running {
-            false
-        } else {
-            queue.running = true;
-            true
-        }
-    };
-    if !should_spawn {
-        return Ok(());
-    }
-    if spawn().is_err() {
-        let failed = {
-            let mut queue = queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            queue.running = false;
-            queue.queued_slot_ids.clear();
-            queue.descriptors.drain(..).collect::<Vec<_>>()
-        };
-        let now = OffsetDateTime::now_utc();
-        for descriptor in failed {
-            let _ = ProductionFinalSpawnGate.publish_preclaim_failure(
-                &descriptor,
-                &default_support_dir(),
-                ClaudeConfigSlotUpkeepResultV1::SpawnFailed,
-                started_at,
-                now,
-            );
-        }
-        return Err(now);
-    }
-    Ok(())
-}
-
-fn run_production_upkeep_queue() {
-    let queue =
-        PRODUCTION_UPKEEP_QUEUE.get_or_init(|| Mutex::new(ProductionUpkeepQueue::default()));
-    loop {
-        let descriptor = {
-            let mut queue = queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(descriptor) = queue.descriptors.pop_front() else {
-                queue.running = false;
-                break;
-            };
-            descriptor
-        };
-        let observation = observe_and_publish_registered_slot_upkeep_with_gate(
-            &descriptor,
-            true,
-            true,
-            &default_support_dir(),
-            &SystemClock,
-            &ProductionCredentialMetadataReader,
-            &ProductionDoctorProcessRunner,
-            &ProductionFinalSpawnGate,
-        );
-        if observation.status.result == ClaudeConfigSlotUpkeepResultV1::Refreshed {
-            // The rejections that may have opened this account's usage breaker
-            // came from the access token upkeep just replaced.
-            if let (Some(account), Some(organization)) = (
-                descriptor.collection.account_identifier_hash.as_deref(),
-                descriptor
-                    .collection
-                    .organization_identifier_hash
-                    .as_deref(),
-            ) {
-                crate::agent_status::clear_claude_oauth_usage_auth_breaker(
-                    account,
-                    organization,
-                    &descriptor.slot_id,
-                );
-            }
-        }
-        // Record an actual completed local worker observation, not queue
-        // admission, a vendor-command attempt, or a quota provider check.
-        let reconciled = if observation.proceed_with_collection
-            && !matches!(
-                observation.status.result,
-                ClaudeConfigSlotUpkeepResultV1::Refreshed
-                    | ClaudeConfigSlotUpkeepResultV1::NeedsLogin
-            ) {
-            crate::agent_status::reconcile_registered_claude_valid_access(
-                &descriptor,
-                &observation.status,
-            )
-        } else {
-            crate::agent_status::record_registered_claude_worker_observation(
-                &descriptor,
-                observation.status.result,
-            );
-            false
-        };
-        if matches!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::Refreshed | ClaudeConfigSlotUpkeepResultV1::NeedsLogin
-        ) || reconciled
-        {
-            crate::snapshot_sync::spawn_claude_agent_status_refresh("upkeep");
-        }
-        queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .queued_slot_ids
-            .remove(&descriptor.slot_id);
-    }
-}
-
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn observe_and_publish_registered_slot_upkeep_with_gate(
     descriptor: &ClaudeConfigSlotDescriptorV1,
@@ -805,6 +638,7 @@ fn observe_registered_slot_upkeep_with(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn observe_registered_slot_upkeep_with_gate(
     descriptor: &ClaudeConfigSlotDescriptorV1,
@@ -975,7 +809,6 @@ fn observe_registered_slot_upkeep_with_gate(
             Some(_) => (ClaudeConfigSlotUpkeepResultV1::ExpiryUnchanged, false),
             None => (ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable, false),
         },
-        DoctorProcessResult::Disabled => (ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled, false),
         DoctorProcessResult::MissingBinary => {
             (ClaudeConfigSlotUpkeepResultV1::MissingBinary, false)
         }
@@ -997,6 +830,7 @@ fn observe_registered_slot_upkeep_with_gate(
     }
 }
 
+#[cfg(test)]
 fn observation(
     proceed_with_collection: bool,
     result: ClaudeConfigSlotUpkeepResultV1,
@@ -1040,6 +874,7 @@ fn observation_with_metadata(
     }
 }
 
+#[cfg(test)]
 fn claim_attempt(
     support_dir: &Path,
     slot_id: &str,
@@ -1098,6 +933,7 @@ fn claim_attempt(
     ))
 }
 
+#[cfg(test)]
 fn complete_attempt(
     support_dir: &Path,
     token: &ClaimToken,
@@ -1149,6 +985,7 @@ fn complete_attempt(
 /// credential just read, the credential has since been replaced or signed out,
 /// so returning that witness would present a stale vendor-command result
 /// (for example `expiry_unchanged`) instead of the current sign-in requirement.
+#[cfg(test)]
 fn persist_preclaim_needs_login(
     support_dir: &Path,
     slot_id: &str,
@@ -1195,6 +1032,7 @@ fn persist_preclaim_needs_login(
     Ok(persisted)
 }
 
+#[cfg(test)]
 fn backoff_duration(failures: u32) -> TimeDuration {
     let exponent = failures.saturating_sub(1).min(16);
     let factor = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
@@ -1237,6 +1075,7 @@ pub(crate) fn preclaim_descriptor(
     Some(fence)
 }
 
+#[cfg(test)]
 fn persist_preclaim_failure(
     support_dir: &Path,
     descriptor: &ClaudeConfigSlotDescriptorV1,
@@ -1395,6 +1234,7 @@ fn parse_timestamp(value: Option<&str>) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(value?, &Rfc3339).ok()
 }
 
+#[cfg(test)]
 fn format_timestamp(value: OffsetDateTime) -> Result<String, ()> {
     value.format(&Rfc3339).map_err(|_| ())
 }
@@ -1406,7 +1246,6 @@ mod tests {
     use serial_test::serial;
     use std::ffi::OsString;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2020,59 +1859,6 @@ mod tests {
             load_state(&root).unwrap().slots.is_empty(),
             "no stale authority persisted"
         );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn preclaim_terminal_queue_spawn_failure_has_original_result_clock_without_attempt() {
-        let root = temp_dir("preclaim-queue-spawn-failure");
-        let _support_guard = EnvGuard::set(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            root.as_os_str().to_os_string(),
-        );
-        let config_dir = root.join("registered");
-        fs::create_dir_all(&config_dir).unwrap();
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        let registered = store
-            .register_path(
-                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                config_dir.to_string_lossy().into_owned(),
-            )
-            .unwrap();
-        store
-            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
-            .unwrap();
-        let mut descriptor = registered.external_slots[0].clone();
-        descriptor.collection = bound_preclaim_descriptor().collection;
-        descriptor.collection.observed_at = Some("2026-08-04T10:00:00Z".to_string());
-        crate::agent_status::persist_one_claude_slot_collection_state(
-            &descriptor.slot_id,
-            &descriptor.collection,
-        )
-        .unwrap();
-        let observed_at = enqueue_production_upkeep_with(descriptor.clone(), || {
-            Err(std::io::Error::other("injected spawn failure"))
-        })
-        .expect_err("mock queue start fails without any worker/vendor spawn");
-        let receipt = persisted_production_upkeep_observation(&descriptor, observed_at)
-            .expect("failed queue has safe durable result");
-        assert_eq!(
-            receipt.status.result,
-            ClaudeConfigSlotUpkeepResultV1::SpawnFailed
-        );
-        assert_eq!(receipt.status.attempted_at, None);
-        assert_eq!(
-            receipt.result_observed_at,
-            format_timestamp(observed_at).ok()
-        );
-        assert!(PRODUCTION_UPKEEP_QUEUE
-            .get()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .queued_slot_ids
-            .is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2839,55 +2625,6 @@ mod tests {
         assert!(second.proceed_with_collection);
     }
 
-    /// Phase 0: the production runner never spawns `claude doctor`, even when
-    /// a `claude` binary is on the search path and the worker is called.
-    #[test]
-    #[serial]
-    fn production_doctor_runner_never_spawns() {
-        let root = temp_dir("doctor-disabled");
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).expect("bin");
-        let capture = root.join("capture.txt");
-        let claude = bin.join("claude");
-        fs::write(
-            &claude,
-            format!("#!/bin/sh\necho \"$*\" >> \"{}\"\n", capture.display()),
-        )
-        .expect("fake claude");
-        let mut permissions = fs::metadata(&claude).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&claude, permissions).expect("chmod");
-        let _path = EnvGuard::set("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str());
-
-        assert_eq!(
-            ProductionDoctorProcessRunner.run("/tmp/exact-claude-slot/", Duration::from_secs(2)),
-            DoctorProcessResult::Disabled
-        );
-        assert!(matches!(
-            ProductionDoctorProcessRunner.start("/tmp/exact-claude-slot/"),
-            DoctorProcessStart::Finished(DoctorProcessResult::Disabled)
-        ));
-        let observation = observe_registered_slot_upkeep_with(
-            &descriptor(),
-            true,
-            true,
-            &root,
-            &FixedClock(at("2026-08-04T10:00:00Z")),
-            &SequenceCredentials::new(vec![Some(metadata(
-                "2026-08-04T10:00:00Z",
-                "2026-08-20T00:00:00Z",
-            ))]),
-            &ProductionDoctorProcessRunner,
-        );
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
-        );
-        assert!(!observation.proceed_with_collection);
-        assert!(!capture.exists(), "no claude process ran");
-        let _ = fs::remove_dir_all(root);
-    }
-
     #[test]
     fn multiprocess_claim_worker() {
         let Some(dir) = std::env::var_os("OTTTO_UPKEEP_MP_DIR") else {
@@ -3006,15 +2743,6 @@ mod tests {
         }
     }
 
-    fn production_queue_idle() -> bool {
-        PRODUCTION_UPKEEP_QUEUE.get().map_or(true, |queue| {
-            let queue = queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            !queue.running && queue.queued_slot_ids.is_empty() && queue.descriptors.is_empty()
-        })
-    }
-
     #[test]
     #[serial]
     fn missing_persisted_deadline_uses_the_live_read_instead_of_latching() {
@@ -3111,7 +2839,6 @@ mod tests {
             Some(access.as_str())
         );
         assert_eq!(observation.status.attempted_at, None);
-        assert!(production_queue_idle(), "nothing is handed to a worker");
     }
 
     #[test]
@@ -3147,7 +2874,6 @@ mod tests {
             absent.status.result,
             ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable
         );
-        assert!(production_queue_idle());
     }
 
     #[test]
@@ -3223,48 +2949,12 @@ mod tests {
             assert_eq!(observation.status.consecutive_failures, 0);
             assert_eq!(observation.status.next_allowed_attempt_at, None);
         }
-        assert!(production_queue_idle(), "no worker hand-off");
         assert_eq!(
             load_state(&root).expect("state"),
             state,
             "the foreground never rewrites the old upkeep state"
         );
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn production_worker_queue_admits_one_refresher_per_slot() {
-        // The daemon never refreshes OAuth tokens itself; the only refresher
-        // it starts is the CLI (`claude doctor`), and the queue admits a slot
-        // at most once until the worker finishes it.
-        let mut descriptor = descriptor_without_persisted_deadline();
-        descriptor.slot_id = "claude_slot_single_refresher_queue_fixture00".to_string();
-        let spawns = Arc::new(AtomicUsize::new(0));
-        for _ in 0..3 {
-            let spawns = spawns.clone();
-            enqueue_production_upkeep_with(descriptor.clone(), move || {
-                spawns.fetch_add(1, Ordering::SeqCst);
-                thread::Builder::new().spawn(|| {})
-            })
-            .expect("enqueue");
-        }
-        let queue = PRODUCTION_UPKEEP_QUEUE.get().expect("queue initialized");
-        let mut queue = queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let admitted = queue
-            .descriptors
-            .iter()
-            .filter(|queued| queued.slot_id == descriptor.slot_id)
-            .count();
-        assert_eq!(admitted, 1, "one queued refresh per slot");
-        assert!(spawns.load(Ordering::SeqCst) <= 1);
-        queue.queued_slot_ids.remove(&descriptor.slot_id);
-        queue
-            .descriptors
-            .retain(|queued| queued.slot_id != descriptor.slot_id);
-        queue.running = false;
     }
 
     fn cli_cleared_metadata() -> ClaudeOAuthCredentialMetadata {
@@ -3297,7 +2987,6 @@ mod tests {
             observation.status.result,
             ClaudeConfigSlotUpkeepResultV1::NeedsLogin
         );
-        assert!(production_queue_idle());
     }
 
     #[test]

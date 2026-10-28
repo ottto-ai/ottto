@@ -6049,6 +6049,7 @@ pub(crate) fn verify_claude_local_identity(
     })
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 enum ClaudeWorkerDiagnostic {
     Observed(ClaudeConfigSlotUpkeepResultV1),
@@ -6057,6 +6058,7 @@ enum ClaudeWorkerDiagnostic {
     Reconciled,
 }
 
+#[cfg(test)]
 impl ClaudeWorkerDiagnostic {
     fn code(self) -> &'static str {
         use ClaudeConfigSlotUpkeepResultV1 as R;
@@ -6110,6 +6112,7 @@ fn claude_worker_diagnostic_message(code: &str) -> Option<&'static str> {
     })
 }
 
+#[cfg(test)]
 fn append_claude_worker_diagnostic(
     status: &mut ClaudeConfigSlotCollectionStatusV1,
     diagnostic: ClaudeWorkerDiagnostic,
@@ -6145,6 +6148,7 @@ fn append_claude_worker_diagnostic(
     Some(())
 }
 
+#[cfg(test)]
 fn claude_worker_receipt_status(
     queued: &ClaudeConfigSlotDescriptorV1,
     current: &ClaudeConfigSlotDescriptorV1,
@@ -6170,6 +6174,7 @@ fn claude_worker_receipt_status(
     Some(status)
 }
 
+#[cfg(test)]
 pub(crate) fn record_registered_claude_worker_observation(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     result: ClaudeConfigSlotUpkeepResultV1,
@@ -6180,6 +6185,7 @@ pub(crate) fn record_registered_claude_worker_observation(
     );
 }
 
+#[cfg(test)]
 fn record_registered_claude_worker_diagnostic(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     diagnostic: ClaudeWorkerDiagnostic,
@@ -6220,6 +6226,7 @@ fn record_registered_claude_worker_diagnostic(
 /// A worker can find already-valid access after a login/refresh while the
 /// foreground still gates on the old saved deadline. Reconcile only through
 /// the existing exact-root identity verifier and collection-state owner.
+#[cfg(test)]
 pub(crate) fn reconcile_registered_claude_valid_access(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     upkeep: &ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
@@ -6303,6 +6310,7 @@ pub(crate) fn reconcile_registered_claude_valid_access(
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn valid_access_reconciliation_due(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     upkeep: &ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
@@ -6326,6 +6334,7 @@ fn valid_access_reconciliation_due(
             .is_some_and(|expiry| expiry > now)
 }
 
+#[cfg(test)]
 fn reconciled_valid_access_status(
     queued: &ClaudeConfigSlotDescriptorV1,
     current: &ClaudeConfigSlotDescriptorV1,
@@ -6365,6 +6374,7 @@ fn reconciled_valid_access_status(
     Some(status)
 }
 
+#[cfg(test)]
 fn reconciled_valid_access_status_with_worker_receipt(
     queued: &ClaudeConfigSlotDescriptorV1,
     current: &ClaudeConfigSlotDescriptorV1,
@@ -12901,6 +12911,7 @@ fn clear_claude_oauth_usage_breaker_with_legacy(
 /// backoff are retired; the default login's rejections, if any, were earned by
 /// a different credential and stay. An account-wide auth verdict written by a
 /// daemon from before caller attribution has only its auth fields cleared.
+#[cfg(test)]
 pub(crate) fn clear_claude_oauth_usage_auth_breaker(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
@@ -13408,6 +13419,7 @@ fn read_claude_oauth_credential_for_slot(
     read_claude_oauth_credential_state_for_slot(slot).into_credential()
 }
 
+#[cfg(test)]
 pub(crate) fn read_claude_oauth_credential_metadata_for_slot(
     slot: &ClaudeConfigDirSlot,
 ) -> Option<ClaudeOAuthCredentialMetadata> {
@@ -21461,6 +21473,10 @@ mod tests {
             Some(ClaudeAccountAnchorHealthV1::TemporarilyUnavailable)
         );
 
+        assert!(!reconcile_registered_claude_valid_access(
+            &slot,
+            &blocked_upkeep
+        ));
         // Real worker publication of the pre-claim outcome.
         record_registered_claude_worker_observation(
             &slot,
