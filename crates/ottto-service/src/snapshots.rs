@@ -30896,19 +30896,20 @@ impl OwnedSourceScan {
                     );
                 }
                 let local_diagnostics = codex_title_metadata.local_diagnostics;
-                let continuation_evidence = if codex_join_completed.is_empty() {
-                    codex_join_inventory
-                        .take()
-                        .filter(|inventory| inventory.complete)
-                        .map(|inventory| CodexContinuationEvidence {
-                            inventory,
-                            ledgers: codex_parent_ownership_ledgers,
-                            codex: codex_title_metadata,
-                            traces: codex_turn_traces,
-                        })
-                } else {
-                    None
-                };
+                let continuation_evidence =
+                    if codex_join_completed.is_empty() && continuation_ticket.is_some() {
+                        codex_join_inventory
+                            .take()
+                            .filter(|inventory| inventory.complete)
+                            .map(|inventory| CodexContinuationEvidence {
+                                inventory,
+                                ledgers: codex_parent_ownership_ledgers,
+                                codex: codex_title_metadata,
+                                traces: codex_turn_traces,
+                            })
+                    } else {
+                        None
+                    };
                 let scan = SourceScanResult {
                     source,
                     backfill_window_days,
