@@ -2729,6 +2729,29 @@ pub(crate) fn record_claude_request_census(
     }
 }
 
+/// A Held key keeps copy proof while its committed entry is still the
+/// version the record describes (the server's stale body), on the same
+/// physical object; the file itself may have grown. A cleared (reparse-debt)
+/// fingerprint leaves the committed modification time to decide.
+pub(super) fn retain_held(index: &mut ScanIndex, candidate: &super::CandidateFile) -> bool {
+    let key = super::local_index_key(&candidate.path);
+    let kept = match (index.claude_request_census.get(&key), index.files.get(&key)) {
+        (Some(record), Some(entry)) => {
+            record.birth.is_some_and(|birth| {
+                candidate.physical_identity == Some([birth.device, birth.inode])
+            }) && record.modified == Some(entry.modified_unix_seconds)
+                && (entry.source_file_fingerprint.is_empty()
+                    || decode_fingerprint(&entry.source_file_fingerprint)
+                        == Some(record.source_file_fingerprint))
+        }
+        _ => false,
+    };
+    if !kept {
+        invalidate_claude_request_census(index, &candidate.path);
+    }
+    kept
+}
+
 /// A parse that reaches no record (a failed finish, or a native comparison
 /// target whose record allocation is not prepaid) leaves the key without
 /// one, never with an older revision's. A virtual recovery audit retains its
