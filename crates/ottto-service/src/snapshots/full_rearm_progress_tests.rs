@@ -3094,8 +3094,25 @@ fn attribution_keys_and_request_sink_refusal_are_diagnostic_only() {
         let mut index = rearm.index();
         rearm.establish(&mut index, &rearm.items);
         let mut items = rearm.items.clone();
-        let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
-        let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        let mut api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        if kind == IgnoredVeto::RequestsRefused {
+            // Missing evidence alone is Missing, not Refused. A checked row
+            // without a login exercises a genuine InvalidEvidence refusal.
+            let request = items[0].claude_usage_request_ids.first().unwrap();
+            let mut row = complete_api_row(&rearm.parent, request, 1, 10, 10, 0);
+            row.account_identifier_hash = None;
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            api.evidence.insert(rearm.parent.clone(), vec![row]);
+            trace.evidence.insert(
+                rearm.parent.clone(),
+                vec![complete_trace_row(&rearm.parent, request, "")],
+            );
+        }
         let evidence =
             claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
         match kind {
