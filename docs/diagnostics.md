@@ -387,8 +387,8 @@ preparation/save events after work, without creating a comparison permit.
   finalization: indexed Claude files whose revision-3 body was stamped in a
   cycle without the identity permit (local money mark `STAMPED_WITHOUT_PERMIT`,
   seeded once by money-rule version 2 unless the loaded contract record was the
-  adopted E2 one). A late permit re-reads none of them; this discloses them.
-  Merging two observations keeps the larger value.
+  adopted E2 one). Merging two observations keeps the larger value.
+  A late identity permit re-reads none of these files; this gauge discloses them.
 - `history_permitted_not_stamped_not_accepted`, `_telemetry_unread`, `_held`,
   `_other`: upgrades the history gate permitted on this page that did not stamp
   the active revision. `not_accepted` stamped but a partial save kept the

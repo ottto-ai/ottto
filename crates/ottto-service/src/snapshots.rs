@@ -43995,9 +43995,9 @@ impl ScanIndex {
     /// sets the contract latch. A difference seen while a traversal is under
     /// way records a placeholder that matches no contract, so that traversal's
     /// terminal cannot clear the latch; the next traversal start records the
-    /// contract it runs under. A late cohort permit re-owes no history (Ron's
-    /// routine re-read rule): files stamped revision 3 without the permit
-    /// keep `STAMPED_WITHOUT_PERMIT`, which the page diagnostics disclose.
+    /// contract it runs under. Files stamped revision 3 without the permit
+    /// carry `STAMPED_WITHOUT_PERMIT` (Ron's routine re-read rule, card G):
+    /// a late permit re-owes none of them; the page gauge discloses them.
     pub(crate) fn observe_claude_request_identity_contract(&mut self, permitted: bool) {
         let contract = claude_request_identity::cycle_contract(permitted);
         if self.claude_request_identity_contract.as_deref() == Some(contract) {
