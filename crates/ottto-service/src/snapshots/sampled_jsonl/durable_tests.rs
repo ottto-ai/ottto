@@ -1671,7 +1671,7 @@ fn pi_ledger_entry_and_byte_caps_refuse_instead_of_truncating() {
         PI_LEDGER_MAX_KEYS
     );
     reduction.accumulator.seen_pi_usage_keys.insert(
-        format!("{:064x}", PI_LEDGER_MAX_KEYS),
+        format!("{PI_LEDGER_MAX_KEYS:064x}"),
         PiUsageDedupState::default(),
     );
     assert_eq!(
