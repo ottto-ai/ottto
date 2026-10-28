@@ -517,6 +517,30 @@ With comparison disabled, the existing `disabled_before_lease` decision still
 reports the gate; additional rows on that same decision stage report nonzero
 preparation/save events after work, without creating a comparison permit.
 
+A due terminal that skips whole-index re-arm can additionally emit
+`counts.rearm_veto_ignored`, a sparse object with the closed keys
+`withheld_account`, `evidence_gap`, `requests_refused`, `identity_refusals`,
+`invalid_rows`, `duplicate_rows`, `client_mismatch`, `multi_root_claims`,
+`proof_failure`, `reconstruction_failure`, `missing_inputs`, `rebuild_failure`.
+Each observed reason increments once per skipped terminal, including reasons
+accumulated on earlier pages of that census window. This is the canonical
+selected refusal, not every hypothetical failure in malformed evidence.
+Nonterminal, non-due and re-arming passes do not increment these counters.
+`counts.rearm_fingerprints_preserved` counts nonempty Claude file fingerprints
+that survive every independent clearing condition on those skipped terminals;
+already-empty or independently cleared entries are excluded. It is not a count
+of distinct files across terminals. Window changes reset the process-local
+reason mask; the existing page scope/merge carries published counts.
+
+These are scheduling diagnostics, never proof or attribution. Request refusal,
+identity refusal, proof, input-consistency and rebuild classes can read native
+facts as well as telemetry. Changed native roster, held hashes, physical birth
+or qualification state still invalidate the structural scheduling basis.
+Sidecar bytes alone do not change that native basis. Strict loader/read-health
+failures remain retryable even when their malformed rows would also fail a
+semantic reducer. No extra reader, output stream or persisted diagnostic state
+is introduced.
+
 `claude_reread` contains these closed keys:
 
 - `restored_empty_held`, `restored_nonempty_held`, `restored_empty_sibling`,

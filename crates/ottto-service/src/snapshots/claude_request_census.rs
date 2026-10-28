@@ -5,7 +5,8 @@
 //! A record is local-only and content-free: the sorted 8-byte SHA-256 prefixes
 //! of the provider request ids one parse saw. It is never proof, usage or
 //! upload input. D1 only produces, persists, prunes and measures records; no
-//! fence, coverage, posture or upload decision reads them. The narrowed
+//! coverage, posture or upload decision reads them. E3 uses only a bounded
+//! native projection as negative scheduling evidence in its structural basis. The narrowed
 //! unhealthy-retry carry conservatively refuses its per-family exception
 //! on saved negative evidence for loss or incomplete identity, and uses a
 //! bound native record only to refuse additional causes in the narrow id-less
@@ -403,6 +404,33 @@ pub(crate) fn shared_hashes(hashes: Vec<u64>) -> Option<Arc<[u64]>> {
 }
 
 impl ClaudeRequestCensusRecord {
+    /// Scheduling-only projection; never proof or usage. Excludes sidecar-
+    /// inclusive fingerprints, observation/retirement clocks and ledger fields.
+    pub(super) fn native_rearm_digest(&self, deadline: std::time::Instant) -> Option<[u8; 32]> {
+        let birth = self.birth.map(|b| (b.unix_seconds, b.device, b.inode));
+        let mut digest = super::serialized_json_digest(
+            &(
+                self.derivation,
+                self.shape.wire(),
+                self.twin,
+                self.unverified,
+                birth,
+                self.retired,
+                self.request_hashes.is_some(),
+            ),
+            b"claude_native_rearm_record:v1\0",
+        )?;
+        for chunk in self.request_hashes().chunks(256) {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            for hash in chunk {
+                digest.update(hash.to_be_bytes());
+            }
+        }
+        Some(digest.finalize().into())
+    }
+
     /// What the hash budget charges.
     fn hash_count(&self) -> usize {
         self.request_hashes().len()

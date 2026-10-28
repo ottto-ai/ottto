@@ -503,7 +503,8 @@ fn record_basis_change_rearms_once() {
             .as_ref()
             .unwrap()
             .basis,
-        claude_full_rearm_record_basis(claude_request_identity::cycle_contract(false))
+        claude_full_rearm_native_basis(&index, claude_request_identity::cycle_contract(false))
+            .unwrap()
     );
     assert!(
         rearm
@@ -1194,6 +1195,33 @@ fn pipeline_sidecar_health_vetoes_but_fixed_evidence_refusals_do_not() {
                 index.claude_full_rearm_progress.structural_record, record,
                 "{cause}: evidence never replaces the structural baseline"
             );
+        }
+        if cause == "malformed-pair" {
+            // The real strict-loader seam removed both failed roots before
+            // passing default-healthy aggregate reports to the fold. Repair
+            // the pair to healthy absence: unchanged native bytes now suppress.
+            fs::remove_dir_all(support.join("local-otel")).unwrap();
+            let mut scan = scan_source_roots_with_test_limit(
+                SnapshotSource::ClaudeCode,
+                &[],
+                &mut ScanIndex::default(),
+                WINDOW,
+                7,
+                100,
+                false,
+            )
+            .unwrap();
+            scan.snapshots = rearm.items.clone();
+            scan.census_complete = true;
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+            let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+                &support, &mut scan, &mut index,
+            );
+            assert_eq!(stats.api_incomplete_root_count, 0);
+            assert_eq!(stats.trace_incomplete_root_count, 0);
+            let recovered = rearm.reread(&mut index, &disposition);
+            assert!(recovered.suppression.full_rearm_suppressed, "{recovered:?}");
+            assert_eq!(recovered.rearmed_files, 0);
         }
         let _ = fs::remove_dir_all(support);
     }
@@ -2763,4 +2791,718 @@ fn dormant_owner_hold_returns_when_unrelated_sidecar_gap_is_fixed() {
         assert_eq!(run.counts.full_rearm, !gap, "{run:?}");
         assert_eq!(run.rearmed_files, if gap { 0 } else { 3 });
     }
+}
+
+fn diagnostics(counts: crate::local_resource_diagnostics::claude_reread::Counts) -> Value {
+    serde_json::to_value(counts).unwrap()
+}
+
+fn assert_ignored(value: &Value, key: &str, preserved: u64) {
+    assert_eq!(value["rearm_veto_ignored"][key], 1, "{value}");
+    assert_eq!(value["rearm_fingerprints_preserved"], preserved, "{value}");
+}
+
+fn reports_for(
+    item: &SnapshotItem,
+) -> (
+    crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+) {
+    let root = claude_snapshot_family_root(item);
+    let rows = item
+        .claude_usage_occurrences
+        .iter()
+        .enumerate()
+        .map(|(n, (id, occurrence))| {
+            let mut row = complete_api_row(
+                &root,
+                id,
+                n as u64,
+                occurrence.usage.input_tokens,
+                occurrence.usage.output_tokens,
+                occurrence.usage.cache_creation_5m_tokens
+                    + occurrence.usage.cache_creation_1h_tokens,
+            );
+            row.model = occurrence.model.clone().unwrap_or(row.model);
+            row.cache_read_tokens = occurrence.usage.cache_read_tokens;
+            row.effort = occurrence.reasoning_effort.clone().unwrap_or_default();
+            row.speed = occurrence
+                .selector
+                .context
+                .get("speed_mode")
+                .cloned()
+                .unwrap_or_default();
+            row.account_identity_checked = false;
+            row.account_identifier_hash = None;
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            assert!(validate_claude_api_row(&row, &root));
+            row
+        })
+        .collect();
+    (
+        crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(root.clone(), rows)]),
+            ..Default::default()
+        },
+        crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(
+                root.clone(),
+                item.claude_usage_request_ids
+                    .iter()
+                    .map(|id| complete_trace_row(&root, id, ""))
+                    .collect(),
+            )]),
+            ..Default::default()
+        },
+    )
+}
+
+fn fold_reports(
+    rearm: &Rearm,
+    index: &mut ScanIndex,
+    items: &mut [SnapshotItem],
+    api: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    complete: bool,
+) -> ClaudeUsageAuthorityDisposition {
+    let _ = rearm;
+    apply_claude_reported_usage_with_index_and_limits(
+        items,
+        api,
+        trace,
+        index,
+        complete,
+        WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        None,
+    )
+}
+
+/// Synthetic *healthy reports* isolate canonical reducer failures. A strict
+/// loader may reject conflicting duplicate rows earlier through read-health;
+/// this test does not certify those files healthy or weaken that boundary.
+#[test]
+fn each_canonical_telemetry_refusal_is_counted_without_whole_index_rearm() {
+    for cause in [
+        "invalid-api",
+        "invalid-trace",
+        "duplicate-api",
+        "duplicate-trace",
+        "client-mismatch",
+        "multi-root",
+        "evidence-gap",
+    ] {
+        let rearm = Rearm::new();
+        let mut index = rearm.index();
+        rearm.establish(&mut index, &rearm.items);
+        let mut api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        api.evidence.insert(
+            OTHER_ROOT.to_string(),
+            vec![complete_api_row(OTHER_ROOT, "shared", 1, 10, 10, 0)],
+        );
+        trace.evidence.insert(
+            OTHER_ROOT.to_string(),
+            vec![complete_trace_row(OTHER_ROOT, "shared", "")],
+        );
+        let expected = match cause {
+            "invalid-api" => {
+                api.evidence.get_mut(OTHER_ROOT).unwrap()[0]
+                    .capture_revision
+                    .clear();
+                IgnoredVeto::InvalidRows
+            }
+            "invalid-trace" => {
+                trace.evidence.get_mut(OTHER_ROOT).unwrap()[0]
+                    .capture_revision
+                    .clear();
+                IgnoredVeto::InvalidRows
+            }
+            "duplicate-api" => {
+                let rows = api.evidence.get_mut(OTHER_ROOT).unwrap();
+                rows.push(rows[0].clone());
+                IgnoredVeto::DuplicateRows
+            }
+            "duplicate-trace" => {
+                let rows = trace.evidence.get_mut(OTHER_ROOT).unwrap();
+                rows.push(rows[0].clone());
+                IgnoredVeto::DuplicateRows
+            }
+            "client-mismatch" => {
+                let row = &mut trace.evidence.get_mut(OTHER_ROOT).unwrap()[0];
+                row.client_request_id = "different".to_string();
+                row.fingerprint.clear();
+                row.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&row).unwrap())
+                );
+                IgnoredVeto::ClientMismatch
+            }
+            "multi-root" => {
+                api.evidence.insert(
+                    rearm.parent.clone(),
+                    vec![complete_api_row(&rearm.parent, "shared", 1, 10, 10, 0)],
+                );
+                trace.evidence.insert(
+                    rearm.parent.clone(),
+                    vec![complete_trace_row(&rearm.parent, "shared", "")],
+                );
+                IgnoredVeto::MultiRootClaims
+            }
+            "evidence-gap" => {
+                trace.evidence.get_mut(OTHER_ROOT).unwrap().clear();
+                IgnoredVeto::EvidenceGap
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            classify_claude_legacy_request_owners(api.evidence.iter(), &trace.evidence)
+                .unwrap_err(),
+            expected
+        );
+        assert!(
+            claude_legacy_request_owners(&api, &trace).is_none(),
+            "Option facade unchanged"
+        );
+        for _ in 0..2 {
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+            let disposition = fold_reports(
+                &rearm,
+                &mut index,
+                &mut rearm.items.clone(),
+                &api,
+                &trace,
+                true,
+            );
+            let run = rearm.reread(&mut index, &disposition);
+            assert!(run.suppression.full_rearm_suppressed, "{cause}: {run:?}");
+            assert_eq!(run.rearmed_files, 0, "{cause}");
+            let key = IgnoredVeto::ALL
+                .iter()
+                .find(|(kind, _)| *kind == expected)
+                .unwrap()
+                .1;
+            assert_ignored(&diagnostics(scope.finish()), key, 2);
+        }
+    }
+}
+
+#[test]
+fn semantic_refusal_keys_follow_real_proof_reconstruction_inputs_and_rebuild_branches() {
+    let _gate = claude_request_money::e2::GateForTest::off();
+    for cause in [
+        "proof_failure",
+        "reconstruction_failure",
+        "missing_inputs",
+        "rebuild_failure",
+    ] {
+        let mut rearm = Rearm::new();
+        let mut index = rearm.index();
+        rearm.add_other_family(&mut index);
+        let other = rearm.other_family(false);
+        let mut all = rearm.items.clone();
+        all.push(other.clone());
+        rearm.establish(&mut index, &all);
+        let (mut api, trace) = reports_for(&other);
+        // Obtain an actual canonical retained witness before testing refusals.
+        fold_reports(&rearm, &mut index, &mut all.clone(), &api, &trace, true);
+        assert!(index.claude_usage_family_witnesses.contains_key(OTHER_ROOT));
+        let mut changed = other.clone();
+        match cause {
+            "proof_failure" => {
+                index.claude_usage_family_witnesses.remove(OTHER_ROOT);
+                api.evidence.get_mut(OTHER_ROOT).unwrap().pop();
+            }
+            "reconstruction_failure" => {
+                api.evidence.get_mut(OTHER_ROOT).unwrap().pop();
+            }
+            "missing_inputs" => {
+                changed
+                    .claude_usage_occurrences
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .usage
+                    .input_tokens += 1;
+            }
+            "rebuild_failure" => {
+                // Timestamp is not in the retained occurrence witness. This is
+                // deterministic preparation validation, with complete read-health.
+                changed
+                    .claude_usage_occurrences
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .timestamp = Some("invalid".to_string());
+            }
+            _ => unreachable!(),
+        }
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        if cause == "proof_failure" {
+            // Canonical pairing succeeds, but native request coverage fails.
+            let id = trace.evidence[OTHER_ROOT]
+                .last()
+                .unwrap()
+                .request_id
+                .clone();
+            let mut paired_trace = trace.clone();
+            paired_trace
+                .evidence
+                .get_mut(OTHER_ROOT)
+                .unwrap()
+                .retain(|row| row.request_id != id);
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+            let disposition = fold_reports(&rearm, &mut index, &mut all, &api, &paired_trace, true);
+            let run = rearm.reread(&mut index, &disposition);
+            assert!(run.suppression.full_rearm_suppressed, "{cause}: {run:?}");
+            assert_eq!(run.rearmed_files, 0);
+        } else {
+            // Incremental reconstruction reads the retained witness; it does
+            // not overwrite it with a new proof from the changed page input.
+            fold_reports(&rearm, &mut index, &mut [changed], &api, &trace, false);
+            // Terminal reasons accumulated on the earlier page remain visible.
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+            let disposition = fold_reports(
+                &rearm,
+                &mut index,
+                &mut rearm.items.clone(),
+                &api,
+                &trace,
+                true,
+            );
+            let run = rearm.reread(&mut index, &disposition);
+            assert!(run.suppression.full_rearm_suppressed, "{cause}: {run:?}");
+            assert_eq!(run.rearmed_files, 0);
+        }
+        assert_ignored(&diagnostics(scope.finish()), cause, 3);
+    }
+}
+
+#[test]
+fn attribution_keys_and_request_sink_refusal_are_diagnostic_only() {
+    for kind in [
+        IgnoredVeto::WithheldAccount,
+        IgnoredVeto::IdentityRefusals,
+        IgnoredVeto::RequestsRefused,
+    ] {
+        let rearm = Rearm::new();
+        let mut index = rearm.index();
+        rearm.establish(&mut index, &rearm.items);
+        let mut items = rearm.items.clone();
+        let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        let evidence =
+            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        match kind {
+            IgnoredVeto::WithheldAccount => {
+                items[0].claude_account_withheld_reason =
+                    Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS)
+            }
+            IgnoredVeto::IdentityRefusals => items[0].request_identity_refusals = 1,
+            IgnoredVeto::RequestsRefused => {
+                assert!(claude_request_identity::full_rearm_requests_refused(
+                    &items[0],
+                    &evidence,
+                    None,
+                    &index.claude_duplicate_request_owners
+                ))
+            }
+            _ => unreachable!(),
+        }
+        // Keep the settled contract fixed when entering the contract-5 fold.
+        let identity = (kind == IgnoredVeto::RequestsRefused).then_some(&evidence);
+        if identity.is_some() {
+            index.claude_request_identity_contract =
+                Some(claude_request_identity::cycle_contract(true).to_string());
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+            let paid = apply_claude_reported_usage_with_index_and_limits(
+                &mut rearm.items.clone(),
+                &api,
+                &trace,
+                &mut index,
+                true,
+                WINDOW,
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+                MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+                identity,
+            );
+            rearm.reread(&mut index, &paid);
+        }
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+        let disposition = apply_claude_reported_usage_with_index_and_limits(
+            &mut items,
+            &api,
+            &trace,
+            &mut index,
+            true,
+            WINDOW,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            identity,
+        );
+        let run = rearm.reread(&mut index, &disposition);
+        assert!(run.suppression.full_rearm_suppressed, "{kind:?}: {run:?}");
+        assert_eq!(run.rearmed_files, 0);
+        let key = IgnoredVeto::ALL
+            .iter()
+            .find(|(candidate, _)| *candidate == kind)
+            .unwrap()
+            .1;
+        assert_ignored(&diagnostics(scope.finish()), key, 2);
+    }
+}
+
+#[test]
+fn native_roster_hash_birth_and_qualification_changes_rearm_once_and_latch_debt() {
+    use claude_request_census::{
+        ClaudeRequestBirth, ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    for cause in [
+        "add-holder",
+        "remove-holder",
+        "hash-ownership",
+        "birth",
+        "qualification",
+        "stub",
+    ] {
+        let mut rearm = Rearm::new();
+        let mut index = rearm.index();
+        rearm.add_other_family(&mut index);
+        let key = rearm.other_key();
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"1".repeat(64),
+            CENSUS_CLOCK,
+            ClaudeRequestCensusShape::Exact,
+            vec![1, 2],
+        )
+        .with_birth_for_test(Some(ClaudeRequestBirth {
+            unix_seconds: 1,
+            device: 2,
+            inode: 3,
+        }));
+        index
+            .claude_request_census
+            .insert_for_test(&key, record.clone());
+        let mut items = rearm.items.clone();
+        items.push(rearm.other_family(false));
+        items[0].claude_account_withheld_reason =
+            Some(CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE);
+        rearm.establish(&mut index, &items);
+        let before = index.clone();
+        match cause {
+            "add-holder" => {
+                let new_key = local_index_key(
+                    &rearm
+                        .root
+                        .join("c8888888-8888-4888-8888-888888888888.jsonl"),
+                );
+                insert_file(&mut index, &new_key, "new-holder", 512);
+                // Real copy in a second native holder, not a telemetry claim.
+                index
+                    .claude_request_census
+                    .insert_for_test(&new_key, record.clone());
+            }
+            "remove-holder" => {
+                index.files.remove(&key);
+            }
+            "hash-ownership" => {
+                index.claude_request_census.insert_for_test(
+                    &key,
+                    ClaudeRequestCensusRecord::synthetic_for_test(
+                        &"1".repeat(64),
+                        CENSUS_CLOCK,
+                        ClaudeRequestCensusShape::Exact,
+                        vec![1, 3],
+                    ),
+                );
+            }
+            "birth" => {
+                index.claude_request_census.insert_for_test(
+                    &key,
+                    record.clone().with_birth_for_test(Some(ClaudeRequestBirth {
+                        unix_seconds: 1,
+                        device: 2,
+                        inode: 4,
+                    })),
+                );
+            }
+            "qualification" => {
+                index
+                    .claude_request_census
+                    .insert_for_test(&key, record.clone().with_unverified_for_test(true));
+            }
+            "stub" => index
+                .claude_request_census
+                .invalidate_keeping_birth_for_test(&key),
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            claude_full_rearm_native_basis(&before, "test"),
+            claude_full_rearm_native_basis(&index, "test"),
+            "{cause}"
+        );
+        // Exercise the actual terminal seam directly so coverage acquisition
+        // does not mask a native projection change outside invalid families.
+        let families = BTreeSet::from([rearm.parent.clone(), OTHER_ROOT.to_string()]);
+        let non_due = claude_full_rearm_structural_terminal(
+            &mut index,
+            WINDOW,
+            &families,
+            true,
+            true,
+            false,
+            false,
+            Some(CENSUS_CLOCK),
+            claude_request_identity::cycle_contract(false),
+        );
+        assert!(!non_due);
+        assert!(
+            index.claude_full_rearm_progress.structural_rearm_owed,
+            "{cause}"
+        );
+        let mut changed_items = items.clone();
+        if cause == "add-holder" {
+            let new_root = "c8888888-8888-4888-8888-888888888888";
+            let mut copy = rearm.other_family(false);
+            copy.source_session_id = new_root.to_string();
+            for fact in &mut copy.attribution_facts {
+                if fact.value == OTHER_ROOT {
+                    fact.value = new_root.to_string();
+                }
+            }
+            changed_items.push(copy);
+        } else if cause == "remove-holder" {
+            changed_items.retain(|item| item.source_session_id != OTHER_ROOT);
+        }
+        let changed = index.clone();
+        for (phase, phase_items) in [("changed", &changed_items), ("stable", &changed_items)] {
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+            let disposition = rearm.fold(
+                &mut index,
+                phase_items,
+                true,
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            );
+            assert_eq!(
+                disposition.duplicate_census.full_rearm,
+                phase == "changed",
+                "{cause}/{phase}"
+            );
+            assert_eq!(
+                disposition.full_rearm_suppression.full_rearm_suppressed,
+                phase == "stable",
+                "{cause}/{phase}"
+            );
+            assert!(index.claude_duplicate_request_witness_overflowed);
+            if phase == "changed" {
+                assert!(index
+                    .files
+                    .values()
+                    .all(|entry| entry.source_file_fingerprint.is_empty()));
+                for (key, entry) in &mut index.files {
+                    entry.source_file_fingerprint =
+                        changed.files[key].source_file_fingerprint.clone();
+                }
+            } else {
+                assert!(index
+                    .files
+                    .values()
+                    .all(|entry| !entry.source_file_fingerprint.is_empty()));
+            }
+        }
+        // A non-due change then revert still owes a due replay, even though
+        // the basis has returned to the currently recorded native state.
+        index.files = before.files.clone();
+        index.claude_request_census = before.claude_request_census.clone();
+        assert!(!claude_full_rearm_structural_terminal(
+            &mut index,
+            WINDOW,
+            &families,
+            true,
+            true,
+            false,
+            false,
+            Some(CENSUS_CLOCK),
+            claude_request_identity::cycle_contract(false)
+        ));
+        assert!(index.claude_full_rearm_progress.structural_rearm_owed);
+        index.files = changed.files.clone();
+        index.claude_request_census = changed.claude_request_census.clone();
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+        let owed = rearm.fold(
+            &mut index,
+            &changed_items,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        );
+        assert!(owed.duplicate_census.full_rearm, "{cause}");
+        // Return to the original native roster and pay its one change, then
+        // contrast sidecar-only refresh against that settled baseline.
+        index = before.clone();
+        // Telemetry-inclusive fingerprints and observation clocks are excluded.
+        let refreshed = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"2".repeat(64),
+            CENSUS_CLOCK + 1,
+            ClaudeRequestCensusShape::Exact,
+            vec![1, 2],
+        )
+        .with_birth_for_test(record.birth());
+        index.claude_request_census.insert_for_test(&key, refreshed);
+        assert_eq!(
+            claude_full_rearm_native_basis(&before, "test"),
+            claude_full_rearm_native_basis(&index, "test")
+        );
+        assert!(
+            rearm
+                .terminal(&mut index, &items)
+                .suppression
+                .full_rearm_suppressed
+        );
+    }
+}
+
+#[test]
+fn ignored_reasons_follow_window_scope_and_exclude_independent_or_empty_clears() {
+    let rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.establish(&mut index, &rearm.items);
+    let mut items = rearm.items.clone();
+    items[0].claude_account_withheld_reason = Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS);
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    // A nonterminal page captures the reason without reporting savings.
+    rearm.fold(
+        &mut index,
+        &items,
+        false,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+    );
+    assert_eq!(diagnostics(Default::default()), serde_json::json!({}));
+    let mut persisted = serde_json::to_value(&index).unwrap();
+    assert!(!persisted.to_string().contains("ignored_vetoes"));
+    // Independent post-proof clear excludes one nonempty fingerprint; the
+    // other is already empty and cannot count as preserved savings.
+    let keys = rearm.sources.keys().cloned().collect::<Vec<_>>();
+    index
+        .files
+        .get_mut(&keys[0])
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let run = rearm.terminal(&mut index, &rearm.items);
+    assert!(!run.counts.full_rearm);
+    assert_ignored(&diagnostics(scope.finish()), "withheld_account", 1);
+    // Process-local masks are intentionally not restored from serialized state.
+    persisted["claude_full_rearm_progress"]["ignored_vetoes"] = serde_json::json!(65535);
+    let restored: ScanIndex = serde_json::from_value(persisted).unwrap();
+    assert_eq!(restored.claude_full_rearm_progress.ignored_vetoes, 0);
+    let mut progress = ClaudeFullRearmProgress::default();
+    progress.observe_ignored("old", IgnoredVeto::WithheldAccount.bit());
+    progress.observe_ignored("new", IgnoredVeto::EvidenceGap.bit());
+    assert_eq!(progress.ignored_vetoes, IgnoredVeto::EvidenceGap.bit());
+}
+
+#[test]
+fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_own_due_retry() {
+    let _gate = claude_request_money::e2::GateForTest::off();
+    let mut rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.add_other_family(&mut index);
+    let mut items = rearm.items.clone();
+    let other = rearm.other_family(false);
+    items.push(other.clone());
+    rearm.establish(&mut index, &items);
+    let revision = "held-native-revision";
+    index.insert_retry_pending_claude_authority_at_revision_for_test(OTHER_ROOT, revision);
+    let before = index.claude_usage_authority_quarantine[OTHER_ROOT].clone();
+    let (api, trace) = reports_for(&other);
+    let mut malformed = api.clone();
+    malformed.evidence.get_mut(OTHER_ROOT).unwrap()[0]
+        .capture_revision
+        .clear();
+    index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    let disposition = fold_reports(&rearm, &mut index, &mut items, &malformed, &trace, true);
+    assert!(disposition
+        .quarantined_source_session_ids
+        .contains(OTHER_ROOT));
+    let run = rearm.reread(&mut index, &disposition);
+    assert!(run.suppression.full_rearm_suppressed, "{run:?}");
+    assert_eq!(run.rearmed_files, 0);
+    let held = &index.claude_usage_authority_quarantine[OTHER_ROOT];
+    assert_eq!(
+        held.disposition,
+        ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+    );
+    assert_eq!(
+        held.proven_witness_fingerprint,
+        before.proven_witness_fingerprint
+    );
+    assert!(claude_usage_authority_preserves_pending(
+        held,
+        &index.claude_usage_family_witnesses[OTHER_ROOT]
+    ));
+    assert_ignored(&diagnostics(scope.finish()), "invalid_rows", 3);
+    let mut candidate = test_candidate(rearm.root.join(format!("{OTHER_ROOT}.jsonl")));
+    candidate.source_file_fingerprint = held.member_source_file_fingerprints[OTHER_ROOT].clone();
+    assert!(index
+        .claude_usage_authority_candidate_requires_family_reparse(&candidate)
+        .is_none());
+    index
+        .claude_usage_authority_quarantine
+        .get_mut(OTHER_ROOT)
+        .unwrap()
+        .retry_after_unix_seconds = 0;
+    assert_eq!(
+        index
+            .claude_usage_authority_candidate_requires_family_reparse(&candidate)
+            .as_deref(),
+        Some(OTHER_ROOT)
+    );
+    assert!(
+        index
+            .claude_usage_authority_quarantine
+            .contains_key(OTHER_ROOT),
+        "selection never settles the held authority"
+    );
+}
+
+#[test]
+fn ignored_savings_exclude_independent_proof_clears_and_non_due_passes() {
+    let _gate = claude_request_money::e2::GateForTest::off();
+    let mut rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.add_other_family(&mut index);
+    let other = rearm.other_family(false);
+    let mut all = rearm.items.clone();
+    all.push(other.clone());
+    rearm.establish(&mut index, &all);
+    let (api, trace) = reports_for(&other);
+    let mut page = rearm.items.clone();
+    page[0].claude_account_withheld_reason = Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS);
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(CENSUS_CLOCK + 1000);
+    let not_due = fold_reports(&rearm, &mut index, &mut all.clone(), &api, &trace, true);
+    assert!(!not_due.duplicate_census.full_rearm);
+    assert!(diagnostics(scope.finish())
+        .get("rearm_veto_ignored")
+        .is_none());
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+    let disposition = fold_reports(&rearm, &mut index, &mut page, &api, &trace, true);
+    assert!(disposition.full_rearm_suppression.full_rearm_suppressed);
+    assert!(!disposition.duplicate_census.full_rearm);
+    assert!(
+        index.files[&rearm.other_key()]
+            .source_file_fingerprint
+            .is_empty(),
+        "earlier-page proof correction still clears independently"
+    );
+    assert_ignored(&diagnostics(scope.finish()), "withheld_account", 2);
 }
