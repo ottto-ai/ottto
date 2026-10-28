@@ -14348,6 +14348,63 @@ mod tests {
     }
 
     #[test]
+    fn cache_overcap_byte_trim_witness_network_and_ack_use_identical_completion() {
+        let (patch, prior) =
+            crate::snapshots::cache_overcap_tests::large_prior_and_replacement_fixture();
+        let mut raw = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        raw.context_curve = None;
+        raw.cache_observations = Some(patch);
+        raw.cache_observations_state = None;
+        let key = cache_session_key(&raw.source_session_id);
+        let mut progress = test_upload_progress();
+        progress
+            .accepted_cache_states
+            .insert(key.clone(), prior.clone());
+        progress
+            .accepted_cache_heads
+            .insert(key.clone(), "e".repeat(64));
+        let witness = effective_snapshot_upload_body_witness(
+            &raw,
+            &progress,
+            true,
+            true,
+            &BTreeSet::new(),
+            &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+        );
+        let mut network = raw.clone();
+        prepare_snapshot_cache_for_upload(&mut network, &progress, true, true, &BTreeSet::new());
+        assert_eq!(witness, snapshot_upload_body_witness(&network));
+        assert_eq!(
+            progress.accepted_cache_states[&key], prior,
+            "projection does not advance accepted state"
+        );
+        let wire = network.cache_observations.as_ref().unwrap();
+        assert!(wire.validate());
+        let expected = crate::snapshots::cache_state_from_patch(Some(&prior), wire);
+        assert_eq!(network.cache_observations_state.as_ref(), Some(&expected));
+        assert!(
+            crate::canonical_json::canonicalize(&expected)
+                .unwrap()
+                .len()
+                <= crate::snapshots::cache_observations::MAX_WIRE_BYTES
+        );
+        progress.record_cache_state(&network, false).unwrap();
+        assert_eq!(
+            progress.accepted_cache_states[&key], expected,
+            "ACK completion applies the actual uploaded patch"
+        );
+        progress.record_cache_state(&network, false).unwrap();
+        assert_eq!(
+            progress.accepted_cache_states[&key], expected,
+            "ACK retry is idempotent"
+        );
+        assert!(
+            raw.cache_observations_state.is_none(),
+            "local evidence is retained"
+        );
+    }
+
+    #[test]
     fn cache_event_ack_restart_correction_and_missing_proof() {
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         item.context_curve = None;
