@@ -26777,6 +26777,10 @@ impl OwnedSourceScan {
         // Construct the large continuation once. Repeating it in every yield
         // branch multiplies debug-build stack slots and can overflow native
         // callers even though the retained scanner state is unchanged.
+        if let Some(traversal) = index.traversal.as_ref() {
+            codex_state_only_blocked_session_ids
+                .extend(traversal.residue.blocked_session_ids.iter().cloned());
+        }
         residue_blocked_session_ids.extend(census.archive_terminal_sessions.iter().cloned());
         codex_state_only_blocked_session_ids
             .extend(census.archive_terminal_sessions.iter().cloned());
@@ -31682,7 +31686,7 @@ impl OwnedSourceScan {
                 .files
                 .get(&local_index_key(&candidate.path))
                 .and_then(|e| e.archive.as_ref())
-                .is_some_and(|a| a.user_change)
+                .is_some_and(|a| a.user_change && a.matches(&opened_file))
                 && !codex_join_inventory.as_ref().is_some_and(|i| {
                     i.archive_work.allowed && i.archive_work.cpu_micros < 30_000_000
                 })

@@ -523,3 +523,100 @@ fn reservation_crashes_spend_six_attempts_and_retry_counter_requires_saved_reser
         .any(|r| r["stage"] == "codex_zst_first_read_retry"));
     assert_eq!(archive_evidence(&prior, &other).decode_attempts, 1);
 }
+
+#[test]
+fn terminal_session_block_survives_empty_final_census_page() {
+    let f = ArchiveFixture::new(b"stamp-only");
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    evidence.disposition = ArchiveDisposition::Refused {
+        cause: CodexZstCause::DecodeFailed,
+    };
+    let mut index = ScanIndex::default();
+    index
+        .files
+        .entry(local_index_key(&f.0))
+        .or_default()
+        .archive = Some(Box::new(evidence));
+    assert!(index.codex_state_only_blocked_session_ids.is_empty()); // inventory-refused path never reached parser
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        &[],
+        index,
+        NOW,
+        365,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        false,
+    );
+    scan.index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .residue
+        .blocked_session_ids
+        .insert("compressed-fixture".into());
+    scan.codex_join_prepared = true;
+    scan.codex_join_inventory = None;
+    scan.identified_candidates.clear(); // later page finishes only bounded reconciliation
+    for owner in ["compressed-fixture", "healthy-final-page"] {
+        scan.codex_title_metadata.state_threads.insert(
+            owner.into(),
+            CodexStateThread {
+                tokens_used: 10,
+                ..Default::default()
+            },
+        );
+    }
+    assert!(scan.state_census_complete && scan.sidecar_census_complete);
+    for _ in 0..1000 {
+        scan = match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => next,
+            OwnedSourceScanStep::Complete { scan: result, .. } => {
+                assert!(result.census_complete, "{result:#?}");
+                let owners = result
+                    .snapshots
+                    .iter()
+                    .map(|s| s.source_session_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(owners, BTreeSet::from(["healthy-final-page"]));
+                return;
+            }
+        };
+    }
+    panic!("final census page did not complete");
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn replaced_archive_uses_new_stamp_first_read_without_old_correction_permission() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let f = correction_archive();
+    let mut state = ScanIndex::default();
+    state.activate_archive_user_context("A".into());
+    let (mut state, body, _, _) = archive_pass(&f, state, true, None);
+    state.settle_archive_outcome(&ack_bodies(&body), true, None);
+    state.activate_archive_user_context("B".into());
+    assert!(archive_evidence(&state, &f).user_change);
+    let original_len = fs::metadata(&f.0).unwrap().len();
+    let mut changed = fs::read(&f.0).unwrap();
+    changed.extend(zstd::stream::encode_all(&b"\n"[..], 1).unwrap());
+    fs::write(&f.0, changed).unwrap();
+    assert!(fs::metadata(&f.0).unwrap().len() > original_len);
+    assert!(!archive_evidence(&state, &f).matches(&File::open(&f.0).unwrap()));
+    let (fresh, body, rows, _) = archive_pass(&f, state, true, None); // no correction power permission
+    assert_eq!(decodes(&rows), 1);
+    assert!(!body.snapshots.is_empty());
+    assert_eq!(archive_evidence(&fresh, &f).decode_attempts, 1);
+    assert!(!archive_evidence(&fresh, &f).user_change);
+    assert!(!rows
+        .iter()
+        .any(|r| r["counts"]["compressed_user_change"] == 1));
+}
