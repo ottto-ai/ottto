@@ -1849,7 +1849,7 @@ fn gc_stops_before_orphan_cleanup_when_classification_disables_mid_loop() {
 
 #[test]
 fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
-    for arm in ["success", "write_failure", "budget", "no_reduction"] {
+    for arm in ["success", "write_failure", "budget"] {
         let _reset = ResetFaults;
         let scratch = Scratch::new();
         let lock = LockedStateDir::acquire(&scratch.root).unwrap();
@@ -1902,15 +1902,7 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
                 Err(io::Error::other("replacement refused"))
             })));
         }
-        let result = cold.write_after_save(
-            &lock,
-            2,
-            if arm == "no_reduction" {
-                vec![]
-            } else {
-                vec![replacement]
-            },
-        );
+        let result = cold.write_after_save(&lock, 2, vec![replacement]);
         test_hooks::set_before_rename(None);
         if arm == "success" {
             assert_eq!(result.unwrap().written, 1);
@@ -2110,7 +2102,7 @@ fn scheduling_deferral_preserves_t14_allowance_until_full_actually_starts() {
 }
 
 #[test]
-fn adapter_deferral_preserves_started_replacement_across_an_empty_save() {
+fn unoffered_started_rebuild_survives_save_until_its_replacement_is_offered() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
@@ -2128,9 +2120,13 @@ fn adapter_deferral_preserves_started_replacement_across_an_empty_save() {
     *bytes.last_mut().unwrap() ^= 1;
     put_record(&path, &bytes);
     assert_eq!(store.full_hold(&b.key, true), None);
-    store.defer_rebuild(&b.key);
     store.write_after_save(&lock, 2, vec![]).unwrap();
     assert_eq!(store.rebuilt.get(&b.key), Some(&Rebuild::Started));
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "save N never offered this key"
+    );
     store.begin_pass();
     assert_eq!(store.full_hold(&b.key, true), Some(Refusal::Corrupt));
     let receipt = store

@@ -788,11 +788,6 @@ impl SharedCache {
         let deferred = later.len() as u64;
         // Deferred keys keep their provenance for the next save.
         for key in &later {
-            stores
-                .slot(source)
-                .as_mut()?
-                .store
-                .defer_rebuild(&store::key_digest(source, key));
             if let Some(fingerprint) = selected.remove(key) {
                 stores.selected.insert(key.clone(), fingerprint);
             }
