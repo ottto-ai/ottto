@@ -27,7 +27,6 @@
 //! record's allowlist digest, so any change to a class, field or type refuses
 //! old records.
 
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sha2::{Digest, Sha256};
