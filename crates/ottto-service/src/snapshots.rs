@@ -28166,7 +28166,7 @@ impl OwnedSourceScan {
                         &codex_title_metadata,
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
-                        index.archive_header(&candidate.path),
+                        index.archive_header(&active.candidate.path),
                     )
                     .map(|dependency| {
                         context.file_scope(
@@ -28355,7 +28355,7 @@ impl OwnedSourceScan {
                         &codex_title_metadata,
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
-                        index.archive_header(&candidate.path),
+                        index.archive_header(&active.candidate.path),
                     )?;
                     let digest = sampled_scan::codex_cursor::memo_digest(
                         index,
@@ -32201,7 +32201,7 @@ impl OwnedSourceScan {
                             &codex_title_metadata,
                             &claude_title_metadata,
                             claude_effort_support_dir_ref,
-                            index.archive_header(&candidate.path),
+                            index.archive_header(&active.candidate.path),
                         );
                         let owner = codex_join_inventory
                             .as_ref()
