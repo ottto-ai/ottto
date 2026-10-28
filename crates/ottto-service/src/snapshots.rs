@@ -136,6 +136,13 @@ pub(crate) fn verify_durable_body(
     nested.and_then(sampled_scan::durable_tail::durable_source) == Some(source)
         && sampled_jsonl::durable::verify(body).is_ok()
 }
+#[cfg(unix)]
+pub(crate) fn durable_allowlist(source: crate::durable_tail_store::DurableSource) -> [u8; 32] {
+    sampled_jsonl::durable::allowlist_digest(match source {
+        crate::durable_tail_store::DurableSource::ClaudeCode => SnapshotSource::ClaudeCode,
+        crate::durable_tail_store::DurableSource::Codex => SnapshotSource::Codex,
+    })
+}
 #[cfg(all(test, unix))]
 pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
     sampled_jsonl::durable::store_fixture_body(source, count, sum)
@@ -27623,7 +27630,10 @@ impl OwnedSourceScan {
                             .members
                             .iter()
                             .find_map(|member| {
-                                Some((member, cache.durable_guard(source, member, index, false)?))
+                                Some((
+                                    member,
+                                    cache.durable_guard(source, member, None, index, false)?,
+                                ))
                             })
                             .or_else(|| {
                                 group.members.iter().find_map(|member| {
@@ -31225,7 +31235,9 @@ impl OwnedSourceScan {
             #[cfg(unix)]
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) = cache.durable_guard(source, &candidate, index, true) {
+                    if let Some(reason) =
+                        cache.durable_guard(source, &candidate, Some(&opened_file), index, true)
+                    {
                         if index.reread_guard.needs_save() {
                             identified_candidates.push_front(candidate);
                         } else {

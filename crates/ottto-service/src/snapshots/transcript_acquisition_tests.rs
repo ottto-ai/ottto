@@ -3703,7 +3703,10 @@ fn pinned_v1_upgrade_rewrites_v2_then_second_restart_tails_without_a_full() {
                 store::ReadOutcome::Found(r) => r,
                 other => panic!("{other:?}"),
             };
-            assert_eq!(record.format, crate::durable_tail_store::FORMAT_VERSION);
+            assert_eq!(record.format, 2);
+            assert_eq!(record.record.metadata.protocol, 0);
+            assert_eq!(record.record.metadata.mark, 0);
+            assert_eq!(record.record.metadata.reuse_814, 0);
             drop(second);
             fixture.file.append(&usage(source, 160, 2, "fixture-model"));
             let third = Arc::new(sampled_scan::SharedCache::default());

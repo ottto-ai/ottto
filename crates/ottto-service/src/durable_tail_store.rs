@@ -40,7 +40,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 
 /// Envelope format. Bump on any envelope or certificate layout change.
-pub(crate) const FORMAT_VERSION: u16 = 1;
+pub(crate) const FORMAT_VERSION: u16 = 2;
 const MAGIC: [u8; 8] = *b"ottto-dt";
 /// One record never exceeds the RAM cache's per-entry bound
 /// (`transcript_cache::ENTRY_BYTES`): the store keeps only what RAM can.
@@ -55,7 +55,7 @@ const RECORD_SUFFIX: &str = ".rec";
 const TEMP_SUFFIX: &str = ".tmp";
 
 /// The fixed envelope size before the body (see `encode`).
-pub(crate) const HEADER_BYTES: usize = 8 // magic
+const V1_HEADER_BYTES: usize = 8 // magic
     + 2 // format_version
     + 32 // allowlist_digest
     + 1 // source
@@ -72,6 +72,10 @@ const CERTIFICATE_BYTES: usize = 8 * 3 // device, inode, length
     + 8 // verified
     + 1 // debt flag
     + 8; // debt
+         // V2 omits the audit-debt presence/deadline. Its fixed extension carries
+         // independent header identity, marker authority and the contract/evidence split.
+const META_BYTES: usize = 32 + 24 + 1 + 57 + 1 + 8 + 2 + 9 + 1 + 1 + 32 + 3;
+pub(crate) const HEADER_BYTES: usize = V1_HEADER_BYTES - 9 + META_BYTES;
 const TRAILER_BYTES: usize = 32;
 
 /// Every 32-byte digest in the envelope (outside the codec body), as
@@ -79,8 +83,11 @@ const TRAILER_BYTES: usize = 32;
 /// (`h_fields_are_audited`) pins what fills each one alongside the body's
 /// `H` fields (M1, SOURCE P2-5). The SHA-256 trailer is an integrity
 /// checksum over the record's own bytes, not a value, so it is not listed.
-pub(crate) const ENVELOPE_H: [&str; 7] = [
+pub(crate) const ENVELOPE_H: [&str; 10] = [
     "Envelope.allowlist",
+    "Metadata.namespace",
+    "Metadata.recovery_digest",
+    "Metadata.ack_owner",
     "Binding.key",
     "Binding.context",
     "Binding.scope",
@@ -269,6 +276,35 @@ pub(crate) struct Binding {
     pub(crate) entry: Digest32,
 }
 
+/// V2 metadata. Tags: protocol Legacy/WriteAhead = 0/1; marker
+/// None/Reserved/Spent = 0/1/2; reuse Undecided/Eligible/Ineligible = 0/1/2.
+/// Counting interpretation None/Legacy/V2 = 0/1/2, evidence None/V2/Legacy = 0/1/2.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Metadata {
+    pub(crate) namespace: Digest32,
+    pub(crate) protocol: u8,
+    pub(crate) mark: u8,
+    pub(crate) recovery_object: [u64; 3],
+    pub(crate) recovery_digest: Digest32,
+    pub(crate) reuse_814: u8,
+    pub(crate) body_revision: u64,
+    pub(crate) counting: (Option<i64>, u8, u8),
+    pub(crate) ack_owner: Digest32,
+}
+fn object(c: &DurableCertificate) -> [u64; 3] {
+    [c.device, c.inode, c.birth_nanos]
+}
+pub(crate) fn namespace_digest(namespace: &str, identity: &str) -> Digest32 {
+    digest(
+        "ottto-dt-namespace:v1",
+        &[namespace.as_bytes(), identity.as_bytes()],
+    )
+}
+pub(crate) fn ack_owner(key: &Digest32, c: &DurableCertificate) -> Digest32 {
+    let o = object(c).map(u64::to_le_bytes).concat();
+    digest("ottto-dt-ack-owner:v1", &[key, &o, &c.head_sha256])
+}
+
 /// A record before the store stamps it with a committed generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingRecord {
@@ -278,6 +314,7 @@ pub(crate) struct PendingRecord {
     pub(crate) body: Vec<u8>,
     /// The codec's allowlist digest, carried in the envelope.
     pub(crate) allowlist: Digest32,
+    pub(crate) metadata: Metadata,
 }
 
 /// A record as stored: the pending record plus the generation of the index
@@ -297,6 +334,8 @@ pub(crate) enum Refusal {
     Undecodable,
     Unbindable,
     Corrupt,
+    RecoveryOpen,
+    SpentCarrier,
     UpgradeMissing,
 }
 
@@ -381,10 +420,10 @@ pub(crate) struct StoreCounters {
     pub(crate) bytes_read: u64,
     pub(crate) records_read: u64,
     pub(crate) missing: u64,
-    pub(crate) format_hold: [u64; 6],
+    pub(crate) format_hold: [u64; 8],
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
-    pub(crate) store_write_skipped: [u64; 2],
+    pub(crate) store_write_skipped: [u64; 3],
     /// T14 records to rebuild (read Full unless the RAM cache still holds the
     /// file, then replaced after the save); owner-only modes restored.
     pub(crate) t14_rebuild: u64,
@@ -587,14 +626,39 @@ impl DurableTailStore {
                 .map_err(|_| Refusal::Undecodable)?;
             let n = header.len();
             self.counters.guard_header_bytes += n as u64;
-            let binding = decode_header(&header, key, self.source)?;
+            let binding = match decode_header(&header, key, self.source) {
+                Err(Refusal::Corrupt)
+                    if header[8..10] == 2_u16.to_le_bytes() && header.get(236) == Some(&1) =>
+                {
+                    return Err(Refusal::RecoveryOpen)
+                }
+                Err(Refusal::Corrupt)
+                    if header[8..10] == 2_u16.to_le_bytes() && header.get(236) == Some(&2) =>
+                {
+                    return Err(Refusal::SpentCarrier)
+                }
+                result => result?,
+            };
+            // Header authority wins even when this older binary cannot verify
+            // the rest of the carrier. No ordinary mutation may retire a mark.
+            if binding.record.metadata.mark == 1 {
+                return Err(Refusal::RecoveryOpen);
+            }
+            if work == "delete" && binding.record.metadata.mark == 2 {
+                return Err(Refusal::SpentCarrier);
+            }
+            let corrupt = if binding.record.metadata.mark == 2 {
+                Refusal::SpentCarrier
+            } else {
+                Refusal::Corrupt
+            };
             // After any repair: its ctime moved.
-            let metadata = file.metadata().map_err(|_| Refusal::Corrupt)?;
+            let metadata = file.metadata().map_err(|_| corrupt)?;
             let stamp = Stamp::of(&metadata);
             if !metadata.is_file()
                 || metadata.len() > (RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES) as u64
             {
-                return Err(Refusal::Corrupt);
+                return Err(corrupt);
             }
             if self.durable.get(key).is_some_and(|(_, old)| *old == stamp) {
                 return Ok(Some(binding));
@@ -602,7 +666,7 @@ impl DurableTailStore {
             let mut bytes = header;
             file.take((RECORD_BYTES + TRAILER_BYTES + 1) as u64)
                 .read_to_end(&mut bytes)
-                .map_err(|_| Refusal::Corrupt)?;
+                .map_err(|_| corrupt)?;
             let read = bytes.len().saturating_sub(n) as u64;
             match work {
                 "delete" => self.counters.delete_verify_bytes += read,
@@ -610,7 +674,7 @@ impl DurableTailStore {
                 _ => self.counters.guard_verify_bytes += read,
             }
             self.note_codec(bytes.capacity());
-            verify(&bytes, self.source)?;
+            verify(&bytes, self.source).map_err(|_| corrupt)?;
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(key) {
                 self.durable.insert(*key, (None, stamp));
             }
@@ -625,8 +689,21 @@ impl DurableTailStore {
 
     /// U holds. T14 does not: the key is read Full once (counted) and its
     /// record is overwritten after the save, unless the breaker disables the store.
-    pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
-        let result = self.classify(key, "guard");
+    pub(crate) fn hold(
+        &mut self,
+        key: &Digest32,
+        live: Option<([u64; 3], Digest32)>,
+    ) -> Option<Refusal> {
+        let result = self.classify(key, "guard").and_then(|header| {
+            if header.as_ref().is_some_and(|h| {
+                h.record.metadata.mark == 2
+                    && live != Some((object(&h.record.certificate), h.record.metadata.namespace))
+            }) {
+                Err(Refusal::SpentCarrier)
+            } else {
+                Ok(header)
+            }
+        });
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
         match result {
             Err(Refusal::Corrupt) if !self.rebuilt.contains(key) => {
@@ -696,17 +773,43 @@ impl DurableTailStore {
             .iter()
             .map(|record| record.body.len())
             .sum::<usize>();
-        for record in pending {
+        for mut record in pending {
             // A T14 predecessor is the rebuild's to replace.
             let keep_prior = match self.classify(&record.binding.key, "overwrite") {
                 Err(Refusal::Corrupt) => true,
-                Err(_) => {
-                    self.counters.store_write_skipped[0] += 1;
+                Err(reason) => {
+                    self.counters.store_write_skipped[if matches!(
+                        reason,
+                        Refusal::RecoveryOpen | Refusal::SpentCarrier
+                    ) {
+                        2
+                    } else {
+                        0
+                    }] += 1;
                     continue;
                 }
-                // Preserve the v1 authority if the ordinary replacement fails
-                // or is refused by the record/store budget.
-                Ok(Some(old)) => old.format == 1,
+                Ok(Some(old)) => {
+                    let same = object(&old.record.certificate) == object(&record.certificate)
+                        && old.record.metadata.namespace == record.metadata.namespace;
+                    if old.record.metadata.mark == 2 {
+                        if !same {
+                            self.counters.store_write_skipped[2] += 1;
+                            continue;
+                        }
+                        record.metadata.mark = 2;
+                        record.metadata.recovery_object = old.record.metadata.recovery_object;
+                        record.metadata.recovery_digest = old.record.metadata.recovery_digest;
+                    }
+                    if same && old.record.binding.scope == record.binding.scope {
+                        record.metadata.reuse_814 = old.record.metadata.reuse_814;
+                        if record.binding.entry == old.record.binding.entry
+                            && record.certificate == old.record.certificate
+                        {
+                            record.metadata.protocol = old.record.metadata.protocol;
+                        }
+                    }
+                    old.format == 1
+                }
                 Ok(None) => false,
             };
             let content = content_digest(&record);
@@ -778,7 +881,7 @@ impl DurableTailStore {
                 // A stale record for this key would bind to an older entry
                 // only; drop it so the refusal costs no disk. A T14 record
                 // and a bootstrappable v1 record stay until replacement.
-                if previous != 0 && !keep_prior {
+                if previous != 0 && !keep_prior && stored.record.metadata.mark == 0 {
                     remove_if_present(&path)?;
                     on_disk.remove(&key);
                     changed = true;
@@ -1131,6 +1234,14 @@ struct Header {
     format: u16,
     body_len: usize,
 }
+fn header_bytes(format: u16) -> usize {
+    if format == 1 {
+        V1_HEADER_BYTES
+    } else {
+        HEADER_BYTES
+    }
+}
+
 fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<Header, Refusal> {
     let mut c = Cursor(bytes);
     if c.array::<8>() != Some(MAGIC) {
@@ -1142,13 +1253,16 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
     }
     let allowlist = c.array::<32>().ok_or(Refusal::Undecodable)?;
     let tag = c.u8().ok_or(Refusal::Undecodable)?;
-    // Both pinned v1 writers (72205c6c and ffc6c846) use these lists.
+    // Source-local dispatch: adding another source does not repin existing ones.
     let pin = match tag {
         1 => "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
         2 => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
-        _ => return Err(Refusal::Unknown),
+        _ => "", // Future v2-only sources need no v1 pin.
     };
-    if format != 1 || Some(allowlist) != parse_hex_digest(pin) {
+    let current = crate::snapshots::durable_allowlist(source);
+    if !matches!(format, 1 | 2)
+        || !(Some(allowlist) == parse_hex_digest(pin) || format == 2 && allowlist == current)
+    {
         return Err(Refusal::Unknown);
     }
     let binding = (|| {
@@ -1166,6 +1280,17 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
     }
     let parsed = (|| {
         let generation = c.u64()?;
+        let mut metadata = Metadata::default();
+        let mut header_object = None;
+        if format == 2 {
+            metadata.namespace = c.array()?;
+            header_object = Some([c.u64()?, c.u64()?, c.u64()?]);
+            metadata.protocol = c.u8()?;
+            metadata.mark = c.u8()?;
+            metadata.recovery_object = [c.u64()?, c.u64()?, c.u64()?];
+            metadata.recovery_digest = c.array()?;
+            metadata.reuse_814 = c.u8()?;
+        }
         let certificate = DurableCertificate {
             device: c.u64()?,
             inode: c.u64()?,
@@ -1179,20 +1304,51 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
             verified_unix_seconds: c.u64()?,
             // The old debt bytes are consumed, structurally checked and dropped.
             audit_debt_unix_seconds: {
-                let tag = c.u8()?;
-                let due = c.u64()?;
-                if tag > 1 || tag == 0 && due != 0 {
-                    return None;
+                if format == 1 {
+                    let tag = c.u8()?;
+                    let due = c.u64()?;
+                    if tag > 1 || tag == 0 && due != 0 {
+                        return None;
+                    }
                 }
                 None
             },
         };
+        if format == 2 {
+            metadata.body_revision = c.u64()?;
+            if c.u16()? != 1 {
+                return None;
+            } // counting-contract schema
+            let present = c.u8()?;
+            let cutover = c.i64()?;
+            if present > 1 || present == 0 && cutover != 0 {
+                return None;
+            }
+            metadata.counting = ((present == 1).then_some(cutover), c.u8()?, c.u8()?);
+            metadata.ack_owner = c.array()?;
+            // Coverage, fragment and provisional sections have explicit absence.
+            if c.array::<3>()? != [0; 3]
+                || metadata.protocol > 1
+                || metadata.mark > 2
+                || metadata.reuse_814 > 2
+                || metadata.counting.1 > 2
+                || metadata.counting.2 > 2
+                || header_object != Some(object(&certificate))
+                || metadata.mark != 0 && metadata.recovery_object != object(&certificate)
+                || metadata.mark == 0
+                    && (metadata.recovery_object != [0; 3] || metadata.recovery_digest != [0; 32])
+                || metadata.ack_owner != ack_owner(key, &certificate)
+            {
+                return None;
+            }
+        }
         Some(Header {
             record: PendingRecord {
                 binding,
                 certificate,
                 body: Vec::new(),
                 allowlist,
+                metadata,
             },
             generation,
             format,
@@ -1213,7 +1369,7 @@ fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
         .and_then(|b| b.try_into().ok())
         .ok_or(bad)?;
     let h = decode_header(bytes, &key, source)?;
-    let start = HEADER_BYTES;
+    let start = header_bytes(h.format);
     if end.checked_sub(start) != Some(h.body_len) {
         return Err(bad);
     }
@@ -1299,6 +1455,17 @@ fn encode_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
         out.extend_from_slice(part);
     }
     out.extend_from_slice(&generation.to_le_bytes());
+    let m = &record.metadata;
+    out.extend_from_slice(&m.namespace);
+    for n in object(certificate) {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+    out.extend_from_slice(&[m.protocol, m.mark]);
+    for n in m.recovery_object {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+    out.extend_from_slice(&m.recovery_digest);
+    out.push(m.reuse_814);
     for value in [certificate.device, certificate.inode, certificate.length] {
         out.extend_from_slice(&value.to_le_bytes());
     }
@@ -1310,13 +1477,13 @@ fn encode_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
     out.extend_from_slice(&certificate.head_sha256);
     out.extend_from_slice(&certificate.boundary_sha256);
     out.extend_from_slice(&certificate.verified_unix_seconds.to_le_bytes());
-    out.push(u8::from(certificate.audit_debt_unix_seconds.is_some()));
-    out.extend_from_slice(
-        &certificate
-            .audit_debt_unix_seconds
-            .unwrap_or(0)
-            .to_le_bytes(),
-    );
+    out.extend_from_slice(&m.body_revision.to_le_bytes());
+    out.extend_from_slice(&1_u16.to_le_bytes());
+    out.push(u8::from(m.counting.0.is_some()));
+    out.extend_from_slice(&m.counting.0.unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(&[m.counting.1, m.counting.2]);
+    out.extend_from_slice(&ack_owner(&binding.key, certificate));
+    out.extend_from_slice(&[0; 3]);
     out.extend_from_slice(&(record.body.len() as u32).to_le_bytes());
 }
 
@@ -1363,7 +1530,7 @@ fn decode(bytes: &[u8], _allowlist: &Digest32) -> Result<DurableRecord, Refusal>
         .ok_or(Refusal::Undecodable)?;
     let mut h = decode_header(bytes, &key, source)?;
     verify(bytes, source)?;
-    h.record.body = bytes[HEADER_BYTES..bytes.len() - TRAILER_BYTES].to_vec();
+    h.record.body = bytes[header_bytes(h.format)..bytes.len() - TRAILER_BYTES].to_vec();
     Ok(DurableRecord {
         record: h.record,
         index_generation: h.generation,
@@ -1418,3 +1585,7 @@ pub(crate) mod test_hooks {
 #[cfg(test)]
 #[path = "durable_tail_store_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "durable_tail_v2_tests.rs"]
+mod v2_tests;

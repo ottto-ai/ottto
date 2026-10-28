@@ -117,6 +117,7 @@ pub(super) fn pending(
     count: u64,
 ) -> PendingRecord {
     PendingRecord {
+        metadata: crate::durable_tail_store::Metadata::default(),
         binding,
         certificate,
         body: placeholder_body(count, count * 7),
@@ -192,7 +193,9 @@ fn envelope_round_trips_and_carries_no_path_or_raw_bytes() {
         );
     }
     let read = found(store.read(&key, &placeholder_allowlist()));
-    assert_eq!(read.record, record);
+    let mut mapped = record;
+    mapped.metadata.ack_owner = ack_owner(&mapped.binding.key, &mapped.certificate);
+    assert_eq!(read.record, mapped);
     assert_eq!(read.index_generation, 1);
     let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&record_file(&store, &key)), 0o600);
@@ -899,7 +902,7 @@ fn store_mode_faults_are_repaired_without_rebuilds() {
     fs::set_permissions(store.dir(), fs::Permissions::from_mode(0o755)).unwrap();
     let mut cold = scratch.store();
     for b in &bindings {
-        assert_eq!(cold.hold(&b.key), None);
+        assert_eq!(cold.hold(&b.key, None), None);
         found(cold.read(&b.key, &placeholder_allowlist()));
     }
     assert_eq!(mode(cold.dir()), 0o700);
@@ -910,7 +913,7 @@ fn store_mode_faults_are_repaired_without_rebuilds() {
     let counters = cold.counters();
     assert_eq!(counters.mode_repaired, 3);
     assert_eq!(counters.t14_rebuild, 0);
-    assert_eq!(counters.format_hold, [0; 6]);
+    assert_eq!(counters.format_hold, [0; 8]);
     assert_eq!(cold.disabled(), None);
 }
 
@@ -965,12 +968,12 @@ fn foreign_owner_disables_the_store_without_rebuilds() {
     // The directory passes its check; then a foreign-owned record with a
     // newer header is store-level, not a hold.
     let mut cold = scratch.store();
-    assert_eq!(cold.hold(&bindings[0].key), None);
+    assert_eq!(cold.hold(&bindings[0].key, None), None);
     let _foreign = ForeignUid::set();
-    assert_eq!(cold.hold(&bindings[2].key), None);
+    assert_eq!(cold.hold(&bindings[2].key, None), None);
     assert_eq!(cold.disabled(), Some("foreign_owner"));
     for b in &bindings {
-        assert_eq!(cold.hold(&b.key), None);
+        assert_eq!(cold.hold(&b.key, None), None);
         assert_eq!(
             cold.read(&b.key, &placeholder_allowlist()),
             ReadOutcome::Missing
@@ -997,7 +1000,7 @@ fn foreign_owner_disables_the_store_without_rebuilds() {
     assert!(cold.inventory().unwrap().is_empty());
     cold.begin_pass();
     assert_eq!(
-        cold.hold(&bindings[2].key),
+        cold.hold(&bindings[2].key, None),
         None,
         "disabled for the process"
     );
@@ -1053,10 +1056,14 @@ fn t14_rebuilds_are_counted_and_the_breaker_trips_past_twenty() {
         let mut cold = scratch.store();
         cold.begin_pass();
         for b in &bindings {
-            assert_eq!(cold.hold(&b.key), None, "T14 and valid records never hold");
+            assert_eq!(
+                cold.hold(&b.key, None),
+                None,
+                "T14 and valid records never hold"
+            );
         }
         // A repeat in the same pass (the restore seam's re-check) counts once.
-        assert_eq!(cold.hold(&bindings[0].key), None);
+        assert_eq!(cold.hold(&bindings[0].key, None), None);
         let tripped = corrupt_count > 20;
         assert_eq!(cold.counters().t14_rebuild, 20);
         assert_eq!(cold.disabled(), tripped.then_some("t14_breaker"));
@@ -1246,9 +1253,9 @@ fn certificate_samples_are_domain_separated_digests() {
     assert!(admits(&path, &cert).unwrap().unchanged);
     // The envelope layout holds exactly the listed digests: allowlist, four
     // binding digests and two samples.
-    assert_eq!(ENVELOPE_H.len(), 1 + 4 + 2);
+    assert_eq!(ENVELOPE_H.len(), 1 + 4 + 2 + 3);
     assert_eq!(
-        HEADER_BYTES - CERTIFICATE_BYTES,
+        HEADER_BYTES - CERTIFICATE_BYTES - META_BYTES + 9,
         8 + 2 + 32 + 1 + 32 * 4 + 8 + 4
     );
     assert_eq!(
@@ -1493,14 +1500,14 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
             }
             assert_eq!(fs::read(&path).unwrap(), bytes, "{kind} x {seam}");
             let held = (!t14).then_some(reason);
-            assert_eq!(cold.hold(&b.key), held, "{kind} x {seam}");
+            assert_eq!(cold.hold(&b.key, None), held, "{kind} x {seam}");
             assert_eq!(
                 cold.counters().t14_rebuild,
                 u64::from(t14),
                 "{kind} x {seam}"
             );
             assert_eq!(
-                scratch.store().hold(&b.key),
+                scratch.store().hold(&b.key, None),
                 held,
                 "restart {kind} x {seam}"
             );
@@ -1523,10 +1530,10 @@ fn exact_predecessor_memo_reuses_verification_and_invalidates_on_change() {
         )
         .unwrap();
     let mut cold = scratch.store();
-    assert_eq!(cold.hold(&b.key), None);
+    assert_eq!(cold.hold(&b.key, None), None);
     let verified = cold.counters().guard_verify_bytes;
     assert!(verified > 0);
-    assert_eq!(cold.hold(&b.key), None);
+    assert_eq!(cold.hold(&b.key, None), None);
     assert_eq!(cold.counters().guard_verify_bytes, verified);
     let path = record_file(&cold, &b.key);
     let mut bytes = fs::read(&path).unwrap();
@@ -1534,7 +1541,7 @@ fn exact_predecessor_memo_reuses_verification_and_invalidates_on_change() {
     bytes[end] ^= 1;
     put_record(&path, &bytes);
     // T14 is not held: one counted rebuild.
-    assert_eq!(cold.hold(&b.key), None);
+    assert_eq!(cold.hold(&b.key, None), None);
     assert_eq!(cold.counters().t14_rebuild, 1);
     assert!(cold.counters().guard_verify_bytes > verified);
 }
@@ -1660,7 +1667,7 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
     assert_eq!(receipt.budget_refused, 0);
     assert_eq!(receipt.deferred_keys, vec![new.key]);
     let counters = store.counters();
-    assert_eq!(counters.store_write_skipped, [0, 1]);
+    assert_eq!(counters.store_write_skipped, [0, 1, 0]);
     assert_eq!(counters.disk_records, INVENTORY_BOUND as u64 + 1);
     assert!(!record_file(&store, &new.key).exists());
     let record = found(scratch.store().read(&b.key, &placeholder_allowlist()));
@@ -1712,7 +1719,7 @@ fn pinned_v1_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) 
 pub(crate) fn pinned_v1_bytes(record: &PendingRecord, generation: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
     pinned_v1_header(&mut bytes, record, generation);
-    assert_eq!(bytes.len(), HEADER_BYTES);
+    assert_eq!(bytes.len(), V1_HEADER_BYTES);
     bytes.extend_from_slice(&record.body);
     let trailer = Sha256::digest(&bytes);
     bytes.extend_from_slice(&trailer);

@@ -65,6 +65,7 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
     let pending = keys
         .iter()
         .map(|key| PendingRecord {
+            metadata: crate::durable_tail_store::Metadata::default(),
             binding: Binding {
                 source: DurableSource::Codex,
                 key: store::key_digest(DurableSource::Codex, key),
@@ -297,6 +298,16 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
                 lock,
                 index.generation,
                 vec![PendingRecord {
+                    metadata: store::Metadata {
+                        namespace: store::namespace_digest(
+                            &namespace.0,
+                            &interpretation.identity_contract,
+                        ),
+                        body_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
+                            source,
+                        ),
+                        ..store::Metadata::default()
+                    },
                     binding,
                     certificate: certificate(&path, &scope),
                     body,
@@ -448,6 +459,16 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
                 lock,
                 index.generation,
                 vec![PendingRecord {
+                    metadata: store::Metadata {
+                        namespace: store::namespace_digest(
+                            &namespace.0,
+                            &interpretation.identity_contract,
+                        ),
+                        body_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
+                            source,
+                        ),
+                        ..store::Metadata::default()
+                    },
                     binding: binding.clone(),
                     certificate: certificate(&path, &scope),
                     body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
@@ -802,6 +823,8 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
             "undecodable",
             "unbindable",
             "known_corrupt",
+            "recovery_open",
+            "spent_carrier",
             "none",
         ] {
             let corrupt = kind == "known_corrupt";
@@ -856,6 +879,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 // production fresh-index cleanup must delete it.
                 let absent_key = store::key_digest(ds, "/synthetic/absent-known.jsonl");
                 let record = |key| PendingRecord {
+                    metadata: store::Metadata::default(),
                     binding: Binding {
                         source: ds,
                         key,
@@ -884,6 +908,16 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     bytes.truncate(5);
                 } else if kind == "unbindable" {
                     bytes[43] ^= 1;
+                } else if matches!(kind, "recovery_open" | "spent_carrier") {
+                    // Header O and marker O agree; namespace deliberately differs
+                    // from the live namespace for the Spent-carrier arm.
+                    bytes[236] = if kind == "recovery_open" { 1 } else { 2 };
+                    let o = bytes[211..235].to_vec();
+                    bytes[237..261].copy_from_slice(&o);
+                    bytes[261..293].fill(7);
+                    let end = bytes.len() - 32;
+                    let trailer = Sha256::digest(&bytes[..end]);
+                    bytes[end..].copy_from_slice(&trailer);
                 } else if corrupt {
                     let end = bytes.len() - 1;
                     bytes[end] ^= 1;
@@ -1098,6 +1132,8 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     "undecodable",
                     "unbindable",
                     "known_corrupt",
+                    "recovery_open",
+                    "spent_carrier",
                 ]
                 .iter()
                 .position(|class| *class == kind);
@@ -1109,7 +1145,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 } else {
-                    assert_eq!(counts.durable_held, [0; 6]);
+                    assert_eq!(counts.durable_held, [0; 8]);
                 }
                 assert_eq!(counts.restored, 0);
                 let _ = std::fs::remove_dir_all(root);
@@ -1140,6 +1176,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     std::fs::write(&cert_path, b"{}\n").unwrap();
     let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
     let pending = PendingRecord {
+        metadata: crate::durable_tail_store::Metadata::default(),
         binding: Binding {
             source: ds,
             key: store::key_digest(ds, key),
@@ -1164,7 +1201,9 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, false);
     assert!(
-        cache.durable_hold(source, key).is_some(),
+        cache
+            .durable_hold(source, key, None, &ScanIndex::default())
+            .is_some(),
         "control: U holds"
     );
     let _own = OwnUid;
@@ -1174,7 +1213,10 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
         for _ in 0..2 {
             fresh.durable_begin_pass(source, &index_path, &namespace, false);
-            assert_eq!(fresh.durable_hold(source, key), None);
+            assert_eq!(
+                fresh.durable_hold(source, key, None, &ScanIndex::default()),
+                None
+            );
             fresh.durable_alarm(source);
         }
     });
@@ -1207,6 +1249,7 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     let pending = [indexed, absent]
         .iter()
         .map(|key| PendingRecord {
+            metadata: crate::durable_tail_store::Metadata::default(),
             binding: Binding {
                 source: ds,
                 key: store::key_digest(ds, key),
@@ -1314,6 +1357,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
                     .unwrap(),
                 allowlist: codec::allowlist_digest(source),
+                metadata: store::Metadata::default(),
             };
             let bytes = store::tests::pinned_v1_bytes(&pending, index.generation);
             let dir = store::store_dir_for_index(&index_path);
@@ -1395,7 +1439,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 cache.durable_note_scope(source, &key, &scope);
                 cache.durable_gc(lock, source, &index).unwrap();
                 assert_eq!(std::fs::read(&disk).unwrap(), bytes);
-                // An ordinary replacement may exceed an unchanged record/store
+                // V2's larger envelope may exceed an unchanged record/store
                 // budget. It must not delete the still-authoritative v1 image.
                 let mut over_budget = pending.clone();
                 over_budget.binding = expected(ds, source, &key, &scope, &index, &interp, None)
@@ -1505,6 +1549,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             certificate: certificate(&path, &scope),
             body,
             allowlist: codec::allowlist_digest(source),
+            metadata: store::Metadata::default(),
         };
         let bytes = store::tests::pinned_v1_bytes(&pending, 1);
         let lock = test_locks::hold(&root);
@@ -1573,7 +1618,12 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 ReadOutcome::Found(r) => r,
                 other => panic!("{other:?}"),
             };
-            assert_eq!(next.format, store::FORMAT_VERSION);
+            assert_eq!(next.format, 2);
+            assert_eq!(next.record.metadata.counting, fact);
+            assert_eq!(
+                next.record.metadata.ack_owner,
+                store::ack_owner(&pending.binding.key, &pending.certificate)
+            );
             let restart = SharedCache::default();
             restart.durable_begin_pass(source, &index_path, &namespace, false);
             let second = restart
@@ -1587,7 +1637,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                     &interpretation,
                 )
                 .into_test_option()
-                .expect("second restart");
+                .expect("v2 second restart");
             assert_eq!(second.retained.state.durable_counting(), Some(fact));
             // A record whose old pinned binding proves the configured cutover
             // but whose own decoded cutover disagrees is R29, never mapped.

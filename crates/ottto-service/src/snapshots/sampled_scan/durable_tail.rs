@@ -67,7 +67,7 @@ pub(crate) struct Counters {
     pub(crate) missing: u64,
     pub(crate) upgrade_state_missing: u64,
     pub(crate) refused_record: u64,
-    pub(crate) durable_held: [u64; 6],
+    pub(crate) durable_held: [u64; 8],
     pub(crate) held_census: [u64; 2],
     pub(crate) ineligible: BTreeMap<&'static str, u64>,
     pub(crate) certificate_refused: BTreeMap<&'static str, u64>,
@@ -110,9 +110,9 @@ impl Counters {
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
-             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,upgrade_missing]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
+             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,recovery_open,spent_carrier,upgrade_missing]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
-             uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
+             uninventoried_records={} store_write_skipped[unknown,inventory_overflow,recovery_carrier]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={}",
             source.api_slug(),
@@ -435,27 +435,41 @@ impl SharedCache {
         }
     }
 
-    pub(in crate::snapshots) fn durable_hold(
+    pub(crate) fn durable_hold(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
+        opened: Option<&File>,
+        index: &ScanIndex,
     ) -> Option<store::Refusal> {
         let source = durable_source(snapshot_source)?;
-        self.durable()?
-            .slot(source)
-            .as_mut()?
-            .store
-            .hold(&store::key_digest(source, key))
+        let mut stores = self.durable()?;
+        let slot = stores.slot(source).as_mut()?;
+        let interpretation = Interpretation::of(
+            snapshot_source,
+            key,
+            index,
+            slot.identity_capture,
+            &slot.namespace,
+        );
+        let namespace =
+            store::namespace_digest(&slot.namespace.0, &interpretation.identity_contract);
+        let live = opened
+            .map_or_else(|| std::fs::metadata(key), File::metadata)
+            .ok()
+            .map(|m| ([m.dev(), m.ino(), birth_unix_nanos(&m)], namespace));
+        slot.store.hold(&store::key_digest(source, key), live)
     }
 
     pub(in crate::snapshots) fn durable_guard(
         &self,
         source: SnapshotSource,
         candidate: &CandidateFile,
+        opened: Option<&File>,
         index: &mut ScanIndex,
         consume: bool,
     ) -> Option<store::Refusal> {
-        self.durable_hold(source, &local_index_key(&candidate.path))
+        self.durable_hold(source, &local_index_key(&candidate.path), opened, index)
             .or_else(|| {
                 self.durable_upgrade_missing(source, candidate, index, consume)
                     .then_some(store::Refusal::UpgradeMissing)
@@ -558,7 +572,7 @@ impl SharedCache {
         ) {
             Some(taken) => RestoreOutcome::Restored(Box::new(taken)),
             None => self
-                .durable_hold(snapshot_source, key)
+                .durable_hold(snapshot_source, key, Some(held), index)
                 .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
         }
     }
@@ -703,6 +717,18 @@ impl SharedCache {
             .next()
             .and_then(|s| s.parse::<i64>().ok());
         if counting.is_some_and(|c| c.0 != cutover) {
+            return Err(Failure::Ineligible(store::Ineligible::Scope));
+        }
+        if record.format == 2
+            && (record.record.metadata.counting != counting.unwrap_or_default()
+                || record.record.metadata.namespace
+                    != store::namespace_digest(
+                        &interpretation.namespace.0,
+                        &interpretation.identity_contract,
+                    )
+                || record.record.metadata.body_revision
+                    != crate::snapshot_sync::effective_upload_body_witness_revision(source))
+        {
             return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
         let mut rederive = held
@@ -861,6 +887,18 @@ impl SharedCache {
                             certificate,
                             body,
                             allowlist,
+                            metadata: store::Metadata {
+                                namespace: store::namespace_digest(
+                                    &interpretation.namespace.0,
+                                    &interpretation.identity_contract,
+                                ),
+                                body_revision:
+                                    crate::snapshot_sync::effective_upload_body_witness_revision(
+                                        snapshot_source,
+                                    ),
+                                counting: retained.state.durable_counting().unwrap_or_default(),
+                                ..store::Metadata::default()
+                            },
                         });
                     }
                     Err(Refuse::TooLarge) if budget < store::RECORD_BYTES => {

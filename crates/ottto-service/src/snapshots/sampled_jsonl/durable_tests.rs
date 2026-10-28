@@ -1084,6 +1084,18 @@ fn allowlist_digest_binds_source_and_field_classes() {
 /// a new `H` field fails here until it is audited (F1).
 const H_AUDIT: &[(&str, &str)] = &[
     (
+        "Metadata.namespace",
+        "digest(ottto-dt-namespace:v1, namespace + identity barrier)",
+    ),
+    (
+        "Metadata.recovery_digest",
+        "opaque 32-byte H copied verbatim from predecessor",
+    ),
+    (
+        "Metadata.ack_owner",
+        "digest(ottto-dt-ack-owner:v1, stored key + O + head digest)",
+    ),
+    (
         "Binding.context",
         "durable_tail_store::digest(\"ottto-dt-context:v1\", [namespace, upload context])",
     ),
