@@ -35,15 +35,19 @@ fn ack(items: &[SnapshotItem], rejected: &[(usize, &str, bool)]) -> SnapshotBatc
     let refused = |i: usize| rejected.iter().find(|(at, _, _)| *at == i);
     let accepted = (0..items.len())
         .filter(|i| refused(*i).is_none())
-        .map(|i| SnapshotEntityRef {
-            source_session_id: items[i].source_session_id.clone(),
-            snapshot_fingerprint: items[i].snapshot_fingerprint.clone(),
-            occurrence_count: 1,
-            body_witness_version: None,
-            body_witness_digest: None,
-            head_etag: None,
-            head_challenge: None,
-            unchanged_basis: None,
+        .map(|i| {
+            let version =
+                crate::snapshot_client::snapshot_ack_body_witness_version(&items[i]).unwrap();
+            SnapshotEntityRef {
+                source_session_id: items[i].source_session_id.clone(),
+                snapshot_fingerprint: items[i].snapshot_fingerprint.clone(),
+                occurrence_count: 1,
+                body_witness_version: version,
+                body_witness_digest: version.map(|_| snapshot_upload_body_witness(&items[i])),
+                head_etag: None,
+                head_challenge: None,
+                unchanged_basis: None,
+            }
         })
         .collect::<Vec<_>>();
     SnapshotBatchResponse {
