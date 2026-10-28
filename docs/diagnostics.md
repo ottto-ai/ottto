@@ -696,20 +696,27 @@ Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
 
-## Ambiguous Codex state-only coverage
+## Codex state-only coverage and retained bodies
 
-The existing `local_resources` carrier emits stage
-`codex_state_only_ambiguous_identity` with
-`counts.codex_state_only_ambiguous_identity: 1` once per ambiguous rollout index
-entry per state-only pass when no filename candidate matches a committed body
-owner with a last accepted fingerprint. Sum these observations to count refusal
-decisions, not distinct sessions or money. No path, identity or token value is
-logged; no new persisted state or read is introduced.
+Prior state-only coverage uses the existing committed header/counting or
+protected owner hash with its last accepted fingerprint before consulting
+filename evidence. This also covers a header id outside both filename
+candidates. Such Codex index entries survive physical retirement and missing-file
+reconciliation, preserving prior coverage without rereading a transcript.
+Retention keeps the existing entry and strings for each accepted owner-bound
+body; it adds no field, store or cache, but those entries remain resident and
+persisted after their files disappear. Retention alone grants no joined-history,
+account or decoder authority. Claude and Pi retention are unchanged.
 
-When trusted metadata supports both the legacy full-remainder and modern UUID
-identities of a timestamp-shaped filename, prior coverage uses the existing
-committed counting/protected owner plus its accepted fingerprint. Without that
-binding, both candidates are withheld from state-only output, preserving any
-previous exclusive body and its token/model breakdown. Unambiguous legacy and
-modern names retain their existing fallback behavior. This affects Codex only;
-Claude and Pi collection are unchanged.
+When a timestamp-shaped filename has two supported identities and no committed
+owner binding, both candidates are withheld from state-only output. The existing
+`local_resources` carrier emits stage `codex_state_only_ambiguous_identity` with
+`counts.codex_state_only_ambiguous_identity: 1` once per unresolved index entry
+per state-only pass. Sum observations to count decisions, not distinct sessions
+or money. No path, identity or token value is logged. Unambiguous legacy and
+modern names retain their existing filename fallback behavior.
+
+An emitted state-only total is not evidence of a server-side overwrite. Backend
+authority rules independently govern successor acceptance. A later complete
+native parse still emits its exclusive body for the same session even when an
+earlier state-only row exists; local prior coverage does not suppress that body.

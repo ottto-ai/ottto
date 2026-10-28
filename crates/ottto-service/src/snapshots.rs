@@ -4369,6 +4369,16 @@ impl ScanIndexEntry {
             || self.codex_captured_tier_receipt.is_some()
             || self.codex_captured_uncommitted
     }
+    fn codex_has_accepted_body(&self) -> bool {
+        self.last_snapshot_fingerprint.is_some()
+            && [
+                self.codex_counting_owner.as_deref(),
+                self.codex_protected_owner.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(valid_codex_protected_owner)
+    }
     fn codex_history_is_protected(&self) -> bool {
         self.codex_protected_owner.is_some()
             || self.codex_joined_member_set.is_some()
@@ -30112,11 +30122,9 @@ impl OwnedSourceScan {
                     .zip(codex_side_pass.as_ref())
                     .map(|(context, pass)| (&*context.cache, pass.ns));
                 for index_key in &census.removed_index_keys {
-                    if !index
-                        .files
-                        .get(index_key)
-                        .is_some_and(ScanIndexEntry::codex_history_is_protected)
-                    {
+                    if !index.files.get(index_key).is_some_and(|entry| {
+                        entry.codex_history_is_protected() || entry.codex_has_accepted_body()
+                    }) {
                         // A Claude member that vanished beneath its present
                         // parent also drops its unverified audit debt (SOURCE
                         // N2); every other removal keeps that debt. Both
@@ -32362,12 +32370,13 @@ fn append_codex_state_only_snapshots(
         .iter()
         .map(|snapshot| resolve_codex_identity(snapshot.source_session_id.as_str()))
         .collect();
-    // Unchanged rollouts are absent from this page, but their committed split
-    // bodies must not be replaced by unattributed state totals. An ambiguous
-    // filename needs the owner bound to the entry's last accepted body; sidecar
-    // support for both filename grammars cannot choose that owner.
+    // A persisted header binding covers the accepted body even when its id is
+    // outside both filename candidates. Filename evidence is a legacy fallback.
     let mut covered_in_prior_runs = BTreeSet::new();
     for (path, entry) in &index.files {
+        if entry.codex_has_accepted_body() {
+            continue; // Covered by its owner hash below, before filename guesses.
+        }
         let path = Path::new(path);
         if let Some(identity) = metadata.identity_from_path_evidence(path) {
             if entry.last_snapshot_fingerprint.is_some() {
@@ -32376,20 +32385,8 @@ fn append_codex_state_only_snapshots(
             continue;
         }
         let candidates = codex_session_id_candidates_from_path(path);
-        if candidates.len() < 2 {
-            continue;
-        }
-        let committed_owner = entry.last_snapshot_fingerprint.as_ref().and_then(|_| {
-            candidates.iter().find(|identity| {
-                let binding = codex_protected_owner(identity);
-                entry.codex_counting_owner.as_ref() == Some(&binding)
-                    || entry.codex_protected_owner.as_ref() == Some(&binding)
-            })
-        });
-        if let Some(owner) = committed_owner {
-            covered_in_prior_runs.insert(owner.clone());
-        } else {
-            // No accepted owner: neither candidate is safe to replace. This is
+        if candidates.len() > 1 {
+            // No committed owner: neither candidate is safe to replace. This is
             // suppression only, never positive body/account/ownership evidence.
             covered_in_prior_runs.extend(candidates);
             crate::local_resource_diagnostics::codex_state_only_ambiguous_identity();
@@ -32410,6 +32407,13 @@ fn append_codex_state_only_snapshots(
     let protected_owners = protected
         .iter()
         .filter_map(|entry| entry.codex_protected_owner.as_ref())
+        .chain(
+            index
+                .files
+                .values()
+                .filter(|entry| entry.codex_has_accepted_body())
+                .filter_map(|entry| entry.codex_counting_owner.as_ref()),
+        )
         .collect::<BTreeSet<_>>();
     for (source_session_id, thread) in &metadata.state_threads {
         if thread.tokens_used == 0
@@ -47924,7 +47928,7 @@ impl ScanIndex {
         if self
             .files
             .get(key)
-            .is_some_and(ScanIndexEntry::has_unverified_source)
+            .is_some_and(|entry| entry.has_unverified_source() || entry.codex_has_accepted_body())
         {
             return;
         }
@@ -58650,9 +58654,17 @@ mod tests {
             .join("\n") + "\n",
         )
         .unwrap();
-        let native = parse_codex_jsonl_file(&path, "2026-05-14T10:04:00Z", "fixture".into())
-            .unwrap()
-            .remove(0);
+        let mut index = ScanIndex::default();
+        let native = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&dir),
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap()
+        .snapshots
+        .remove(0);
         assert_eq!(native.source_session_id, owner);
         assert_eq!(native.input_tokens, 50);
         assert_eq!(native.cache_read_tokens, 8);
@@ -58676,18 +58688,14 @@ mod tests {
             );
         }
         assert!(metadata.identity_from_path_evidence(&path).is_none());
-        let mut index = ScanIndex::default();
-        index.files.insert(
-            local_index_key(&path),
-            serde_json::from_value(json!({
-                "size_bytes": 1,
-                "modified_unix_seconds": 1,
-                "source_file_fingerprint": "fixture",
-                "last_snapshot_fingerprint": native.snapshot_fingerprint,
-                "last_upload_body_witness": snapshot_upload_body_witness(&native),
-                "codex_counting_owner": codex_protected_owner(owner)
-            }))
-            .unwrap(),
+        index = index.committable_subset(
+            &ScanIndex::default(),
+            &BTreeSet::from([native.snapshot_fingerprint.clone()]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            index.files[&local_index_key(&path)].codex_counting_owner,
+            Some(codex_protected_owner(owner))
         );
         fs::remove_dir_all(dir).unwrap();
         (metadata, index, native)
@@ -58738,12 +58746,46 @@ mod tests {
     }
 
     #[test]
-    fn codex_ambiguous_filename_without_committed_owner_withholds_and_counts() {
-        for binding in [
-            None,
-            Some("malformed".to_string()),
-            Some(codex_protected_owner("unrelated")),
+    fn codex_state_only_covers_a_persisted_header_outside_both_filename_candidates() {
+        let owner = "header-outside-both-candidates";
+        let (mut metadata, index, native) = ambiguous_state_only_fixture(owner);
+        let path = Path::new(index.files.keys().next().unwrap());
+        assert!(!codex_session_id_candidates_from_path(path).contains(&owner.to_string()));
+        metadata.state_threads.insert(
+            owner.into(),
+            CodexStateThread {
+                tokens_used: 900,
+                ..Default::default()
+            },
+        );
+        for mut index in [
+            index.clone(),
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap(),
         ] {
+            let mut replacements = Vec::new();
+            append_codex_state_only_snapshots(
+                &mut replacements,
+                &metadata,
+                "2026-05-14T11:04:00Z",
+                &mut index,
+                &BTreeSet::new(),
+            );
+            assert!(!replacements
+                .iter()
+                .any(|item| item.source_session_id == owner));
+            assert_eq!(
+                replacements.len(),
+                2,
+                "header coverage does not cover unrelated filename candidates"
+            );
+            assert_eq!(native.input_tokens, 50);
+            assert_eq!(native.model_usage[0].model, "gpt-5.5");
+        }
+    }
+
+    #[test]
+    fn codex_ambiguous_filename_without_committed_owner_withholds_and_counts() {
+        for binding in [None, Some("malformed".to_string())] {
             let (metadata, mut index, _) =
                 ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
             index
@@ -58850,7 +58892,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_state_only_replaces_a_deleted_rollout_in_the_same_complete_census() {
+    fn codex_state_only_retains_accepted_body_after_rollout_retirement() {
         let codex_dir = temp_dir("codex-state-deleted-rollout");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -58898,7 +58940,19 @@ mod tests {
         assert_eq!(first.snapshots.len(), 1);
         assert_eq!(first.snapshots[0].unattributed_total_tokens, 0);
 
+        let key = local_index_key(&rollout);
+        index = index.committable_subset(
+            &ScanIndex::default(),
+            &BTreeSet::from([first.snapshots[0].snapshot_fingerprint.clone()]),
+            &BTreeMap::new(),
+        );
+        assert!(index.files[&key].codex_has_accepted_body());
+        let accepted = serde_json::to_value(&index.files[&key]).unwrap();
         fs::remove_file(&rollout).expect("remove rollout while state row remains");
+        index.remove_file_entry(&key); // Exact removal/age paths retain accepted Codex evidence.
+        assert!(index.files.contains_key(&key));
+        let mut index: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
         let replacement = scan_source_roots(
             SnapshotSource::Codex,
             std::slice::from_ref(&sessions_dir),
@@ -58909,16 +58963,14 @@ mod tests {
         .expect("reconcile deletion and state fallback together");
 
         assert!(replacement.census_complete);
-        assert!(index.files.is_empty());
-        let state_only = replacement
-            .snapshots
-            .iter()
-            .find(|snapshot| snapshot.source_session_id == session_id)
-            .expect("same complete generation emits the state-only replacement");
-        assert_eq!(state_only.unattributed_total_tokens, 59);
-        assert_eq!(
-            state_only.provenance.input_token_scope.as_deref(),
-            Some("total_only")
+        assert!(
+            replacement.snapshots.is_empty(),
+            "retired accepted body must not be replaced by state-only output"
+        );
+        assert_eq!(serde_json::to_value(&index.files[&key]).unwrap(), accepted);
+        assert!(
+            !index.files[&key].codex_history_is_protected(),
+            "retention alone adds no joined-history refusal"
         );
         let _ = fs::remove_dir_all(codex_dir);
     }
