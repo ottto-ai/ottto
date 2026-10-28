@@ -782,3 +782,30 @@ holds. Universal archive coverage is not claimed.
 for an archive; the paid main parser uses its stateful factory.
 `codex_zst_refused` reader failures also enter the unreadable census at their
 caller; the direct compatibility API has no census. Refusals retain prior output.
+
+Archive settlement keeps two stamp-bound counts: terminal upload failures
+(Completed without the current body ACK, or Rejected; cap three), and committed
+decode attempts (cap six, including interrupted reservations). Shed, Deferred
+and transport errors do not spend terminal failures. A current body ACK can
+revive either settlement hold; an older body witness cannot. Retry diagnostics
+emit only after the reservation checkpoint succeeds, once per committed attempt.
+
+Terminal archive holds/refusals use `archive_terminal_residue{cause}` instead of
+a sweep-wide unreadable count. `archive_terminal_residue_session_count` is the
+running distinct-session count for that page (not an additive counter). Affected
+sessions remain unknown for state-only, absence retirement and departed-owner
+release decisions; other files can complete census. Bodyless Pending remains
+unreadable within its bounded recovery window. Admission uses unreadable until
+that archive's twelfth consecutive yield, then `admission_starved` residue.
+`codex_zst_admission_alarm.admission_starved_count` counts currently starved keys
+in the existing bounded process map; unrelated admissions never reset them.
+Restart or map eviction loses the RAM-only streak; no durable lifetime bound is
+claimed.
+
+User upload-policy/attribution changes bind one correction generation per archive
+and count A3 `full_reads.user_change` with `compressed_user_change`. Internal
+cache-capability changes do not grant A3. The existing fail-closed HeaderWork
+AC/utility-QoS permission and shared 30 CPU-second counter gate correction reads;
+activation must wire real platform signals before discovery opens. Unapproved
+code replay/body-witness revision changes preserve the historical body and hold
+`CompressedCorrectionUnapplied` without decoding or earning new ACK credit.

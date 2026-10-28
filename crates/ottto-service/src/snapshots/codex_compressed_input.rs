@@ -73,7 +73,7 @@ pub(super) fn compressed_input_credit() -> io::Result<usize> {
         .ok_or_else(|| invalid("compressed rollout credit overflow"))
 }
 
-fn thread_cpu_micros() -> u64 {
+pub(super) fn thread_cpu_micros() -> u64 {
     let mut spec: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: valid writable timespec, querying only the current thread.
     if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } != 0 {
@@ -99,6 +99,23 @@ pub(super) fn admission_streak(key: &str, yielded: bool) -> u8 {
     let count = previous.saturating_add(1).min(13);
     slots.insert(hash, count);
     count
+}
+pub(super) fn admission_starved_count() -> usize {
+    STREAKS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values()
+        .filter(|n| **n >= 12)
+        .count()
+}
+pub(super) fn admission_starved(key: &str) -> bool {
+    use sha2::Digest;
+    let hash: [u8; 32] = sha2::Sha256::digest(key.as_bytes()).into();
+    STREAKS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&hash)
+        .is_some_and(|n| *n >= 12)
 }
 impl super::OwnedSourceScan {
     pub(crate) fn persist_archive_reservation(
@@ -128,6 +145,20 @@ impl super::OwnedSourceScan {
         }
         self.index.generation = committed.generation;
         evidence.reservation_saved = true;
+        if evidence.decode_attempts > 1 && !evidence.user_change {
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_zst_first_read_retry",
+                "codex",
+                &serde_json::json!({"codex_zst_first_read_retry": 1}),
+            );
+        }
+        if evidence.user_change {
+            crate::local_resource_diagnostics::traversal_point(
+                "full_reads",
+                "codex",
+                &serde_json::json!({"full_reads": {"user_change": 1}, "compressed_user_change": 1}),
+            );
+        }
         Ok(())
     }
 }
@@ -146,6 +177,16 @@ pub(crate) struct ArchiveEvidence {
     pub(super) header_validated: Option<ValidatedHeader>,
     #[serde(default)]
     header_attempted: bool,
+    #[serde(default)]
+    pub(super) decode_attempts: u8,
+    #[serde(default)]
+    terminal_failures: u8,
+    #[serde(default)]
+    terminal_attempt: u8,
+    #[serde(default)]
+    pub(super) user_change: bool,
+    #[serde(default)]
+    pub(super) user_context: Option<String>,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ArchiveDisposition {
@@ -226,23 +267,26 @@ impl ArchiveEvidence {
             .next()
             .ok_or_else(|| invalid("compressed rollout logical id unavailable"))?;
         let logical_id = previous.map_or(logical_id, |old| old.logical_id.clone());
-        let attempts = match previous.map(|old| &old.disposition) {
-            Some(ArchiveDisposition::Pending { attempts, .. }) => attempts.saturating_add(1),
-            _ => 1,
-        };
-        if attempts > 1 {
-            crate::local_resource_diagnostics::traversal_point(
-                "codex_zst_first_read_retry",
-                "codex",
-                &BTreeMap::from([("codex_zst_first_read_retry", 1_u64)]),
-            );
-        }
+        let attempts = previous
+            .map_or(0, |old| {
+                old.decode_attempts.max(match old.disposition {
+                    ArchiveDisposition::Pending { attempts, .. } => attempts,
+                    ArchiveDisposition::HeaderValidated => 0,
+                    _ => 1,
+                })
+            })
+            .saturating_add(1);
         Ok(Self {
             stamp: stamp.content_only(),
             logical_id,
             owner: None,
             body_witness: None,
             reservation_saved: false,
+            decode_attempts: attempts,
+            terminal_failures: previous.map_or(0, |a| a.terminal_failures),
+            terminal_attempt: previous.map_or(0, |a| a.terminal_attempt),
+            user_change: previous.is_some_and(|a| a.user_change),
+            user_context: previous.and_then(|a| a.user_context.clone()),
             header_attempted: previous.is_some_and(|a| a.header_attempted),
             header_validated: previous.and_then(|a| a.header_validated.clone()),
             disposition: ArchiveDisposition::Pending {
@@ -288,16 +332,54 @@ impl ArchiveEvidence {
             && !matches!(self.disposition, ArchiveDisposition::HeaderValidated)
             && !matches!(self.disposition, ArchiveDisposition::Pending { retry_after, .. } if super::sampled_scan::now_seconds() >= retry_after)
     }
-    pub(super) fn settle(&mut self, accepted: bool) {
+    pub(super) fn stop_exhausted(&mut self) -> bool {
         if let ArchiveDisposition::Pending { attempts, .. } = self.disposition {
-            if accepted {
-                self.disposition = ArchiveDisposition::Acquired;
-            } else if attempts >= 3 {
-                self.disposition = ArchiveDisposition::Held {
-                    cause: CodexZstCause::SettlementStuck,
-                };
-                codex_zst_refused(CodexZstCause::SettlementStuck);
+            self.decode_attempts = self.decode_attempts.max(attempts);
+        }
+        let cause = if self.terminal_failures >= 3 {
+            Some(CodexZstCause::SettlementStuck)
+        } else if self.decode_attempts >= 6 {
+            Some(CodexZstCause::DecodeBudget)
+        } else {
+            None
+        };
+        if let Some(cause) = cause {
+            self.disposition = ArchiveDisposition::Held { cause };
+            codex_zst_refused(cause); // Per committed attempt, never a quiet-pass counter.
+        }
+        cause.is_some()
+    }
+    pub(super) fn settle(&mut self, accepted: bool, terminal: bool) {
+        let pending = matches!(self.disposition, ArchiveDisposition::Pending { .. });
+        let stuck = matches!(
+            self.disposition,
+            ArchiveDisposition::Held {
+                cause: CodexZstCause::SettlementStuck | CodexZstCause::DecodeBudget
             }
+        );
+        if !(pending || stuck) {
+            return;
+        }
+        if accepted {
+            self.disposition = ArchiveDisposition::Acquired;
+            self.user_change = false;
+        } else if pending {
+            if terminal
+                && self.body_witness.is_some()
+                && self.terminal_attempt < self.decode_attempts
+            {
+                self.terminal_failures = self.terminal_failures.saturating_add(1);
+                self.terminal_attempt = self.decode_attempts;
+            }
+            self.stop_exhausted();
+        }
+    }
+    pub(super) fn terminal_cause(&self) -> Option<CodexZstCause> {
+        match self.disposition {
+            ArchiveDisposition::Held { cause } | ArchiveDisposition::Refused { cause } => {
+                Some(cause)
+            }
+            _ => None,
         }
     }
     pub(super) fn invalid_header(&self, path: &Path, metadata: &std::fs::Metadata) -> bool {
@@ -599,7 +681,115 @@ pub(super) struct HeaderWork {
     pub(super) cpu_micros: u64,
 }
 crate::heap_layout_bound::fields!(HeaderWork; allowed, physical_bytes, decoded_bytes, cpu_micros);
+impl super::ScanCensus {
+    pub(super) fn archive_failure(
+        &mut self,
+        index: &super::ScanIndex,
+        path: &Path,
+        normal: super::UnreadableCause,
+    ) {
+        let key = super::local_index_key(path);
+        let archive = index.files.get(&key).and_then(|e| e.archive.as_deref());
+        if let Some(cause) = archive
+            .and_then(|a| a.terminal_cause())
+            .or_else(|| admission_starved(&key).then_some(CodexZstCause::AdmissionStarved))
+        {
+            self.archive_residue(path, archive, cause);
+        } else {
+            self.record_unreadable(normal, 1);
+        }
+    }
+
+    pub(super) fn archive_residue(
+        &mut self,
+        path: &Path,
+        archive: Option<&ArchiveEvidence>,
+        cause: CodexZstCause,
+    ) {
+        self.archive_terminal_sessions
+            .extend(super::codex_session_id_candidates_from_path(
+                &path.with_extension(""),
+            ));
+        if let Some(archive) = archive {
+            self.archive_terminal_sessions
+                .insert(archive.logical_id.clone());
+        }
+        crate::local_resource_diagnostics::traversal_point(
+            "archive_terminal_residue",
+            "codex",
+            &serde_json::json!({
+                "archive_terminal_residue": BTreeMap::from([(cause, 1)]),
+                "archive_terminal_residue_session_count": self.archive_terminal_sessions.len(),
+            }),
+        );
+    }
+}
 impl super::ScanIndex {
+    pub(super) fn archive_scoped_unknown(&self, key: &str) -> bool {
+        let Some(t) = self.traversal.as_ref() else {
+            return false;
+        };
+        self.files
+            .get(key)
+            .and_then(|e| e.codex_counting_owner.as_ref())
+            .is_some_and(|o| {
+                t.residue
+                    .blocked_session_ids
+                    .iter()
+                    .any(|id| super::codex_protected_owner(id) == *o)
+            })
+            || super::codex_session_id_candidates_from_path(Path::new(key))
+                .iter()
+                .any(|o| t.residue.blocked_session_ids.contains(o))
+    }
+    pub(crate) fn activate_archive_user_context(&mut self, context: String) {
+        self.active_archive_user_context = Some(context.clone());
+        for entry in self.files.values_mut() {
+            let Some(archive) = entry.archive.as_mut() else {
+                continue;
+            };
+            let changed = archive
+                .user_context
+                .as_ref()
+                .is_some_and(|old| old != &context);
+            archive.user_context = Some(context.clone());
+            if changed
+                && matches!(
+                    archive.disposition,
+                    ArchiveDisposition::Acquired
+                        | ArchiveDisposition::Pending { .. }
+                        | ArchiveDisposition::Held {
+                            cause: CodexZstCause::CorrectionUnapplied
+                        }
+                )
+            {
+                archive.user_change = true;
+                archive.body_witness = None;
+                archive.disposition = ArchiveDisposition::Pending {
+                    attempts: archive.decode_attempts,
+                    retry_after: 0,
+                };
+            }
+        }
+    }
+    pub(super) fn hold_archive_corrections(&mut self, revision: Option<u64>) {
+        for entry in self.files.values_mut() {
+            if revision.is_some_and(|r| entry.effective_upload_body_witness_revision >= r) {
+                continue;
+            }
+            if let Some(archive) = entry
+                .archive
+                .as_mut()
+                .filter(|a| matches!(a.disposition, ArchiveDisposition::Acquired))
+            {
+                archive.disposition = ArchiveDisposition::Held {
+                    cause: CodexZstCause::CorrectionUnapplied,
+                };
+                codex_zst_refused(CodexZstCause::CorrectionUnapplied);
+            }
+        }
+    }
+
     pub fn codex_archive_cli_version(&self, path: &Path) -> Option<&str> {
         self.archive_header(path)?.cli_version()
     }
@@ -641,6 +831,7 @@ impl super::ScanIndex {
         let started = thread_cpu_micros();
         let mut evidence = ArchiveEvidence::begin(&file, &candidate.path, old)?;
         evidence.disposition = ArchiveDisposition::HeaderValidated;
+        evidence.decode_attempts = 0;
         let mut input = match cache.map(|cache| OpenedInput::funded(file, cache)) {
             Some(Ok(input)) => input.context("header admission unavailable")?.header_only(),
             _ => {
@@ -702,21 +893,32 @@ impl super::ScanIndex {
         }
         result.map(|header| (header, physical as usize))
     }
+    #[cfg(test)]
     pub(crate) fn settle_archive_bodies(&mut self, accepted: &BTreeMap<String, String>) {
+        self.settle_archive_outcome(accepted, true, None);
+    }
+    pub(crate) fn settle_archive_outcome(
+        &mut self,
+        accepted: &BTreeMap<String, String>,
+        terminal: bool,
+        submitted: Option<&BTreeMap<String, String>>,
+    ) {
         for (key, entry) in &mut self.files {
             if let Some(archive) = entry.archive.as_mut() {
-                let bodies = self
-                    .file_snapshot_fingerprints
-                    .get(key)
-                    .into_iter()
-                    .flatten()
-                    .map(|fp| accepted.get(fp))
-                    .collect::<Option<BTreeSet<_>>>()
-                    .filter(|bodies| !bodies.is_empty());
-                let settled = bodies
-                    .map(super::snapshot_file_upload_body_set_hex)
-                    .is_some_and(|witness| Some(witness) == archive.body_witness);
-                archive.settle(settled);
+                let matches = |facts: &BTreeMap<String, String>| {
+                    self.file_snapshot_fingerprints
+                        .get(key)
+                        .into_iter()
+                        .flatten()
+                        .map(|fp| facts.get(fp))
+                        .collect::<Option<BTreeSet<_>>>()
+                        .filter(|b| !b.is_empty())
+                        .map(super::snapshot_file_upload_body_set_hex)
+                        .is_some_and(|w| Some(w) == archive.body_witness)
+                };
+                let settled = matches(accepted);
+                let terminal = terminal && submitted.map_or(true, matches);
+                archive.settle(settled, terminal);
             }
         }
     }
@@ -736,7 +938,7 @@ impl super::ScanIndex {
         }
     }
 }
-crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, disposition, body_witness, reservation_saved, header_validated, header_attempted);
+crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, disposition, body_witness, reservation_saved, header_validated, header_attempted, decode_attempts, terminal_failures, terminal_attempt, user_change, user_context);
 impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)
@@ -746,6 +948,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
 #[cfg(test)]
 pub(in crate::snapshots) mod tests {
     include!("codex_archive_header_tests.rs");
+    include!("codex_archive_correction_tests.rs");
     use super::super::*;
     use super::*;
     use crate::transcript_acquisition::Scope;
@@ -1291,7 +1494,10 @@ pub(in crate::snapshots) mod tests {
                     let (saved, result, rows, _) = archive_pass(&f, checkpoint(&state), true, None);
                     assert_eq!(decodes(&rows), 0);
                     assert!(result.snapshots.is_empty());
-                    assert!(result.unreadable_path_count > 0);
+                    assert_eq!(
+                        result.unreadable_path_count, 0,
+                        "terminal archive uses scoped residue"
+                    );
                     assert!(saved.codex_parent_ownership_ledgers.is_empty());
                     assert!(saved.accepted_snapshot_fingerprints.is_empty());
                     state = saved;
@@ -1356,7 +1562,10 @@ pub(in crate::snapshots) mod tests {
             let (_, result, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
             assert_eq!(decodes(&rows), 0);
             assert!(result.snapshots.is_empty());
-            assert!(result.unreadable_path_count > 0);
+            assert_eq!(
+                result.unreadable_path_count, 0,
+                "terminal archive uses scoped residue"
+            );
         }
     }
     #[test]
@@ -1638,7 +1847,7 @@ pub(in crate::snapshots) mod tests {
     }
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
-    fn archive_interrupted_third_attempt_sticks_and_content_change_resets_attempts() {
+    fn archive_interrupted_decode_budget_sticks_and_content_change_resets_attempts() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1655,20 +1864,28 @@ pub(in crate::snapshots) mod tests {
             .as_mut()
             .unwrap()
             .disposition = ArchiveDisposition::Pending {
-            attempts: 3,
+            attempts: 6,
             retry_after: 0,
         };
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .archive
+            .as_mut()
+            .unwrap()
+            .decode_attempts = 6;
         let (held, result, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
-        assert_eq!(decodes(&rows), 0, "restart must not admit attempt four");
+        assert_eq!(decodes(&rows), 0, "restart must not admit attempt seven");
         assert!(result.snapshots.is_empty());
         assert!(held.accepted_snapshot_fingerprints.is_empty());
         assert!(matches!(
             held.files[&key].archive.as_ref().unwrap().disposition,
             ArchiveDisposition::Held {
-                cause: CodexZstCause::SettlementStuck
+                cause: CodexZstCause::DecodeBudget
             }
         ));
-        for (n, cause) in [CodexZstCause::SettlementStuck, CodexZstCause::DecodeFailed]
+        for (n, cause) in [CodexZstCause::DecodeBudget, CodexZstCause::DecodeFailed]
             .into_iter()
             .enumerate()
         {
@@ -1844,7 +2061,7 @@ pub(in crate::snapshots) mod tests {
             let (next, result, rows, _) = archive_pass(&f, index, false, None);
             assert!(next.files.is_empty());
             assert_eq!(decodes(&rows), 0);
-            assert!(result.unreadable_path_count > 0);
+            assert_eq!(result.unreadable_path_count > 0, pass < 12);
             assert_eq!(
                 rows.iter()
                     .filter(|r| r["stage"] == "codex_zst_refused")
