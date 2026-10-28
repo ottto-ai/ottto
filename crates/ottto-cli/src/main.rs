@@ -3199,7 +3199,7 @@ mod tests {
 
     #[test]
     fn doctor_human_output_surfaces_reconnect_finding_before_daemon_running() {
-        let guidance = "Connection binding is unreadable; run `ottto login` to reconnect this Mac and resume uploads";
+        let guidance = "Connection binding is unreadable; get a fresh claim code from Ottto Apps, then run `ottto login --claim-code <code>` to reconnect this Mac and resume uploads";
         let mut payload = status_response().payload.unwrap();
         payload["canonical_health"] = serde_json::json!({"blockers":[{
             "code":"connection_binding_unreadable", "clear_condition":guidance

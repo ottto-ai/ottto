@@ -2952,7 +2952,7 @@ fn local_health_blockers_for_status(
             "account",
             LocalHealthAuthority::Setup,
             &status.generated_at,
-            "Connection binding is unreadable; run `ottto login` to reconnect this Mac and resume uploads",
+            "Connection binding is unreadable; get a fresh claim code from Ottto Apps, then run `ottto login --claim-code <code>` to reconnect this Mac and resume uploads",
         ));
     }
     if !runtime.protocol_match || !runtime.schema_match {
@@ -4958,7 +4958,7 @@ mod tests {
             assert!(problem.clear_condition.contains("Connection binding"));
             assert!(problem
                 .clear_condition
-                .contains("`ottto login` to reconnect"));
+                .contains("`ottto login --claim-code <code>` to reconnect"));
             assert!(!problem.clear_condition.contains(root.to_str().unwrap()));
         }
         std::fs::remove_file(root.join("connection.json")).unwrap();
