@@ -28941,6 +28941,12 @@ impl OwnedSourceScan {
                         pending!();
                     }
                 };
+                let archive_singleton = codex_join_inventory
+                    .as_ref()
+                    .zip(archive_owner.as_deref())
+                    .map_or(true, |(inventory, owner)| {
+                        !inventory.bound_owner_has_sibling(&candidate.path, owner)
+                    });
                 if let Some(evidence) = index
                     .files
                     .get_mut(&local_index_key(&candidate.path))
@@ -28949,6 +28955,13 @@ impl OwnedSourceScan {
                     index
                         .codex_state_only_blocked_session_ids
                         .extend(archive_owner.iter().cloned());
+                    if !archive_singleton {
+                        evidence.disposition = ArchiveDisposition::Held {
+                            cause: CodexZstCause::OutputHeld,
+                        };
+                        codex_zst_refused(CodexZstCause::OutputHeld);
+                        pending!();
+                    }
                     if !evidence.finish(archive_owner, &candidate.path, &parsed_file) {
                         census.record_unreadable(UnreadableCause::Reduction, 1);
                         if !matches!(evidence.disposition, ArchiveDisposition::Pending { .. }) {
@@ -48468,10 +48481,7 @@ impl ScanIndex {
             );
         };
         if let Some(archive) = &entry.archive {
-            let reason = if matches!(
-                archive.disposition,
-                ArchiveDisposition::HeaderValidated | ArchiveDisposition::HeaderBoundReached
-            ) {
+            let reason = if matches!(archive.disposition, ArchiveDisposition::HeaderValidated) {
                 CandidateParseReason::NewFile
             } else {
                 CandidateParseReason::UnknownOutcome

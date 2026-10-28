@@ -289,6 +289,23 @@ pub(super) enum HeaderStep {
 }
 
 impl HeaderInventory {
+    pub(super) fn bound_owner_has_sibling(&self, path: &Path, owner: &str) -> bool {
+        self.first_read_archives.contains(&local_index_key(path))
+            && (self.headers.iter().any(|header| header.owner == owner)
+                || self
+                    .first_read_archives
+                    .iter()
+                    .chain(&self.held_archives)
+                    .chain(&self.deferred_archives)
+                    .any(|key| {
+                        Path::new(key) != path
+                            && codex_session_id_candidates_from_path(
+                                &Path::new(key).with_extension(""),
+                            )
+                            .iter()
+                            .any(|hint| hint == owner)
+                    }))
+    }
     pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
         self.complete && !owner.is_some_and(|owner| self.held_owners.contains(owner))
     }
@@ -370,7 +387,6 @@ impl HeaderInventory {
         let compressed = is_compressed_codex_rollout(Some(&path), None);
         let mut excluded = false;
         let mut deferred = false;
-        let mut bound_reached = false;
         let result = (|| -> Result<Option<HeaderWitness>> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
@@ -421,7 +437,6 @@ impl HeaderInventory {
                             Ok((h.owner, h.created_unix_ms, metadata_witness(&stat), 0))
                         }
                         codex_compressed_input::HeaderRead::BoundReached => {
-                            bound_reached = true;
                             return Ok(None);
                         }
                         codex_compressed_input::HeaderRead::Deferred => {
@@ -462,14 +477,13 @@ impl HeaderInventory {
                 self.deferred_archives.insert(key);
                 return HeaderStep::Deferred;
             }
-            Ok(None) if bound_reached => {
+            Ok(None) => {
                 self.held_owners
                     .extend(codex_session_id_candidates_from_path(
                         &Path::new(&key).with_extension(""),
                     ));
                 self.first_read_archives.insert(key);
             }
-            Ok(None) => unreachable!("header outcome"),
             Err(_) if excluded => {
                 self.held_owners
                     .extend(codex_session_id_candidates_from_path(
