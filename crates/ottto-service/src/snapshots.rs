@@ -4369,16 +4369,6 @@ impl ScanIndexEntry {
             || self.codex_captured_tier_receipt.is_some()
             || self.codex_captured_uncommitted
     }
-    fn codex_has_accepted_body(&self) -> bool {
-        self.last_snapshot_fingerprint.is_some()
-            && [
-                self.codex_counting_owner.as_deref(),
-                self.codex_protected_owner.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .any(valid_codex_protected_owner)
-    }
     fn codex_history_is_protected(&self) -> bool {
         self.codex_protected_owner.is_some()
             || self.codex_joined_member_set.is_some()
@@ -5231,6 +5221,19 @@ fn claude_index_file_body_accepted(
                                 .contains_key(fingerprint)
                     })
             })
+}
+
+// A file checkpoint may also describe a permanent refusal. Owner coverage and
+// physical-retirement retention require the existing non-quarantined ACK proof.
+fn codex_index_file_body_accepted(index: &ScanIndex, key: &str, entry: &ScanIndexEntry) -> bool {
+    [
+        entry.codex_counting_owner.as_deref(),
+        entry.codex_protected_owner.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(valid_codex_protected_owner)
+        && claude_index_file_body_accepted(index, key, entry)
 }
 
 /// Whether the accepted ledger is current and not being rebuilt by the
@@ -30123,7 +30126,8 @@ impl OwnedSourceScan {
                     .map(|(context, pass)| (&*context.cache, pass.ns));
                 for index_key in &census.removed_index_keys {
                     if !index.files.get(index_key).is_some_and(|entry| {
-                        entry.codex_history_is_protected() || entry.codex_has_accepted_body()
+                        entry.codex_history_is_protected()
+                            || codex_index_file_body_accepted(index, index_key, entry)
                     }) {
                         // A Claude member that vanished beneath its present
                         // parent also drops its unverified audit debt (SOURCE
@@ -32374,7 +32378,7 @@ fn append_codex_state_only_snapshots(
     // outside both filename candidates. Filename evidence is a legacy fallback.
     let mut covered_in_prior_runs = BTreeSet::new();
     for (path, entry) in &index.files {
-        if entry.codex_has_accepted_body() {
+        if codex_index_file_body_accepted(index, path, entry) {
             continue; // Covered by its owner hash below, before filename guesses.
         }
         let path = Path::new(path);
@@ -32410,9 +32414,9 @@ fn append_codex_state_only_snapshots(
         .chain(
             index
                 .files
-                .values()
-                .filter(|entry| entry.codex_has_accepted_body())
-                .filter_map(|entry| entry.codex_counting_owner.as_ref()),
+                .iter()
+                .filter(|(key, entry)| codex_index_file_body_accepted(index, key, entry))
+                .filter_map(|(_, entry)| entry.codex_counting_owner.as_ref()),
         )
         .collect::<BTreeSet<_>>();
     for (source_session_id, thread) in &metadata.state_threads {
@@ -41853,6 +41857,10 @@ fn reconcile_missing_index_entries_with_side(
                 .files
                 .get(key)
                 .is_some_and(ScanIndexEntry::retain_history_evidence)
+            && !index
+                .files
+                .get(key)
+                .is_some_and(|entry| codex_index_file_body_accepted(index, key, entry))
             && !sampled_audit::awaits_hold_deadline_restoration(index, key)
             && codex_counting_version::tombstone_before_retire(index, key)
         {
@@ -47925,11 +47933,9 @@ impl ScanIndex {
         if self.decode_holds_file(key) {
             return;
         }
-        if self
-            .files
-            .get(key)
-            .is_some_and(|entry| entry.has_unverified_source() || entry.codex_has_accepted_body())
-        {
+        if self.files.get(key).is_some_and(|entry| {
+            entry.has_unverified_source() || codex_index_file_body_accepted(self, key, entry)
+        }) {
             return;
         }
         for session_id in codex_session_id_candidates_from_path(Path::new(key)) {
@@ -58655,16 +58661,16 @@ mod tests {
         )
         .unwrap();
         let mut index = ScanIndex::default();
-        let native = scan_source_roots(
+        let mut scan = scan_source_roots(
             SnapshotSource::Codex,
             std::slice::from_ref(&dir),
             &mut index,
             "2026-05-14T10:04:00Z",
             BACKFILL_WINDOW_DAYS,
         )
-        .unwrap()
-        .snapshots
-        .remove(0);
+        .unwrap();
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        let native = scan.snapshots.remove(0);
         assert_eq!(native.source_session_id, owner);
         assert_eq!(native.input_tokens, 50);
         assert_eq!(native.cache_read_tokens, 8);
@@ -58892,6 +58898,45 @@ mod tests {
     }
 
     #[test]
+    fn codex_retirement_does_not_treat_quarantine_as_accepted_body_coverage() {
+        let owner = "019e253c-9999-7000-9000-cccccccccccc";
+        for reconcile in [false, true] {
+            let (metadata, mut index, native) = ambiguous_state_only_fixture(owner);
+            let key = index.files.keys().next().unwrap().clone();
+            index.accepted_snapshot_fingerprints.clear();
+            index.quarantined_snapshot_fingerprints.insert(
+                native.snapshot_fingerprint.clone(),
+                snapshot_quarantine_record(SnapshotSource::Codex),
+            );
+            assert!(!codex_index_file_body_accepted(
+                &index,
+                &key,
+                &index.files[&key]
+            ));
+            if reconcile {
+                let mut traversal = terminal_unhealthy_traversal("fixture".into());
+                traversal.reconciliation_upper_bound = Some(key.clone());
+                index.traversal = Some(traversal);
+                assert!(reconcile_missing_index_entries_with_limit(&mut index, 10));
+            } else {
+                index.remove_file_entry(&key);
+            }
+            assert!(!index.files.contains_key(&key));
+            let mut replacements = Vec::new();
+            append_codex_state_only_snapshots(
+                &mut replacements,
+                &metadata,
+                "2026-05-14T11:04:00Z",
+                &mut index,
+                &BTreeSet::new(),
+            );
+            assert!(replacements.iter().any(
+                |item| item.source_session_id == owner && item.unattributed_total_tokens == 900
+            ));
+        }
+    }
+
+    #[test]
     fn codex_state_only_retains_accepted_body_after_rollout_retirement() {
         let codex_dir = temp_dir("codex-state-deleted-rollout");
         let sessions_dir = codex_dir.join("sessions");
@@ -58928,7 +58973,7 @@ mod tests {
         drop(connection);
         let mut index = ScanIndex::default();
 
-        let first = scan_source_roots(
+        let mut first = scan_source_roots(
             SnapshotSource::Codex,
             std::slice::from_ref(&sessions_dir),
             &mut index,
@@ -58936,6 +58981,7 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("scan file-backed session");
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
         assert!(first.census_complete);
         assert_eq!(first.snapshots.len(), 1);
         assert_eq!(first.snapshots[0].unattributed_total_tokens, 0);
@@ -58946,7 +58992,11 @@ mod tests {
             &BTreeSet::from([first.snapshots[0].snapshot_fingerprint.clone()]),
             &BTreeMap::new(),
         );
-        assert!(index.files[&key].codex_has_accepted_body());
+        assert!(codex_index_file_body_accepted(
+            &index,
+            &key,
+            &index.files[&key]
+        ));
         let accepted = serde_json::to_value(&index.files[&key]).unwrap();
         fs::remove_file(&rollout).expect("remove rollout while state row remains");
         index.remove_file_entry(&key); // Exact removal/age paths retain accepted Codex evidence.

@@ -700,7 +700,9 @@ explicit release, including real durable I/O paths.
 
 Prior state-only coverage uses the existing committed header/counting or
 protected owner hash with its last accepted fingerprint before consulting
-filename evidence. This also covers a header id outside both filename
+filename evidence. Accepted-body retention and coverage require nonempty exact
+file incidence whose entities are in the accepted ledger and not quarantined;
+a permanent refusal or local wire-size rejection grants neither. This also covers a header id outside both filename
 candidates. Such Codex index entries survive physical retirement and missing-file
 reconciliation, preserving prior coverage without rereading a transcript.
 Retention keeps the existing entry and strings for each accepted owner-bound
