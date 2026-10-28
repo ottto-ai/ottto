@@ -2709,7 +2709,7 @@ fn accrue_equivalent(
 
 /// Why `cursor_continuation_ready` refused a ticket. Every refusal sends the
 /// next page to the ordinary cadence.
-#[cfg_attr(not(test), allow(dead_code))] // Read by StateMissing's adapter (inert).
+// Read by StateMissing's adapter (inert).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum ReadyRefusal {
     /// The cursor state is poisoned.
@@ -2784,7 +2784,7 @@ impl SharedCache {
     /// `cursor_continuation_ready`: whether `ticket`'s attempt is still the
     /// paused job, for its namespace, in this cursor state, and accelerated.
     /// Under the cursor lock, with no IO.
-    #[cfg_attr(not(test), allow(dead_code))] // StateMissing's entry (inert).
+    // StateMissing's entry (inert).
     pub(in crate::snapshots) fn cursor_continuation_ready(
         &self,
         ticket: &CodexCursorTicket,
@@ -2795,7 +2795,7 @@ impl SharedCache {
 
     /// Stage 1 (D): the index keys of a ready ticket's job members: the only
     /// paths a continuation page selects. None unless the ticket is ready.
-    #[cfg_attr(not(test), allow(dead_code))] // StateMissing's entry (inert).
+    // StateMissing's entry (inert).
     pub(in crate::snapshots) fn continuation_members(
         &self,
         ticket: &CodexCursorTicket,
@@ -2842,12 +2842,12 @@ impl SharedCache {
 /// methods. StateMissing's `CursorContinuation` adapter wraps it in its own
 /// file; nothing in production builds one while continuation pages are
 /// disabled.
-#[cfg_attr(not(test), allow(dead_code))] // StateMissing's adapter (inert).
+// StateMissing's adapter (inert).
 pub(crate) struct CodexCursorPort {
     cache: Arc<SharedCache>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // StateMissing's adapter (inert).
+// StateMissing's adapter (inert).
 impl CodexCursorPort {
     pub(crate) fn new(cache: Arc<SharedCache>) -> Self {
         Self { cache }

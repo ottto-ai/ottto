@@ -4328,7 +4328,6 @@ fn e2_native_heap_walk_admits_optional_metadata_in_both_modes() {
 #[test]
 fn e2_virgin_live_maps_have_no_heap_and_initialized_empty_maps_stay_charged() {
     use crate::heap_layout_bound::{Counter, HeapLayoutBound};
-    #[allow(dead_code)]
     struct BeforeInitializationBit {
         grains: BTreeMap<
             (

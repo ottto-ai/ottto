@@ -276,7 +276,7 @@ pub(crate) enum KindsVersion {
 /// What the reader knows about the line being classified.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LineCtx<'a> {
-    #[allow(dead_code)] // Informational: no reader branches on it.
+    // Informational: no reader branches on it.
     pub(crate) agent: Agent,
     /// Whether the line belongs to the session's first request.
     pub(crate) request_1: Request1,
@@ -512,7 +512,7 @@ pub(crate) fn claude_attachment(ctx: &LineCtx, att: &ClaudeAttachment) -> Verdic
 
 /// Whether kinds_version 2 knows a Claude attachment type; unknown types
 /// count as `automatic_additions` / `other` (a health counter's input).
-#[allow(dead_code)] // Read once the reader keeps health counters.
+// Read once the reader keeps health counters.
 pub(crate) fn claude_attachment_known(att_type: &str) -> bool {
     v2::claude_attachment_known(att_type)
 }

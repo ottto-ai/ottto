@@ -65,7 +65,6 @@ impl CodexCounting {
 
     /// Local, content-free receipts for the diagnostics owner to fold in
     /// before the accumulator is consumed (no consumer yet: activation gate).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn counters(&self) -> Option<&OccurrenceCounters> {
         self.reducer.as_ref().map(|reducer| &reducer.counters)
     }

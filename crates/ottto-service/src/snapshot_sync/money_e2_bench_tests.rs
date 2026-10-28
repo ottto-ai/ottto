@@ -31,7 +31,6 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 /// The pre-E2 reference build. The job swaps the candidate hook below for
 /// this module in its second checkout, which has no E2 path to gate.
-#[allow(dead_code)]
 mod reference_hook {
     pub(super) const STATE: &str = "reference";
 

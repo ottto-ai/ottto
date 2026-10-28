@@ -193,7 +193,7 @@ pub(super) enum PageEnd {
     Eof(EofCompletion),
     /// The lease was lost, the page was dropped, or the process is stopping.
     /// Nothing was saved.
-    #[allow(dead_code)] // No stop signal reaches a page yet; the fakes use it.
+    // No stop signal reaches a page yet; the fakes use it.
     Cancelled,
     /// A local error (a failed load, a worker that panicked or could not
     /// keep its invariants). Nothing was saved.
@@ -250,7 +250,7 @@ impl CursorContinuation for NoCursorContinuation {
 /// A platform answer. Anything but `Allowed` falls back to the ordinary
 /// cadence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `Refused` comes from the platform hunk under review.
+// `Refused` comes from the platform hunk under review.
 pub(super) enum PlatformState {
     Allowed,
     Refused,

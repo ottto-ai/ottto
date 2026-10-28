@@ -32080,7 +32080,6 @@ for line in sys.stdin:
         // A daemon from before caller attribution reads the new file: the
         // schema version is unchanged and the additive fields are ignored.
         #[derive(Deserialize)]
-        #[allow(dead_code)]
         struct PreAttributionBreaker {
             schema_version: u16,
             account_identifier_hash: String,

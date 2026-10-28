@@ -2,7 +2,6 @@
 //! Discovery does not enumerate compressed rollouts yet. Activation must also
 //! bind the header, plain/compressed twin identity and decoder credit at each
 //! open site before it constructs `OpenedInput::compressed`.
-#![cfg_attr(not(test), allow(dead_code))]
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;

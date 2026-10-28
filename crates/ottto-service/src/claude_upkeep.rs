@@ -150,7 +150,6 @@ enum ClaimOutcome {
 
 // Only test runners construct the process outcomes now that the production
 // runner never spawns (Phase 0).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorProcessResult {
     ExitZero,
@@ -556,7 +555,6 @@ fn observe_registered_slot_upkeep_reading(
 // Phase 0: the foreground no longer reads worker witnesses (an old
 // `Backoff`/`InProgress` witness must not be resurrected for an expired
 // slot). Kept for the dormant worker and its tests until Phase 1 replaces it.
-#[cfg_attr(not(test), allow(dead_code))]
 fn persisted_production_upkeep_observation(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     now: OffsetDateTime,
@@ -595,7 +593,6 @@ fn persisted_production_upkeep_observation(
 // Phase 0: nothing enqueues the background worker. It is kept, dormant and
 // unable to spawn (`ProductionDoctorProcessRunner` returns `Disabled`), until
 // Phase 1 replaces it with a consented, waiting refresher.
-#[allow(dead_code)]
 fn enqueue_production_upkeep(
     descriptor: ClaudeConfigSlotDescriptorV1,
 ) -> Result<(), OffsetDateTime> {

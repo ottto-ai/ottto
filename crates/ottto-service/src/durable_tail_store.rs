@@ -25,7 +25,7 @@
 //!   uploaded.
 //! - Writes and GC require the state-directory single-writer lock
 //!   (`SingleWriter`); this layer adds no lock of its own.
-#![cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
+// First production caller: the M1 restore hook.
 
 use crate::transcript_acquisition::DurableCertificate;
 use sha2::{Digest, Sha256};

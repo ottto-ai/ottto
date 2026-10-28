@@ -17,7 +17,6 @@
 //! The stores live beside the RAM cache for the process lifetime and are not
 //! part of its state budget: each holds at most `MAX_RECORDS` 64-byte digest
 //! pairs (`STORES_RESIDENT_BOUND`).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;

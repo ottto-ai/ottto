@@ -70,7 +70,7 @@ impl IntegratedSlot {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)] // Historical fault adapters retained for the canonical transport fixture.
+// Historical fault adapters retained for the canonical transport fixture.
 enum IntegratedScript {
     Ack,
     FallbackShed,

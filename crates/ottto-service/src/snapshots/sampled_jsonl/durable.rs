@@ -9,7 +9,6 @@
 //! up to the latest mark, at most `HEAD_BOUND` bytes, and preads at most one
 //! named line (the title); every value must hash-equal its digest, else the
 //! entry reads in Full.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};

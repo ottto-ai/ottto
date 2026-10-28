@@ -9656,9 +9656,7 @@ struct SetupRunCredentials {
 #[derive(Debug, Deserialize)]
 struct SetupRunDisconnectResponse {
     setup_run_id: String,
-    #[allow(dead_code)]
     run_status: String,
-    #[allow(dead_code)]
     client_disconnected: bool,
     disconnected_at: String,
     /// True only when the server authenticated the release proof and revoked
@@ -11373,7 +11371,6 @@ struct InstallSessionApiResponse {
     install_session_token: String,
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct TelemetryDeviceRegisterApiResponse {
     device: TelemetryDeviceApiResponse,
