@@ -97,10 +97,15 @@ fn correction_waits_for_power_and_a4_keeps_historical_witness_without_decode() {
     index.settle_archive_outcome(&ack_bodies(&first), true, None);
     index.activate_archive_user_context("A".into());
     let old = archive_evidence(&index, &f).body_witness.clone();
+    let prior_incidence = index.file_snapshot_fingerprints.clone();
+    index.accepted_snapshot_fingerprints = ack_bodies(&first).into_keys().collect();
+    let prior_acceptance = index.accepted_snapshot_fingerprints.clone();
     let historical_entry = index.files[&local_index_key(&f.0)]
         .last_upload_body_witness
         .clone();
     index.prepare_historical_replay("unapproved-code-replay".into());
+    assert_eq!(index.file_snapshot_fingerprints, prior_incidence);
+    assert_eq!(index.accepted_snapshot_fingerprints, prior_acceptance);
     assert!(matches!(
         archive_evidence(&index, &f).disposition,
         ArchiveDisposition::Held {
@@ -288,7 +293,7 @@ fn terminal_archive_residue_skips_only_affected_session_and_pending_still_reduce
         &mut items,
         &metadata,
         NOW,
-        &index,
+        &mut index,
         &census.archive_terminal_sessions,
     );
     assert_eq!(
@@ -391,10 +396,13 @@ fn rotating_admission_starvation_is_per_archive_and_alarm_reports_source_count()
             assert!(admit(&a, None).is_err());
             assert!(admit(&b, None).is_err());
             admit(&c, Some(&cache)).unwrap().reader.reader.close();
-            assert_eq!(admission_starved_count(), if pass < 12 { 0 } else { 2 });
+            assert_eq!(admission_starved_count(None), if pass < 12 { 0 } else { 2 });
         }
     });
-    assert!(admission_starved(&keys[0]) && admission_starved(&keys[1]));
+    assert!(
+        (admission_starved_count(Some(&keys[0])) > 0)
+            && (admission_starved_count(Some(&keys[1])) > 0)
+    );
     assert!(rows
         .iter()
         .any(|r| r["stage"] == "codex_zst_admission_alarm"
@@ -404,9 +412,9 @@ fn rotating_admission_starvation_is_per_archive_and_alarm_reports_source_count()
     census.archive_failure(&ScanIndex::default(), &b.0, UnreadableCause::Reduction);
     assert_eq!(census.unreadable_path_count, 0);
     admit(&a, Some(&cache)).unwrap().reader.reader.close();
-    assert!(!admission_starved(&keys[0]));
-    assert!(admission_starved(&keys[1]));
-    assert_eq!(admission_starved_count(), 1);
+    assert_eq!(admission_starved_count(Some(&keys[0])), 0);
+    assert_eq!(admission_starved_count(Some(&keys[1])), 1);
+    assert_eq!(admission_starved_count(None), 1);
     let mut after = ScanCensus::default();
     after.archive_failure(&ScanIndex::default(), &a.0, UnreadableCause::Reduction);
     assert_eq!(

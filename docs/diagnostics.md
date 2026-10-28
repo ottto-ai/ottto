@@ -804,8 +804,8 @@ claimed.
 
 User upload-policy/attribution changes bind one correction generation per archive
 and count A3 `full_reads.user_change` with `compressed_user_change`. Internal
-cache-capability changes do not grant A3. The existing fail-closed HeaderWork
+cache/label capability changes and attribution key rotations do not grant A3. The existing fail-closed HeaderWork
 AC/utility-QoS permission and shared 30 CPU-second counter gate correction reads;
 activation must wire real platform signals before discovery opens. Unapproved
-code replay/body-witness revision changes preserve the historical body and hold
+code replay/body-witness revision changes preserve the historical body, incidence and existing acceptance evidence, and hold
 `CompressedCorrectionUnapplied` without decoding or earning new ACK credit.
