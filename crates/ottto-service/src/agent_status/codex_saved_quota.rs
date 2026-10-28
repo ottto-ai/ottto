@@ -2360,6 +2360,7 @@ mod tests {
     #[test]
     fn a_read_that_rewrites_an_unnamed_credential_keeps_its_reading() {
         let root = scratch("unnamed-rewrite");
+        let _pinned = ReadsFinishAtTriggerClock::pin(&root);
         let home = opaque_home(&root);
         let now = current_unix_seconds();
         let before = login_mark(&home, CodexHomeTrust::Managed);
@@ -2427,6 +2428,7 @@ mod tests {
     #[test]
     fn an_unwritable_saved_file_still_spaces_the_reads() {
         let root = scratch("unwritable");
+        let _pinned = ReadsFinishAtTriggerClock::pin(&root);
         let home = opaque_home(&root);
         // The state directory is a file: every saved write fails.
         std::fs::write(root.join("codex-quota"), b"").unwrap();
@@ -2858,6 +2860,24 @@ mod tests {
 
     pub(super) fn reads_finish_at_trigger_clock(support_dir: &Path) -> bool {
         pinned_support_dirs().contains(support_dir)
+    }
+
+    /// Reads under a support dir finish at the trigger's clock while this
+    /// lives, so a read that crosses a wall-clock second cannot shift the
+    /// schedule a test checks to the second.
+    struct ReadsFinishAtTriggerClock(PathBuf);
+
+    impl ReadsFinishAtTriggerClock {
+        fn pin(support_dir: &Path) -> Self {
+            pinned_support_dirs().insert(support_dir.to_path_buf());
+            Self(support_dir.to_path_buf())
+        }
+    }
+
+    impl Drop for ReadsFinishAtTriggerClock {
+        fn drop(&mut self) {
+            pinned_support_dirs().remove(&self.0);
+        }
     }
 
     /// Write a credential that names `user` in `workspace`, with an id token
