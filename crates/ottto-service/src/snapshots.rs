@@ -118,8 +118,17 @@ pub(crate) mod e2_pipeline_scan_fixture;
 mod pi_retry_inputs;
 mod sampled_audit;
 mod sampled_jsonl;
+/// Structural verification plus the nested source binding `decode` enforces.
 #[cfg(unix)]
-pub(crate) use sampled_jsonl::durable::verify as verify_durable_body;
+pub(crate) fn verify_durable_body(
+    body: &[u8],
+    source: crate::durable_tail_store::DurableSource,
+) -> bool {
+    let mut d = crate::durable_tail_codec::Dec::new(body);
+    let nested = <SnapshotSource as crate::durable_tail_codec::Durable>::take(&mut d).ok();
+    nested.and_then(sampled_scan::durable_tail::durable_source) == Some(source)
+        && sampled_jsonl::durable::verify(body).is_ok()
+}
 #[cfg(all(test, unix))]
 pub(crate) fn durable_store_fixture_body(count: u64, sum: u64) -> Vec<u8> {
     sampled_jsonl::durable::store_fixture_body(count, sum)
@@ -27550,6 +27559,19 @@ impl OwnedSourceScan {
                     {
                         index.mark_bounded_sweep_unsettled();
                         pending!();
+                    }
+                    // Grouped members bypass the per-candidate guard: one held member holds the group.
+                    #[cfg(unix)]
+                    if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        if let Some((member, reason)) = group.members.iter().find_map(|member| {
+                            Some((
+                                member,
+                                cache.durable_hold(source, &local_index_key(&member.path))?,
+                            ))
+                        }) {
+                            cache.durable_hold_exit(source, reason, index, member, &mut census);
+                            pending!();
+                        }
                     }
                     // M-5 (b): a group whose attempt already ended as terminal
                     // debt in this generation is not attempted again; its

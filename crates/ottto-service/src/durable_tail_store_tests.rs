@@ -1169,6 +1169,7 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
         "spent_v2",
         "bad_trailer",
         "bad_body",
+        "foreign_source",
         "bad_length",
         "debt_tag",
         "unbindable",
@@ -1217,6 +1218,13 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                 }
                 "bad_body" => {
                     bytes[HEADER_BYTES] = 255; // invalid nested source enum, but valid trailer
+                    set_version(&mut bytes, 1);
+                    Refusal::Corrupt
+                }
+                "foreign_source" => {
+                    // Structurally valid Codex body under a Claude envelope: `decode` refuses it.
+                    assert_eq!(bytes[HEADER_BYTES], 1);
+                    bytes[HEADER_BYTES] = 0;
                     set_version(&mut bytes, 1);
                     Refusal::Corrupt
                 }

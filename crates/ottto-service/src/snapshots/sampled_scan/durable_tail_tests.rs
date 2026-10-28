@@ -979,10 +979,18 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 }
                 assert!(completed);
                 let (counts, _) = cache.durable_counters(source).unwrap();
-                let class = kind;
+                let class = [
+                    "newer",
+                    "unknown",
+                    "undecodable",
+                    "unbindable",
+                    "known_corrupt",
+                ]
+                .iter()
+                .position(|class| *class == kind)
+                .unwrap();
                 assert_eq!(
-                    counts.durable_held.get(class),
-                    Some(&1),
+                    counts.durable_held[class], 1,
                     "{source:?}/{corrupt}/{bypass}"
                 );
                 assert_eq!(counts.restored, 0);

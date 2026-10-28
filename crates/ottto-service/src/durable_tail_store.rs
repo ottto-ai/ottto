@@ -275,17 +275,6 @@ pub(crate) enum Refusal {
     Unbindable,
     Corrupt,
 }
-impl Refusal {
-    pub(crate) fn class(self) -> &'static str {
-        match self {
-            Self::NewerFormat => "newer",
-            Self::Unknown => "unknown",
-            Self::Undecodable => "undecodable",
-            Self::Unbindable => "unbindable",
-            Self::Corrupt => "known_corrupt",
-        }
-    }
-}
 
 /// The outcome of reading one key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -493,7 +482,7 @@ impl DurableTailStore {
                 _ => self.counters.guard_verify_bytes += read,
             }
             self.note_codec(bytes.capacity());
-            verify(&bytes)?;
+            verify(&bytes, self.source)?;
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(key) {
                 self.durable.insert(*key, (None, stamp));
             }
@@ -910,26 +899,20 @@ impl Stamp {
 }
 
 fn dead_temp(name: &str) -> bool {
-    let Some((record, pid)) = name
+    let name = name
         .strip_prefix('.')
-        .and_then(|n| n.strip_suffix(TEMP_SUFFIX))
-        .and_then(|n| n.rsplit_once('.'))
-    else {
+        .and_then(|n| n.strip_suffix(TEMP_SUFFIX));
+    let Some((record, pid)) = name.and_then(|n| n.rsplit_once('.')) else {
         return false;
     };
-    record
+    let pid = pid.parse::<i32>().ok().filter(|pid| *pid > 0);
+    let named = record
         .strip_suffix(RECORD_SUFFIX)
-        .and_then(parse_hex_digest)
-        .is_some()
-        && pid
-            .parse::<i32>()
-            .ok()
-            .filter(|pid| *pid > 0)
-            .is_some_and(|pid| {
-                // SAFETY: signal zero only probes the process; it sends no signal.
-                (unsafe { libc::kill(pid, 0) }) == -1
-                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            })
+        .and_then(parse_hex_digest);
+    // SAFETY: signal zero only probes the process; it sends no signal.
+    named.is_some()
+        && pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1)
+        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 fn decode_header(header: &[u8], key: &Digest32, source: DurableSource) -> Result<Binding, Refusal> {
@@ -971,7 +954,7 @@ fn decode_header(header: &[u8], key: &Digest32, source: DurableSource) -> Result
     Ok(binding)
 }
 
-fn verify(bytes: &[u8]) -> Result<(), Refusal> {
+fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
     let bad = Refusal::Corrupt;
     if bytes.len() < HEADER_BYTES + TRAILER_BYTES {
         return Err(bad);
@@ -989,7 +972,9 @@ fn verify(bytes: &[u8]) -> Result<(), Refusal> {
     if !matches!(bytes[debt], 0 | 1) || (bytes[debt] == 0 && bytes[debt + 1..debt + 9] != [0; 8]) {
         return Err(bad);
     }
-    crate::snapshots::verify_durable_body(&bytes[HEADER_BYTES..end]).map_err(|_| bad)
+    crate::snapshots::verify_durable_body(&bytes[HEADER_BYTES..end], source)
+        .then_some(())
+        .ok_or(bad)
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
@@ -1132,7 +1117,7 @@ fn decode(bytes: &[u8], allowlist: &Digest32) -> Result<DurableRecord, Refusal> 
         .and_then(|b| b.try_into().ok())
         .ok_or(Refusal::Undecodable)?;
     decode_header(bytes, &key, source)?;
-    verify(bytes)?;
+    verify(bytes, source)?;
     let body_end = bytes.len() - TRAILER_BYTES;
     let mut cursor = Cursor(&bytes[10..body_end]);
     let record_allowlist = cursor.array::<32>().ok_or(Refusal::Corrupt)?;

@@ -66,7 +66,7 @@ pub(crate) struct Counters {
     pub(crate) restored: u64,
     pub(crate) missing: u64,
     pub(crate) refused_record: u64,
-    pub(crate) durable_held: BTreeMap<&'static str, u64>,
+    pub(crate) durable_held: [u64; 5],
     pub(crate) held_census: [u64; 2],
     pub(crate) ineligible: BTreeMap<&'static str, u64>,
     pub(crate) certificate_refused: BTreeMap<&'static str, u64>,
@@ -109,9 +109,9 @@ impl Counters {
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
-             bytes_read={} format_hold{{newer:{},unknown:{},undecodable:{},unbindable:{},known_corrupt:{}}} durable_held={{{}}} held_census{{kept:{},invalidated:{}}} \
+             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
-             uninventoried_records={} store_write_skipped{{unknown:{},known_corrupt:{}}} \
+             uninventoried_records={} store_write_skipped[unknown,known_corrupt]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={}",
             source.api_slug(),
@@ -138,21 +138,15 @@ impl Counters {
             store.records_clean,
             store.budget_refused,
             store.bytes_read,
-            store.format_hold[0],
-            store.format_hold[1],
-            store.format_hold[2],
-            store.format_hold[3],
-            store.format_hold[4],
-            classes(&self.durable_held),
-            self.held_census[0],
-            self.held_census[1],
+            store.format_hold,
+            self.durable_held,
+            self.held_census,
             store.guard_header_bytes,
             store.guard_verify_bytes,
             store.delete_verify_bytes,
             store.overwrite_verify_bytes,
             store.uninventoried_records,
-            store.store_write_skipped[0],
-            store.store_write_skipped[1],
+            store.store_write_skipped,
             store.gc_records_deleted,
             store.gc_records_read,
             store.gc_bytes_read,
@@ -418,7 +412,7 @@ impl SharedCache {
         let kept = source == SnapshotSource::ClaudeCode
             && claude_request_census::retain_held(index, candidate);
         if let Some(mut stores) = self.durable() {
-            Counters::bump(&mut stores.counters.durable_held, reason.class());
+            stores.counters.durable_held[reason as usize] += 1;
             if source == SnapshotSource::ClaudeCode {
                 stores.counters.held_census[usize::from(!kept)] += 1;
             }
@@ -441,10 +435,8 @@ impl SharedCache {
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
     ) -> RestoreOutcome {
-        if let Some(reason) = self.durable_hold(snapshot_source, key) {
-            return RestoreOutcome::Held(reason);
-        }
-        match self.durable_restore_known(
+        // The common guard held U/T14 before acquisition; this sees class changes since.
+        match self.restore_known(
             snapshot_source,
             key,
             path,
@@ -461,7 +453,7 @@ impl SharedCache {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn durable_restore_known(
+    fn restore_known(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
