@@ -232,7 +232,7 @@ impl ContinuationFixture {
         let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
         self.ordinary_side_pass(&cache, true);
         let mut minted = self.preparation(true);
-        let mut inputs = take_continuation_inputs(&mut minted);
+        let mut inputs = take_continuation_inputs(&mut minted, &std::sync::Arc::default());
         let before = self.disk();
         assert_eq!(self.prepare_on(&cache, &mut inputs).err(), Some(refusal));
         assert_eq!(self.disk(), before, "no save, no claim, no reset");
@@ -249,7 +249,7 @@ pub(super) fn continuation_inputs_for_test(
 ) -> (ContinuationInputs, std::sync::Arc<AgentStatusCollection>) {
     let fixture = ContinuationFixture::quiescent("continuation-inputs-for-test");
     let mut preparation = fixture.preparation(attribution);
-    let inputs = take_continuation_inputs(&mut preparation);
+    let inputs = take_continuation_inputs(&mut preparation, &std::sync::Arc::default());
     let sentinel = std::sync::Arc::clone(&preparation.scan_agent_status_collection);
     drop(preparation);
     (inputs, sentinel)
@@ -264,7 +264,7 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
         .activity_hint
         .session_attribution_hmac_key
         .is_some());
-    let inputs = take_continuation_inputs(&mut preparation);
+    let inputs = take_continuation_inputs(&mut preparation, &std::sync::Arc::default());
     assert!(
         preparation.attribution_context.is_none(),
         "moved out, not copied"
@@ -292,7 +292,7 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
 fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     let fixture = ContinuationFixture::quiescent("continuation-prepare-parity");
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(&mut minted, &std::sync::Arc::default());
     let before = fixture.disk();
     let prepared = fixture
         .prepare(&mut inputs)
@@ -411,7 +411,7 @@ fn a_pending_historical_replay_refuses_the_continuation_prepare() {
     )
     .unwrap();
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(&mut minted, &std::sync::Arc::default());
     let before = fixture.disk();
     assert_eq!(
         fixture.prepare(&mut inputs).err(),
@@ -525,7 +525,7 @@ fn the_always_on_sampled_scope_keeps_the_permit_era_bytes() {
 fn no_continuation_output_serializes_the_attribution_key() {
     let fixture = ContinuationFixture::quiescent("continuation-no-key-output");
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(&mut minted, &std::sync::Arc::default());
     let prepared = fixture
         .prepare(&mut inputs)
         .unwrap_or_else(|refusal| panic!("refused: {}", refusal.label()));
@@ -707,7 +707,7 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
         let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
         assert!(fixture.ordinary_side_pass(&cache, ordinary_saved));
         let mut minted = fixture.preparation(true);
-        let mut inputs = take_continuation_inputs(&mut minted);
+        let mut inputs = take_continuation_inputs(&mut minted, &std::sync::Arc::default());
         let before = fixture.disk();
         let prepared = fixture
             .prepare_on(&cache, &mut inputs)

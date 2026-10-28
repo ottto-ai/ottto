@@ -1331,4 +1331,4 @@ fn local_harvest_disabled(support_dir: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

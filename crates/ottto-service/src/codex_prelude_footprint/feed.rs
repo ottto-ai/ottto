@@ -335,3 +335,6 @@ impl LineObserver for Observer {
         f.put(file, home, state);
     }
 }
+#[cfg(test)]
+#[path = "feed_tests.rs"]
+mod tests;
