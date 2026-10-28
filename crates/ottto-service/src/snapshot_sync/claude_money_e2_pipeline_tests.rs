@@ -2598,6 +2598,27 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
     conflict_only(true);
 }
 
+#[test]
+fn e2_page_never_creates_p1_ledger_or_diagnostics() {
+    with_e2(|| {
+        let mut corpus = Corpus::new("e2-without-p1");
+        corpus.root(ROOT, &line(ROOT, "req-real", AT, 10));
+        corpus.evidence(&[api("req-real", 10, 100)], &[]);
+        let scanner = E2ScanFixture::default();
+        let mut page = corpus.raw(&scanner, ScanIndex::default(), 16, true, &[]);
+        page.enrich(&corpus);
+        page.finish();
+        literal(&page);
+        assert_eq!(total(&page), 1);
+        assert!(!corpus.support.join("claude-request-ledger").exists());
+        assert!(!corpus
+            .support
+            .join(".claude-request-money-run.json")
+            .exists());
+        assert!(!corpus.support.join("diagnostics").exists());
+    });
+}
+
 // The held-read regression needs the classification from BEFORE finish
 // removes withheld items, matching production settlement. Existing fixtures
 // keep their original helper and their original assertions.

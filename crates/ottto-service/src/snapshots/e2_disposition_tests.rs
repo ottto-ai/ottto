@@ -162,3 +162,78 @@ fn e2_body_of_previously_proven_family_is_not_a_demotion() {
         });
     }
 }
+
+#[test]
+fn money_cache_creation_normalizer_has_one_reading_for_every_caller() {
+    use crate::snapshots::claude_request_money::{claude_cache_creation, CacheCreation::*};
+    for (total, five_m, one_h, expected) in [
+        (0, 0, 0, Unattributed(0)),
+        (100, 0, 0, Unattributed(100)),
+        (
+            0,
+            5,
+            6,
+            Split {
+                five_m: 5,
+                one_h: 6,
+            },
+        ),
+        (
+            11,
+            5,
+            6,
+            Split {
+                five_m: 5,
+                one_h: 6,
+            },
+        ),
+        (12, 5, 6, Contradictory),
+        (0, u64::MAX, 1, Contradictory),
+    ] {
+        assert_eq!(
+            claude_cache_creation(total, five_m, one_h),
+            expected,
+            "{total} {five_m} {one_h}"
+        );
+    }
+    // The transcript reading: a stated split wins even when the flat total
+    // disagrees; a flat-only write is the default (5m) TTL.
+    for (usage, expected) in [
+        (
+            serde_json::json!({"cache_creation_input_tokens": 9}),
+            (9, 0),
+        ),
+        (
+            serde_json::json!({"cache_creation_input_tokens": 9,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0}}),
+            (9, 0),
+        ),
+        (
+            serde_json::json!({"cache_creation_input_tokens": 12,
+                "cache_creation": {"ephemeral_5m_input_tokens": 5, "ephemeral_1h_input_tokens": 6}}),
+            (5, 6),
+        ),
+        (
+            serde_json::json!({"cacheCreation": {"ephemeral5mInputTokens": 2, "ephemeral1hInputTokens": 3}}),
+            (2, 3),
+        ),
+        (serde_json::json!({}), (0, 0)),
+    ] {
+        assert_eq!(
+            claude_code_cache_creation_split(&usage),
+            expected,
+            "{usage}"
+        );
+    }
+    // The API row reading: a contradiction cannot authorize usage.
+    let row = |total, five_m, one_h| crate::claude_local_otel::ClaudeLocalOtelEvidence {
+        cache_creation_tokens: total,
+        cache_creation_5m_tokens: five_m,
+        cache_creation_1h_tokens: one_h,
+        ..Default::default()
+    };
+    assert_eq!(claude_api_cache_creation(&row(7, 0, 0)), Some((0, 0, 7)));
+    assert_eq!(claude_api_cache_creation(&row(0, 3, 4)), Some((3, 4, 0)));
+    assert_eq!(claude_api_cache_creation(&row(7, 3, 4)), Some((3, 4, 0)));
+    assert_eq!(claude_api_cache_creation(&row(8, 3, 4)), None);
+}

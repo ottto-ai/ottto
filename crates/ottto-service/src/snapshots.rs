@@ -48,9 +48,10 @@ pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
 pub(crate) mod claude_request_accounts;
+// P1-only census helpers remain until the separate persisted-format cleanup.
+#[allow(dead_code)]
 pub(crate) mod claude_request_census;
 pub(crate) mod claude_request_identity;
-pub(crate) mod claude_request_ledger;
 pub(crate) mod claude_request_money;
 mod idless_retry_marker;
 mod oversized_discovery;
@@ -12354,7 +12355,7 @@ fn reduce_claude_usage_ledger(
 /// The per-row checks of a strict Claude API sidecar row, in this order:
 /// revision, root session, request id, model, one request, evidence
 /// fingerprint, RFC 3339 clock. Duplicate request ids are the caller's check.
-/// Shared by the live reducer and the P1 money shadow.
+/// Shared by the live telemetry reducers.
 pub(crate) fn validate_claude_api_row(
     row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
     root_session_id: &str,
@@ -16824,7 +16825,7 @@ struct RowKey {
 }
 
 impl RowKey {
-    /// The hoisted billing fields by their selector names (P1 money shadow).
+    /// The hoisted billing fields by their selector names.
     fn billing_fields(&self) -> [(&'static str, Option<&str>); 6] {
         [
             ("auth_mode", self.auth_mode.as_deref()),
@@ -18635,27 +18636,13 @@ impl SnapshotAccumulator {
     /// and make the enclosing file retryable through the existing diagnostics.
     #[cfg(test)]
     fn finalize_claude_responses(&mut self) {
-        self.finalize_claude_responses_captured(None);
-    }
-
-    /// `capture` is the P1 money shadow's side capture: armed, funded and
-    /// owned by the shadow. With None this is exactly the live finalizer.
-    #[cfg(test)]
-    fn finalize_claude_responses_captured(
-        &mut self,
-        capture: Option<&mut claude_request_money::ClaudeResponseCapture>,
-    ) {
-        self.finalize_claude_responses_e2(capture, None);
+        self.finalize_claude_responses_e2(None);
     }
 
     fn finalize_claude_responses_e2(
         &mut self,
-        mut capture: Option<&mut claude_request_money::ClaudeResponseCapture>,
         money_context: Option<claude_request_money::e2::ReadContext<'_>>,
     ) {
-        if let Some(capture) = capture.as_deref_mut() {
-            capture.note_messages(self.claude_responses.message_keys());
-        }
         let (mut responses, selectors) = std::mem::take(&mut self.claude_responses).into_parts();
         responses.sort_by_key(|response| response.sequence);
         // Gate off, the fold keys by hour only: it never reads the selector.
@@ -18783,13 +18770,6 @@ impl SnapshotAccumulator {
                         effective_input_context,
                     },
                 );
-                // Shadow-only: just a response that displaces an earlier one
-                // under its request id needs the hash, as timed and admitted
-                // capture work.
-                let request_hash = match (capture.as_deref_mut(), &prior_occurrence) {
-                    (Some(capture), Some(_)) => capture.request_hash(&request_id),
-                    _ => None,
-                };
                 if self.claude_usage_request_ids.contains(&request_id) || prior_occurrence.is_some()
                 {
                     if let Some(money) = money.as_mut() {
@@ -18804,22 +18784,8 @@ impl SnapshotAccumulator {
                 if !request_id_was_new || prior_occurrence.is_some() {
                     self.claude_context_curve_identity_complete = false;
                 }
-                if let Some((capture, (prior, request_hash))) = capture
-                    .as_deref_mut()
-                    .zip(prior_occurrence.as_ref().zip(request_hash))
-                {
-                    capture.displaced(request_hash, prior);
-                }
             } else {
                 self.claude_context_curve_identity_complete = false;
-                if let Some(capture) = capture.as_deref_mut() {
-                    capture.unkeyed(
-                        response.sequence,
-                        &response.usage,
-                        response.terminal_timestamp.as_deref(),
-                        response.model.as_deref(),
-                    );
-                }
                 // An id-less response is never a compaction size. Mark the
                 // compaction it sits just before or just after for the fold's
                 // local counters; the sizes themselves are unchanged.
@@ -18893,14 +18859,7 @@ impl SnapshotAccumulator {
             }
             if let Some(placed) = placed {
                 claude_request_money::e2::timed("native.add", || {
-                    self.add_placed_usage(
-                        placed,
-                        response.usage,
-                        response.reasoning_effort,
-                        capture
-                            .as_deref_mut()
-                            .map(|capture| (capture, response.sequence)),
-                    )
+                    self.add_placed_usage(placed, response.usage, response.reasoning_effort)
                 });
             }
         }
@@ -19407,7 +19366,7 @@ impl SnapshotAccumulator {
             size_of::<SnapshotItem>(), // `vec![item]`
             responses,
             resolved.checked_mul(per_response)?,
-            current_selector, // `add_usage_with_selector_placed`'s `merged`
+            current_selector, // `add_usage_with_selector`'s `merged`
             state.checked_mul(3)?,
             usage_buckets.checked_mul(ROW_COPIES.checked_sub(3)?)?,
             rows.checked_mul(per_row)?,
@@ -19572,24 +19531,10 @@ impl SnapshotAccumulator {
         timestamp: Option<&str>,
         effort: Option<String>,
     ) {
-        self.add_usage_with_selector_placed(model, usage, selector, timestamp, effort, None);
-    }
-
-    /// `placement`: the P1 money shadow's capture and the response sequence;
-    /// it records the row this usage lands in. None changes nothing.
-    fn add_usage_with_selector_placed(
-        &mut self,
-        model: Option<String>,
-        usage: UsageTotals,
-        selector: SelectorCapture,
-        timestamp: Option<&str>,
-        effort: Option<String>,
-        placement: Option<(&mut claude_request_money::ClaudeResponseCapture, u64)>,
-    ) {
         if let Some(placed) =
             self.place_usage(model, &usage, selector, timestamp, effort.as_deref())
         {
-            self.add_placed_usage(placed, usage, effort, placement);
+            self.add_placed_usage(placed, usage, effort);
         }
     }
 
@@ -19636,10 +19581,8 @@ impl SnapshotAccumulator {
         placed: PlacedClaudeUsage,
         usage: UsageTotals,
         effort: Option<String>,
-        placement: Option<(&mut claude_request_money::ClaudeResponseCapture, u64)>,
     ) {
         let PlacedClaudeUsage {
-            model,
             placement:
                 Some(ClaudeRowPlacement {
                     bucket: bucket_start,
@@ -19657,16 +19600,6 @@ impl SnapshotAccumulator {
         if !self.accepted_usage_totals.add(&usage) {
             self.note_dropped_usage();
             return;
-        }
-
-        if let Some((capture, sequence)) = placement {
-            capture.place(
-                sequence,
-                &bucket_start,
-                &model,
-                &reduced_context,
-                &row_key.billing_fields(),
-            );
         }
 
         let bucket = self.usage_buckets.entry(bucket_start).or_default();
@@ -33060,16 +32993,9 @@ impl OwnedJsonlParser {
             accumulator.apply_first_prompt_fallback();
         }
         if source == SnapshotSource::ClaudeCode {
-            #[cfg(test)]
-            claude_native_delay_for_test(path);
-            // P1 money shadow: a side capture only where the shadow is armed.
-            let mut capture = claude_request_money::ClaudeResponseCapture::begin(path);
             claude_request_money::e2::timed("claude.finalize", || {
-                accumulator.finalize_claude_responses_e2(capture.as_mut(), money_context)
+                accumulator.finalize_claude_responses_e2(money_context)
             });
-            if let Some(capture) = capture {
-                capture.deposit(path, &source_file_fingerprint);
-            }
             if let Some(metadata) = claude_title_metadata {
                 accumulator.apply_claude_title_metadata(path, metadata);
             }
@@ -36159,87 +36085,6 @@ fn claude_fork_line_provenance(value: &Value) -> ClaudeForkLineProvenance {
         ClaudeForkLineProvenance::Inherited
     } else {
         ClaudeForkLineProvenance::Invalid
-    }
-}
-
-/// Native scan time a test injects before each Claude finalizer under a
-/// root (a production-shaped slow native page: seconds of native I/O
-/// between money finalizers). Production scanning is unchanged.
-#[cfg(test)]
-static CLAUDE_NATIVE_DELAY_FOR_TEST: std::sync::Mutex<Option<(PathBuf, std::time::Duration)>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-pub(crate) fn set_claude_native_delay_for_test(delay: Option<(PathBuf, std::time::Duration)>) {
-    *CLAUDE_NATIVE_DELAY_FOR_TEST
-        .lock()
-        .expect("native delay control") = delay;
-}
-
-#[cfg(test)]
-fn claude_native_delay_for_test(path: &Path) {
-    let delay = CLAUDE_NATIVE_DELAY_FOR_TEST
-        .lock()
-        .expect("native delay control")
-        .as_ref()
-        .filter(|(root, _)| path.starts_with(root))
-        .map(|(_, delay)| *delay);
-    if let Some(delay) = delay {
-        std::thread::sleep(delay);
-    }
-}
-
-/// Prepare synthetic native input before a timing/fairness probe. The
-/// returned closure runs the real finalizers/capture hooks, with no fixture
-/// file I/O between them. Production scanning is unchanged.
-///
-/// It prepares exactly the files the product's own capture eligibility
-/// admits now: every file before the scope's first page, then only what the
-/// plan the last page installed allows (complete or fallback). A scope paged
-/// without a plan (a page refused before planning, or a closed plan) fails
-/// the probe instead of being modelled.
-#[cfg(test)]
-pub(crate) fn prepare_money_finalizers_for_test(
-    support: &Path,
-    index: &ScanIndex,
-) -> impl FnOnce() {
-    match claude_request_money::capture::plan_allows_capture_for_test(support) {
-        // Never paged: every file is eligible.
-        None => {}
-        Some(true) => {}
-        Some(false) => panic!(
-            "the scope has paged without a capture plan (complete or fallback): the next parse captures nothing optional"
-        ),
-    }
-    let prepared = index
-        .files
-        .iter()
-        .filter(|(key, _)| claude_request_money::capture::capture_eligible_for_test(Path::new(key)))
-        .map(|(key, entry)| {
-            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-            let input = BufReader::new(std::fs::File::open(key).expect("synthetic transcript"));
-            for line in input.lines() {
-                let line = line.expect("synthetic line");
-                apply_claude_code_line(
-                    &serde_json::from_str(&line).expect("synthetic record"),
-                    &mut accumulator,
-                );
-            }
-            (
-                PathBuf::from(key),
-                entry.source_file_fingerprint.clone(),
-                accumulator,
-            )
-        })
-        .collect::<Vec<_>>();
-    move || {
-        for (path, fingerprint, mut accumulator) in prepared {
-            let mut capture = claude_request_money::ClaudeResponseCapture::begin(&path);
-            accumulator.finalize_claude_responses_captured(capture.as_mut());
-            if let Some(capture) = capture {
-                capture.deposit(&path, &fingerprint);
-            }
-        }
     }
 }
 
@@ -43648,7 +43493,7 @@ impl ScanIndex {
     /// local hold, a file the history gate holds, a literal-denied file, and
     /// under a row that denies the literal any listed family or, while the
     /// list is paused, any file: a protected root never stamps to a new
-    /// revision. MONEY (#699) routes
+    /// revision. Request-owned money routes
     /// its covering-ACK, below-floor and confirmed-empty settlements here.
     /// The only other writer is `re_owe_effective_upload_body_witness_revision`.
     pub(crate) fn stamp_effective_upload_body_witness_revision(
@@ -43704,7 +43549,7 @@ impl ScanIndex {
     /// any activation, below the highest revision with a policy row), so the
     /// file is owed again and goes back through the history gate. Counts
     /// `history_reowed`. Returns false and writes nothing otherwise. MONEY's
-    /// census 3 -> 2 path (#699) calls it.
+    /// census 3 -> 2 path calls it.
     pub(crate) fn re_owe_effective_upload_body_witness_revision(
         &mut self,
         index_key: &str,
@@ -49371,8 +49216,8 @@ mod tests {
     mod claude_request_census_tests {
         include!("snapshots/claude_request_census_tests.rs");
     }
-    mod claude_request_money_tests {
-        include!("snapshots/claude_request_money_tests.rs");
+    mod claude_census_money_invariant_tests {
+        include!("snapshots/claude_census_money_invariant_tests.rs");
     }
     mod e2_disposition_tests {
         include!("snapshots/e2_disposition_tests.rs");
