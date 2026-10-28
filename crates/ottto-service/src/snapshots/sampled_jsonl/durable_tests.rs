@@ -1854,3 +1854,105 @@ fn pi_new_representation_preserves_legacy_emitted_bodies() {
         assert_eq!(outputs[0], outputs[1]);
     }
 }
+
+#[test]
+fn pi_restored_counts_and_pairs_continue_with_suffix_only_tail() {
+    let prefix = [
+        pi_record("message", Some("reused"), 10),
+        pi_record("message", Some("reused"), 10),
+        pi_record("message_end", Some("paired"), 20),
+        pi_record("message", Some("paired"), 20),
+    ];
+    let suffix = [
+        pi_record("message_end", Some("reused"), 10),
+        pi_record("message_end", Some("reused"), 10),
+        pi_record("message", Some("reused"), 30),
+        pi_record("message", None, 40),
+        pi_record("message_end", None, 40),
+    ];
+    let scratch = Scratch::new("pi-sealed-tail");
+    let path = scratch.write(
+        "pi.jsonl",
+        &prefix.iter().map(Value::to_string).collect::<Vec<_>>(),
+    );
+    let (reduction, checkpoint) = full_read(&path, SnapshotSource::Pi);
+    let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
+    let certificate = checkpoint
+        .durable_certificate(birth_unix_nanos(&fs::metadata(&path).unwrap()))
+        .unwrap();
+    let suffix = suffix
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(suffix.as_bytes())
+        .unwrap();
+    let (checkpoint, _) = certificate
+        .restore(&mut File::open(&path).unwrap(), scope())
+        .unwrap();
+    let (restored, _) = restore(&path, &body, SnapshotSource::Pi).unwrap();
+    assert_eq!(full_digest(&restored), full_digest(&reduction));
+    let mut continued = parser(&path, SnapshotSource::Pi);
+    assert_eq!(
+        continued
+            .prepare_acquisition(
+                Some(Retained {
+                    checkpoint,
+                    state: restored
+                }),
+                &scope(),
+                None,
+                NOW
+            )
+            .unwrap(),
+        ReadMode::Tail
+    );
+    while !continued.step().unwrap() {}
+    assert_eq!(continued.reader.consumed_bytes(), suffix.len() as u64);
+    assert_eq!(
+        items(continued, &path, SnapshotSource::Pi),
+        cold_items(&path, SnapshotSource::Pi)
+    );
+}
+
+#[test]
+fn pi_occurrence_identity_keeps_timestamp_normalization_and_selector_inputs() {
+    let value = pi_record("message", Some("normalized"), 10);
+    let usage = pi_message_usage(&value).unwrap();
+    let selector = SelectorCapture::default();
+    let digest = pi_usage_occurrence_digest(
+        Some("fixture-model"),
+        &usage,
+        &selector,
+        Some("2026-10-20T10:00:01Z"),
+    );
+    assert_eq!(
+        digest,
+        pi_usage_occurrence_digest(
+            Some("fixture-model"),
+            &usage,
+            &selector,
+            Some("2026-10-20T12:00:01.000+02:00")
+        )
+    );
+    let mut selected = selector;
+    selected.insert(
+        "region_mode",
+        "/synthetic/user-supplied/path".into(),
+        "fixture",
+    );
+    assert_ne!(
+        digest,
+        pi_usage_occurrence_digest(
+            Some("fixture-model"),
+            &usage,
+            &selected,
+            Some("2026-10-20T10:00:01Z")
+        )
+    );
+}
