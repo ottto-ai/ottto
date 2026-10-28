@@ -423,7 +423,18 @@ fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() 
     assert!(validate_snapshot_batch_request(&invalid_request).is_err());
     drop(invalid_request);
     drop(invalid);
-    for (files, models) in [(1, 100), (50, 1)] {
+    for (file_ceiling, models) in [(1, 100), (50, 1)] {
+        // Establish an admitted lower endpoint before growing either dimension.
+        let mut one = PiLiveFixture::with_page(1, models, 0);
+        assert!(one.try_capture(Duration::ZERO).is_some());
+        let mut files = 1;
+        for candidate in 2..=file_ceiling {
+            let mut fixture = PiLiveFixture::with_page(candidate, models, 0);
+            if fixture.try_capture(Duration::ZERO).is_some() {
+                files = candidate;
+            }
+        }
+        eprintln!("native_envelope_cardinality models={models} largest_admitted_files={files} searched_ceiling={file_ceiling}");
         let (mut low, mut high) = (0, 2048);
         while low + 1 < high {
             let middle = (low + high) / 2;
@@ -550,7 +561,7 @@ fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() 
             )
             .unwrap();
             assert!(scan.snapshots.is_empty());
-            eprintln!("native_envelope models=100 label_bytes_admitted={low} next_refused={high} ack_bytes={} item_json_bytes={} checkpoint_ack_restart=true", ack.len(), serde_json::to_vec(&f.items).unwrap().len());
+            eprintln!("native_envelope files={files} models={models} label_bytes_admitted={low} next_refused={high} ack_bytes={} item_json_bytes={} checkpoint_ack_restart=true", ack.len(), serde_json::to_vec(&f.items).unwrap().len());
             eprintln!(
             "native_envelope files={files} models={models} replay={replay} derived_peak={peak_bound} requested_peak={} usable_peak={} allocations={}",
             allocation.requested_peak_with_overlap, allocation.usable_peak_with_overlap, allocation.allocations

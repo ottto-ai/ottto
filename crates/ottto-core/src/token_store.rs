@@ -2,6 +2,7 @@ use crate::account_store::default_support_dir;
 use crate::{OTTTO_CONTROL_TOKEN_ENV, OTTTO_SECRET_FALLBACK_DIR_ENV};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
@@ -738,7 +739,26 @@ fn set_user_only_directory_permissions(path: &Path) -> Result<(), TokenStoreErro
 }
 
 fn load_file_secret(account: &str) -> Result<String, TokenStoreError> {
-    match fs::read_to_string(file_secret_path(account)) {
+    let read = || -> std::io::Result<String> {
+        const LIMIT: u64 = 64 * 1024;
+        let too_large = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file-backed secret exceeds 64 KiB",
+            )
+        };
+        let file = fs::File::open(file_secret_path(account))?;
+        if file.metadata()?.len() > LIMIT {
+            return Err(too_large());
+        }
+        let mut value = String::with_capacity((LIMIT + 1) as usize);
+        file.take(LIMIT + 1).read_to_string(&mut value)?;
+        if value.len() > LIMIT as usize {
+            return Err(too_large());
+        }
+        Ok(value)
+    };
+    match read() {
         Ok(value) => {
             let token = value.trim().to_string();
             if token.is_empty() {
@@ -937,6 +957,30 @@ mod tests {
         store.delete().expect("delete token");
         assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_secret_load_enforces_64_kib_boundary() {
+        let _env = lock_secret_fallback_dir_env();
+        let account = "e2-9-synthetic-size-bound";
+        save_file_secret(account, &"s".repeat(64 * 1024)).unwrap();
+        assert_eq!(load_file_secret(account).unwrap().len(), 64 * 1024);
+        {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(file_secret_path(account))
+                .unwrap()
+                .write_all(b"s")
+                .unwrap();
+        }
+        let error = load_file_secret(account).unwrap_err().to_string();
+        assert!(error.contains("exceeds 64 KiB"));
+        delete_file_secret(account).unwrap();
+        assert!(matches!(
+            load_file_secret(account),
+            Err(TokenStoreError::Missing)
+        ));
     }
 
     #[test]

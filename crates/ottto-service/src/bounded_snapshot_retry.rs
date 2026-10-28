@@ -4,16 +4,19 @@ use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::snapshot_retry::RetryBudget;
 
-/// Provisional requested-layout reservation (retained owner charged separately):
+/// Accepted E9-2 requested-layout evidence (Lead A ruling, 2026-10-28):
 /// 4H for outgoing clone, selected checkpoint/restoration, ACK maps and JSON
 /// comparisons; 4 MiB auxiliary decode (8192 nodes, capped 128 KiB input);
 /// 4 MiB encoded index/request/response copies, gzip and ACK response growth;
 /// 8 MiB transport/TLS workspace. Admission enforces 4H + 16 MiB <= 20 MiB,
-/// hence H <= 1 MiB. Initial checkpoint validation streams a comparison and
-/// allocates no auxiliary native state or serialized index copies. Native ACK
-/// and selected-index writers retain their bounded decoders. This is a
-/// requested-layout envelope measured by the native boundary fixture, not a
-/// universal decoder/TLS proof; allocator slack and process RSS are separate.
+/// hence H <= 1 MiB before copies. The partition model plus native peak receipts
+/// at the largest admitted pages is the accepted evidence, not a universal
+/// decoder/TLS or RSS proof. The retained owner is charged separately below.
+/// Initial checkpoint validation streams a comparison, with no native decode
+/// or serialized index copies; native ACK/selected-index bounded decoders stay.
+/// Fresh binding/file-secret loads are capped at 64 KiB before reading.
+/// Keychain loads belong to the shared ordinary-path resource domain and are
+/// not charged to the retry reserve. Allocator slack and process RSS are separate.
 const SEND_BUDGET: usize = 20 * 1024 * 1024;
 const SEND_FIXED: usize = 16 * 1024 * 1024;
 const RETAINED_BUDGET: usize =
@@ -124,7 +127,14 @@ impl PreparedRetry {
         let cap = allowance
             .min(RETAINED_BUDGET)
             .min(crate::retry_retention_bound::HEAP_CAP);
-        let page = crate::retry_retention_bound::page_bound(items, cap)?;
+        let Some(page) = crate::retry_retention_bound::page_bound(items, cap) else {
+            #[cfg(test)]
+            eprintln!(
+                "pi_retry_capture_refused bound=page-requested-layout cap_bytes={cap} items={}",
+                items.len()
+            );
+            return None;
+        };
         // Count escaped JSON before any retained-body deep copy. The actual
         // wire serializer has its own cap including semantic envelopes.
         if !crate::snapshot_retry::json_fits(items, crate::snapshot_retry::REQUEST_BYTES / 2)
@@ -132,14 +142,32 @@ impl PreparedRetry {
             || !crate::snapshot_retry::json_fits(baseline, crate::snapshot_retry::RESPONSE_BYTES)
             || !crate::snapshot_retry::json_fits(progress, crate::snapshot_retry::RESPONSE_BYTES)
         {
+            #[cfg(test)]
+            eprintln!("pi_retry_capture_refused bound=serialized-json items_fit={} working_fit={} baseline_fit={} progress_fit={}",
+                crate::snapshot_retry::json_fits(items, crate::snapshot_retry::REQUEST_BYTES / 2),
+                crate::snapshot_retry::json_fits(working, crate::snapshot_retry::RESPONSE_BYTES),
+                crate::snapshot_retry::json_fits(baseline, crate::snapshot_retry::RESPONSE_BYTES),
+                crate::snapshot_retry::json_fits(progress, crate::snapshot_retry::RESPONSE_BYTES));
             return None;
         }
         let mut counter = Counter::new(cap);
-        counter.add(page)?;
-        counter.add(std::mem::size_of::<Self>())?;
-        working.heap_bound(&mut counter)?;
-        baseline.heap_bound(&mut counter)?;
-        progress.heap_bound(&mut counter)?;
+        macro_rules! admit_heap {
+            ($value:expr, $stage:literal) => {{
+                let admitted = $value;
+                #[cfg(test)]
+                if admitted.is_none() {
+                    eprintln!("pi_retry_capture_refused bound={} stage={} cap_bytes={cap} used_bytes={} visits={}",
+                        if counter.visits_for_test() > 4096 { "heap-visits-4096" } else { "retained-requested-layout" },
+                        $stage, counter.bytes, counter.visits_for_test());
+                }
+                admitted?
+            }};
+        }
+        admit_heap!(counter.add(page), "page");
+        admit_heap!(counter.add(std::mem::size_of::<Self>()), "owner");
+        admit_heap!(working.heap_bound(&mut counter), "working-index");
+        admit_heap!(baseline.heap_bound(&mut counter), "baseline-index");
+        admit_heap!(progress.heap_bound(&mut counter), "progress");
         counter.add(index_path.as_os_str().len())?;
         counter.add(progress_path.as_os_str().len())?;
         counter.add(machine_id.len())?;
