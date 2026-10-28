@@ -3240,6 +3240,24 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
                         );
                     }
                 }
+                // A real content change re-reads and restamps the marked
+                // file; the retired bit is carried as stored.
+                fixture.append(HISTORY_SESSIONS[0], "req_0_2");
+                let page = fixture.cycle("2026-08-02T15:00:00Z", cycle);
+                assert!(page.uploaded.contains(HISTORY_SESSIONS[0]), "the change re-emits");
+                assert_ne!(
+                    page.index.files[&marked].last_upload_body_witness,
+                    stamped[&marked].1,
+                    "the marked file is restamped"
+                );
+                assert_eq!(
+                    page.index
+                        .claude_money_birth_store
+                        .money_marks(location_key(&marked))
+                        & RETIRED_PERMIT_MARK,
+                    RETIRED_PERMIT_MARK,
+                    "a restamp keeps the retired bit"
+                );
             })
         });
         assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed);

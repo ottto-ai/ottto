@@ -7981,7 +7981,12 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 })
                 .peekable();
             if items.peek().is_some() {
-                let marks = items.fold(0, |marks, item| {
+                // The retired permit bit stays as stored.
+                let retired = index
+                    .claude_money_birth_store
+                    .money_marks(claude_money_birth_store::location_key(&pending.index_key))
+                    & claude_request_money::e2::money_mark::RETIRED_PERMIT;
+                let marks = items.fold(retired, |marks, item| {
                     marks | claude_request_money::e2::money_marks(item)
                 });
                 index

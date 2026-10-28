@@ -390,10 +390,11 @@ pub(crate) mod money_mark {
     pub(crate) const CONFLICT: u8 = 16;
     /// This file was kept on ordinary money by the local list.
     pub(crate) const LEGACY: u8 = 32;
-    // 64 was #825's `STAMPED_WITHOUT_PERMIT`, retired with the identity permit
-    // (contract 5 always on). Stores may still carry it: it is decoded and
-    // kept like any mark byte (durable entry digests bind the raw byte), but
-    // never set, acted on or replayed.
+    /// #825's `STAMPED_WITHOUT_PERMIT`, retired with the identity permit
+    /// (contract 5 always on). Stores may still carry it: it is decoded and
+    /// carried through every restamp as stored (durable entry digests bind
+    /// the raw byte), but never set, cleared, acted on or replayed.
+    pub(crate) const RETIRED_PERMIT: u8 = 64;
 }
 /// Money-rule versions and the marks each one re-reads. Version 1 is the
 /// switch-on, whose revision 3 already re-reads every file. A later money
