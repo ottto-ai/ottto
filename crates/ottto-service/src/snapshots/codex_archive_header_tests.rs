@@ -310,7 +310,9 @@ fn refused_header_admission_does_not_spend_a_decode_attempt() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let cache = Arc::new(sampled_scan::SharedCache::default());
-    let occupied = OpenedInput::funded(File::open(&f.0).unwrap(), &cache).unwrap();
+    let occupied = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+        .unwrap()
+        .unwrap();
     let mut state = ScanIndex::default();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         assert!(state
@@ -468,7 +470,9 @@ fn real_full_admission_refusal_preserves_header_without_redecode() {
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut state = ScanIndex::default();
     assert_eq!(decodes(&header_inventory(&f, &mut state, &cache)), 1);
-    let occupied = OpenedInput::funded(File::open(&f.0).unwrap(), &cache).unwrap();
+    let occupied = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+        .unwrap()
+        .unwrap();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
         assert!(sampled_scan::new_source_parser(
             File::open(&f.0).unwrap(),
@@ -492,9 +496,7 @@ fn real_full_admission_refusal_preserves_header_without_redecode() {
             .as_ref()
             .unwrap()
             .disposition,
-        ArchiveDisposition::Refused {
-            cause: CodexZstCause::AdmissionRefused
-        }
+        ArchiveDisposition::HeaderValidated
     ));
     occupied.close();
     assert_eq!(decodes(&header_inventory(&f, &mut state, &cache)), 0);
@@ -626,7 +628,7 @@ fn double_uuid_archive_has_named_owner_hold_no_replacement_or_redecode() {
     not(target_os = "macos"),
     ignore = "funded decoder needs validated heap layout"
 )]
-fn inventory_step_charges_actual_decoded_bytes_to_page_budget() {
+fn inventory_step_charges_actual_physical_bytes_to_page_budget() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let root = f.0.parent().unwrap().to_owned();
@@ -662,7 +664,7 @@ fn inventory_step_charges_actual_decoded_bytes_to_page_budget() {
                 if inventory.archive_work.decoded_bytes > 0 {
                     assert_eq!(
                         next.codex_page.singleton_remaining(limits),
-                        before - inventory.archive_work.decoded_bytes
+                        before - inventory.archive_work.physical_bytes
                     );
                     assert_eq!(
                         inventory.read_bytes as u64,

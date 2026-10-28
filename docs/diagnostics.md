@@ -763,7 +763,7 @@ Inventory uses an 8 KiB output buffer, retains only the first newline-terminated
 record in a Vec capped at 64 KiB, and caps physical input at 128 KiB. Read-ahead
 can decode beyond that newline; zstd internal block work also costs CPU. Those
 bytes and CPU are measured. Physical bytes charge inventory's read bound;
-actual decoded bytes also charge E2-4's per-pass singleton budget. HeaderWork's
+actual physical bytes also charge E2-4's per-pass singleton budget. HeaderWork's
 CPU accumulator stops new header attempts at 30 CPU-s. 11b-1 must supply actual
 AC/utility-QoS permission and fold that CPU into its shared catch-up accumulator;
 permission defaults to denied. This slice does not activate discovery/catch-up.

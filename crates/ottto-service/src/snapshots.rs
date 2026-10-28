@@ -26782,16 +26782,16 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
-                    let before = inventory.archive_work.decoded_bytes;
+                    let before = inventory.archive_work.physical_bytes;
                     inventory.archive_work.allowed &= codex_page
                         .singleton_remaining(sampled_scan::codex_cursor::Limits::current())
-                        >= codex_file_join::MAX_HEADER_BYTES as u64;
+                        >= 2 * codex_file_join::MAX_HEADER_BYTES as u64;
                     let done = inventory.step_with_archive(
                         &codex_title_metadata,
                         index,
                         sampling.as_ref().map(|context| &context.cache),
                     );
-                    codex_page.charge(false, inventory.archive_work.decoded_bytes - before);
+                    codex_page.charge(false, inventory.archive_work.physical_bytes - before);
                     if !done {
                         pending!();
                     }

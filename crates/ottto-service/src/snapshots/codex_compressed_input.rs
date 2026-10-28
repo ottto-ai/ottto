@@ -623,7 +623,7 @@ impl super::ScanIndex {
         let old = self
             .files
             .get(&key)
-            .and_then(|e| e.archive.as_ref())
+            .and_then(|e| e.archive.as_deref())
             .filter(|a| a.matches(&file));
         if let Some(header) = old.and_then(|a| a.header_for(&candidate.path)) {
             return Ok((header.clone(), 0));
