@@ -2922,7 +2922,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
             assert_eq!(fs::read(&record).unwrap(), bytes);
             assert!(durable.durable_held[store::Refusal::NewerFormat as usize] >= 1);
         } else {
-            assert_eq!(durable.durable_held, [0; 6]);
+            assert_eq!(durable.durable_held, [0; 5]);
         }
         scanned.push(result.scanned_file_count);
         fs::remove_dir_all(root).unwrap();
@@ -2931,68 +2931,6 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         scanned[1] + 2 <= scanned[0],
         "control acquires both members; the held group acquires neither: {scanned:?}"
     );
-}
-
-/// A successful joined scan has no per-file durable reductions by design.
-/// Appending only the live member must still admit its unchanged sealed peer.
-#[cfg(unix)]
-#[test]
-fn completed_joined_members_are_not_missing_upgrade_state() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (root, _) = fixture();
-    let source = SnapshotSource::Codex;
-    let cache = Arc::new(SharedCache::default());
-    let namespace = Scope("group-fixture".into());
-    cache.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
-    let (mut index, first) = sampled(&root, ScanIndex::default(), 10, &cache);
-    assert!(!first.snapshots.is_empty());
-    for name in ["a", "b"] {
-        let entry = &index.files[&local_index_key(&root.join(format!("sessions/{name}.jsonl")))];
-        assert!(
-            entry.codex_joined_member_set.is_some()
-                || entry.codex_captured_joined_member_set.is_some()
-        );
-    }
-    let sealed = root.join("sessions/a.jsonl");
-    let before = fs::read(&sealed).unwrap();
-    append_rows(
-        &root.join("sessions/b.jsonl"),
-        &[
-            turn("66666666-aaaa-4aaa-8aaa-666666666666"),
-            native(OWNER, "new-response", 5, 305),
-        ],
-    );
-    let cold = Arc::new(SharedCache::default());
-    cold.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
-    for n in 0..2 {
-        if n != 0 {
-            append_rows(
-                &root.join("sessions/b.jsonl"),
-                &[native(OWNER, "newer-response", 5, 310)],
-            );
-        }
-        let (next, scan) = sampled_at(
-            &root,
-            index,
-            10,
-            &cold,
-            if n == 0 {
-                "2026-10-06T23:01:00Z"
-            } else {
-                "2026-10-06T23:02:00Z"
-            },
-        );
-        assert!(scan.scanned_file_count >= 2, "joined updates must progress");
-        assert!(!scan.snapshots.is_empty());
-        index = next;
-    }
-    assert_eq!(fs::read(sealed).unwrap(), before);
-    let (counts, _) = cold.durable_counters(source).unwrap();
-    assert_eq!(counts.upgrade_state_missing, 0);
-    assert_eq!(counts.durable_held.iter().sum::<u64>(), 0);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

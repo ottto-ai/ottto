@@ -1109,7 +1109,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 } else {
-                    assert_eq!(counts.durable_held, [0; 6]);
+                    assert_eq!(counts.durable_held, [0; 5]);
                 }
                 assert_eq!(counts.restored, 0);
                 let _ = std::fs::remove_dir_all(root);
@@ -1523,7 +1523,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
         std::fs::set_permissions(&disk, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .unwrap();
         let mut store = DurableTailStore::new(dir.clone(), DurableSource::Codex);
-        let old = match store.read(&pending.binding.key, &pending.allowlist) {
+        let old = match store.read(&pending.binding.key) {
             ReadOutcome::Found(r) => r,
             other => panic!("{other:?}"),
         };
@@ -1569,7 +1569,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                     .written,
                 1
             );
-            let next = match store.read(&pending.binding.key, &pending.allowlist) {
+            let next = match store.read(&pending.binding.key) {
                 ReadOutcome::Found(r) => r,
                 other => panic!("{other:?}"),
             };
@@ -1731,5 +1731,163 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
         before_offset
     );
     assert_eq!(std::fs::read(record_path).unwrap(), before_bytes);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scope_for(
+    source: DurableSource,
+    snapshot_source: SnapshotSource,
+    scope: &Scope,
+    index: &ScanIndex,
+    interpretation: &Interpretation<'_>,
+    format: u16,
+    allowlist: &store::Digest32,
+) -> store::Digest32 {
+    store::replay_scope_digest(
+        &store::scope_digest_for(
+            format,
+            &scope.0,
+            allowlist,
+            &interpretation.identity_contract,
+            &interpretation.counting_view,
+        ),
+        crate::snapshot_sync::effective_upload_body_witness_revision(snapshot_source),
+        index.active_effective_upload_body_witness_revision,
+        if source == DurableSource::ClaudeCode {
+            index.claude_money_birth_store.money_rule_version()
+        } else {
+            0
+        },
+        source == DurableSource::ClaudeCode && claude_request_money::e2::enabled(),
+    )
+}
+
+pub(crate) fn seed_pinned_v1(
+    cache: &SharedCache,
+    source: SnapshotSource,
+    key: &str,
+    index: &ScanIndex,
+) -> Vec<u8> {
+    let checkpoint = cache.retained_checkpoint(key).unwrap();
+    let ds = durable_source(source).unwrap();
+    let mut stores = cache.durable().unwrap();
+    let slot = stores.slot(ds).as_mut().unwrap();
+    let interpretation =
+        Interpretation::of(source, key, index, slot.identity_capture, &slot.namespace);
+    let record = match slot.store.read(&store::key_digest(ds, key)) {
+        ReadOutcome::Found(record) => record,
+        other => panic!("{other:?}"),
+    };
+    let mut pending = record.record;
+    pending.binding.scope = scope_for(
+        ds,
+        source,
+        checkpoint.scope(),
+        index,
+        &interpretation,
+        1,
+        &pending.allowlist,
+    );
+    let bytes = store::tests::pinned_v1_bytes(&pending, record.index_generation);
+    let name = store::key_digest(ds, key)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    std::fs::write(slot.store.dir().join(format!("{name}.rec")), &bytes).unwrap();
+    bytes
+}
+
+/// V1 envelope debt is retired, but the index remains the deadline authority.
+/// Exercise real disk decode, certificate restore and acquisition decisions on
+/// every layout, including two process/index reloads and a later offered debt.
+#[test]
+fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
+    use crate::transcript_acquisition::{AuditDebt, ReadMode};
+    let root = crate::test_scratch::private_dir("ottto-v1-debt-survival");
+    let lock = test_locks::hold(&root);
+    let path = root.join("source.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let scope = Scope("debt-survival".into());
+    let key = local_index_key(&path);
+    let index_path = root.join("index.json");
+    let now = 1_800_000_000;
+    let due = now + 60;
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes": 3, "modified_unix_seconds": 1, "source_file_fingerprint": "debt-source"
+        }))
+        .unwrap(),
+    );
+    assert!(index.stage_sampled_audit(
+        &key,
+        "debt-source",
+        AuditDebt {
+            due_unix_seconds: due
+        }
+    ));
+    index.save(&index_path).unwrap();
+    let mut certificate = certificate(&path, &scope);
+    certificate.audit_debt_unix_seconds = Some(due);
+    let source = DurableSource::ClaudeCode;
+    let record_key = store::key_digest(source, &key);
+    let pending = PendingRecord {
+        binding: store::Binding {
+            source,
+            key: record_key,
+            context: [0; 32],
+            scope: [1; 32],
+            entry: [2; 32],
+        },
+        certificate,
+        body: crate::snapshots::durable_store_fixture_body(SnapshotSource::ClaudeCode, 0, 0),
+        allowlist: codec::allowlist_digest(SnapshotSource::ClaudeCode),
+    };
+    let dir = store::store_dir_for_index(&index_path);
+    DurableTailStore::new(dir.clone(), source)
+        .write_after_save(lock, index.generation, vec![pending])
+        .unwrap();
+    for pass in 0..2 {
+        let mut index = ScanIndex::load(&index_path).unwrap();
+        let record = match DurableTailStore::new(dir.clone(), source).read(&record_key) {
+            ReadOutcome::Found(record) => record,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(record.record.certificate.audit_debt_unix_seconds, None);
+        let mut held = File::open(&path).unwrap();
+        let (checkpoint, _) = record
+            .record
+            .certificate
+            .restore(&mut held, scope.clone())
+            .unwrap();
+        assert_eq!(checkpoint.audit_debt(), None, "no envelope fallback");
+        let debt = sampled_audit::debt_for_key(&index, &key, now + pass).unwrap();
+        assert_eq!(debt.due_unix_seconds, due);
+        let before =
+            ReadPlan::prepare(&mut held, Some(&checkpoint), &scope, Some(debt), due - 1).unwrap();
+        assert_eq!(before.mode(), ReadMode::Unchanged);
+        let retained = before
+            .commit_after_native_completion(&held, &scope, due - 1)
+            .unwrap();
+        assert_eq!(retained.audit_debt().unwrap().due_unix_seconds, due);
+        assert!(index.stage_sampled_audit(
+            &key,
+            "debt-source",
+            AuditDebt {
+                due_unix_seconds: due + 600
+            }
+        ));
+        index.save(&index_path).unwrap();
+        let debt = sampled_audit::debt_for_key(&index, &key, due).unwrap();
+        assert_eq!(debt.due_unix_seconds, due, "later offers cannot renew debt");
+        assert_eq!(
+            ReadPlan::prepare(&mut held, Some(&checkpoint), &scope, Some(debt), due)
+                .unwrap()
+                .mode(),
+            ReadMode::Full(FullReason::AuditDue)
+        );
+    }
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -27633,7 +27633,10 @@ impl OwnedSourceScan {
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                         if let Some((member, reason)) = group.members.iter().find_map(|member| {
-                            Some((member, cache.durable_guard(source, member, index)?))
+                            Some((
+                                member,
+                                cache.durable_hold(source, &local_index_key(&member.path))?,
+                            ))
                         }) {
                             cache.durable_hold_exit(source, reason, index, member, &mut census);
                             pending!();
@@ -31174,7 +31177,9 @@ impl OwnedSourceScan {
             #[cfg(unix)]
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) = cache.durable_guard(source, &candidate, index) {
+                    if let Some(reason) =
+                        cache.durable_hold(source, &local_index_key(&candidate.path))
+                    {
                         cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
                         pending!();
                     }

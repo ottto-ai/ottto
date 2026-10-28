@@ -54,6 +54,11 @@ pub(super) struct CodexCounting {
 }
 
 impl CodexCounting {
+    pub(super) fn durable_cutover(&self) -> Option<i64> {
+        self.cutover_unix_ms
+    }
+
+    #[cfg(test)]
     pub(super) fn durable_contract(&self) -> (Option<i64>, u8, u8) {
         (
             self.cutover_unix_ms,

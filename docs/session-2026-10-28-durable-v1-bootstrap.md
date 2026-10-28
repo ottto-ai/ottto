@@ -6,17 +6,21 @@ Formats 2 and 3 remain newer-format holds: this change allocates no new tag.
 Decoded Codex counting state must agree with the configured cutover; its
 interpretation and evidence remain the reduction's decision. V1 audit-debt
 bytes are checked and dropped on decode without changing their wire offsets.
+The v1 writer still emits that field. The index-owned audit obligation remains
+the deadline authority: restore and later offers cannot postpone its deadline.
 Ordinary replacement failure or budget refusal retains valid v1 authority.
 
-GD removed the old reread reservation ledger. This change does not restore it
-or use its retired positional fields. Indexed cold misses hold conservatively,
-including changed content, until the approved cause gate can durably bind the
-one permitted A5 recovery. Held misses are observable as `durable_held` class
-`upgrade_missing`; `upgrade_state_missing` counts admitted A5 reads and remains
-zero while that admission is unavailable. Completed joined Codex jobs retain no
-per-file reduction by design. Pending pre-POST captures also keep their
-existing recovery admission; neither absence is an upgrade loss. Durable
-record holds still precede this exemption.
+No migration occurs in this slice: tag 1 and its scope formula are unchanged.
+An absent record keeps the existing Full-on-miss behavior, including absence
+caused by capacity, inventory overflow, write deferral, failed persistence or GC.
+There is no missing-state hold, counter, alarm or special Codex exemption.
+O3 upgrade recovery belongs to 5b-Claude-A1 (SOURCE SRC-1b): idle hold, then one
+counted A5 on real new content, excluding keys with no record by design. That
+later slice must supply its durable cause binding; this change grants none.
+GD's retired reservation ledger and positional fields remain retired.
 
-No feature flags, new source tags or representation reinterpretation. Broader
-restart admission and R2 format 3 remain separate changes.
+Fixed v1 scope/replay digests and header bytes pin the two historical writers
+and both sources independently of current helpers. Native restart fixtures
+cover old restore, Tail, ordinary save/GC and a second restore with zero Fulls;
+existing bounded class-X re-derivation still prevents a zero-byte claim.
+No flags, parser/scan-identity bump, Pi source or tag reinterpretation.

@@ -297,7 +297,6 @@ pub(crate) enum Refusal {
     Undecodable,
     Unbindable,
     Corrupt,
-    UpgradeMissing,
 }
 
 /// The outcome of reading one key.
@@ -375,13 +374,14 @@ pub(crate) struct StoreCounters {
     pub(crate) records_deferred: u64,
     pub(crate) batches: u64,
     /// Budget refusals: a record over `RECORD_BYTES` or a store over
-    /// `STORE_BYTES`. The entry is Full after restart.
+    /// `STORE_BYTES`. A verified predecessor stays until replacement;
+    /// without one, the entry is Full after restart.
     pub(crate) budget_refused: u64,
     /// Per-pass read I/O.
     pub(crate) bytes_read: u64,
     pub(crate) records_read: u64,
     pub(crate) missing: u64,
-    pub(crate) format_hold: [u64; 6],
+    pub(crate) format_hold: [u64; 5],
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
@@ -513,16 +513,10 @@ impl DurableTailStore {
     }
 
     pub(crate) fn representation(&mut self, key: &Digest32) -> Option<(u16, Digest32)> {
-        self.classify(key, "guard")
+        self.classify(key, "delete")
             .ok()
             .flatten()
             .map(|h| (h.format, h.record.allowlist))
-    }
-
-    pub(crate) fn absent(&self, key: &Digest32) -> bool {
-        self.disabled.is_none()
-            && fs::symlink_metadata(self.record_path(key))
-                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
     }
 
     pub(crate) fn counters(&self) -> StoreCounters {
@@ -586,7 +580,12 @@ impl DurableTailStore {
                 .read_to_end(&mut header)
                 .map_err(|_| Refusal::Undecodable)?;
             let n = header.len();
-            self.counters.guard_header_bytes += n as u64;
+            if work == "delete" {
+                self.counters.gc_records_read += 1;
+                self.counters.gc_bytes_read += n as u64;
+            } else {
+                self.counters.guard_header_bytes += n as u64;
+            }
             let binding = decode_header(&header, key, self.source)?;
             // After any repair: its ctime moved.
             let metadata = file.metadata().map_err(|_| Refusal::Corrupt)?;
@@ -646,7 +645,7 @@ impl DurableTailStore {
         }
     }
 
-    pub(crate) fn read(&mut self, key: &Digest32, allowlist: &Digest32) -> ReadOutcome {
+    pub(crate) fn read(&mut self, key: &Digest32) -> ReadOutcome {
         match self.classify(key, "guard") {
             Err(reason) => return ReadOutcome::Refused(reason),
             Ok(None) => {
@@ -663,7 +662,7 @@ impl DurableTailStore {
         self.counters.bytes_read += bytes.len() as u64;
         self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
         self.note_codec(bytes.capacity() + bytes.len().saturating_sub(HEADER_BYTES));
-        match decode(&bytes, allowlist) {
+        match decode(&bytes) {
             Ok(record) => {
                 if let Some((content, _)) = self.durable.get_mut(key) {
                     *content = Some(content_digest(&record.record));
@@ -698,17 +697,13 @@ impl DurableTailStore {
             .sum::<usize>();
         for record in pending {
             // A T14 predecessor is the rebuild's to replace.
-            let keep_prior = match self.classify(&record.binding.key, "overwrite") {
-                Err(Refusal::Corrupt) => true,
+            match self.classify(&record.binding.key, "overwrite") {
+                Err(Refusal::Corrupt) | Ok(_) => {}
                 Err(_) => {
                     self.counters.store_write_skipped[0] += 1;
                     continue;
                 }
-                // Preserve the v1 authority if the ordinary replacement fails
-                // or is refused by the record/store budget.
-                Ok(Some(old)) => old.format == 1,
-                Ok(None) => false,
-            };
+            }
             let content = content_digest(&record);
             if self
                 .durable
@@ -717,7 +712,7 @@ impl DurableTailStore {
             {
                 receipt.clean += 1;
             } else {
-                dirty.push((record, content, keep_prior));
+                dirty.push((record, content));
             }
         }
         if !self.usable() {
@@ -730,7 +725,7 @@ impl DurableTailStore {
         ensure_private_dir(&self.dir)?;
         let (mut on_disk, mut unlisted) = self.scan_disk()?;
         let mut changed = false;
-        for (record, content, keep_prior) in dirty {
+        for (record, content) in dirty {
             if receipt.written + receipt.budget_refused >= MAX_BATCH {
                 receipt.deferred += 1;
                 receipt.deferred_keys.push(record.binding.key);
@@ -775,14 +770,8 @@ impl DurableTailStore {
                 || total > STORE_BYTES
                 || (previous == 0 && on_disk.len() >= MAX_RECORDS)
             {
-                // A stale record for this key would bind to an older entry
-                // only; drop it so the refusal costs no disk. A T14 record
-                // and a bootstrappable v1 record stay until replacement.
-                if previous != 0 && !keep_prior {
-                    remove_if_present(&path)?;
-                    on_disk.remove(&key);
-                    changed = true;
-                }
+                // Preserve the verified predecessor until an ordinary
+                // replacement succeeds, including on budget refusal.
                 self.durable.remove(&key);
                 receipt.budget_refused += 1;
                 continue;
@@ -822,7 +811,6 @@ impl DurableTailStore {
         &mut self,
         writer: &W,
         live_context: &Digest32,
-        _allowlist: &Digest32,
         keep: &BTreeMap<Digest32, Option<Digest32>>,
     ) -> io::Result<()> {
         self.check_writer(writer)?;
@@ -866,8 +854,6 @@ impl DurableTailStore {
                 unlisted_bytes += len;
                 continue;
             }
-            self.counters.gc_records_read += 1;
-            self.counters.gc_bytes_read += HEADER_BYTES as u64;
             let verdict = match self.classify(&key, "delete") {
                 Ok(Some(binding)) => {
                     let binding = binding.record.binding;
@@ -1352,7 +1338,7 @@ impl<'a> Cursor<'a> {
 
 /// The version is checked before the trailer: a newer layout is not ours to
 /// judge. Everything else must pass the trailer and decode exactly.
-fn decode(bytes: &[u8], _allowlist: &Digest32) -> Result<DurableRecord, Refusal> {
+fn decode(bytes: &[u8]) -> Result<DurableRecord, Refusal> {
     let source = bytes
         .get(42)
         .and_then(|tag| DurableSource::from_tag(*tag))

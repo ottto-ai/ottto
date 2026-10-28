@@ -48,7 +48,7 @@ pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 128;
 
 /// Head re-parse bytes of restores, per source, for the process lifetime.
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
-/// miss only), so the census pass line reports it beside the guard's own
+/// miss only, so the census pass line reports it beside the guard's own
 /// counters (SOURCE N1).
 static REDERIVE_HEAD_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -65,9 +65,8 @@ pub(crate) struct Counters {
     pub(crate) restore_attempts: u64,
     pub(crate) restored: u64,
     pub(crate) missing: u64,
-    pub(crate) upgrade_state_missing: u64,
     pub(crate) refused_record: u64,
-    pub(crate) durable_held: [u64; 6],
+    pub(crate) durable_held: [u64; 5],
     pub(crate) held_census: [u64; 2],
     pub(crate) ineligible: BTreeMap<&'static str, u64>,
     pub(crate) certificate_refused: BTreeMap<&'static str, u64>,
@@ -105,12 +104,12 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} restore_attempts={} restored={} missing={} \
-             refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
+             refused_record={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
-             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,upgrade_missing]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
+             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
@@ -120,7 +119,6 @@ impl Counters {
             self.restored,
             self.missing,
             self.refused_record,
-            self.upgrade_state_missing,
             classes(&self.ineligible),
             classes(&self.certificate_refused),
             self.corrupt_body,
@@ -169,9 +167,9 @@ struct Slot {
     namespace: Scope,
     identity_capture: bool,
     /// Keys held (U) by this source, and the totals the last alarm reported:
-    /// [held, t14_rebuild, mode_repaired, disabled, upgrade_state_missing].
+    /// [held, t14_rebuild, mode_repaired, disabled].
     held: u64,
-    reported: [u64; 5],
+    reported: [u64; 4],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -318,36 +316,6 @@ fn expected(
     })
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn scope_for(
-    source: DurableSource,
-    snapshot_source: SnapshotSource,
-    scope: &Scope,
-    index: &ScanIndex,
-    interpretation: &Interpretation<'_>,
-    format: u16,
-    allowlist: &store::Digest32,
-) -> store::Digest32 {
-    store::replay_scope_digest(
-        &store::scope_digest_for(
-            format,
-            &scope.0,
-            allowlist,
-            &interpretation.identity_contract,
-            &interpretation.counting_view,
-        ),
-        crate::snapshot_sync::effective_upload_body_witness_revision(snapshot_source),
-        index.active_effective_upload_body_witness_revision,
-        if source == DurableSource::ClaudeCode {
-            index.claude_money_birth_store.money_rule_version()
-        } else {
-            0
-        },
-        source == DurableSource::ClaudeCode && claude_request_money::e2::enabled(),
-    )
-}
-
 fn ineligible_class(reason: store::Ineligible) -> &'static str {
     match reason {
         store::Ineligible::Source => "source",
@@ -456,7 +424,7 @@ impl SharedCache {
                 namespace: namespace.clone(),
                 identity_capture,
                 held: 0,
-                reported: [0; 5],
+                reported: [0; 4],
             });
         }
     }
@@ -472,66 +440,6 @@ impl SharedCache {
             .as_mut()?
             .store
             .hold(&store::key_digest(source, key))
-    }
-
-    pub(in crate::snapshots) fn durable_guard(
-        &self,
-        source: SnapshotSource,
-        candidate: &CandidateFile,
-        index: &mut ScanIndex,
-    ) -> Option<store::Refusal> {
-        self.durable_hold(source, &local_index_key(&candidate.path))
-            .or_else(|| {
-                self.durable_upgrade_missing(source, candidate, index)
-                    .then_some(store::Refusal::UpgradeMissing)
-            })
-    }
-
-    pub(in crate::snapshots) fn durable_upgrade_missing(
-        &self,
-        source: SnapshotSource,
-        candidate: &CandidateFile,
-        index: &mut ScanIndex,
-    ) -> bool {
-        if !crate::heap_layout_bound::layout_supported() {
-            return false;
-        }
-        let key = local_index_key(&candidate.path);
-        if self
-            .retained()
-            .is_ok_and(|cache| cache.peek(&key).is_some())
-        {
-            return false;
-        }
-        let Some(ds) = durable_source(source) else {
-            return false;
-        };
-        let Some(mut stores) = self.durable() else {
-            return false;
-        };
-        let Some(slot) = stores.slot(ds).as_mut() else {
-            return false;
-        };
-        let Some(entry) = index
-            .files
-            .get(&key)
-            .filter(|e| !e.source_file_fingerprint.is_empty())
-        else {
-            return false;
-        };
-        // Completed joined jobs and pending pre-POST captures deliberately
-        // lack a per-file record. Their existing admission owns recovery.
-        if source == SnapshotSource::Codex
-            && (entry.codex_joined_member_set.is_some() || entry.codex_recovery_is_pending())
-        {
-            return false;
-        }
-        if !slot.store.absent(&store::key_digest(ds, &key)) {
-            return false;
-        }
-        // GD retired the old reservation ledger. Missing state is never a
-        // replay grant: hold until the approved cause gate can durably bind A5.
-        true
     }
 
     pub(in crate::snapshots) fn durable_hold_exit(
@@ -608,8 +516,8 @@ impl SharedCache {
         interpretation: &Interpretation<'_>,
     ) -> Option<Taken<CachedJsonlReduction>> {
         let source = durable_source(snapshot_source)?;
+        index.files.get(key)?;
         let store_key = store::key_digest(source, key);
-        let allowlist = codec::allowlist_digest(snapshot_source);
         let record = {
             let mut stores = self.durable()?;
             stores.counters.restore_attempts += 1;
@@ -631,7 +539,7 @@ impl SharedCache {
                 return None;
             }
             let outcome = match stores.slot(source).as_mut() {
-                Some(slot) => slot.store.read(&store_key, &allowlist),
+                Some(slot) => slot.store.read(&store_key),
                 None => return None,
             };
             match outcome {
@@ -727,21 +635,20 @@ impl SharedCache {
                 .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
         }
         record.eligible(expected).map_err(Failure::Ineligible)?;
-        let (checkpoint, _) = record
-            .record
-            .certificate
-            .restore(held, scope.clone())
-            .map_err(Failure::Certificate)?;
         let decoded = codec::decode(&record.record.body, source).map_err(|_| Failure::Corrupt)?;
-        let counting = decoded.counting();
         let cutover = interpretation
             .counting_view
             .split(':')
             .next()
             .and_then(|s| s.parse::<i64>().ok());
-        if counting.is_some_and(|c| c.0 != cutover) {
+        if decoded.cutover().is_some_and(|stored| stored != cutover) {
             return Err(Failure::Ineligible(store::Ineligible::Scope));
         }
+        let (checkpoint, _) = record
+            .record
+            .certificate
+            .restore(held, scope.clone())
+            .map_err(Failure::Certificate)?;
         let mut rederive = held
             .try_clone()
             .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("descriptor")))?;
@@ -956,7 +863,6 @@ impl SharedCache {
         let Some(source) = durable_source(snapshot_source) else {
             return Ok(());
         };
-        let allowlist = codec::allowlist_digest(snapshot_source);
         let Some(mut stores) = self.durable() else {
             return Ok(());
         };
@@ -1005,7 +911,7 @@ impl SharedCache {
         let Some(slot) = stores.slot(source).as_mut() else {
             return Ok(());
         };
-        slot.store.gc(writer, &context, &allowlist, &keep)
+        slot.store.gc(writer, &context, &keep)
     }
 
     /// Fresh-index cleanup uses the same verified, bounded GC; U/T14 survive.
@@ -1021,12 +927,7 @@ impl SharedCache {
             return Ok(());
         };
         match stores.slot(source).as_mut() {
-            Some(slot) => slot.store.gc(
-                writer,
-                &[0; 32],
-                &codec::allowlist_digest(snapshot_source),
-                &BTreeMap::new(),
-            ),
+            Some(slot) => slot.store.gc(writer, &[0; 32], &BTreeMap::new()),
             None => Ok(()),
         }
     }
@@ -1053,7 +954,6 @@ impl SharedCache {
         #[derive(serde::Serialize)]
         struct Alarm {
             held_keys: [u64; 2],
-            upgrade_state_missing: [u64; 2],
             t14_rebuild: [u64; 2],
             mode_repaired: [u64; 2],
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -1065,7 +965,6 @@ impl SharedCache {
         let Some(mut stores) = self.durable() else {
             return;
         };
-        let upgrade = stores.counters.upgrade_state_missing;
         let Some(slot) = stores.slot(source).as_mut() else {
             return;
         };
@@ -1075,7 +974,6 @@ impl SharedCache {
             store.t14_rebuild,
             store.mode_repaired,
             u64::from(disabled.is_some()),
-            upgrade,
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -1085,7 +983,6 @@ impl SharedCache {
                 snapshot_source.api_slug(),
                 &Alarm {
                     held_keys: pair(0),
-                    upgrade_state_missing: pair(4),
                     t14_rebuild: pair(1),
                     mode_repaired: pair(2),
                     store_disabled: disabled.filter(|_| last[3] == 0),
@@ -1125,42 +1022,4 @@ enum Failure {
 mod tests;
 
 #[cfg(test)]
-pub(crate) fn seed_pinned_v1(
-    cache: &SharedCache,
-    source: SnapshotSource,
-    key: &str,
-    index: &ScanIndex,
-    pin: &str,
-) -> Vec<u8> {
-    assert!(matches!(pin, "72205c6c" | "ffc6c846"));
-    let checkpoint = cache.retained_checkpoint(key).unwrap();
-    let ds = durable_source(source).unwrap();
-    let mut stores = cache.durable().unwrap();
-    let slot = stores.slot(ds).as_mut().unwrap();
-    let interpretation =
-        Interpretation::of(source, key, index, slot.identity_capture, &slot.namespace);
-    let record = match slot.store.read(
-        &store::key_digest(ds, key),
-        &codec::allowlist_digest(source),
-    ) {
-        ReadOutcome::Found(record) => record,
-        other => panic!("{other:?}"),
-    };
-    let mut pending = record.record;
-    pending.binding.scope = scope_for(
-        ds,
-        source,
-        checkpoint.scope(),
-        index,
-        &interpretation,
-        1,
-        &pending.allowlist,
-    );
-    let bytes = store::tests::pinned_v1_bytes(&pending, record.index_generation);
-    let name = store::key_digest(ds, key)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    std::fs::write(slot.store.dir().join(format!("{name}.rec")), &bytes).unwrap();
-    bytes
-}
+pub(crate) use tests::seed_pinned_v1;

@@ -158,6 +158,23 @@ retryable (red) for the whole hold, so census close, retirement and
 account-family proof wait for that source; a held key is not yet terminal
 disclosed residue.
 
+An absent record is a restore `missing` outcome and keeps the existing Full
+admission; it is not a held key. There is no `upgrade_state_missing` counter or
+alarm in this format-1 bootstrap. Audit deadlines remain owned by the index,
+even though the v1 envelope's old debt field is structurally consumed and dropped.
+The `format_hold` and `durable_held` arrays keep five slots:
+`newer,unknown,undecodable,unbindable,known_corrupt`.
+
+Store header reads for GC (including representation lookup for a decided key)
+are counted in `gc_records_read` / `gc_bytes_read`, using actual bytes read;
+GC trailer/body verification uses `delete_verify_bytes`. They do not inflate
+`guard_header_bytes` / `guard_verify_bytes`. A decided key currently needs two
+bounded header reads; the verification memo avoids a second full verification.
+These are store bytes, separate from transcript re-derivation bytes. Counters
+on the durable pass summary are process totals; `take_pass` store receipts reset
+their flows while retaining disk levels. Alarm counts retain the delta/total
+contract above.
+
 ## Line Delivery Counters
 
 Schema 2's `native_collection_page` can add two sparse, counts-only objects.
