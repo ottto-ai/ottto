@@ -47895,7 +47895,7 @@ impl ScanIndex {
         }
         if !self.decode_has_opaque_file_incidence() {
             let mut current = self.current_snapshot_fingerprints();
-            current.extend(self.upload_progress_ack_incidence());
+            current.extend(self.upload_progress_ack_incidence().map(str::to_owned));
             self.snapshot_activity_at
                 .retain(|fp, _| current.contains(fp));
         }
