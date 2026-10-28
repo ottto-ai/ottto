@@ -622,10 +622,9 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   Claude Code setup also installs a local
   `statusLine` wrapper that preserves an existing status line command while
   feeding documented `rate_limits` fields into the local quota cache. The relay
-  uses a source header to route shared-port payloads to source-scoped
-  relay-token exchange before forwarding OTLP payloads to the setup run's
-  persisted backend API base URL. Manual edits to the managed Ottto fence are
-  rejected with `manual_fence_review_required`, leaving local keys in place
+  reduces OTLP payloads locally and answers the exporter itself; it forwards
+  nothing upstream, because Ottto's server retired OTLP ingest. Manual edits
+  to the managed Ottto fence are rejected with `manual_fence_review_required`, leaving local keys in place
   until the user reviews the file instead of guessing at cleanup. Pi setup
   actions also register or merge the local telemetry device source grant, but
   they skip Codex/Claude OTLP config patching because Pi telemetry is imported
@@ -636,15 +635,15 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
 - local Claude Code reasoning-effort reduction at that loopback boundary:
   Claude's documented `claude_code.api_request` logs use OTLP/HTTP JSON while
   metrics and traces remain protobuf. The relay accepts both fixed-length and
-  bounded HTTP/1.1 chunked request bodies, de-chunks before reduction and cloud
-  forwarding, and rejects ambiguous or unsupported transfer framing. It stores only session id, request
+  bounded HTTP/1.1 chunked request bodies, de-chunks before reduction, and
+  rejects ambiguous or unsupported transfer framing. It stores only session id, request
   timestamp, model, applied effort, and token counters in owner-only hashed
   sidecars; prompts, responses, commands, paths, account identity, email, and
   raw OTLP are discarded. Snapshot sync partitions matching transcript
   model/hour rows by this evidence, leaves uncovered residual usage as unknown,
-  and preserves exact transcript totals. Organization-disabled live telemetry
-  still returns its normal OTLP success response after the local reduction;
-  transient forwarding failures retain the existing exporter retry behavior.
+  and preserves exact transcript totals. The relay returns the OTLP success
+  response after the local reduction, and a non-retryable error when the body
+  cannot be decoded or its evidence cannot be stored.
 - source-local snapshot parsing and background sync in `ottto-service` for Codex
   `~/.codex/sessions/**/*.jsonl`, Claude Code
   `~/.claude/projects/**/*.jsonl`, and Pi

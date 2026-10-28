@@ -26,6 +26,13 @@ use std::path::Path;
 #[cfg(test)]
 thread_local! { pub(super) static IO_BYTES: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) }; }
 #[cfg(test)]
+thread_local! { pub(super) static TRANSCRIPT_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn record_transcript_read(bytes: u64) {
+    TRANSCRIPT_BYTES.with(|total| total.set(total.get() + bytes));
+    record_read(bytes);
+}
+#[cfg(test)]
 pub(super) fn record_read(bytes: u64) {
     IO_BYTES.with(|io| {
         let (read, write) = io.get();
@@ -205,12 +212,6 @@ pub(super) struct RunRecord {
     /// Full-read bytes spent on `repair_day`.
     pub(super) repair_day: Day,
     pub(super) repair_used: u64,
-    /// Audit bytes spent on `audit_day`.
-    pub(super) audit_day: Day,
-    pub(super) audit_used: u64,
-    /// Per agent: the copy key audited last; the next audit starts after it,
-    /// so every eligible file is sampled in turn.
-    pub(super) audit_after: BTreeMap<String, String>,
     /// Per agent: the full-read backlog at its last run and how many runs in
     /// a row it grew.
     pub(super) backlog: BTreeMap<String, Backlog>,
@@ -284,9 +285,6 @@ pub(super) struct Pin {
     pub(super) head: Fingerprint,
     #[serde(default)]
     pub(super) tail: Fingerprint,
-    /// Where the file's first read started (`start` moves on with each commit).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) origin: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -380,7 +378,7 @@ pub(super) struct Checkpoint {
     pub(super) tail: Fingerprint,
     pub(super) size: u64,
     pub(super) mtime: Stamp,
-    /// Parser identity at the file's first read.
+    /// Parser identity at the file's first read, required by older readers on rollback.
     pub(super) parser_version: String,
     pub(super) status: Status,
     pub(super) parse: StoredParse,
@@ -392,10 +390,6 @@ pub(super) struct Checkpoint {
     /// `compact`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) cold: Option<Cold>,
-    /// Where the file's first read started, kept so pins rebuilt from this
-    /// checkpoint still know it (see `Pin::origin`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) origin: Option<u64>,
 }
 
 /// A file unchanged this long is cold.
@@ -566,26 +560,11 @@ pub(super) struct ParseState {
     pub(super) request1_closed: bool,
     /// Latest final snapshot verdict, refreshed without reading transcripts.
     pub(super) start_measured: bool,
-    /// The verdict reads while request 1 was open ran under, so an audit
-    /// re-read counts its lines the same way after the verdict changed.
-    pub(super) request1_start_measured: Option<bool>,
-    /// Those reads ran under different verdicts: no re-read can match.
-    pub(super) request1_verdict_mixed: bool,
     pub(super) compactions: crate::snapshots::CompositionCompactions,
     pub(super) cwd: Option<Box<str>>,
 }
 
 impl ParseState {
-    /// Note the verdict a read that advanced while request 1 was open ran
-    /// under.
-    pub(super) fn note_request1_verdict(&mut self, measured: bool) {
-        match self.request1_start_measured {
-            None => self.request1_start_measured = Some(measured),
-            Some(earlier) if earlier != measured => self.request1_verdict_mixed = true,
-            Some(_) => {}
-        }
-    }
-
     pub(super) fn add_open(&mut self, day: Day, slot: &Slot, tokens: u64) {
         if tokens == 0 {
             return;
@@ -679,10 +658,6 @@ pub(super) struct StoredParse {
     min_ts: Option<i64>,
     has_rendered: bool,
     request1_closed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    request1_start_measured: Option<bool>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    request1_verdict_mixed: bool,
     #[serde(skip_serializing_if = "crate::snapshots::CompositionCompactions::is_empty")]
     compactions: crate::snapshots::CompositionCompactions,
     cwd: Option<String>,
@@ -700,15 +675,6 @@ impl StoredParse {
             copied: self.copied,
             ..ParseState::default()
         }
-    }
-
-    /// The start verdict request 1 was counted under, once request 1 has
-    /// closed (`None` while it is open, when unknown or when its reads ran
-    /// under different verdicts).
-    pub(super) fn request1_verdict(&self) -> Option<bool> {
-        let closed = self.request1_closed || self.last_assistant.is_some() || self.call_seq > 0;
-        self.request1_start_measured
-            .filter(|_| closed && !self.request1_verdict_mixed)
     }
 
     fn ids_known(&self) -> bool {
@@ -816,8 +782,6 @@ impl StoredParse {
             min_ts: state.min_ts,
             has_rendered: state.has_rendered,
             request1_closed: state.request1_closed,
-            request1_start_measured: state.request1_start_measured,
-            request1_verdict_mixed: state.request1_verdict_mixed,
             compactions: state.compactions.clone(),
             cwd: state.cwd.as_deref().map(str::to_string),
         }
@@ -889,8 +853,6 @@ impl StoredParse {
             has_rendered: self.has_rendered,
             request1_closed,
             start_measured: false,
-            request1_start_measured: self.request1_start_measured,
-            request1_verdict_mixed: self.request1_verdict_mixed,
             compactions: self.compactions,
             cwd: self.cwd.map(Into::into),
         })
@@ -955,7 +917,7 @@ pub(super) fn fingerprint(file: &File, at: u64, len: u64) -> std::io::Result<Fin
         }
         read += count;
         #[cfg(test)]
-        record_read(count as u64);
+        record_transcript_read(count as u64);
     }
     bytes.truncate(read);
     use sha2::{Digest, Sha256};

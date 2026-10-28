@@ -28,7 +28,6 @@
 //! with the switch off the kinds_version 1 harvest runs unchanged.
 
 mod aggregate;
-mod audit;
 mod checkpoint;
 mod claude;
 mod codex;
@@ -78,7 +77,7 @@ const STATE_DIR: &str = "v2";
 /// state instead of a bump: a bump would set every scope aside.
 const STATE_SCHEMA: u32 = 1;
 /// Parser identity recorded on each checkpoint at its first read. Changing it
-/// never re-reads old bytes.
+/// never re-reads old bytes. Retained for older checkpoint readers on rollback.
 const PARSER_VERSION: &str = "context-composition-reader-v2.1";
 const COLLECTOR_VERSION: &str = "context-composition-0.2.0";
 
@@ -97,11 +96,6 @@ const RUN_WALL_CAP: Duration = Duration::from_secs(30 * 60);
 /// earlier build's install) and reads after a state fallback, per day.
 /// New bytes are not capped.
 const REPAIR_BYTES_PER_DAY: u64 = 1024 * 1024 * 1024;
-/// Audit re-reads of files already read whole, per day (see `audit`).
-const AUDIT_BYTES_PER_DAY: u64 = 100 * 1000 * 1000;
-/// Audited files per day at most, so many small files never turn the audit
-/// into a scan of every scope.
-const AUDIT_FILES_PER_DAY: usize = 32;
 
 // Retention.
 /// Daily rows kept (the server's capture-window cap).

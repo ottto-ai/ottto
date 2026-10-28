@@ -34,15 +34,14 @@ use super::super::harvest::{
     read_marker, write_marker,
 };
 use super::aggregate::{day_of, Aggregate, Day, StoredContribution, Window};
-use super::audit::AuditRun;
 use super::checkpoint::{
     birth_secs, born_secs, file_identity, fingerprints, fingerprints_match, install_path,
     prefix_matches, read_json, stamp, write_json, write_packed, Checkpoint, Index, InstallRecord,
     Pin, RunRecord, Stamp, Status, StoredParse, COLD_AFTER_SECS,
 };
 use super::file::{
-    head_cwds, new_audit_parse_state, new_parse_state, new_parse_state_before, read_lines,
-    LineSink, LineStats, Names, Source,
+    head_cwds, new_parse_state, new_parse_state_before, read_lines, LineSink, LineStats, Names,
+    Source,
 };
 use super::health::{HealthEntry, HealthLog, HealthPoster, PostCounts, WorkerCounts};
 use super::scope::{
@@ -54,8 +53,8 @@ use super::upload::{
     upload_scope, UploadOutcome, UploadReceipt, UploadResult, UploadTarget, Uploader,
 };
 use super::{
-    AUDIT_BYTES_PER_DAY, COPIED_SLACK_SECS, FORGET_MISSING_DAYS, KEEP_DAYS, MIN_UPTIME,
-    PARSER_VERSION, REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA, WAKE_INTERVAL,
+    COPIED_SLACK_SECS, FORGET_MISSING_DAYS, KEEP_DAYS, MIN_UPTIME, PARSER_VERSION,
+    REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA, WAKE_INTERVAL,
 };
 use crate::composition_kinds::{GitRootCache, KindsVersion};
 use crate::snapshot_client::{
@@ -535,10 +534,6 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
         deadline: Instant::now() + RUN_WALL_CAP,
         resolver: &mut resolver,
         repair_left: REPAIR_BYTES_PER_DAY.saturating_sub(record.repair_used),
-        audit: AuditRun::with_budget(
-            AUDIT_BYTES_PER_DAY.saturating_sub(record.audit_used),
-            std::mem::take(&mut record.audit_after),
-        ),
     };
     for (snapshot_source, source) in source_order(today) {
         if !enabled.contains(&snapshot_source) || Instant::now() >= run.deadline {
@@ -615,8 +610,6 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
         print_metrics(source, &stats, now);
     }
     record.repair_used = REPAIR_BYTES_PER_DAY.saturating_sub(run.repair_left);
-    record.audit_used = AUDIT_BYTES_PER_DAY.saturating_sub(run.audit.left);
-    record.audit_after = std::mem::take(&mut run.audit.after);
     let _ = write_json(&dir.join("run.json"), &record);
     Ok(())
 }
@@ -662,10 +655,6 @@ pub(super) fn begin_run(dir: &Path, now: OffsetDateTime) -> Result<Option<RunRec
         record.repair_day = today;
         record.repair_used = 0;
     }
-    if record.audit_day != today {
-        record.audit_day = today;
-        record.audit_used = 0;
-    }
     write_json(&path, &record)
         .map_err(|error| anyhow!("save composition run day failed: {error}"))?;
     Ok(Some(record))
@@ -695,7 +684,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
     let at = now.format(&Rfc3339).unwrap_or_default();
     let lines = &stats.lines;
     eprintln!(
-        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} install_forward_only={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} bytes_audit={} audit_files={} audit_differences={} audit_skipped={} audit_skipped_undated={} audit_failed={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
+        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} install_forward_only={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
         source.label(),
         stats.bytes_new,
         stats.bytes_repair,
@@ -744,16 +733,10 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         stats.upload_dropped_unsafe,
         stats.upload_payload_bytes,
         stats.upload_rows_written,
-        stats.bytes_audit,
-        stats.audit_files,
-        stats.audit_differences,
-        stats.audit_skipped,
-        stats.audit_skipped_undated,
-        stats.audit_failed,
         stats.files_checked,
         stats.full_read_waiting_files,
         stats.full_read_backlog_bytes,
-        stats.bytes_new + stats.bytes_repair + stats.bytes_head + stats.bytes_failed + stats.bytes_audit,
+        stats.bytes_new + stats.bytes_repair + stats.bytes_head + stats.bytes_failed,
         stats.cut,
         stats.cpu_micros / 1000,
         stats.wall_micros / 1000,
@@ -884,7 +867,6 @@ pub(super) struct Run<'a> {
     /// Full-read bytes left today (shared by the sources).
     pub(super) repair_left: u64,
     pub(super) start_verdicts: crate::snapshots::start_verdict_store::Verdicts,
-    pub(super) audit: AuditRun,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -896,15 +878,6 @@ pub(super) struct SourceStats {
     pub(super) bytes_head: u64,
     /// Bytes read by reads that then failed (their lines did not count).
     pub(super) bytes_failed: u64,
-    /// Audit re-reads (see `audit`).
-    pub(super) bytes_audit: u64,
-    pub(super) audit_files: u64,
-    /// Audited files whose re-read differed (the re-read replaced them).
-    pub(super) audit_differences: u64,
-    /// Ineligible picks or samples whose retained history cannot be compared.
-    pub(super) audit_skipped: u64,
-    pub(super) audit_skipped_undated: u64,
-    pub(super) audit_failed: u64,
     /// Transcripts the walk found (one per copy key and copy).
     pub(super) files_checked: u64,
     /// Files waiting for a full read at the end of the run, and their bytes.
@@ -1003,9 +976,6 @@ enum Mode {
     Full,
     /// From its current end, keeping its earlier contribution.
     RestartAtEnd,
-    /// The audit sample: from its start to its checkpoint, compared with
-    /// its stored share (see `audit`).
-    Audit,
 }
 
 struct Work {
@@ -1216,7 +1186,6 @@ fn reconcile_pins(
                         restart_at_end: false,
                         head: checkpoint.head,
                         tail: checkpoint.tail,
-                        origin: checkpoint.origin,
                     },
                 );
                 rebuilt += 1;
@@ -1237,7 +1206,6 @@ fn reconcile_pins(
             pin.mtime = checkpoint.mtime;
             pin.head = checkpoint.head;
             pin.tail = checkpoint.tail;
-            pin.origin = checkpoint.origin;
             pin.waiting = false;
             rebuilt += 1;
         }
@@ -1475,7 +1443,6 @@ fn run_source_inner(
                         restart_at_end: !first_run && !new,
                         head: Default::default(),
                         tail: Default::default(),
-                        origin: Some(start),
                     },
                 );
                 start < file.size || agent_reset
@@ -1734,15 +1701,6 @@ fn run_source_inner(
         let waiting = index.files.get(&item.key).is_some_and(|pin| pin.waiting);
         !waiting || item.mode != Mode::Forward
     });
-
-    let busy: BTreeSet<&str> = work.iter().map(|item| item.key.as_str()).collect();
-    let picks = super::audit::pick(&mut run.audit, source.label(), &index, &busy, now_secs);
-    drop(busy);
-    for (key, path, metadata) in picks {
-        let mut item = Work::new(key, Found::new(path, &metadata), Mode::Audit);
-        item.reserved = Some(metadata.len());
-        work.push(item);
-    }
 
     let mut by_scope: BTreeMap<String, Vec<Work>> = BTreeMap::new();
     for item in work {
@@ -2057,9 +2015,6 @@ fn process_scope(
     };
     let generation = scope.generation.max(highest_generation(&path)) + 1;
     let legacy = std::mem::take(&mut scope.files);
-    // A scope visited only for audit samples commits only when one differed.
-    let mut audit_only =
-        reset.is_none() && legacy.is_empty() && items.iter().all(|item| item.mode == Mode::Audit);
     let mut groups: BTreeMap<u16, Vec<Work>> = BTreeMap::new();
     for item in items.drain(..) {
         groups.entry(shard_id(&item.key)).or_default().push(item);
@@ -2105,7 +2060,6 @@ fn process_scope(
             scope.files.clear();
             continue;
         }
-        let audit_group = !migrating && items.iter().all(|item| item.mode == Mode::Audit);
         let held = scope.accounted_bytes();
         stats.peak_accounted_bytes = stats.peak_accounted_bytes.max(held);
         // Oldest transcript first (a stable order).
@@ -2150,9 +2104,6 @@ fn process_scope(
                     }
                 }
                 Ok(None) => {}
-                // A failed audit leaves the file as it was; it is no fault
-                // of the file's own reading.
-                Err(ReadFailed) if item.mode == Mode::Audit => stats.audit_failed += 1,
                 Err(ReadFailed) => {
                     // Nothing of this read counted; the rest of the scope
                     // commits. Retried the next day, then quarantined.
@@ -2168,12 +2119,6 @@ fn process_scope(
             }
         }
 
-        if audit_group && read_files.is_empty() {
-            // Every sample matched: nothing in this shard changed.
-            scope.files.clear();
-            continue;
-        }
-        audit_only = false;
         let read_keys: Vec<String> = read_files.iter().map(|(key, _)| key.clone()).collect();
         scope.files.extend(read_files);
         // Files unchanged for `COLD_AFTER_SECS` and not read now go cold.
@@ -2225,8 +2170,6 @@ fn process_scope(
                 pin.path = checkpoint.path.clone();
                 pin.head = checkpoint.head;
                 pin.tail = checkpoint.tail;
-                // Where counting started: a restart at the end moves it.
-                pin.origin = checkpoint.origin;
                 pin.waiting = false;
                 pin.restart_at_end = false;
                 pin.failures = 0;
@@ -2241,10 +2184,6 @@ fn process_scope(
             }
         }
         scope.files.clear();
-    }
-    if audit_only {
-        // Nothing changed: no new generation, no commit, no upload.
-        return None;
     }
     update_members(&mut scope.file_sessions, removed, added, window.floor);
     scope.agg.prune(window);
@@ -2380,8 +2319,6 @@ fn read_file(
     stats: &mut SourceStats,
 ) -> Result<Option<Outcome>, ReadFailed> {
     #[cfg(test)]
-    let _audit_reads = (item.mode == Mode::Audit).then(tests::AuditReads::begin);
-    #[cfg(test)]
     tests::before_open(&item.found.path);
     let opened = File::open(&item.found.path)
         .and_then(|file| Ok((file.metadata()?, file.try_clone()?, file)));
@@ -2398,25 +2335,6 @@ fn read_file(
     if mode == Mode::RestartAtEnd {
         stats.checkpoint_restarts += 1;
     }
-    // An audit re-reads exactly the bytes its checkpoint counted, under the
-    // verdict request 1 was counted with.
-    let audit = if mode == Mode::Audit {
-        let checked = existing.as_ref().and_then(|checkpoint| {
-            let measured = super::audit::eligible(checkpoint, item.reserved?)?;
-            // Both fingerprint passes were reserved with the sample. Account
-            // their maximum I/O even when a probe fails partway through.
-            stats.bytes_head += u64::from(checkpoint.head.len) + u64::from(checkpoint.tail.len);
-            (size >= checkpoint.offset && fingerprints_match(&file, checkpoint))
-                .then_some((measured, checkpoint.offset))
-        });
-        let Some(checked) = checked else {
-            stats.audit_skipped += 1;
-            return Ok(None);
-        };
-        Some(checked)
-    } else {
-        None
-    };
     let mut reserved = item.reserved;
     if let Some(checkpoint) = existing
         .as_mut()
@@ -2470,9 +2388,8 @@ fn read_file(
     }
     // A full read stops at its granted end; later appends are read forward
     // by the next run.
-    let end_at = match (mode, reserved, audit) {
-        (Mode::Full, Some(reserved), _) => reserved.min(size),
-        (Mode::Audit, _, Some((_, end))) => end,
+    let end_at = match (mode, reserved) {
+        (Mode::Full, Some(reserved)) => reserved.min(size),
         _ => size,
     };
     let created = existing.as_ref().map_or_else(
@@ -2495,19 +2412,13 @@ fn read_file(
         }
         (mode, existing) => {
             let offset = match mode {
-                Mode::Full | Mode::Audit => 0,
+                Mode::Full => 0,
                 Mode::RestartAtEnd => size,
                 Mode::Forward => pin_start.min(size),
             };
-            // Where this file's counting started, kept with the checkpoint.
-            let origin = match (mode, &existing) {
-                (Mode::Full | Mode::Audit, _) => Some(0),
-                (_, Some(old)) => old.origin,
-                (_, None) => Some(offset),
-            };
             let mut contribution = StoredContribution::default();
             if let Some(old) = existing {
-                if matches!(mode, Mode::Full | Mode::Audit) {
+                if matches!(mode, Mode::Full) {
                     // Replaced once the read succeeds (the days still in the
                     // window; older days stay in all-history totals).
                     let mut share = old.contribution;
@@ -2522,10 +2433,6 @@ fn read_file(
             }
             let (state, head_bytes) = match restart_state {
                 Some(state) => (state, 0),
-                None if mode == Mode::Audit => {
-                    new_audit_parse_state(source, &item.found.path, end_at, run.deadline)
-                        .map_err(|_| ReadFailed)?
-                }
                 None => new_parse_state(source, &item.found.path, offset),
             };
             stats.bytes_head += head_bytes;
@@ -2547,22 +2454,15 @@ fn read_file(
                     contribution,
                     last_seen: window.today,
                     cold,
-                    origin,
                 },
                 state,
             )
         }
     };
-    state.start_measured = match audit {
-        Some((measured, _)) => measured,
-        None => {
-            run.start_verdicts
-                .get(source.label(), &state.session, run.now.unix_timestamp())
-                == crate::snapshots::StartVerdict::Measured
-        }
-    };
-    let request1_open = !state.request1_closed;
-    let undated_before = stats.lines.undated;
+    state.start_measured =
+        run.start_verdicts
+            .get(source.label(), &state.session, run.now.unix_timestamp())
+            == crate::snapshots::StartVerdict::Measured;
     let mut contribution = std::mem::take(&mut checkpoint.contribution)
         .into_share()
         .unwrap_or_default();
@@ -2603,21 +2503,10 @@ fn read_file(
         }
     };
     out.sink.session_start(&state.session, state.min_ts);
-    if request1_open && end.offset > checkpoint.offset {
-        if checkpoint.offset > 0 && state.request1_start_measured.is_none() {
-            // An older checkpoint did not record the prefix's verdict.
-            // The current read cannot establish that prefix's provenance.
-            state.request1_verdict_mixed = true;
-        }
-        state.note_request1_verdict(state.start_measured);
-    }
     #[cfg(test)]
     if tests::fail_read(&item.found.path) {
         stats.bytes_failed += end.bytes;
         return Err(ReadFailed);
-    }
-    if mode == Mode::Audit {
-        stats.bytes_head += 2 * end.offset.min(super::checkpoint::FINGERPRINT_BYTES);
     }
     let Ok((head, tail)) = fingerprints(&file, end.offset) else {
         stats.scan_errors += 1;
@@ -2628,50 +2517,12 @@ fn read_file(
     stats.peak_accounted_bytes = stats
         .peak_accounted_bytes
         .max(held + end.buffer_bytes + state.accounted_bytes() + delta.accounted_bytes());
-    #[cfg(test)]
-    if mode == Mode::Forward {
-        tests::skew(&item.found.path, &mut contribution, &mut delta);
-    }
-    #[cfg(test)]
-    let end = tests::cut_audit(&item.found.path, end);
-    if let Some((_, audited_end)) = audit {
-        stats.bytes_audit += end.bytes;
-        stats.audit_files += 1;
-        if end.cut {
-            // Stopped by the wall cap: an incomplete re-read proves nothing,
-            // and the stored checkpoint stays as it was.
-            stats.cut = true;
-            stats.audit_failed += 1;
-            return Ok(None);
-        }
-        let undated = stats.lines.undated > undated_before;
-        if undated {
-            // Without original per-record day provenance, a reread cannot
-            // compare or replace any part of this file without moving days.
-            stats.audit_skipped += 1;
-            stats.audit_skipped_undated += 1;
-            return Ok(None);
-        }
-        let same_end = end.offset == audited_end;
-        if same_end && !super::audit::differs(old_share.as_ref(), &contribution) {
-            // Same numbers: the stored checkpoint stays as it was.
-            return Ok(None);
-        }
-        stats.audit_differences += 1;
-        if !same_end {
-            // The re-read did not end where the checkpoint did, so it does
-            // not cover the same bytes: counted, but it cannot replace them.
-            return Ok(None);
-        }
-        // Use the re-read's result for this file (as a full read would).
-    }
     // The read succeeded: only now does it change the scope's totals.
     if let Some(old) = old_share {
         scope.agg.subtract(&old, generation);
     }
     scope.agg.merge(delta);
     match mode {
-        Mode::Audit => {}
         Mode::Full => {
             stats.files_read += 1;
             stats.bytes_repair += end.bytes;
@@ -2788,73 +2639,10 @@ pub(super) mod tests {
     use std::path::{Path, PathBuf};
 
     thread_local! {
-        pub(in super::super) static AUDIT_READ_BYTES: Cell<u64> = const { Cell::new(0) };
         static FAIL_SCOPE_COMMIT: Cell<bool> = const { Cell::new(false) };
         static FAIL_READ: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
         static CRASH_AFTER: Cell<Option<u64>> = const { Cell::new(None) };
         static GROW: RefCell<Option<(PathBuf, Vec<u8>)>> = const { RefCell::new(None) };
-        static SKEW: RefCell<Option<(PathBuf, u64)>> = const { RefCell::new(None) };
-        static CUT_AUDIT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-    }
-
-    pub(super) struct AuditReads(u64);
-    impl AuditReads {
-        pub(super) fn begin() -> Self {
-            Self(super::super::checkpoint::IO_BYTES.with(|io| io.get().0))
-        }
-    }
-    impl Drop for AuditReads {
-        fn drop(&mut self) {
-            let read = super::super::checkpoint::IO_BYTES.with(|io| io.get().0) - self.0;
-            AUDIT_READ_BYTES.with(|total| total.set(total.get() + read));
-        }
-    }
-
-    /// Simulate the wall cap stopping a read of `path` (meant for audits).
-    pub(in super::super) fn set_cut_audit(path: Option<&Path>) {
-        CUT_AUDIT.with(|cell| *cell.borrow_mut() = path.map(Path::to_path_buf));
-    }
-
-    pub(super) fn cut_audit(
-        path: &Path,
-        mut end: super::super::file::ReadEnd,
-    ) -> super::super::file::ReadEnd {
-        if CUT_AUDIT.with(|cell| cell.borrow().as_deref() == Some(path)) {
-            end.cut = true;
-        }
-        end
-    }
-
-    /// Simulate a reader fault: a forward read of `path` counts `tokens`
-    /// more on one of its parts than its lines hold.
-    pub(in super::super) fn set_skew_forward(path: Option<&Path>, tokens: u64) {
-        SKEW.with(|cell| *cell.borrow_mut() = path.map(|path| (path.to_path_buf(), tokens)));
-    }
-
-    pub(super) fn skew(
-        path: &Path,
-        share: &mut super::super::aggregate::Contribution,
-        delta: &mut super::super::aggregate::Aggregate,
-    ) {
-        let Some(tokens) = SKEW.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .filter(|(skewed, _)| skewed == path)
-                .map(|(_, tokens)| *tokens)
-        }) else {
-            return;
-        };
-        let Some(((day, slot), bucket)) = share.parts.iter_mut().next_back() else {
-            return;
-        };
-        bucket.tokens += tokens;
-        delta.days.entry((*day, slot.kind)).or_default().tokens += tokens;
-        delta
-            .day_parts
-            .entry((*day, slot.clone()))
-            .or_default()
-            .tokens += tokens;
-        delta.all_parts.entry(slot.clone()).or_default().tokens += tokens;
     }
 
     /// Simulate a crash (no pins write) once `commits` scopes committed.

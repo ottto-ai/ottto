@@ -458,12 +458,20 @@ pub(crate) fn money_marks(item: &SnapshotItem) -> u8 {
     .fold(0, |marks, (_, mark)| marks | mark)
 }
 
-/// A request-owned emitted body after its fold's last consumer (contract 5,
-/// account qualification): the final rows own its money now. `money_marks`
+/// A request-owned emitted body after its last local consumer (comparison,
+/// finalizer, contract 5, account qualification and optional shadow): the
+/// final rows own its money now; native inputs can go too. `money_marks`
 /// still reads `disclosed` when the settled body is acknowledged, so a
 /// disclosing fold keeps its inline counters and frees every heap field;
 /// any other fold is dropped.
 pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
+    if super::request_owned_family_root(item).is_none() {
+        return;
+    }
+    // These serde-skipped inputs have served every local consumer. Emptying
+    // them here also keeps the generic upload clone from copying native maps.
+    item.claude_usage_occurrences = BTreeMap::new();
+    item.claude_usage_request_ids = BTreeSet::new();
     let Some(fold) = item.claude_money.as_deref_mut() else {
         return;
     };

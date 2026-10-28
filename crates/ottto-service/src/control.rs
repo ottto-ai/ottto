@@ -1539,8 +1539,7 @@ fn lock_managed_claude_settings() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn approved_managed_claude_relay_env() -> Result<Option<Vec<(&'static str, String)>>, LocalApiError>
-{
+pub(crate) fn approved_managed_claude_relay_endpoint() -> Result<Option<String>, LocalApiError> {
     if source_patch_disabled(&SourceKind::ClaudeCode) {
         return Ok(None);
     }
@@ -1559,8 +1558,22 @@ fn approved_managed_claude_relay_env() -> Result<Option<Vec<(&'static str, Strin
     else {
         return Ok(None);
     };
-    let Some(port) = crate::agent_configs::claude_managed_settings::approved_relay_port(&body)
-    else {
+    if crate::agent_configs::claude_managed_settings::approved_relay_port(&body).is_none() {
+        return Ok(None);
+    }
+    let settings: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| LocalApiError::StatePoisoned)?;
+    Ok(settings["env"]["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"]
+        .as_str()
+        .map(str::to_owned))
+}
+
+fn approved_managed_claude_relay_env() -> Result<Option<Vec<(&'static str, String)>>, LocalApiError>
+{
+    let Some(endpoint) = approved_managed_claude_relay_endpoint()? else {
+        return Ok(None);
+    };
+    let Some(port) = crate::otlp_relay::local_relay_port_from_endpoint(&endpoint) else {
         return Ok(None);
     };
     let Some(machine) = FileMachineStore::default().load().map_err(|_| {
@@ -11452,20 +11465,6 @@ struct InstallSessionEvent<'a> {
     device_id: Option<&'a str>,
 }
 
-#[allow(dead_code)]
-fn register_telemetry_device_legacy(
-    api_base_url: &str,
-    install_session: &InstallSessionApiResponse,
-    machine: &MachineIdentity,
-) -> Result<TelemetryDeviceRegisterApiResponse, LocalApiError> {
-    let url = api_url_with_base(api_base_url, "/api/v1/telemetry/devices/register");
-    let prior = prior_device_credential_for_registration()?;
-    let body = telemetry_device_register_body_with_prior(install_session, machine, prior.as_ref());
-    let registered = backend_post_json(&url, &body, &[])?;
-    validate_registration_continuity_response(&url, &registered, prior.as_ref())?;
-    Ok(registered)
-}
-
 fn prepare_telemetry_device_registration(
     api_base_url: &str,
     install_session: &InstallSessionApiResponse,
@@ -11758,6 +11757,7 @@ fn validate_device_credential_status(
     Ok(())
 }
 
+#[cfg(test)] // Only the removed legacy register path used it in production.
 fn validate_registration_continuity_response(
     url: &str,
     registered: &TelemetryDeviceRegisterApiResponse,
@@ -31476,6 +31476,142 @@ X-API-Key = "otel_redacted"
             })
             .unwrap();
         (root, guards)
+    }
+
+    #[cfg(unix)]
+    fn startup_relay_candidates() -> Vec<u16> {
+        // SAFETY: getuid has no preconditions.
+        crate::otlp_relay::candidate_relay_ports(unsafe { libc::getuid() })
+    }
+
+    fn write_startup_relay_settings(root: &Path, base: &str) {
+        let env: serde_json::Map<String, serde_json::Value> =
+            claude_code_relay_env_for_machine_id("machine_test", base)
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), json!(value)))
+                .collect();
+        fs::write(
+            root.join(".claude/settings.json"),
+            serde_json::to_vec(&json!({"env": env})).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn startup_relay_reuses_approved_free_port_without_rewriting_settings() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let port = startup_relay_candidates()[1];
+        let base = crate::otlp_relay::local_relay_base_url_for_port(port);
+        let settings = root.join(".claude/settings.json");
+        let support = root.join("support");
+        patch_claude_code_settings_at_with_relay_base(&settings, &test_machine(), &support, &base)
+            .unwrap();
+        let prepared = FileClaudeConfigSlotSettingsStore::default()
+            .prepare_managed_account_target(
+                1,
+                "claude_setup_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let managed_root = prepared.managed_slots[0].config_dir.as_deref().unwrap();
+        provision_managed_claude_relay_settings(managed_root).unwrap();
+        let managed_settings = Path::new(managed_root).join("settings.json");
+        let default_before = fs::read(&settings).unwrap();
+        let managed_before = fs::read(&managed_settings).unwrap();
+
+        let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        let bound_base = format!("http://{}", listener.local_addr().unwrap());
+        assert!(
+            !patch_claude_code_settings_at_with_relay_base(
+                &settings,
+                &test_machine(),
+                &support,
+                &bound_base,
+            )
+            .unwrap()
+            .changed
+        );
+        assert!(!repair_registered_managed_claude_relay_settings().unwrap());
+        assert_eq!(fs::read(&settings).unwrap(), default_before);
+        assert_eq!(fs::read(&managed_settings).unwrap(), managed_before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn startup_relay_without_settings_binds_default() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        fs::remove_file(root.join(".claude/settings.json")).unwrap();
+        let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
+        assert_eq!(
+            listener.local_addr().unwrap().port(),
+            crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn startup_relay_busy_preferred_port_uses_default_then_fallbacks() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let ports = startup_relay_candidates();
+        let port = ports[1];
+        write_startup_relay_settings(
+            &root,
+            &crate::otlp_relay::local_relay_base_url_for_port(port),
+        );
+        let _busy_preferred = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let default_listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
+        assert_eq!(default_listener.local_addr().unwrap().port(), ports[0]);
+        // Keep default occupied too; the first fallback is the preferred busy
+        // port, so the next candidate must be selected.
+        let fallback_listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
+        assert_eq!(fallback_listener.local_addr().unwrap().port(), ports[2]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn startup_relay_ignores_unapproved_hosts_ports_and_settings() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let port = startup_relay_candidates()[1];
+        for base in [
+            format!("http://192.0.2.1:{port}"),
+            format!("http://localhost:{port}"),
+            "http://127.0.0.1:48123".to_string(),
+        ] {
+            write_startup_relay_settings(&root, &base);
+            let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
+            assert_eq!(
+                listener.local_addr().unwrap().port(),
+                crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
+            );
+        }
+        write_startup_relay_settings(
+            &root,
+            &crate::otlp_relay::local_relay_base_url_for_port(port),
+        );
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "test".into(),
+                machine_id: None,
+                sources: vec!["codex".into()],
+            })
+            .unwrap();
+        let listener = crate::otlp_relay::bind_startup_local_relay_listener().unwrap();
+        assert_eq!(
+            listener.local_addr().unwrap().port(),
+            crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

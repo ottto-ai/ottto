@@ -593,7 +593,7 @@ impl OwnedJsonlParser {
 /// The packet's refusal buckets: disjoint, and together every refused
 /// singleton retention (`RetentionBoundRefused` or `RetentionCloneBoundRefused`).
 /// No production counter reads them; C2 may adopt them.
-#[cfg_attr(not(test), allow(dead_code))] // C2's buckets; tests only for now.
+#[cfg(test)] // C2's buckets; tests only for now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Bucket {
     /// Both walks measured, and no room.
@@ -607,7 +607,7 @@ pub(super) enum Bucket {
 }
 
 /// The budget a refused pass was admitted against.
-#[cfg_attr(not(test), allow(dead_code))] // C2's buckets; tests only for now.
+#[cfg(test)] // C2's buckets; tests only for now.
 #[derive(Clone, Copy)]
 pub(super) struct RefusalView {
     granted: bool,
@@ -619,7 +619,7 @@ pub(super) struct RefusalView {
     /// `Deferred`.
     entry_limit: usize,
 }
-#[cfg_attr(not(test), allow(dead_code))] // C2's buckets; tests only for now.
+#[cfg(test)] // C2's buckets; tests only for now.
 impl RefusalView {
     pub(super) fn of(budget: &sampled_scan::RetainBudget) -> Self {
         match budget {
@@ -662,7 +662,7 @@ impl RefusalView {
 }
 
 /// What refused the pass.
-#[cfg_attr(not(test), allow(dead_code))] // C2's buckets; tests only for now.
+#[cfg(test)] // C2's buckets; tests only for now.
 #[derive(Clone, Copy)]
 pub(super) enum Refusal {
     /// The admission check refused; `charge` is one walk at `usize::MAX`,
@@ -675,7 +675,7 @@ pub(super) enum Refusal {
 }
 
 /// One bucket per refused pass (packet §2.2). Pure.
-#[cfg_attr(not(test), allow(dead_code))] // C2's buckets; tests only for now.
+#[cfg(test)] // C2's buckets; tests only for now.
 pub(super) fn classify_refusal(view: RefusalView, refusal: Refusal) -> Bucket {
     let by_charge = |charge: Option<usize>| {
         // A refused charge that fits both limits cannot happen; in a release

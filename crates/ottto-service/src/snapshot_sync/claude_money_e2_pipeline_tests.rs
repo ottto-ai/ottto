@@ -146,6 +146,7 @@ impl Corpus {
         });
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(&self.support);
+        let committed = index.clone();
         let (index, scan, modes) = scanner.scan(
             std::slice::from_ref(&self.root),
             &self.support,
@@ -156,6 +157,8 @@ impl Corpus {
             hints,
         );
         Page {
+            cache: scanner.cache.clone(),
+            committed,
             index,
             scan,
             modes,
@@ -175,6 +178,8 @@ impl Drop for Corpus {
     }
 }
 struct Page {
+    cache: std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
+    committed: ScanIndex,
     index: ScanIndex,
     scan: SourceScanResult,
     modes: (usize, usize, usize),
@@ -185,11 +190,17 @@ impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
         let ((mut disposition, _, _), released) =
             e2::pipeline_test_observer::capture_released(|| {
-                apply_claude_local_evidence_to_scan(
+                try_apply_claude_local_evidence_to_scan_with_comparison(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some((&self.cache, &self.committed)),
                 )
+                .unwrap()
             });
         self.released = released;
         self.index
@@ -217,7 +228,7 @@ impl Page {
         self.disposition = disposition.clone();
         disposition
     }
-    fn finish(&mut self) {
+    fn finish(&mut self) -> LocalHoldSettlement {
         exclude_held_effective_body_witness_revision(
             &mut self.index,
             &self.scan.snapshots,
@@ -229,7 +240,7 @@ impl Page {
             &mut self.index,
             snapshot_upload_body_witness,
         );
-        LocalHoldSettlement::classify(
+        let holds = LocalHoldSettlement::classify(
             SnapshotSource::ClaudeCode,
             &mut self.index,
             &mut self.scan,
@@ -237,6 +248,7 @@ impl Page {
         );
         self.index
             .retain_claude_history_emission_permitted(&mut self.scan.snapshots);
+        holds
     }
     fn receipt(&self) -> Vec<(String, String, String)> {
         self.scan
@@ -403,6 +415,14 @@ fn literal(page: &Page) {
         .iter()
         .all(crate::snapshots::claude_request_money::is_request_owned_literal));
     assert!(
+        page.scan
+            .snapshots
+            .iter()
+            .all(|item| item.claude_usage_occurrences.is_empty()
+                && item.claude_usage_request_ids.is_empty()),
+        "final E2 bodies release native inputs before upload and retry clones"
+    );
+    assert!(
         page.scan.snapshots.iter().all(|item| item
             .claude_money
             .as_deref()
@@ -461,6 +481,8 @@ fn ready(
     let mut p = corpus.raw(scanner, index, limit, sampled, &[]);
     p.enrich(corpus);
     let mut send = Page {
+        cache: p.cache.clone(),
+        committed: p.committed.clone(),
         index: p.index.clone(),
         scan: p.scan.clone(),
         modes: p.modes,
@@ -2579,4 +2601,164 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
 // Shared helpers above remain the real scan/evidence/finish/upload callers.
 mod money_equivalence_tests {
     include!("money_equivalence_tests.rs");
+}
+
+// The held-read regression needs the classification from BEFORE finish
+// removes withheld items, matching production settlement. Existing fixtures
+// keep their original helper and their original assertions.
+fn settle_captured_holds(
+    c: &Corpus,
+    committed: &ScanIndex,
+    mut page: Page,
+    progress: &mut SnapshotUploadProgress,
+) -> ScanIndex {
+    let holds = page.finish();
+    upload(&page.scan.snapshots, progress, ack).0.unwrap();
+    let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
+    settle_index_after_upload(&mut settled.index, committed, progress);
+    c.reload(&mut settled.index)
+}
+/// A census deadline withholds a NEW copy. Every walk re-decides the hold;
+/// a healthy external census releases it without any transcript change.
+fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss: u8) {
+    with_e2(|| {
+        let mut c = Corpus::new(&format!("e2-held-new-tail-{grow}-{sampled}-{loss}"));
+        c.root(ROOT, &line(ROOT, "root", AT, 10));
+        let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        let empty = ScanIndex::default();
+        let original = ready(&c, &scanner, empty.clone(), 100, sampled);
+        let prior = settle_captured_holds(&c, &empty, original, &mut progress);
+        // Consume the existing one-time identity-contract re-arm.
+        let warm = ready(&c, &scanner, prior.clone(), 100, sampled);
+        let prior = settle_captured_holds(&c, &prior, warm, &mut progress);
+        let accepted_before = progress.accepted_fingerprints.clone();
+        let path = c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "root", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let mut first = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
+        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+            first.enrich(&c);
+        });
+        assert_withheld(&first, COPY, "external census unavailable");
+        let prior = settle_captured_holds(&c, &prior, first, &mut progress);
+        assert_eq!(progress.accepted_fingerprints, accepted_before);
+        assert_eq!(prior.current_snapshot_fingerprints(), accepted_before);
+        if grow {
+            // Keep every response pre-birth, so growth cannot itself resolve
+            // the all-copied main-file hold before external evidence arrives.
+            append(&path, &line(COPY, "own", "2026-08-02T07:01:00Z", 20));
+        }
+        assert!(
+            !prior.files.contains_key(path.to_string_lossy().as_ref()),
+            "held NEW keys must never gain money authority after real save/load"
+        );
+        let restarted = E2ScanFixture::default();
+        if loss == 1 {
+            scanner.evict();
+        } else if loss == 2 {
+            // Actual capacity eviction through the existing victim mechanism.
+            scanner.evict_for_pressure();
+        }
+        let scanner = if loss == 3 { &restarted } else { &scanner };
+        let mut retry = c.raw(scanner, prior.clone(), 100, sampled, &[]);
+        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
+            retry.enrich(&c);
+        });
+        assert_withheld(&retry, COPY, "external census still unavailable");
+        if sampled {
+            // These assertions run only in the macOS-specific tests below.
+            assert_eq!(
+                retry.modes,
+                if loss != 0 {
+                    (1, 0, 0)
+                } else if grow {
+                    (0, 1, 0)
+                } else {
+                    (0, 0, 1)
+                }
+            );
+        }
+        let prior = settle_captured_holds(&c, &prior, retry, &mut progress);
+        assert_eq!(progress.accepted_fingerprints, accepted_before);
+        let before = std::fs::metadata(&path).unwrap();
+        let restored = ready(&c, scanner, prior.clone(), 100, sampled);
+        if sampled {
+            assert_eq!(restored.modes, (0, 0, 1));
+        }
+        literal(&restored);
+        // Cold Full is only the fixture's reference oracle. Production keeps
+        // the retained read when the external census becomes available.
+        let full_prior = prior.clone();
+        assert!(!full_prior
+            .files
+            .contains_key(path.to_string_lossy().as_ref()));
+        // Today's settlement omits this NEW held key. Keep its other census
+        // evidence, and compare the resulting published body byte for byte.
+        let full = ready(&c, &E2ScanFixture::default(), full_prior, 100, false);
+        assert_eq!(
+            canonical(&request(&restored.scan.snapshots)),
+            canonical(&request(&full.scan.snapshots))
+        );
+        let copy = body(&restored, COPY).expect("external evidence releases the copy");
+        assert_eq!(copy.removed_request_count, Some(1));
+        assert_eq!(copy.request_count, u64::from(grow));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before.len());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        // Check the two rejected placeholder authority paths using the real
+        // held settlement; modes/body checks above finish before disappearance.
+        std::fs::remove_file(&path).unwrap();
+        e2::pipeline_test_observer::assert_held_new_file_has_no_money_authority(&prior, &path);
+        let settled = settle_captured_holds(&c, &prior, restored, &mut progress);
+        assert_eq!(
+            progress.accepted_fingerprints.len(),
+            accepted_before.len() + 1
+        );
+        assert_eq!(
+            settled.current_snapshot_fingerprints().len(),
+            accepted_before.len() + 1
+        );
+    });
+}
+
+#[test]
+fn e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
+    withheld_new_file_retries_from_retained_read(false, false, 0);
+}
+
+#[test]
+fn e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
+    withheld_new_file_retries_from_retained_read(true, false, 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged() {
+    withheld_new_file_retries_from_retained_read(false, true, 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
+    withheld_new_file_retries_from_retained_read(true, true, 0);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
+    for loss in 1..=3 {
+        withheld_new_file_retries_from_retained_read(false, true, loss);
+    }
+}
+
+#[test]
+fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
+    for loss in 1..=3 {
+        withheld_new_file_retries_from_retained_read(false, false, loss);
+    }
 }

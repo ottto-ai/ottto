@@ -5,7 +5,10 @@
 //! listener can read or write local state, and hold it until the process
 //! exits. A second daemon on the same directory, whatever its entry point,
 //! socket path, launchd label or binary, fails here and exits without
-//! writing anything.
+//! writing anything. A daemon never drops its guard
+//! ([`StateDirLock::hold_until_exit`]): its relays, snapshot worker and
+//! listener threads write state until the process ends, so an error return
+//! or a panic in `main` must not free the directory while they still run.
 //!
 //! The per-save locks next to the scan index and upload progress only guard
 //! one read-modify-write. They make a second writer's save fail its
@@ -14,10 +17,16 @@
 //! Process-local mutexes (backfill state, upload receipts) do not see
 //! another process at all.
 //!
-//! The kernel drops the lock when its holder exits, crashes or is killed, so
-//! a lock is never stale and there is nothing to clean up; the file stays.
-//! The descriptor is close-on-exec, so a child process (Claude, Codex, the
-//! composition worker) never keeps the lock past the daemon's own exit.
+//! The kernel drops the lock when the last descriptor of its open file
+//! closes, so a lock is never stale and there is nothing to clean up; the
+//! file stays. The descriptor is close-on-exec, so a child process (Claude,
+//! Codex, the composition worker) drops its copy when it execs. Until then a
+//! child forked from the daemon shares the lock: if the daemon exits, crashes
+//! or is killed in that window, the lock stays held until the child execs or
+//! exits, and a restart may be refused (exit 75) or uninstall wait meanwhile.
+//! Dropping the guard unlocks explicitly, which frees the lock for every copy
+//! at once. Only the process that took the lock unlocks it: a forked child
+//! that did would free it under the daemon that still runs.
 //!
 //! Two other writers of daemon-owned state respect it without holding it for
 //! long: the CLI creates a missing control token only while it holds the
@@ -42,10 +51,29 @@ pub const STATE_DIR_HELD_EXIT_CODE: i32 = 75;
 /// is the only writer.
 pub const STATE_DIR_LOCK_FAILED_EXIT_CODE: i32 = 74;
 
-/// Holds the state directory until dropped.
+/// Holds the state directory until dropped, or until the process exits
+/// after [`StateDirLock::hold_until_exit`].
 #[derive(Debug)]
 pub struct StateDirLock {
-    _file: File,
+    file: File,
+    /// The process that took the lock.
+    owner: u32,
+}
+
+impl Drop for StateDirLock {
+    fn drop(&mut self) {
+        // A forked child that drops its copy of the guard shares the lock's
+        // open file description; unlocking there would free the holder's
+        // lock while the holder still runs.
+        if std::process::id() != self.owner {
+            return;
+        }
+        // If the unlock fails, closing the file below still releases this
+        // descriptor's share, as it would without the unlock.
+        while unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        {}
+    }
 }
 
 #[derive(Debug)]
@@ -137,6 +165,15 @@ impl StateDirLock {
         }
     }
 
+    /// Holds the lock for the life of the process: the guard is never
+    /// dropped, so no early return, error or panic unwind in the caller
+    /// frees it while threads the caller started still write. The kernel
+    /// releases it when the process exits. For daemons; a short claim
+    /// (token creation, uninstall) drops its guard when done.
+    pub fn hold_until_exit(self) -> &'static StateDirLock {
+        Box::leak(Box::new(self))
+    }
+
     fn lock(mut file: File, support_dir: &Path) -> Result<Self, StateDirLockError> {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
@@ -153,7 +190,10 @@ impl StateDirLock {
         }
         // Best effort: the pid only names the holder in a later refusal.
         let _ = record_holder_pid(&mut file);
-        Ok(Self { _file: file })
+        Ok(Self {
+            file,
+            owner: std::process::id(),
+        })
     }
 }
 
@@ -189,27 +229,76 @@ pub(crate) fn scratch(prefix: &str) -> PathBuf {
     path
 }
 
-/// Takes a lock its holder just released. Tests in this process spawn
-/// children concurrently, and a child forked before it execs shares every
-/// descriptor, the lock's included, for that moment; so retry briefly
-/// instead of expecting the release to be visible at once.
-#[cfg(test)]
-pub(crate) fn acquire_released(support_dir: &Path) -> StateDirLock {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match StateDirLock::acquire(support_dir) {
-            Ok(lock) => return lock,
-            Err(StateDirLockError::Held { .. }) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(error) => panic!("released lock still unavailable: {error:?}"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    /// Whether the calling test runs its body in this process: true in a
+    /// child test process that runs only that test. Otherwise runs it there,
+    /// panics unless exactly that test passed, and returns false. Other
+    /// tests of this binary spawn processes at any moment, and each child
+    /// shares every descriptor open at its fork until it execs.
+    fn run_isolated() -> bool {
+        const ISOLATED_TEST_ENV: &str = "OTTTO_CORE_ISOLATED_UNIT_TEST";
+        let current = std::thread::current();
+        let test = current
+            .name()
+            .expect("the test harness names a test's thread after the test");
+        if std::env::var_os(ISOLATED_TEST_ENV).is_some_and(|isolated| isolated == test) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([test, "--exact", "--test-threads=1"])
+            .env(ISOLATED_TEST_ENV, test)
+            .output()
+            .expect("run the isolated test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "isolated run of {test} failed ({}):\n--- stdout\n{stdout}\n--- stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    /// Forks a child that runs `child` and exits 0. `child` must only make
+    /// async-signal-safe calls: it runs in a copy of this process.
+    fn fork_child(child: impl FnOnce()) -> libc::pid_t {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            child();
+            unsafe { libc::_exit(0) };
+        }
+        pid
+    }
+
+    fn reap(pid: libc::pid_t) -> std::process::ExitStatus {
+        let mut status = 0;
+        loop {
+            if unsafe { libc::waitpid(pid, &mut status, 0) } == pid {
+                return std::process::ExitStatus::from_raw(status);
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.raw_os_error(), Some(libc::EINTR), "waitpid: {error}");
+        }
+    }
+
+    /// Kills and reaps a forked child, also when an assertion fails first.
+    struct ForkedChild(libc::pid_t);
+
+    impl Drop for ForkedChild {
+        fn drop(&mut self) {
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+            // No assertion here: a panic while unwinding would abort.
+            let mut status = 0;
+            while unsafe { libc::waitpid(self.0, &mut status, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+            {}
+        }
+    }
 
     fn entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
@@ -258,7 +347,7 @@ mod tests {
         );
 
         drop(first);
-        let restarted = super::acquire_released(&support);
+        let restarted = StateDirLock::acquire(&support).expect("released at drop");
         drop(restarted);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -319,16 +408,185 @@ mod tests {
         );
         drop(owner);
 
-        let holder = super::acquire_released(&support);
+        let holder = StateDirLock::acquire(&support).expect("released at drop");
         let refusal = StateDirLock::acquire_in_existing_dir(&support).expect_err("held");
         assert!(
             matches!(refusal, StateDirLockError::Held { .. }),
             "{refusal:?}"
         );
         drop(holder);
-        drop(super::acquire_released(&support));
+        drop(StateDirLock::acquire(&support).expect("released at drop"));
         let claimed = StateDirLock::acquire_in_existing_dir(&support).expect("free lock");
         assert!(claimed.is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A child forked from the holder shares the lock until it execs or
+    /// exits. The holder dropping its guard frees the lock at once all the
+    /// same, and only the holder's drop does: a child dropping its copy of
+    /// the guard leaves the lock with the holder. Runs alone, so no other
+    /// test's child shares a descriptor of this lock.
+    #[test]
+    fn dropped_guard_frees_the_lock_a_forked_child_still_shares() {
+        if !run_isolated() {
+            return;
+        }
+        let root = super::scratch("state-dir-lock-fork");
+        let support = root.join("Ottto");
+        let holder = StateDirLock::acquire(&support).expect("daemon takes the lock");
+
+        let dropper = fork_child(|| drop(unsafe { std::ptr::read(&holder) }));
+        let dropped = reap(dropper);
+        assert!(dropped.success(), "{dropped:?}");
+        let refusal = StateDirLock::acquire(&support).expect_err("holder keeps the lock");
+        assert!(
+            matches!(refusal, StateDirLockError::Held { .. }),
+            "{refusal:?}"
+        );
+
+        // Never execs or exits on its own: it shares the lock until killed.
+        let sharer = ForkedChild(fork_child(|| loop {
+            unsafe { libc::pause() };
+        }));
+        let refusal = StateDirLock::acquire(&support).expect_err("still held");
+        assert!(
+            matches!(refusal, StateDirLockError::Held { .. }),
+            "{refusal:?}"
+        );
+        drop(holder);
+        let restarted = StateDirLock::acquire(&support)
+            .expect("the lock is free once its guard drops, though a fork child shares it");
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(sharer.0, &mut status, libc::WNOHANG) },
+            0,
+            "the forked child still runs"
+        );
+        drop(restarted);
+        drop(sharer);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Shaped like `serve`: takes the daemon's lock, starts a state writer
+    /// that writes whenever `writes` asks and reports each write on
+    /// `written`, then fails to bind its listener and returns the error.
+    fn daemon_shaped_serve(
+        support: &Path,
+        writes: std::sync::mpsc::Receiver<()>,
+        written: std::sync::mpsc::Sender<()>,
+    ) -> std::io::Result<()> {
+        let _local_state = StateDirLock::acquire(support)
+            .map_err(std::io::Error::other)?
+            .hold_until_exit();
+        let state = support.join("state.json");
+        std::thread::spawn(move || {
+            for () in writes {
+                std::fs::write(&state, b"written after serve failed\n").expect("write state");
+                written.send(()).expect("report the write");
+            }
+        });
+        // The parent directory does not exist, so the bind fails.
+        std::os::unix::net::UnixListener::bind(support.join("missing").join("serve.sock"))?;
+        Ok(())
+    }
+
+    /// A daemon holds its lock for the life of its process. When `serve`
+    /// fails after its writers started, or a panic unwinds past the guard,
+    /// the directory stays held while the process and its writers live,
+    /// and frees once the process exits.
+    #[test]
+    fn daemon_lock_holds_through_an_error_return_and_unwind_until_exit() {
+        use std::io::{BufRead, BufReader};
+        const DAEMON_ENV: &str = "OTTTO_CORE_STATE_DIR_LOCK_DAEMON";
+        const FAILED: &str = "OTTTO_CORE_STATE_DIR_LOCK_DAEMON_FAILED";
+        if let Some(root) = std::env::var_os(DAEMON_ENV) {
+            let root = PathBuf::from(root);
+            let (write, writes) = std::sync::mpsc::channel();
+            let (written, wrote) = std::sync::mpsc::channel();
+            daemon_shaped_serve(&root.join("error"), writes, written)
+                .expect_err("the listener cannot bind");
+            // The writer outlives the failed serve and still writes.
+            write.send(()).expect("ask the writer");
+            wrote.recv().expect("the writer still runs");
+
+            let unwound: std::thread::Result<()> = std::panic::catch_unwind(|| {
+                let _local_state = StateDirLock::acquire(&root.join("unwind"))
+                    .expect("daemon takes the lock")
+                    .hold_until_exit();
+                std::panic::resume_unwind(Box::new("listener panicked"));
+            });
+            assert!(unwound.is_err());
+
+            println!("{FAILED}");
+            std::io::stdout().flush().expect("flush");
+            // Lives on, writer included, until the test closes stdin.
+            let _ = std::io::stdin().read(&mut [0; 1]);
+            return;
+        }
+
+        let current = std::thread::current();
+        let test = current.name().expect("the test harness names the thread");
+        let root = super::scratch("state-dir-lock-daemon");
+        let mut daemon = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(DAEMON_ENV, &root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the daemon");
+        // Kills and reaps the daemon if an assertion fails first.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut stdout = BufReader::new(daemon.stdout.take().expect("daemon stdout"));
+        let stdin = daemon.stdin.take().expect("daemon stdin");
+        let mut daemon = Reap(daemon);
+        let mut line = String::new();
+        while !line.contains(FAILED) {
+            line.clear();
+            assert_ne!(
+                stdout.read_line(&mut line).expect("read daemon stdout"),
+                0,
+                "the daemon exited before both failures"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read(root.join("error").join("state.json")).expect("state the writer wrote"),
+            b"written after serve failed\n"
+        );
+        for support in [root.join("error"), root.join("unwind")] {
+            let refusal = StateDirLock::acquire(&support).expect_err("the daemon still owns it");
+            assert!(
+                matches!(
+                    refusal,
+                    StateDirLockError::Held { holder_pid: Some(pid), .. } if pid == daemon.0.id()
+                ),
+                "{refusal:?}"
+            );
+        }
+        assert!(
+            daemon.0.try_wait().expect("poll the daemon").is_none(),
+            "the daemon still runs"
+        );
+
+        drop(stdin);
+        let mut rest = String::new();
+        stdout
+            .read_to_string(&mut rest)
+            .expect("read daemon stdout");
+        let status = daemon.0.wait().expect("reap the daemon");
+        assert!(
+            status.success() && rest.contains("test result: ok. 1 passed;"),
+            "daemon run failed ({status}):\n{rest}"
+        );
+        for support in [root.join("error"), root.join("unwind")] {
+            drop(StateDirLock::acquire(&support).expect("free once the daemon exits"));
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

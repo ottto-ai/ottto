@@ -7,7 +7,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub(crate) mod cache_lifecycle;
 pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
-#[cfg_attr(not(test), allow(dead_code))] // first production callers are the side rows
 pub(crate) mod codex_side_lifecycle;
 
 /// Nonzero-only counters on the existing native_collection_page line.

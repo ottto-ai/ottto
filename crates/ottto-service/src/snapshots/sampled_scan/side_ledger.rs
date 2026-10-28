@@ -7,7 +7,6 @@
 //! Authority: for a key with an entry, the entry is the truth; the loaded
 //! index request is overwritten with its projection. Only the side charge
 //! (G7) creates entries; every other writer updates an existing one.
-#![cfg_attr(not(test), allow(dead_code))] // first production callers are C14/C15 and G7
 
 use super::SharedCache;
 use crate::local_resource_diagnostics::codex_side_lifecycle::{record, Event};
@@ -278,6 +277,7 @@ impl SideLedger {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub(in crate::snapshots) fn pass_seq(&self) -> u32 {
         self.pass_seq
     }

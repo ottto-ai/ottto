@@ -4,7 +4,7 @@ use crate::transcript_acquisition::Scope;
 
 #[derive(Default)]
 pub(crate) struct E2ScanFixture {
-    cache: Arc<sampled_scan::SharedCache>,
+    pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
 }
 impl E2ScanFixture {
@@ -14,6 +14,13 @@ impl E2ScanFixture {
 
     pub(crate) fn evict(&self) {
         self.cache.clear();
+    }
+
+    pub(crate) fn evict_for_pressure(&self) {
+        let mut retained = self.cache.retained().unwrap();
+        let empty = sampled_scan::RetainedCache::default();
+        let limit = crate::heap_layout_bound::bound(&empty, usize::MAX).unwrap_or(0);
+        assert!(retained.release_until(limit) || !crate::heap_layout_bound::layout_supported());
     }
 
     #[allow(clippy::too_many_arguments)]
