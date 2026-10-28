@@ -239,7 +239,7 @@ if [[ "$(plutil -extract CFBundleIdentifier raw -o - "$info_plist")" != "net.ott
   exit 1
 fi
 if [[ "$(plutil -extract NSAppleEventsUsageDescription raw -o - "$info_plist")" != \
-  "Ottto reads the folder in your selected terminal tab when you choose Terminal folder." ]]; then
+  "Ottto reads the folder in your selected terminal tab when you choose Terminal folder, and opens Terminal when you sign in to Claude Code." ]]; then
   echo "Packaged Info.plist must explain the Terminal folder Apple Events use" >&2
   exit 1
 fi

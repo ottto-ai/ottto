@@ -67,6 +67,10 @@ codesign --force --sign - "$TMP_DIR/helper" >/dev/null 2>&1
   fail "signed Companion entitlements were not read back"
 [[ "$(ottto_macos_signed_entitlement_keys "$TMP_DIR/helper")" == "[]" ]] ||
   fail "a helper signed without entitlements must report none"
+printf 'not code' >"$TMP_DIR/unsigned"
+if ottto_macos_signed_entitlement_keys "$TMP_DIR/unsigned" >/dev/null 2>&1; then
+  fail "an unreadable signature must fail, not report no entitlements"
+fi
 
 # The packager consumes the shared plist for the Companion only.
 # shellcheck disable=SC2016
@@ -75,6 +79,8 @@ codesign --force --sign - "$TMP_DIR/helper" >/dev/null 2>&1
     fail "macOS packaging must source the Companion entitlement policy"
   grep -Fq 'COMPANION_ENTITLEMENTS="$MAC_APP_ROOT/Companion.entitlements.plist"' "$PACKAGE_SCRIPT" ||
     fail "macOS packaging must read the shared Companion entitlements from the app subtree"
+  grep -Fq 'ls-files --error-unmatch -- "$MAC_APP_SOURCE_PATH/Companion.entitlements.plist"' "$PACKAGE_SCRIPT" ||
+    fail "macOS packaging must require the Companion entitlements to be tracked at the source commit"
   grep -Fq 'ottto_macos_check_companion_entitlements "$COMPANION_ENTITLEMENTS"' "$PACKAGE_SCRIPT" ||
     fail "macOS packaging must validate the Companion entitlements before building"
   [[ "$(grep -c -- '--entitlements "$COMPANION_ENTITLEMENTS"' "$PACKAGE_SCRIPT")" -eq 2 ]] ||
@@ -94,7 +100,7 @@ codesign --force --sign - "$TMP_DIR/helper" >/dev/null 2>&1
     fail "the packaged Info.plist must explain Apple Events use"
   fi
 }
-[[ "$OTTTO_MACOS_APPLE_EVENTS_USAGE" == "Ottto reads the folder in your selected terminal tab when you choose Terminal folder." ]] ||
+[[ "$OTTTO_MACOS_APPLE_EVENTS_USAGE" == "Ottto reads the folder in your selected terminal tab when you choose Terminal folder, and opens Terminal when you sign in to Claude Code." ]] ||
   fail "Apple Events usage text changed; update the private dev build to match"
 
 echo "macOS Companion entitlement policy tests passed"

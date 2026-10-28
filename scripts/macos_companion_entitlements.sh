@@ -4,12 +4,13 @@
 # plist. The plist lives in the private app subtree (tools/ottto-macos-app),
 # so the dev build and this release packager sign the same permission
 # surface. It may grant exactly one thing: sending Apple Events, which the
-# "Terminal folder" action uses to read the front terminal tab's folder after
-# the person allows Automation. No App Sandbox, no Accessibility, and never on
+# "Terminal folder" action uses to read the front terminal tab's folder, and
+# Claude Code sign-in uses to open Terminal, after the person allows
+# Automation. No App Sandbox, no Accessibility, and never on
 # the bundled ottto CLI, ottto-service or Sparkle helpers.
 OTTTO_MACOS_COMPANION_ENTITLEMENT_KEY="com.apple.security.automation.apple-events"
 # shellcheck disable=SC2034 # read by the sourcing packager and its tests
-OTTTO_MACOS_APPLE_EVENTS_USAGE="Ottto reads the folder in your selected terminal tab when you choose Terminal folder."
+OTTTO_MACOS_APPLE_EVENTS_USAGE="Ottto reads the folder in your selected terminal tab when you choose Terminal folder, and opens Terminal when you sign in to Claude Code."
 
 ottto_macos_check_companion_entitlements() {
   local plist="${1:-}"
@@ -37,7 +38,11 @@ ottto_macos_check_companion_entitlements() {
 ottto_macos_signed_entitlement_keys() {
   local code="${1:-}"
   local xml
-  xml="$(codesign -d --entitlements - --xml "$code" 2>/dev/null || true)"
+  # A codesign failure is an error, never "no entitlements".
+  if ! xml="$(codesign -d --entitlements - --xml "$code" 2>/dev/null)"; then
+    echo "Could not read the code signature of $code" >&2
+    return 1
+  fi
   if [[ -z "$xml" ]]; then
     printf '[]\n'
     return 0

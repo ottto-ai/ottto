@@ -226,6 +226,10 @@ if [[ "$MAC_APP_SOURCE_COMMIT" != "$MAC_APP_REMOTE_MASTER" ]]; then
 fi
 MAC_APP_SOURCE_TREE="$(git -C "$MAC_APP_GIT_ROOT" rev-parse "HEAD:$MAC_APP_SOURCE_PATH")"
 COMPANION_ENTITLEMENTS="$MAC_APP_ROOT/Companion.entitlements.plist"
+if ! git -C "$MAC_APP_GIT_ROOT" ls-files --error-unmatch -- "$MAC_APP_SOURCE_PATH/Companion.entitlements.plist" >/dev/null 2>&1; then
+  echo "Companion entitlements plist must be tracked in the private app source" >&2
+  exit 2
+fi
 if ! ottto_macos_check_companion_entitlements "$COMPANION_ENTITLEMENTS"; then
   exit 2
 fi

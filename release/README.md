@@ -23,8 +23,8 @@ A stable macOS release must fail unless every local-platform artifact is:
 
 Only the `Ottto.app` executable carries an entitlement: Apple Events
 (`com.apple.security.automation.apple-events`), so "Terminal folder" can read
-the front Terminal, iTerm2 or Ghostty tab's folder once the person allows
-Automation. It comes from the app subtree's `Companion.entitlements.plist`,
+the front Terminal, iTerm2 or Ghostty tab's folder, and Claude Code sign-in can
+open Terminal, once the person allows Automation. It comes from the app subtree's `Companion.entitlements.plist`,
 which packaging refuses if it grants anything else, and the packaged
 `Info.plist` carries `NSAppleEventsUsageDescription`. The bundled `ottto`,
 `ottto-service` and Sparkle helpers are signed without it; there is no App
