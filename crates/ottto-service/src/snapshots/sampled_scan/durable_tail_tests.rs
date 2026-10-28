@@ -1684,3 +1684,128 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
     assert_eq!(std::fs::read(record_path).unwrap(), before_bytes);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// Contract-5 cutover (Lead B, byte-stable keys): a record a permit-era
+/// permitted Claude cycle wrote (capture on, the E2 contract recorded)
+/// keeps its identity interpretation byte for byte under the always-on
+/// capture, so it binds and restores; nothing is refused. Codex never
+/// captured and still does not.
+///
+/// This is a same-binary round trip: no record bytes written by the
+/// previous binary are replayed. Its cross-version claim rests on the
+/// pinned literal interpretation below and on the
+/// sampled-scope goldens (`the_always_on_sampled_scope_keeps_the_permit_era_bytes`).
+/// A restore reads only its bounded certificate and re-derivation bytes,
+/// never the transcript in Full; an unsupported heap layout cannot restore
+/// and says so.
+#[test]
+fn a_permit_era_record_restores_under_the_always_on_capture() {
+    let root = crate::test_scratch::private_dir("ottto-dt-contract5");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("contract5-test".into());
+    let scope = Scope("contract5-file".into());
+    let index_path = root.join("index.json");
+    let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":std::fs::metadata(&path).unwrap().len(),
+            "modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    index.claude_request_identity_contract = Some(claude_request_identity::E2_GROUPING.to_owned());
+    index.save(&index_path).unwrap();
+    // The permit-era permitted cycle: capture followed the permit.
+    let before = Interpretation::of(source, &key, &index, true, &namespace);
+    assert_eq!(
+        before.identity_contract,
+        format!(
+            "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1|changed=false|capture=true|attr={}",
+            claude_attribution_capture_enabled()
+        ),
+        "the pre-cutover interpretation bytes"
+    );
+    let capture = claude_request_identity::captures(source);
+    let after = Interpretation::of(source, &key, &index, capture, &namespace);
+    assert_eq!(after.identity_contract, before.identity_contract);
+    let codex = SnapshotSource::Codex;
+    assert_eq!(
+        Interpretation::of(codex, &key, &index, false, &namespace).identity_contract,
+        Interpretation::of(
+            codex,
+            &key,
+            &index,
+            claude_request_identity::captures(codex),
+            &namespace
+        )
+        .identity_contract
+    );
+    let binding = expected(
+        DurableSource::ClaudeCode,
+        source,
+        &key,
+        &scope,
+        &index,
+        &before,
+    )
+    .unwrap()
+    .binding;
+    let (reduction, _) = native_record(&path, &scope);
+    let mut store = DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        DurableSource::ClaudeCode,
+    );
+    store
+        .write_after_save(
+            lock,
+            index.generation,
+            vec![PendingRecord {
+                binding,
+                certificate: certificate(&path, &scope),
+                body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
+                    .unwrap(),
+                allowlist: codec::allowlist_digest(source),
+            }],
+        )
+        .unwrap();
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, capture);
+    let restored = cache
+        .durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &index,
+            &after,
+        )
+        .into_test_option();
+    let supported = crate::heap_layout_bound::layout_supported();
+    assert_eq!(restored.is_some(), supported);
+    let (counts, disk) = cache.durable_counters(source).unwrap();
+    if supported {
+        assert!(counts.ineligible.is_empty(), "{:?}", counts.ineligible);
+        assert_eq!(counts.refused_record, 0);
+        // No Full read: re-derivation reads less than the transcript.
+        let transcript = std::fs::metadata(&path).unwrap().len();
+        let read = counts.rederive_head_bytes + counts.rederive_line_bytes;
+        assert!(read < transcript, "re-derived {read} of {transcript} bytes");
+    } else {
+        std::io::Write::write_all(
+            &mut std::io::stderr().lock(),
+            b"a_permit_era_record_restores_under_the_always_on_capture: UNEXECUTED \
+              (heap layout unsupported; restore not exercised)\n",
+        )
+        .unwrap();
+    }
+    assert_eq!(counts.restored, u64::from(supported));
+    assert_eq!(disk.records_read, 1);
+    drop(restored);
+    let _ = std::fs::remove_dir_all(root);
+}

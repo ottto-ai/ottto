@@ -702,10 +702,10 @@ pub struct ActivityHintResponse {
     /// which every backend accepts.
     #[serde(default)]
     pub census_residue_status_contract: Option<String>,
-    /// Per-account cohort token for contract-5 request identity rows. Only the
-    /// exact `own_request_identity_rows:v1` permits emission, and only in a
-    /// build with emission compiled in; missing / null / any other token keeps
-    /// today's bodies. Read fresh every cycle, never cached.
+    /// Retired per-account cohort token for contract-5 request identity rows.
+    /// Contract 5 is always on for Claude Code, so this daemon decodes the
+    /// field for compatibility and never reads it; the server keeps sending
+    /// it for permit-era daemons.
     #[serde(default)]
     pub session_request_identity_contract: Option<String>,
     pub recommended_scan_after: String,
@@ -3420,8 +3420,8 @@ mod tests {
         assert_eq!(CENSUS_RESIDUE_ERROR_CODE, "census_residue");
     }
 
-    /// The contract-5 cohort token is read as sent: absent and null read as
-    /// none, and any other string reaches the exact-match permit unchanged.
+    /// The retired contract-5 cohort token still decodes as sent: absent and
+    /// null read as none, any string is kept verbatim (and never read).
     #[test]
     fn request_identity_cohort_token_defaults_off_and_is_kept_verbatim() {
         for extra in ["", r#", "session_request_identity_contract":null"#] {

@@ -562,12 +562,15 @@ impl RearmFixture {
             .iter()
             .map(|item| item.source_session_id.clone())
             .collect();
+        // A page without request identity is a pre-cutover daemon's
+        // unpermitted page: no marker capture and no contract-5 evidence.
+        let _pre_cutover = (!self.request_identity)
+            .then(crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter);
         let (mut disposition, _, _) = if let Some(frame) = native_preparation.as_mut() {
             apply_claude_local_evidence_to_scan_with_comparison(
                 &self.support,
                 &mut scan,
                 &mut index,
-                cycle_request_identity_permit(SnapshotSource::ClaudeCode, &frame.activity_hint),
                 frame.prepared_claude_evidence.take(),
                 comparison_completion.as_mut(),
                 frame.native_comparison_lease.as_ref(),
@@ -624,7 +627,6 @@ impl RearmFixture {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
-            true,
             |snapshot| {
                 let witness = effective_snapshot_upload_body_witness(
                     snapshot,

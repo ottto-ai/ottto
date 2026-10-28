@@ -48,6 +48,9 @@ struct HistoryCycle<'a> {
     /// request-owned literal copy of every item, ignoring #699's own
     /// protected-root skip, so only the gate's hook can remove it.
     mint_literal: bool,
+    /// Observe the contract-5 contract before the scan, as a daemon cycle
+    /// does. Evidence is always built (contract 5 always on); `false` leaves
+    /// the index's recorded contract untouched.
     request_identity: bool,
     shed_upload: bool,
 }
@@ -270,20 +273,8 @@ impl HistoryFixture {
         )
         .expect("scan Claude page");
         before_evidence(&mut scan);
-        let (mut disposition, _, _) = if cycle.request_identity {
-            apply_claude_local_evidence_to_scan_with_permit(
-                &self.support,
-                &mut scan,
-                &mut index,
-                crate::snapshots::claude_request_identity::emission_permit(
-                    SnapshotSource::ClaudeCode,
-                    Some(crate::snapshots::claude_request_identity::COHORT_HINT_TOKEN),
-                )
-                .ok(),
-            )
-        } else {
-            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
-        };
+        let (mut disposition, _, _) =
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut scan.snapshots);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -321,7 +312,6 @@ impl HistoryFixture {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
-            cycle.request_identity,
             |snapshot| {
                 effective_snapshot_upload_body_witness(
                     snapshot,
@@ -2585,7 +2575,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_money::e2::{money_mark, with_money_rules};
     use crate::snapshots::{history_local_count, HistoryLocalCount};
-    // Version 2 is the permit-mark migration row (zero mask, E3).
+    // Version 2 is #825's zero-mask row, kept for version stability.
     const RELEASE: &[(u16, u8)] = &[(1, 0), (2, 0), (3, money_mark::ESTIMATED)];
     let fixture = HistoryFixture::new("e2-switch-on-once");
     fixture.baseline();
@@ -2629,12 +2619,8 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
             {
                 let key = HistoryFixture::key(index, session);
                 assert_eq!(index.files[&key].effective_upload_body_witness_revision, 3);
-                // These cycles hold no identity permit (`request_identity`).
-                assert_eq!(
-                    store.money_marks(location_key(&key)),
-                    marks | money_mark::STAMPED_WITHOUT_PERMIT,
-                    "{session}"
-                );
+                // The retired permit mark is never set (contract 5 always on).
+                assert_eq!(store.money_marks(location_key(&key)), marks, "{session}");
             }
 
             // A later money fix: only the two estimated files are re-owed and
@@ -3171,18 +3157,21 @@ fn e2_stem_listed_before_root_indexing_counts_each_session_request_once() {
     });
 }
 
-/// E3 (B17 path A), Ron's routine re-read rule (design §12) and card G
-/// option (b): a late cohort permit (`""` → `E2_GROUPING`) after revision 3
-/// re-owes nothing. The files stamped without it keep their revision-3
-/// bodies and `STAMPED_WITHOUT_PERMIT`, which the page gauge discloses. Was
-/// `e2_late_identity_permit_reowes_revision_three_once_paced` (3 paced reads).
+/// Contract-5 cutover, first run after upgrade (SOURCE §B; card G (b)):
+/// revision-3 history stamped by a permit-era build without the permit
+/// (recorded contract `""`, no capture), some carrying #825's retired
+/// `STAMPED_WITHOUT_PERMIT` bit (64), meets the always-on contract. Nothing
+/// is re-read or re-owed: a record that never captured is not "no marker
+/// existed", and waits for real content change. The bit is decoded and kept
+/// as stored, never cleared or replayed. Was
+/// `e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps`.
 #[test]
-fn e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps() {
+fn e2_always_on_contract_reowes_no_uncaptured_history() {
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
-    use crate::snapshots::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
     use crate::snapshots::{history_local_count, HistoryLocalCount};
-    let fixture = HistoryFixture::new("e2-late-cohort-permit");
+    const RETIRED_PERMIT_MARK: u8 = 64;
+    let fixture = HistoryFixture::new("e2-always-on-contract");
     fixture.baseline();
     fixture.install_list(&[]);
     with_e2_history(&fixture, || {
@@ -3192,6 +3181,22 @@ fn e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps() {
             .files
             .values()
             .all(|entry| entry.effective_upload_body_witness_revision == 3));
+        // The permit-era record: contract `""`, and #825's bit on one file.
+        let mut old = ScanIndex::load(&fixture.index_path).unwrap();
+        let marked = HistoryFixture::key(&old, HISTORY_SESSIONS[0]);
+        let kept = old
+            .claude_money_birth_store
+            .money_marks(location_key(&marked));
+        old.claude_money_birth_store
+            .set_money_marks(&marked, kept | RETIRED_PERMIT_MARK);
+        old.save(&fixture.index_path).unwrap();
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+        saved["claude_request_identity_contract"] = serde_json::json!("");
+        saved["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
+        saved["claude_duplicate_fence_next_full_rearm_unix_seconds"] =
+            serde_json::json!(1785711600u64);
+        std::fs::write(&fixture.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
         let witnesses = |index: &ScanIndex| {
             index
                 .files
@@ -3204,23 +3209,18 @@ fn e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps() {
                             entry.last_upload_body_witness.clone(),
                             index
                                 .claude_money_birth_store
-                                .money_marks(location_key(key))
-                                & STAMPED_WITHOUT_PERMIT,
+                                .money_marks(location_key(key)),
                         ),
                     )
                 })
                 .collect::<BTreeMap<_, _>>()
         };
-        let stamped = witnesses(&before.index);
-        assert!(stamped
-            .values()
-            .all(|(_, _, mark)| *mark == STAMPED_WITHOUT_PERMIT));
-        let mut saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
-        saved["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
-        saved["claude_duplicate_fence_next_full_rearm_unix_seconds"] =
-            serde_json::json!(1785711600u64);
-        std::fs::write(&fixture.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let stamped = witnesses(&ScanIndex::load(&fixture.index_path).unwrap());
+        assert_eq!(
+            stamped[&marked].2 & RETIRED_PERMIT_MARK,
+            RETIRED_PERMIT_MARK,
+            "the old bit decodes"
+        );
         let reowed = history_local_count(HistoryLocalCount::Reowed);
         with_cycle_contract_for_test(E2_GROUPING, || {
             crate::snapshots::with_body_witness_adoption_page_budget(1, || {
@@ -3229,18 +3229,10 @@ fn e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps() {
                     ..E2_HISTORY_UPGRADE
                 };
                 for hour in 9..15 {
-                    let scope =
-                        crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
                     let page = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), cycle);
-                    let counts = scope.finish().claude_reread;
                     assert_eq!(page.scan.scanned_file_count, 0, "hour={hour}: no re-read");
                     assert!(page.uploaded.is_empty(), "hour={hour}: no body change");
                     assert_eq!(witnesses(&page.index), stamped, "hour={hour}");
-                    assert_eq!(
-                        counts.stamped_without_permit,
-                        HISTORY_SESSIONS.len() as u64,
-                        "hour={hour}: the gauge discloses every unpermitted stamp"
-                    );
                     if hour == 14 {
                         assert_eq!(
                             page.index.claude_request_identity_contract_for_test(),
@@ -3254,239 +3246,70 @@ fn e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps() {
     });
 }
 
-/// SOURCE C1 (#825 interim (b)): a real e2 identity-contract latch clear
-/// (a non-E2 record → `E2_GROUPING`, cleared at a census terminal) keeps every
-/// `STAMPED_WITHOUT_PERMIT` bit and the gauge. Only a permitted restamp
-/// clears a bit afterwards (under option (a), only its own re-owe would).
+/// Contract 5: a real content change restamps a file's money marks from its
+/// new body. #825's retired bit is carried as stored through that restamp
+/// (durable entry digests bind the raw byte), never cleared or set. The
+/// stored byte keeps only the retired bit, so the body's own marks return
+/// only if the restamp ran.
 #[test]
-fn e2_latch_clear_keeps_permit_marks_and_the_gauge() {
+fn e2_restamp_carries_the_retired_permit_bit() {
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
-    use crate::snapshots::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
-    let fixture = HistoryFixture::new("e2-latch-clear-marks");
+    const RETIRED_PERMIT_MARK: u8 = 64;
+    let fixture = HistoryFixture::new("e2-restamp-retired-bit");
     fixture.baseline();
-    fixture.install_list(&[]);
-    let marks = |index: &ScanIndex| {
-        HISTORY_SESSIONS
-            .iter()
-            .map(|session| {
-                let key = HistoryFixture::key(index, session);
-                index
-                    .claude_money_birth_store
-                    .money_marks(location_key(&key))
-            })
-            .collect::<Vec<_>>()
-    };
     with_e2_history(&fixture, || {
-        let before = fixture.cycle("2026-08-02T08:30:00Z", E2_HISTORY_UPGRADE);
-        let stamped = marks(&before.index);
-        assert!(stamped.iter().all(|m| m & STAMPED_WITHOUT_PERMIT != 0));
-        // The fixture's scan-start observation records the collector.
-        assert_eq!(
-            before.index.claude_request_identity_contract_for_test().0,
-            Some(crate::snapshots::claude_request_identity::COLLECTOR)
-        );
-        let mut saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
-        saved["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
-        saved["claude_duplicate_fence_next_full_rearm_unix_seconds"] =
-            serde_json::json!(1785711600u64);
-        std::fs::write(&fixture.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
-        let on = HistoryCycle {
-            request_identity: true,
-            ..E2_HISTORY_UPGRADE
-        };
         with_cycle_contract_for_test(E2_GROUPING, || {
-            crate::snapshots::with_body_witness_adoption_page_budget(1, || {
-                let mut latch = Vec::new();
-                for hour in 9..15 {
-                    let scope =
-                        crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-                    let page = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), on);
-                    let gauge = scope.finish().claude_reread.stamped_without_permit;
-                    let (contract, latched) =
-                        page.index.claude_request_identity_contract_for_test();
-                    latch.push((contract.map(str::to_owned), latched));
-                    assert_eq!(marks(&page.index), stamped, "hour={hour}: bits kept");
-                    assert_eq!(gauge, HISTORY_SESSIONS.len() as u64, "hour={hour}");
-                }
-                // The observed flip to E2 sets the latch at hour 9's prepare;
-                // only the census terminal clears it.
-                assert_eq!(latch.last(), Some(&(Some(E2_GROUPING.to_owned()), false)));
-                let first = HISTORY_SESSIONS[0];
-                fixture.append(first, "req_0_2");
-                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-                let restamped = fixture.cycle("2026-08-02T15:00:00Z", on);
-                assert_eq!(
-                    scope.finish().claude_reread.stamped_without_permit,
-                    HISTORY_SESSIONS.len() as u64 - 1
-                );
-                let after = marks(&restamped.index);
-                assert_eq!(after[0] & STAMPED_WITHOUT_PERMIT, 0, "a permitted restamp");
-                assert_eq!(after[1..], stamped[1..]);
-            })
-        });
-    });
-}
-
-/// SOURCE C2: the gauge rides every Claude collection page from the store's
-/// mark count, also a page no finalization follows; with no marks its sparse
-/// key is absent (absent = 0).
-#[test]
-fn e2_permit_gauge_rides_a_collection_page_without_finalization() {
-    use crate::snapshots::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
-    let fixture = HistoryFixture::new("e2-permit-gauge-page");
-    fixture.baseline();
-    with_e2_history(&fixture, || {
-        let mut index = fixture
-            .cycle("2026-08-02T08:30:00Z", E2_HISTORY_UPGRADE)
-            .index;
-        // The scan alone: no finalization runs after this page.
-        let page = |index: &mut ScanIndex| {
-            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-                crate::snapshots::scan_source_roots_with_artifacts(
-                    SnapshotSource::ClaudeCode,
-                    std::slice::from_ref(&fixture.root),
-                    index,
-                    "2026-08-02T09:00:00Z",
-                    crate::snapshots::BACKFILL_WINDOW_DAYS,
-                    true,
-                )
-                .unwrap()
-            });
-            rows.iter()
-                .filter(|row| {
-                    row["stage"] == "native_collection_page" && row["source"] == "claude_code"
-                })
-                .map(|row| row["counts"]["claude_reread"]["stamped_without_permit"].as_u64())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(page(&mut index), [Some(HISTORY_SESSIONS.len() as u64)]);
-        for session in HISTORY_SESSIONS {
-            let key = HistoryFixture::key(&index, session);
-            index
-                .claude_money_birth_store
-                .set_money_mark(&key, STAMPED_WITHOUT_PERMIT, false);
-        }
-        assert_eq!(page(&mut index), [None]);
-    });
-}
-
-/// E3: off/on/off/on. Each permitted restamp clears its file's bit and each
-/// unpermitted one sets it, in the same save as its stamp; no flip re-owes
-/// or re-sends anything, also with the duplicate prepare/start observation.
-#[test]
-fn e2_permit_flips_reowe_nothing_and_restamps_maintain_the_permit_mark() {
-    use crate::snapshots::claude_money_birth_store::location_key;
-    use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
-    use crate::snapshots::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
-    use crate::snapshots::{history_local_count, HistoryLocalCount};
-    let fixture = HistoryFixture::new("e2-permit-flips");
-    fixture.baseline();
-    fixture.cycle("2026-08-02T08:00:00Z", HISTORY_REVISION_2);
-    let on = HistoryCycle {
-        request_identity: true,
-        ..E2_HISTORY_UPGRADE
-    };
-    let page = |hour: u32, permitted: bool| {
-        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-        let at = format!("2026-08-02T{hour:02}:00:00Z");
-        let outcome = if permitted {
-            with_cycle_contract_for_test(E2_GROUPING, || fixture.cycle(&at, on))
-        } else {
-            fixture.cycle(&at, E2_HISTORY_UPGRADE)
-        };
-        let gauge = scope.finish().claude_reread.stamped_without_permit;
-        let marked = HISTORY_SESSIONS
-            .iter()
-            .filter(|session| {
-                let key = HistoryFixture::key(&outcome.index, session);
-                outcome
-                    .index
-                    .claude_money_birth_store
-                    .money_marks(location_key(&key))
-                    & STAMPED_WITHOUT_PERMIT
-                    != 0
-            })
-            .map(|session| session.to_string())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(gauge, marked.len() as u64, "hour={hour}");
-        assert!(
-            outcome
-                .index
-                .files
-                .values()
-                .all(|entry| entry.effective_upload_body_witness_revision == 3),
-            "hour={hour}: no revision is lowered"
-        );
-        (outcome.uploaded, marked)
-    };
-    let all = HISTORY_SESSIONS
-        .iter()
-        .map(|session| session.to_string())
-        .collect::<BTreeSet<_>>();
-    let first = HISTORY_SESSIONS[0];
-    with_e2_history(&fixture, || {
-        assert_eq!(page(9, false), (all.clone(), all.clone()));
-        let reowed = history_local_count(HistoryLocalCount::Reowed);
-        assert_eq!(page(10, true), (BTreeSet::new(), all.clone()), "first flip");
-        fixture.append(first, "req_0_2");
-        let (uploaded, marked) = page(11, true);
-        assert_eq!(uploaded, BTreeSet::from([first.to_string()]));
-        let mut unpermitted = all.clone();
-        unpermitted.remove(first);
-        assert_eq!(marked, unpermitted, "a permitted restamp clears its bit");
-        fixture.append(first, "req_0_3");
-        assert_eq!(
-            page(12, false),
-            (BTreeSet::from([first.to_string()]), all.clone()),
-            "an unpermitted restamp sets it again"
-        );
-        assert_eq!(
-            page(13, true),
-            (BTreeSet::new(), all.clone()),
-            "second flip"
-        );
-        assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed);
-    });
-}
-
-/// E3: history stamped only under the permit carries no bit, and flipping
-/// the permit off and back with no stamps in between keeps the gauge at 0.
-#[test]
-fn e2_permitted_history_has_no_permit_mark_across_flips() {
-    use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
-    let fixture = HistoryFixture::new("e2-permitted-history");
-    fixture.baseline();
-    fixture.cycle("2026-08-02T08:00:00Z", HISTORY_REVISION_2);
-    let on = HistoryCycle {
-        request_identity: true,
-        ..E2_HISTORY_UPGRADE
-    };
-    with_e2_history(&fixture, || {
-        for (hour, permitted) in [(9, true), (10, false), (11, true), (12, true)] {
-            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
-            let at = format!("2026-08-02T{hour:02}:00:00Z");
-            let page = if permitted {
-                with_cycle_contract_for_test(E2_GROUPING, || fixture.cycle(&at, on))
-            } else {
-                fixture.cycle(&at, E2_HISTORY_UPGRADE)
+            let cycle = HistoryCycle {
+                request_identity: true,
+                ..E2_HISTORY_UPGRADE
             };
-            assert_eq!(
-                scope.finish().claude_reread.stamped_without_permit,
-                0,
-                "hour={hour}"
-            );
-            if hour == 9 {
-                assert_eq!(page.uploaded.len(), HISTORY_SESSIONS.len());
-            } else {
-                assert!(page.uploaded.is_empty(), "hour={hour}");
+            for at in ["08:30", "08:40", "08:50"] {
+                fixture.cycle(&format!("2026-08-02T{at}:00Z"), cycle);
             }
-            assert!(page
+            let mut old = ScanIndex::load(&fixture.index_path).unwrap();
+            let marked = HistoryFixture::key(&old, HISTORY_SESSIONS[0]);
+            assert_eq!(old.files[&marked].effective_upload_body_witness_revision, 3);
+            let body_marks = old
+                .claude_money_birth_store
+                .money_marks(location_key(&marked));
+            assert_ne!(body_marks, 0, "the body carries money marks");
+            assert_eq!(
+                body_marks & RETIRED_PERMIT_MARK,
+                0,
+                "the always-on build never sets it"
+            );
+            old.claude_money_birth_store
+                .set_money_marks(&marked, RETIRED_PERMIT_MARK);
+            old.save(&fixture.index_path).unwrap();
+            let before = old.files[&marked].source_file_fingerprint.clone();
+            fixture.append(HISTORY_SESSIONS[0], "req_0_2");
+            let page = fixture.cycle("2026-08-02T09:00:00Z", cycle);
+            let after = &page.index.files[&marked];
+            let marks = page
                 .index
-                .files
-                .values()
-                .all(|entry| entry.effective_upload_body_witness_revision == 3));
-        }
+                .claude_money_birth_store
+                .money_marks(location_key(&marked));
+            let state = format!(
+                "uploaded={:?} read={} source {before}->{} rev {} marks {body_marks}->{marks}",
+                page.uploaded,
+                page.scan.scanned_file_count,
+                after.source_file_fingerprint,
+                after.effective_upload_body_witness_revision,
+            );
+            assert!(page.uploaded.contains(HISTORY_SESSIONS[0]), "{state}");
+            assert_ne!(after.source_file_fingerprint, before, "re-read: {state}");
+            assert_eq!(after.effective_upload_body_witness_revision, 3, "{state}");
+            assert_ne!(
+                marks & !RETIRED_PERMIT_MARK,
+                0,
+                "the restamp recomputes the body's marks: {state}"
+            );
+            assert_eq!(
+                marks & RETIRED_PERMIT_MARK,
+                RETIRED_PERMIT_MARK,
+                "and keeps the retired bit: {state}"
+            );
+        })
     });
 }
