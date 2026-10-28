@@ -561,7 +561,15 @@ fn codex_client_version(home: &Path) -> Option<String> {
     for _ in 0..3 {
         dir = newest_child(&dir, true)?;
     }
-    let file = std::fs::File::open(newest_child(&dir, false)?).ok()?;
+    let newest = newest_child(&dir, false);
+    if newest_archive_is_newer(&dir, newest.as_deref()) {
+        // Archives are never decoded here; the version comes from an older
+        // plain log, or is unknown.
+        eprintln!(
+            "mcp_harvest codex_version=unavailable reason=CompressedClientVersionUnavailable"
+        );
+    }
+    let file = std::fs::File::open(newest?).ok()?;
     let mut reader = BufReader::new(file.take(CODEX_SESSION_META_MAX_BYTES));
     let mut first = String::new();
     reader.read_line(&mut first).ok()?;
@@ -572,6 +580,30 @@ fn codex_client_version(home: &Path) -> Option<String> {
         .map(str::trim)
         .filter(|version| parse_version(version).is_some())
         .map(|version| version.chars().take(64).collect())
+}
+
+/// Whether the newest rollout in `dir` is a `.jsonl.zst` archive, newer than
+/// `newest_plain` (or with no plain log at all). Names only, nothing is read.
+fn newest_archive_is_newer(dir: &Path, newest_plain: Option<&Path>) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let newest_archive = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let stem = name.strip_suffix(".zst")?;
+            (stem.starts_with("rollout-") && stem.ends_with(".jsonl")).then(|| stem.to_string())
+        })
+        .max();
+    let plain = newest_plain
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str());
+    match (newest_archive, plain) {
+        (Some(archive), Some(plain)) => archive.as_str() > plain,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 /// Stamp each harvested server with its loading decision.
@@ -2451,6 +2483,27 @@ mod tests {
             println!("MCP_RESOURCE mode={mode} fds_before={} fds_after={} threads_before={} threads_after={} admitted=0", before.0,after.0,before.1,after.1);
             assert_eq!(after, before);
         }
+    }
+
+    #[test]
+    fn codex_version_notes_a_newer_archive_without_reading_it() {
+        let home = test_home("codex-version-archive");
+        let day = home.join(".codex/sessions/2026/10/28");
+        fs::create_dir_all(&day).unwrap();
+        let meta = r#"{"type":"session_meta","payload":{"cli_version":"0.50.0"}}"#;
+        let older = day.join("rollout-2026-10-28T01-00-00-a.jsonl");
+        fs::write(&older, format!("{meta}\n")).unwrap();
+        assert!(!newest_archive_is_newer(&day, Some(&older)));
+        // A plain log's own archive twin is not newer.
+        fs::write(day.join("rollout-2026-10-28T01-00-00-a.jsonl.zst"), b"x").unwrap();
+        assert!(!newest_archive_is_newer(&day, Some(&older)));
+        // A newer archive is reported; the version still comes from the
+        // older plain log (the archive is not zstd and is never opened).
+        fs::write(day.join("rollout-2026-10-28T02-00-00-b.jsonl.zst"), b"x").unwrap();
+        assert!(newest_archive_is_newer(&day, Some(&older)));
+        assert!(newest_archive_is_newer(&day, None));
+        assert_eq!(codex_client_version(&home).as_deref(), Some("0.50.0"));
+        fs::remove_dir_all(&home).unwrap();
     }
 
     fn test_home(name: &str) -> PathBuf {
