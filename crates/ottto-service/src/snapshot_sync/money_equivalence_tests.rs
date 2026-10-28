@@ -242,6 +242,17 @@ impl Disk {
         std::fs::read_dir(crate::durable_tail_store::store_dir_for_index(&self.index))
             .map_or(0, |entries| entries.count())
     }
+    /// Every record file's bytes, generation stamp included.
+    fn record_bytes(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(crate::durable_tail_store::store_dir_for_index(&self.index))
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
 }
 
 /// This owner's restore counters: (attempts, restored, ineligible classes).
@@ -843,10 +854,13 @@ fn restart_between_pages() {
 }
 
 /// An upgraded binary that changes no record binding (codec, allowlist,
-/// scope, body-witness revision, money rule) first commits the index
-/// without reading, advancing its generation past the record's. Its first
-/// read must still restore the older binary's record and Tail. A real
-/// cross-binary upgrade is not buildable in one test binary.
+/// scope, body-witness revision, money rule) restores the older binary's
+/// record. The older owner's next pass sees the file unchanged and commits
+/// again without rewriting its unchanged record, so the record's generation
+/// stamp is older than the committed index. The upgraded owner (a new
+/// process) must still restore it and Tail the growth. Every commit follows
+/// a real pass, as in the daemon. A real cross-binary upgrade is not
+/// buildable in one test binary.
 #[test]
 fn upgrade_without_semantic_revision() {
     let name = "upgrade_without_semantic_revision";
@@ -855,22 +869,31 @@ fn upgrade_without_semantic_revision() {
     }
     with_e2(|| {
         let (c, disk, path, scanner, prior) = disk_corpus(name);
-        let upgraded = disk.owner(SnapshotSource::ClaudeCode);
-        let mut loaded = ScanIndex::load(&disk.index).unwrap();
-        let migrated = disk.commit(&upgraded.cache, SnapshotSource::ClaudeCode, &mut loaded);
-        assert!(migrated.generation > prior.generation);
+        let written = disk.record_bytes();
+        assert_eq!(written.len(), 1);
+        disk.begin(&scanner, SnapshotSource::ClaudeCode);
+        let mut quiet = c.raw(&scanner, prior.clone(), 100, true, &[]);
         assert_eq!(
-            serde_json::to_value(&migrated.files).unwrap(),
-            serde_json::to_value(&prior.files).unwrap(),
-            "the upgrade's commit changes no entry"
+            quiet.modes.0 + quiet.modes.1,
+            0,
+            "the older owner's file is unchanged: no read"
         );
-        assert_eq!(disk.records(), 1, "the older binary's record is kept");
+        quiet.enrich(&c);
+        quiet.finish();
+        let committed = disk.commit(&quiet.cache, SnapshotSource::ClaudeCode, &mut quiet.index);
+        assert!(committed.generation > prior.generation);
+        assert_eq!(
+            disk.record_bytes(),
+            written,
+            "an unchanged record keeps its older generation stamp"
+        );
         grow(&path, "r2", 20);
+        let upgraded = disk.owner(SnapshotSource::ClaudeCode);
         let pages = claude_pages(
             &c,
             &scanner,
             &upgraded,
-            [migrated.clone(), migrated.clone(), migrated],
+            [committed.clone(), committed.clone(), committed],
             (0, 1, 0),
             (0, 1, 0),
         );
