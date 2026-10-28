@@ -112,6 +112,7 @@ scalar!(
     isize,
     f32,
     f64,
+    serde::de::IgnoredAny,
     ()
 );
 impl HeapLayoutBound for String {

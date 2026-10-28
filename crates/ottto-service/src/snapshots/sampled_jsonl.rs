@@ -179,10 +179,6 @@ impl OwnedJsonlParser {
             now,
         )?;
         let mode = plan.mode();
-        if matches!(mode, ReadMode::Full(_)) {
-            self.assert_reread_ticket();
-            anyhow::ensure!(self.reread_read_allowed(), "reread ticket expired");
-        }
         if matches!(mode, ReadMode::Full(_)) && self.source == SnapshotSource::Codex {
             self.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
         }

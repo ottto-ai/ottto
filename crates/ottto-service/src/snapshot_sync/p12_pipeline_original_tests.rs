@@ -154,7 +154,6 @@ struct RearmBodyTrace {
 
 struct RearmFixture {
     // New structural-guard acceptance opts into the real save-before-read seam.
-    reread_guard_cache: Option<std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>>,
     case: &'static str,
     base: PathBuf,
     root: PathBuf,
@@ -190,7 +189,6 @@ impl RearmFixture {
             std::fs::create_dir_all(directory).expect("create synthetic directory");
         }
         let fixture = Self {
-            reread_guard_cache: None,
             case,
             request_identity: false,
             hinted_paths: Vec::new(),
@@ -350,12 +348,6 @@ impl RearmFixture {
             true, // Match its context-curve setting; byte parity includes it.
             self.request_identity,
         );
-        if let Some(cache) = self.reread_guard_cache.as_ref() {
-            scan = scan.with_reread_persistence().with_sampled_acquisition(
-                cache.clone(),
-                crate::transcript_acquisition::Scope("structural-reread-fixture".into()),
-            );
-        }
         if crate::snapshots::claude_native_comparison::enabled() {
             scan.enable_native_comparison();
         }
@@ -1476,7 +1468,6 @@ fn native_comparison_pending_ack_corrective_parse_partial_save_and_terminal_use_
 fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture {
     let base = test_dir("native-parity-independent-index");
     RearmFixture {
-        reread_guard_cache: None,
         root: source.root.clone(),
         support: source.support.clone(),
         index_path: base.join("claude-scan-index.json"),

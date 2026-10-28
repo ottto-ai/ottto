@@ -967,15 +967,13 @@ impl ScanIndex {
             .map(|(_, members)| members.len())
             .sum::<usize>()
             .saturating_add(self.claude_history_emission.skipped_carried_entries);
-        // SOURCE N1: the durable-tail head re-parse is not a reread the guard
-        // sees, so its bytes are reported beside the guard's counters.
         #[cfg(unix)]
         let durable_head = sampled_scan::durable_tail::rederive_head_bytes_total(source);
         #[cfg(not(unix))]
         let durable_head = 0_u64;
         emit_scan_index_containment_line(format!(
-            "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried} {} durable_rederive_head_bytes={durable_head} carried_ack_pending_age_seconds={age}",
-            source.api_slug(), census_complete, self.reread_guard.disclosure()
+            "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried} durable_rederive_head_bytes={durable_head} carried_ack_pending_age_seconds={age}",
+            source.api_slug(), census_complete
         ));
     }
 
