@@ -2497,31 +2497,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn codex_version_notes_a_newer_archive_without_reading_it() {
-        let home = test_home("codex-version-archive");
-        let day = home.join(".codex/sessions/2026/10/28");
-        fs::create_dir_all(&day).unwrap();
-        let meta = r#"{"type":"session_meta","payload":{"cli_version":"0.50.0"}}"#;
-        let older = day.join("rollout-2026-10-28T01-00-00-a.jsonl");
-        fs::write(&older, format!("{meta}\n")).unwrap();
-        assert!(!newest_archive_is_newer(&day, Some(&older)));
-        // A plain log's own archive twin is not newer.
-        fs::write(day.join("rollout-2026-10-28T01-00-00-a.jsonl.zst"), b"x").unwrap();
-        assert!(!newest_archive_is_newer(&day, Some(&older)));
-        // A directory named like an archive is not one.
-        fs::create_dir(day.join("rollout-2026-10-28T03-00-00-c.jsonl.zst")).unwrap();
-        assert!(!newest_archive_is_newer(&day, Some(&older)));
-        fs::remove_dir(day.join("rollout-2026-10-28T03-00-00-c.jsonl.zst")).unwrap();
-        // A newer archive is reported, from its name alone; the version still
-        // comes from the older plain log.
-        fs::write(day.join("rollout-2026-10-28T02-00-00-b.jsonl.zst"), b"x").unwrap();
-        assert!(newest_archive_is_newer(&day, Some(&older)));
-        assert!(newest_archive_is_newer(&day, None));
-        assert_eq!(codex_client_version(&home).as_deref(), Some("0.50.0"));
-        fs::remove_dir_all(&home).unwrap();
-    }
-
     fn test_home(name: &str) -> PathBuf {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir()
@@ -3154,7 +3129,7 @@ url = "https://unset.test/mcp"
             json!({ "env": { "ENABLE_TOOL_SEARCH": "false" } }).to_string(),
         )
         .unwrap();
-        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode, None);
         let configured = discover_claude_code(&home);
         let mut servers: Vec<McpServerInput> = configured.iter().map(unreachable_server).collect();
         apply_loading_policy(&mut servers, &configured, &policy);
@@ -3175,7 +3150,7 @@ url = "https://unset.test/mcp"
             json!({ "env": { "ENABLE_TOOL_SEARCH": "auto:5" } }).to_string(),
         )
         .unwrap();
-        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode, None);
         assert_eq!(policy.tool_search_auto_pct(), None);
         let mut servers: Vec<McpServerInput> = configured.iter().map(unreachable_server).collect();
         apply_loading_policy(&mut servers, &configured, &policy);
@@ -3186,7 +3161,7 @@ url = "https://unset.test/mcp"
     }
 
     #[test]
-    fn loading_policy_reads_claude_settings_and_codex_session_version() {
+    fn loading_policy_reads_claude_settings_and_accepts_codex_sample() {
         let home = test_home("loading-policy");
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::write(
@@ -3212,7 +3187,7 @@ url = "https://unset.test/mcp"
             json!({ "env": { "ENABLE_TOOL_SEARCH": "auto:20" } }).to_string(),
         )
         .unwrap();
-        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode, None);
         assert_eq!(policy.client_version().as_deref(), Some("2.1.299"));
         assert_eq!(policy.tool_search_auto_pct(), Some(20));
 
@@ -3226,37 +3201,7 @@ url = "https://unset.test/mcp"
         assert_eq!(by_name("lazy").loading_mode, "unknown");
         assert_eq!(by_name("lazy").loading_mode_basis, "tool_search_auto");
 
-        // Codex: the newest session log's first line carries the version.
-        let day = home
-            .join(".codex")
-            .join("sessions")
-            .join("2026")
-            .join("10")
-            .join("18");
-        fs::create_dir_all(&day).unwrap();
-        let old_day = home
-            .join(".codex")
-            .join("sessions")
-            .join("2026")
-            .join("09")
-            .join("30");
-        fs::create_dir_all(&old_day).unwrap();
-        fs::write(
-            old_day.join("rollout-2026-09-30T01-00-00-a.jsonl"),
-            "{\"payload\":{\"cli_version\":\"0.140.0\"}}\n",
-        )
-        .unwrap();
-        fs::write(
-            day.join("rollout-2026-10-18T01-00-00-a.jsonl"),
-            "{\"payload\":{\"cli_version\":\"0.160.0\"}}\n",
-        )
-        .unwrap();
-        fs::write(
-            day.join("rollout-2026-10-18T09-00-00-b.jsonl"),
-            "{\"type\":\"session_meta\",\"payload\":{\"cli_version\":\"0.162.1\"}}\n{}\n",
-        )
-        .unwrap();
-        let codex = LoadingPolicy::read(&home, SnapshotSource::Codex);
+        let codex = LoadingPolicy::read(&home, SnapshotSource::Codex, Some("0.162.1"));
         assert_eq!(codex.client_version().as_deref(), Some("0.162.1"));
         assert_eq!(codex.tool_search_auto_pct(), None);
 
@@ -3371,6 +3316,7 @@ url = "https://unset.test/mcp"
             SnapshotSource::Pi,
             Some("otm_test"),
             unbounded_deadline(),
+            None,
         );
         assert_eq!(built.inventory.agent_source, "pi");
         assert!(built.inventory.servers.is_empty());
@@ -3387,6 +3333,7 @@ url = "https://unset.test/mcp"
                 SnapshotSource::ClaudeCode,
                 None,
                 unbounded_deadline(),
+                None,
             )
             .inventory,
         )
@@ -3401,6 +3348,7 @@ url = "https://unset.test/mcp"
                 SnapshotSource::ClaudeCode,
                 Some("otm_x"),
                 unbounded_deadline(),
+                None,
             )
             .inventory,
         )
@@ -3635,6 +3583,7 @@ done
     fn cache_freshness_tracks_max_staleness() {
         let now = OffsetDateTime::from_unix_timestamp(1_750_000_000).unwrap();
         let fresh = InventoryCacheEntry {
+            seed: None,
             identity: "d|m|u".to_string(),
             inventory_sha256: "x".to_string(),
             posted_at: now.format(&Rfc3339).unwrap(),
@@ -3651,6 +3600,7 @@ done
 
         // An unparseable timestamp is treated as stale (force a re-POST).
         let corrupt = InventoryCacheEntry {
+            seed: None,
             identity: "d|m|u".to_string(),
             inventory_sha256: "x".to_string(),
             posted_at: "not-a-timestamp".to_string(),
@@ -3709,6 +3659,7 @@ done
         Enabled,
         Disabled,
         Error,
+        UploadError,
     }
 
     /// Mock backend accepting exactly `count` requests, dispatching by path:
@@ -3771,10 +3722,15 @@ done
                             "200 OK",
                             format!(
                                 r#"{{"source":"claude_code","server_time":"2099-01-01T00:00:00Z","record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":183,"recommended_scan_after":"2099-01-01T00:00:00Z","mcp_inventory_harvest_enabled":{}}}"#,
-                                matches!(mode, HintMode::Enabled)
+                                matches!(mode, HintMode::Enabled | HintMode::UploadError)
                             ),
                         ),
                     }
+                } else if matches!(hint, HintMode::UploadError) {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"error":"upload"}"#.to_string(),
+                    )
                 } else {
                     ("200 OK", r#"{"snapshot_id":"snap_1"}"#.to_string())
                 };
@@ -3812,6 +3768,7 @@ done
             base,
             home,
             support_dir,
+            None,
         )
     }
 
@@ -4117,6 +4074,7 @@ done
     fn a_deferred_claude_server_keeps_only_a_fresh_last_inventory() {
         let now = OffsetDateTime::now_utc();
         let entry = |identity: &str, age_days: i64| InventoryCacheEntry {
+            seed: None,
             identity: identity.to_string(),
             inventory_sha256: "hash".to_string(),
             posted_at: (now - time::Duration::days(age_days))
@@ -4187,4 +4145,5 @@ done
         assert!(!alive(other_pid));
         let _ = fs::remove_dir_all(&dir);
     }
+    include!("mcp_inventory_version_tests.rs");
 }

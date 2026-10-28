@@ -13819,3 +13819,48 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
         assert_eq!(c[..6].iter().sum::<usize>() + unknown, 3);
     }
 }
+
+#[test]
+fn mcp_version_waits_for_resumed_cursor_eof() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let path = fixture.file(SESSION);
+    let text = fs::read_to_string(&path).unwrap();
+    let (first, rest) = text.split_once('\n').unwrap();
+    let mut meta: Value = serde_json::from_str(first).unwrap();
+    meta["payload"]["cli_version"] = json!("0.148.9");
+    fs::write(&path, meta.to_string() + "\n" + rest).unwrap();
+    let home = fixture.root.parent().unwrap().parent().unwrap();
+    let projection = Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(
+        Some(home),
+    ));
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_with(
+                &fixture,
+                index,
+                Some(cache.clone()),
+                "mcp-cursor",
+                NOW,
+                |s| s.codex_versions = Some(projection.clone()),
+            );
+            index = next;
+            let completed = cache.with_cursor(|c| c.counters.jobs_certified).unwrap();
+            if completed > 0 {
+                assert!(cache.with_cursor(|c| c.counters.jobs_resumed).unwrap() > 0);
+                assert_eq!(projection.snapshot().0.unwrap().version(), Some("0.148.9"));
+                assert_eq!(projection.snapshot().1, 1, "publish only at completed EOF");
+                return;
+            }
+            assert!(
+                projection.snapshot().0.is_none(),
+                "paused cursors publish nothing"
+            );
+        }
+        panic!("cursor never completed");
+    });
+}

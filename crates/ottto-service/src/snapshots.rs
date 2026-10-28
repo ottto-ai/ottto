@@ -22713,6 +22713,35 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    static TRANSCRIPT_IO_DENIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) fn transcript_io_allowed() -> std::io::Result<()> {
+    if TRANSCRIPT_IO_DENIED.with(|v| v.get()) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "synthetic transcript I/O denial",
+        ))
+    } else {
+        Ok(())
+    }
+}
+#[cfg(test)]
+pub(crate) fn with_transcript_io_denied<T>(run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TRANSCRIPT_IO_DENIED.with(|v| v.set(false));
+        }
+    }
+    TRANSCRIPT_IO_DENIED.with(|v| assert!(!v.replace(true)));
+    let _reset = Reset;
+    assert!(transcript_io_allowed().is_err(), "denial seam is armed");
+    run()
+}
+
+#[cfg(test)]
 type AfterReaderEofHook = Box<dyn FnMut(&OwnedActiveFile)>;
 
 #[cfg(test)]
@@ -33274,6 +33303,8 @@ impl OwnedJsonlParser {
     }
     fn step_delivering(&mut self, on_line: Option<line_delivery::LineTap<'_>>) -> Result<bool> {
         #[cfg(test)]
+        transcript_io_allowed()?;
+        #[cfg(test)]
         if let Some(path) = self.source_read_probe.take() {
             terminal_contract_retry::record_source_acquisition(&path);
         }
@@ -42391,6 +42422,8 @@ fn open_candidate_file_stat_retained(
 ) -> std::io::Result<(File, Option<OpenedObjectStat>)> {
     #[cfg(test)]
     ALL_TRANSCRIPT_OPENS_FOR_TEST.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    transcript_io_allowed()?;
     let mut file = open_candidate_beneath_root(candidate)?;
     let retained = cache
         .filter(|_| source == SnapshotSource::Codex)
