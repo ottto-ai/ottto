@@ -173,6 +173,8 @@ pub(crate) struct ArchiveEvidence {
     #[serde(default)]
     header_attempted: bool,
     #[serde(default)]
+    header_bound_reached: bool,
+    #[serde(default)]
     pub(super) decode_attempts: u8,
     #[serde(default)]
     terminal_failures: u8,
@@ -206,7 +208,6 @@ fn bounded_archive_context<'de, D: serde::Deserializer<'de>>(
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ArchiveDisposition {
     HeaderValidated,
-    HeaderBoundReached,
     Acquired,
     Empty,
     Pending { attempts: u8, retry_after: u64 },
@@ -321,6 +322,7 @@ impl ArchiveEvidence {
                 }
             }),
             header_attempted: previous.is_some_and(|a| a.header_attempted),
+            header_bound_reached: previous.is_some_and(|a| a.header_bound_reached),
             header_validated: previous.and_then(|a| a.header_validated.clone()),
             disposition: ArchiveDisposition::Pending {
                 attempts,
@@ -362,10 +364,7 @@ impl ArchiveEvidence {
     }
     pub(super) fn quiet(&self, file: &File) -> bool {
         self.matches(file)
-            && !matches!(
-                self.disposition,
-                ArchiveDisposition::HeaderValidated | ArchiveDisposition::HeaderBoundReached
-            )
+            && !matches!(self.disposition, ArchiveDisposition::HeaderValidated)
             && !matches!(self.disposition, ArchiveDisposition::Pending { retry_after, .. } if super::sampled_scan::now_seconds() >= retry_after)
     }
     pub(super) fn stop_exhausted(&mut self) -> bool {
@@ -440,10 +439,14 @@ impl ArchiveEvidence {
             _ => None,
         }
     }
+    fn header_bound_pending(&self) -> bool {
+        use ArchiveDisposition::*;
+        self.header_bound_reached && matches!(self.disposition, HeaderValidated | Pending { .. })
+    }
     pub(super) fn invalid_header(&self, path: &Path, metadata: &std::fs::Metadata) -> bool {
         let bound = self.header_for(path).is_some();
         !bound
-            && !matches!(self.disposition, ArchiveDisposition::HeaderBoundReached)
+            && !self.header_bound_pending()
             && (self.header_attempted
                 || !matches!(self.disposition, ArchiveDisposition::HeaderValidated))
             && crate::transcript_acquisition::FileStamp::capture(metadata.clone())
@@ -952,7 +955,7 @@ impl super::ScanIndex {
             return Ok(HeaderRead::Validated(header.clone()));
         }
         if let Some(old) = old {
-            if matches!(old.disposition, ArchiveDisposition::HeaderBoundReached) {
+            if old.header_bound_pending() {
                 return Ok(HeaderRead::BoundReached);
             }
             if old.header_attempted
@@ -1029,9 +1032,7 @@ impl super::ScanIndex {
         let evidence = entry.archive.as_mut().expect("header attempt");
         match &result {
             Ok(HeaderRead::Validated(header)) => evidence.header_validated = Some(header.clone()),
-            Ok(HeaderRead::BoundReached) => {
-                evidence.disposition = ArchiveDisposition::HeaderBoundReached
-            }
+            Ok(HeaderRead::BoundReached) => evidence.header_bound_reached = true,
             Err(_) => {
                 evidence.disposition = ArchiveDisposition::Refused {
                     cause: CodexZstCause::HeaderInvalid,
@@ -1087,7 +1088,7 @@ impl super::ScanIndex {
         }
     }
 }
-crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, disposition, body_witness, reservation_saved, header_validated, header_attempted, decode_attempts, terminal_failures, terminal_attempt, user_change, user_context, user_generation, user_change_spent);
+crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, disposition, body_witness, reservation_saved, header_validated, header_attempted, decode_attempts, terminal_failures, terminal_attempt, user_change, user_context, user_generation, user_change_spent, header_bound_reached);
 impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)

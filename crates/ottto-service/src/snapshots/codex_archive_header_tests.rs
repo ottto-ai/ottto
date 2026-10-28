@@ -1879,9 +1879,15 @@ fn selector_scan(
 }
 
 fn finish_selector(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
+    let mut committed = scan.index.clone();
+    let reservation = fixture(b"{}", ".json");
     for _ in 0..1000 {
         match scan.step(None) {
-            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Pending(mut next) => {
+                next.persist_archive_reservation(&mut committed, &reservation.0)
+                    .unwrap();
+                scan = next;
+            }
             OwnedSourceScanStep::Complete {
                 mut index,
                 mut scan,
@@ -2073,4 +2079,183 @@ fn bound_header_marker_survives_restart_without_inventory_redecode() {
         assert!(result.snapshots.is_empty());
         state = next;
     }
+}
+
+fn large_header_rollout() -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(&json!({"type":"session_meta", "payload": {
+        "id":"compressed-fixture", "instructions":"x".repeat(70 * 1024)
+    }}))
+    .unwrap();
+    bytes.push(b'\n');
+    bytes.extend(
+        synthetic_rollout()
+            .splitn(2, |b| *b == b'\n')
+            .nth(1)
+            .unwrap(),
+    );
+    bytes
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn oversized_archive_never_publishes_alone_with_same_owner_plain_continuation() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap());
+    let plain = f.0.with_file_name("rollout-compressed-fixture.jsonl");
+    fs::write(&plain, synthetic_rollout()).unwrap();
+    let mut member = super::super::codex_zst_refusal_tests::candidate(&plain);
+    member.size_bytes = fs::metadata(&plain).unwrap().len();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (mut prior, result) = finish_selector(selector_scan(
+        &f,
+        ScanIndex::default(),
+        cache.clone(),
+        VecDeque::from([member.clone()]),
+        true,
+    ));
+    assert_eq!(result.snapshots.len(), 1);
+    let accepted = BTreeSet::from([result.snapshots[0].snapshot_fingerprint.clone()]);
+    prior.record_accepted_snapshot_fingerprints(&accepted);
+    let plain_body = prior.files[&local_index_key(&plain)]
+        .last_upload_body_witness
+        .clone();
+    assert!(plain_body.is_some());
+    let ((mut state, result), rows) = crate::local_resource_diagnostics::capture(|| {
+        finish_selector(selector_scan(
+            &f,
+            checkpoint(&prior),
+            cache.clone(),
+            VecDeque::from([f.candidate(), member.clone()]),
+            true,
+        ))
+    });
+    assert_eq!(decodes(&rows), 2);
+    assert!(
+        result.snapshots.is_empty(),
+        "no partial session replaces accepted money"
+    );
+    assert_eq!(
+        state.files[&local_index_key(&plain)].last_upload_body_witness,
+        plain_body
+    );
+    assert_eq!(state.accepted_snapshot_fingerprints, accepted);
+    assert!(matches!(
+        state.files[&local_index_key(&f.0)]
+            .archive
+            .as_ref()
+            .unwrap()
+            .disposition,
+        ArchiveDisposition::Held {
+            cause: CodexZstCause::OutputHeld
+        }
+    ));
+    for _ in 0..5 {
+        let ((next, result), rows) = crate::local_resource_diagnostics::capture(|| {
+            finish_selector(selector_scan(
+                &f,
+                checkpoint(&state),
+                cache.clone(),
+                VecDeque::from([f.candidate(), member.clone()]),
+                true,
+            ))
+        });
+        assert_eq!(decodes(&rows), 0);
+        assert!(result.snapshots.is_empty());
+        assert_eq!(
+            next.files[&local_index_key(&plain)].last_upload_body_witness,
+            plain_body
+        );
+        state = next;
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn bound_header_survives_saved_reservation_before_first_line_crash() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&large_header_rollout()[..], 1).unwrap());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut committed = ScanIndex::default();
+    let path = f.0.parent().unwrap().join("before-line-index.json");
+    committed.save(&path).unwrap();
+    let mut scan = selector_scan(
+        &f,
+        committed.clone(),
+        cache.clone(),
+        VecDeque::from([f.candidate()]),
+        true,
+    );
+    let key = local_index_key(&f.0);
+    for _ in 0..1000 {
+        scan = match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => next,
+            OwnedSourceScanStep::Complete { .. } => panic!("read must await reservation"),
+        };
+        if scan.active_file.is_some() {
+            break;
+        }
+    }
+    assert!(scan.active_file.is_some());
+    assert_eq!(decoded_in(&scan), 0);
+    scan.persist_archive_reservation(&mut committed, &path)
+        .unwrap();
+    let mut restored = ScanIndex::load(&path).unwrap();
+    assert_pending(&restored, &f.0, 1);
+    assert!(
+        restored.files[&key]
+            .archive
+            .as_ref()
+            .unwrap()
+            .header_bound_reached
+    );
+    assert!(
+        restored.archive_header(&f.0).is_none(),
+        "no captured full header before crash"
+    );
+    scan.active_file
+        .take()
+        .unwrap()
+        .parser
+        .reader
+        .reader
+        .close();
+    assert_eq!(cache.cursor_reserved(), 0);
+    let (quiet, result, rows, _) = selector_archive_pass(&f, restored);
+    assert_eq!(
+        decodes(&rows),
+        0,
+        "deadline still binds the reserved attempt"
+    );
+    assert!(result.snapshots.is_empty());
+    restored = checkpoint(&quiet);
+    retry_due(&mut restored, &key);
+    let (mut state, result, rows, _) = selector_archive_pass(&f, restored);
+    assert_eq!(decodes(&rows), 1, "no repeated inventory prefix on retry");
+    assert_eq!(result.snapshots.len(), 1);
+    assert_pending(&state, &f.0, 2);
+    state.settle_archive_bodies(
+        &result
+            .snapshots
+            .iter()
+            .map(|s| {
+                (
+                    s.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(s),
+                )
+            })
+            .collect(),
+    );
+    assert!(matches!(
+        state.files[&key].archive.as_ref().unwrap().disposition,
+        ArchiveDisposition::Acquired
+    ));
+    let (_, result, rows, _) = selector_archive_pass(&f, checkpoint(&state));
+    assert_eq!(decodes(&rows), 0);
+    assert!(result.snapshots.is_empty());
 }

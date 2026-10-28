@@ -455,6 +455,23 @@ impl HeaderInventory {
         // read_bytes is NOT reset: repeated real edits reach the existing bound.
         crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::OwnerUnproven);
     }
+    pub(super) fn bound_owner_has_sibling(&self, path: &Path, owner: &str) -> bool {
+        self.first_read_archives.contains(&local_index_key(path))
+            && (self.headers.iter().any(|header| header.owner == owner)
+                || self
+                    .first_read_archives
+                    .iter()
+                    .chain(&self.held_archives)
+                    .chain(&self.deferred_archives)
+                    .any(|key| {
+                        Path::new(key) != path
+                            && codex_session_id_candidates_from_path(
+                                &Path::new(key).with_extension(""),
+                            )
+                            .iter()
+                            .any(|hint| hint == owner)
+                    }))
+    }
     pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
         self.complete
             && !owner.is_some_and(|owner| {
@@ -616,7 +633,6 @@ impl HeaderInventory {
         let cache = cache.filter(|_| !decode_held);
         let mut excluded = false;
         let mut deferred = false;
-        let mut bound_reached = false;
         let result = (|| -> Result<Option<HeaderWitness>> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
@@ -669,7 +685,6 @@ impl HeaderInventory {
                 let header = match result? {
                     codex_compressed_input::HeaderRead::Validated(header) => header,
                     codex_compressed_input::HeaderRead::BoundReached => {
-                        bound_reached = true;
                         return Ok(None);
                     }
                     codex_compressed_input::HeaderRead::Deferred => {
@@ -732,6 +747,7 @@ impl HeaderInventory {
                     (facts, witness)
                 }
 
+
             };
             Ok(Some(HeaderWitness {
                 custody_cause: None,
@@ -755,14 +771,13 @@ impl HeaderInventory {
                 self.deferred_archives.insert(key);
                 return HeaderStep::Deferred;
             }
-            Ok(None) if bound_reached => {
+            Ok(None) => {
                 self.held_owners
                     .extend(codex_session_id_candidates_from_path(
                         &Path::new(&key).with_extension(""),
                     ));
                 self.first_read_archives.insert(key);
             }
-            Ok(None) => unreachable!("header outcome"),
             Err(_) if excluded => {
                 self.held_owners
                     .extend(codex_session_id_candidates_from_path(
