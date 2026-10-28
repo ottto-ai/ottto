@@ -28,6 +28,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub(crate) mod support_health;
 
 mod bounded_read;
+#[cfg(test)]
+mod decoder_tests;
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
@@ -636,6 +638,41 @@ fn identity_upgrade_replay(
     previous == incoming
 }
 
+/// Cumulative arrival-order API projection. Keep even suppressed fingerprints:
+/// rebuilding `seen_fingerprints` from surviving rows changes replay semantics.
+#[cfg_attr(test, derive(Debug, Clone, PartialEq, Eq))]
+struct ApiSidecarDecoder<'a> {
+    session_id: &'a str,
+    rows: Vec<ClaudeLocalOtelEvidence>,
+    seen_fingerprints: BTreeSet<String>,
+    request_rows: BTreeMap<String, usize>,
+    health: ClaudeLocalOtelLoadHealth,
+}
+
+impl<'a> ApiSidecarDecoder<'a> {
+    fn new(session_id: &'a str, rows: Vec<ClaudeLocalOtelEvidence>) -> Self {
+        Self {
+            session_id,
+            rows,
+            seen_fingerprints: BTreeSet::new(),
+            request_rows: BTreeMap::new(),
+            health: ClaudeLocalOtelLoadHealth::default(),
+        }
+    }
+
+    // EOF is terminal for this view; callers retain only complete-line state
+    // when they need to extend a previously observed fragment.
+    fn finish_eof(&mut self, fragment: Option<&[u8]>) {
+        if let Some(fragment) = fragment {
+            self.push_line(fragment);
+        }
+    }
+
+    fn into_output(self) -> (Vec<ClaudeLocalOtelEvidence>, ClaudeLocalOtelLoadHealth) {
+        (self.rows, self.health)
+    }
+}
+
 /// Append one distinct request row; report a same-request fingerprint conflict.
 /// A compatible upgrade replay keeps one usage row and the richer local witness.
 fn append_request_evidence(
@@ -1131,9 +1168,8 @@ fn decode_api_rows(
     session_id: &str,
     health: &mut ClaudeLocalOtelLoadHealth,
 ) -> (Vec<ClaudeLocalOtelEvidence>, u64) {
-    let mut seen = BTreeSet::new();
-    let mut request_rows = BTreeMap::new();
-    let mut rows = Vec::new();
+    let mut decoder = ApiSidecarDecoder::new(session_id, Vec::new());
+    decoder.health = std::mem::take(health);
     let mut line = Vec::new();
     let mut bytes = 0;
     loop {
@@ -1149,53 +1185,51 @@ fn decode_api_rows(
                 });
             }
             Err(_) => {
-                health.unreadable_lines += 1;
+                decoder.health.unreadable_lines += 1;
                 break;
             }
         }
-        decode_api_line(
-            &line,
-            session_id,
-            health,
-            &mut rows,
-            &mut seen,
-            &mut request_rows,
-        );
+        if line.ends_with(b"\n") {
+            decoder.push_line(&line);
+        } else {
+            decoder.finish_eof(Some(&line));
+        }
     }
+    let (rows, decoded_health) = decoder.into_output();
+    *health = decoded_health;
     (rows, bytes)
 }
 
-// Shared canonical row decoder: the optional paid-input path only controls
-// storage/capacity; identity, validation and conflict decisions stay here.
-fn decode_api_line(
-    line: &[u8],
-    session_id: &str,
-    health: &mut ClaudeLocalOtelLoadHealth,
-    rows: &mut Vec<ClaudeLocalOtelEvidence>,
-    seen: &mut BTreeSet<String>,
-    request_rows: &mut BTreeMap<String, usize>,
-) {
-    let Ok(line) = std::str::from_utf8(line) else {
-        health.unreadable_lines += 1;
-        return;
-    };
-    let item = match serde_json::from_str::<ClaudeLocalOtelEvidence>(line) {
-        Ok(item) => item,
-        Err(_) => {
-            health.malformed_lines += 1;
+// Both whole-file and paid-input readers use this same state transition.
+impl ApiSidecarDecoder<'_> {
+    fn push_line(&mut self, line: &[u8]) {
+        let Ok(line) = std::str::from_utf8(line) else {
+            self.health.unreadable_lines += 1;
+            return;
+        };
+        let item = match serde_json::from_str::<ClaudeLocalOtelEvidence>(line) {
+            Ok(item) => item,
+            Err(_) => {
+                self.health.malformed_lines += 1;
+                return;
+            }
+        };
+        if item.session_id != self.session_id {
+            self.health.invalid_session_rows += 1;
             return;
         }
-    };
-    if item.session_id != session_id {
-        health.invalid_session_rows += 1;
-        return;
-    }
-    if item.request_id.is_empty() {
-        health.missing_request_ids += 1;
-    }
-    let request_id = item.request_id.clone();
-    if append_request_evidence(rows, seen, request_rows, item) {
-        health.conflicting_request_ids.insert(request_id);
+        if item.request_id.is_empty() {
+            self.health.missing_request_ids += 1;
+        }
+        let request_id = item.request_id.clone();
+        if append_request_evidence(
+            &mut self.rows,
+            &mut self.seen_fingerprints,
+            &mut self.request_rows,
+            item,
+        ) {
+            self.health.conflicting_request_ids.insert(request_id);
+        }
     }
 }
 
@@ -1231,26 +1265,21 @@ pub fn load_claude_trace_ownership_evidence(
         };
         #[cfg(test)]
         TRACE_READ_RECEIPT.with(|count| count.set(count.get() + 1));
-        let mut seen_fingerprints = BTreeSet::new();
-        let mut request_fingerprints = BTreeMap::<String, String>::new();
-        let mut rows = Vec::new();
+        let mut decoder = TraceSidecarDecoder::new(&session_id, Vec::new());
+        decoder.report = report;
         for line in BufReader::new(file).lines() {
             let line = match line {
                 Ok(line) => line,
                 Err(_) => {
-                    report.unreadable_lines += 1;
+                    decoder.report.unreadable_lines += 1;
                     continue;
                 }
             };
-            decode_trace_line(
-                &line,
-                &session_id,
-                &mut report,
-                &mut rows,
-                &mut seen_fingerprints,
-                &mut request_fingerprints,
-            );
+            decoder.push_line(line.as_bytes());
         }
+        decoder.finish_eof(None);
+        let (rows, decoded_report) = decoder.into_output();
+        report = decoded_report;
         if !rows.is_empty() {
             report.evidence.insert(session_id, rows);
         }
@@ -1258,38 +1287,73 @@ pub fn load_claude_trace_ownership_evidence(
     report
 }
 
-fn decode_trace_line(
-    line: &str,
-    session_id: &str,
-    report: &mut ClaudeTraceOwnershipLoadReport,
-    rows: &mut Vec<ClaudeTraceOwnershipEvidence>,
-    seen_fingerprints: &mut BTreeSet<String>,
-    request_fingerprints: &mut BTreeMap<String, String>,
-) {
-    let item = match serde_json::from_str::<ClaudeTraceOwnershipEvidence>(line) {
-        Ok(item) => item,
-        Err(_) => {
-            report.malformed_lines += 1;
+/// Trace conflicts track the last export even when its fingerprint was seen.
+#[cfg_attr(test, derive(Debug, Clone, PartialEq, Eq))]
+struct TraceSidecarDecoder<'a> {
+    session_id: &'a str,
+    rows: Vec<ClaudeTraceOwnershipEvidence>,
+    seen_fingerprints: BTreeSet<String>,
+    request_fingerprints: BTreeMap<String, String>,
+    report: ClaudeTraceOwnershipLoadReport,
+}
+
+impl<'a> TraceSidecarDecoder<'a> {
+    fn new(session_id: &'a str, rows: Vec<ClaudeTraceOwnershipEvidence>) -> Self {
+        Self {
+            session_id,
+            rows,
+            seen_fingerprints: BTreeSet::new(),
+            request_fingerprints: BTreeMap::new(),
+            report: ClaudeTraceOwnershipLoadReport::default(),
+        }
+    }
+
+    fn finish_eof(&mut self, fragment: Option<&[u8]>) {
+        if let Some(fragment) = fragment {
+            self.push_line(fragment);
+        }
+    }
+
+    fn into_output(
+        self,
+    ) -> (
+        Vec<ClaudeTraceOwnershipEvidence>,
+        ClaudeTraceOwnershipLoadReport,
+    ) {
+        (self.rows, self.report)
+    }
+
+    fn push_line(&mut self, line: &[u8]) {
+        let Ok(line) = std::str::from_utf8(line) else {
+            self.report.unreadable_lines += 1;
+            return;
+        };
+        let item = match serde_json::from_str::<ClaudeTraceOwnershipEvidence>(line) {
+            Ok(item) => item,
+            Err(_) => {
+                self.report.malformed_lines += 1;
+                return;
+            }
+        };
+        if item.session_id != self.session_id {
+            self.report.invalid_session_rows += 1;
             return;
         }
-    };
-    if item.session_id != session_id {
-        report.invalid_session_rows += 1;
-        return;
-    }
-    if item.request_id.is_empty() {
-        report.missing_request_ids += 1;
-    } else if let Some(previous) =
-        request_fingerprints.insert(item.request_id.clone(), item.fingerprint.clone())
-    {
-        if previous != item.fingerprint {
-            report
-                .conflicting_request_ids
-                .insert(item.request_id.clone());
+        if item.request_id.is_empty() {
+            self.report.missing_request_ids += 1;
+        } else if let Some(previous) = self
+            .request_fingerprints
+            .insert(item.request_id.clone(), item.fingerprint.clone())
+        {
+            if previous != item.fingerprint {
+                self.report
+                    .conflicting_request_ids
+                    .insert(item.request_id.clone());
+            }
         }
-    }
-    if seen_fingerprints.insert(item.fingerprint.clone()) {
-        rows.push(item);
+        if self.seen_fingerprints.insert(item.fingerprint.clone()) {
+            self.rows.push(item);
+        }
     }
 }
 

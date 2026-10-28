@@ -260,26 +260,20 @@ pub(super) fn api(
     if rows.capacity() != shape.lines {
         return None;
     }
-    let mut health = ClaudeLocalOtelLoadHealth::default();
-    let mut seen = BTreeSet::new();
-    let mut requests = BTreeMap::new();
+    let mut decoder = ApiSidecarDecoder::new(session_id, rows);
     for line in input.lines() {
-        decode_api_line(
-            line,
-            session_id,
-            &mut health,
-            &mut rows,
-            &mut seen,
-            &mut requests,
-        );
+        if line.ends_with(b"\n") {
+            decoder.push_line(line);
+        } else {
+            decoder.finish_eof(Some(line));
+        }
     }
+    let (rows, health) = decoder.into_output();
     let witness = ApiReadWitness {
         generation: health.is_complete().then_some(input.generation),
         health,
     };
     drop(input.bytes);
-    drop(seen);
-    drop(requests);
     let mut retained = Counter::new(usize::MAX);
     rows.completed_heap_bound(&mut retained)?;
     witness.completed_heap_bound(&mut retained)?;
@@ -314,25 +308,20 @@ pub(super) fn trace(
     if rows.capacity() != shape.lines {
         return None;
     }
-    let mut report = ClaudeTraceOwnershipLoadReport::default();
-    let mut seen = BTreeSet::new();
-    let mut requests = BTreeMap::new();
+    let mut decoder = TraceSidecarDecoder::new(session_id, rows);
     for line in input.lines() {
-        decode_trace_line(
-            std::str::from_utf8(line).ok()?,
-            session_id,
-            &mut report,
-            &mut rows,
-            &mut seen,
-            &mut requests,
-        );
+        // Shape admission already excludes non-ASCII input.
+        if line.ends_with(b"\n") {
+            decoder.push_line(line);
+        } else {
+            decoder.finish_eof(Some(line));
+        }
     }
+    let (rows, mut report) = decoder.into_output();
     if !rows.is_empty() {
         report.evidence.insert(session_id.to_owned(), rows);
     }
     drop(input.bytes);
-    drop(seen);
-    drop(requests);
     let retained = heap_layout_bound::completed_bound(&report, usize::MAX)?;
     paid.record_allocated(occupied.checked_add(retained)?)
         .then_some((
