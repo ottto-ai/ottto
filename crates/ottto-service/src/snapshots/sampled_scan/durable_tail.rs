@@ -257,6 +257,7 @@ impl<'a> Interpretation<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expected(
     source: DurableSource,
     snapshot_source: SnapshotSource,
@@ -264,9 +265,15 @@ fn expected(
     scope: &Scope,
     index: &ScanIndex,
     interpretation: &Interpretation<'_>,
+    representation: Option<(u16, store::Digest32)>,
 ) -> Option<Expected> {
     let entry = index.files.get(key)?;
-    let allowlist = codec::allowlist_digest(snapshot_source);
+    let (format, allowlist) = representation.unwrap_or_else(|| {
+        (
+            store::FORMAT_VERSION,
+            codec::allowlist_digest(snapshot_source),
+        )
+    });
     Some(Expected {
         binding: Binding {
             source,
@@ -275,14 +282,22 @@ fn expected(
                 &interpretation.namespace.0,
                 index.active_upload_context_fingerprint.as_deref(),
             ),
-            scope: scope_for(
-                source,
-                snapshot_source,
-                scope,
-                index,
-                interpretation,
-                store::FORMAT_VERSION,
-                &allowlist,
+            scope: store::replay_scope_digest(
+                &store::scope_digest_for(
+                    format,
+                    &scope.0,
+                    &allowlist,
+                    &interpretation.identity_contract,
+                    &interpretation.counting_view,
+                ),
+                crate::snapshot_sync::effective_upload_body_witness_revision(snapshot_source),
+                index.active_effective_upload_body_witness_revision,
+                if source == DurableSource::ClaudeCode {
+                    index.claude_money_birth_store.money_rule_version()
+                } else {
+                    0
+                },
+                source == DurableSource::ClaudeCode && claude_request_money::e2::enabled(),
             ),
             entry: store::replay_entry_digest(
                 &store::entry_digest(
@@ -303,6 +318,7 @@ fn expected(
     })
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn scope_for(
     source: DurableSource,
@@ -445,6 +461,20 @@ impl SharedCache {
         slot.store.hold(&store::key_digest(source, key), live)
     }
 
+    pub(in crate::snapshots) fn durable_guard(
+        &self,
+        source: SnapshotSource,
+        candidate: &CandidateFile,
+        opened: Option<&File>,
+        index: &mut ScanIndex,
+    ) -> Option<store::Refusal> {
+        self.durable_hold(source, &local_index_key(&candidate.path), opened, index)
+            .or_else(|| {
+                self.durable_upgrade_missing(source, candidate, index)
+                    .then_some(store::Refusal::UpgradeMissing)
+            })
+    }
+
     pub(in crate::snapshots) fn durable_upgrade_missing(
         &self,
         source: SnapshotSource,
@@ -557,7 +587,7 @@ impl SharedCache {
         interpretation: &Interpretation<'_>,
     ) -> Option<Taken<CachedJsonlReduction>> {
         let source = durable_source(snapshot_source)?;
-        let mut expected = expected(source, snapshot_source, key, scope, index, interpretation)?;
+        let store_key = store::key_digest(source, key);
         let allowlist = codec::allowlist_digest(snapshot_source);
         let record = {
             let mut stores = self.durable()?;
@@ -580,7 +610,7 @@ impl SharedCache {
                 return None;
             }
             let outcome = match stores.slot(source).as_mut() {
-                Some(slot) => slot.store.read(&expected.binding.key, &allowlist),
+                Some(slot) => slot.store.read(&store_key, &allowlist),
                 None => return None,
             };
             match outcome {
@@ -595,15 +625,15 @@ impl SharedCache {
                 }
             }
         };
-        expected.binding.scope = scope_for(
+        let expected = expected(
             source,
             snapshot_source,
+            key,
             scope,
             index,
             interpretation,
-            record.format,
-            &record.record.allowlist,
-        );
+            Some((record.format, record.record.allowlist)),
+        )?;
         let restored = self.durable_restore_record(
             snapshot_source,
             &record,
@@ -826,6 +856,7 @@ impl SharedCache {
                     retained.checkpoint.scope(),
                     index,
                     &interpretation,
+                    None,
                 ) else {
                     continue;
                 };
@@ -955,15 +986,16 @@ impl SharedCache {
                         namespace,
                     );
                     let (format, allowlist) = slot.store.representation(&digest)?;
-                    Some(scope_for(
+                    expected(
                         source,
                         snapshot_source,
+                        key,
                         scope,
                         index,
                         &interpretation,
-                        format,
-                        &allowlist,
-                    ))
+                        Some((format, allowlist)),
+                    )
+                    .map(|e| e.binding.scope)
                 });
                 keep.insert(digest, scope);
             }

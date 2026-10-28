@@ -137,6 +137,7 @@ fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
             &scope,
             index,
             &interpretation,
+            None,
         )
         .unwrap()
         .binding
@@ -282,6 +283,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             &scope,
             &index,
             &interpretation,
+            None,
         )
         .unwrap()
         .binding;
@@ -443,6 +445,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             &scope,
             &index,
             &interpretation,
+            None,
         )
         .unwrap()
         .binding;
@@ -486,6 +489,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             &scope,
             &index,
             &after,
+            None,
         )
         .unwrap()
         .binding;
@@ -1334,7 +1338,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
             index.save(&index_path).unwrap();
             let interp = Interpretation::of(source, &key, &index, false, &namespace);
             let ds = durable_source(source).unwrap();
-            let mut binding = expected(ds, source, &key, &scope, &index, &interp)
+            let mut binding = expected(ds, source, &key, &scope, &index, &interp, None)
                 .unwrap()
                 .binding;
             binding.scope = scope_for(
@@ -1424,7 +1428,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                     Err(std::io::Error::other("injected"))
                 })));
                 let mut v2 = pending.clone();
-                v2.binding = expected(ds, source, &key, &scope, &index, &interp)
+                v2.binding = expected(ds, source, &key, &scope, &index, &interp, None)
                     .unwrap()
                     .binding;
                 let mut disk_store = DurableTailStore::new(dir.clone(), ds);

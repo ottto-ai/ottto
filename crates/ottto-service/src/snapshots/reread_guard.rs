@@ -110,8 +110,9 @@ struct Reservation {
     saved: bool,
     claimed: bool,
     replay: bool,
+    upgrade: bool,
 }
-crate::heap_layout_bound::fields!(Reservation; wall, born, saved, claimed, replay);
+crate::heap_layout_bound::fields!(Reservation; wall, born, saved, claimed, replay, upgrade);
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct State {
@@ -297,7 +298,7 @@ impl State {
         if let Some(r) = self
             .reservations
             .get_mut(&id)
-            .filter(|r| r.replay && r.saved && !r.claimed)
+            .filter(|r| r.upgrade && r.saved && !r.claimed)
         {
             r.claimed = true;
             return true;
@@ -317,6 +318,7 @@ impl State {
                 saved: false,
                 claimed: false,
                 replay: true,
+                upgrade: true,
             },
         );
         false
@@ -536,6 +538,7 @@ impl State {
                 saved: durable,
                 claimed: durable,
                 replay,
+                upgrade: false,
             },
         );
         Admission::Admit(Ticket {

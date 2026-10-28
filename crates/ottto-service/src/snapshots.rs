@@ -27672,27 +27672,12 @@ impl OwnedSourceScan {
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                         if let Some((member, reason)) = group.members.iter().find_map(|member| {
-                            Some((
-                                member,
-                                cache
-                                    .durable_hold(
-                                        source,
-                                        &local_index_key(&member.path),
-                                        None,
-                                        index,
-                                    )
-                                    .or_else(|| {
-                                        cache
-                                            .durable_upgrade_missing(source, member, index)
-                                            .then_some(
-                                                crate::durable_tail_store::Refusal::UpgradeMissing,
-                                            )
-                                    })?,
-                            ))
+                            Some((member, cache.durable_guard(source, member, None, index)?))
                         }) {
-                            cache.durable_hold_exit(source, reason, index, member, &mut census);
                             if index.reread_guard.needs_save() {
                                 codex_join_groups.push_front(group);
+                            } else {
+                                cache.durable_hold_exit(source, reason, index, member, &mut census);
                             }
                             pending!();
                         }
@@ -31278,25 +31263,13 @@ impl OwnedSourceScan {
             #[cfg(unix)]
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) = cache.durable_hold(
-                        source,
-                        &local_index_key(&candidate.path),
-                        Some(&opened_file),
-                        index,
-                    ) {
-                        cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
-                        pending!();
-                    }
-                    if cache.durable_upgrade_missing(source, &candidate, index) {
-                        cache.durable_hold_exit(
-                            source,
-                            crate::durable_tail_store::Refusal::UpgradeMissing,
-                            index,
-                            &candidate,
-                            &mut census,
-                        );
+                    if let Some(reason) =
+                        cache.durable_guard(source, &candidate, Some(&opened_file), index)
+                    {
                         if index.reread_guard.needs_save() {
                             identified_candidates.push_front(candidate);
+                        } else {
+                            cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
                         }
                         pending!();
                     }
