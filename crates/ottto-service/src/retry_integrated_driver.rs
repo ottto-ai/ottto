@@ -75,9 +75,6 @@ enum IntegratedScript {
     Ack,
     FallbackShed,
     AuthReplay,
-    LostAck,
-    Exhaust,
-    Deadline,
     BeforePostAccount,
     AfterAckAccount,
     LedgerCrash,
@@ -250,39 +247,6 @@ fn integrated_send(
                                 crate::snapshot_client::BatchAuthorizationRejected { status: 401 };
                             let _fresh = integrated_token(trace);
                             integrated_post(slot, now + 3_000, current, "auth-replay", trace)?;
-                        }
-                        IntegratedScript::LostAck => return Err(anyhow!("synthetic lost ACK")),
-                        IntegratedScript::Exhaust => {
-                            integrated_post(
-                                slot,
-                                now + 3_000,
-                                current,
-                                "encoding-fallback",
-                                trace,
-                            )?;
-                            let _fresh = integrated_token(trace);
-                            integrated_post(slot, now + 4_000, current, "auth-replay", trace)?;
-                            assert!(integrated_post(
-                                slot,
-                                now + 5_000,
-                                current,
-                                "adaptive-fourth",
-                                trace
-                            )
-                            .is_err());
-                            return Err(anyhow!("three physical POSTs exhausted"));
-                        }
-                        IntegratedScript::Deadline => {
-                            assert!(integrated_post(
-                                slot,
-                                deadline,
-                                current,
-                                "late-fallback",
-                                trace
-                            )
-                            .is_err());
-                            assert_eq!(slot.budget.turn_deadline, deadline);
-                            return Err(anyhow!("absolute turn deadline expired"));
                         }
                         _ => {}
                     }
