@@ -1161,7 +1161,8 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
     let roots = registered_scan_roots(SnapshotSource::Codex, home)?;
     let salt = load_or_create_salt(support_dir);
     let deadline = Instant::now() + CYCLE_BUDGET;
-    let candidates = select_candidates(&roots, support_dir, &identity, deadline);
+    let mut compressed = 0usize;
+    let candidates = select_candidates(&roots, support_dir, &identity, deadline, &mut compressed);
     let (mut uploaded, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     for (file, workspace, codex_home) in candidates {
         if Instant::now() >= deadline {
@@ -1206,7 +1207,7 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
         }
     }
     eprintln!(
-        "codex_session_start_harvest_metrics discovered={} uploaded={uploaded} skipped={skipped} failed={failed}",
+        "codex_session_start_harvest_metrics discovered={} uploaded={uploaded} skipped={skipped} failed={failed} compressed_skipped={compressed}",
         uploaded + skipped + failed
     );
     Ok(())
@@ -1221,6 +1222,7 @@ fn select_candidates(
     support_dir: &Path,
     identity: &str,
     deadline: Instant,
+    compressed: &mut usize,
 ) -> Vec<(PathBuf, PathBuf, PathBuf)> {
     let mut files = Vec::new();
     let mut homes: BTreeMap<String, PathBuf> = BTreeMap::new();
@@ -1230,7 +1232,7 @@ fn select_candidates(
             continue;
         };
         let first = files.len();
-        collect_recent_jsonl_files(root, SystemTime::now(), &mut files);
+        collect_recent_jsonl_files(root, SystemTime::now(), &mut files, compressed);
         for (file, _) in &files[first..] {
             homes.insert(
                 file.to_string_lossy().into_owned(),

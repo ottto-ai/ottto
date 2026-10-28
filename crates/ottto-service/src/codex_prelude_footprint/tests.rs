@@ -671,8 +671,12 @@ fn newest_session_start_wins_over_recent_activity() {
             usage(10),
         ],
     );
+    // A compressed rollout is counted, never selected or read.
+    fs::write(sessions.join("rollout-archived.jsonl.zst"), b"not zstd").unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
-    let chosen = select_candidates(&roots, &support, "dest", deadline);
+    let mut compressed = 0;
+    let chosen = select_candidates(&roots, &support, "dest", deadline, &mut compressed);
+    assert_eq!(compressed, 1);
     assert_eq!(chosen.len(), 1);
     assert!(chosen[0].0.ends_with("rollout-newer.jsonl"));
     // Read against the home that wrote it (its user file, skills, config).
@@ -681,7 +685,7 @@ fn newest_session_start_wins_over_recent_activity() {
     let index = read_index(&support);
     assert_eq!(index.files.len(), 3);
     assert_eq!(
-        select_candidates(&roots, &support, "dest", deadline),
+        select_candidates(&roots, &support, "dest", deadline, &mut 0),
         chosen
     );
     // Once that start is sent it is one observation: a week later it is
@@ -698,16 +702,16 @@ fn newest_session_start_wins_over_recent_activity() {
             started_at: Some(1_792_314_000),
         },
     );
-    assert!(select_candidates(&roots, &support, "dest", deadline).is_empty());
+    assert!(select_candidates(&roots, &support, "dest", deadline, &mut 0).is_empty());
     // An older session resuming later is no newer observation either.
     write_rollout(
         &sessions,
         "rollout-older.jsonl",
         &start("older", "2026-10-17T09:00:00Z"),
     );
-    assert!(select_candidates(&roots, &support, "dest", deadline).is_empty());
+    assert!(select_candidates(&roots, &support, "dest", deadline, &mut 0).is_empty());
     assert_eq!(
-        select_candidates(&roots, &support, "other", deadline),
+        select_candidates(&roots, &support, "other", deadline, &mut 0),
         chosen
     );
     // A genuinely newer start is a new observation.
@@ -716,7 +720,7 @@ fn newest_session_start_wins_over_recent_activity() {
         "rollout-newest.jsonl",
         &start("newest", "2026-10-18T11:00:00Z"),
     );
-    let newer = select_candidates(&roots, &support, "dest", deadline);
+    let newer = select_candidates(&roots, &support, "dest", deadline, &mut 0);
     assert_eq!(newer.len(), 1);
     assert!(newer[0].0.ends_with("rollout-newest.jsonl"));
 }

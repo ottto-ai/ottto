@@ -1512,10 +1512,13 @@ fn dedupe_workspace_candidates_by_repository(
     out
 }
 
+/// Recent plain `.jsonl` transcripts under `dir`. Recent `.jsonl.zst` archives
+/// are counted in `compressed` and never opened.
 pub(crate) fn collect_recent_jsonl_files(
     dir: &Path,
     now: SystemTime,
     out: &mut Vec<(PathBuf, SystemTime)>,
+    compressed: &mut usize,
 ) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -1526,15 +1529,25 @@ pub(crate) fn collect_recent_jsonl_files(
             continue;
         };
         if metadata.is_dir() {
-            collect_recent_jsonl_files(&path, now, out);
+            collect_recent_jsonl_files(&path, now, out, compressed);
             continue;
         }
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        let plain = path.extension().and_then(|value| value.to_str()) == Some("jsonl");
+        let archive = !plain
+            && path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with(".jsonl.zst"));
+        if !plain && !archive {
             continue;
         }
         let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         if now.duration_since(mtime).unwrap_or(Duration::ZERO) <= RECENT_WORKSPACE_WINDOW {
-            out.push((path, mtime));
+            if plain {
+                out.push((path, mtime));
+            } else {
+                *compressed += 1;
+            }
         }
     }
 }
@@ -1949,6 +1962,25 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         test_scratch::private_dir(&format!("ottto-context-footprint-{name}"))
+    }
+
+    #[test]
+    fn recent_archives_are_counted_and_never_listed() {
+        let root = temp_dir("collector-archives");
+        let day = root.join("2026/10/28");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("rollout-a.jsonl"), b"{}\n").unwrap();
+        fs::write(day.join("rollout-b.jsonl.zst"), b"not zstd").unwrap();
+        fs::write(day.join("notes.zst"), b"other").unwrap();
+        let (mut files, mut compressed) = (Vec::new(), 0);
+        collect_recent_jsonl_files(&root, SystemTime::now(), &mut files, &mut compressed);
+        let names: Vec<_> = files
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("rollout-a.jsonl")]);
+        assert_eq!(compressed, 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
@@ -2428,7 +2460,12 @@ mod tests {
     /// then deduplicated by repository and truncated to one cycle.
     fn discover_all_files_oracle(home: &Path, now: SystemTime) -> Vec<WorkspaceCandidate> {
         let mut files = Vec::new();
-        collect_recent_jsonl_files(&home.join(".claude").join("projects"), now, &mut files);
+        collect_recent_jsonl_files(
+            &home.join(".claude").join("projects"),
+            now,
+            &mut files,
+            &mut 0,
+        );
         files.sort_by_key(|item| std::cmp::Reverse(item.1));
         let mut by_path: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
         for (file, mtime) in files {
@@ -2533,7 +2570,12 @@ mod tests {
 
     fn discover_with_counts(home: &Path, now: SystemTime) -> (Vec<WorkspaceCandidate>, usize) {
         let mut files = Vec::new();
-        collect_recent_jsonl_files(&home.join(".claude").join("projects"), now, &mut files);
+        collect_recent_jsonl_files(
+            &home.join(".claude").join("projects"),
+            now,
+            &mut files,
+            &mut 0,
+        );
         let projection = Arc::new(CwdProjection::default());
         project_transcripts(&projection, &files);
         let mut path_scopes = 0;
