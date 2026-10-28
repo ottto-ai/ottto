@@ -123,7 +123,8 @@ fn target_requests(ordinal: u64) -> Vec<(String, u64, u64, u64)> {
         3 => vec![own("a", 30), ("req-b2-ack".to_string(), 300, 30, 0)],
         4 => vec![own("a", 40), ("req-b2-hash".to_string(), 400, 40, 0)],
         5 => vec![own("a", 50), ("req-b2-hash".to_string(), 400, 40, 0)],
-        6 | 7 | 10 => vec![own("a", 60), own("b", 70)],
+        // A second request keeps a body when the first one is excluded.
+        6 | 7 | 10 | 11 | 13 | 15 => vec![own("a", 60), own("b", 70)],
         _ => vec![own("a", 7 + ordinal)],
     }
 }
