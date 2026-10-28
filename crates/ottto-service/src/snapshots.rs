@@ -16024,16 +16024,15 @@ impl ClaudeTitleMetadata {
     ) -> Self {
         let mut store_dirs = BTreeSet::new();
         for root in roots {
-            // root is `<home>/.claude/projects`; the desktop store lives under
-            // `<home>/Library/Application Support/Claude/claude-code-sessions`.
+            // root is `<home>/.claude/projects`; discover each configured app's
+            // existing session metadata store without adding transcript roots.
             let Some(home) = root.parent().and_then(Path::parent) else {
                 continue;
             };
-            store_dirs.insert(
-                home.join("Library")
-                    .join("Application Support")
-                    .join("Claude")
-                    .join("claude-code-sessions"),
+            store_dirs.extend(
+                crate::claude_desktop::support_roots(home)
+                    .into_iter()
+                    .map(|root| root.join("claude-code-sessions")),
             );
         }
         Self::load_from_store_dirs_with_index(&store_dirs, index, collected_at, identity_capture)
@@ -16076,6 +16075,7 @@ impl ClaudeTitleMetadata {
                         .claude_desktop_identity_census_complete,
                     ..Self::default()
                 },
+                Some(store_dirs),
             );
         }
 
@@ -16206,7 +16206,7 @@ impl ClaudeTitleMetadata {
             index.claude_desktop_store_retry_not_before_unix_seconds = None;
         }
 
-        Self::from_durable_index_with_metadata(index, metadata)
+        Self::from_durable_index_with_metadata(index, metadata, Some(store_dirs))
     }
 
     #[cfg(test)]
@@ -16218,10 +16218,15 @@ impl ClaudeTitleMetadata {
                 original_identity_census_incomplete: sidecar_census_incomplete,
                 ..Self::default()
             },
+            None,
         )
     }
 
-    fn from_durable_index_with_metadata(index: &ScanIndex, mut metadata: Self) -> Self {
+    fn from_durable_index_with_metadata(
+        index: &ScanIndex,
+        mut metadata: Self,
+        store_dirs: Option<&BTreeSet<PathBuf>>,
+    ) -> Self {
         for entry in index.claude_desktop_title_files.values() {
             if let Some(original_identity) = &entry.original_identity {
                 metadata
@@ -16254,18 +16259,58 @@ impl ClaudeTitleMetadata {
             }
         }
         if index.claude_desktop_lineage_census_complete {
-            metadata.spawn_lineage = claude_desktop_spawn_lineage(
-                index.claude_desktop_title_files.values(),
-                |cli_session_id| {
-                    let file_name = format!("{cli_session_id}.jsonl");
-                    claude_transcript_live_window(index.files.keys().map(Path::new).filter(
-                        |path| {
-                            path.file_name().and_then(|name| name.to_str())
-                                == Some(file_name.as_str())
+            // Desktop-local parent ids are meaningful only inside their own
+            // app store. Keep indexed paths as the scope, without changing the
+            // persisted entry format or exporting a root identifier.
+            let mut by_store: BTreeMap<&Path, Vec<&ClaudeDesktopTitleIndexEntry>> = BTreeMap::new();
+            for (path, entry) in &index.claude_desktop_title_files {
+                let scope = match store_dirs {
+                    Some(dirs) => dirs
+                        .iter()
+                        .find(|dir| Path::new(path).starts_with(dir))
+                        .map(PathBuf::as_path)
+                        .unwrap_or_else(|| Path::new(path)),
+                    None => Path::new(""), // synthetic durable-index tests
+                };
+                by_store.entry(scope).or_default().push(entry);
+            }
+            let mut candidates: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+            for entries in by_store.into_values() {
+                let lineage =
+                    claude_desktop_spawn_lineage(entries.iter().copied(), |cli_session_id| {
+                        let file_name = format!("{cli_session_id}.jsonl");
+                        claude_transcript_live_window(index.files.keys().map(Path::new).filter(
+                            |path| {
+                                path.file_name().and_then(|name| name.to_str())
+                                    == Some(file_name.as_str())
+                            },
+                        ))
+                    });
+                for entry in entries {
+                    candidates
+                        .entry(entry.cli_session_id.clone())
+                        .or_default()
+                        .insert(
+                            lineage
+                                .get(&entry.cli_session_id)
+                                .map(|edge| edge.parent_session_id.clone()),
+                        );
+                }
+            }
+            metadata.spawn_lineage = candidates
+                .into_iter()
+                .filter_map(|(child, parents)| {
+                    if parents.len() != 1 {
+                        return None;
+                    }
+                    Some((
+                        child,
+                        ClaudeDesktopSpawnLineage {
+                            parent_session_id: parents.into_iter().next()??,
                         },
                     ))
-                },
-            );
+                })
+                .collect();
         }
         let sidecar_parts = metadata
             .titles
@@ -75637,6 +75682,137 @@ mod tests {
                 .unwrap()
                 .identity_disposition,
             Some("missing")
+        );
+    }
+
+    #[test]
+    fn claude_desktop_alt_metadata_supplies_native_identity_and_conflicts_fail_closed() {
+        let home = crate::test_scratch::ScratchDir::new("desktop-alt-native");
+        let projects = home.join(".claude/projects");
+        let support = home.join("Library/Application Support");
+        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let (a, b, x, y) = (uuid(1), uuid(2), uuid(11), uuid(12));
+        let mut paths = Vec::new();
+        for (root, account, org, session) in [
+            ("Claude", &a, &x, "main-session"),
+            ("Claude-ALT", &b, &y, "alt-session"),
+        ] {
+            let root = support.join(root);
+            let bucket = root.join("claude-code-sessions").join(account).join(org);
+            fs::create_dir_all(&bucket).unwrap();
+            fs::write(
+                root.join("config.json"),
+                format!(r#"{{"lastKnownAccountUuid":"{account}"}}"#),
+            )
+            .unwrap();
+            let path = bucket.join("local_session.json");
+            fs::write(
+                &path,
+                format!(r#"{{"cliSessionId":"{session}","createdAt":"2026-10-25T10:00:00Z"}}"#),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        let mut index = ScanIndex::default();
+        let metadata = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut index,
+            "2026-10-25T10:05:00Z",
+            true,
+        );
+        for (session, account, org) in [("main-session", &a, &x), ("alt-session", &b, &y)] {
+            let evidence = metadata.session_account_evidence(session);
+            assert_eq!(evidence.identity_disposition, Some("complete"));
+            assert_eq!(
+                evidence.account_identifier_hash,
+                ottto_core::billing_identity_hash("anthropic", "account", account)
+            );
+            assert_eq!(
+                evidence.provider_workspace_hash,
+                ottto_core::billing_identity_hash("anthropic", "organization", org)
+            );
+        }
+        // Existing path-keyed persistence preserves the roots without adding
+        // an entry field. A copied transcript id cannot borrow another app's
+        // account or org when the native witnesses disagree.
+        let mut restored: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        fs::write(
+            &paths[1],
+            r#"{"cliSessionId":"main-session","createdAt":"2026-10-25T10:00:00Z"}"#,
+        )
+        .unwrap();
+        let conflicted = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut restored,
+            "2026-10-25T10:06:00Z",
+            true,
+        );
+        let evidence = conflicted.session_account_evidence("main-session");
+        assert_eq!(evidence.identity_disposition, Some("conflict"));
+        assert!(evidence.account_identifier_hash.is_none());
+        assert!(evidence.provider_workspace_hash.is_none());
+    }
+
+    #[test]
+    fn claude_desktop_lineage_resolves_parent_ids_within_each_app() {
+        let home = crate::test_scratch::ScratchDir::new("desktop-alt-lineage");
+        let projects = home.join(".claude/projects");
+        let support = home.join("Library/Application Support");
+        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let (parent_a, parent_b, child_a, child_b, orphan) =
+            (uuid(1), uuid(2), uuid(3), uuid(4), uuid(5));
+        let write = |root: &str, name: &str, session: &str, parent: Option<&str>| {
+            let root = support.join(root);
+            let bucket = root.join("claude-code-sessions/account/org");
+            fs::create_dir_all(&bucket).unwrap();
+            fs::write(root.join("config.json"), "{}").unwrap();
+            let mut body = json!({"cliSessionId":session,"sessionId":name});
+            if let Some(parent) = parent {
+                body["spawnedFrom"] = json!({"sessionId":parent});
+            }
+            fs::write(bucket.join(format!("{name}.json")), body.to_string()).unwrap();
+        };
+        write("Claude", "local_parent", &parent_a, None);
+        write("Claude", "local_child", &child_a, Some("local_parent"));
+        write("Claude", "local_main_only", &parent_a, None);
+        write("Claude-ALT", "local_parent", &parent_b, None);
+        write("Claude-ALT", "local_child", &child_b, Some("local_parent"));
+        write(
+            "Claude-ALT",
+            "local_orphan",
+            &orphan,
+            Some("local_main_only"),
+        );
+        let mut index = ScanIndex::default();
+        let metadata = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut index,
+            "2026-10-25T10:05:00Z",
+            true,
+        );
+        assert_eq!(
+            metadata.spawn_lineage(&child_a).unwrap().parent_session_id,
+            parent_a
+        );
+        assert_eq!(
+            metadata.spawn_lineage(&child_b).unwrap().parent_session_id,
+            parent_b
+        );
+        assert!(
+            metadata.spawn_lineage(&orphan).is_none(),
+            "an ALT child cannot resolve a parent found only in the main app"
+        );
+        write("Claude", "local_copy", &child_b, Some("local_parent"));
+        let conflicted = ClaudeTitleMetadata::load_from_roots_with_index(
+            std::slice::from_ref(&projects),
+            &mut index,
+            "2026-10-25T10:06:00Z",
+            true,
+        );
+        assert!(
+            conflicted.spawn_lineage(&child_b).is_none(),
+            "copies of a child must agree across roots"
         );
     }
 

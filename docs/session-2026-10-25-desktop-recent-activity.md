@@ -60,6 +60,12 @@ config, `claude-code-sessions`, and `local-agent-mode-sessions` metadata readers
 Session ownership and labels are resolved separately inside each root before
 combining observations, so buckets from different apps cannot lend each other
 identity. Pair uploads retain their existing global observation limits.
+The snapshot fold's existing native-identity/title sidecar reader uses the same
+roots and retains its global file/entry budgets. Native witnesses still fail
+closed when copies of a transcript disagree on account or organization.
+Desktop-local parent IDs resolve within their own app; copies of a child across
+apps must agree on the resolved parent. The existing path-keyed index keeps
+the app scope without a persisted-format change.
 Installation detection uses the same roots. The existing account-switch probe
 includes every root's config identity, waking the existing wait loop on a sibling
 account switch or profile addition/removal. The single-app fingerprint is
