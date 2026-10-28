@@ -19,7 +19,7 @@ fn cause_cardinality_and_each_contribution_slot_are_pinned_and_sum_to_s() {
     assert_eq!(all.into_iter().collect::<BTreeSet<_>>(), (0..N).collect());
     assert_eq!(NAMES.split(' ').count(), N);
     let mut traversal = Counts::default();
-    let mut page = traversal.page();
+    let mut page = traversal.page(Some(77));
     for cause in all {
         page.add(cause, 1);
     }
@@ -32,23 +32,24 @@ fn cause_cardinality_and_each_contribution_slot_are_pinned_and_sum_to_s() {
 #[test]
 fn repeated_work_counts_every_contribution_and_marker_stays_in_generation() {
     let mut traversal = Counts::default();
-    let mut first = traversal.page();
+    let mut first = traversal.page(Some(77));
     let marker = first.summary(0).1[1];
     assert!(marker > 0);
     first.add(INVENTORY, 2);
     traversal.merge(&first);
-    let mut second = traversal.page();
+    let mut second = traversal.page(Some(77));
     assert_eq!(second.summary(0).1[1], marker);
     second.add(CREATED, 1);
     traversal.merge(&second);
     assert_eq!(traversal.summary(3).0[INVENTORY], 2);
     assert_eq!(traversal.summary(3).0[CREATED], 1);
     conserved(&traversal, 3);
-    assert!(Counts::default().page().summary(0).1[1] > marker);
+    assert_eq!(Counts::default().page(Some(78)).summary(0).1[1], 78);
 }
 
 #[test]
-fn index_restart_retains_contributions_and_fresh_generation_resets_them() {
+fn index_save_load_resume_retains_contributions_and_start_marker_and_fresh_generation_resets_them()
+{
     let dir = crate::test_scratch::ScratchDir::new("ownership-causes-restart");
     let path = dir.join("index.json");
     let mut index = ScanIndex::default();
@@ -59,18 +60,27 @@ fn index_restart_retains_contributions_and_fresh_generation_resets_them() {
         "2026-10-12T00:00:00Z",
         30,
     );
-    let counts = &mut index.traversal.as_mut().unwrap().counts;
-    counts.causes = counts.causes.page();
+    let traversal = index.traversal.as_mut().unwrap();
+    let started = rfc3339_unix_seconds(&traversal.census_window_end).unwrap() as usize;
+    let counts = &mut traversal.counts;
+    counts.causes = counts.causes.page(Some(started as i64));
     counts.causes.add(PARENT, 2);
     counts.ownership_incomplete_file_count = 2;
     let marker = counts.causes.summary(2).1[1];
     index.save(&path).unwrap();
     let mut restored = ScanIndex::load(&path).unwrap();
-    let counts = &mut restored.traversal.as_mut().unwrap().counts;
+    let traversal = restored.traversal.as_mut().unwrap();
+    let restored_start = rfc3339_unix_seconds(&traversal.census_window_end).unwrap() as usize;
+    assert_eq!(restored_start, marker);
+    let counts = &mut traversal.counts;
     assert_eq!(counts.causes.summary(2).0[PARENT], 2);
     assert_eq!(counts.causes.summary(2).1, [0; 3]);
-    let mut page = counts.causes.page();
-    assert!(page.summary(0).1[1] > marker);
+    let mut page = counts.causes.page(Some(restored_start as i64));
+    assert_eq!(
+        page.summary(0).1[1],
+        marker,
+        "routine reload retains the traversal start marker"
+    );
     page.add(PARENT, 1);
     counts.causes.merge(&page);
     counts.ownership_incomplete_file_count += 1;
@@ -84,8 +94,19 @@ fn index_restart_retains_contributions_and_fresh_generation_resets_them() {
         "2026-10-13T00:00:00Z",
         30,
     );
-    let fresh = &restored.traversal.as_ref().unwrap().counts;
-    assert_eq!(fresh.causes.summary(0), ([0; N + 2], [0; 3]));
+    let fresh = restored.traversal.as_mut().unwrap();
+    assert_eq!(fresh.counts.causes.summary(0), ([0; N + 2], [0; 3]));
+    let fresh_start = rfc3339_unix_seconds(&fresh.census_window_end).unwrap() as usize;
+    assert!(fresh_start > marker);
+    assert_eq!(
+        fresh
+            .counts
+            .causes
+            .page(Some(fresh_start as i64))
+            .summary(0)
+            .1[1],
+        fresh_start
+    );
 }
 
 #[test]
@@ -95,10 +116,10 @@ fn sparse_closed_wire_and_json_omit_empty_causes_and_keep_unattributed_last() {
         .unwrap()
         .get("causes")
         .is_none());
-    let mut counts = Counts::default().page();
+    let mut counts = Counts::default().page(Some(77));
     counts.add(PARENT, 1);
     let emitted = line(counts.summary(4));
-    assert!(emitted.contains("ownership_incomplete_generation="));
+    assert!(emitted.contains("ownership_incomplete_generation_start="));
     assert!(
         emitted.contains("ownership_incomplete_contributions{bucket=\"parent_unresolvable\"}=1")
     );
@@ -203,7 +224,7 @@ fn prior_map_and_positional_counts_default_the_appended_split_without_shifting_n
         assert_eq!(restored.causes.summary(17).1[0], 17);
         conserved(&restored.causes, 17);
     }
-    let mut added = Counts::default().page();
+    let mut added = Counts::default().page(Some(77));
     added.add(GROUP, 1);
     positional.push(serde_json::to_value(added).unwrap());
     let restored: ScanTraversalCounts = serde_json::from_value(json!(positional)).unwrap();

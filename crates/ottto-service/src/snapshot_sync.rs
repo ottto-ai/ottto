@@ -24098,7 +24098,7 @@ mod ownership_census_tests {
         assert!(line.contains("unproven_terminal=3"));
         assert!(line.contains("ownership_incomplete_files=5"));
         assert!(line.contains("ownership_incomplete_contributions{bucket=\"inventory_hold\"}=2"));
-        assert!(line.contains("ownership_incomplete_generation=77"));
+        assert!(line.contains("ownership_incomplete_generation_start=77"));
         assert!(!line.contains("ownership_incomplete_distinct_paths{"));
         assert!(!line.contains("bucket=\"unattributed\""));
         assert!(

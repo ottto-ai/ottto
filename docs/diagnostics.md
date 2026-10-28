@@ -741,13 +741,14 @@ projection. `unattributed` is expected approximately zero by construction:
 can legitimately lose the split until the next fresh traversal. Otherwise
 investigate a missing hook or the invalid/reset disclosure below.
 
-`ownership_incomplete_generation` is a process-monotonic, counts-only marker.
-It is assigned when a traversal is first observed by this process and stays
-fixed across its pages. A fresh traversal or a restored traversal after restart
-gets a new process marker; process restart resets the sequence. Generation and
-invalid/reset observations are RAM-only, never persisted or admission inputs.
-No marker is emitted before observation (zero). Compare within a process, using
-the restart boundary explicitly; this is not a globally unique traversal id.
+`ownership_incomplete_generation_start` is the existing traversal's frozen census
+window boundary, expressed as Unix seconds: a numeric generation-start marker.
+It is derived from the already-persisted `census_window_end` each page, so routine
+save/load/resume and process restart preserve it. Fresh traversals use their new
+window boundary. It has second resolution: separate traversals started within the
+same second can share a marker; compare across timestamped generation starts,
+not as a globally unique id. Invalid/nonpositive timestamps omit the zero marker.
+No new generation field is persisted or used for admission.
 
 Checked additions and checked aggregate/subtraction arithmetic protect the new
 counters. Per-slot addition/merge overflow clears the diagnostic split, counts a
@@ -755,10 +756,11 @@ reset, and later contributions may be classified again. At terminal projection,
 an unrepresentable sum or classified sum greater than S instead clears the
 projected split and reports all S as `unattributed`. It does not rewrite S or
 repair the stored record. `ownership_incomplete_invalid_resets` counts arithmetic
-resets observed by this process in the generation, plus one when the current
+resets observed by the in-memory traversal owner, plus one when the current
 projection is invalid. Repeated invalid projections each disclose that condition;
 they do not accumulate repeated reads as additional stored reset events. The
-reset count saturates at `usize::MAX` and resets on restart/fresh generation.
+reset count saturates at `usize::MAX` and resets on checkpoint reload (including restart) or a fresh generation; lost
+attribution remains visible in the restart-retained unattributed remainder.
 This explicitly discloses lost attribution; silent clamping is forbidden. A
 legacy S overflow is detected if it leaves classification greater than the
 observed scalar; the pre-existing scalar arithmetic itself is unchanged.

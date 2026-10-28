@@ -1,6 +1,4 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-static NEXT_GENERATION: AtomicUsize = AtomicUsize::new(1);
 pub(super) const INVENTORY: usize = 0;
 pub(super) const CREATED: usize = 1;
 pub(super) const PARENT: usize = 2;
@@ -26,10 +24,8 @@ impl Counts {
         self.contributions = [0; N + 2];
         self.observation[1] = self.observation[1].saturating_add(1);
     }
-    pub(super) fn page(&mut self) -> Self {
-        if self.observation[0] == 0 {
-            self.observation[0] = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        }
+    pub(super) fn page(&mut self, started: Option<i64>) -> Self {
+        self.observation[0] = started.unwrap_or_default().max(0) as usize;
         Self {
             observation: [self.observation[0], 0],
             ..Self::default()
@@ -77,7 +73,10 @@ pub(crate) fn line((c, [unattributed, generation, invalid]): Summary) -> String 
             ));
         }
     }
-    for (name, count) in [("generation", generation), ("invalid_resets", invalid)] {
+    for (name, count) in [
+        ("generation_start", generation),
+        ("invalid_resets", invalid),
+    ] {
         if count != 0 {
             line.push_str(&format!(" ownership_incomplete_{name}={count}"));
         }

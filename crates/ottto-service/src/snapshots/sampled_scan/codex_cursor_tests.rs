@@ -13784,7 +13784,7 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
     for cause in [ownership::CREATED, ownership::PARENT, ownership::PARSER] {
         let mut index = ScanIndex::default();
         let mut census = ScanCensus::default();
-        census.causes = census.causes.page();
+        census.causes = census.causes.page(Some(77));
         let mut residue = BTreeSet::new();
         let mut blocked = BTreeSet::new();
         let mut residue_blocked = BTreeSet::new();
