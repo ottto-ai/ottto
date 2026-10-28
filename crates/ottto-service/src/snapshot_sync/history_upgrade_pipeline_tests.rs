@@ -3303,13 +3303,15 @@ fn e2_latch_clear_keeps_permit_marks_and_the_gauge() {
                         crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
                     let page = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), on);
                     let gauge = scope.finish().claude_reread.stamped_without_permit;
-                    latch.push(page.index.claude_request_identity_contract_for_test());
+                    let (contract, latched) =
+                        page.index.claude_request_identity_contract_for_test();
+                    latch.push((contract.map(str::to_owned), latched));
                     assert_eq!(marks(&page.index), stamped, "hour={hour}: bits kept");
                     assert_eq!(gauge, HISTORY_SESSIONS.len() as u64, "hour={hour}");
                 }
                 // Observed "" → E2 sets the latch at hour 9's prepare; only
                 // the census terminal clears it.
-                assert_eq!(latch.last(), Some(&(Some(E2_GROUPING), false)));
+                assert_eq!(latch.last(), Some(&(Some(E2_GROUPING.to_owned()), false)));
                 let first = HISTORY_SESSIONS[0];
                 fixture.append(first, "req_0_2");
                 let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
