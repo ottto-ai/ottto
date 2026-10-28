@@ -45,9 +45,13 @@ on:
         description: Release-build receipt that a scan cycle with a durable restore fits the 2 MiB spawn default (synthetic inputs)
         type: boolean
         default: false
+      build_h527_producer:
+        description: Draft #592 only. Build the release ottto-service for the one-time h527 producer run and upload the binary (1 day)
+        type: boolean
+        default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.money_equivalence && '-money-equivalence' || '' }}${{ inputs.scan_stack_margin && '-scan-stack-margin' || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.money_equivalence && '-money-equivalence' || '' }}${{ inputs.scan_stack_margin && '-scan-stack-margin' || '' }}${{ inputs.build_h527_producer && '-h527-producer' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -61,7 +65,7 @@ jobs:
     # success for the required check; the ruleset's merge_queue rule makes every
     # merge pass this job in the queue. Rollback: remove this line FIRST, and
     # only then the queue rule; never leave the skip without the queue.
-    if: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin || inputs.build_h527_producer)) }}
     # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
     # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
     timeout-minutes: 55
@@ -139,7 +143,7 @@ jobs:
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
 
   public-surface:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin || inputs.build_h527_producer)) }}
     name: Public surface checks
     timeout-minutes: 30
     runs-on: ubuntu-24.04
@@ -171,7 +175,7 @@ jobs:
 
   dependency-review:
     name: Dependency review
-    if: ${{ github.event_name == 'pull_request' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ github.event_name == 'pull_request' && !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin || inputs.build_h527_producer)) }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
@@ -189,7 +193,7 @@ jobs:
           fail-on-severity: moderate
 
   rust-advisories:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin || inputs.build_h527_producer)) }}
     name: Rust advisory audit
     timeout-minutes: 10
     runs-on: ubuntu-24.04
@@ -567,6 +571,37 @@ jobs:
           cargo test -p ottto-service --lib --locked --release scan_worker_stack_margin_receipt -- --ignored --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/stack-margin.log"
           grep -q '^SCAN_STACK_MARGIN_RECEIPT ' "$RUNNER_TEMP/stack-margin.log"
           grep -q '^test result: ok\. 1 passed' "$RUNNER_TEMP/stack-margin.log"
+
+  h527-producer-binary:
+    name: h527 producer binary
+    # Draft #592 only; this branch never merges. Manual dispatch only
+    # (build_h527_producer=true), never on a pull request, push or merge queue.
+    # One standard Mac, one release build, no tests, matrix, retry or cache.
+    # Uploads only the unsigned ottto-service binary, kept for one day, for
+    # the one-time offline `h527-produce` run.
+    if: github.event_name == 'workflow_dispatch' && inputs.build_h527_producer && !(inputs.money_e2_bench || inputs.money_equivalence || inputs.scan_stack_margin)
+    timeout-minutes: 40
+    runs-on: macos-15
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Release build
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          rustc -Vv && cargo -V
+          cargo build --release --locked -p ottto-service
+          shasum -a 256 target/release/ottto-service
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ottto-service-h527-producer-${{ github.sha }}
+          path: target/release/ottto-service
+          retention-days: 1
+          if-no-files-found: error
 
   money-equivalence:
     name: Money equivalence (emitted bodies)
