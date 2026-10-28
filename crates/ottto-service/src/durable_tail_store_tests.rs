@@ -70,6 +70,27 @@ impl Drop for Scratch {
     }
 }
 
+/// Exact in-memory custody oracle; no new production representation/hash.
+pub(crate) fn pending_snapshot(store: &DurableTailStore) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (key, (prior, generation, content, allowlist)) in &store.pending {
+        out.extend_from_slice(key);
+        out.push(u8::from(prior.is_some()));
+        if let Some(stamp) = prior {
+            for word in stamp.0 {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+            for word in stamp.1 {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&generation.to_le_bytes());
+        out.extend_from_slice(content);
+        out.extend_from_slice(allowlist);
+    }
+    out
+}
+
 const NOW: u64 = 1_800_000_000;
 
 #[test]
@@ -390,9 +411,10 @@ fn pending_capacity_failure_retains_every_existing_obligation() {
     store.durable.clear();
     store.begin_pass();
     for record in &records[..MAX_BATCH] {
+        assert_eq!(store.hold(&record.binding.key), None);
         assert_eq!(
-            store.hold(&record.binding.key),
-            Some(Refusal::ReceiptPending)
+            store.read(&record.binding.key, &record.allowlist),
+            ReadOutcome::Missing
         );
         assert_eq!(
             fs::read(record_file(&store, &record.binding.key)).unwrap(),

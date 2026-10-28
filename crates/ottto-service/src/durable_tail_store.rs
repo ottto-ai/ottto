@@ -384,6 +384,8 @@ pub(crate) struct StoreCounters {
     pub(crate) receipt_pending_held: u64,
     pub(crate) receipt_pending_records: u64,
     pub(crate) durable_write_failed_published: u64,
+    /// Failed physical attempt boundaries: setup, inventory, statvfs.
+    pub(crate) store_write_failed: [u64; 3],
     /// Per-pass read I/O.
     pub(crate) bytes_read: u64,
     pub(crate) records_read: u64,
@@ -678,6 +680,9 @@ impl DurableTailStore {
     /// U holds. T14 does not: the key is read Full once (counted) and its
     /// record is overwritten after the save, unless the breaker disables the store.
     pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
+        if self.disabled.is_some() {
+            return None; // D-DISABLED: keep debt, publish valid RAM under native fences.
+        }
         if self.pending.contains_key(key) {
             return Some(Refusal::ReceiptPending);
         }
@@ -702,6 +707,9 @@ impl DurableTailStore {
     }
 
     pub(crate) fn read(&mut self, key: &Digest32, allowlist: &Digest32) -> ReadOutcome {
+        if self.disabled.is_some() {
+            return ReadOutcome::Missing; // Never reuse ambiguous disabled-store bytes.
+        }
         if self.pending.contains_key(key) {
             return ReadOutcome::Refused(Refusal::ReceiptPending);
         }
@@ -881,12 +889,14 @@ impl DurableTailStore {
             self.counters.records_clean += receipt.clean as u64;
             return Ok(receipt);
         }
-        ensure_private_dir(&self.dir)?;
+        ensure_private_dir(&self.dir).inspect_err(|_| self.counters.store_write_failed[0] += 1)?;
         self.checked = false;
         if !self.usable(Some(writer)) {
             return Ok(receipt);
         }
-        let (mut on_disk, mut unlisted) = self.scan_disk()?;
+        let (mut on_disk, mut unlisted) = self
+            .scan_disk()
+            .inspect_err(|_| self.counters.store_write_failed[1] += 1)?;
         let mut attempted = 0;
         for (record, content, prior) in dirty {
             if attempted >= MAX_BATCH {
@@ -928,7 +938,10 @@ impl DurableTailStore {
             let bytes = encode(&stored);
             self.note_codec(pending_bytes + bytes.capacity());
             let previous = on_disk.get(&key).copied().unwrap_or(0);
-            if previous == 0 && !above_floor(&self.dir, bytes.len() as u64, index_length)? {
+            if previous == 0
+                && !above_floor(&self.dir, bytes.len() as u64, index_length)
+                    .inspect_err(|_| self.counters.store_write_failed[2] += 1)?
+            {
                 self.counters.durable_floor_skipped += 1;
                 continue;
             }
@@ -1164,6 +1177,8 @@ impl DurableTailStore {
     /// Record files and their sizes, as on disk now: the first
     /// `INVENTORY_BOUND` by key, the rest only counted and summed.
     fn scan_disk(&self) -> io::Result<(BTreeMap<Digest32, u64>, [u64; 2])> {
+        #[cfg(test)]
+        test_hooks::write_failure("inventory")?;
         let mut on_disk = BTreeMap::new();
         let mut unlisted = [0; 2];
         for entry in fs::read_dir(&self.dir)? {
@@ -1232,6 +1247,8 @@ fn parse_hex_digest(text: &str) -> Option<Digest32> {
 }
 
 fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    test_hooks::write_failure("setup")?;
     match fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -1242,6 +1259,8 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 
 // An absent record leaves index length plus max(2 GiB, 1% volume).
 fn above_floor(dir: &Path, encoded: u64, index_len: u64) -> io::Result<bool> {
+    #[cfg(test)]
+    test_hooks::write_failure("statvfs")?;
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| io::Error::other("store path"))?;
@@ -1612,10 +1631,24 @@ pub(crate) mod test_hooks {
     type DirHook = Box<dyn FnMut(&Path) -> io::Result<()>>;
 
     thread_local! {
+        static WRITE_FAILURE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
         static BEFORE_RENAME: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static BEFORE_DIR_SYNC: RefCell<Option<DirHook>> = const { RefCell::new(None) };
         static BEFORE_UNLINK: RefCell<Option<DirHook>> = const { RefCell::new(None) };
         static UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn set_write_failure(stage: Option<&'static str>) {
+        WRITE_FAILURE.with(|s| *s.borrow_mut() = stage);
+    }
+    pub(super) fn write_failure(stage: &'static str) -> io::Result<()> {
+        WRITE_FAILURE.with(|s| {
+            if *s.borrow() == Some(stage) {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        })
     }
 
     pub(crate) fn set_before_unlink(hook: Option<DirHook>) {

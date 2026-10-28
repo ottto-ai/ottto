@@ -39,8 +39,16 @@ impl ActiveLease {
         outcome.map_or(LeaseWait::Busy, LeaseWait::Granted)
     }
     fn wait(source: &'static str, timeout: Duration) -> Option<Self> {
+        Self::wait_on(timeout, &OWNER, &WAKE)?;
+        Some(Self {
+            source,
+            bytes: 0,
+            released: false,
+        })
+    }
+    fn wait_on(timeout: Duration, owner: &Mutex<Owner>, wake: &Condvar) -> Option<()> {
         let deadline = Instant::now().checked_add(timeout)?;
-        let mut owner = OWNER.lock().ok()?;
+        let mut owner = owner.lock().ok()?;
         if owner.len == owner.queue.len() {
             return None;
         }
@@ -57,20 +65,16 @@ impl ActiveLease {
                 let at = owner.queue[..owner.len].iter().position(|t| *t == ticket)?;
                 owner.queue[at..].rotate_left(1);
                 owner.len -= 1;
-                WAKE.notify_all();
+                wake.notify_all();
                 return None;
             }
             if !owner.busy && owner.queue[0] == ticket {
                 owner.queue.rotate_left(1);
                 owner.len -= 1;
                 owner.busy = true;
-                return Some(Self {
-                    source,
-                    bytes: 0,
-                    released: false,
-                });
+                return Some(());
             }
-            owner = WAKE.wait_timeout(owner, remaining).ok()?.0;
+            owner = wake.wait_timeout(owner, remaining).ok()?.0;
         }
     }
     pub(crate) fn charge(&mut self, bytes: u64) -> Result<(), ActiveOverBudget> {
@@ -141,6 +145,49 @@ mod tests {
             LeaseWait::Granted(lease) => lease,
             LeaseWait::Busy => panic!("test owner unavailable"),
         }
+    }
+
+    fn isolated_owner() -> Mutex<Owner> {
+        Mutex::new(Owner {
+            busy: false,
+            next: 0,
+            queue: [0; 64],
+            len: 0,
+        })
+    }
+
+    #[test]
+    fn poisoned_isolated_owner_refuses_without_poisoning_global_owner() {
+        let owner = isolated_owner();
+        let wake = Condvar::new();
+        assert!(std::panic::catch_unwind(|| {
+            let _guard = owner.lock().unwrap();
+            panic!("isolated poison");
+        })
+        .is_err());
+        assert!(owner.is_poisoned());
+        assert!(ActiveLease::wait_on(WAIT, &owner, &wake).is_none());
+        assert!(!OWNER.is_poisoned());
+    }
+
+    #[test]
+    fn full_isolated_queue_refuses_without_registering_or_taking_ownership() {
+        let owner = isolated_owner();
+        let wake = Condvar::new();
+        {
+            let mut state = owner.lock().unwrap();
+            for (i, ticket) in state.queue.iter_mut().enumerate() {
+                *ticket = i as u64 + 1;
+            }
+            state.len = state.queue.len();
+            state.next = state.len as u64;
+        }
+        assert!(ActiveLease::wait_on(WAIT, &owner, &wake).is_none());
+        let state = owner.lock().unwrap();
+        assert!(!state.busy);
+        assert_eq!(state.len, 64);
+        assert_eq!(state.next, 64);
+        assert_eq!(state.queue, std::array::from_fn(|i| i as u64 + 1));
     }
 
     #[test]

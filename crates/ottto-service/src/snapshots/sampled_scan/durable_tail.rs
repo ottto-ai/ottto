@@ -44,6 +44,10 @@ use sampled_jsonl::CachedJsonlReduction;
 pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper bound of both stores' resident digest maps (two sources).
+/// Pin history: Lead A approved 65,536 -> 401,408 bytes on 2026-10-29:
+/// memo 2*256*256 = 131,072; pending 2*(32+1)*4096 = 270,336 bytes.
+/// Any further growth requires a new owner decision. Native/container evidence
+/// remains required; this pin is not enforcement by the cache's heap walk.
 pub(crate) const STORES_RESIDENT_BOUND: usize =
     2 * store::MAX_RECORDS * 256 + 2 * (store::MAX_BATCH + 1) * 4096;
 
@@ -109,7 +113,7 @@ impl Counters {
              refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
-             write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
+             write_deferred={} write_unlocked={} peak_body_bytes={} store_write_failed[setup,inventory,statvfs]={:?} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt,upgrade_missing,receipt_pending]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
@@ -134,6 +138,7 @@ impl Counters {
             self.write_deferred,
             self.write_unlocked,
             self.peak_body_bytes,
+            store.store_write_failed,
             store.disk_records,
             store.disk_bytes,
             store.bytes_written,
@@ -192,6 +197,16 @@ pub(crate) struct Stores {
 }
 
 impl Stores {
+    fn retry_offered(&mut self, offered: BTreeMap<store::Digest32, String>, index: &ScanIndex) {
+        for key in offered.into_values() {
+            if let Some(entry) = index.files.get(&key) {
+                self.selected
+                    .insert(key.clone(), entry.source_file_fingerprint.clone());
+                self.touched.insert(key);
+            }
+        }
+    }
+
     fn slot(&mut self, source: DurableSource) -> &mut Option<Slot> {
         match source {
             DurableSource::ClaudeCode => &mut self.claude,
@@ -455,7 +470,7 @@ impl SharedCache {
         {
             let mut stores = self.durable()?;
             let slot = stores.slot(source).as_mut()?;
-            if !slot.store.receipt_pending(&digest) {
+            if slot.store.disabled().is_some() || !slot.store.receipt_pending(&digest) {
                 return None;
             }
         }
@@ -463,7 +478,7 @@ impl SharedCache {
             snapshot_source,
             (4 * store::RECORD_BYTES + WRITE_PASS_BYTES) as u64,
         ) else {
-            return Some(store::Refusal::ReceiptPending);
+            return self.durable_hold(snapshot_source, key);
         };
         let result = self.hold_active(snapshot_source, key);
         lease.release();
@@ -1004,13 +1019,33 @@ impl SharedCache {
             Ok(metadata) => metadata.len(),
             Err(_) => {
                 Counters::bump(&mut stores.counters.not_persisted, "index_metadata");
+                stores.retry_offered(offered, index);
                 return None;
             }
         };
-        let receipt = slot
+        let before = slot.store.counters().store_write_failed;
+        let result = slot
             .store
-            .write_after_save(writer, index.generation, index_length, pending)
-            .ok()?;
+            .write_after_save(writer, index.generation, index_length, pending);
+        let after = slot.store.counters().store_write_failed;
+        let receipt = match result {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                let stage = ["setup", "inventory", "statvfs"]
+                    .into_iter()
+                    .enumerate()
+                    .find(|(i, _)| after[*i] > before[*i])
+                    .map_or("store_io", |(_, stage)| stage);
+                Counters::bump(&mut stores.counters.not_persisted, stage);
+                stores.retry_offered(offered, index);
+                drop(stores);
+                crate::local_resource_diagnostics::durable_tail_alarm(
+                    snapshot_source.api_slug(),
+                    &serde_json::json!({"store_write_failed":{(stage):1}, "not_persisted":{(stage):1}}),
+                );
+                return None;
+            }
+        };
         // Records past the batch limit are offered again after the next save.
         for key in &receipt.deferred_keys {
             if let Some(key) = offered.remove(key) {
