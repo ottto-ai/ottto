@@ -24,8 +24,8 @@ impl Counts {
         self.contributions = [0; N + 2];
         self.observation[1] = self.observation[1].saturating_add(1);
     }
-    pub(super) fn page(&mut self, started: Option<i64>) -> Self {
-        self.observation[0] = started.unwrap_or_default().max(0) as usize;
+    pub(super) fn page(&mut self, started: Option<u64>) -> Self {
+        self.observation[0] = usize::try_from(started.unwrap_or(0)).unwrap_or(0);
         Self {
             observation: [self.observation[0], 0],
             ..Self::default()

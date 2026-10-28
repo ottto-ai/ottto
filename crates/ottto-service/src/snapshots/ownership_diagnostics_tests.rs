@@ -61,21 +61,21 @@ fn index_save_load_resume_retains_contributions_and_start_marker_and_fresh_gener
         30,
     );
     let traversal = index.traversal.as_mut().unwrap();
-    let started = rfc3339_unix_seconds(&traversal.census_window_end).unwrap() as usize;
+    let started = rfc3339_unix_seconds(&traversal.census_window_end).unwrap();
     let counts = &mut traversal.counts;
-    counts.causes = counts.causes.page(Some(started as i64));
+    counts.causes = counts.causes.page(Some(started));
     counts.causes.add(PARENT, 2);
     counts.ownership_incomplete_file_count = 2;
     let marker = counts.causes.summary(2).1[1];
     index.save(&path).unwrap();
     let mut restored = ScanIndex::load(&path).unwrap();
     let traversal = restored.traversal.as_mut().unwrap();
-    let restored_start = rfc3339_unix_seconds(&traversal.census_window_end).unwrap() as usize;
-    assert_eq!(restored_start, marker);
+    let restored_start = rfc3339_unix_seconds(&traversal.census_window_end).unwrap();
+    assert_eq!(restored_start as usize, marker);
     let counts = &mut traversal.counts;
     assert_eq!(counts.causes.summary(2).0[PARENT], 2);
     assert_eq!(counts.causes.summary(2).1, [0; 3]);
-    let mut page = counts.causes.page(Some(restored_start as i64));
+    let mut page = counts.causes.page(Some(restored_start));
     assert_eq!(
         page.summary(0).1[1],
         marker,
@@ -96,16 +96,11 @@ fn index_save_load_resume_retains_contributions_and_start_marker_and_fresh_gener
     );
     let fresh = restored.traversal.as_mut().unwrap();
     assert_eq!(fresh.counts.causes.summary(0), ([0; N + 2], [0; 3]));
-    let fresh_start = rfc3339_unix_seconds(&fresh.census_window_end).unwrap() as usize;
-    assert!(fresh_start > marker);
+    let fresh_start = rfc3339_unix_seconds(&fresh.census_window_end).unwrap();
+    assert!(fresh_start as usize > marker);
     assert_eq!(
-        fresh
-            .counts
-            .causes
-            .page(Some(fresh_start as i64))
-            .summary(0)
-            .1[1],
-        fresh_start
+        fresh.counts.causes.page(Some(fresh_start)).summary(0).1[1],
+        fresh_start as usize
     );
 }
 
