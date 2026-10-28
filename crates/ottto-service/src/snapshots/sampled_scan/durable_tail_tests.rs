@@ -582,7 +582,12 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         ));
         cache.durable_note_selection(&key, fingerprint);
     };
-    for arm in ["spent", "too_large"] {
+    for (arm, t14) in [
+        ("spent", false),
+        ("too_large", false),
+        ("spent", true),
+        ("too_large", true),
+    ] {
         let root = crate::test_scratch::private_dir(&format!("ottto-dt-budget-{arm}"));
         let lock = test_locks::hold(&root);
         let index_path = root.join("index.json");
@@ -615,9 +620,15 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         index.files.insert(local_index_key(&c), entry(&c, "fp-c0"));
         index.save(&index_path).unwrap();
         prior.durable_write_after_save(lock, source, &index);
-        let existing = record_files();
+        let mut existing = record_files();
         assert_eq!(existing.len(), 1, "{arm}: c's prior record");
         drop(prior);
+        if t14 {
+            for (path, bytes) in &mut existing {
+                *bytes.last_mut().unwrap() ^= 1;
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
 
         // Process 1: a and b, then c's replacement, all resident.
         let id_bytes = 3 * 1024 * 1024;
@@ -663,6 +674,10 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         }
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &namespace, false);
+        assert_eq!(
+            cache.durable_full_hold(source, &local_index_key(&c), true),
+            None
+        );
         admit(&cache, &a, "fp-a", (reduction_a, checkpoint_a));
         admit(&cache, &b, "fp-b", (reduction_b, checkpoint_b));
         admit(&cache, &c, "fp-c1", (reduction_c, checkpoint_c));
@@ -711,6 +726,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
             counts.summary(source, &disk)
         );
         assert_eq!(counts.write_deferred, 1, "{arm}");
+        assert_eq!(disk.t14_rebuild_full_started, u64::from(t14));
         assert_eq!(disk.records_written, 3, "{arm}: c's replacement written");
         assert_eq!(disk.disk_records, 3, "{arm}");
         assert!(
@@ -760,6 +776,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         let (counts, disk) = restart.durable_counters(source).unwrap();
         println!("dt_budget {arm} restart: {}", counts.summary(source, &disk));
         assert_eq!(counts.restored, 3, "{arm}");
+        assert_eq!(disk.t14_rebuild_full_started, 0);
         let _ = std::fs::remove_dir_all(root);
     }
 }

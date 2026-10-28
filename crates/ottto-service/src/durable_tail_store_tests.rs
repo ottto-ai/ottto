@@ -1879,6 +1879,17 @@ fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
             None,
             "unstarted allowance survives scheduling deferral"
         );
+        test_hooks::set_before_rename(Some(Box::new(|_, _| panic!("unstarted replacement"))));
+        assert_eq!(
+            cold.write_after_save(
+                &lock,
+                2,
+                vec![pending(b.clone(), certificate(&transcript), 2)]
+            )
+            .unwrap(),
+            BatchReceipt::default()
+        );
+        test_hooks::set_before_rename(None);
         assert_eq!(cold.full_hold(&b.key, true), None);
         assert_eq!(cold.counters().t14_rebuild_full_started, 1);
         assert_eq!(cold.full_hold(&b.key, true), Some(Refusal::Corrupt));
@@ -2096,4 +2107,41 @@ fn scheduling_deferral_preserves_t14_allowance_until_full_actually_starts() {
     assert_eq!(store.full_hold(&b.key, true), Some(Refusal::Corrupt));
     assert_eq!(store.counters().t14_rebuild, 1);
     assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), bytes);
+}
+
+#[test]
+fn adapter_deferral_preserves_started_replacement_across_an_empty_save() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let b = binding("acct", "scope", ("fp", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(
+            &lock,
+            1,
+            vec![pending(b.clone(), certificate(&transcript), 1)],
+        )
+        .unwrap();
+    let path = record_file(&store, &b.key);
+    let mut bytes = fs::read(&path).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    put_record(&path, &bytes);
+    assert_eq!(store.full_hold(&b.key, true), None);
+    store.defer_rebuild(&b.key);
+    store.write_after_save(&lock, 2, vec![]).unwrap();
+    assert_eq!(store.rebuilt.get(&b.key), Some(&Rebuild::Started));
+    store.begin_pass();
+    assert_eq!(store.full_hold(&b.key, true), Some(Refusal::Corrupt));
+    let receipt = store
+        .write_after_save(
+            &lock,
+            3,
+            vec![pending(b.clone(), certificate(&transcript), 2)],
+        )
+        .unwrap();
+    assert_eq!(receipt.written, 1);
+    assert_eq!(store.hold(&b.key), None);
+    assert!(store.rebuilt.is_empty());
+    assert_eq!(store.counters().t14_rebuild_full_started, 1);
 }

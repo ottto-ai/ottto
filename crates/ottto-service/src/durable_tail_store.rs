@@ -422,6 +422,7 @@ pub(crate) struct DurableTailStore {
 enum Rebuild {
     Authorized,  // Scheduling deferral has not spent the Full allowance.
     Started,     // The rebuild may offer its own replacement after save.
+    Deferred,    // Adapter encoding budget; restored to Started after this save.
     NotReplaced, // Memory-only with RAM; otherwise a census-safe hold.
 }
 
@@ -679,6 +680,12 @@ impl DurableTailStore {
         held
     }
 
+    pub(crate) fn defer_rebuild(&mut self, key: &Digest32) {
+        if self.rebuilt.get(key) == Some(&Rebuild::Started) {
+            self.rebuilt.insert(*key, Rebuild::Deferred);
+        }
+    }
+
     pub(crate) fn read(&mut self, key: &Digest32, allowlist: &Digest32) -> ReadOutcome {
         match self.classify(key, "guard") {
             Err(reason) => return ReadOutcome::Refused(reason),
@@ -725,7 +732,9 @@ impl DurableTailStore {
     ) -> io::Result<BatchReceipt> {
         let result = self.write_batch(writer, committed_generation, pending);
         for (key, state) in &mut self.rebuilt {
-            if *state == Rebuild::Started
+            if *state == Rebuild::Deferred {
+                *state = Rebuild::Started;
+            } else if *state == Rebuild::Started
                 && !result.as_ref().is_ok_and(|r| r.deferred_keys.contains(key))
             {
                 *state = Rebuild::NotReplaced;
@@ -752,7 +761,10 @@ impl DurableTailStore {
             .map(|record| record.body.len())
             .sum::<usize>();
         for record in pending {
-            if self.rebuilt.get(&record.binding.key) == Some(&Rebuild::NotReplaced) {
+            if matches!(
+                self.rebuilt.get(&record.binding.key),
+                Some(Rebuild::Authorized | Rebuild::NotReplaced)
+            ) {
                 continue;
             }
             // A rebuild may replace its corrupt predecessor once, after save.
