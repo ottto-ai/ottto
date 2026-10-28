@@ -306,6 +306,11 @@ impl ContinuationFixture {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn continuation_preparation_for_test() -> SourcePreparation {
+    ContinuationFixture::quiescent("continuation-mint-finish").preparation(true)
+}
+
 /// K2: cached inputs for the continuation tests, with a drop sentinel (the
 /// status collection's `Arc`, whose count falls back to one when the inputs,
 /// and the context with them, are dropped).

@@ -210,6 +210,7 @@ pub(in crate::snapshots) struct PageBudget {
     /// diagnostics window (`SharedCache::cursor_diagnostics`). Boxed so the
     /// by-value scan object stays small.
     window_start: Option<Box<Counters>>,
+    /// Resume-only frame: no selection, proof hook, side-due work or sweep.
     continuation: bool,
     /// Stage 1 (§6): a continuation page's ordinary interval
     /// (StateMissing's input); `None` is unknown coverage.
@@ -2755,7 +2756,12 @@ impl SharedCache {
         page: &PageBudget,
     ) -> Option<CodexCursorTicket> {
         if job.group.is_some() {
-            crate::local_resource_diagnostics::codex_continuation(Some("group_job"));
+            if page.continuation()
+                || (page.cursor_exhausted(Limits::current())
+                    && job.cursor.as_ref().is_some_and(accelerated))
+            {
+                crate::local_resource_diagnostics::codex_continuation(Some("group_job"));
+            }
             return None;
         }
         let meta = job.cursor.as_ref()?;
@@ -2822,6 +2828,7 @@ impl SharedCache {
     }
 }
 
+/// Resume-only access to the held cursor; never selects or starts a job.
 pub(crate) struct CodexCursorPort {
     cache: Arc<SharedCache>,
 }
@@ -3266,6 +3273,8 @@ pub(in crate::snapshots) fn finish_job(
 /// onto another object than the job's (K5); the caller then ends the
 /// attempt and nothing publishes.
 pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool {
+    #[cfg(test)]
+    tests::TIER_REPLAYS.with(|v| v.set(v.get() + 1));
     let Some((frozen, start)) = job
         .parser
         .reader

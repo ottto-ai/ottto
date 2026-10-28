@@ -1149,6 +1149,7 @@ impl ScanRoot {
 thread_local! {
     static CARRIED: std::cell::RefCell<BTreeMap<PathBuf, crate::snapshots::CodexContinuationEvidence>> = Default::default();
     pub(in crate::snapshots) static NATIVE_RANGES: std::cell::RefCell<Option<Vec<std::ops::Range<u64>>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static TIER_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(in crate::snapshots) static EOF_APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(in crate::snapshots) static GROUP_EOF_APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FAIL_EOF_PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -11447,8 +11448,7 @@ fn a_release_without_a_measure_drops_no_proof() {
     refuses(overflow, "poisoned cursor");
 }
 
-// Stage 1 S1-a (`stage1/c14c15-answer.md` §7): continuation pages. Inert in
-// production; these drive `OwnedSourceScan::new_continuation` directly.
+// Continuation fixtures drive the enabled resume-only scan frame directly.
 
 /// Steps `scan` to completion with the collector's post-policy finalization
 /// (as `page_selections`).
@@ -11725,10 +11725,27 @@ fn continuation_prepares_no_group_attempt() {
         let (mut job, lease) = cache
             .cursor_resume(&Scope("group-fixture".into()), false)
             .unwrap();
-        job.cursor.as_mut().unwrap().pace.accelerate = true;
         let mut budget = PageBudget::default();
         budget.charge(true, Limits::current().cursor);
-        assert!(cache.continuation_ticket(&job, &budget).is_none());
+        let (_, ordinary_records) = crate::local_resource_diagnostics::capture(|| {
+            assert!(cache
+                .continuation_ticket(&job, &PageBudget::default())
+                .is_none());
+            assert!(cache.continuation_ticket(&job, &budget).is_none());
+        });
+        assert!(
+            ordinary_records.is_empty(),
+            "ordinary group pauses are not continuation holds"
+        );
+        job.cursor.as_mut().unwrap().pace.accelerate = true;
+        let (_, refused_records) = crate::local_resource_diagnostics::capture(|| {
+            assert!(cache.continuation_ticket(&job, &budget).is_none());
+        });
+        assert_eq!(refused_records.len(), 1);
+        assert_eq!(
+            refused_records[0]["counts"]["continuation_held"]["group_job"],
+            1
+        );
         assert!(matches!(lease.pause(job), PauseEnd::Paused));
         let resumed = counter(&cache, |c| c.jobs_resumed);
         GROUP_EOF_APPLIED.with(|v| v.set(0));
@@ -13852,9 +13869,9 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
         return;
     }
     let fixture = ScanRoot::new(80);
-    let mut trailing = token_line(81);
-    assert_eq!(trailing.pop(), Some(b'\n'));
-    fixture.append(SESSION, &trailing);
+    let mut trailing: serde_json::Value = serde_json::from_slice(&token_line(81)).unwrap();
+    trailing["payload"]["service_tier"] = "priority".into();
+    fixture.append(SESSION, &serde_json::to_vec(&trailing).unwrap());
     with_test_limits(2048, 1024, 64, || {
         let baseline = Arc::new(SharedCache::default());
         let mut index = ScanIndex::default();
@@ -13869,10 +13886,16 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
         }
         assert!(!expected.is_empty(), "uninterrupted ordinary paged output");
         let expected = serde_json::to_value(expected).unwrap();
-        for schedule in ["before", "after", "interleaved"] {
-            let cache = Arc::new(SharedCache::default());
+        let expected_receipt = serde_json::to_value(
+            &index.files[&local_index_key(&fixture.file(SESSION))].codex_applied_tier_receipt,
+        )
+        .unwrap();
+        assert!(!expected_receipt.is_null(), "priority receipt is exercised");
+        for schedule in ["before", "after", "interleaved", "restart"] {
+            let mut cache = Arc::new(SharedCache::default());
             let (mut index, _) = paused_singleton(&fixture, &cache);
             EOF_APPLIED.with(|v| v.set(0));
+            TIER_REPLAYS.with(|v| v.set(0));
             if schedule == "before" {
                 let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
                 index = next;
@@ -13881,6 +13904,41 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
             let mut reached_eof = false;
             let started = counter(&cache, |c| c.jobs_started);
             for turn in 0..64 {
+                if schedule == "restart" && turn == 2 {
+                    let stale = cache.paused_ticket_for_test().unwrap();
+                    let path = fixture._dir.0.join("restart-index.json");
+                    index.save(&path).unwrap();
+                    drop(cache); // Cursor, reader and continuation inputs are RAM-only.
+                    CARRIED.with(|v| {
+                        v.borrow_mut().remove(&fixture.root);
+                    });
+                    index = ScanIndex::load_for_snapshot_source(
+                        &path,
+                        SnapshotSource::Codex,
+                        &fixture._dir.0,
+                    )
+                    .unwrap();
+                    cache = Arc::new(SharedCache::default());
+                    assert!(!CodexCursorPort::new(Arc::clone(&cache)).ready(&stale));
+                    NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
+                    let (next, scan, selections) = page_selections(
+                        &fixture,
+                        index,
+                        Some(Arc::clone(&cache)),
+                        "cursor-fixture",
+                        NOW,
+                        |_| {},
+                        usize::MAX,
+                    );
+                    index = next;
+                    assert!(scan.snapshots.is_empty());
+                    assert_eq!(
+                        selections.modes,
+                        (1, 0),
+                        "one clean Full re-plan after RAM loss"
+                    );
+                    assert_eq!(selections.full_reasons[FullReason::StateMissing.slot()], 1);
+                }
                 if schedule == "interleaved" && turn == 2 {
                     let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
                     index = next;
@@ -13922,6 +13980,21 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
                 }
             }
             assert!(reached_eof, "{schedule}: EOF parked");
+            if schedule == "restart" {
+                NATIVE_RANGES.with(|v| {
+                    let ranges = v.borrow_mut().take().unwrap();
+                    let mut end = 0;
+                    for range in ranges {
+                        assert_eq!(
+                            range.start, end,
+                            "restart allows one clean Full, no extra re-read"
+                        );
+                        end = range.end;
+                    }
+                    assert_eq!(end, fixture.len(SESSION));
+                });
+            }
+            TIER_REPLAYS.with(|v| assert_eq!(v.get(), 0, "no TierReplay restart"));
             let resumed = counter(&cache, |c| c.jobs_resumed);
             NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
             let (index, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
@@ -13943,13 +14016,25 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
             );
             assert!(!scan.snapshots.is_empty());
             assert_eq!(counter(&cache, |c| c.jobs_certified), 1);
+            let key = local_index_key(&fixture.file(SESSION));
+            let receipt =
+                serde_json::to_value(&index.files[&key].codex_applied_tier_receipt).unwrap();
+            assert_eq!(
+                receipt, expected_receipt,
+                "{schedule}: one receipt application"
+            );
             EOF_APPLIED.with(|v| assert_eq!(v.get(), 1));
-            let (_, duplicate) = page(&fixture, index, Some(Arc::clone(&cache)));
+            let (index, duplicate) = page(&fixture, index, Some(Arc::clone(&cache)));
             assert!(
                 duplicate.snapshots.is_empty(),
                 "ordinary EOF is not emitted twice"
             );
             EOF_APPLIED.with(|v| assert_eq!(v.get(), 1));
+            assert_eq!(
+                serde_json::to_value(&index.files[&key].codex_applied_tier_receipt).unwrap(),
+                receipt
+            );
+            TIER_REPLAYS.with(|v| assert_eq!(v.get(), 0));
         }
     });
 }

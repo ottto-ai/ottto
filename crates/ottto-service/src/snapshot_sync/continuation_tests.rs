@@ -2105,3 +2105,116 @@ fn carried_inventory_over_the_retained_limit_refuses_ticket_admission() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_platform_qos_restores_on_a_spawned_thread_and_power_has_valid_range() {
+    std::thread::spawn(|| {
+        let prior = query_qos().expect("native QoS query");
+        let guard = MacPlatformSignals::background().expect("native background entry");
+        assert_eq!(query_qos(), Some((0x09, 0)));
+        drop(guard);
+        let restored = if prior.0 == 0 { (0x15, prior.1) } else { prior };
+        assert_eq!(query_qos(), Some(restored));
+        assert!(matches!(unsafe { ottto_power_state() }, -1..=1));
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
+    let mut preparation = super::super::tests::continuation_preparation_for_test();
+    let root = preparation.index_path.parent().unwrap().join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let session = "019fa111-2222-7333-8444-555555555555";
+    let mut body = format!(
+        "{}\n",
+        serde_json::json!({"type":"session_meta", "timestamp":"2026-10-24T00:00:00Z", "payload":{"id":session}})
+    );
+    for n in 1..=80 {
+        body.push_str(&format!("{}\n", serde_json::json!({"type":"event_msg", "timestamp":"2026-10-24T00:30:00Z", "payload":{"type":"token_count", "info":{"model":"fixture-model", "total_token_usage":{"input_tokens":n*100,"cached_input_tokens":n*50,"output_tokens":n*10},"last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10}}}})));
+    }
+    std::fs::write(
+        root.join(format!("rollout-2026-10-24T00-00-00-{session}.jsonl")),
+        body,
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
+        let mut owned = crate::snapshots::OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            ScanIndex::default(),
+            "2026-10-24T12:00:00Z",
+            30,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .with_sampled_acquisition(
+            Arc::clone(&cache),
+            crate::snapshots::sampled_scan::Scope("mint-fixture".into()),
+        );
+        let mut scan = loop {
+            match owned.step(None) {
+                crate::snapshots::OwnedSourceScanStep::Pending(next) => owned = next,
+                crate::snapshots::OwnedSourceScanStep::Complete { scan, .. } => break scan,
+            }
+        };
+        assert!(scan.snapshots.is_empty());
+        assert!(
+            scan.continuation_ticket().is_some(),
+            "real paused accelerated scan"
+        );
+        static LATCH: AtomicBool = AtomicBool::new(false);
+        let mut port = CodexContinuation {
+            cache: &cache,
+            home: &root,
+            support_dir: &root,
+            worker_qos: MacPlatformSignals::background,
+            latch: &LATCH,
+        };
+        let world = World::new();
+        let ticket = ordinary_ticket(
+            &port,
+            &scan,
+            &preparation.upload_destination_namespace,
+            Some(AUTHORITY),
+            Some((world.now.get(), world.now.get() + LIFETIME)),
+        )
+        .unwrap();
+        let (ticket, records) = crate::local_resource_diagnostics::capture(|| {
+            super::super::continuation_finish_inputs(
+                &mut preparation,
+                &mut scan,
+                Some(8 * 1024 * 1024),
+            )(ticket)
+            .expect("real finish admits carried evidence under an 8 MiB retained allowance")
+        });
+        *world.slot.lock().unwrap() = Some(ticket);
+        assert!(world.held());
+        let mut held = world.slot.lock().unwrap();
+        let ticket = held.as_mut().unwrap();
+        assert!(port.ready(&ticket.cursor));
+        match &ticket.cursor.0 {
+            CursorParts::Codex(page) => {
+                let inputs = page.inputs.as_ref().unwrap();
+                assert!(inputs.evidence.as_ref().unwrap().content_unchanged());
+                assert!(inputs.holds_attribution());
+            }
+            _ => panic!("a production Codex ticket"),
+        }
+        assert!(preparation.attribution_context.is_none(), "inputs moved");
+        assert!(
+            scan.take_continuation_evidence().is_none(),
+            "evidence moved once"
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["counts"]["continuation_mint"]["minted"], 1);
+    });
+}

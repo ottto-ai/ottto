@@ -732,6 +732,10 @@ pub(crate) fn codex_continuation(held: Option<&'static str>) {
     });
     traversal_point("codex_continuation", "codex", &counts);
 }
+pub(crate) fn codex_continuation_mint(outcome: &'static str) {
+    let counts = serde_json::json!({"continuation_mint": BTreeMap::from([(outcome, 1u8)])});
+    traversal_point("codex_continuation_mint", "codex", &counts);
+}
 pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,
@@ -2350,6 +2354,32 @@ mod tests {
 }
 #[cfg(test)]
 mod continuation_tests {
+    #[test]
+    fn continuation_mint_counts_have_closed_fixed_keys() {
+        let outcomes = [
+            "minted",
+            "inventory_incomplete",
+            "groups_completed",
+            "no_remaining",
+            "over_bound",
+        ];
+        let (_, rows) = super::capture(|| {
+            for outcome in outcomes {
+                super::codex_continuation_mint(outcome);
+            }
+        });
+        assert_eq!(rows.len(), outcomes.len());
+        for (row, outcome) in rows.iter().zip(outcomes) {
+            assert_eq!(row["stage"], "codex_continuation_mint");
+            assert_eq!(row["schema_version"], 2);
+            assert_eq!(row["source"], "codex");
+            assert_eq!(
+                row["counts"],
+                serde_json::json!({"continuation_mint":{outcome:1}})
+            );
+        }
+    }
+
     #[test]
     fn continuation_counts_use_fixed_point_schema() {
         let (_, rows) = super::capture(|| {

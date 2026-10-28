@@ -4598,16 +4598,13 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                 authority,
                 continuation::ticket_lifetime(self.codex_started),
             )
-            .and_then(|ticket| {
-                let evidence = completed.2.take_continuation_evidence()?;
-                let mut inputs = take_continuation_inputs(
-                    &mut completed.0,
-                    &self.daemon.codex_preludes,
-                    self.daemon.codex_versions.clone(),
-                );
-                inputs.evidence = Some(evidence);
-                ticket.with_inputs(inputs, remaining?)
-            })
+            .and_then(continuation_finish_inputs(
+                &mut completed.0,
+                &mut completed.2,
+                remaining,
+                &self.daemon.codex_preludes,
+                self.daemon.codex_versions.clone(),
+            ))
         });
         let finished = crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
             self.finish_completed(completed)
@@ -6314,6 +6311,27 @@ impl ContinuationInputs {
     }
 }
 
+/// Ordinary finish closure: move evidence and admit all retained inputs.
+fn continuation_finish_inputs<'a>(
+    preparation: &'a mut SourcePreparation,
+    scan: &'a mut SourceScanResult,
+    remaining: Option<usize>,
+    codex_preludes: &'a std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
+) -> impl FnOnce(continuation::ContinuationTicket) -> Option<continuation::ContinuationTicket> + 'a
+{
+    move |ticket| {
+        let evidence = scan.take_continuation_evidence()?;
+        let mut inputs = take_continuation_inputs(preparation, codex_preludes, codex_versions);
+        inputs.evidence = Some(evidence);
+        let refusal = remaining.map_or("no_remaining", |_| "over_bound");
+        let ticket = remaining.and_then(|limit| ticket.with_inputs(inputs, limit));
+        crate::local_resource_diagnostics::codex_continuation_mint(
+            ticket.as_ref().map_or(refusal, |_| "minted"),
+        );
+        ticket
+    }
+}
 /// Stage 1 (K2): the continuation inputs of a just-finished ordinary Codex
 /// page, taken before its finish. `finish_sync_source` never reads the
 /// attribution context, so moving it out changes nothing for the finish.

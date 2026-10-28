@@ -3239,6 +3239,7 @@ impl CodexContinuationEvidence {
         self.inventory.content_unchanged()
     }
 }
+/// Continuation excludes G7, side-due work, the proof hook and the sweep.
 pub(crate) fn begin_codex_continuation_side_pass(
     cache: &sampled_scan::SharedCache,
     index_path: &Path,
@@ -25998,6 +25999,7 @@ impl OwnedSourceScan {
         )
     }
 
+    /// Performs no selection, inventory read or traversal update.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_continuation(
         roots: &[PathBuf],
@@ -30887,6 +30889,15 @@ impl OwnedSourceScan {
                     codex: codex_title_metadata,
                     traces: codex_turn_traces,
                 });
+                if continuation_ticket.is_some() && continuation_evidence.is_none() {
+                    crate::local_resource_diagnostics::codex_continuation_mint(
+                        if codex_join_completed.is_empty() {
+                            "inventory_incomplete"
+                        } else {
+                            "groups_completed"
+                        },
+                    );
+                }
                 let scan = SourceScanResult {
                     source,
                     backfill_window_days,

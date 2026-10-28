@@ -125,11 +125,24 @@ counts over the desired window; they are not persisted process totals.
 Roster/context/policy holds occur before prepare or transcript reads. Context
 wins if both context and policy changed; missing carried evidence, prepare
 errors/refusals and step-admission refusals use `other`. Group refusals are
-counted at ticket mint or resume, before taking the job. A stepped page can
+counted at resume or when a group would otherwise mint (exhausted cursor
+budget and accelerated), before taking the job. Ordinary ineligible group
+pauses add no continuation hold. A stepped page can
 later produce an additional hold record; the two counters are not exclusive.
 Timer wakes without a ready page and platform/QoS skips are outside these scan
 admission counts. No path, session id, digest, error text or transcript content
 is included, and the counts grant no authority.
+
+The `codex_continuation_mint` stage uses the same point carrier and source,
+with one sparse `continuation_mint` count: `minted`, `inventory_incomplete`,
+`groups_completed`, `no_remaining`, or `over_bound`. Each record counts one
+mint decision for a paused, accelerated ticket candidate. Completed joins take
+precedence over incomplete/missing inventory. With valid evidence, missing
+rotation allowance is `no_remaining`; unknown/over-limit retained layout is
+`over_bound`; `minted` means inputs were admitted, before ordinary finish,
+contention and cadence may still discard the candidate. These counters grant
+no authority and do not imply a continuation page ran. No raw ticket means no
+mint decision; authority/lifetime refusals remain outside these five outcomes.
 
 The inventory check performs at most one `lstat` per carried rollout path
 (up to 32,768), stopping on the first mismatch. It includes ledger parents and
