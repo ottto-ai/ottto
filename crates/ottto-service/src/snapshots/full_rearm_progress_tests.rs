@@ -958,6 +958,8 @@ fn occurrence_key_mismatch_in_an_already_invalid_family_still_vetoes() {
 /// Those reports must not erase the suppression veto, even without a permit.
 #[test]
 fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::LegacyAccountPathForTest::enter();
     let rearm = Rearm::new();
     let mut baseline = rearm.index();
     rearm.establish(&mut baseline, &rearm.items);

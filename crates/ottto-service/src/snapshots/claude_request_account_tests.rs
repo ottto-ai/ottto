@@ -710,6 +710,8 @@ fn claude_h296_root_clocks_and_creator_conflicts_stay_separate() {
 
 #[test]
 fn claude_h296_root_production_enrichment_keeps_child_separate() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::LegacyAccountPathForTest::enter();
     // D1 session-account qualification and binding; E2 keeps per-request account partitions.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, root, api, trace) = h296_root_evidence();

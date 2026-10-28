@@ -101,6 +101,36 @@ pub(crate) const fn captures(source: SnapshotSource) -> bool {
     matches!(source, SnapshotSource::ClaudeCode)
 }
 
+/// Every Claude sync cycle builds contract-5 evidence. A test may pin the
+/// legacy account path (D1 qualification, mixed bodies, owner holds) that
+/// production now reaches only for bodies contract 5 leaves untagged.
+pub(crate) fn builds_evidence() -> bool {
+    #[cfg(test)]
+    if LEGACY_ACCOUNT_PATH.with(std::cell::Cell::get) {
+        return false;
+    }
+    true
+}
+#[cfg(test)]
+thread_local! { static LEGACY_ACCOUNT_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// Runs this thread's sync evidence stage without contract-5 evidence until
+/// dropped, as every unpermitted cycle did before the cutover. Only for
+/// fixtures whose subject is that legacy path.
+#[cfg(test)]
+pub(crate) struct LegacyAccountPathForTest(bool);
+#[cfg(test)]
+impl LegacyAccountPathForTest {
+    pub(crate) fn enter() -> Self {
+        Self(LEGACY_ACCOUNT_PATH.with(|v| v.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for LegacyAccountPathForTest {
+    fn drop(&mut self) {
+        LEGACY_ACCOUNT_PATH.with(|v| v.set(self.0));
+    }
+}
+
 /// `transcript_email` (and its status-coverage feed) needs its own review and
 /// receiver acceptance on top of contract-5 emission. Flipping this is a
 /// separate, parent-owned change.

@@ -96,9 +96,9 @@ fn version_two_reowes_nothing_and_seeds_no_mark() {
 #[test]
 fn a_retired_permit_bit_is_decoded_and_never_replayed() {
     let root = temp("retired-bit");
-    let file = root.join("index.json");
     let (marked, plain) = ("/p/marked.jsonl", "/p/plain.jsonl");
     for stored_version in [1, 2] {
+        let file = root.join(format!("index-v{stored_version}.json"));
         let mut index = at_revision_three();
         index.files.insert(marked.into(), entry(3, "marked"));
         index.files.insert(plain.into(), entry(3, "plain"));

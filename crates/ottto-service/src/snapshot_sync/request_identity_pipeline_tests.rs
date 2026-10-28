@@ -288,9 +288,20 @@ fn always_on_emits_contract5_whatever_the_hint_token() {
             (item.request_count, item.input_tokens, item.output_tokens),
             (2, 30, 3)
         );
-        bodies.insert(cycle.body);
+        // Each cycle scans at its own wall time, so compare what the hint
+        // could change: the contract and every tagged row.
+        bodies.insert(
+            serde_json::to_vec(&(
+                &item.provenance.collector,
+                &item.request_evidence,
+                item.request_identity_refusals,
+                &item.model_usage,
+                &item.usage_buckets,
+            ))
+            .expect("serialize identity projection"),
+        );
     }
-    assert_eq!(bodies.len(), 1, "the hint token changes no body byte");
+    assert_eq!(bodies.len(), 1, "the hint token changes no identity or usage");
 
     // A hint that cannot be read aborts the cycle: no scan, no fallback body.
     let support = fixture.base.join("support-unreadable");

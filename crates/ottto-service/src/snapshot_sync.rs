@@ -8847,6 +8847,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     {
         fallback.withhold(scan_result);
     }
+    let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.
@@ -8954,7 +8955,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
                 full_rearm_evidence_complete = false;
-                identity_unhealthy_roots.insert(session_id.clone());
+                if builds_evidence || request_owned(session_id) {
+                    identity_unhealthy_roots.insert(session_id.clone());
+                }
             }
             paired
         })
@@ -9008,7 +9011,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
-            identity_unhealthy_roots.insert(root_session_id);
+            if builds_evidence || request_owned(&root_session_id) {
+                identity_unhealthy_roots.insert(root_session_id);
+            }
             continue;
         }
         stats.complete_sidecar_root_count += 1;
@@ -9065,7 +9070,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     // Contract-5 evidence is always built; the reported rebuild then
     // classifies and groups each request as it places it.
-    let identity_evidence = Some(
+    let identity_evidence = builds_evidence.then(|| {
         crate::snapshots::claude_request_identity::ScanEvidence::new(
             &api_report,
             &trace_report,
@@ -9073,8 +9078,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_identity::desktop_census(index),
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
-        .with_native_originals(&originals),
-    );
+        .with_native_originals(&originals)
+    });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
     }
@@ -23612,6 +23617,8 @@ mod tests {
     }
     #[test]
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
+        // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+        let _legacy = crate::snapshots::claude_request_identity::LegacyAccountPathForTest::enter();
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         use crate::claude_local_otel::ClaudeIdentityDisposition;
