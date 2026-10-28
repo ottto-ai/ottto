@@ -8,10 +8,10 @@
 // (`pi_seed`, `pi_turn`, `pi_json`, `pi_grow`). PR-Pi-b2 removes the gate when it
 // merges the codec on top of 5c1b (PR-Pi-b1 is folded into E1's 5b-B, which
 // adds the source-keyed `DurableSource` table); until then this file is not
-// compiled. The P-ACTIVE-BOUND and P-LEDGER-CAP rows also wait on cap knobs
-// that do not exist yet (`cfg(ottto_e5_fixture_knobs)`, E5-PI-FIXTURE questions
-// for E1), and assert `Harness::full_reads(cause)`, assumed from r2-interfaces
-// (5c1a0a-2).
+// compiled. Test-only overrides this file assumes: the `PI_LEDGER_MAX_KEYS`
+// thread-local that PR-Pi-b2 adds in the Pi codec module (`ledger_cap` below),
+// E1's 5c1a0a-1 active-budget override (P-ACTIVE-BOUND stays ignored until it
+// lands) and `Harness::full_reads(cause)` from r2-interfaces (5c1a0a-2).
 //
 // P-PREACT (a binary without Pi support meeting Pi files and a Pi store) is a
 // cross-build property: it belongs to the money_equivalence base-vs-candidate
@@ -23,6 +23,15 @@ use crate::snapshots::sampled_scan::transition_fixture::{
 };
 
 const SOURCE: SnapshotSource = SnapshotSource::Pi;
+
+/// Caps the Pi ledger at `max` keys on this thread until the guard drops.
+/// ASSUMED: PR-Pi-b2 adds `set_test_pi_ledger_max_keys`, a `#[cfg(test)]`
+/// thread-local override of `PI_LEDGER_MAX_KEYS` in the owning Pi codec module
+/// (`snapshots/sampled_jsonl/durable.rs`), re-exported for test adapters.
+fn ledger_cap(max: usize) -> Reset<impl FnMut()> {
+    crate::snapshots::set_test_pi_ledger_max_keys(Some(max));
+    Reset(|| crate::snapshots::set_test_pi_ledger_max_keys(None))
+}
 
 /// One native Pi pass over `prior`, emitted as its upload envelope. Bytes are
 /// the real reader's; restores and rederive bytes are this owner's counters.
@@ -230,10 +239,15 @@ impl PiDriver {
         (counts.missing, counts.refused_record, store.t14_rebuild)
     }
 
+    /// This route's U holds: store format holds plus restore-side holds.
+    fn holds(&self, mode: Mode) -> u64 {
+        let (counts, store) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
+        store.format_hold.iter().chain(&counts.durable_held).sum()
+    }
+
     /// This route's `full_reads{cause}`. ASSUMED: `Harness::full_reads(cause)`
     /// (r2-interfaces, R2 plan) arrives with 5c1a0a-2; the receiver and
     /// arguments here are a guess until it lands.
-    #[cfg(ottto_e5_fixture_knobs)]
     fn full_reads(&self, mode: Mode, cause: &str) -> u64 {
         fixture::Harness::full_reads(&self.pages[&mode].cache, SOURCE, cause)
     }
@@ -474,9 +488,11 @@ fn pi_evict_retry_save_restart_reads_no_full() {
     money_oracle::assert_equivalent(&cold, &restart);
 }
 
-// P-S: an older surviving record on the same object whose planned extent is
-// behind the accepted body holds (P11-S2); the extent regression is known
-// independently from the index. An equal-or-larger extent POSTs normally.
+// P-S (restore path: restart or RAM miss): an older surviving record on the
+// same object, same head, whose planned extent is behind the accepted body
+// holds in `durable_restore` (P11-S2, 5b-A1): no Full, no POST. The extent
+// regression is known independently from the index. An equal-or-larger extent
+// POSTs normally. The RAM-resident cut is the in-process control below.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -547,11 +563,109 @@ fn pi_restored_tail_behind_accepted_extent_holds() {
     money_oracle::assert_no_smaller_reemit(&f.entity, &cold, &restored, &cold, behind);
 }
 
-// P-T14 / P-T14-SECTION: a corrupt, truncated or stripped Pi section is read
-// Full once (counted T14 rebuild), then replaced by a record the next restart
-// restores. The first two arms break the trailer, so framing refuses them; the
-// stripped arm is re-framed with a valid trailer, so only the Pi section
-// check can refuse it (never decoded as an empty ledger).
+// P-S in-process control (RAM resident): the same object cut below the
+// accepted extent with the same head, its entry still in RAM, is classified
+// Shrunk by the certificate/ReadPlan and takes one A2 Full
+// `real_edit.<check>` outside the restore seam (s5b:85). Publication falls
+// under 5c1's N2 rule (pending Lead B), so the row asserts the read and the
+// mode and pins nothing beyond `assert_equivalent`.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "Pi restore requires qualified native heap layout"
+)]
+fn pi_ram_resident_same_head_cut_reads_one_real_edit_full() {
+    if !supported("pi_transition_smaller_ram") {
+        return;
+    }
+    let mut f = PiDriver::warm("transition-pi-smaller-ram", &pi_seed());
+    let sealed = std::fs::read(&f.path).unwrap();
+    f.grow(&[
+        pi_turn("message", Some("accepted-one"), 20, "2026-10-27T06:01:00Z"),
+        pi_turn("message", Some("accepted-two"), 30, "2026-10-27T06:02:00Z"),
+    ]);
+    let grown = f.emit_bodies(Mode::Ram);
+    assert_eq!(
+        (grown.modes, grown.restored),
+        ((0, 1, 0), 0),
+        "RAM resident"
+    );
+    f.save_gc(Mode::Ram);
+    let head = |bytes: &[u8]| bytes.split(|&b| b == b'\n').next().unwrap().to_vec();
+    let accepted_head = head(&std::fs::read(&f.path).unwrap());
+    std::fs::write(&f.path, &sealed).unwrap();
+    pi_grow(
+        &f.path,
+        pi_turn("message", Some("short"), 1, "2026-10-27T06:03:00Z"),
+    );
+    let key = fixture::local_key(&f.path);
+    let extent = std::fs::metadata(&f.path).unwrap().len();
+    assert!(
+        extent < f.prior.files[&key].size_bytes,
+        "cut below accepted"
+    );
+    assert_eq!(head(&std::fs::read(&f.path).unwrap()), accepted_head);
+    let cold = f.emit_bodies(Mode::ColdFull);
+    let edited = f.emit_bodies(Mode::Ram);
+    assert_eq!(
+        (edited.modes, edited.restored),
+        ((1, 0, 0), 0),
+        "one in-process Shrunk Full"
+    );
+    assert_eq!(edited.io.consumed, extent);
+    let (_, refused, t14) = f.counters(Mode::Ram);
+    assert_eq!((refused, t14, f.holds(Mode::Ram)), (0, 0, 0));
+    money_oracle::assert_equivalent(&cold, &edited);
+}
+
+/// One trailer-valid Pi-section defect (P-T14-SECTION) in a record body whose
+/// last bytes are the Pi section: tag 1, u64 LE length, then the H-keyed map
+/// (key-count varint, then per entry a 32-byte H key and its value).
+fn break_pi_section(body: &mut Vec<u8>, arm: &str) {
+    let section =
+        fixture::trailing_section(body, 1).expect("the Pi section (tag 1) closes the body");
+    let payload = body[section.start + 9..].to_vec();
+    let start = section.start;
+    let reframe = |body: &mut Vec<u8>, payload: &[u8]| {
+        body.truncate(start);
+        body.push(1);
+        body.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        body.extend_from_slice(payload);
+    };
+    match arm {
+        "stripped" => body.truncate(start),
+        "duplicated" => {
+            let whole = body[section].to_vec();
+            body.extend_from_slice(&whole);
+        }
+        "trailing" => body.push(0),
+        "over-cap" => {
+            // Four well-formed, distinct entries: only the key cap refuses.
+            assert_eq!(payload[0], 1, "the seed ledger holds one key");
+            let mut forged = vec![4];
+            for n in 0..4 {
+                let mut entry = payload[1..].to_vec();
+                entry[0] ^= n;
+                forged.extend_from_slice(&entry);
+            }
+            reframe(body, &forged);
+        }
+        "short-h" => {
+            // H keys are stored as 32 bytes, so a non-hex H cannot be on disk;
+            // its record-side form is an H key cut short.
+            assert_eq!(payload[0], 1, "the seed ledger holds one key");
+            reframe(body, &payload[..1 + 16]);
+        }
+        _ => unreachable!("{arm}"),
+    }
+}
+
+// P-T14 / P-T14-SECTION: a corrupt, truncated or malformed Pi section is read
+// Full once (counted T14 rebuild, never a U hold), then replaced by a record
+// the next restart restores. The first two arms break the trailer, so framing
+// refuses them. The section arms (stripped, duplicated, trailing bytes, key
+// count over the cap, short H) are re-framed with a valid trailer, so only
+// the Pi section checks can refuse them (never decoded as an empty ledger).
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -563,8 +677,20 @@ fn pi_corrupt_or_missing_section_rebuilds_once_then_replaces_the_record() {
     }
     use sha2::{Digest, Sha256};
     const TRAILER: usize = 32;
-    for arm in ["corrupt", "missing", "stripped"] {
+    let arms = [
+        "corrupt",
+        "missing",
+        "stripped",
+        "duplicated",
+        "trailing",
+        "over-cap",
+        "short-h",
+    ];
+    for arm in arms {
         let name = format!("transition-pi-t14-{arm}");
+        // A cap of 3 is under the forged 4 keys and over every real ledger
+        // this arm writes (1, then 2, then 3), so the rebuild still persists.
+        let _cap = (arm == "over-cap").then(|| ledger_cap(3));
         let mut f = PiDriver::warm(&name, &pi_seed());
         // The Pi section closes the body, immediately before the trailer.
         let (path, mut bytes) = only_record(&f.disk);
@@ -577,14 +703,10 @@ fn pi_corrupt_or_missing_section_rebuilds_once_then_replaces_the_record() {
             _ => {
                 let valid = bytes.len();
                 // E5-PI-FIXTURE: reframe hook (E1 takes it into r2-fixture-ext).
-                fixture::reframe_record(&path, |body| {
-                    let section = fixture::trailing_section(body, 1)
-                        .expect("the Pi section (tag 1) closes the body");
-                    body.truncate(section.start);
-                });
+                fixture::reframe_record(&path, |body| break_pi_section(body, arm));
                 bytes = std::fs::read(&path).unwrap();
                 let end = bytes.len() - TRAILER;
-                assert!(end < valid - TRAILER, "{name}: section stripped");
+                assert_ne!(bytes.len(), valid, "{name}: section edited");
                 assert_eq!(
                     bytes[end..],
                     Sha256::digest(&bytes[..end])[..],
@@ -605,6 +727,7 @@ fn pi_corrupt_or_missing_section_rebuilds_once_then_replaces_the_record() {
         assert_eq!((rebuilt.modes, rebuilt.restored), ((1, 0, 0), 0), "{name}");
         let (_, refused, t14) = f.counters(Mode::Restart);
         assert_eq!((refused, t14), (1, 1), "{name}: one counted T14 rebuild");
+        assert_eq!(f.holds(Mode::Restart), 0, "{name}: T14, never U");
         money_oracle::assert_equivalent(&cold, &rebuilt);
         f.save_gc(Mode::Restart);
         let (replaced, replacement) = only_record(&f.disk);
@@ -731,21 +854,22 @@ fn pi_refused_cache_copy_still_receipts_and_every_change_restores() {
 // published without a record, counted not-persisted{active_bound}, and the
 // next restart is the counted degraded-no-record Full. An existing record
 // whose growth would exceed the lease stays Pending, never Full.
-#[cfg(ottto_e5_fixture_knobs)]
+// Disclosed gap: E1 adds the active-budget `#[cfg(test)]` thread-local override
+// in 5c1a0a-1. Until then this row stays ignored with its body kept; restore
+// the macOS-only `cfg_attr` ignore when it is enabled. The override name below
+// is ASSUMED until r2-interfaces publishes it.
 #[test]
-#[cfg_attr(
-    not(target_os = "macos"),
-    ignore = "Pi restore requires qualified native heap layout"
-)]
+#[ignore = "needs 5c1a0a-1 active-budget test override"]
 fn pi_active_bound_publishes_new_keys_without_record_and_never_fulls_on_restore() {
     if !supported("pi_transition_active_bound") {
         return;
     }
-    // E5-PI-FIXTURE: active-lease knob (assumed name), not 40k+ real keys.
+    // The active-lease override, not 40k+ real keys.
+    use crate::durable_tail_store::active::set_test_active_bytes as set_active_budget;
     const TINY_ACTIVE_BUDGET: u64 = 1;
-    let _reset = Reset(|| fixture::set_active_budget(None));
+    let _reset = Reset(|| set_active_budget(None));
 
-    fixture::set_active_budget(Some(TINY_ACTIVE_BUDGET));
+    set_active_budget(Some(TINY_ACTIVE_BUDGET));
     let mut f = PiDriver::warm("transition-pi-active-new", &pi_seed());
     assert_eq!(f.disk.records(), 0, "NEW key: published, no record");
     f.restart();
@@ -767,7 +891,7 @@ fn pi_active_bound_publishes_new_keys_without_record_and_never_fulls_on_restore(
     assert_eq!((refused, t14), (0, 0), "not a refused record");
     money_oracle::assert_equivalent(&cold, &full);
 
-    fixture::set_active_budget(None);
+    set_active_budget(None);
     let mut f = PiDriver::warm("transition-pi-active-existing", &pi_seed());
     assert_eq!(f.disk.records(), 1);
     let record = f.disk.record_bytes();
@@ -779,7 +903,7 @@ fn pi_active_bound_publishes_new_keys_without_record_and_never_fulls_on_restore(
         "2026-10-27T06:01:00Z",
     )]);
     let cold = f.emit_bodies(Mode::ColdFull);
-    fixture::set_active_budget(Some(TINY_ACTIVE_BUDGET));
+    set_active_budget(Some(TINY_ACTIVE_BUDGET));
     for pass in 0..2 {
         f.restart();
         let pending = f.emit_bodies(Mode::Restart);
@@ -789,7 +913,7 @@ fn pi_active_bound_publishes_new_keys_without_record_and_never_fulls_on_restore(
         assert_eq!(stored_bodies(&f.prior), before, "{pass}: nothing advanced");
         assert_eq!(f.disk.record_bytes(), record, "{pass}: record kept");
     }
-    fixture::set_active_budget(None);
+    set_active_budget(None);
     f.restart();
     let restored = f.emit_bodies(Mode::Restart);
     assert_eq!((restored.modes, restored.restored), ((0, 1, 0), 1));
@@ -800,7 +924,6 @@ fn pi_active_bound_publishes_new_keys_without_record_and_never_fulls_on_restore(
 // (`pi_ledger_cap`): a NEW key is counted not-persisted{codec} and read as
 // the degraded-no-record Full on restart; an existing record is kept, not
 // replaced, and still restores a Tail.
-#[cfg(ottto_e5_fixture_knobs)]
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -810,9 +933,8 @@ fn pi_ledger_over_cap_refuses_the_codec_and_keeps_an_existing_record() {
     if !supported("pi_transition_ledger_cap") {
         return;
     }
-    // E5-PI-FIXTURE: ledger-cap knob (assumed name); real size is ~20 MB.
-    let _reset = Reset(|| fixture::set_pi_ledger_max_keys(None));
-    fixture::set_pi_ledger_max_keys(Some(2));
+    // The PR-Pi-b2 ledger override, not a ~20 MB real-size file.
+    let _cap = ledger_cap(2);
 
     let mut f = PiDriver::warm("transition-pi-ledger-new", &(pi_seed() + &ledger_lines(2)));
     assert_eq!(f.disk.records(), 0, "over-cap NEW key: no record");
@@ -911,8 +1033,15 @@ fn pi_appended_while_down_over_an_hour_restores_and_tails() {
         if pending > 0 {
             // More pending audits than slots: the population a slot gate
             // would read; a checkpoint view must not consult it.
-            let like = fixture::local_key(&f.path);
-            fixture::stage_pending_audits(&mut f.prior, &like, pending, START);
+            // Real pending entries at keys outside discovery, inserted
+            // through `ScanIndex::files` (no `audit_slots` override).
+            let like = f.prior.files[&fixture::local_key(&f.path)].clone();
+            for n in 0..pending {
+                let mut entry = like.clone();
+                fixture::set_unverified_deadline(&mut entry, START);
+                let key = format!("/synthetic-pending-audits/{n}.jsonl");
+                f.prior.files.insert(key, entry);
+            }
         }
         let cold = f.emit_bodies(Mode::ColdFull);
         let restored = f.emit_bodies(Mode::Restart);
