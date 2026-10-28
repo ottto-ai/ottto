@@ -695,3 +695,56 @@ counts. Callers close the decoder and explicitly release after Stores drops.
 Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
+
+
+## Codex ownership-incomplete causes
+
+The existing `snapshot terminal_census source=codex` line appends count-only
+`ownership_<bucket>` and `ownership_<bucket>_distinct` fields. Existing field
+order and all holds, selection, parsing, upload and settlement decisions are
+unchanged. These diagnostics never authorize a read or admission.
+
+**Contributions: generation-cumulative, restart-retained, same unit as
+ownership_incomplete_files.** The scanner scalar S counts contributions, not
+unique paths or sessions. The six contribution buckets plus
+`ownership_unattributed` equal S. The existing terminal public scalar also adds
+`unproven_terminal` (snapshot entities) and any existing account-deferred hold
+term; those additions are outside this Codex scanner partition.
+
+| Bucket | Contribution unit and existing site |
+| --- | --- |
+| `inventory_hold` | Group member count at compound group-preparation refusal (inventory, captured membership, protected history, owner collisions or singleton protection); remaining singleton candidate count when incomplete inventory clears the vector. |
+| `created_thread_proof` | One per held parsed rollout in the strict native-created-thread-only proof path, including failed parentless A2 conjuncts. An exact unresolvable-parent cause takes precedence. |
+| `parent_unresolvable` | One per held parsed rollout with an exact parent cause, including Absent, DeferredRef and DeferredRestart. |
+| `protected_absent` | Newly missing protected path index keys, excluding keys already in this generation's existing residue set. |
+| `other_group_receipt_legacy` | Strict group member failures; one per terminal group member disclosure; requested-tier replay candidate; receipt-cap alias members (minimum one); incomplete joined replacement alias members; distinct affected keys per post-parse legacy hold invocation. |
+| `other_parser` | One per other ownership-incomplete parsed rollout after excluding the parent and native-created-thread proof cases. |
+| `unattributed` | Scanner contributions restored without this split from older checkpoints; unavailable cause, never snapshot-terminal entities. |
+
+Group/member counts retain exactly the existing member-count arithmetic; repeated
+selections, held memo replays and repeated hold invocations contribute again.
+The original cause travels with the held singleton/group disclosure, including
+memo replays. Counts persist only inside the existing serialized traversal counts
+as a trailing defaulted diagnostic field; no parser/identity version changes.
+
+**Distinct: unique path keys observed by this process in this generation;
+resets on restart.** Distinct counters use physical path index keys, not inodes
+or logical sessions. First observed cause wins across all buckets. Only 64-bit
+key hashes are retained in RAM; hashes, paths and ids are never emitted or
+persisted. Hash collisions can undercount this diagnostic. Capacity is fixed
+when the process first observes the traversal: the smaller of the current index
+entry count and 65,536, including zero for an empty index. At capacity, no new
+hash is inserted and `ownership_distinct_capped=true` marks lower-bound distinct
+counts. Existing hashes retain their original cause. A new traversal resets
+membership and the flag; restart resets them while keeping contributions.
+Thus contributions minus distinct reflects repeat contributions for the observed
+population, but also includes pre-restart contributions and untracked keys after
+capping. It is not an exact repeat gauge across those boundaries.
+
+`ownership_input_plain` and `ownership_input_compressed` orthogonally count
+contributions by the already-known input path representation (`.jsonl.zst` for
+compressed). They sum to classified contributions; legacy unattributed inputs
+have unavailable representation. No reads are added. A plain child of an Absent
+parent remains a plain input: Absent never implies a compressed parent, and
+`archived_sessions` does not imply compression. The counters contain no usage,
+prices, account identifiers or transcript content.

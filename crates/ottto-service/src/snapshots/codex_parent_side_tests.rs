@@ -11,6 +11,7 @@ fn parsed() -> ParsedJsonlFile {
         snapshots: Vec::new(),
         report: JsonlReadReport::default(),
         recognized_usage_drop_count: 0,
+        cause: ownership::PARSER,
         ownership_incomplete_file_count: 0,
         zero_snapshot_usage_evidence: false,
         dropped_usage_record_count: 0,

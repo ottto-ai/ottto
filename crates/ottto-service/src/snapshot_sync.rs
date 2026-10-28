@@ -3319,6 +3319,7 @@ struct SyncCounts {
     over_line_cap_count: u64,
     recognized_usage_drop_count: u64,
     ownership_incomplete_file_count: u64,
+    causes: crate::snapshots::ownership_diagnostics::Summary,
     snapshot_unproven_terminal_count: u64,
     snapshot_superseded_terminal_count: u64,
     cooldown_conflict_deferred: usize,
@@ -3442,6 +3443,9 @@ impl SyncCounts {
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
             ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
+            causes: scan_result
+                .causes
+                .summary(scan_result.ownership_incomplete_file_count),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -3469,7 +3473,7 @@ impl SyncCounts {
     }
 
     fn terminal_census_line(&self, source: &str) -> String {
-        format!(
+        let mut line = format!(
             "snapshot terminal_census source={source} census_complete={} scanned_files={} \
              uploaded={} unproven_terminal={} superseded_terminal={} \
              ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
@@ -3485,7 +3489,11 @@ impl SyncCounts {
             self.cooldown_conflict_deferred,
             crate::snapshots::terminal_contract_retry::local_count(),
             crate::snapshots::terminal_contract_retry::exhausted_count(),
-        )
+        );
+        if source == "codex" {
+            line.push_str(&crate::snapshots::ownership_diagnostics::line(self.causes));
+        }
+        line
     }
 
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {

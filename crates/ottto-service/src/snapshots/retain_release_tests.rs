@@ -1076,6 +1076,7 @@ fn x_out_coverage_witness_names_every_finished_field() {
             snapshots: _,                               // I (Vec slot) + per-item fields below
             report: _,                                  // M
             recognized_usage_drop_count: _,             // I
+            cause: _,                                   // I (local Codex diagnostic)
             ownership_incomplete_file_count: _,         // I
             zero_snapshot_usage_evidence: _,            // I
             dropped_usage_record_count: _,              // I
