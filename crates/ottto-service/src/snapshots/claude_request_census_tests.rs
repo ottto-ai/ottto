@@ -2465,7 +2465,7 @@ fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidat
         let state = scratch.join(arm);
         let index_path = state.join("index.json");
         let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
-        let namespace = Scope("held-census-production".to_owned());
+        let namespace = crate::transcript_acquisition::Scope("held-census-production".to_owned());
         cache.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &namespace, false);
         // Both entries are reparse debt, so both files are Parse while unchanged.
         let mut index = seeded.clone();
