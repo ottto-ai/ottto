@@ -19,7 +19,8 @@
 //!   committed one. Anything else is Full; nothing is partially applied.
 //! - Unknown representations hold acquisition and survive every mutation. A
 //!   known corrupt record (T14) is one counted Full read, then replaced by the
-//!   post-save rename-over; nothing deletes it first. More than
+//!   post-save rename-over; without replacement, later passes hold it for
+//!   this process. Nothing deletes it first. More than
 //!   `max(T14_BREAKER, 2%)` T14 records in one pass disable the store.
 //! - Owner or mode faults are store-level: our own entries get 0700/0600
 //!   back; a foreign owner disables the store for this process (memory-only).
@@ -409,11 +410,12 @@ pub(crate) struct DurableTailStore {
     counters: StoreCounters,
     /// The store-level fault that made this store memory-only for the process.
     disabled: Option<&'static str>,
-    /// This pass: directory checked, [records loaded, T14 rebuilds], and the
-    /// rebuilt keys (at most `REBUILT_BOUND`; past it a repeat counts again).
+    /// This pass: directory checked and [records loaded, T14 rebuilds].
     checked: bool,
     pass: [u64; 2],
-    rebuilt: BTreeSet<Digest32>,
+    /// Process-lifetime attempts; true permits the current pass
+    /// (including the restore recheck), false holds a still-corrupt record.
+    rebuilt: BTreeMap<Digest32, bool>,
 }
 
 /// The most record files one GC or inventory pass looks at. Twice the
@@ -437,7 +439,7 @@ impl DurableTailStore {
             disabled: None,
             checked: false,
             pass: [0; 2],
-            rebuilt: BTreeSet::new(),
+            rebuilt: BTreeMap::new(),
         }
     }
 
@@ -445,7 +447,7 @@ impl DurableTailStore {
     pub(crate) fn begin_pass(&mut self) {
         self.checked = false;
         self.pass = [0; 2];
-        self.rebuilt.clear();
+        self.rebuilt.values_mut().for_each(|active| *active = false);
     }
 
     pub(crate) fn disabled(&self) -> Option<&'static str> {
@@ -464,12 +466,13 @@ impl DurableTailStore {
     fn usable(&mut self) -> bool {
         if !self.checked && self.disabled.is_none() {
             self.checked = true;
-            match fs::symlink_metadata(&self.dir) {
+            match inspect_path(&self.dir) {
                 Ok(metadata) if !metadata.is_dir() => self.disable("not_directory"),
                 Ok(metadata) => {
                     self.repair(&self.dir.clone(), &metadata, 0o700);
                 }
-                Err(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => self.disable("directory_access"),
             }
         }
         self.disabled.is_none()
@@ -523,6 +526,8 @@ impl DurableTailStore {
         let path = self.record_path(key);
         let result = (|| {
             let open = || {
+                #[cfg(test)]
+                test_hooks::before_access(&path, "open")?;
                 OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -532,19 +537,28 @@ impl DurableTailStore {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    let repaired = fs::symlink_metadata(&path)
-                        .is_ok_and(|m| m.is_file() && self.repair(&path, &m, 0o600));
+                    let repaired = match inspect_path(&path) {
+                        Ok(m) => m.is_file() && self.repair(&path, &m, 0o600),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                        Err(_) => false,
+                    };
                     if self.disabled.is_some() {
                         return Ok(None);
                     }
-                    if !repaired {
-                        return Err(Refusal::Undecodable);
+                    match repaired.then(open) {
+                        Some(Ok(file)) => file,
+                        Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                        _ => {
+                            self.disable("record_access");
+                            return Ok(None);
+                        }
                     }
-                    open().map_err(|_| Refusal::Undecodable)?
                 }
                 Err(_) => return Err(Refusal::Undecodable),
             };
-            let metadata = file.metadata().map_err(|_| Refusal::Undecodable)?;
+            let Some(metadata) = self.inspect_file(&file) else {
+                return Ok(None);
+            };
             if metadata.is_file() && !self.repair(&path, &metadata, 0o600) {
                 return Ok(None);
             }
@@ -552,12 +566,14 @@ impl DurableTailStore {
             Read::by_ref(&mut file)
                 .take(HEADER_BYTES as u64)
                 .read_to_end(&mut header)
-                .map_err(|_| Refusal::Undecodable)?;
+                .map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
             let n = header.len();
             self.counters.guard_header_bytes += n as u64;
             let binding = decode_header(&header, key, self.source)?;
             // After any repair: its ctime moved.
-            let metadata = file.metadata().map_err(|_| Refusal::Corrupt)?;
+            let Some(metadata) = self.inspect_file(&file) else {
+                return Ok(None);
+            };
             let stamp = Stamp::of(&metadata);
             if !metadata.is_file()
                 || metadata.len() > (RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES) as u64
@@ -570,7 +586,7 @@ impl DurableTailStore {
             let mut bytes = header;
             file.take((RECORD_BYTES + TRAILER_BYTES + 1) as u64)
                 .read_to_end(&mut bytes)
-                .map_err(|_| Refusal::Corrupt)?;
+                .map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
             let read = bytes.len().saturating_sub(n) as u64;
             match work {
                 "delete" => self.counters.delete_verify_bytes += read,
@@ -584,6 +600,9 @@ impl DurableTailStore {
             }
             Ok(Some(binding))
         })();
+        if self.disabled.is_some() {
+            return Ok(None);
+        }
         if let Err(reason) = result {
             self.durable.remove(key);
             self.counters.format_hold[reason as usize] += 1;
@@ -591,25 +610,44 @@ impl DurableTailStore {
         result
     }
 
-    /// U holds. T14 does not: the key is read Full once (counted) and its
-    /// record is overwritten after the save, unless the breaker disables the store.
+    fn read_failure(&mut self, error: io::Error, reason: Refusal) -> Refusal {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            self.disable("record_access");
+        }
+        reason
+    }
+
+    fn inspect_file(&mut self, file: &File) -> Option<fs::Metadata> {
+        #[cfg(test)]
+        if test_hooks::before_access(&self.dir, "fstat").is_err() {
+            self.disable("record_metadata");
+            return None;
+        }
+        file.metadata()
+            .inspect_err(|_| self.disable("record_metadata"))
+            .ok()
+    }
+
+    /// U holds. T14 gets one counted rebuild pass per process; if it still
+    /// cannot be replaced, later passes hold until restart or replacement.
     pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
         let result = self.classify(key, "guard");
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
         match result {
-            Err(Refusal::Corrupt) if !self.rebuilt.contains(key) => {
+            Err(Refusal::Corrupt) if !self.rebuilt.contains_key(key) => {
                 if self.pass[1] >= T14_BREAKER.max(self.pass[0] / 50) {
                     self.disable("t14_breaker");
+                } else if self.rebuilt.len() >= REBUILT_BOUND {
+                    self.disable("t14_rebuilt_overflow");
                 } else {
                     self.pass[1] += 1;
                     self.counters.t14_rebuild += 1;
-                    if self.rebuilt.len() < REBUILT_BOUND {
-                        self.rebuilt.insert(*key);
-                    }
+                    self.rebuilt.insert(*key, true);
                 }
                 None
             }
-            Err(Refusal::Corrupt) | Ok(_) => None,
+            Err(Refusal::Corrupt) if self.rebuilt[key] => None,
+            Ok(_) => None,
             Err(reason) => Some(reason),
         }
     }
@@ -625,6 +663,10 @@ impl DurableTailStore {
         }
         let bytes = match read_private(&self.record_path(key)) {
             Ok(Some(bytes)) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                self.disable("record_access");
+                return ReadOutcome::Missing;
+            }
             _ => return ReadOutcome::Refused(Refusal::Corrupt),
         };
         self.counters.records_read += 1;
@@ -802,6 +844,8 @@ impl DurableTailStore {
             }
             Err(error) => return Err(error),
         };
+        #[cfg(test)]
+        let entries = test_hooks::gc_entries(entries);
         let mut deleted = false;
         let mut on_disk = BTreeMap::new();
         self.counters.uninventoried_records = 0;
@@ -842,6 +886,7 @@ impl DurableTailStore {
                         };
                     live.then_some(len)
                 }
+                Ok(None) if self.disabled.is_some() => return Ok(()),
                 Ok(None) => continue,
                 Err(_) => Some(len),
             };
@@ -982,6 +1027,12 @@ fn content_digest(record: &PendingRecord) -> Digest32 {
         "ottto-dt-content:v2",
         &[header.as_slice(), record.body.as_slice()],
     )
+}
+
+fn inspect_path(path: &Path) -> io::Result<fs::Metadata> {
+    #[cfg(test)]
+    test_hooks::before_access(path, "metadata")?;
+    fs::symlink_metadata(path)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1344,7 +1395,7 @@ fn decode(bytes: &[u8], allowlist: &Digest32) -> Result<DurableRecord, Refusal> 
     Ok(record)
 }
 
-/// Test-only fault points inside the atomic write.
+/// Test-only filesystem faults and deterministic GC ordering.
 #[cfg(test)]
 pub(crate) mod test_hooks {
     use std::cell::RefCell;
@@ -1353,11 +1404,39 @@ pub(crate) mod test_hooks {
 
     type Hook = Box<dyn FnMut(&Path, &Path) -> io::Result<()>>;
     type DirHook = Box<dyn FnMut(&Path) -> io::Result<()>>;
+    type AccessHook = Box<dyn FnMut(&Path, &str) -> io::Result<()>>;
 
     thread_local! {
         static BEFORE_RENAME: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static BEFORE_DIR_SYNC: RefCell<Option<DirHook>> = const { RefCell::new(None) };
+        static BEFORE_ACCESS: RefCell<Option<AccessHook>> = const { RefCell::new(None) };
+        static RECORDS_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn set_before_access(hook: Option<AccessHook>) {
+        BEFORE_ACCESS.with(|slot| *slot.borrow_mut() = hook);
+    }
+    pub(super) fn before_access(path: &Path, operation: &str) -> io::Result<()> {
+        BEFORE_ACCESS.with(|slot| match slot.borrow_mut().as_mut() {
+            Some(hook) => hook(path, operation),
+            None => Ok(()),
+        })
+    }
+    pub(crate) fn set_gc_records_first(value: bool) {
+        RECORDS_FIRST.with(|slot| slot.set(value));
+    }
+    pub(super) fn gc_entries(entries: std::fs::ReadDir) -> Vec<io::Result<std::fs::DirEntry>> {
+        let mut entries: Vec<_> = entries.collect();
+        if RECORDS_FIRST.with(std::cell::Cell::get) {
+            entries.sort_by_key(|entry| {
+                entry.as_ref().ok().map(|entry| {
+                    let name = entry.file_name();
+                    (!name.to_string_lossy().ends_with(".rec"), name)
+                })
+            });
+        }
+        entries
     }
 
     /// The uid the store treats as its own (a foreign owner without root).
