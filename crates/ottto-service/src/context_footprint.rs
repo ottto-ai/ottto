@@ -1262,8 +1262,9 @@ pub(crate) fn safe_text(raw: &str, max_len: usize) -> Option<String> {
 const OBSERVED_CWDS_PER_FILE: usize = 8;
 const OBSERVED_CWD_MAX_BYTES: usize = 4 * 1024;
 const PROJECTION_MAX_BYTES: usize = 4 * 1024 * 1024;
-/// Charged per projected file for its entry and map slot (the map may hold
-/// twice its live entries), on top of its cwd allocations.
+/// Charged per projected file for its map slots, on top of its cwd
+/// allocations: `merge` keeps the map's capacity within twice its files plus
+/// eight, and one slot (entry and control byte at 7/8 load) is under 128 bytes.
 const PROJECTED_FILE_BYTES: usize = 256;
 
 /// Raw cwds of Claude transcripts, filled by snapshot sync's one read through
@@ -1344,12 +1345,11 @@ impl CwdProjection {
         for cwd in &cwds {
             remember_cwd(&mut known, cwd);
         }
-        let Some(mtime) = file.mtime.filter(|_| !known.is_empty()) else {
-            return;
-        };
-        let entry = ProjectedFile { mtime, cwds: known };
-        projection.bytes += projected_bytes(&entry);
-        projection.files.insert(file.object, entry);
+        if let Some(mtime) = file.mtime.filter(|_| !known.is_empty()) {
+            let entry = ProjectedFile { mtime, cwds: known };
+            projection.bytes += projected_bytes(&entry);
+            projection.files.insert(file.object, entry);
+        }
         while projection.bytes > PROJECTION_MAX_BYTES {
             let oldest = projection.files.iter().min_by_key(|(_, file)| file.mtime);
             let Some(oldest) = oldest.map(|(object, _)| *object) else {
@@ -1361,6 +1361,11 @@ impl CwdProjection {
                 .map_or(0, |file| projected_bytes(&file));
             projection.bytes -= evicted;
             projection.evicted_files += 1;
+        }
+        // Removal keeps the table's allocation; shrink it before it outgrows
+        // the per-file charge.
+        if projection.files.capacity() > 2 * projection.files.len() + 8 {
+            projection.files.shrink_to_fit();
         }
     }
 
@@ -3429,6 +3434,64 @@ mod tests {
         assert!(projection.recent_cwds(newest + day * 30).is_empty());
         let state = projection.lock();
         assert_eq!((state.bytes, state.files.capacity()), (0, 0));
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn projection_shrinks_its_map_after_evictions_and_empty_full_reads() {
+        // The per-file charge covers a map of twice its files plus eight only
+        // while one slot (entry and control byte at 7/8 load) is under 128 bytes.
+        const _: () =
+            assert!((std::mem::size_of::<(FileObject, ProjectedFile)>() + 1) * 8 / 7 < 128);
+        let within_charge = |state: &Projection| {
+            state.files.capacity() <= 2 * state.files.len() + 8
+                && state.bytes <= PROJECTION_MAX_BYTES
+        };
+        let root = temp_dir("cwd-projection-churn");
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let projection = Arc::new(CwdProjection::default());
+        let mut observer = projection.observer();
+        let short = [json!({"cwd": "/s"})];
+        let mut shorts = Vec::new();
+        for index in 0..2_000 {
+            let path = root.join(format!("short-{index:04}.jsonl"));
+            fs::write(&path, "").unwrap();
+            let view = claude_view(&path, start, DeliveryMode::Full);
+            deliver(&mut observer, &view, &short, DeliveryEnd::Complete);
+            shorts.push(view);
+        }
+        assert_eq!(projection.lock().files.len(), 2_000);
+
+        // Full reads that name no cwd forget every file and release the map.
+        for view in &shorts {
+            deliver(&mut observer, view, &[json!({})], DeliveryEnd::Complete);
+        }
+        let state = projection.lock();
+        assert!(state.files.is_empty() && state.bytes == 0 && within_charge(&state));
+        drop(state);
+
+        // Newer large files evict the short ones; the map shrinks with them.
+        for view in &shorts {
+            deliver(&mut observer, view, &short, DeliveryEnd::Complete);
+        }
+        let large: Vec<Value> = (0..OBSERVED_CWDS_PER_FILE)
+            .map(|i| json!({"cwd": format!("/{i}{}", "c".repeat(OBSERVED_CWD_MAX_BYTES - 2))}))
+            .collect();
+        for index in 0..130u64 {
+            let path = root.join(format!("large-{index:03}.jsonl"));
+            fs::write(&path, "").unwrap();
+            let view = claude_view(
+                &path,
+                start + Duration::from_secs(index + 1),
+                DeliveryMode::Full,
+            );
+            deliver(&mut observer, &view, &large, DeliveryEnd::Complete);
+            assert!(within_charge(&projection.lock()));
+        }
+        let state = projection.lock();
+        assert_eq!((state.files.len(), state.evicted_files), (126, 2_004));
+        assert!(within_charge(&state));
         drop(state);
         fs::remove_dir_all(root).unwrap();
     }
