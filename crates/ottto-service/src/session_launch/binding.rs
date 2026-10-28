@@ -126,6 +126,19 @@ pub(super) fn resolve(
         }
         Provider::Codex => {
             let store = FileCodexAccountSlotSettingsStore::default();
+            let (auth_home, trust) = if slot_id == "default" {
+                (user.home.join(".codex"), CodexHomeTrust::ProviderDefault)
+            } else {
+                (
+                    store
+                        .slot_home(slot_id)
+                        .map_err(|_| block(Reason::SlotNotFound))?,
+                    CodexHomeTrust::Managed,
+                )
+            };
+            if crate::agent_status::session_launch_codex_api_key_route(&auth_home, trust) {
+                return Err(block(Reason::CodexApiKeyLogin));
+            }
             let status = crate::agent_status::session_launch_codex_accounts_status(
                 store
                     .load_for_session_launch()

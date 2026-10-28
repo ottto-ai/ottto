@@ -17593,10 +17593,32 @@ pub(crate) fn session_launch_claude_identity(
     ))
 }
 
+/// Explicit or persisted API authentication must not inherit stale OAuth
+/// tokens from the same auth file. Unknown non-null modes are inert too.
+pub(crate) fn session_launch_codex_api_key_route(home: &Path, trust: CodexHomeTrust) -> bool {
+    let Some(value) = ottto_core::read_codex_auth_file_secure(home, trust)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return false;
+    };
+    value
+        .get("auth_mode")
+        .filter(|mode| !mode.is_null())
+        .is_some_and(|mode| mode.as_str() != Some("chatgpt"))
+        || value
+            .get("OPENAI_API_KEY")
+            .is_some_and(|key| !key.is_null() && key.as_str() != Some(""))
+}
+
 pub(crate) fn session_launch_codex_identity(
     home: &Path,
     trust: CodexHomeTrust,
 ) -> Option<(String, String)> {
+    if session_launch_codex_api_key_route(home, trust) {
+        return None;
+    }
     let credential = read_codex_auth_credentials_at(home, trust).ok()??;
     let (account, workspace) = codex_credential_claimed_ids(&credential)?;
     Some((

@@ -595,6 +595,20 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
         fs::read_to_string(&witness).unwrap(),
         "--version\n--version\n"
     );
+    let mut auth: serde_json::Value =
+        serde_json::from_slice(&fs::read(codex.join("auth.json")).unwrap()).unwrap();
+    auth["auth_mode"] = serde_json::json!("apikey");
+    auth["OPENAI_API_KEY"] = serde_json::json!("synthetic-api-key");
+    fs::write(codex.join("auth.json"), serde_json::to_vec(&auth).unwrap()).unwrap();
+    assert_eq!(
+        prepare(&mut registry).err().unwrap().reason,
+        Reason::CodexApiKeyLogin
+    );
+    assert!(!nickname_target_is_current_for_user(&pair, user.clone()));
+    assert_eq!(
+        fs::read_to_string(&witness).unwrap(),
+        "--version\n--version\n"
+    );
     fs::remove_file(codex.join("auth.json")).unwrap();
     assert!(!nickname_target_is_current_for_user(&pair, user));
     assert_eq!(
