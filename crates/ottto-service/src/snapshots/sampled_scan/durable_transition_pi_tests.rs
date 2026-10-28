@@ -11,7 +11,7 @@
 // compiled. Test-only overrides this file assumes: the `PI_LEDGER_MAX_KEYS`
 // thread-local that PR-Pi-b2 adds in the Pi codec module (`ledger_cap` below),
 // E1's 5c1a0a-1 active-budget override (P-ACTIVE-BOUND stays ignored until it
-// lands) and `Harness::full_reads(cause)` from r2-interfaces (5c1a0a-2).
+// lands) and the free test function `transition_fixture::full_reads` (5c1a0a-2).
 //
 // P-PREACT (a binary without Pi support meeting Pi files and a Pi store) is a
 // cross-build property: it belongs to the money_equivalence base-vs-candidate
@@ -243,13 +243,6 @@ impl PiDriver {
     fn holds(&self, mode: Mode) -> u64 {
         let (counts, store) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
         store.format_hold.iter().chain(&counts.durable_held).sum()
-    }
-
-    /// This route's `full_reads{cause}`. ASSUMED: `Harness::full_reads(cause)`
-    /// (r2-interfaces, R2 plan) arrives with 5c1a0a-2; the receiver and
-    /// arguments here are a guess until it lands.
-    fn full_reads(&self, mode: Mode, cause: &str) -> u64 {
-        fixture::Harness::full_reads(&self.pages[&mode].cache, SOURCE, cause)
     }
 
     /// This route's content-free durable summary line for source=pi.
@@ -618,6 +611,14 @@ fn pi_ram_resident_same_head_cut_reads_one_real_edit_full() {
     money_oracle::assert_equivalent(&cold, &edited);
 }
 
+/// `full_reads{cause}` for one route, its source taken from `result.source`.
+/// ASSUMED: E1's free test function arrives with 5c1a0a-2, proposed as
+/// `transition_fixture::full_reads(&RouteResult, &str) -> u64`; E1 publishes
+/// the exact signature in r2-interfaces. This is its only call site.
+fn full_reads(result: &RouteResult, cause: &str) -> u64 {
+    fixture::full_reads(result, cause)
+}
+
 /// One trailer-valid Pi-section defect (P-T14-SECTION) in a record body whose
 /// last bytes are the Pi section: tag 1, u64 LE length, then the H-keyed map
 /// (key-count varint, then per entry a 32-byte H key and its value).
@@ -886,7 +887,7 @@ fn pi_active_bound_publishes_new_keys_without_record_and_never_fulls_on_restore(
         .summary(Mode::Restart)
         .contains("durable_live_finish_not_persisted={active_bound:1}"));
     // The one named exception: a NEW key published without a record.
-    assert_eq!(f.full_reads(Mode::Restart, "degraded_no_record"), 1);
+    assert_eq!(full_reads(&full, "degraded_no_record"), 1);
     let (_, refused, t14) = f.counters(Mode::Restart);
     assert_eq!((refused, t14), (0, 0), "not a refused record");
     money_oracle::assert_equivalent(&cold, &full);
@@ -957,7 +958,7 @@ fn pi_ledger_over_cap_refuses_the_codec_and_keeps_an_existing_record() {
         summary.contains("durable_live_finish_not_persisted={codec:1}"),
         "{summary}"
     );
-    assert_eq!(f.full_reads(Mode::Restart, "degraded_no_record"), 1);
+    assert_eq!(full_reads(&full, "degraded_no_record"), 1);
     let (_, refused, t14) = f.counters(Mode::Restart);
     assert_eq!((refused, t14), (0, 0), "not a refused record");
     money_oracle::assert_equivalent(&cold, &full);
