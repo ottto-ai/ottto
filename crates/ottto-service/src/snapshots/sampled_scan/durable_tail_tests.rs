@@ -749,3 +749,46 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+#[test]
+fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
+    let root = crate::test_scratch::private_dir("zst-record-refusal");
+    let plain = root.join("plain.jsonl");
+    std::fs::write(&plain, b"{\"n\":1}\n").unwrap();
+    let scope = Scope("fixture".into());
+    let binding = Binding {
+        source: DurableSource::Codex,
+        key: [0; 32],
+        context: [0; 32],
+        scope: [0; 32],
+        entry: [0; 32],
+    };
+    let expected = Expected {
+        binding: binding.clone(),
+        committed_generation: 1,
+    };
+    let record = store::DurableRecord {
+        record: PendingRecord {
+            binding,
+            certificate: certificate(&plain, &scope),
+            body: Vec::new(),
+            allowlist: [0; 32],
+        },
+        index_generation: 1,
+    };
+    let mut held = File::open(&plain).unwrap();
+    codex_zst_refusal_tests::assert_refused(CodexZstCause::DurableTailUnsupported, || {
+        assert!(matches!(
+            SharedCache::default().durable_restore_record(
+                SnapshotSource::Codex,
+                &record,
+                &expected,
+                &root.join("rollout.jsonl.zst"),
+                &scope,
+                &mut held
+            ),
+            Err(Failure::NotRederived(_))
+        ));
+    });
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -3,10 +3,38 @@
 //! bind the header, plain/compressed twin identity and decoder credit at each
 //! open site before it constructs `OpenedInput::compressed`.
 #![cfg_attr(not(test), allow(dead_code))]
+use crate::local_resource_diagnostics::{codex_zst_refused, CodexZstCause};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
+use std::path::Path;
 use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer};
+
+/// One predicate for a candidate's encoding or the already-opened input kind.
+/// A suffix is only a refusal signal, never ownership or decode authority.
+pub(super) fn is_compressed_codex_rollout(
+    path: Option<&Path>,
+    input: Option<&OpenedInput>,
+) -> bool {
+    path.and_then(Path::file_name)
+        .is_some_and(|name| name.as_encoded_bytes().ends_with(b".jsonl.zst"))
+        || input.is_some_and(OpenedInput::is_compressed)
+}
+
+pub(super) fn refuse_compressed_codex(
+    path: Option<&Path>,
+    input: Option<&OpenedInput>,
+    cause: CodexZstCause,
+) -> io::Result<()> {
+    if is_compressed_codex_rollout(path, input) {
+        codex_zst_refused(cause);
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            serde_json::to_string(&cause).unwrap_or_else(|_| "compressed refusal".into()),
+        ));
+    }
+    Ok(())
+}
 
 /// Compressed bytes buffered from the File, and decoded bytes buffered for the
 /// line reader. Plain input keeps `BufReader::new`'s default capacity.
@@ -60,6 +88,8 @@ pub(super) struct BoundedDecoder<R: Read> {
 
 impl<R: Read> BoundedDecoder<R> {
     fn new(input: R, decoded_limit: u64) -> io::Result<Self> {
+        #[cfg(test)]
+        super::codex_zst_refusal_tests::decoder_constructed();
         let reserved = decoder_reservation()?;
         let mut context = DCtx::try_create()
             .ok_or_else(|| io::Error::other("compressed rollout decoder allocation failed"))?;

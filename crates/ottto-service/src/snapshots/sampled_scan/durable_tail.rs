@@ -399,6 +399,12 @@ impl SharedCache {
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
     ) -> Option<Taken<CachedJsonlReduction>> {
+        if snapshot_source == SnapshotSource::Codex
+            && refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
+                .is_err()
+        {
+            return None;
+        }
         let source = durable_source(snapshot_source)?;
         let expected = expected(source, snapshot_source, key, scope, index, interpretation)?;
         let allowlist = codec::allowlist_digest(snapshot_source);
@@ -496,6 +502,10 @@ impl SharedCache {
         scope: &Scope,
         held: &mut File,
     ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
+        if source == SnapshotSource::Codex {
+            refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
+                .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
+        }
         record.eligible(expected).map_err(Failure::Ineligible)?;
         let (checkpoint, _) = record
             .record

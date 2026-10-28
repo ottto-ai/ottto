@@ -133,6 +133,11 @@ impl OwnedJsonlParser {
     ) -> Result<ReadMode> {
         // Checkpoints, samples and resume offsets are physical-file bytes. A
         // compressed stream has none, so it is never sampled or resumed.
+        refuse_compressed_codex(
+            None,
+            Some(&self.reader.reader),
+            CodexZstCause::PhysicalOffsetUnsupported,
+        )?;
         anyhow::ensure!(
             !self.reader.reader.is_compressed(),
             "compressed input has no physical acquisition offsets"

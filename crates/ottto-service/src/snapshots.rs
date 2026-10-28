@@ -66,6 +66,8 @@ pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
 pub(crate) use tests::output as claude_request_account_output;
 mod codex_compressed_input;
+#[cfg(test)]
+mod codex_zst_refusal_tests;
 mod compaction_events;
 pub(crate) use compaction_events::bounded_compaction_events;
 pub use compaction_events::SnapshotCompactionEvent;
@@ -135,6 +137,7 @@ use stale_carry_diagnostics::{
 };
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
+use crate::local_resource_diagnostics::CodexZstCause;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
 pub(crate) use claude_history_upgrade::{
     note_prior_history_unverified, PriorHistory, MAX_GATED_CLAUDE_REVISION,
@@ -147,7 +150,7 @@ use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState}
 use claude_response_records::{
     ClaudeResponseBook, ClaudeSelectorTable, CompactClaudeResponseRecord, CompactClaudeSelector,
 };
-use codex_compressed_input::OpenedInput;
+use codex_compressed_input::{refuse_compressed_codex, OpenedInput};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 // Stage 1 (N2): the cursor side of a continuation page, for StateMissing's
 // adapter in `snapshot_sync` (inert while continuation pages are disabled).
@@ -21597,6 +21600,9 @@ fn codex_parent_candidate_match(
         CodexCensusMatch::Duplicated => return Err(Duplicated),
         CodexCensusMatch::One(key) => PathBuf::from(key),
     };
+    if refuse_compressed_codex(Some(&path), None, CodexZstCause::ParentLedgerUnbound).is_err() {
+        return Err(Absent);
+    }
     let scan_root = census
         .scan_roots
         .iter()
@@ -21680,6 +21686,15 @@ fn retained_codex_parent(
     Option<(String, String)>,
 ) {
     let opened = codex_parent_locate(census, parent).and_then(|(key, file)| {
+        if refuse_compressed_codex(
+            Some(Path::new(&key)),
+            None,
+            CodexZstCause::ParentLedgerUnbound,
+        )
+        .is_err()
+        {
+            return Err(CodexParentUnresolvable::Absent);
+        }
         cache
             .retained_open(Path::new(&key), &file)
             .map(|(_, identity, live)| (identity, live))
@@ -22020,6 +22035,7 @@ impl CodexProofReader {
         file: File,
         now: u64,
     ) -> Result<Self> {
+        refuse_compressed_codex(Some(&path), None, CodexZstCause::ProofParentUnsupported)?;
         let stamp_open = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
         let mut parser = OwnedJsonlParser::new(
             file,
@@ -22062,6 +22078,7 @@ impl CodexProofReader {
     /// A child's decision-only reader, frozen at its open extent. No
     /// acquisition: the child side is re-proven at use by the chain.
     pub(in crate::snapshots) fn child(key: String, path: PathBuf, file: File) -> Result<Self> {
+        refuse_compressed_codex(Some(&path), None, CodexZstCause::ProofChildUnsupported)?;
         let stamp_open = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
         let mut parser = OwnedJsonlParser::new(
             file,
@@ -27356,7 +27373,14 @@ impl OwnedSourceScan {
                             .memo_digest(index, &codex_title_metadata)
                             .zip(live_file.as_ref())
                             .and_then(|(digest, file)| {
-                                entry.matches_stamp(&digest, file, None, "", wake_stamp.clone()?)
+                                entry.matches_stamp(
+                                    &boot.live()?.0.path,
+                                    &digest,
+                                    file,
+                                    None,
+                                    "",
+                                    wake_stamp.clone()?,
+                                )
                             });
                         if let Some(stamp) = hit {
                             // No wake dependency changed: the same terminal
@@ -27947,7 +27971,8 @@ impl OwnedSourceScan {
                 }) {
                     // Native finish compares the reopened descriptor to the captured
                     // identity, so replacement during fallback cannot publish.
-                    let reopened = open_candidate_file(source, &mut active.candidate.clone());
+                    let reopened =
+                        reopen_for_replay(source, &active.candidate, &active.parser.reader.reader);
                     let Ok(file) = reopened else {
                         census.record_unreadable(UnreadableCause::OpenRead, 1);
                         pending!();
@@ -28280,7 +28305,11 @@ impl OwnedSourceScan {
                 }
                 let memo_candidate = memo_offset.and_then(|offset| {
                     let file = active.parser.reader.reader.get_ref();
-                    let live = sampled_scan::codex_cursor::LiveWitness::read(file, offset)?;
+                    let live = sampled_scan::codex_cursor::LiveWitness::read(
+                        &active.candidate.path,
+                        file,
+                        offset,
+                    )?;
                     let stamp = sampled_scan::codex_cursor::OpenStamp::capture(file).ok()?;
                     // PR-1: every singleton entry is exact until a counted tail
                     // makes growth replayable, so the stamp must cover exactly
@@ -31318,6 +31347,7 @@ impl OwnedSourceScan {
                     });
                     let hit = digest.as_deref().and_then(|digest| {
                         entry.matches_stamp(
+                            &candidate.path,
                             digest,
                             &opened_file,
                             parent_now.as_ref(),
@@ -31365,6 +31395,7 @@ impl OwnedSourceScan {
                     }
                     match digest.as_deref().and_then(|digest| {
                         entry.grew_past_exact(
+                            &candidate.path,
                             digest,
                             &opened_file,
                             parent_now.as_ref(),
@@ -31568,6 +31599,12 @@ impl OwnedSourceScan {
                     .retain_target_metadata(bytes, capture_credit.expect("funded target input"))?;
             }
 
+            if side_origin.is_some() && check_parent_side_input(&candidate, None).is_err() {
+                if let Some(side) = side_origin {
+                    side.end();
+                }
+                pending!();
+            }
             let mut parser = match sampled_scan::new_source_parser(
                 opened_file,
                 &candidate,
@@ -31631,7 +31668,7 @@ impl OwnedSourceScan {
             if side_origin.is_some() {
                 // Defensive: a compressed input has no physical offsets or
                 // samples (no production open builds one today).
-                if parser.reader.reader.is_compressed() {
+                if check_parent_side_input(&candidate, Some(&parser.reader.reader)).is_err() {
                     if let Some(side) = side_origin {
                         side.end();
                     }
@@ -32673,6 +32710,7 @@ fn parse_codex_jsonl_file_with_diagnostics(
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<ParsedSnapshotFile> {
+    refuse_compressed_codex(Some(path), None, CodexZstCause::CompatibilityUnfunded)?;
     parse_jsonl_file(
         path,
         collected_at,
@@ -32993,6 +33031,9 @@ impl OwnedJsonlParser {
         artifacts_enabled: bool,
         context_curve_enabled: bool,
     ) -> Result<Self> {
+        if source == SnapshotSource::Codex {
+            refuse_compressed_codex(Some(path), None, CodexZstCause::CompatibilityUnfunded)?;
+        }
         Self::new_opened(
             OpenedInput::plain(file),
             path,
@@ -34282,6 +34323,8 @@ fn apply_physical_line(
     deliver: Option<(u64, line_delivery::LineTap<'_>)>,
     on_value: &mut impl FnMut(&Value),
 ) {
+    #[cfg(test)]
+    codex_zst_refusal_tests::jsonl_parse_attempted();
     report.physical_line_count += 1;
     if overflowed {
         report.over_line_cap_count += 1;
@@ -42345,6 +42388,33 @@ fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<Fil
         ));
     }
     fs::OpenOptions::new().read(true).open(&candidate.path)
+}
+
+/// Replay and parent-side readers fail before a parser or decoder is opened.
+fn reopen_for_replay(
+    source: SnapshotSource,
+    candidate: &CandidateFile,
+    input: &OpenedInput,
+) -> std::io::Result<File> {
+    if source == SnapshotSource::Codex {
+        refuse_compressed_codex(
+            Some(&candidate.path),
+            Some(input),
+            CodexZstCause::ReplayNotAuthorized,
+        )?;
+    }
+    open_candidate_file(source, &mut candidate.clone())
+}
+
+fn check_parent_side_input(
+    candidate: &CandidateFile,
+    input: Option<&OpenedInput>,
+) -> std::io::Result<()> {
+    refuse_compressed_codex(
+        Some(&candidate.path),
+        input,
+        CodexZstCause::ParentSideUnsupported,
+    )
 }
 
 fn opened_object_identity(source: SnapshotSource, file: &mut File) -> std::io::Result<String> {
