@@ -129,13 +129,21 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         &inventory_paths,
         Some(&directories),
     );
-    assert_refused(CodexZstCause::AdmissionRefused, || {
-        while !inventory.step(&CodexTitleMetadata::default()) {}
-        assert!(inventory.headers.is_empty());
-        assert!(inventory.refused.contains_key(&local_index_key(&path)));
-        assert!(!inventory.complete);
-        assert_eq!(inventory.read_bytes, 0);
-    });
+    assert_eq!(
+        inventory.step_with_archive(
+            &CodexTitleMetadata::default(),
+            &mut ScanIndex::default(),
+            None
+        ),
+        codex_file_join::HeaderStep::Deferred
+    );
+    assert!(inventory.headers.is_empty());
+    assert!(inventory.refused.is_empty());
+    assert!(inventory.complete);
+    assert!(inventory
+        .deferred_archives
+        .contains(&local_index_key(&path)));
+    assert_eq!(inventory.read_bytes, 0);
     let paths = BTreeSet::from([local_index_key(&path)]);
     let roots = [root.clone()];
     let census = CodexParentCensus::new(&roots, &paths);

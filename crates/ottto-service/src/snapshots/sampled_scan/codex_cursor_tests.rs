@@ -14919,11 +14919,12 @@ fn invalid_archive_owner_holds_paused_singleton_without_more_reads() {
             Some(&directories),
         );
         let ((), rows) = crate::local_resource_diagnostics::capture(|| {
-            while !inventory.step_with_archive(
+            while inventory.step_with_archive(
                 &CodexTitleMetadata::default(),
                 &mut index,
                 Some(&cache),
-            ) {}
+            ) != codex_file_join::HeaderStep::Complete
+            {}
         });
         assert!(inventory.complete);
         assert!(inventory.held_owners.contains(SESSION));

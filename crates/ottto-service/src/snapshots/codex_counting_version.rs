@@ -405,6 +405,8 @@ pub(super) fn absence_coverage_complete(
         && !index.files.values().any(|entry| entry.codex_compressed_hold.is_some())
         && !inventory.custody_refused
         && !inventory.custody_unknown
+        && inventory.first_read_archives.is_empty()
+        && inventory.deferred_archives.is_empty()
         && index.legacy_unresolved_root_file_witnesses.is_empty()
         && index.traversal.as_ref().is_some_and(|traversal| {
             !traversal.counts.has_errors()

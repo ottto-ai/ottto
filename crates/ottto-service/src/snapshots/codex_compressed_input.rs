@@ -206,6 +206,7 @@ fn bounded_archive_context<'de, D: serde::Deserializer<'de>>(
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ArchiveDisposition {
     HeaderValidated,
+    HeaderBoundReached,
     Acquired,
     Empty,
     Pending { attempts: u8, retry_after: u64 },
@@ -361,7 +362,10 @@ impl ArchiveEvidence {
     }
     pub(super) fn quiet(&self, file: &File) -> bool {
         self.matches(file)
-            && !matches!(self.disposition, ArchiveDisposition::HeaderValidated)
+            && !matches!(
+                self.disposition,
+                ArchiveDisposition::HeaderValidated | ArchiveDisposition::HeaderBoundReached
+            )
             && !matches!(self.disposition, ArchiveDisposition::Pending { retry_after, .. } if super::sampled_scan::now_seconds() >= retry_after)
     }
     pub(super) fn stop_exhausted(&mut self) -> bool {
@@ -439,6 +443,7 @@ impl ArchiveEvidence {
     pub(super) fn invalid_header(&self, path: &Path, metadata: &std::fs::Metadata) -> bool {
         let bound = self.header_for(path).is_some();
         !bound
+            && !matches!(self.disposition, ArchiveDisposition::HeaderBoundReached)
             && (self.header_attempted
                 || !matches!(self.disposition, ArchiveDisposition::HeaderValidated))
             && crate::transcript_acquisition::FileStamp::capture(metadata.clone())
@@ -621,10 +626,19 @@ impl OpenedInput {
         file: File,
         cache: &std::sync::Arc<super::sampled_scan::SharedCache>,
     ) -> io::Result<Option<Self>> {
+        Self::funded_inner(file, cache, true)
+    }
+    fn funded_inner(
+        file: File,
+        cache: &std::sync::Arc<super::sampled_scan::SharedCache>,
+        count_refusal: bool,
+    ) -> io::Result<Option<Self>> {
         let credit = compressed_input_credit()?;
         let Some(owner) = super::sampled_scan::codex_cursor::DecoderOwner::acquire(cache, credit)
         else {
-            codex_zst_refused(CodexZstCause::AdmissionRefused);
+            if count_refusal {
+                codex_zst_refused(CodexZstCause::AdmissionRefused);
+            }
             return Ok(None);
         };
         let mut input = Self::compressed(
@@ -814,6 +828,13 @@ impl super::ScanCensus {
         );
     }
 }
+/// A bounded inventory check grants neither ownership nor acquisition credit.
+#[derive(Debug)]
+pub(super) enum HeaderRead {
+    Validated(ValidatedHeader),
+    BoundReached,
+    Deferred,
+}
 impl super::ScanIndex {
     pub(super) fn archive_scoped_unknown(&self, key: &str) -> bool {
         let Some(t) = self.traversal.as_ref() else {
@@ -917,60 +938,67 @@ impl super::ScanIndex {
         candidate: &super::CandidateFile,
         cache: Option<&std::sync::Arc<super::sampled_scan::SharedCache>>,
         work: &mut HeaderWork,
-    ) -> super::Result<(ValidatedHeader, usize)> {
+    ) -> super::Result<HeaderRead> {
         use super::*;
         // Cached ownership evidence cannot grant acquisition permission.
         if !work.allowed {
-            codex_zst_refused(CodexZstCause::AdmissionRefused);
-            anyhow::bail!("archive inventory power/QoS gate");
+            return Ok(HeaderRead::Deferred);
         }
         let file = open_candidate_beneath_root(candidate)?;
         let key = local_index_key(&candidate.path);
         let previous = self.files.get(&key).and_then(|e| e.archive.as_deref());
         let old = previous.filter(|a| a.matches(&file));
         if let Some(header) = old.and_then(|a| a.header_for(&candidate.path)) {
-            return Ok((header.clone(), 0));
+            return Ok(HeaderRead::Validated(header.clone()));
         }
-        if old.is_some_and(|a| {
-            a.header_attempted || !matches!(a.disposition, ArchiveDisposition::HeaderValidated)
-        }) {
-            codex_zst_refused(CodexZstCause::HeaderInvalid);
-            anyhow::bail!("archive header unavailable without another read");
+        if let Some(old) = old {
+            if matches!(old.disposition, ArchiveDisposition::HeaderBoundReached) {
+                return Ok(HeaderRead::BoundReached);
+            }
+            if old.header_attempted
+                || !matches!(old.disposition, ArchiveDisposition::HeaderValidated)
+            {
+                codex_zst_refused(CodexZstCause::HeaderInvalid);
+                anyhow::bail!("archive header unavailable without another read");
+            }
         }
         if work.cpu_micros >= 30_000_000 {
-            codex_zst_refused(CodexZstCause::AdmissionRefused);
-            anyhow::bail!("archive inventory power/QoS/CPU gate");
+            return Ok(HeaderRead::Deferred);
         }
         let started = thread_cpu_micros();
         let mut evidence = ArchiveEvidence::begin(&file, &candidate.path, previous)?;
         evidence.disposition = ArchiveDisposition::HeaderValidated;
         evidence.decode_attempts = 0;
-        let mut input = match cache.map(|cache| OpenedInput::funded(file, cache)) {
-            Some(Ok(input)) => input.context("header admission unavailable")?.header_only(),
-            _ => {
-                codex_zst_refused(CodexZstCause::AdmissionRefused);
-                anyhow::bail!("archive header admission unavailable");
-            }
+        let input = match cache {
+            Some(cache) => OpenedInput::funded_inner(file, cache, false)?,
+            None => None,
+        };
+        let mut input = match input {
+            Some(input) => input.header_only(),
+            None => return Ok(HeaderRead::Deferred),
         };
         evidence.header_attempted = true;
         self.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
         let mut bytes = Vec::new();
-        let result = (|| -> Result<ValidatedHeader> {
+        let result = (|| -> Result<HeaderRead> {
             (&mut input)
                 .take(codex_file_join::MAX_HEADER_BYTES as u64)
                 .read_until(b'\n', &mut bytes)?;
-            let header =
-                ValidatedHeader::from_bytes(&bytes).context("invalid archive owning header")?;
             let evidence = self.files[&key].archive.as_ref().expect("header attempt");
             anyhow::ensure!(
                 evidence.matches(input.get_ref()),
                 "archive changed during header read"
             );
+            if bytes.len() == codex_file_join::MAX_HEADER_BYTES && !bytes.ends_with(b"\n") {
+                return Ok(HeaderRead::BoundReached);
+            }
+            let header =
+                ValidatedHeader::from_bytes(&bytes).context("invalid archive owning header")?;
             anyhow::ensure!(
                 header.filename_matches(&candidate.path),
                 "archive header owner mismatch"
             );
-            Ok(header)
+            Ok(HeaderRead::Validated(header))
         })();
         let (physical, decoded, compressed) = match &input {
             OpenedInput::Compressed(r, _) => (
@@ -999,12 +1027,20 @@ impl super::ScanIndex {
         input.close();
         let entry = self.files.get_mut(&key).expect("header attempt");
         let evidence = entry.archive.as_mut().expect("header attempt");
-        if let Ok(header) = &result {
-            evidence.header_validated = Some(header.clone());
-        } else {
-            codex_zst_refused(CodexZstCause::HeaderInvalid);
+        match &result {
+            Ok(HeaderRead::Validated(header)) => evidence.header_validated = Some(header.clone()),
+            Ok(HeaderRead::BoundReached) => {
+                evidence.disposition = ArchiveDisposition::HeaderBoundReached
+            }
+            Err(_) => {
+                evidence.disposition = ArchiveDisposition::Refused {
+                    cause: CodexZstCause::HeaderInvalid,
+                };
+                codex_zst_refused(CodexZstCause::HeaderInvalid);
+            }
+            _ => {}
         }
-        result.map(|header| (header, physical as usize))
+        result
     }
     #[cfg(test)]
     pub(crate) fn settle_archive_bodies(&mut self, accepted: &BTreeMap<String, String>) {
@@ -1428,12 +1464,16 @@ pub(in crate::snapshots) mod tests {
         }
     }
     #[derive(Clone, Default)]
-    struct Ends(Arc<Mutex<Vec<super::super::line_delivery::DeliveryEnd>>>);
+    struct Ends(
+        Arc<Mutex<Vec<super::super::line_delivery::DeliveryEnd>>>,
+        Arc<Mutex<usize>>,
+    );
     impl super::super::line_delivery::LineObserver for Ends {
         fn begin(
             &mut self,
             file: &super::super::line_delivery::FileView,
         ) -> super::super::line_delivery::Want {
+            *self.1.lock().unwrap() += 1;
             assert_eq!(file.mode, super::super::line_delivery::DeliveryMode::Full);
             super::super::line_delivery::Want::Lines
         }
@@ -1442,6 +1482,7 @@ pub(in crate::snapshots) mod tests {
             _: &super::super::line_delivery::FileView,
             _: &super::super::line_delivery::PhysicalLine<'_>,
         ) {
+            *self.1.lock().unwrap() += 1;
         }
         fn end(
             &mut self,
@@ -1567,9 +1608,11 @@ pub(in crate::snapshots) mod tests {
         let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
         let (mut index, result, rows, ends) = archive_pass(&f, ScanIndex::default(), true, None);
         assert_eq!(decodes(&rows), 1);
+        assert!(ends.0.lock().unwrap().is_empty());
         assert_eq!(
-            *ends.0.lock().unwrap(),
-            vec![super::super::line_delivery::DeliveryEnd::Complete]
+            *ends.1.lock().unwrap(),
+            0,
+            "no compressed physical-line delivery"
         );
         assert_eq!(result.snapshots.len(), 1);
         let plain = fixture(&bytes, ".jsonl");

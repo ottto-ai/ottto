@@ -55,7 +55,9 @@ fn header_inventory(
     );
     inventory.archive_work.allowed = true;
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-        while !inventory.step_with_archive(&CodexTitleMetadata::default(), state, Some(cache)) {}
+        while inventory.step_with_archive(&CodexTitleMetadata::default(), state, Some(cache))
+            != codex_file_join::HeaderStep::Complete
+        {}
     });
     assert!(inventory.complete);
     assert_eq!(inventory.headers.len(), 1);
@@ -256,15 +258,10 @@ fn header_read_never_checks_archive_completion_and_failed_full_keeps_projection(
 fn header_limits_and_failures_do_not_redecode_same_stamp() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
     let cache = Arc::new(sampled_scan::SharedCache::default());
-    let large = vec![b'x'; codex_file_join::MAX_HEADER_BYTES + 1];
     let mut skippable = vec![0x50, 0x2a, 0x4d, 0x18];
     skippable.extend_from_slice(&(256_u32 * 1024).to_le_bytes());
     skippable.extend(vec![0; 256 * 1024]);
-    for encoded in [
-        zstd::stream::encode_all(&large[..], 1).unwrap(),
-        skippable,
-        b"garbage".to_vec(),
-    ] {
+    for encoded in [skippable, b"garbage".to_vec()] {
         let f = ArchiveFixture::new(&encoded);
         let mut state = ScanIndex::default();
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
@@ -315,9 +312,12 @@ fn refused_header_admission_does_not_spend_a_decode_attempt() {
         .unwrap();
     let mut state = ScanIndex::default();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-        assert!(state
-            .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
-            .is_err());
+        assert!(matches!(
+            state
+                .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
+                .unwrap(),
+            HeaderRead::Deferred
+        ));
     });
     assert_eq!(decodes(&rows), 0);
     assert_eq!(
@@ -432,13 +432,27 @@ fn full_read_accepts_seventy_kib_header_and_settles_once() {
             .unwrap(),
     );
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
-    let mut unseen = ScanIndex::default();
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    assert!(unseen
-        .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
-        .is_err());
-    let (mut state, result, rows, _) = archive_pass(&f, unseen, true, None);
-    assert_eq!(decodes(&rows), 1);
+    let (mut state, result, rows, observer) = selector_archive_pass(&f, ScanIndex::default());
+    assert_eq!(decodes(&rows), 2, "one inventory prefix then one A1 Full");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["stage"] == "codex_zst_inventory")
+            .count(),
+        1
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["stage"] == "codex_zst_input")
+            .count(),
+        1
+    );
+    assert_eq!(
+        *observer.1.lock().unwrap(),
+        0,
+        "no physical-offset callbacks"
+    );
+    assert!(observer.0.lock().unwrap().is_empty());
+    assert_eq!(result.ownership_incomplete_file_count, 0);
     assert!(!result.snapshots.is_empty());
     assert_eq!(state.codex_archive_cli_version(&f.0), Some("v-large"));
     state.settle_archive_bodies(
@@ -461,9 +475,12 @@ fn full_read_accepts_seventy_kib_header_and_settles_once() {
             .disposition,
         ArchiveDisposition::Acquired
     ));
-    let (_, result, rows, _) = archive_pass(&f, checkpoint(&state), true, None);
-    assert_eq!(decodes(&rows), 0);
-    assert!(result.snapshots.is_empty());
+    for _ in 0..5 {
+        let (next, result, rows, _) = selector_archive_pass(&f, checkpoint(&state));
+        assert_eq!(decodes(&rows), 0);
+        assert!(result.snapshots.is_empty());
+        state = next;
+    }
 }
 
 #[test]
@@ -529,9 +546,12 @@ fn header_permission_and_cpu_gate_spend_no_transcript_bytes_or_attempt() {
     ] {
         let before = (work.physical_bytes, work.decoded_bytes, work.cpu_micros);
         let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            assert!(state
-                .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
-                .is_err());
+            assert!(matches!(
+                state
+                    .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
+                    .unwrap(),
+                HeaderRead::Deferred
+            ));
         });
         assert_eq!(decodes(&rows), 0);
         assert_eq!(
@@ -542,10 +562,13 @@ fn header_permission_and_cpu_gate_spend_no_transcript_bytes_or_attempt() {
     }
     let mut work = funded_header_work();
     let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-        let (_, physical) = state
+        let HeaderRead::Validated(_) = state
             .inventory_archive_header(&f.candidate(), Some(&cache), &mut work)
-            .unwrap();
-        assert_eq!(physical as u64, work.physical_bytes);
+            .unwrap()
+        else {
+            panic!("header not validated")
+        };
+        assert!(work.physical_bytes > 0);
     });
     let row = rows
         .iter()
@@ -1813,4 +1836,241 @@ fn changed_stamp_preserves_historical_logical_identity_but_resets_acquisition_st
         codex_zst_refusal_tests::decoder_construction_count(),
         constructions
     );
+}
+
+// Discovery remains off: inject only the roster/candidates, leaving the native
+// inventory, selector, parser, owner finish, upload policy and checkpoint intact.
+fn selector_scan(
+    f: &ArchiveFixture,
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    candidates: VecDeque<CandidateFile>,
+    allowed: bool,
+) -> OwnedSourceScan {
+    let root = f.0.parent().unwrap().to_owned();
+    let paths = candidates
+        .iter()
+        .map(|c| local_index_key(&c.path))
+        .collect();
+    let mut directories = codex_file_join::DirectoryCensus::new();
+    directories.observe(&root, &fs::metadata(&root).unwrap());
+    let mut inventory = codex_file_join::HeaderInventory::new(&[root], &paths, Some(&directories));
+    inventory.archive_work.allowed = allowed;
+    let mut scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        &[],
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    )
+    .with_sampled_acquisition(cache, Scope("selector-archive-test".into()));
+    scan.identified_candidates = candidates;
+    scan.census.observed_index_keys.extend(paths);
+    scan.codex_join_inventory = Some(inventory);
+    scan.codex_join_prepared = false;
+    scan.census_unix_seconds = None;
+    scan
+}
+
+fn finish_selector(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
+    for _ in 0..1000 {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index,
+                mut scan,
+                ..
+            } => {
+                apply_upload_policy(
+                    SnapshotSource::Codex,
+                    &mut scan.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                return (index, scan);
+            }
+        }
+    }
+    panic!("normal selector did not finish");
+}
+
+fn selector_archive_pass(
+    f: &ArchiveFixture,
+    index: ScanIndex,
+) -> (ScanIndex, SourceScanResult, Vec<Value>, Ends) {
+    let observer = Ends::default();
+    let ((index, result), rows) = crate::local_resource_diagnostics::capture(|| {
+        let scan = selector_scan(
+            f,
+            index,
+            Arc::new(sampled_scan::SharedCache::default()),
+            VecDeque::from([f.candidate()]),
+            true,
+        )
+        .with_line_observer("codex_prelude", Box::new(observer.clone()));
+        assert!(
+            !scan.codex_join_prepared,
+            "exercise production inventory/selection"
+        );
+        finish_selector(scan)
+    });
+    (index, result, rows, observer)
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn deferred_archive_keeps_plain_uploads_and_requeues_without_refusal_debt() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    for gate in ["battery", "admission", "cpu", "page"] {
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let plain = f.0.with_file_name("rollout-unrelated.jsonl");
+        let mut bytes = Vec::new();
+        for row in synthetic_rollout()
+            .split(|b| *b == b'\n')
+            .filter(|r| !r.is_empty())
+        {
+            let mut value: Value = serde_json::from_slice(row).unwrap();
+            if value["type"] == "session_meta" {
+                value["payload"]["id"] = json!("unrelated");
+            }
+            serde_json::to_writer(&mut bytes, &value).unwrap();
+            bytes.push(b'\n');
+        }
+        fs::write(&plain, bytes).unwrap();
+        let mut live = super::super::codex_zst_refusal_tests::candidate(&plain);
+        live.size_bytes = fs::metadata(&plain).unwrap().len();
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let occupied = (gate == "admission").then(|| {
+            OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+                .unwrap()
+                .unwrap()
+        });
+        let mut scan = selector_scan(
+            &f,
+            ScanIndex::default(),
+            cache.clone(),
+            VecDeque::from([f.candidate(), live.clone()]),
+            gate != "battery",
+        );
+        if gate == "cpu" {
+            scan.codex_join_inventory
+                .as_mut()
+                .unwrap()
+                .archive_work
+                .cpu_micros = 30_000_000;
+        }
+        if gate == "page" {
+            let remaining = scan
+                .codex_page
+                .singleton_remaining(sampled_scan::codex_cursor::Limits::current());
+            scan.codex_page.charge(
+                false,
+                remaining - 2 * codex_file_join::MAX_HEADER_BYTES as u64 + 1,
+            );
+        }
+        let ((mut state, result), rows) =
+            crate::local_resource_diagnostics::capture(|| finish_selector(scan));
+        assert_eq!(decodes(&rows), 0, "{gate}");
+        assert!(
+            !rows.iter().any(|r| r["stage"] == "codex_zst_refused"),
+            "{gate}"
+        );
+        assert_eq!(result.ownership_incomplete_file_count, 0, "{gate}");
+        assert_eq!(result.scanned_file_count, 1, "{gate}");
+        assert_eq!(
+            result.snapshots.len(),
+            1,
+            "plain upload body survives {gate}"
+        );
+        assert_eq!(result.snapshots[0].source_session_id, "unrelated");
+        assert!(result.snapshots[0].input_tokens > 0);
+        state.record_accepted_snapshot_fingerprints(&BTreeSet::from([result.snapshots[0]
+            .snapshot_fingerprint
+            .clone()]));
+        assert!(state
+            .accepted_snapshot_fingerprints
+            .contains(&result.snapshots[0].snapshot_fingerprint));
+        let pending = &state.traversal.as_ref().unwrap().pending_candidates;
+        assert_eq!(
+            pending.iter().filter(|p| p.path == f.0).count(),
+            1,
+            "same archive remains queued"
+        );
+        assert!(
+            !state.files.contains_key(&local_index_key(&f.0)),
+            "no attempt spent"
+        );
+        if let Some(occupied) = occupied {
+            occupied.close();
+        }
+        // Next page may admit the same work; previous deferral granted no Full.
+        let (state, result, rows, _) = selector_archive_pass(&f, checkpoint(&state));
+        assert_eq!(decodes(&rows), 2, "header + first Full after {gate}");
+        assert_eq!(result.snapshots.len(), 1);
+        assert!(state.archive_header(&f.0).is_some());
+        assert_eq!(cache.cursor_reserved(), 0);
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn bound_header_marker_survives_restart_without_inventory_redecode() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let bytes = vec![b'x'; codex_file_join::MAX_HEADER_BYTES + 1];
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut state = ScanIndex::default();
+    for expected in [1, 0, 0] {
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            assert!(matches!(
+                state
+                    .inventory_archive_header(
+                        &f.candidate(),
+                        Some(&cache),
+                        &mut funded_header_work()
+                    )
+                    .unwrap(),
+                HeaderRead::BoundReached
+            ));
+        });
+        assert_eq!(decodes(&rows), expected);
+        assert!(!state.files[&local_index_key(&f.0)]
+            .archive
+            .as_ref()
+            .unwrap()
+            .invalid_header(&f.0, &fs::metadata(&f.0).unwrap()));
+        state = checkpoint(&state);
+    }
+    // A bound is not a validity claim: the one full decode refuses this junk,
+    // and all later selector passes stay quiet rather than yielding forever.
+    let (mut state, result, rows, _) = selector_archive_pass(&f, state);
+    assert_eq!(decodes(&rows), 1);
+    assert!(result.snapshots.is_empty());
+    assert!(matches!(
+        state.files[&local_index_key(&f.0)]
+            .archive
+            .as_ref()
+            .unwrap()
+            .disposition,
+        ArchiveDisposition::Held { .. } | ArchiveDisposition::Refused { .. }
+    ));
+    for _ in 0..5 {
+        let (next, result, rows, _) = selector_archive_pass(&f, checkpoint(&state));
+        assert_eq!(decodes(&rows), 0);
+        assert!(result.snapshots.is_empty());
+        state = next;
+    }
 }

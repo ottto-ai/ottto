@@ -27552,16 +27552,19 @@ impl OwnedSourceScan {
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
                     let before = inventory.archive_work.physical_bytes;
-                    inventory.archive_work.allowed &= codex_page
-                        .singleton_remaining(sampled_scan::codex_cursor::Limits::current())
-                        >= 2 * codex_file_join::MAX_HEADER_BYTES as u64;
+                    let allowed = inventory.archive_work.allowed;
+                    inventory.archive_work.allowed = allowed
+                        && codex_page
+                            .singleton_remaining(sampled_scan::codex_cursor::Limits::current())
+                            >= 2 * codex_file_join::MAX_HEADER_BYTES as u64;
                     let done = inventory.step_with_archive(
                         &codex_title_metadata,
                         index,
                         sampling.as_ref().map(|context| &context.cache),
                     );
+                    inventory.archive_work.allowed = allowed;
                     codex_page.charge(false, inventory.archive_work.physical_bytes - before);
-                    if !done {
+                    if done != codex_file_join::HeaderStep::Complete {
                         pending!();
                     }
                     if !inventory.prepare_custody(index) {
@@ -27600,8 +27603,37 @@ impl OwnedSourceScan {
                     let unresolved = &inventory.held_owners;
                     residue_blocked_session_ids.extend(unresolved.iter().cloned());
                     codex_state_only_blocked_session_ids.extend(unresolved.iter().cloned());
+                    // Deferral keeps the same candidate pending, without refusal debt.
+                    let deferred_owners = inventory
+                        .deferred_archives
+                        .iter()
+                        .flat_map(|key| {
+                            codex_session_id_candidates_from_path(
+                                &Path::new(key).with_extension(""),
+                            )
+                        })
+                        .collect::<BTreeSet<_>>();
+                    let deferred = |candidate: &CandidateFile| {
+                        inventory
+                            .deferred_archives
+                            .contains(&local_index_key(&candidate.path))
+                            || inventory
+                                .owner_for_path(&candidate.path)
+                                .is_some_and(|owner| deferred_owners.contains(owner))
+                    };
+                    sampled_scan::codex_cursor::requeue_members(
+                        index,
+                        &codex_selected_flags,
+                        identified_candidates
+                            .iter()
+                            .filter(|candidate| deferred(candidate)),
+                    );
+                    identified_candidates.retain(|candidate| !deferred(candidate));
                     identified_candidates.retain(|candidate| {
                         let key = local_index_key(&candidate.path);
+                        if inventory.first_read_archives.contains(&key) {
+                            return true;
+                        }
                         let owner = inventory.owner_for_path(&candidate.path);
                         if !inventory.held_archives.contains(&key)
                             && !owner.is_some_and(|o| unresolved.contains(o))
@@ -27635,7 +27667,9 @@ impl OwnedSourceScan {
                         })
                         .map(|header| local_index_key(&header.candidate.path))
                         .collect::<BTreeSet<_>>();
-                    inventory.complete &= selected.is_subset(&inventoried);
+                    inventory.complete &= selected.iter().all(|key| {
+                        inventoried.contains(key) || inventory.first_read_archives.contains(key)
+                    });
                     let mut owners = BTreeMap::<String, BTreeSet<PathBuf>>::new();
                     for header in inventory
                         .headers
@@ -49998,7 +50032,10 @@ impl ScanIndex {
             );
         };
         if let Some(archive) = &entry.archive {
-            let reason = if matches!(archive.disposition, ArchiveDisposition::HeaderValidated) {
+            let reason = if matches!(
+                archive.disposition,
+                ArchiveDisposition::HeaderValidated | ArchiveDisposition::HeaderBoundReached
+            ) {
                 CandidateParseReason::NewFile
             } else {
                 CandidateParseReason::UnknownOutcome

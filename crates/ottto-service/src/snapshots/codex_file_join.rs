@@ -401,6 +401,8 @@ pub(super) struct HeaderInventory {
     pub(super) read_bytes: usize,
     pub(super) held_archives: BTreeSet<String>,
     pub(super) held_owners: BTreeSet<String>,
+    pub(super) first_read_archives: BTreeSet<String>,
+    pub(super) deferred_archives: BTreeSet<String>,
     pub(super) archive_work: codex_compressed_input::HeaderWork,
     pub(super) reuse_hits: usize,
     pub(super) reuse_misses: usize,
@@ -420,6 +422,13 @@ pub(super) struct HeaderInventory {
 /// inventory reads groups in.
 fn group_key(home: &Path, owner: &str) -> String {
     sha256_hex(&["codex_file_group:v1", &local_index_key(home), owner])
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HeaderStep {
+    Pending,
+    Deferred,
+    Complete,
 }
 
 impl HeaderInventory {
@@ -483,6 +492,8 @@ impl HeaderInventory {
             absence_held: BTreeSet::new(),
             held_archives: BTreeSet::new(),
             held_owners: BTreeSet::new(),
+            first_read_archives: BTreeSet::new(),
+            deferred_archives: BTreeSet::new(),
             archive_work: codex_compressed_input::HeaderWork::default(),
             reuse_hits: 0,
             reuse_misses: 0,
@@ -514,7 +525,7 @@ impl HeaderInventory {
 
     #[cfg(test)]
     pub(super) fn step(&mut self, metadata: &CodexTitleMetadata) -> bool {
-        self.step_with_archive(metadata, &mut ScanIndex::default(), None)
+        self.step_with_archive(metadata, &mut ScanIndex::default(), None) == HeaderStep::Complete
     }
     #[cfg(test)]
     pub(super) fn step_cached(
@@ -522,14 +533,14 @@ impl HeaderInventory {
         metadata: &CodexTitleMetadata,
         cache: Option<&sampled_scan::SharedCache>,
     ) -> bool {
-        self.step_inner(metadata, &mut ScanIndex::default(), cache, None)
+        self.step_inner(metadata, &mut ScanIndex::default(), cache, None) == HeaderStep::Complete
     }
     pub(super) fn step_with_archive(
         &mut self,
         metadata: &CodexTitleMetadata,
         index: &mut ScanIndex,
         cache: Option<&Arc<sampled_scan::SharedCache>>,
-    ) -> bool {
+    ) -> HeaderStep {
         self.step_inner(metadata, index, cache.map(Arc::as_ref), cache)
     }
     fn step_inner(
@@ -538,7 +549,7 @@ impl HeaderInventory {
         index: &mut ScanIndex,
         cache: Option<&sampled_scan::SharedCache>,
         archive_cache: Option<&Arc<sampled_scan::SharedCache>>,
-    ) -> bool {
+    ) -> HeaderStep {
         if !self.cache_pruned {
             self.cache_pruned = true;
             if let Some(cache) = cache {
@@ -552,14 +563,22 @@ impl HeaderInventory {
                     .unwrap_or(0),
             );
         }
+        // Every deferred path stays in custody for the next page, after plain work.
+        if self
+            .pending
+            .front()
+            .is_some_and(|path| self.deferred_archives.contains(&local_index_key(path)))
+        {
+            return HeaderStep::Complete;
+        }
         let Some(path) = self.pending.pop_front() else {
-            return true;
+            return HeaderStep::Complete;
         };
         if self.read_bytes >= MAX_HEADER_READ_BYTES || self.headers.len() >= MAX_HEADER_FILES {
             self.complete = false;
             self.bounded_out = true;
             self.pending.clear();
-            return true;
+            return HeaderStep::Complete;
         }
         let Some(scan_root) = self
             .roots
@@ -570,7 +589,7 @@ impl HeaderInventory {
         else {
             self.complete = false;
             self.bounded_out = true;
-            return false;
+            return HeaderStep::Pending;
         };
         // Held plain files still need the existing cold owning-header read:
         // group/owner gates scope their custody hold without stalling siblings.
@@ -581,10 +600,10 @@ impl HeaderInventory {
             .get(&key)
             .is_some_and(|entry| entry.codex_compressed_hold.is_some())
         {
-            return false;
+            return HeaderStep::Pending;
         }
         if self.held_archives.contains(&key) {
-            return false;
+            return HeaderStep::Pending;
         }
         let compressed = is_compressed_codex_rollout(Some(&path), None);
         let decode_held = index.decode_holds_file(&key);
@@ -592,11 +611,13 @@ impl HeaderInventory {
             self.complete = false;
             self.refused.insert(key, path_witness(&path));
 
-            return false;
+            return HeaderStep::Pending;
         }
         let cache = cache.filter(|_| !decode_held);
         let mut excluded = false;
-        let result = (|| -> Result<HeaderWitness> {
+        let mut deferred = false;
+        let mut bound_reached = false;
+        let result = (|| -> Result<Option<HeaderWitness>> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
                 stat.is_file() && !stat.file_type().is_symlink(),
@@ -645,7 +666,17 @@ impl HeaderInventory {
                 self.read_bytes = self
                     .read_bytes
                     .saturating_add((self.archive_work.physical_bytes - before) as usize);
-                let (header, _) = result?;
+                let header = match result? {
+                    codex_compressed_input::HeaderRead::Validated(header) => header,
+                    codex_compressed_input::HeaderRead::BoundReached => {
+                        bound_reached = true;
+                        return Ok(None);
+                    }
+                    codex_compressed_input::HeaderRead::Deferred => {
+                        deferred = true;
+                        return Ok(None);
+                    }
+                };
                 let stamp = index
                     .files
                     .get(&key)
@@ -653,7 +684,7 @@ impl HeaderInventory {
                     .context("archive header stamp unavailable")?
                     .stamp
                     .clone();
-                return Ok(HeaderWitness {
+                return Ok(Some(HeaderWitness {
                     plain_twin: false,
                     custody_cause: None,
                     home: member_home(&candidate.scan_root),
@@ -662,7 +693,7 @@ impl HeaderInventory {
                     created_unix_ms: header.created_unix_ms,
                     metadata: metadata_witness(&stat),
                     stamp,
-                });
+                }));
             }
             self.reuse_misses += 1;
             let mut reused = None;
@@ -700,8 +731,9 @@ impl HeaderInventory {
                     }
                     (facts, witness)
                 }
+
             };
-            Ok(HeaderWitness {
+            Ok(Some(HeaderWitness {
                 custody_cause: None,
                 plain_twin: false,
                 home: member_home(&candidate.scan_root),
@@ -710,10 +742,27 @@ impl HeaderInventory {
                 created_unix_ms: facts.created_unix_ms,
                 metadata: witness,
                 stamp: facts.stamp,
-            })
+            }))
         })();
         match result {
-            Ok(header) => self.headers.push(header),
+            Ok(Some(header)) => self.headers.push(header),
+            Ok(None) if deferred => {
+                self.held_owners
+                    .extend(codex_session_id_candidates_from_path(
+                        &Path::new(&key).with_extension(""),
+                    ));
+                self.pending.push_back(PathBuf::from(&key));
+                self.deferred_archives.insert(key);
+                return HeaderStep::Deferred;
+            }
+            Ok(None) if bound_reached => {
+                self.held_owners
+                    .extend(codex_session_id_candidates_from_path(
+                        &Path::new(&key).with_extension(""),
+                    ));
+                self.first_read_archives.insert(key);
+            }
+            Ok(None) => unreachable!("header outcome"),
             Err(_) if excluded => {
                 self.held_owners
                     .extend(codex_session_id_candidates_from_path(
@@ -740,7 +789,7 @@ impl HeaderInventory {
             self.complete = false;
             self.bounded_out = true;
         }
-        false
+        HeaderStep::Pending
     }
     pub(super) fn groups(&self) -> BTreeMap<String, Group> {
         let mut groups = BTreeMap::<String, Group>::new();
@@ -814,7 +863,8 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; plain_twin, custody_cause, candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; custody_next, absence_held, custody_unknown, custody_after, custody_done, custody_peak, custody_refused, roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, bounded_out, first_read_archives, deferred_archives);
+
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
