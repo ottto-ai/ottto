@@ -24079,3 +24079,35 @@ crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reas
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+
+#[cfg(test)]
+mod ownership_census_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_appends_scanner_partition_only_for_codex_and_keeps_unproven_separate() {
+        let mut contributions = [0; 8];
+        contributions[0] = 2;
+        contributions[6] = 2;
+        let counts = SyncCounts {
+            ownership_incomplete_file_count: 5,
+            snapshot_unproven_terminal_count: 3,
+            causes: (contributions, [0; 7], 0),
+            ..SyncCounts::default()
+        };
+        let line = counts.terminal_census_line("codex");
+        assert!(line.contains("unproven_terminal=3"));
+        assert!(line.contains("ownership_incomplete_files=5"));
+        assert!(line.contains("ownership_inventory_hold=2 ownership_inventory_hold_distinct=0"));
+        assert!(line.contains("ownership_unattributed=0"));
+        assert!(
+            line.find("terminal_contract_retry_exhausted=").unwrap()
+                < line.find("ownership_inventory_hold=").unwrap()
+        );
+        for source in ["claude_code", "pi"] {
+            assert!(!counts
+                .terminal_census_line(source)
+                .contains("ownership_inventory_hold="));
+        }
+    }
+}

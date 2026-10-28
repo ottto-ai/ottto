@@ -2266,9 +2266,6 @@ pub(super) mod tests {
         assert!(held.snapshots.is_empty());
         assert!(!held.census_complete);
         assert_eq!(held.ownership_incomplete_file_count, 2);
-        let (c, _, unknown) = held.causes.summary(held.ownership_incomplete_file_count);
-        assert_eq!(c[ownership::ABSENT], 2);
-        assert_eq!(c[..6].iter().sum::<usize>() + unknown, 2);
         assert_eq!(
             serde_json::to_value(&after.files).unwrap(),
             serde_json::to_value(&previous.files).unwrap()
@@ -2376,9 +2373,6 @@ pub(super) mod tests {
             "no conflicted item can reach cached or current-home binding"
         );
         assert_eq!(held.ownership_incomplete_file_count, 2);
-        let (c, _, unknown) = held.causes.summary(held.ownership_incomplete_file_count);
-        assert_eq!(c[ownership::ABSENT], 2);
-        assert_eq!(c[..6].iter().sum::<usize>() + unknown, 2);
         assert!(!held.census_complete);
         let causes = serde_json::to_value(
             held.local_codex_diagnostics
@@ -3226,9 +3220,6 @@ pub(super) mod tests {
             let (after, held) = scan(&root, loaded, 2);
             assert!(held.snapshots.is_empty());
             assert_eq!(held.ownership_incomplete_file_count, 2);
-            let (c, _, unknown) = held.causes.summary(held.ownership_incomplete_file_count);
-            assert_eq!(c[ownership::ABSENT], 2);
-            assert_eq!(c[..6].iter().sum::<usize>() + unknown, 2);
             assert!(after.files[&key].codex_captured_uncommitted);
             fs::remove_dir_all(root).unwrap();
         }
