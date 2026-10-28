@@ -303,14 +303,15 @@ impl State {
             r.claimed = consume;
             return true;
         }
-        let keys = self
-            .replayed
-            .entry(format!(
-                "upgrade_state_missing:{}",
-                ottto_core::compiled_release_version()
-            ))
-            .or_default();
-        if keys.len() >= MAX_TRACKED_KEYS || !keys.insert(id) {
+        let release = format!(
+            "upgrade_state_missing:{}",
+            ottto_core::compiled_release_version()
+        );
+        // One hash per indexed file for this release, not a 256-file grant cap.
+        // Old releases cannot constrain the current one and need no retention.
+        self.replayed
+            .retain(|name, _| !name.starts_with("upgrade_state_missing:") || name == &release);
+        if !self.replayed.entry(release).or_default().insert(id) {
             return false;
         }
         self.reservations.insert(

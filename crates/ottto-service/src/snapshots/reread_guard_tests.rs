@@ -813,3 +813,31 @@ fn group_upgrade_preflight_does_not_consume_ready_siblings() {
     assert!(!state.upgrade_missing("a", false));
     assert!(!state.upgrade_missing("b", false));
 }
+
+#[test]
+fn upgrade_missing_progresses_past_tracking_window_and_keeps_once_semantics() {
+    let mut state = State::default();
+    state.replayed.insert(
+        "upgrade_state_missing:old-release".into(),
+        BTreeSet::from([KeyHash::of("old")]),
+    );
+    for n in 0..MAX_TRACKED_KEYS + 2 {
+        let key = format!("indexed-{n}");
+        assert!(!state.upgrade_missing(&key, true));
+        assert!(state.needs_save(), "new indexed files always get a receipt");
+        state.saved();
+        assert!(state.upgrade_missing(&key, true));
+        assert!(!state.upgrade_missing(&key, true));
+    }
+    assert!(!state
+        .replayed
+        .contains_key("upgrade_state_missing:old-release"));
+    let mut restart: State = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    for n in 0..MAX_TRACKED_KEYS + 2 {
+        assert!(!restart.upgrade_missing(&format!("indexed-{n}"), true));
+    }
+    assert!(!restart.upgrade_missing("next-indexed-file", true));
+    assert!(restart.needs_save());
+    restart.saved();
+    assert!(restart.upgrade_missing("next-indexed-file", true));
+}
