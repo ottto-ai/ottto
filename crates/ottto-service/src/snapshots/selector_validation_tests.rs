@@ -470,3 +470,68 @@ fn all_existing_object_aliases_match_their_expected_formats_and_sources() {
     assert_eq!(counts.selector_key_rejected_unknown, 0);
     assert_eq!(counts.selector_key_rejected_format, 0);
 }
+
+#[test]
+fn claude_active_scopes_do_not_duplicate_selector_totals_in_cache_events() {
+    use crate::local_resource_diagnostics::{
+        capture, claude_reread::Scope, CollectionCounts, NativeDecision, Probe,
+    };
+    let reject = || {
+        claude_code_selector_from_line(&json!({"selector_context":{
+            "PRIVATE_CLASS_CANARY":"VALUE_CLASS_CANARY", "plan_window_bucket":"/tmp/BUCKET_CLASS_CANARY"
+        }}));
+    };
+    let (_, logs) = capture(|| {
+        let scope = Scope::begin(true);
+        cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+        reject();
+        let mut probe = Probe::start();
+        probe.page_events.merge(scope.finish());
+        probe.collection(
+            "claude_code",
+            CollectionCounts {
+                scanned_files: 1,
+                semantic_noops: 0,
+                sampled_acquisition: None,
+            },
+        );
+        let scope = Scope::begin(true);
+        reject();
+        NativeDecision::new().emit();
+        drop(scope);
+    });
+    assert_eq!(logs.len(), 2);
+    assert_eq!(
+        logs[0]["counts"]["retained_cache_page_events"]["take_hit"],
+        1
+    );
+    assert!(
+        logs[0]["counts"]["selector_key_rejected"]["unknown"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        logs[0]["counts"]["selector_key_rejected"]["format"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(logs[1]["counts"].get("selector_key_rejected").is_none());
+    let text = serde_json::to_string(&logs).unwrap();
+    for forbidden in [
+        "CLASS_CANARY",
+        "selector_key_rejected_unknown",
+        "selector_key_rejected_format",
+    ] {
+        assert!(!text.contains(forbidden));
+    }
+    let sparse = serde_json::to_value(cache_lifecycle::Sparse(cache_lifecycle::Counts {
+        selector_key_rejected_unknown: u64::MAX,
+        selector_key_rejected_format: u64::MAX,
+        ..Default::default()
+    }))
+    .unwrap();
+    assert!(sparse.get("selector_key_rejected_unknown").is_none());
+    assert!(sparse.get("selector_key_rejected_format").is_none());
+}

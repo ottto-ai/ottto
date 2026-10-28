@@ -13,7 +13,7 @@ macro_rules! counters {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(None)?;
-                $(if self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
+                $(if Event::$event.is_scope_event() && self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
                 map.end()
             }
         }
@@ -90,8 +90,19 @@ counters! {
     prefix_tag_clears: PrefixTagCleared,
 }
 
+impl Event {
+    fn is_scope_event(self) -> bool {
+        !matches!(
+            self,
+            Self::SelectorKeyRejectedUnknown | Self::SelectorKeyRejectedFormat
+        )
+    }
+}
+
 pub(crate) fn add(event: Event, amount: u64) {
-    super::claude_reread::cache_event(event, amount);
+    if event.is_scope_event() {
+        super::claude_reread::cache_event(event, amount);
+    }
     let _ = TOTALS[event as usize].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(amount))
     });
