@@ -51,3 +51,18 @@ test or Clippy. Linux CI runs on the review-ready standalone PR. Native restore
 fixtures still require the supported heap layout; native contracts, money
 equality and E3/Lead B owner review remain owed. The Mac slot order is #857,
 then #854, then this PR; the owning integration agent dispatches those checks.
+
+The standalone review exposed overdue Codex Tail restarting at cursor completion.
+The seal now uses the selector's identical exact-stamp audit predicate: ordinary
+Checkpoint views are non-exact, while PrefixSeal proof views remain exact and
+retain their deadline refusal. No new field or cursor implementation change.
+Tail completion preserves its prior full-verification time and debt verbatim.
+
+Regression coverage adds a real durable restart with a Codex suffix larger than
+the existing scaled cursor budget, checks resumed/certified publication and
+replacement index/disk binding, then restarts again and asserts zero native
+suffix bytes with the same debt. Claude exercises ordinary overdue Tail as a
+negative regression control. The seal unit case fails before this fix at the
+overdue commit; the Codex integration case fails on audit Restart. The Claude
+control and exact-stamp proof refusal already pass before the fix and guard
+against widening. These native paths still need supported-layout CI evidence.

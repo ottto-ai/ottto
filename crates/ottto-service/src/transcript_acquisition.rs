@@ -271,11 +271,14 @@ impl Checkpoint {
         self.last_full_verified_unix_seconds
     }
 
+    // Admission and completion use the same ordinary-certificate policy.
+    const EXACT_STAMP: bool = false;
+
     /// The parts of this certificate `select_mode` reads.
     fn view(&self) -> CertificateView<'_> {
         CertificateView {
             stamp: &self.stamp,
-            exact_stamp: false,
+            exact_stamp: Self::EXACT_STAMP,
             scope: &self.scope.0,
             sealed_offset: self.samples.sealed_offset,
             samples_valid: self.samples.valid_for(self.stamp.length),
@@ -520,9 +523,8 @@ pub(crate) enum PrefixRefusal {
     Invalidated(FullReason),
     /// The interpretation scope or another dependency changed: invalidates.
     Dependency,
-    /// A tail reached its audit deadline before commit. Like
-    /// `commit_after_native_completion`, a tail never certifies past it;
-    /// the next read is the full audit. Not an invalidation.
+    /// Audit expiry outside ordinary checkpoint reuse. The exact-stamp
+    /// proof horizon remains separate from acquisition completion.
     AuditDue,
     /// Every object check holds but the native read was lossy. The result
     /// publishes uncertified, exactly like a lossy full read.
@@ -687,6 +689,10 @@ enum SampleAt {
     Boundary,
 }
 
+fn audit_due(exact_stamp: bool, debt: Option<AuditDebt>, now: u64) -> bool {
+    exact_stamp && debt.is_some_and(|debt| now >= debt.due_unix_seconds)
+}
+
 /// `prepare`'s mode decision. `sample_eq` compares one sample window of the
 /// held FD with the certificate's; it is called only when the decision needs
 /// that window, in the order head then boundary.
@@ -713,7 +719,7 @@ fn select_mode(
             }));
     Ok(if clock_changed {
         ReadMode::Full(FullReason::ClockChanged)
-    } else if proof_horizon && debt.is_some_and(|d| now >= d.due_unix_seconds) {
+    } else if audit_due(proof_horizon, debt, now) {
         ReadMode::Full(FullReason::AuditDue)
     } else if let Some(old) = old {
         if !old.samples_valid {
@@ -1094,10 +1100,11 @@ impl ReadPlan {
         if current_scope != &self.scope {
             return Err(PrefixRefusal::Dependency);
         }
-        if let (ReadMode::Tail, Some(debt)) = (self.mode, self.debt) {
-            if now >= debt.due_unix_seconds {
-                return Err(PrefixRefusal::AuditDue);
-            }
+        // ReadPlan::prepare accepts Checkpoint::view, never PrefixSeal's
+        // exact-stamp view. Use the selector's identical horizon predicate;
+        // overdue ordinary Tail still carries its prior verification/debt.
+        if self.mode == ReadMode::Tail && audit_due(Checkpoint::EXACT_STAMP, self.debt, now) {
+            return Err(PrefixRefusal::AuditDue);
         }
         if lossy {
             return Err(PrefixRefusal::Lossy);
@@ -2443,11 +2450,11 @@ mod tests {
         }
     }
 
-    /// M1: a multi-page tail that reaches its audit deadline before commit is
-    /// refused by the legacy cursor-prefix path; ordinary acquisition can
-    /// now continue past the deadline. Cursor migration belongs to full S1.
+    /// Ordinary checkpoint completion shares admission's audit predicate;
+    /// the exact-stamp proof seal still refuses elapsed debt. At 57ffaa32,
+    /// the overdue ordinary seal below returns PrefixRefusal::AuditDue.
     #[test]
-    fn tail_prefix_reaching_its_audit_deadline_is_refused_for_the_audit() {
+    fn overdue_tail_seals_with_identical_debt_but_proof_horizon_still_refuses() {
         let f = Fixture::new(b"one\n");
         let cp = initial(&f, 1000);
         f.append(b"two\n");
@@ -2462,14 +2469,24 @@ mod tests {
             file.read_to_end(&mut bytes).unwrap();
             plan.observe_complete_records(&bytes).unwrap();
             let consumed = plan.frozen_length();
-            plan.commit_sealed_prefix(&mut file, true, &scope(), 1100, commit_at, false, consumed)
+            let before = (plan.last_full_verified_unix_seconds, plan.debt);
+            let next = plan
+                .commit_sealed_prefix(&mut file, true, &scope(), 1100, commit_at, false, consumed)
+                .unwrap();
+            assert_eq!((next.last_full_verified(), next.audit_debt()), before);
+            next
         };
-        assert_eq!(tail(1500).unwrap_err(), PrefixRefusal::AuditDue);
-        let certified = tail(1499).unwrap();
-        assert_eq!(certified.sealed_offset(), 8);
+        for now in [1499, 1500, 181_000] {
+            let certified = tail(now);
+            assert_eq!(certified.sealed_offset(), 8);
+            assert_eq!(certified.last_full_verified(), 1000);
+            assert_eq!(certified.audit_debt(), debt);
+        }
+        let nongated = tail(1499).seal(1499);
+        assert_eq!(nongated.admits(&mut f.open(), &scope(), 1499, false), Ok(0));
         assert_eq!(
-            certified.audit_debt().map(|debt| debt.due_unix_seconds),
-            Some(1500)
+            nongated.admits(&mut f.open(), &scope(), 1500, false),
+            Err(FullReason::AuditDue)
         );
     }
 

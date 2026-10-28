@@ -1930,6 +1930,183 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
     }
 }
 
+/// P1: an overdue restored checkpoint must finish through the real cursor
+/// seal, publish, replace its disk binding, then restore without rereading.
+/// At 57ffaa32 Codex increments jobs_audit_restarted, never jobs_certified.
+/// Claude is the already-working ordinary-Tail negative regression control.
+#[cfg(unix)]
+#[test]
+fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
+    use crate::durable_tail_store as store;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    struct ResetClock;
+    impl Drop for ResetClock {
+        fn drop(&mut self) {
+            sampled_scan::set_test_now(None);
+        }
+    }
+    let _clock = ResetClock;
+    const START: u64 = 1_800_000_000;
+    const PAGE_BYTES: u64 = 1024;
+    let due = START + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS;
+    sampled_scan::codex_cursor::with_test_limits(PAGE_BYTES, PAGE_BYTES, 128, || {
+        for source in [SnapshotSource::Codex, SnapshotSource::ClaudeCode] {
+            sampled_scan::set_test_now(Some(START));
+            let fixture = ScanFixture::new(source);
+            fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+            let before = fs::metadata(&fixture.file.0).unwrap().len();
+            assert!(before < PAGE_BYTES, "seed is an ordinary read");
+            let namespace = Scope("overdue-cursor-restart".into());
+            let state = fixture.dir.join("state");
+            fs::create_dir_all(&state).unwrap();
+            let lock = crate::locked_state_dir::test_locks::hold(&state);
+            let index_path = state.join("index.json");
+            let key = local_index_key(&fixture.file.0);
+            let first = Arc::new(sampled_scan::SharedCache::default());
+            first.durable_begin_pass(source, &index_path, &namespace, true);
+            let (mut index, seed, modes) = production_scan(
+                &fixture,
+                source,
+                ScanIndex::default(),
+                Some(first.clone()),
+                &namespace.0,
+            );
+            assert_eq!(modes, (1, 0, 0));
+            assert!(!seed.snapshots.is_empty());
+            let old_fingerprint = index.files[&key].source_file_fingerprint.clone();
+            assert!(index.stage_sampled_audit(
+                &key,
+                &old_fingerprint,
+                crate::transcript_acquisition::AuditDebt {
+                    due_unix_seconds: due
+                },
+            ));
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                first
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            let durable_source = sampled_scan::durable_tail::durable_source(source).unwrap();
+            let allowlist = sampled_jsonl::durable::allowlist_digest(source);
+            let read_record = || {
+                let mut disk = store::DurableTailStore::new(
+                    store::store_dir_for_index(&index_path),
+                    durable_source,
+                );
+                match disk.read(&store::key_digest(durable_source, &key), &allowlist) {
+                    store::ReadOutcome::Found(record) => record,
+                    other => panic!("{other:?}"),
+                }
+            };
+            let old_record = read_record();
+            drop(first);
+            for id in 1..=12 {
+                fixture
+                    .file
+                    .append(&usage(source, 100 + id as u64 * 30, id, "fixture-model"));
+            }
+            let length = fs::metadata(&fixture.file.0).unwrap().len();
+            assert!(
+                length - before > PAGE_BYTES,
+                "append exceeds the scaled real cursor budget"
+            );
+            sampled_scan::set_test_now(Some(due + 3600));
+            let second = Arc::new(sampled_scan::SharedCache::default());
+            second.durable_begin_pass(source, &index_path, &namespace, true);
+            assert!(second.retained_checkpoint(&key).is_none());
+            index = ScanIndex::load(&index_path).unwrap();
+            let cold_index = index.clone();
+            let mut published = None;
+            for page in 1..=32 {
+                let (next, result, modes, _) = production_scan_at(
+                    &fixture,
+                    source,
+                    index,
+                    Some(second.clone()),
+                    &namespace.0,
+                    &format!("2026-10-07T12:00:{page:02}Z"),
+                );
+                index = next;
+                assert_eq!(modes.0, 0, "no forced Full");
+                assert_eq!(
+                    second.counters_for_test().jobs_audit_restarted,
+                    0,
+                    "never Restart for audit age"
+                );
+                if !result.snapshots.is_empty() {
+                    published = Some(result);
+                    break;
+                }
+            }
+            let published = published.expect("overdue Tail completes and publishes");
+            let counters = second.counters_for_test();
+            if source == SnapshotSource::Codex {
+                assert_eq!(counters.jobs_started, 1);
+                assert!(
+                    counters.jobs_resumed > 0,
+                    "real multi-page cursor completion"
+                );
+                assert_eq!(counters.jobs_certified, 1);
+                assert_eq!(counters.jobs_finish_failed, 0);
+            } else {
+                assert_eq!(counters.jobs_started, 0, "Claude uses ordinary Tail");
+            }
+            assert_eq!(second.durable_counters(source).unwrap().0.restored, 1);
+            assert_ne!(index.files[&key].source_file_fingerprint, old_fingerprint);
+            assert_eq!(index.files[&key].size_bytes, length);
+            assert_eq!(index.files[&key].unverified_deadline(), Some(due));
+            let checkpoint = second
+                .retained_checkpoint(&key)
+                .expect("completed Tail retained");
+            assert_eq!(checkpoint.sealed_offset(), length);
+            assert_eq!(checkpoint.last_full_verified(), START);
+            assert_eq!(checkpoint.audit_debt().unwrap().due_unix_seconds, due);
+            let (_, cold, _) = production_scan(&fixture, source, cold_index, None, &namespace.0);
+            assert_eq!(
+                production_body(source, published),
+                production_body(source, cold)
+            );
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                second
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            let new_record = read_record();
+            assert_ne!(
+                new_record.binding.entry, old_record.binding.entry,
+                "disk binding replaced"
+            );
+            drop(second);
+            let third = Arc::new(sampled_scan::SharedCache::default());
+            third.durable_begin_pass(source, &index_path, &namespace, true);
+            let (next, result, modes, bytes) = production_scan_with_metrics(
+                &fixture,
+                source,
+                ScanIndex::load(&index_path).unwrap(),
+                Some(third.clone()),
+                &namespace.0,
+            );
+            assert_eq!(third.durable_counters(source).unwrap().0.restored, 1);
+            assert_eq!(modes, (0, 0, 1));
+            assert_eq!(bytes.0, 0, "second restart reads zero native suffix bytes");
+            assert!(result.snapshots.is_empty(), "no duplicate publication");
+            assert_eq!(third.counters_for_test().jobs_started, 0);
+            assert_eq!(next.files[&key].unverified_deadline(), Some(due));
+            let reused = third.retained_checkpoint(&key).unwrap();
+            assert_eq!(reused.last_full_verified(), START);
+            assert_eq!(reused.audit_debt(), checkpoint.audit_debt());
+        }
+    });
+}
+
 /// Review F1: more kept opaque records than the store's inventory bound
 /// never block the known key's replacement. Restore + Tail an append, save,
 /// restart: the next append Tails again (no Full) and matches the cold Full.
