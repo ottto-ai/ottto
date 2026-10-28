@@ -1063,22 +1063,18 @@ fn t14_rebuilds_are_counted_and_the_breaker_trips_past_twenty() {
         for (path, bytes) in &kept {
             assert_eq!(&fs::read(path).unwrap(), bytes, "nothing deleted first");
         }
-        // The save after the Full reads: the rebuild overwrites each T14.
+        // A rebuilt T14 key stays memory-only: the save never writes its record.
         let rebuild = corrupt
             .iter()
             .map(|n| pending(bindings[*n].clone(), certificate(&transcript), 2))
             .collect::<Vec<_>>();
         let receipt = cold.write_after_save(&lock, 2, rebuild).unwrap();
-        assert_eq!(receipt.written, if tripped { 0 } else { 20 });
+        assert_eq!(receipt.written, 0);
         for n in &corrupt {
             let outcome = scratch
                 .store()
                 .read(&bindings[*n].key, &placeholder_allowlist());
-            if tripped {
-                assert_eq!(outcome, ReadOutcome::Refused(Refusal::Corrupt));
-            } else {
-                assert_eq!(found(outcome).index_generation, 2);
-            }
+            assert_eq!(outcome, ReadOutcome::Refused(Refusal::Corrupt));
         }
     }
 }
@@ -1845,7 +1841,7 @@ fn gc_stops_before_orphan_cleanup_when_classification_disables_mid_loop() {
 }
 
 #[test]
-fn t14_rebuild_attempt_survives_write_failure_and_budget_refusal() {
+fn rebuilt_t14_is_memory_only_and_never_reaches_the_writer() {
     for arm in ["write_failure", "budget"] {
         let _reset = ResetFaults;
         let scratch = Scratch::new();
@@ -1876,20 +1872,21 @@ fn t14_rebuild_attempt_survives_write_failure_and_budget_refusal() {
             Some(Refusal::Corrupt),
             "second outer guard in the same pass must hold"
         );
+        assert_eq!(cold.full_hold(&b.key), None);
+        assert_eq!(cold.counters().known_corrupt_rebuild_after_restart, 1);
+        assert_eq!(cold.full_hold(&b.key), Some(Refusal::Corrupt));
         let mut replacement = pending(b.clone(), certificate(&transcript), 2);
         if arm == "budget" {
             replacement.body.resize(RECORD_BYTES, 0);
-            assert_eq!(
-                cold.write_after_save(&lock, 2, vec![replacement])
-                    .unwrap()
-                    .budget_refused,
-                1
-            );
-        } else {
-            test_hooks::set_before_rename(Some(Box::new(|_, _| Err(io::ErrorKind::Other.into()))));
-            assert!(cold.write_after_save(&lock, 2, vec![replacement]).is_err());
-            test_hooks::set_before_rename(None);
         }
+        test_hooks::set_before_rename(Some(Box::new(|_, _| {
+            panic!("memory-only record reached writer")
+        })));
+        assert_eq!(
+            cold.write_after_save(&lock, 2, vec![replacement]).unwrap(),
+            BatchReceipt::default()
+        );
+        test_hooks::set_before_rename(None);
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(cold.counters().t14_rebuild, 1);
         cold.take_pass();
@@ -1899,7 +1896,7 @@ fn t14_rebuild_attempt_survives_write_failure_and_budget_refusal() {
         }
         assert_eq!(cold.counters().t14_rebuild, 0);
         assert_eq!(cold.counters().format_hold[Refusal::Corrupt as usize], 3);
-        // A later successful write releases the hold, but does not renew the allowance.
+        // A later offer remains memory-only; only restart grants a new Full.
         cold.write_after_save(
             &lock,
             3,
@@ -1907,9 +1904,8 @@ fn t14_rebuild_attempt_survives_write_failure_and_budget_refusal() {
         )
         .unwrap();
         cold.begin_pass();
-        assert_eq!(cold.hold(&b.key, false), None);
-        put_record(&path, &bytes);
         assert_eq!(cold.hold(&b.key, false), Some(Refusal::Corrupt));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(cold.counters().t14_rebuild, 0);
         assert_eq!(
             scratch.store().hold(&b.key, false),
@@ -1985,5 +1981,50 @@ fn restore_read_access_failure_disables_but_disappearance_is_absence() {
         assert_eq!(cold.counters().format_hold, [0; 5]);
         assert_eq!(cold.counters().t14_rebuild, 0);
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn non_format_io_errors_disable_at_every_read_boundary_without_spending_t14() {
+    for stage in ["open", "header", "body", "restore_open", "restore_metadata"] {
+        for errno in [libc::EIO, libc::EMFILE, libc::ENFILE, libc::EPERM] {
+            let _reset = ResetFaults;
+            let scratch = Scratch::new();
+            let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+            let transcript = scratch.transcript("t.jsonl", b"{}\n");
+            let b = binding("acct", "scope", ("fp", None));
+            let mut store = scratch.store();
+            store
+                .write_after_save(
+                    &lock,
+                    1,
+                    vec![pending(b.clone(), certificate(&transcript), 1)],
+                )
+                .unwrap();
+            let record = record_file(&store, &b.key);
+            let before = fs::read(&record).unwrap();
+            test_hooks::set_before_access(Some(Box::new(move |_, op| {
+                if op == stage {
+                    Err(io::Error::from_raw_os_error(errno))
+                } else {
+                    Ok(())
+                }
+            })));
+            let mut cold = scratch.store();
+            if stage.starts_with("restore") {
+                assert_eq!(
+                    cold.read(&b.key, &placeholder_allowlist()),
+                    ReadOutcome::Missing
+                );
+            } else {
+                assert_eq!(cold.hold(&b.key, false), None);
+            }
+            assert!(cold.disabled().is_some(), "{stage}/{errno}");
+            assert_eq!(cold.hold(&b.key, false), None);
+            assert_eq!(cold.counters().format_hold, [0; 5]);
+            assert_eq!(cold.counters().t14_rebuild, 0);
+            assert!(cold.rebuilt.is_empty());
+            assert_eq!(fs::read(&record).unwrap(), before);
+        }
     }
 }

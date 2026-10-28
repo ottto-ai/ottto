@@ -113,7 +113,7 @@ impl Counters {
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
-             records_invalidated={} peak_codec_bytes={}",
+             records_invalidated={} peak_codec_bytes={} known_corrupt_rebuild_after_restart={}",
             source.api_slug(),
             self.restore_attempts,
             self.restored,
@@ -153,6 +153,7 @@ impl Counters {
             self.gc_keep_peak,
             store.records_invalidated,
             store.peak_codec_bytes,
+            store.known_corrupt_rebuild_after_restart,
         )
     }
 }
@@ -169,7 +170,7 @@ struct Slot {
     /// Keys held (U) by this source, and the totals the last alarm reported:
     /// [held, t14_rebuild, mode_repaired, disabled].
     held: u64,
-    reported: [u64; 4],
+    reported: [u64; 5],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -390,7 +391,7 @@ impl SharedCache {
                 namespace: namespace.clone(),
                 identity_capture,
                 held: 0,
-                reported: [0; 4],
+                reported: [0; 5],
             });
         }
     }
@@ -409,12 +410,35 @@ impl SharedCache {
         key: &str,
         restore_recheck: bool,
     ) -> Option<store::Refusal> {
+        let ram = !restore_recheck && self.retained().is_ok_and(|ram| ram.peek(key).is_some());
         let source = durable_source(snapshot_source)?;
+        let held = self
+            .durable()?
+            .slot(source)
+            .as_mut()?
+            .store
+            .hold(&store::key_digest(source, key), restore_recheck);
+        if held == Some(store::Refusal::Corrupt) && ram {
+            Counters::bump(
+                &mut self.durable()?.counters.not_persisted,
+                "known_corrupt_memory_only",
+            );
+            return None;
+        }
+        held
+    }
+
+    pub(crate) fn durable_full_hold(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+    ) -> Option<store::Refusal> {
+        let source = durable_source(source)?;
         self.durable()?
             .slot(source)
             .as_mut()?
             .store
-            .hold(&store::key_digest(source, key), restore_recheck)
+            .full_hold(&store::key_digest(source, key))
     }
 
     pub(in crate::snapshots) fn durable_hold_exit(
@@ -425,6 +449,12 @@ impl SharedCache {
         candidate: &CandidateFile,
         census: &mut ScanCensus,
     ) {
+        if reason == store::Refusal::Corrupt {
+            if let Some(mut stores) = self.durable() {
+                Counters::bump(&mut stores.counters.not_persisted, "known_corrupt_held");
+            }
+            return;
+        }
         let kept = source == SnapshotSource::ClaudeCode
             && claude_request_census::retain_held(index, candidate);
         if let Some(mut stores) = self.durable() {
@@ -890,6 +920,7 @@ impl SharedCache {
         struct Alarm {
             held_keys: [u64; 2],
             t14_rebuild: [u64; 2],
+            known_corrupt_rebuild_after_restart: u64,
             mode_repaired: [u64; 2],
             #[serde(skip_serializing_if = "Option::is_none")]
             store_disabled: Option<&'static str>,
@@ -909,6 +940,7 @@ impl SharedCache {
             store.t14_rebuild,
             store.mode_repaired,
             u64::from(disabled.is_some()),
+            store.known_corrupt_rebuild_after_restart,
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -919,6 +951,7 @@ impl SharedCache {
                 &Alarm {
                     held_keys: pair(0),
                     t14_rebuild: pair(1),
+                    known_corrupt_rebuild_after_restart: store.known_corrupt_rebuild_after_restart,
                     mode_repaired: pair(2),
                     store_disabled: disabled.filter(|_| last[3] == 0),
                 },

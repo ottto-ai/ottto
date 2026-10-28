@@ -27622,7 +27622,7 @@ impl OwnedSourceScan {
                         if let Some((member, reason)) = group.members.iter().find_map(|member| {
                             Some((
                                 member,
-                                cache.durable_hold(source, &local_index_key(&member.path))?,
+                                cache.durable_full_hold(source, &local_index_key(&member.path))?,
                             ))
                         }) {
                             cache.durable_hold_exit(source, reason, index, member, &mut census);
@@ -31992,6 +31992,21 @@ impl OwnedSourceScan {
                             retained_usage: None,
                             reinsertion: Default::default(),
                         });
+                    }
+                }
+            }
+            #[cfg(unix)]
+            if side_origin.is_none()
+                && file_sampling.as_ref().map_or(true, |a| {
+                    matches!(a.mode, crate::transcript_acquisition::ReadMode::Full(_))
+                })
+            {
+                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                    if let Some(reason) =
+                        cache.durable_full_hold(source, &local_index_key(&candidate.path))
+                    {
+                        cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
+                        pending!();
                     }
                 }
             }

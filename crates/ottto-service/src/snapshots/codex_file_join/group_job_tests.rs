@@ -2931,3 +2931,122 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         "control acquires both members; the held group acquires neither: {scanned:?}"
     );
 }
+
+/// B1: a spent T14 member holds its whole joined acquisition through the
+/// production exit WITHOUT making its source census unreadable. An unrelated
+/// session still publishes; the held group's accepted witnesses stay intact.
+#[cfg(unix)]
+#[test]
+fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
+    use crate::durable_tail_store::{self as store, SingleWriter};
+    use std::io::Read;
+    let (root, _) = fixture();
+    let source = SnapshotSource::Codex;
+    let cache = Arc::new(SharedCache::default());
+    let (mut index, seed) = sampled(&root, ScanIndex::default(), 10, &cache);
+    assert!(seed.census_complete);
+    let key = local_index_key(&root.join("sessions/a.jsonl"));
+    let accepted = index.files[&key].last_snapshot_fingerprint.clone();
+    assert!(accepted.is_some());
+    let index_path = root.join("index.json");
+    let scope = Scope("group-fixture".into());
+    let path = root.join("sessions/a.jsonl");
+    let mut file = fs::File::open(&path).unwrap();
+    let mut plan = crate::transcript_acquisition::ReadPlan::prepare(
+        &mut file,
+        None,
+        &scope,
+        None,
+        1_800_000_000,
+    )
+    .unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    plan.observe_complete_records(&bytes).unwrap();
+    let checkpoint = plan
+        .commit_after_native_completion(&file, &scope, 1_800_000_000)
+        .unwrap();
+    let certificate = checkpoint
+        .durable_certificate(crate::transcript_acquisition::birth_unix_nanos(
+            &file.metadata().unwrap(),
+        ))
+        .unwrap();
+    struct Writer(PathBuf);
+    impl SingleWriter for Writer {
+        fn state_dir(&self) -> &Path {
+            &self.0
+        }
+    }
+    let writer = Writer(root.clone());
+    let mut disk = store::DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        store::DurableSource::Codex,
+    );
+    let digest = store::key_digest(store::DurableSource::Codex, &key);
+    disk.write_after_save(
+        &writer,
+        1,
+        vec![store::PendingRecord {
+            binding: store::Binding {
+                source: store::DurableSource::Codex,
+                key: digest,
+                context: [0; 32],
+                scope: [0; 32],
+                entry: [0; 32],
+            },
+            certificate,
+            body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+            allowlist: sampled_jsonl::durable::allowlist_digest(source),
+        }],
+    )
+    .unwrap();
+    let record = disk.dir().join(format!(
+        "{}.rec",
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ));
+    let mut corrupt = fs::read(&record).unwrap();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fs::write(&record, &corrupt).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(source, &index_path, &scope, false);
+    assert_eq!(
+        cache.durable_full_hold(source, &key),
+        None,
+        "initial group rebuild attempt"
+    );
+    cache.durable_begin_pass(source, &index_path, &scope, false);
+    // A healthy, unrelated singleton is selected in the same terminal pass.
+    let peer_owner = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    write_rows(
+        &root.join("sessions/peer.jsonl"),
+        &member(peer_owner, "r-peer", 90, 90),
+    );
+    // Force the existing group to be offered without changing accepted witnesses.
+    for entry in index.files.values_mut() {
+        entry.source_file_fingerprint.clear();
+    }
+    let (index, result) = sampled_at(&root, index, 10, &cache, "2026-10-06T23:01:00Z");
+    assert!(
+        result.census_complete,
+        "a known_corrupt group must not make source census red"
+    );
+    assert_eq!(result.unreadable_path_count, 0);
+    assert_eq!(index.files[&key].last_snapshot_fingerprint, accepted);
+    assert!(!result
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == OWNER));
+    assert!(result
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == peer_owner));
+    let (counts, stats) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.durable_held, [0; 5]);
+    assert!(counts.not_persisted["known_corrupt_held"] > 0);
+    assert_eq!(stats.known_corrupt_rebuild_after_restart, 1);
+    assert_eq!(fs::read(&record).unwrap(), corrupt);
+    fs::remove_dir_all(root).unwrap();
+}

@@ -370,6 +370,7 @@ pub(crate) struct StoreCounters {
     /// T14 records to rebuild (read Full unless the RAM cache still holds the
     /// file, then replaced after the save); owner-only modes restored.
     pub(crate) t14_rebuild: u64,
+    pub(crate) known_corrupt_rebuild_after_restart: u64,
     pub(crate) mode_repaired: u64,
     pub(crate) guard_header_bytes: u64,
     pub(crate) guard_verify_bytes: u64,
@@ -413,8 +414,8 @@ pub(crate) struct DurableTailStore {
     /// This pass: directory checked and [records loaded, T14 rebuilds].
     checked: bool,
     pass: [u64; 2],
-    /// Process-lifetime attempts; true permits the current pass
-    /// (including the restore recheck), false holds a still-corrupt record.
+    /// Process-lifetime attempts; true permits the initial restore/Full check.
+    /// Spent keys are memory-only, or held when no RAM chain remains.
     rebuilt: BTreeMap<Digest32, bool>,
 }
 
@@ -554,14 +555,23 @@ impl DurableTailStore {
                         }
                     }
                 }
-                Err(_) => return Err(Refusal::Undecodable),
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(Refusal::Undecodable)
+                }
+                Err(e) => return Err(self.read_failure(e, Refusal::Undecodable)),
             };
             let Some(metadata) = self.inspect_file(&file) else {
                 return Ok(None);
             };
-            if metadata.is_file() && !self.repair(&path, &metadata, 0o600) {
+            if !metadata.is_file() {
+                return Err(Refusal::Undecodable);
+            }
+            if !self.repair(&path, &metadata, 0o600) {
                 return Ok(None);
             }
+            #[cfg(test)]
+            test_hooks::before_access(&path, "header")
+                .map_err(|e| self.read_failure(e, Refusal::Undecodable))?;
             let mut header = Vec::with_capacity(HEADER_BYTES);
             Read::by_ref(&mut file)
                 .take(HEADER_BYTES as u64)
@@ -583,6 +593,9 @@ impl DurableTailStore {
             if self.durable.get(key).is_some_and(|(_, old)| *old == stamp) {
                 return Ok(Some(binding));
             }
+            #[cfg(test)]
+            test_hooks::before_access(&path, "body")
+                .map_err(|e| self.read_failure(e, Refusal::Corrupt))?;
             let mut bytes = header;
             file.take((RECORD_BYTES + TRAILER_BYTES + 1) as u64)
                 .read_to_end(&mut bytes)
@@ -611,7 +624,7 @@ impl DurableTailStore {
     }
 
     fn read_failure(&mut self, error: io::Error, reason: Refusal) -> Refusal {
-        if error.kind() == io::ErrorKind::PermissionDenied {
+        if error.kind() != io::ErrorKind::InvalidData {
             self.disable("record_access");
         }
         reason
@@ -628,8 +641,7 @@ impl DurableTailStore {
             .ok()
     }
 
-    /// U holds. T14 gets one counted rebuild pass per process; if it still
-    /// cannot be replaced, later passes hold until restart or replacement.
+    /// U holds. T14 permits one rebuild; the adapter checks RAM before holding.
     pub(crate) fn hold(&mut self, key: &Digest32, restore_recheck: bool) -> Option<Refusal> {
         let result = self.classify(key, "guard");
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
@@ -650,6 +662,17 @@ impl DurableTailStore {
             Ok(_) => None,
             Err(reason) => Some(reason),
         }
+    }
+
+    pub(crate) fn full_hold(&mut self, key: &Digest32) -> Option<Refusal> {
+        let held = self.hold(key, true);
+        if held.is_none()
+            && self.disabled.is_none()
+            && self.rebuilt.get_mut(key).is_some_and(std::mem::take)
+        {
+            self.counters.known_corrupt_rebuild_after_restart += 1;
+        }
+        held
     }
 
     pub(crate) fn read(&mut self, key: &Digest32, allowlist: &Digest32) -> ReadOutcome {
@@ -708,6 +731,9 @@ impl DurableTailStore {
             .map(|record| record.body.len())
             .sum::<usize>();
         for record in pending {
+            if self.rebuilt.contains_key(&record.binding.key) {
+                continue;
+            }
             // A T14 predecessor is the rebuild's to replace.
             let corrupt = match self.classify(&record.binding.key, "overwrite") {
                 Err(Refusal::Corrupt) => true,
