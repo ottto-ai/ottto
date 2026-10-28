@@ -487,9 +487,15 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
 }
 
 /// A Codex transcript whose open call's id is `call_id_bytes` long: the id
-/// is kept verbatim in the record body, so it sizes the body.
+/// is kept verbatim in the record body, so it sizes the body. Three counted
+/// requests close the session-start window first, so its re-derived opening
+/// content ends inside the 1 MiB head.
 fn codex_budget_fixture(path: &Path, session: &str, call_id_bytes: Option<usize>) {
     let at = "2026-10-07T10:00:00Z";
+    let usage = |input: u64, output: u64| {
+        serde_json::json!({"input_tokens":input,"cached_input_tokens":0,
+            "output_tokens":output,"reasoning_output_tokens":0})
+    };
     let mut lines = vec![
         serde_json::json!({"type":"session_meta","timestamp":at,"payload":{"id":session,
             "timestamp":at,"cwd":"/tmp/dt-budget","originator":"codex_cli_rs",
@@ -497,6 +503,12 @@ fn codex_budget_fixture(path: &Path, session: &str, call_id_bytes: Option<usize>
         serde_json::json!({"type":"turn_context","timestamp":at,
             "payload":{"turn_id":"turn-1","cwd":"/tmp/dt-budget","model":"gpt-5.2"}}),
     ];
+    for n in 1..=crate::snapshots::session_start::WINDOW_REQUESTS as u64 {
+        lines.push(serde_json::json!({"type":"event_msg","timestamp":at,
+            "payload":{"type":"token_count","info":{
+                "total_token_usage":usage(100 * n, 10 * n),
+                "last_token_usage":usage(100, 10),"model":"gpt-5.2"}}}));
+    }
     if let Some(bytes) = call_id_bytes {
         lines.push(open_call(bytes));
     }
