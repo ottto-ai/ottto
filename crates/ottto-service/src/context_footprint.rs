@@ -1262,8 +1262,9 @@ pub(crate) fn safe_text(raw: &str, max_len: usize) -> Option<String> {
 const OBSERVED_CWDS_PER_FILE: usize = 8;
 const OBSERVED_CWD_MAX_BYTES: usize = 4 * 1024;
 const PROJECTION_MAX_BYTES: usize = 4 * 1024 * 1024;
-/// Charged per projected file on top of its cwd text.
-const PROJECTED_FILE_BYTES: usize = 128;
+/// Charged per projected file for its entry and map slot (the map may hold
+/// twice its live entries), on top of its cwd allocations.
+const PROJECTED_FILE_BYTES: usize = 256;
 
 /// Raw cwds of Claude transcripts, filled by snapshot sync's one read through
 /// its line delivery and read by each footprint cycle; footprint opens no
@@ -1293,7 +1294,8 @@ struct ProjectedFile {
 }
 
 fn projected_bytes(file: &ProjectedFile) -> usize {
-    PROJECTED_FILE_BYTES + file.cwds.iter().map(String::len).sum::<usize>()
+    let slots = file.cwds.capacity() * std::mem::size_of::<String>();
+    PROJECTED_FILE_BYTES + slots + file.cwds.iter().map(String::capacity).sum::<usize>()
 }
 
 /// Moves `cwd` to the newest position, keeping at most one file's worth.
@@ -1326,12 +1328,13 @@ impl CwdProjection {
     fn merge(&self, file: &FileView, cwds: Vec<String>, dropped: u64, incomplete: bool) {
         let mut projection = self.lock();
         projection.cwd_dropped += dropped;
-        projection.incomplete_files += u64::from(incomplete);
-        let Some(mtime) = file.mtime else {
-            return;
-        };
+        let old = projection.files.remove(&file.object);
+        // A Tail of an unknown file follows a prefix this process never saw
+        // (restart or eviction): partial, like an interrupted read.
+        let unseen_prefix = old.is_none() && file.mode == DeliveryMode::Tail;
+        projection.incomplete_files += u64::from(incomplete || unseen_prefix);
         let mut known = Vec::new();
-        if let Some(old) = projection.files.remove(&file.object) {
+        if let Some(old) = old {
             projection.bytes -= projected_bytes(&old);
             // A Full read starts at offset 0 and replaces what was known.
             if file.mode != DeliveryMode::Full {
@@ -1341,9 +1344,9 @@ impl CwdProjection {
         for cwd in &cwds {
             remember_cwd(&mut known, cwd);
         }
-        if known.is_empty() {
+        let Some(mtime) = file.mtime.filter(|_| !known.is_empty()) else {
             return;
-        }
+        };
         let entry = ProjectedFile { mtime, cwds: known };
         projection.bytes += projected_bytes(&entry);
         projection.files.insert(file.object, entry);
@@ -1368,6 +1371,7 @@ impl CwdProjection {
         projection.files.retain(|_, file| {
             now.duration_since(file.mtime).unwrap_or(Duration::ZERO) <= RECENT_WORKSPACE_WINDOW
         });
+        projection.files.shrink_to_fit();
         projection.bytes = projection.files.values().map(projected_bytes).sum();
         let mut out: BTreeMap<String, SystemTime> = BTreeMap::new();
         for file in projection.files.values() {
@@ -3345,6 +3349,23 @@ mod tests {
         observer.end(&codex, &DeliveryEnd::Incomplete);
         assert_eq!(projection.lock().incomplete_files, 1);
 
+        // A Tail of a file this process never projected missed its prefix.
+        let tail = root.join("tail.jsonl");
+        fs::write(&tail, "").unwrap();
+        let tail = claude_view(&tail, at, DeliveryMode::Tail);
+        deliver(
+            &mut projection.observer(),
+            &tail,
+            &[json!({"cwd": "/short"})],
+            DeliveryEnd::Complete,
+        );
+        assert_eq!(projection.lock().incomplete_files, 2);
+        // Short cwds are charged their slots and capacity, not only text.
+        let state = projection.lock();
+        let entry = &state.files[&tail.object];
+        assert!(projected_bytes(entry) >= PROJECTED_FILE_BYTES + std::mem::size_of::<String>() + 6);
+        drop(state);
+
         // A file whose read named no cwd is not projected.
         let empty = root.join("empty.jsonl");
         fs::write(&empty, "").unwrap();
@@ -3367,7 +3388,8 @@ mod tests {
         let lines: Vec<Value> = (0..OBSERVED_CWDS_PER_FILE)
             .map(|i| json!({"cwd": format!("/{i}{}", "c".repeat(OBSERVED_CWD_MAX_BYTES - 2))}))
             .collect();
-        let per_file = PROJECTED_FILE_BYTES + OBSERVED_CWDS_PER_FILE * OBSERVED_CWD_MAX_BYTES;
+        let per_file = PROJECTED_FILE_BYTES
+            + OBSERVED_CWDS_PER_FILE * (std::mem::size_of::<String>() + OBSERVED_CWD_MAX_BYTES);
         let fits = PROJECTION_MAX_BYTES / per_file;
         let projection = Arc::new(CwdProjection::default());
         let mut observer = projection.observer();
@@ -3382,6 +3404,10 @@ mod tests {
         {
             let state = projection.lock();
             assert_eq!(state.files.len(), fits);
+            assert!(state
+                .files
+                .values()
+                .all(|file| projected_bytes(file) == per_file));
             assert_eq!(state.bytes, fits * per_file);
             assert_eq!(state.evicted_files, 3);
         }
@@ -3398,6 +3424,11 @@ mod tests {
         let state = projection.lock();
         assert_eq!(state.files.len(), 15);
         assert_eq!(state.bytes, 15 * per_file);
+        drop(state);
+        // Forgetting every file releases the map's slots too.
+        assert!(projection.recent_cwds(newest + day * 30).is_empty());
+        let state = projection.lock();
+        assert_eq!((state.bytes, state.files.capacity()), (0, 0));
         drop(state);
         fs::remove_dir_all(root).unwrap();
     }

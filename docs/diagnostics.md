@@ -163,25 +163,35 @@ whether or not an observer is registered.
 Context footprint opens no transcript. Its workspaces come from the cwds of
 the Claude lines snapshot sync's primary reads already delivered to the
 `footprint` line observer, kept in RAM only (no transcript path, nothing
-persisted). Coverage follows that read: after a daemon restart only files
-read since then count, and nothing is seen while reconciliation is off,
-Claude is disabled for the source, snapshot sync is down, or the org backfill
-window is shorter than footprint's 14 days (0 days: almost nothing).
+persisted). Coverage follows that read:
 
-Each footprint cycle's `context_footprint_harvest_metrics` line adds counts
-since daemon start, with no paths or values:
+- After a daemon restart, only files read since then are known; a workspace
+  idle since the restart is not proposed until it is used again.
+- An org backfill window of 1-13 days narrows footprint's 14 days to that
+  window; 0 days leaves almost no history.
+- While reconciliation is off, Claude is disabled for the source or snapshot
+  sync is down, nothing new is delivered; files already known stay usable
+  until they age out of the 14 days or are evicted.
+- Claude files over 256 MiB are never delivered, and a cwd only on a line
+  over 16 MiB is not seen.
 
-- `discovery_path_scopes`: workspaces this cycle scoped by their own path (no
-  repository, or a repository probe that failed).
-- `footprint_observer_passes`: snapshot-sync Claude passes that registered the
-  observer. 0 means no delivery reached footprint.
-- `footprint_observer_files`, `footprint_observer_bytes`: files and estimated
-  RAM bytes held now (at most 8 cwds per file, 4 MiB in all).
-- `footprint_observer_evicted_files`: files dropped at the 4 MiB cap, oldest
-  modification time first.
-- `footprint_observer_cwd_dropped`: cwd values over 4 KiB, not kept.
-- `footprint_observer_incomplete_files`: deliveries that ended before their
-  read completed; what was delivered is kept.
+Each footprint cycle's `context_footprint_harvest_metrics` line adds these
+counts, with no paths or values:
+
+- `discovery_path_scopes` (this cycle): workspaces scoped by their own path
+  (no repository, or a repository probe that failed).
+- `footprint_observer_files`, `footprint_observer_bytes` (now): files held and
+  their charged RAM (cwd allocations plus a fixed per-file slot), capped at
+  4 MiB with at most 8 cwds per file.
+- Since daemon start:
+  - `footprint_observer_passes`: snapshot-sync Claude passes that registered
+    the observer. 0 means no delivery reached footprint.
+  - `footprint_observer_evicted_files`: files dropped at the cap, oldest
+    modification time first.
+  - `footprint_observer_cwd_dropped`: cwd values over 4 KiB, not kept.
+  - `footprint_observer_incomplete_files`: deliveries that ended before their
+    read completed, or appended lines of a file whose earlier lines this
+    process never saw (restart or eviction). What was delivered is kept.
 
 ## Private Codex Census Outcomes
 
