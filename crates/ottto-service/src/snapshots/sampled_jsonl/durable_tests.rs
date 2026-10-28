@@ -1021,7 +1021,10 @@ const ALLOWLIST_PINS: [(SnapshotSource, &str); 3] = [
         SnapshotSource::Codex,
         "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
     ),
-    (SnapshotSource::Pi, "PI_PIN_FROM_CI"),
+    (
+        SnapshotSource::Pi,
+        "bd43c3d6197e6a6dfe339a486b0bbf4aaa121fc40022fcc8418f9d900baac4f7",
+    ),
 ];
 
 fn hex(digest: [u8; 32]) -> String {

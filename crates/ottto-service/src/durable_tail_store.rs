@@ -1118,9 +1118,9 @@ fn decode_header(header: &[u8], key: &Digest32, source: DurableSource) -> Result
     let pin = match tag {
         1 => "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
         2 => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
-        // E5-REBASE(5a2): repin with `allowlist_digests_are_pinned`; until
-        // then every Pi record reads as Unknown and is held.
-        3 => "PI_PIN_FROM_CI",
+        // E5-REBASE(5a2): move the SOURCE-approved Pi pin into the
+        // format/source/allowlist dispatch table owned by 5a2.
+        3 => "bd43c3d6197e6a6dfe339a486b0bbf4aaa121fc40022fcc8418f9d900baac4f7",
         _ => return Err(Refusal::Unknown),
     };
     if Some(allowlist) != parse_hex_digest(pin) {
