@@ -255,7 +255,6 @@ fn read_records(root: &Path, max_files: usize) -> Vec<Record> {
     }
 }
 
-#[cfg(any(not(test), target_os = "macos"))]
 fn process_starts(pids: &[u32]) -> BTreeMap<u32, String> {
     #[cfg(target_os = "macos")]
     {

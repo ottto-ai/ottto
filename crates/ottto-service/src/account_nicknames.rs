@@ -327,9 +327,12 @@ pub(crate) fn set(
     if generation_for_device(&device).as_ref() != Some(&generation) {
         return finish(Outcome::NotConnected);
     }
-    let Some(machine_id) = device.machine_id.as_deref() else {
+    let Ok(Some(machine_id)) = crate::snapshot_sync::snapshot_machine_id(&device) else {
         return finish(Outcome::NotConnected);
     };
+    if !crate::session_launch::nickname_target_is_current(&pair) {
+        return finish(Outcome::TargetUnknown);
+    }
     let source = match pair.source {
         Provider::ClaudeCode => crate::snapshots::SnapshotSource::ClaudeCode,
         Provider::Codex => crate::snapshots::SnapshotSource::Codex,
@@ -369,7 +372,14 @@ pub(crate) fn set(
         payload["base_revision"] = serde_json::json!(revision);
     }
     match client.put_account_nickname(&token, &payload) {
-        Ok(Some(entry)) if entry.pair.as_ref() == Some(&pair) && entry.revision.is_some() => {
+        Ok(Some(entry))
+            if entry.pair.as_ref() == Some(&pair)
+                && entry.revision.is_some_and(|revision| revision > 0)
+                && entry
+                    .nickname
+                    .as_ref()
+                    .is_none_or(|text| normalize(Some(text.expose_secret())).is_ok()) =>
+        {
             if self::generation().as_ref() != Some(&generation) {
                 return finish(Outcome::NotConnected);
             }
@@ -441,4 +451,53 @@ mod tests {
         assert!(normalize(Some(&"a".repeat(41))).is_err());
         assert_eq!(normalize(Some("  ")).unwrap(), None);
     }
+
+    #[test]
+    fn cache_permissions_absent_field_and_late_generation_response() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let scratch = crate::test_scratch::ScratchDir::new("nicknames");
+        let root = scratch.as_ref();
+        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", root);
+        let account = serde_json::from_value(serde_json::json!({
+            "state":"connected", "user":{"id":"user-one","email":"synthetic@example.invalid"},
+            "organization":{"id":"org-one","name":"Synthetic"},
+            "connected_at":"2026-10-28T00:00:00Z", "last_refreshed_at":null, "message":null
+        }))
+        .unwrap();
+        FileAccountStore::default().save(&account).unwrap();
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device-one".into(),
+                machine_id: Some("machine-one".into()),
+                sources: vec!["codex".into()],
+            })
+            .unwrap();
+        let first = generation().unwrap();
+        apply_upload(Some(&first), Some(&[entry(2, Some("חדש"))]));
+        assert_eq!(
+            fs::metadata(root.join(CACHE_NAME)).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(read().entries.unwrap()[0].revision, Some(2));
+        apply_upload(Some(&first), None);
+        assert_eq!(read().entries.unwrap()[0].revision, Some(2));
+        // Reclaim fences even a late response carrying a higher revision for
+        // the same pair; the old nickname never crosses the new generation.
+        {
+            let _lock = crate::control::lock_setup_run_binding();
+            invalidate_locked();
+        }
+        apply_upload(Some(&first), Some(&[entry(99, Some("old generation"))]));
+        assert!(read().entries.unwrap().is_empty());
+        let next = generation().unwrap();
+        apply_upload(Some(&next), Some(&[entry(3, None)]));
+        assert!(read().entries.unwrap()[0].nickname.is_none());
+        reject(&next);
+        assert_eq!(read().connected, Some(false));
+        std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
+    }
 }
+
+crate::heap_layout_bound::fields!(Generation; binding, epoch);

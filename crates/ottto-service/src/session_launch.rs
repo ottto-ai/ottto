@@ -4,6 +4,8 @@
 mod binding;
 mod preflight;
 mod recent;
+#[cfg(test)]
+mod tests;
 
 use binding::Binding;
 use ottto_core::{
@@ -232,12 +234,17 @@ impl Registry {
             return consume_block(block(Reason::LaunchUnknown));
         };
         if entry.state != State::Pending {
-            return consume_block(
-                entry
-                    .block
-                    .clone()
-                    .unwrap_or_else(|| block(Reason::LaunchAlreadyUsed)),
-            );
+            return consume_block(block(if entry.state == State::Expired {
+                Reason::LaunchExpired
+            } else if entry
+                .block
+                .as_ref()
+                .is_some_and(|error| error.reason == Reason::LaunchCancelled)
+            {
+                Reason::LaunchCancelled
+            } else {
+                Reason::LaunchAlreadyUsed
+            }));
         }
         // Atomic single-use claim before *any* check. A failed first attempt
         // cannot be retried with the same secret.
@@ -319,6 +326,41 @@ impl Registry {
     ) -> ottto_protocol::SessionLaunchRecentFoldersV1 {
         self.recent.get(provider, slot_id, limit, support)
     }
+}
+
+/// A display nickname may be edited only for a currently verified local
+/// login. Remembered/historical rows never become write authority.
+pub(crate) fn nickname_target_is_current(pair: &ottto_protocol::AccountNicknamePairV1) -> bool {
+    let (Some(user), Some(account), Some(org)) = (
+        launch_user(),
+        pair.account_identifier_hash.as_deref(),
+        pair.organization_identifier_hash.as_deref(),
+    ) else {
+        return false;
+    };
+    let ids: Vec<String> = match pair.source {
+        Provider::ClaudeCode => {
+            match ottto_core::FileClaudeConfigSlotSettingsStore::default().load() {
+                Ok(status) => std::iter::once(status.default_slot)
+                    .chain(status.managed_slots)
+                    .chain(status.external_slots)
+                    .map(|slot| slot.slot_id)
+                    .collect(),
+                Err(_) => return false,
+            }
+        }
+        Provider::Codex => match ottto_core::FileCodexAccountSlotSettingsStore::default().load() {
+            Ok(status) => std::iter::once(status.default_slot)
+                .chain(status.managed_slots)
+                .map(|slot| slot.slot_id)
+                .collect(),
+            Err(_) => return false,
+        },
+        Provider::Unknown => return false,
+    };
+    ids.iter()
+        .take(10)
+        .any(|id| binding::resolve(pair.source, id, account, org, user.clone()).is_ok())
 }
 
 fn consume_block(error: Block) -> SessionLaunchConsumeResultV1 {
@@ -417,6 +459,8 @@ fn supported_version(program: &Path, binding: &Binding, cwd: &Path) -> Result<St
     }
     // Reapply selectors after scrubbing, exactly as the terminal executor does.
     command.envs(environment(binding).1);
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
     let mut child = command
         .spawn()
         .map_err(|_| block(Reason::CliVersionUnsupported))?;
@@ -437,12 +481,18 @@ fn supported_version(program: &Path, binding: &Binding, cwd: &Path) -> Result<St
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
+                unsafe {
+                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(block(Reason::CliVersionUnsupported));
             }
         }
     };
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
     let (read, bytes) = receiver
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| block(Reason::CliVersionUnsupported))?;
@@ -462,7 +512,16 @@ fn parse_version(bytes: &[u8], provider: Provider) -> Option<String> {
             .unwrap_or(text),
         Provider::Unknown => return None,
     };
-    let major = version.split('.').next()?.parse::<u64>().ok()?;
+    let core = version.split(['-', '+']).next()?;
+    let components = core.split('.').collect::<Vec<_>>();
+    if components.len() != 3
+        || components
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let major = components[0].parse::<u64>().ok()?;
     if !version.contains('.')
         || version.chars().any(char::is_control)
         || major

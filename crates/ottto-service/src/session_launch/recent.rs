@@ -21,7 +21,7 @@ pub(super) struct Cache {
         Instant,
         Option<Provider>,
         Option<String>,
-        Option<String>,
+        Option<crate::account_nicknames::Generation>,
         Response,
     )>,
     key: Option<String>,

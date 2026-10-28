@@ -1605,6 +1605,7 @@ fn decode_account_nicknames<'de, D: serde::Deserializer<'de>>(
     Ok(value.as_array().map(|values| {
         values
             .iter()
+            .filter(|value| value.get("nickname").is_some())
             .filter_map(|value| serde_json::from_value(value.clone()).ok())
             .collect()
     }))
@@ -1763,6 +1764,34 @@ impl SnapshotApiClient {
         self
     }
 
+    /// Status uploads alone carry the optional nickname projection. Tag the
+    /// token before its network request; all other relay clients stay unchanged.
+    pub(crate) fn issue_status_relay_token(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+    ) -> Result<String> {
+        let nickname_generation =
+            if self.matches_api_base(&crate::snapshot_sync::snapshot_api_base_url()) {
+                crate::account_nicknames::generation_for_device(device)
+            } else {
+                None
+            };
+        let token = self.issue_relay_token(device, device_secret, source)?;
+        if let Some(generation) = nickname_generation {
+            use sha2::Digest;
+            let key: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
+            if let Ok(mut generations) = self.nickname_generations.lock() {
+                if generations.len() >= 32 {
+                    generations.clear();
+                }
+                generations.insert(key, generation);
+            }
+        }
+        Ok(token)
+    }
+
     pub fn issue_relay_token(
         &self,
         device: &LocalDeviceBinding,
@@ -1828,12 +1857,6 @@ impl SnapshotApiClient {
         timeout: Duration,
         response_cap: Option<usize>,
     ) -> Result<String> {
-        let nickname_generation =
-            if self.matches_api_base(&crate::snapshot_sync::snapshot_api_base_url()) {
-                crate::account_nicknames::generation_for_device(device)
-            } else {
-                None
-            };
         let mut probe = crate::relay_auth::Probe::begin(
             &self.api_base_url,
             device,
@@ -1880,16 +1903,6 @@ impl SnapshotApiClient {
         }
         .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
         probe.success();
-        if let Some(generation) = nickname_generation {
-            use sha2::Digest;
-            let key: [u8; 32] = sha2::Sha256::digest(response.token.as_bytes()).into();
-            if let Ok(mut generations) = self.nickname_generations.lock() {
-                if generations.len() >= 32 {
-                    generations.clear();
-                }
-                generations.insert(key, generation);
-            }
-        }
         Ok(response.token)
     }
 
@@ -2464,10 +2477,55 @@ impl SnapshotApiClient {
                     .lock()
                     .ok()
                     .and_then(|generations| generations.get(&key).cloned());
-                crate::account_nicknames::apply_upload(
-                    generation.as_ref(),
-                    response.account_nicknames.as_deref(),
-                );
+                let admitted = response.account_nicknames.as_ref().map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.pair.as_ref().is_some_and(|pair| {
+                                request.snapshots.iter().any(|snapshot| {
+                                    let source_matches = matches!(
+                                        (&snapshot.source, pair.source),
+                                        (
+                                            ottto_protocol::SourceKind::ClaudeCode,
+                                            ottto_protocol::SessionLaunchProviderV1::ClaudeCode
+                                        ) | (
+                                            ottto_protocol::SourceKind::Codex,
+                                            ottto_protocol::SessionLaunchProviderV1::Codex
+                                        )
+                                    );
+                                    source_matches
+                                        && (snapshot.account.as_ref().is_some_and(|account| {
+                                            pair.account_identifier_hash
+                                                == account.account_identifier_hash
+                                                && pair
+                                                    .organization_identifier_hash
+                                                    .as_deref()
+                                                    .unwrap_or("")
+                                                    == account
+                                                        .organization_identifier_hash
+                                                        .as_deref()
+                                                        .unwrap_or("")
+                                        }) || snapshot.plan_observations.iter().any(
+                                            |observation| {
+                                                pair.account_identifier_hash
+                                                    == observation.account_identifier_hash
+                                                    && pair
+                                                        .organization_identifier_hash
+                                                        .as_deref()
+                                                        .unwrap_or("")
+                                                        == observation
+                                                            .organization_identifier_hash
+                                                            .as_deref()
+                                                            .unwrap_or("")
+                                            },
+                                        ))
+                                })
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+                crate::account_nicknames::apply_upload(generation.as_ref(), admitted.as_deref());
                 Ok(response)
             }
             Err(ureq::Error::Status(code, response)) => {
@@ -5146,6 +5204,7 @@ crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, las
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         let Self {
+            nickname_generations,
             api_base_url,
             #[cfg(test)]
                 bounded_retry_loopback_http_for_test: _,
@@ -5158,6 +5217,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
         // Both Agent handles clone the existing process-wide shared_agents pool;
         // SourcePreparation creates no new pool. Inline handles are charged by
         // their owning frame, and this bound covers its incremental owned heap.
+        nickname_generations.heap_bound(c)?;
         api_base_url.heap_bound(c)?;
         receipt_state_dir.heap_bound(c)?;
         receipt_destination_namespace.heap_bound(c)?;
