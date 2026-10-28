@@ -860,6 +860,7 @@ fn apc_pending(
         previous_snapshot_fingerprint: None,
         previous_upload_body_witness: None,
         parse_complete,
+        complete_native_reduction: false,
         diagnostic_reason: if parse_complete {
             FileReason::Complete
         } else {

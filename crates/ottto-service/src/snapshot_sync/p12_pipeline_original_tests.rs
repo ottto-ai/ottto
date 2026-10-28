@@ -311,12 +311,15 @@ impl RearmFixture {
             .collect()
     }
 
-    /// Family members whose source revision is cleared, so the next traversal
-    /// reparses them.
+    /// Family members whose source revision is cleared, or (O1) that selected
+    /// recovery queued as restore-only targets, so the next traversal reads them.
     fn family_rearm_debt(index: &ScanIndex) -> usize {
         Self::family_keys(index)
             .values()
-            .filter(|key| index.files[*key].source_file_fingerprint.is_empty())
+            .filter(|key| {
+                index.files[*key].source_file_fingerprint.is_empty()
+                    || index.native_comparison_restore_target_for_test(key)
+            })
             .count()
     }
 
@@ -1793,13 +1796,24 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     // The deferred-only contract applies to families that fit a native page.
     // The ORIGINAL two required oracles remain at REARM_PAGE_FILES=2.
     fixture.native_file_limit = 4;
+    // O1: production sampled acquisition, so N+1 restores A, never re-reads it.
+    fixture.reread_guard_cache = Some(std::sync::Arc::new(Default::default()));
     fixture.establish();
     assert_eq!(rearm_reads(&fixture.generation(10)), 0);
     const COPY: &str = "e5555555-5555-4555-8555-555555555555";
     let path = native_comparison_add_import(&fixture, COPY, "req_root_1");
     let family = rearm_family_sessions();
     let mut seen = BTreeMap::<String, BTreeSet<String>>::new();
-    let first = fixture.generation(11);
+    let (first, records) = crate::local_resource_diagnostics::capture(|| fixture.generation(11));
+    let restore = native_restore_counts(&records);
+    assert_eq!(
+        restore.refused, 0,
+        "a retained reduction serves every deferred A"
+    );
+    assert!(
+        restore.unchanged >= 3,
+        "N+1 serves A from the reduction: 0 bytes re-read"
+    );
     let deferred = first
         .iter()
         .find(|page| page.parsed.contains(COPY))
@@ -1823,6 +1837,15 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     let family_keys = RearmFixture::family_keys(&deferred.index)
         .into_values()
         .collect::<BTreeSet<_>>();
+    assert!(
+        family_keys
+            .iter()
+            .all(|key| !deferred.index.files[key].source_file_fingerprint.is_empty()),
+        "O1: recovery keeps every A object stamp; the debt is queued beside it"
+    );
+    let (targets, dependents, refused) = deferred.index.native_comparison_restore_debt_for_test();
+    assert_eq!(targets, 3);
+    assert!(dependents >= 1 && !refused);
     let queued = saved["traversal"]["pending_candidates"]
         .as_array()
         .expect("selected C3 has a durable queue");
@@ -1847,6 +1870,11 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     assert!(
         !next.native_lease_allowed,
         "N+1 is BASE under the family latch"
+    );
+    assert_eq!(
+        next.index.native_comparison_restore_debt_for_test(),
+        (0, 0, false),
+        "N+1 consumes the queued debt once"
     );
     let next_copy = next
         .scan
@@ -1931,6 +1959,181 @@ fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
     writeln!(std::io::stderr().lock(),"native_comparison_real_copy_hit: hit_body_ran=true quiet0_before_hit=true deliberate_policy_defer=true eligible_family3_page_cap4=true copy_withheld_until_samewindow_native=true selected_restore_debt3=true copy_not_fake_empty=true exact_pair_saved=true no_positive_copied_posture_or_tags=true bounded_copy_liveness=true").unwrap();
 }
 
+/// O1 page totals from the captured `native_collection_page` lines.
+#[derive(Debug, Default)]
+struct NativeRestoreCounts {
+    refused: u64,
+    deferred_base: u64,
+    disclosed: u64,
+    unchanged: u64,
+}
+
+fn native_restore_counts(records: &[serde_json::Value]) -> NativeRestoreCounts {
+    let mut total = NativeRestoreCounts::default();
+    let mut recovery_cleared = 0;
+    for counts in records
+        .iter()
+        .filter(|record| record["stage"] == "native_collection_page")
+        .map(|record| &record["counts"])
+    {
+        let n = |value: &serde_json::Value| value.as_u64().unwrap_or(0);
+        let acquisition = &counts["sampled_acquisition"];
+        total.refused +=
+            n(&acquisition["acquisition_admission"]["full_refused_native_comparison_target"]);
+        total.unchanged += n(&acquisition["unchanged_selections"]);
+        total.deferred_base += n(&counts["full_refused_native_comparison_target_deferred_base"]);
+        recovery_cleared += n(&counts["full_refused_native_comparison_target_recovery_cleared"]);
+    }
+    assert_eq!(
+        total.refused,
+        total.deferred_base + recovery_cleared,
+        "the origin split sums exactly to the single refused leaf"
+    );
+    total.disclosed = records
+        .iter()
+        .filter(|record| record["stage"] == "native_comparison_restore_unavailable")
+        .filter_map(|record| record["counts"]["native_comparison_pending_debt"].as_u64())
+        .max()
+        .unwrap_or(0);
+    total
+}
+
+/// O1: with no retained or durable reduction, the deferred A is refused and
+/// counted once, its queued dependent (COPY) is held unread, an unrelated
+/// changed file continues, nothing reads Full and nothing is requeued.
+#[test]
+#[serial(source_manifests)]
+fn native_comparison_deferred_target_without_reduction_holds_dependents_once() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    if !crate::heap_layout_bound::layout_supported() {
+        eprintln!("native_comparison_restore_unavailable: supported_positive=UNEXECUTED");
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let mut fixture = RearmFixture::new("native-restore-unavailable");
+    fixture.native_file_limit = 4;
+    fixture.reread_guard_cache = Some(std::sync::Arc::new(Default::default()));
+    fixture.establish();
+    assert_eq!(rearm_reads(&fixture.generation(10)), 0);
+    const COPY: &str = "e7777777-7777-4777-8777-777777777777";
+    native_comparison_add_import(&fixture, COPY, "req_root_1");
+    let family = rearm_family_sessions();
+    let mut number = 0;
+    let deferred = loop {
+        assert!(number < REARM_MAX_PAGES, "the hit page is reached");
+        let page = fixture.page(
+            &format!("2026-08-02T11:{number:02}:00Z"),
+            RearmUpload::Accept,
+        );
+        number += 1;
+        if page.parsed.contains(COPY) {
+            break page;
+        }
+    };
+    let family_keys = RearmFixture::family_keys(&deferred.index);
+    let stamps = family_keys
+        .values()
+        .map(|key| deferred.index.files[key].source_file_fingerprint.clone())
+        .collect::<Vec<_>>();
+    assert!(stamps.iter().all(|stamp| !stamp.is_empty()));
+    assert_eq!(
+        deferred.index.native_comparison_restore_debt_for_test().0,
+        3
+    );
+    // No retained copy (eviction or restart) and no durable store: restore is
+    // unavailable. An unrelated file, still queued later in this walk, changes.
+    crate::snapshots::reread_guard::clear_cache_for_test(
+        fixture.reread_guard_cache.as_ref().unwrap(),
+    );
+    RearmFixture::append(
+        &fixture
+            .root
+            .join("zz-terminal")
+            .join("nested")
+            .join(format!("{REARM_TERMINAL}.jsonl")),
+        &rearm_transcript_line(REARM_TERMINAL, None, "req_terminal_2", 30),
+    );
+    let (next, records) = crate::local_resource_diagnostics::capture(|| {
+        fixture.page(
+            &format!("2026-08-02T11:{number:02}:00Z"),
+            RearmUpload::Accept,
+        )
+    });
+    number += 1;
+    let restore = native_restore_counts(&records);
+    assert_eq!(restore.refused, 3, "one count per refused A, never a Full");
+    assert_eq!(restore.deferred_base, 3);
+    assert!(
+        restore.disclosed >= 1,
+        "the unread dependent debt is disclosed by the shared boundary gauge"
+    );
+    assert!(next.parsed.is_disjoint(&family), "no A byte is re-read");
+    assert!(!next.parsed.contains(COPY), "COPY is held unread");
+    assert!(next
+        .scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id != COPY));
+    assert!(!next.scan.census_complete);
+    let (targets, _, refused) = next.index.native_comparison_restore_debt_for_test();
+    assert!(
+        targets == 3 && refused,
+        "unresolved targets survive without being requeued this walk"
+    );
+    assert_eq!(
+        family_keys
+            .values()
+            .map(|key| next.index.files[key].source_file_fingerprint.clone())
+            .collect::<Vec<_>>(),
+        stamps,
+        "object stamps stay intact"
+    );
+    // The rest of the walk: no requeue loop and no further refusal or read of A.
+    let mut rest = Vec::new();
+    let ((), records) = crate::local_resource_diagnostics::capture(|| {
+        fixture.finish_generation(11, number, &mut rest)
+    });
+    assert_eq!(native_restore_counts(&records).refused, 0);
+    assert!(rest.iter().all(|page| page.parsed.is_disjoint(&family)));
+    assert!(
+        std::iter::once(&next).chain(&rest).any(|page| page
+            .scan
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == REARM_TERMINAL)),
+        "unrelated bodies continue"
+    );
+    // Production load/save on subsequent walks must keep the unresolved owner
+    // dependency even though the old traversal and lifecycle lease have ended.
+    for hour in [12, 13] {
+        let (later, records) =
+            crate::local_resource_diagnostics::capture(|| fixture.generation(hour));
+        assert!(
+            native_restore_counts(&records).refused <= 3,
+            "at most one attempt per target per walk"
+        );
+        assert!(later.iter().all(|page| !page.parsed.contains(COPY)));
+        assert!(later.iter().all(|page| page
+            .scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != COPY)));
+        let saved = later.last().unwrap();
+        assert!(!saved.index.scan_traversal_in_progress_for_test());
+        assert_eq!(saved.index.native_comparison_restore_debt_for_test().0, 3);
+        let encoded = serde_json::to_value(&saved.index).unwrap();
+        assert_eq!(
+            encoded["native_comparison_restore"]["targets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+    writeln!(std::io::stderr().lock(), "native_comparison_restore_unavailable: refused=3 deferred_base=3 disclosed={} family_reads=0 copy_held=true unrelated_continues=true stamps_intact=true requeued=0", restore.disclosed).unwrap();
+}
+
 fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool) {
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_copy_interruption: mode={upload:?} restart={restart} supported_positive=UNEXECUTED").unwrap();
@@ -1946,6 +2149,8 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
     if let Some(base) = baseline.as_ref() {
         base.establish();
     }
+    // O1: production sampled acquisition; N+1 restores A from its reduction.
+    fixture.reread_guard_cache = Some(std::sync::Arc::new(Default::default()));
     let native = crate::snapshots::claude_native_comparison::enable_for_test();
     fixture.establish();
     let quiet = fixture.generation(10);
@@ -2301,7 +2506,9 @@ fn native_comparison_deferred_policy_resource_usefulness() {
     // retain this faithful BASE input. SOURCE/SI qualify only additive curve
     // phase differences; all semantic/identity and per-mode ACK checks stay exact.
     base.owned_base_preparation = true;
-    let candidate = native_comparison_independent_history(&base);
+    let mut candidate = native_comparison_independent_history(&base);
+    // O1: production sampled acquisition; the deferred A is restored, not read.
+    candidate.reread_guard_cache = Some(std::sync::Arc::new(Default::default()));
     // 8 MiB of valid non-usage progress rows, streamed rather than one giant
     // line. No provider data, live corpus read, parser limit or cap change.
     {

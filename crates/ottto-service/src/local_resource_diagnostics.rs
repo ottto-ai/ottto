@@ -71,6 +71,44 @@ pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
     )
 }
 
+/// O1 (E3): nonzero-only native comparison restore counters on the existing
+/// native_collection_page line. The two refusal origins sum exactly to that
+/// page's `full_refused_native_comparison_target`.
+#[derive(Default, Serialize)]
+struct NativeComparisonRestore {
+    /// Deferred targets popped on the next BASE page, with no validated reuse.
+    #[serde(skip_serializing_if = "is_zero")]
+    full_refused_native_comparison_target_deferred_base: u64,
+    /// Legacy phase/recovery target origin; recovery now preserves stamps.
+    #[serde(skip_serializing_if = "is_zero")]
+    full_refused_native_comparison_target_recovery_cleared: u64,
+}
+#[cfg(not(test))]
+static NATIVE_RESTORE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+thread_local! {
+    static NATIVE_RESTORE: [AtomicU64; 2] = const { [const { AtomicU64::new(0) }; 2] };
+}
+fn with_native_restore<T>(f: impl FnOnce(&[AtomicU64; 2]) -> T) -> T {
+    #[cfg(test)]
+    {
+        NATIVE_RESTORE.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&NATIVE_RESTORE)
+    }
+}
+/// One count per refused acquisition decision (per file and attempt).
+pub(crate) fn native_comparison_target_refused(deferred_base: bool) {
+    with_native_restore(|c| c[usize::from(!deferred_base)].fetch_add(1, Relaxed));
+}
+fn take_native_comparison_restore() -> NativeComparisonRestore {
+    with_native_restore(|c| NativeComparisonRestore {
+        full_refused_native_comparison_target_deferred_base: c[0].swap(0, Relaxed),
+        full_refused_native_comparison_target_recovery_cleared: c[1].swap(0, Relaxed),
+    })
+}
 /// K10 (LD): one line observer's counts for a page; nonzero keys only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LineDeliveryCounts {
@@ -287,6 +325,8 @@ impl Probe {
             #[serde(flatten)]
             caps: ClaudeRecordCaps,
             #[serde(flatten)]
+            native_restore: NativeComparisonRestore,
+            #[serde(flatten)]
             identity: crate::snapshots::claude_request_identity::IdentityCounts,
             #[serde(flatten)]
             reread: claude_reread::Counts,
@@ -320,6 +360,11 @@ impl Probe {
             },
             caps: if claude {
                 take_claude_record_caps()
+            } else {
+                Default::default()
+            },
+            native_restore: if claude {
+                take_native_comparison_restore()
             } else {
                 Default::default()
             },
@@ -598,6 +643,24 @@ fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
         },
         counts,
     });
+}
+
+/// Comparison bodies actually withheld and unresolved source debt at this
+/// boundary. The latter is a gauge, not coverage or a settlement receipt.
+pub(crate) fn native_comparison_restore_unavailable(bodies: usize, pending: usize) {
+    #[derive(Serialize)]
+    struct Counts {
+        native_comparison_disclosed_restore_unavailable: usize,
+        native_comparison_pending_debt: usize,
+    }
+    traversal_point(
+        "native_comparison_restore_unavailable",
+        "claude_code",
+        &Counts {
+            native_comparison_disclosed_restore_unavailable: bodies,
+            native_comparison_pending_debt: pending,
+        },
+    );
 }
 
 /// One preparation/page observation, never a permit or authority input.
@@ -900,6 +963,8 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) audit_slot_available: AssessedBool,
     pub(crate) sampling_allowed: AssessedBool,
     pub(crate) retained_entry_rejected_by_eligibility: usize,
+    /// Native comparison targets with no validated reuse: refused, never Full.
+    pub(crate) full_refused_native_comparison_target: usize,
     pub(crate) prepare_started: usize,
     pub(crate) prepare_failed: usize,
 }
@@ -1185,6 +1250,7 @@ mod tests {
                 audit_slot_available: gate,
                 sampling_allowed: gate,
                 retained_entry_rejected_by_eligibility: usize::MAX,
+                full_refused_native_comparison_target: usize::MAX,
                 prepare_started: usize::MAX,
                 prepare_failed: usize::MAX,
             },

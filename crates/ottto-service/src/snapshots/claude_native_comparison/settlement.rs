@@ -551,10 +551,12 @@ impl Completion {
                                 && member.matches_member(&item.source_session_id)
                         },
                     )
-                    && previous
+                    && (previous
                         .files
                         .get(&pending.index_key)
                         .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                        // O1: recovery now queues the debt, not an empty stamp.
+                        || previous.native_comparison_restore.targets.contains(&pending.index_key))
             }) else {
                 continue;
             };
@@ -923,6 +925,8 @@ impl Controller {
                 }),
             });
         }
+        // A debt-free comparison boundary resets the pending-debt gauge.
+        crate::local_resource_diagnostics::native_comparison_restore_unavailable(0, 0);
         // Only fallback restoration needs the full graph. Retire it before
         // allocating plans/window metadata, moving its existing window string.
         let native_terminal = terminal.map(TerminalTraversal::into_native_census);
@@ -1121,8 +1125,20 @@ impl SelectedFallback {
             cost.add(target.path.capacity())?;
             cost.add(target.scan_root.capacity())?;
             cost.add(path.len())?;
+            cost.add(path.len())?; // O1 restore-only target key
         }
         heap_layout_bound::tree_nodes::<String, ()>(keys, &mut cost)?;
+        let debt = &index.native_comparison_restore;
+        for (entries, operations) in [
+            (debt.targets.len(), target_count),
+            (debt.dependents.len(), pending.len()),
+        ] {
+            restore_tree_insert_peak::<String, ()>(
+                entries.checked_add(operations)?,
+                operations,
+                &mut cost,
+            )?;
+        }
         for read in pending {
             let path = Path::new(&read.index_key);
             let root = traversal
@@ -1131,6 +1147,7 @@ impl SelectedFallback {
                 .filter(|root| path.starts_with(root))
                 .max_by_key(|root| root.components().count())?;
             cost.add(read.index_key.len())?;
+            cost.add(read.index_key.len())?; // O1 dependent debt key
             cost.add(root.capacity())?;
         }
         for path in &traversal.pending_candidates {
@@ -1197,8 +1214,13 @@ impl SelectedFallback {
     /// deferred file cannot be finalized as an empty or semantic-no-op file.
     pub(crate) fn withhold(&self, scan: &mut SourceScanResult) {
         eprintln!("local snapshot comparison deferred: reason=native_comparison_unavailable sources={} target_files={}; prior accepted bodies unchanged", self.withheld_sources.len(), self.targets.len());
+        let before = scan.snapshots.len();
         scan.snapshots
             .retain(|item| !self.withheld_sources.contains(&item.source_session_id));
+        crate::local_resource_diagnostics::native_comparison_restore_unavailable(
+            before - scan.snapshots.len(),
+            self.withheld_sources.len(),
+        );
     }
 
     pub(crate) fn after_native_fold(&self, scan: &mut SourceScanResult, index: &mut ScanIndex) {
@@ -1352,11 +1374,16 @@ impl SelectedFallback {
             .retain(|candidate| !keys.contains(&local_index_key(&candidate.path)));
         priority.append(&mut traversal.pending_candidates);
         traversal.pending_candidates = priority;
-        for target in &self.targets {
-            if let Some(entry) = index.files.get_mut(&local_index_key(&target.path)) {
-                entry.source_file_fingerprint.clear();
-            }
-        }
+        // O1: the deferred demand is restore-only debt beside the unchanged
+        // object stamp. A cleared fingerprint would refuse the durable restore
+        // and force a Full read of the frozen target.
+        let debt = &mut index.native_comparison_restore;
+        debt.targets.extend(
+            self.targets
+                .iter()
+                .map(|target| local_index_key(&target.path)),
+        );
+        debt.dependents.extend(self.withheld_keys.iter().cloned());
         index.mark_bounded_sweep_unsettled();
         Ok(())
     }

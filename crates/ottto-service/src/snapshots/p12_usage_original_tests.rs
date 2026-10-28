@@ -173,6 +173,7 @@ impl Family {
                     previous_snapshot_fingerprint: old.last_snapshot_fingerprint.clone(),
                     previous_upload_body_witness: old.last_upload_body_witness.clone(),
                     parse_complete: true,
+                    complete_native_reduction: false,
                     diagnostic_reason: FileReason::Complete,
                     parsed_snapshot_count: 1,
                     effective_upload_body_witness_revision: 0,

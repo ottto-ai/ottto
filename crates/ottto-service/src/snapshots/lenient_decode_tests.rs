@@ -836,6 +836,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
         previous_snapshot_fingerprint: Some("previous-group".into()),
         previous_upload_body_witness: None,
         parse_complete: true,
+        complete_native_reduction: false,
         diagnostic_reason: FileReason::Complete,
         parsed_snapshot_count: 1,
         effective_upload_body_witness_revision: 0,
@@ -2045,6 +2046,11 @@ fn every_persisted_field_fixture() -> ScanIndex {
             "held_audit_progress" => serde_json::json!({
                 "key":"/synthetic/0.jsonl", "due":7, "attempted":true
             }),
+            "native_comparison_restore" => serde_json::json!({
+                "targets":["/synthetic/0.jsonl"],
+                "dependents":["/synthetic/1.jsonl"],
+                "refused":true
+            }),
             "claude_money_birth_store" => {
                 let mut store = claude_money_birth_store::BirthStore::default();
                 store.record_observation("session", "/synthetic/0.jsonl", 1);
@@ -2127,15 +2133,20 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
     let current = serde_json::to_value(&seed).unwrap();
     let fields = lenient_decode::FIELDS;
     assert_eq!(
-        &fields[fields.len() - 3..],
+        &fields[fields.len() - 4..],
         &[
             "upload_ack_retirement_handoff",
             "held_audit_progress",
             "claude_money_birth_store",
+            "native_comparison_restore",
         ]
     );
     for earlier_e2 in [false, true] {
         let mut legacy = current.clone();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("native_comparison_restore");
         legacy.as_object_mut().unwrap().remove(if earlier_e2 {
             "held_audit_progress"
         } else {
@@ -2144,9 +2155,9 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
         let mut forms = vec![legacy.clone()];
         if !earlier_e2 {
             // The main positional schema ends at audit progress; appending E2
-            // must leave every already-shipped position intact.
+            // and restore debt must leave every already-shipped position intact.
             forms.push(Value::Array(
-                fields[..fields.len() - 1]
+                fields[..fields.len() - 2]
                     .iter()
                     .map(|name| legacy[*name].clone())
                     .collect(),

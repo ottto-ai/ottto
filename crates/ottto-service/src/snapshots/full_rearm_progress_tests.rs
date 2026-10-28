@@ -1322,6 +1322,7 @@ fn rebuild_reads(index: &ScanIndex) -> Vec<PendingIndexFinalization> {
             previous_snapshot_fingerprint: None,
             previous_upload_body_witness: None,
             parse_complete: true,
+            complete_native_reduction: false,
             diagnostic_reason: FileReason::Complete,
             parsed_snapshot_count: 1,
             effective_upload_body_witness_revision: 0,

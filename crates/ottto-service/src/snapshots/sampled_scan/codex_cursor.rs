@@ -6705,6 +6705,7 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
         previous_snapshot_fingerprint: previous.0,
         previous_upload_body_witness: previous.1,
         parse_complete: false,
+        complete_native_reduction: false,
         diagnostic_reason: disclosure.diagnostic_reason,
         parsed_snapshot_count: disclosure.parsed_snapshot_count,
         effective_upload_body_witness_revision: index.active_effective_upload_body_witness_revision,

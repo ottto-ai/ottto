@@ -101,6 +101,17 @@ def main():
                 raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
             if len(verified) + len(disk) != len(expected) + len(DISK_FIXTURES):
                 raise RuntimeError(f"expected {len(expected)} + {len(DISK_FIXTURES)} receipts")
+        # Native comparison is a candidate-only acquisition seam. Compare its
+        # restored and fresh-Full emitted bodies/assigned hashes/settlement in
+        # one binary, alongside the unchanged cross-build and disk receipts.
+        native = subprocess.run([bins[0], "native_comparison_restored_money_equivalence",
+                                 "--nocapture", "--test-threads=1"], cwd=repo, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(native.stdout, flush=True)
+        (receipts / "native-comparison.log").write_text(native.stdout)
+        native.check_returncode()
+        if native.stdout.count("MONEY_EQUIVALENCE_NATIVE_COMPARISON VERIFIED") != 1 or "UNEXECUTED" in native.stdout:
+            raise RuntimeError("native comparison restore fixture did not execute")
         left, right = receipts / "base", receipts / "head"
         names = sorted(p.name for p in left.glob("*.json") if not p.name.endswith(".cross-build.json"))
         if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")):
@@ -121,7 +132,7 @@ def main():
             a, b = (left / cross_name).read_bytes(), (right / cross_name).read_bytes()
             if a != b or hashlib.sha256(a).digest() != hashlib.sha256(b).digest():
                 raise RuntimeError(f"base/head cross-build emitted bytes or digest differ: {name}")
-        manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
+        manifest.update(verdict="VERIFIED", native_comparison="restored_equals_fresh_full", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])

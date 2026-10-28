@@ -1551,6 +1551,8 @@ struct NativePreparationFixture {
     index: ScanIndex,
     api: Api,
     trace: Trace,
+    /// The comparison pass's sampled acquisition, if any (`paused`).
+    cache: Option<Arc<sampled_scan::SharedCache>>,
 }
 impl NativePreparationFixture {
     fn new() -> Self {
@@ -1593,16 +1595,25 @@ impl NativePreparationFixture {
             index,
             api,
             trace,
+            cache: None,
         }
     }
     fn paused(&self) -> OwnedSourceScan {
         self.paused_with_limit(8)
     }
     fn paused_with_limit(&self, limit: usize) -> OwnedSourceScan {
+        self.paused_from(self.index.clone(), self.cache.as_ref(), limit)
+    }
+    fn paused_from(
+        &self,
+        index: ScanIndex,
+        cache: Option<&Arc<sampled_scan::SharedCache>>,
+        limit: usize,
+    ) -> OwnedSourceScan {
         let mut state = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&self.dir),
-            self.index.clone(),
+            index,
             WINDOW,
             30,
             limit,
@@ -1613,6 +1624,9 @@ impl NativePreparationFixture {
             false,
             false,
         );
+        if let Some(cache) = cache {
+            state = state.with_sampled_acquisition(cache.clone(), target_reuse_namespace());
+        }
         state.enable_native_comparison();
         for _ in 0..1024 {
             if state.native_comparison_ready() {
@@ -1627,6 +1641,56 @@ impl NativePreparationFixture {
         }
         panic!("native preparation did not reach bounded pause");
     }
+}
+impl NativePreparationFixture {
+    /// O1: a prior pass of this process reads every file Full under the
+    /// comparison pass's scope inputs, so `cache` holds each member's
+    /// reduction; the comparison pass then samples with `cache`.
+    fn warm_target_reductions(&mut self, cache: Arc<sampled_scan::SharedCache>) {
+        let mut index = ScanIndex::default();
+        index.upload_context_fingerprint = self.index.upload_context_fingerprint.clone();
+        index.active_upload_context_fingerprint =
+            self.index.active_upload_context_fingerprint.clone();
+        index.historical_replay_generation = self.index.historical_replay_generation.clone();
+        let warm = OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&self.dir),
+            index,
+            WINDOW,
+            30,
+            8,
+            false,
+            None,
+            &[],
+            false,
+            false,
+            false,
+        )
+        .with_sampled_acquisition(cache.clone(), target_reuse_namespace());
+        SelectionFixture::run(warm);
+        self.cache = Some(cache);
+    }
+    /// Today's fresh Full of every file (the forced re-read a cleared
+    /// fingerprint demands), with no reusable state: the cold-Full bodies
+    /// at the same pause the comparison reaches.
+    fn cold_full_bodies(&self) -> Vec<String> {
+        let mut index = self.index.clone();
+        for entry in index.files.values_mut() {
+            entry.source_file_fingerprint.clear();
+        }
+        native_bodies(&self.paused_from(index, None, 8).snapshots)
+    }
+}
+fn target_reuse_namespace() -> crate::transcript_acquisition::Scope {
+    crate::transcript_acquisition::Scope("native-target-reuse".into())
+}
+fn native_bodies(items: &[SnapshotItem]) -> Vec<String> {
+    let mut bodies = items
+        .iter()
+        .map(|item| serde_json::to_string(item).unwrap())
+        .collect::<Vec<_>>();
+    bodies.sort();
+    bodies
 }
 impl Drop for NativePreparationFixture {
     fn drop(&mut self) {
@@ -2361,12 +2425,28 @@ fn native_comparison_q5_keeps_old_proof_and_checks_revision_and_occurrences() {
     writeln!(std::io::stderr().lock(), "native_comparison_q5: frozen_old_p=true live_proof_replacement_ignored=true changed_revision_or_occurrence_or_request_set_uses_all=true").unwrap();
 }
 
+/// Targets are restore-only (O1): the default fixture's comparison pass
+/// reuses the members' reductions a prior pass retained in RAM.
 fn native_comparison_positive_hit_fixture() -> (
     NativePreparationFixture,
     OwnedSourceScan,
     claude_native_comparison::Qualification,
 ) {
-    let fixture = NativePreparationFixture::new();
+    native_comparison_positive_hit_fixture_with(|fixture| {
+        fixture.warm_target_reductions(Arc::new(sampled_scan::SharedCache::default()));
+    })
+}
+
+/// `prepare` sets up the members' reusable state before the new file lands.
+fn native_comparison_positive_hit_fixture_with(
+    prepare: impl FnOnce(&mut NativePreparationFixture),
+) -> (
+    NativePreparationFixture,
+    OwnedSourceScan,
+    claude_native_comparison::Qualification,
+) {
+    let mut fixture = NativePreparationFixture::new();
+    prepare(&mut fixture);
     let c = "c3333333-3333-4333-8333-333333333333";
     fs::write(fixture.dir.join(format!("{c}.jsonl")), format!("{{\"timestamp\":\"2026-08-02T07:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{c}\",\"requestId\":\"req_1\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")).unwrap();
     let mut state = fixture.paused();
@@ -2387,71 +2467,9 @@ fn native_comparison_positive_hit_fixture() -> (
 }
 
 #[test]
-fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold() {
+fn native_comparison_missing_page_coverage_defers_without_target_jobs() {
     if !native_positive_layout_for_test(
-        "native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold",
-    ) {
-        return;
-    }
-    let (_fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
-    let scope_before = state.native_comparison_context().unwrap().to_owned();
-    let requested_layout_bytes =
-        crate::heap_layout_bound::completed_bound(&qualification, usize::MAX);
-    if crate::heap_layout_bound::layout_supported() {
-        assert!(requested_layout_bytes.is_some_and(|bytes| bytes > 0));
-    } else {
-        assert!(
-            requested_layout_bytes.is_none(),
-            "unvalidated compiler layouts must remain unavailable"
-        );
-    }
-    let limit = state.file_limit;
-    let selection = state.acquire_native_comparison_targets(&mut qualification);
-    assert_eq!(selection.matched_roots, 1);
-    assert_eq!(selection.queued, 2);
-    assert!(selection.unresolved_sources.is_empty());
-    assert_eq!(
-        qualification.certified_member_count(),
-        0,
-        "positive hit withdraws S"
-    );
-    assert_eq!(
-        state.scanned_file_count, 1,
-        "enqueue is not a successful read"
-    );
-    let mut state = pause_native_comparison(state);
-    assert_eq!(state.scanned_file_count, 3);
-    assert_eq!(state.snapshots.len(), 3);
-    assert_eq!(state.pending_finalization.len(), 3);
-    assert!(state
-        .pending_finalization
-        .iter()
-        .all(|entry| entry.parse_complete));
-    assert_eq!(
-        state.native_comparison_context(),
-        Some(scope_before.as_str())
-    );
-    assert_eq!(state.file_limit, limit);
-    assert!(state.scanned_file_count <= limit);
-    assert!(state
-        .snapshots
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
-    let again = state.acquire_native_comparison_targets(&mut qualification);
-    assert_eq!(
-        again.queued, 0,
-        "withdrawn family cannot target twice in a pass"
-    );
-    state.resume_native_comparison_base();
-    let (_, scan) = SelectionFixture::run(state);
-    assert_eq!(scan.scanned_file_count, 3);
-    writeln!(std::io::stderr().lock(), "native_comparison_target: initial_native=1 matched_roots=1 queued=2 actual_target_reads=2 same_scanner_context=true existing_file_budget=true before_body_fold=true repeated_targets=0 requested_layout_bytes={requested_layout_bytes:?} rss_measured=false").unwrap();
-}
-
-#[test]
-fn native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresolved() {
-    if !native_positive_layout_for_test(
-        "native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresolved",
+        "native_comparison_missing_page_coverage_defers_without_target_jobs",
     ) {
         return;
     }
@@ -2477,7 +2495,7 @@ fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
         return;
     }
     let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
-    let selection = state.acquire_native_comparison_targets(&mut qualification);
+    let selection = queue_deferred_restores(&mut state, &mut qualification);
     assert_eq!(selection.queued, 2);
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
     let replacement = fixture.dir.join("replacement.tmp");
@@ -2837,14 +2855,14 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
 }
 
 #[test]
-fn native_comparison_acquisition_requires_actual_completed_target_reads() {
+fn native_comparison_acquisition_requires_complete_reductions() {
     if !native_positive_layout_for_test(
-        "native_comparison_acquisition_requires_actual_completed_target_reads",
+        "native_comparison_acquisition_requires_complete_reductions",
     ) {
         return;
     }
     let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
-    let selection = state.acquire_native_comparison_targets(&mut qualification);
+    let selection = queue_deferred_restores(&mut state, &mut qualification);
     assert_eq!(selection.queued, 2);
     let mut state = pause_native_comparison(state);
     let acquired = state.take_native_comparison_acquisition(&mut qualification);
@@ -2872,58 +2890,13 @@ fn native_comparison_acquisition_requires_actual_completed_target_reads() {
     assert!(consumed.ready_for_fold_sources.is_empty());
     state.resume_native_comparison_base();
     SelectionFixture::run(state);
-    writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 actual_full_reads=2 ready_for_exact_fold=1 body_authority_granted=false receipt_consumed_once=true").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 restored_target_reads=2 ready_for_exact_fold=1 body_authority_granted=false receipt_consumed_once=true").unwrap();
 }
 
 #[test]
-fn native_comparison_controller_moves_frozen_plan_across_native_target_yields() {
+fn native_comparison_controller_generation_loss_or_missing_coverage_uses_base() {
     if !native_positive_layout_for_test(
-        "native_comparison_controller_moves_frozen_plan_across_native_target_yields",
-    ) {
-        return;
-    }
-    let (fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
-    let mut controller = claude_native_comparison::Controller::new(qualification);
-    assert_eq!(
-        controller.required_roots(),
-        &BTreeSet::from([fixture.parent.clone()])
-    );
-    let context = state.native_comparison_context().unwrap().to_owned();
-    assert!(controller.advance(&mut state, true));
-    assert_eq!(state.scanned_file_count, 1, "queueing is not acquisition");
-    let mut state = pause_native_comparison(state);
-    assert_eq!(state.scanned_file_count, 3);
-    assert_eq!(state.native_comparison_context(), Some(context.as_str()));
-    assert!(controller.advance(&mut state, true));
-    let (receipt, frontier) = controller.receipt_for_test();
-    assert_eq!(frontier, 3, "only the two newly acquired bodies extend H");
-    assert_eq!(receipt.completed_target_files, 2);
-    assert_eq!(
-        receipt.acquired_roots,
-        BTreeSet::from([fixture.parent.clone()])
-    );
-    assert_eq!(receipt.ready_for_fold_sources.len(), 1);
-    assert!(receipt.unresolved_sources.is_empty());
-    assert!(state.identified_candidates.is_empty());
-    assert!(!state.native_comparison_ready());
-    assert!(state
-        .snapshots
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
-    let (_, scan) = SelectionFixture::run(state);
-    assert_eq!(scan.scanned_file_count, 3);
-    assert_eq!(
-        scan.snapshots.len(),
-        3,
-        "no emission filtering is activated"
-    );
-    writeln!(std::io::stderr().lock(), "native_comparison_controller: initial_native=1 completed_targets=2 frontier=3 same_owner_context=true repeated_targets=0 pre_fold_bodies=3 selected_deferral_and_rearm_suppression=false").unwrap();
-}
-
-#[test]
-fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base() {
-    if !native_positive_layout_for_test(
-        "native_comparison_controller_generation_loss_or_insufficient_budget_uses_base",
+        "native_comparison_controller_generation_loss_or_missing_coverage_uses_base",
     ) {
         return;
     }
@@ -2955,80 +2928,7 @@ fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base
         );
         assert!(scan.snapshots[0].usage_accounting_contract.is_none());
     }
-    writeln!(std::io::stderr().lock(), "native_comparison_controller: changed_generation_base=true insufficient_remaining_budget_base=true no_extra_target_reads=true no_body_suppression=true actual_process_bootstrap_unproved=true").unwrap();
-}
-
-#[test]
-fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
-    if !native_positive_layout_for_test(
-        "native_comparison_controller_replaced_target_cannot_complete_comparison",
-    ) {
-        return;
-    }
-    let (fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
-    let mut controller = claude_native_comparison::Controller::new(qualification);
-    assert!(controller.advance(&mut state, true));
-    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
-    let replacement = fixture.dir.join("controller-replacement.tmp");
-    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
-    fs::rename(replacement, &path).unwrap();
-    let base_bodies = state
-        .snapshots
-        .iter()
-        .map(|item| {
-            (
-                item.source_session_id.clone(),
-                serde_json::to_vec(item).unwrap(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let target_key = local_index_key(&path);
-    let target_entry = serde_json::to_vec(&state.index.files[&target_key]).unwrap();
-    let file_limit = state.file_limit;
-    let sidecar_complete = state.sidecar_census_complete;
-    let (mut state, disappearance_events) =
-        disappearance_diagnostics::observe(|| pause_native_comparison(state));
-    assert_eq!(
-        disappearance_events,
-        [[0; 4], [0, 0, 0, 1], [0; 4]],
-        "a real reopened replacement reaches the frozen revision comparison"
-    );
-    assert_eq!(
-        serde_json::to_vec(&state.index.files[&target_key]).unwrap(),
-        target_entry,
-        "a mismatched target cannot refresh the frozen index entry"
-    );
-    assert_eq!(state.file_limit, file_limit);
-    assert_eq!(state.sidecar_census_complete, sidecar_complete);
-    for (session, bytes) in base_bodies {
-        let retained = state
-            .snapshots
-            .iter()
-            .find(|item| item.source_session_id == session)
-            .unwrap();
-        assert_eq!(
-            serde_json::to_vec(retained).unwrap(),
-            bytes,
-            "target failure preserves already parsed native bodies"
-        );
-    }
-
-    assert!(!controller.advance(&mut state, true));
-    assert!(
-        state
-            .native_comparison
-            .as_ref()
-            .is_some_and(|phase| phase.disabled_for_test()),
-        "no eligibility remains; only terminal-traversal custody survives"
-    );
-    assert!(controller.receipt_for_test().0.acquired_roots.is_empty());
-    let (_, scan) = SelectionFixture::run(state);
-    assert!(!scan.census_complete);
-    assert!(scan
-        .snapshots
-        .iter()
-        .all(|item| item.usage_accounting_contract.is_none()));
-    writeln!(std::io::stderr().lock(), "native_comparison_controller: actual_target_replacement_base=true current_native_census_incomplete=true no_acquired_owner_posture=true").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_controller: changed_generation_base=true missing_page_coverage_base=true no_extra_target_reads=true no_body_suppression=true actual_process_bootstrap_unproved=true").unwrap();
 }
 
 #[test]
@@ -3040,9 +2940,7 @@ fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
     }
     let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
     assert_eq!(
-        state
-            .acquire_native_comparison_targets(&mut qualification)
-            .queued,
+        queue_deferred_restores(&mut state, &mut qualification).queued,
         2
     );
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
@@ -3073,7 +2971,514 @@ fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
     state.resume_native_comparison_base();
     let (_, scan) = SelectionFixture::run(state);
     assert!(!scan.census_complete);
-    writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 actual_full_reads=1 unresolved_sources=1 fallback_roots=1 queue_is_not_success=true body_authority_granted=false").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 restored_target_reads=1 unresolved_sources=1 fallback_roots=1 queue_is_not_success=true body_authority_granted=false").unwrap();
+}
+
+/// The comparison pass's acquisition totals (sampled context and #799
+/// admission), to measure what the target page itself read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TargetReads {
+    full: usize,
+    tail: usize,
+    unchanged: usize,
+    native_bytes: u64,
+    refused: usize,
+}
+impl TargetReads {
+    fn of(state: &OwnedSourceScan) -> Self {
+        let context = state.sampling.as_ref().expect("sampled comparison pass");
+        Self {
+            full: context.full_files,
+            tail: context.tail_files,
+            unchanged: context.unchanged_files,
+            native_bytes: context.native_bytes,
+            refused: context.admission.full_refused_native_comparison_target,
+        }
+    }
+    fn since(self, before: Self) -> Self {
+        Self {
+            full: self.full - before.full,
+            tail: self.tail - before.tail,
+            unchanged: self.unchanged - before.unchanged,
+            native_bytes: self.native_bytes - before.native_bytes,
+            refused: self.refused - before.refused,
+        }
+    }
+}
+
+/// Run the NEXT BASE restore jobs through E1's acquisition seam. Selection
+/// itself queues no in-pass targets; E3 owns scheduling these deferred jobs.
+fn queue_deferred_restores(
+    state: &mut OwnedSourceScan,
+    qualification: &mut claude_native_comparison::Qualification,
+) -> claude_native_comparison::TargetSelection {
+    let mut selection = state.acquire_native_comparison_targets(qualification);
+    assert_eq!(selection.queued, 0, "no immediate-Full prototype");
+    let targets = qualification
+        .recovery_targets()
+        .cloned()
+        .collect::<Vec<_>>();
+    state
+        .native_comparison
+        .as_mut()
+        .unwrap()
+        .start_targets(&targets);
+    state.identified_candidates.extend(targets);
+    selection.queued = state.identified_candidates.len();
+    selection
+}
+
+/// Queues and runs the two frozen targets; returns what that page read.
+fn acquire_two_targets(
+    mut state: OwnedSourceScan,
+    qualification: &mut claude_native_comparison::Qualification,
+) -> (OwnedSourceScan, TargetReads) {
+    let before = TargetReads::of(&state);
+    assert_eq!(queue_deferred_restores(&mut state, qualification).queued, 2);
+    let state = pause_native_comparison(state);
+    let reads = TargetReads::of(&state).since(before);
+    (state, reads)
+}
+
+/// A served target: both members acquired, the dependent source ready, and
+/// every native body equal to today's cold Full of the same files.
+fn assert_targets_served(
+    fixture: &NativePreparationFixture,
+    mut state: OwnedSourceScan,
+    qualification: &mut claude_native_comparison::Qualification,
+) {
+    let acquired = state.take_native_comparison_acquisition(qualification);
+    assert_eq!(acquired.completed_target_files, 2);
+    assert_eq!(
+        acquired.acquired_roots,
+        BTreeSet::from([fixture.parent.clone()])
+    );
+    assert_eq!(
+        acquired.ready_for_fold_sources,
+        BTreeSet::from(["c3333333-3333-4333-8333-333333333333".to_owned()])
+    );
+    assert!(acquired.rearm_roots.is_empty());
+    assert_eq!(native_bodies(&state.snapshots), fixture.cold_full_bodies());
+    let mut cold_index = fixture.index.clone();
+    for entry in cold_index.files.values_mut() {
+        entry.source_file_fingerprint.clear();
+    }
+    let mut cold = fixture.paused_from(cold_index, None, 8);
+    cold.resume_native_comparison_base();
+    let (cold_index, cold_scan) = SelectionFixture::run(cold);
+    state.resume_native_comparison_base();
+    let (index, scan) = SelectionFixture::run(state);
+    let (restored_wire, restored_settlement) = comparison_money_body(fixture, index, scan);
+    let (full_wire, full_settlement) = comparison_money_body(fixture, cold_index, cold_scan);
+    assert!(!restored_wire.is_empty());
+    assert_eq!(restored_wire, full_wire, "post-fold emitted envelopes");
+    assert_eq!(
+        restored_settlement, full_settlement,
+        "assigned hashes and accepted state"
+    );
+}
+
+/// The real reported-usage fold, upload policy, finalizer, wire serialization
+/// and public entity-ACK validator. Acquisition itself grants no ACK credit.
+fn comparison_money_body(
+    fixture: &NativePreparationFixture,
+    mut index: ScanIndex,
+    mut scan: SourceScanResult,
+) -> (Vec<u8>, serde_json::Value) {
+    apply_claude_reported_usage_to_scan_with_identity(
+        &mut scan,
+        &fixture.api,
+        &fixture.trace,
+        &mut index,
+        None,
+    );
+    apply_upload_policy(
+        SnapshotSource::ClaudeCode,
+        &mut scan.snapshots,
+        SnapshotUploadPolicy::default(),
+    );
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    scan.snapshots
+        .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
+    assert!(
+        !scan.snapshots.is_empty(),
+        "money equivalence cannot be vacuous"
+    );
+    let request = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "claude_code".into(),
+        machine_id: "a".repeat(64),
+        collector_version: None,
+        snapshots: scan.snapshots.clone(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    let wire = serde_json::to_vec(&request).unwrap();
+    let head_cas = request
+        .snapshots
+        .iter()
+        .any(|item| item.cache_observations.is_some());
+    let entities = request.snapshots.iter().map(|item| {
+        let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
+        json!({"source_session_id":item.source_session_id,"snapshot_fingerprint":item.snapshot_fingerprint,
+            "occurrence_count":1,"body_witness_version":version,
+            "body_witness_digest":version.map(|_| snapshot_upload_body_witness(item)),
+            "head_etag":head_cas.then(|| "e".repeat(64))})
+    }).collect::<Vec<_>>();
+    let response: crate::snapshot_client::SnapshotBatchResponse = serde_json::from_value(json!({
+        "accepted":request.snapshots.len(),"sessions_reconciled":request.snapshots.len(),
+        "session_ids":[],"disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1",
+        "accepted_entities":entities,"unchanged_entities":[],"rejected_entities":[],"conflict_entities":[],
+    })).unwrap();
+    response.validate_entity_ack(&request).unwrap();
+    index.record_accepted_snapshot_fingerprints(
+        &request
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    (
+        wire,
+        json!({"assigned": index.claude_usage_family_witnesses,
+        "accepted": index.accepted_snapshot_fingerprints,
+        "file_settlement": index.files.iter().map(|(key, entry)| (key,
+            (&entry.source_file_fingerprint, &entry.last_snapshot_fingerprint,
+             &entry.last_upload_body_witness, entry.effective_upload_body_witness_revision)))
+            .collect::<BTreeMap<_, _>>(),
+        "file_bodies":index.file_snapshot_fingerprints,
+        "quarantine":index.quarantined_snapshot_fingerprints}),
+    )
+}
+
+#[test]
+fn native_comparison_restored_money_equivalence() {
+    if !native_positive_layout_for_test("native_comparison_restored_money_equivalence") {
+        return;
+    }
+    // A ctime-only change (chmod) moves no content: the target still reuses.
+    for chmod in [false, cfg!(unix)] {
+        let (fixture, state, mut qualification) =
+            native_comparison_positive_hit_fixture_with(|fixture| {
+                fixture.warm_target_reductions(Arc::new(sampled_scan::SharedCache::default()));
+                #[cfg(unix)]
+                if chmod {
+                    use std::os::unix::fs::PermissionsExt;
+                    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            });
+        let (state, reads) = acquire_two_targets(state, &mut qualification);
+        assert_eq!(
+            reads,
+            TargetReads {
+                unchanged: 2,
+                ..TargetReads::default()
+            },
+            "chmod={chmod}: served from RAM, zero bytes re-read"
+        );
+        assert_targets_served(&fixture, state, &mut qualification);
+    }
+    println!("MONEY_EQUIVALENCE_NATIVE_COMPARISON VERIFIED");
+}
+
+#[test]
+fn native_comparison_target_tails_older_reduction_to_the_frozen_revision() {
+    if !native_positive_layout_for_test(
+        "native_comparison_target_tails_older_reduction_to_the_frozen_revision",
+    ) {
+        return;
+    }
+    let mut suffix = 0;
+    let (fixture, state, mut qualification) =
+        native_comparison_positive_hit_fixture_with(|fixture| {
+            // The same object was shorter when the prior pass retained its
+            // reduction; it has since grown to the revision the comparison
+            // froze (its stamp restored; no earlier mtime, which would move
+            // the macOS birth time and so the object identity).
+            let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
+            let full = fs::read(&path).unwrap();
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            let prefix = full
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'\n')
+                .nth(2)
+                .unwrap()
+                .0
+                + 1;
+            suffix = full.len() - prefix;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(prefix as u64)
+                .unwrap();
+            fixture.warm_target_reductions(Arc::new(sampled_scan::SharedCache::default()));
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&full[prefix..]).unwrap();
+            file.set_modified(modified).unwrap();
+        });
+    let (state, reads) = acquire_two_targets(state, &mut qualification);
+    assert_eq!(
+        reads,
+        TargetReads {
+            tail: 1,
+            unchanged: 1,
+            native_bytes: suffix as u64,
+            ..TargetReads::default()
+        },
+        "the Tail reads only the suffix; nothing is read Full"
+    );
+    // The Tail completes the reduction to the current (frozen) revision: a
+    // validated complete reduction, never the retained prefix's revision.
+    assert_targets_served(&fixture, state, &mut qualification);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_comparison_target_restores_durable_reduction_without_full() {
+    if !native_positive_layout_for_test(
+        "native_comparison_target_restores_durable_reduction_without_full",
+    ) {
+        return;
+    }
+    let state_dir = crate::test_scratch::ScratchDir::new("native-target-durable");
+    crate::locked_state_dir::test_locks::hold(&state_dir);
+    let index_path = state_dir.join("scan-index.json");
+    let namespace = target_reuse_namespace();
+    let mut restart = None;
+    let (fixture, state, mut qualification) =
+        native_comparison_positive_hit_fixture_with(|fixture| {
+            let warm = Arc::new(sampled_scan::SharedCache::default());
+            warm.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &namespace, false);
+            fixture.warm_target_reductions(warm.clone());
+            // The #806 records, bound to the index the comparison pass loads.
+            durable_after_save(
+                &warm,
+                &state_dir,
+                SnapshotSource::ClaudeCode,
+                &fixture.index,
+            );
+            // A restarted process: empty RAM, the same store.
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            cache.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &namespace, false);
+            fixture.cache = Some(cache.clone());
+            restart = Some(cache);
+        });
+    let (state, reads) = acquire_two_targets(state, &mut qualification);
+    assert_eq!(
+        reads,
+        TargetReads {
+            unchanged: 2,
+            ..TargetReads::default()
+        },
+        "served from the durable store, zero bytes re-read"
+    );
+    let (counters, _) = restart
+        .unwrap()
+        .durable_counters(SnapshotSource::ClaudeCode)
+        .unwrap();
+    assert_eq!(counters.restored, 2);
+    assert_targets_served(&fixture, state, &mut qualification);
+}
+
+#[test]
+fn native_comparison_target_without_reuse_is_refused_not_read_full() {
+    if !native_positive_layout_for_test(
+        "native_comparison_target_without_reuse_is_refused_not_read_full",
+    ) {
+        return;
+    }
+    // Sampled, but nothing retained or stored: no validated reuse exists.
+    let (fixture, state, mut qualification) =
+        native_comparison_positive_hit_fixture_with(|fixture| {
+            fixture.cache = Some(Arc::new(sampled_scan::SharedCache::default()));
+        });
+    let full_before = TargetReads::of(&state).full;
+    let (mut state, reads) = acquire_two_targets(state, &mut qualification);
+    assert_eq!(
+        reads,
+        TargetReads {
+            refused: 2,
+            ..TargetReads::default()
+        },
+        "a comparison target is never a Full cause"
+    );
+    let acquired = state.take_native_comparison_acquisition(&mut qualification);
+    assert_eq!(acquired.completed_target_files, 0);
+    assert!(acquired.acquired_roots.is_empty());
+    assert!(acquired.ready_for_fold_sources.is_empty());
+    assert_eq!(
+        acquired.unresolved_sources,
+        BTreeSet::from(["c3333333-3333-4333-8333-333333333333".to_owned()])
+    );
+    assert_eq!(
+        acquired.rearm_roots,
+        BTreeSet::from([fixture.parent.clone()])
+    );
+    assert_eq!(acquired.known_rearm_candidates.len(), 2);
+    assert_eq!(state.snapshots.len(), 1, "only the dependent's own body");
+    state.resume_native_comparison_base();
+    // Refused targets are not census members (a Skip stays a Skip): the
+    // census may complete while the comparison stays unresolved.
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| SelectionFixture::run(state));
+    let pages = rows
+        .iter()
+        .filter(|row| row["stage"] == "native_collection_page")
+        .collect::<Vec<_>>();
+    assert_eq!(pages.len(), 1);
+    let counts = &pages[0]["counts"]["sampled_acquisition"];
+    assert_eq!(
+        counts["acquisition_admission"]["full_refused_native_comparison_target"],
+        2
+    );
+    assert_eq!(
+        counts["full_selections"], full_before,
+        "the refused targets are not re-read Full later in the pass"
+    );
+}
+
+#[test]
+fn native_comparison_raw_suffix_old_body_stale_revision_and_loss_refuse() {
+    if !native_positive_layout_for_test(
+        "native_comparison_raw_suffix_old_body_stale_revision_and_loss_refuse",
+    ) {
+        return;
+    }
+    for mode in [
+        "suffix",
+        "old_body",
+        "stale",
+        "loss",
+        "duplicate_body",
+        "duplicate_completion",
+    ] {
+        let (fixture, state, mut qualification) = native_comparison_positive_hit_fixture();
+        let (mut state, _) = acquire_two_targets(state, &mut qualification);
+        let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
+        let key = local_index_key(&path);
+        let slot = state
+            .pending_finalization
+            .iter()
+            .position(|read| read.index_key == key)
+            .unwrap();
+        match mode {
+            "suffix" => {
+                let mut file = File::open(&path).unwrap();
+                file.seek(SeekFrom::Start(1)).unwrap();
+                let parser = OwnedJsonlParser::new(
+                    file,
+                    &path,
+                    SnapshotSource::ClaudeCode,
+                    apply_claude_code_line,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap();
+                assert!(
+                    !parser.complete_native_prefix,
+                    "raw suffix is not a retained accumulator"
+                );
+                state.pending_finalization[slot].complete_native_reduction =
+                    parser.complete_native_prefix;
+            }
+            "old_body" => {
+                state.pending_finalization.remove(slot);
+            }
+            "stale" => {
+                state.pending_finalization[slot].source_file_fingerprint = "stale".into();
+            }
+            "loss" => {
+                state.pending_finalization[slot].parse_complete = false;
+            }
+            "duplicate_body" => {
+                let item = state
+                    .snapshots
+                    .iter()
+                    .find(|item| item.source_session_id == fixture.parent)
+                    .unwrap()
+                    .clone();
+                state.snapshots.push(item);
+            }
+            "duplicate_completion" => {
+                state
+                    .pending_finalization
+                    .push(state.pending_finalization[slot].clone());
+            }
+            _ => unreachable!(),
+        }
+        let result = state.take_native_comparison_acquisition(&mut qualification);
+        assert!(result.acquired_roots.is_empty(), "{mode}");
+        assert!(result.ready_for_fold_sources.is_empty(), "{mode}");
+        assert_eq!(result.unresolved_sources.len(), 1, "{mode}");
+        assert_eq!(result.known_rearm_candidates.len(), 2);
+    }
+}
+
+#[test]
+fn native_comparison_exact_page_bodies_cover_plan_without_target_jobs() {
+    if !native_positive_layout_for_test(
+        "native_comparison_exact_page_bodies_cover_plan_without_target_jobs",
+    ) {
+        return;
+    }
+    let (fixture, _, qualification) = native_comparison_positive_hit_fixture();
+    let mut index = fixture.index.clone();
+    for entry in index.files.values_mut() {
+        entry.source_file_fingerprint.clear();
+    }
+    let mut state = fixture.paused_from(index, None, 8);
+    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut lease = owner.begin();
+    lease.bind("exact-page-policy-only".into());
+    assert!(!lease.allowed(), "this test mints no bootstrap grant");
+    let bytes = crate::heap_layout_bound::completed_bound(&qualification, usize::MAX).unwrap()
+        - std::mem::size_of_val(&qualification);
+    let mut credit = crate::source_rotation::PaidReservation::from_remainder(
+        Some(crate::source_rotation::PARKED_BUDGET),
+        bytes,
+        bytes,
+    );
+    let mut controller = claude_native_comparison::Controller::new_paid(
+        qualification,
+        state.snapshots.len(),
+        &mut credit,
+    )
+    .unwrap();
+    assert!(
+        controller
+            .advance_paid(&mut state, true, &fixture.index, &mut credit, &mut lease)
+            .unwrap(),
+        "exact page coverage requires neither BASE nor target jobs"
+    );
+    let (receipt, frontier) = controller.receipt_for_test();
+    assert_eq!(receipt.completed_target_files, 2);
+    assert_eq!(
+        receipt.acquired_roots,
+        BTreeSet::from([fixture.parent.clone()])
+    );
+    assert!(receipt.unresolved_sources.is_empty());
+    assert_eq!(frontier, 3);
+    assert!(state.identified_candidates.is_empty());
+    assert_eq!(owner.status().deferred_family_count, Some(0));
+    let (index, scan) = SelectionFixture::run(state);
+    let (completion, rows) = crate::local_resource_diagnostics::capture(|| {
+        controller.complete(&scan, None, true).unwrap()
+    });
+    assert!(completion.fallback.is_none());
+    let counts = &rows
+        .iter()
+        .find(|row| row["stage"] == "native_comparison_restore_unavailable")
+        .unwrap()["counts"];
+    assert_eq!(counts["native_comparison_pending_debt"], 0);
+    assert_eq!(
+        index.accepted_snapshot_fingerprints, fixture.index.accepted_snapshot_fingerprints,
+        "native readiness alone is never ACK credit"
+    );
 }
 
 #[test]
@@ -3811,6 +4216,44 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
         .iter()
         .all(|item| item.source_session_id == FALLBACK_HEALTHY));
     writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: actual_native_copy_peer_observed=true healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
+}
+
+#[test]
+fn native_comparison_unavailable_holds_money_and_counts_debt() {
+    if !native_positive_layout_for_test("native_comparison_unavailable_holds_money_and_counts_debt")
+    {
+        return;
+    }
+    let ((_, mut index, scan, mut fallback, previous, _), rows) =
+        crate::local_resource_diagnostics::capture(native_comparison_selected_fallback_fixture);
+    let counts = &rows
+        .iter()
+        .find(|row| row["stage"] == "native_comparison_restore_unavailable")
+        .unwrap()["counts"];
+    assert_eq!(counts["native_comparison_disclosed_restore_unavailable"], 2);
+    assert_eq!(counts["native_comparison_pending_debt"], 2);
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id == FALLBACK_HEALTHY));
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    assert_eq!(
+        index.accepted_snapshot_fingerprints,
+        previous.accepted_snapshot_fingerprints
+    );
+    let key = previous
+        .files
+        .keys()
+        .find(|key| key.ends_with(&format!("{FALLBACK_COPY}.jsonl")))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&index.files[key]).unwrap(),
+        serde_json::to_value(&previous.files[key]).unwrap()
+    );
+    assert!(
+        !index.confirmed_empty_files.contains(key),
+        "held is never an empty/$0 completion"
+    );
 }
 
 /// Diagnostics only: the comparison fallback's fold and its selected restore

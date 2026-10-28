@@ -328,6 +328,10 @@ impl Serialize for ScanIndex {
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
         );
+        field!(
+            native_comparison_restore,
+            NativeComparisonRestoreDebt::is_empty
+        );
         map.end()
     }
 }
@@ -419,6 +423,7 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
+    "native_comparison_restore",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1910,6 +1915,9 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "accepted_rebuild_last_alarm_unix_seconds" => {
                             index.accepted_rebuild_last_alarm_unix_seconds =
                                 self.diagnostic_timestamp(value)?;
+                        }
+                        "native_comparison_restore" => {
+                            index.native_comparison_restore = self.typed(value)?
                         }
                         "claude_money_birth_store" => {
                             // Optional money hints cannot rebuild or pause an otherwise valid index.
