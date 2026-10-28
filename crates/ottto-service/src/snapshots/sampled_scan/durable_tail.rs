@@ -451,6 +451,9 @@ impl SharedCache {
         candidate: &CandidateFile,
         index: &mut ScanIndex,
     ) -> bool {
+        if !crate::heap_layout_bound::layout_supported() {
+            return false;
+        }
         let key = local_index_key(&candidate.path);
         if self
             .retained()
@@ -860,13 +863,7 @@ impl SharedCache {
                                     crate::snapshot_sync::effective_upload_body_witness_revision(
                                         snapshot_source,
                                     ),
-                                counting: retained
-                                    .state
-                                    .accumulator
-                                    .codex_counting
-                                    .as_deref()
-                                    .map(|c| c.durable_contract())
-                                    .unwrap_or_default(),
+                                counting: retained.state.durable_counting().unwrap_or_default(),
                                 ..store::Metadata::default()
                             },
                         });

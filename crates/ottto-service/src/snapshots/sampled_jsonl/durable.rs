@@ -193,13 +193,17 @@ pub(crate) struct RederiveReceipt {
     pub(crate) line_bytes: u64,
 }
 
-impl Decoded {
-    pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
-        self.reduction
-            .accumulator
+impl CachedJsonlReduction {
+    pub(in crate::snapshots) fn durable_counting(&self) -> Option<(Option<i64>, u8, u8)> {
+        self.accumulator
             .codex_counting
             .as_deref()
             .map(|c| c.durable_contract())
+    }
+}
+impl Decoded {
+    pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
+        self.reduction.durable_counting()
     }
 
     /// How far the head re-parse must read: the latest mark of a field to
