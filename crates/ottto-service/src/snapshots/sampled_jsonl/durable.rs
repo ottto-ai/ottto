@@ -371,5 +371,8 @@ pub(crate) fn rederive_parser(
 }
 
 #[cfg(test)]
+#[path = "durable_pi_tests.rs"]
+mod pi_tests;
+#[cfg(test)]
 #[path = "durable_tests.rs"]
 mod tests;
