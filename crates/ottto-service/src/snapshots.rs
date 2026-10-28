@@ -5640,6 +5640,16 @@ fn claude_stream_accepted_retry_carry_inner(
         .try_fold(0usize, |sum, root| sum.checked_add(root.len()))
         .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+    // Scoped batch replacement prices the retained carry while its proof and
+    // replay reserve are still live. Refusal cannot discard that custody.
+    cost.add(
+        crate::heap_layout_bound::bound(
+            &index.claude_stale_family_carry,
+            crate::source_rotation::PARKED_BUDGET,
+        )
+        .ok_or(ClaudeRetryAdmissionRefusal::Structure)?,
+    )
+    .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     tree_nodes::<String, ()>(stale.len(), &mut cost)
         .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     cost.add(root_bytes)
@@ -6282,6 +6292,7 @@ fn refund_claude_stale_family_carry(
     plan_clock: &str,
     context_fingerprint: &str,
     version_changed: bool,
+    defer_on_refusal: bool,
 ) -> bool {
     let carry = &index.claude_stale_family_carry;
     if carry.roots.is_empty() && carry.capped_roots.is_empty() {
@@ -6305,6 +6316,11 @@ fn refund_claude_stale_family_carry(
     ) && replay.try_reserve_exact(requeues).is_ok()
     {
         return true;
+    }
+    // Scheduling refusal is not an invalidation signal. Admission retains
+    // custody and waits for funding; only independent BASE recovery rewinds.
+    if defer_on_refusal {
+        return false;
     }
     let carry = &index.claude_stale_family_carry;
     let passed = index.traversal.as_ref().is_some_and(|traversal| {
@@ -25939,6 +25955,19 @@ impl OwnedSourceScan {
         if source == SnapshotSource::ClaudeCode {
             claude_retry_queue_due_families(index, collected_at);
         }
+        let retry_context = index
+            .traversal
+            .as_ref()
+            .expect("retained")
+            .context_fingerprint
+            .clone();
+        let retry_carry_ready = source != SnapshotSource::ClaudeCode
+            || !index
+                .claude_stale_family_carry
+                .origin
+                .as_ref()
+                .is_some_and(|o| o.admission.is_some())
+            || claude_retry_carry_ready(index, source, collected_at, &retry_context, false);
         let traversal = index.traversal.as_mut().expect("traversal initialized");
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
@@ -25951,8 +25980,8 @@ impl OwnedSourceScan {
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member && !candidate.watcher_hint);
-        let selection_limit = if (source == SnapshotSource::Codex
-            && !traversal.pending_directories.is_empty())
+        let selection_limit = if !retry_carry_ready
+            || (source == SnapshotSource::Codex && !traversal.pending_directories.is_empty())
             || continuation.is_some()
         {
             0
@@ -26187,7 +26216,7 @@ impl OwnedSourceScan {
                 index,
                 &mut pending_paths,
                 retry_service_end,
-                &census_window_end,
+                collected_at,
             );
         }
         index.resume_census_window_end = Some(census_window_end.clone());
@@ -26272,6 +26301,28 @@ impl OwnedSourceScan {
         } else {
             BTreeSet::new()
         };
+        let retained_retry = source == SnapshotSource::ClaudeCode
+            && index
+                .claude_stale_family_carry
+                .origin
+                .as_ref()
+                .is_some_and(|o| o.admission.is_some());
+        if retained_retry {
+            if let Some(root) = index
+                .claude_stale_family_carry
+                .origin
+                .as_ref()
+                .and_then(|o| o.admission.as_ref())
+                .and_then(|s| s.oversized_root.as_ref())
+            {
+                if identified_candidates
+                    .iter()
+                    .any(|c| claude_index_path_member_ref(&c.path).is_some_and(|m| m.root == root))
+                {
+                    forced_claude_family_reparses.insert(root.clone());
+                }
+            }
+        }
         let claude_family_membership_is_authoritative = source == SnapshotSource::ClaudeCode
             && index.traversal.as_ref().is_some_and(|traversal| {
                 traversal.pending_directories.is_empty()
@@ -26280,7 +26331,7 @@ impl OwnedSourceScan {
                     && traversal.counts.unreadable_path_count == 0
                     && traversal.counts.disappeared_file_count == 0
             });
-        if claude_family_membership_is_authoritative {
+        if claude_family_membership_is_authoritative && !retained_retry {
             let current_members_by_root = index
                 .traversal
                 .as_ref()
@@ -26371,7 +26422,7 @@ impl OwnedSourceScan {
                 }
             }
         }
-        if !forced_claude_family_reparses.is_empty() {
+        if !forced_claude_family_reparses.is_empty() && !retained_retry {
             let already_identified = identified_candidates
                 .iter()
                 .map(|candidate| local_index_key(&candidate.path))
@@ -40193,6 +40244,60 @@ fn ensure_bounded_traversal(
             origin.context_fingerprint == context_fingerprint && !origin.full_rearm_window
         })
         .and_then(|origin| origin.admission.clone());
+    let mut decision = traversal_transition::RetryDecision {
+        event: "retry_decision",
+        family_retry_due: false,
+        floor_retry_due: false,
+        ordinary_deadline_eligible: false,
+        admission_present: prior_admission.is_some(),
+        admission_complete: prior_admission.as_ref().is_some_and(|s| s.complete),
+        admission_progressed: prior_admission.as_ref().is_some_and(|s| s.progressed),
+        selected_action: "full_start",
+    };
+    if let Some(t) = index
+        .traversal
+        .as_ref()
+        .filter(|t| t.context_fingerprint == context_fingerprint)
+    {
+        decision.family_retry_due = source == SnapshotSource::ClaudeCode
+            && claude_retry_due_family_exists(index, collected_at);
+        decision.floor_retry_due = oversized_discovery::floor_retry_due(source, t, collected_at);
+        decision.ordinary_deadline_eligible =
+            rfc3339_unix_seconds(collected_at).map_or(true, |now| {
+                t.unhealthy_retry_not_before_unix_seconds
+                    .map_or(true, |deadline| {
+                        now >= deadline
+                            || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
+                    })
+            });
+        let terminal = t.pending_directories.is_empty()
+            && !t.pending_candidates.iter().any(|p| p.census_member)
+            && index.claude_stale_family_carry.replay.is_empty();
+        let sweep = oversized_discovery::clock_retry_required(source, t)
+            || (t.counts.has_errors()
+                && index.unsettled_cause_bits()
+                    & !UnsettledUploadCause::CompletedBlockingHolds.bit()
+                    != 0);
+        let full = terminal
+            && (decision.floor_retry_due || (sweep && decision.ordinary_deadline_eligible));
+        let scoped = terminal
+            && (t.counts.has_errors() || prior_admission.is_some())
+            && source == SnapshotSource::ClaudeCode
+            && index.claude_full_rearm_progress.full_rearm_window.is_none()
+            && !index.claude_full_rearm_progress.full_rearm_window_next
+            && (decision.family_retry_due
+                || prior_admission
+                    .as_ref()
+                    .is_some_and(|s| !s.complete && s.progressed));
+        decision.selected_action = if full {
+            "full_start"
+        } else if scoped {
+            "scoped_retry"
+        } else {
+            "resume"
+        };
+    }
+    let decision_full_start = decision.selected_action == "full_start";
     let carry = &index.claude_stale_family_carry;
     let carry_origin_valid = carry.origin.as_ref().is_some_and(|origin| {
         origin.context_fingerprint == context_fingerprint
@@ -40243,6 +40348,8 @@ fn ensure_bounded_traversal(
                 && (traversal.counts.has_errors() || prior_admission.is_some())
         });
     if source == SnapshotSource::ClaudeCode
+        && decision.selected_action != "scoped_retry"
+        && !(prior_admission.is_some() && !decision_full_start && !window_origin_invalid)
         && (window_origin_invalid || (!carry.is_empty() && !carry_origin_valid))
     {
         index.claude_full_rearm_progress.full_rearm_window = None;
@@ -40300,77 +40407,34 @@ fn ensure_bounded_traversal(
         .traversal
         .as_ref()
         .is_some_and(|traversal| traversal.context_fingerprint == context_fingerprint);
-    let retry_attempt = if let Some(traversal) = index
-        .traversal
-        .as_ref()
-        .filter(|traversal| traversal.context_fingerprint == context_fingerprint)
-    {
-        // G1: discovery's census-member rule; pending re-reads do not hold
-        // the bounded retry.
-        // Bound family recovery remains independent of oversized admission debt.
-        let family_retry_due = rfc3339_unix_seconds(collected_at).is_some_and(|now| {
-            source == SnapshotSource::ClaudeCode
-                        && index.claude_usage_authority_quarantine.iter().any(|(root, record)| {
-                            record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
-                                && record.retry_after_unix_seconds <= now
-                                // A start already served all deadlines at or
-                                // before it, even if a held/deleted member
-                                // yielded no item and retained its old record.
-                                && rfc3339_unix_seconds(&traversal.census_window_end)
-                                    .is_some_and(|started| record.retry_after_unix_seconds > started)
-                                && index.claude_usage_family_witnesses.get(root).is_some_and(|witness| {
-                                    claude_usage_authority_preserves_pending(record, witness)
-                                })
-                        })
-        });
-        let unsettled_retry_required =
-            index.unsettled_cause_bits() & !UnsettledUploadCause::CompletedBlockingHolds.bit() != 0;
-        let floor_retry_due = oversized_discovery::floor_retry_due(source, traversal, collected_at);
-        let terminal_unhealthy = traversal.pending_directories.is_empty()
-            && !traversal
-                .pending_candidates
-                .iter()
-                .any(|candidate| candidate.census_member)
-            && index.claude_stale_family_carry.replay.is_empty()
-            && (oversized_discovery::clock_retry_required(source, traversal)
-                || (traversal.counts.has_errors()
-                    && (family_retry_due || unsettled_retry_required || floor_retry_due))
-                || prior_admission.is_some());
-        // What clears the latch: a generation that completes drops the
-        // traversal, and a changed scan context takes the `else` branch below;
-        // both start the next traversal at attempt zero. What bounds it: the
-        // attempt saturates at `UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS`, the delay
-        // at `UNHEALTHY_SCAN_RETRY_MAX_SECONDS`, and a deadline that is past,
-        // absurdly far ahead, or missing altogether (an index persisted before
-        // the deadline existed) is due now. The retry depends on the clock
-        // alone, never on new input arriving.
-        let retry_due = floor_retry_due
-            || prior_admission
-                .as_ref()
-                .is_some_and(|state| !state.complete && state.progressed)
-            || match rfc3339_unix_seconds(collected_at) {
-                Some(now) => {
-                    traversal
-                        .unhealthy_retry_not_before_unix_seconds
-                        .map_or(true, |deadline| {
-                            now >= deadline
-                                || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
-                        })
-                        || family_retry_due
-                }
-                // A malformed or backwards observation clock must not turn the
-                // durable red witness into a permanent fence. Retrying remains
-                // bounded by the per-tick traversal limits.
-                None => true,
-            };
-        (terminal_unhealthy && retry_due).then(|| {
-            traversal
-                .unhealthy_retry_attempt
-                .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS)
-        })
-    } else {
-        Some(0)
-    };
+    if index.traversal.is_none() {
+        decision.selected_action = "full_start";
+    }
+    let retry_attempt = (decision.selected_action == "full_start").then(|| {
+        index
+            .traversal
+            .as_ref()
+            .filter(|t| t.context_fingerprint == context_fingerprint)
+            .map_or(0, |t| {
+                t.unhealthy_retry_attempt
+                    .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS)
+            })
+    });
+    if decision.selected_action != "full_start" {
+        decision.emit(source);
+    }
+    if decision.selected_action == "scoped_retry" {
+        if claude_retry_carry_ready(
+            index,
+            source,
+            &plan_clock,
+            &context_fingerprint,
+            plan_revision_changed,
+        ) {
+            claude_retry_scoped_service(index, collected_at, &context_fingerprint);
+        }
+        return TraversalProgress::Resumed;
+    }
     let Some(retry_attempt) = retry_attempt else {
         // Serve scoped oversized changes only after deciding that no ordinary
         // retry starts. A simultaneous bound-family wake keeps its old cadence.
@@ -40396,7 +40460,11 @@ fn ensure_bounded_traversal(
             &plan_clock,
             &context_fingerprint,
             plan_revision_changed,
+            prior_admission.is_some(),
         ) {
+            if prior_admission.is_some() {
+                return TraversalProgress::Resumed;
+            }
             index.traversal = None;
             return ensure_bounded_traversal(
                 source,
@@ -40420,6 +40488,7 @@ fn ensure_bounded_traversal(
         prior_traversal_context_matches,
         retry_attempt,
     );
+    transition.decision = Some(decision);
 
     // A prior partially settled page may have advanced its traversal past an
     // entity whose replacement was not accepted. Finishing that generation

@@ -7,6 +7,23 @@ use super::{
 use serde::Serialize;
 
 #[derive(Serialize)]
+pub(super) struct RetryDecision {
+    pub event: &'static str,
+    pub family_retry_due: bool,
+    pub floor_retry_due: bool,
+    pub ordinary_deadline_eligible: bool,
+    pub admission_present: bool,
+    pub admission_complete: bool,
+    pub admission_progressed: bool,
+    pub selected_action: &'static str,
+}
+impl RetryDecision {
+    pub(super) fn emit(&self, source: SnapshotSource) {
+        crate::local_resource_diagnostics::traversal_transition(source.api_slug(), self);
+    }
+}
+
+#[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum StartReason {
     NoRetainedTraversal,
@@ -35,6 +52,8 @@ fn is_zero(value: &usize) -> bool {
 #[derive(Serialize)]
 pub(super) struct Starting {
     event: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) decision: Option<RetryDecision>,
     reason: StartReason,
     index_generation: u64,
     window_unix_seconds: Option<u64>,
@@ -93,6 +112,7 @@ impl Starting {
         Self {
             disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
             event: "starting",
+            decision: None,
             reason: match (previous.is_some(), matches) {
                 (false, _) => StartReason::NoRetainedTraversal,
                 (true, false) => StartReason::ContextChanged,
@@ -232,7 +252,11 @@ mod tests {
     const T3: &str = "2026-08-01T00:03:00Z";
 
     fn start(index: &mut ScanIndex, now: &str, days: u64) -> Vec<Value> {
-        capture(|| ensure_bounded_traversal(SnapshotSource::Pi, &[], index, now, days)).1
+        capture(|| ensure_bounded_traversal(SnapshotSource::Pi, &[], index, now, days))
+            .1
+            .into_iter()
+            .filter(|r| r["counts"]["event"] != "retry_decision")
+            .collect()
     }
 
     #[test]
