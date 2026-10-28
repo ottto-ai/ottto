@@ -1,5 +1,6 @@
 //! Pi SOURCE canaries and codec restore controls, using synthetic sessions only.
 use super::*;
+use crate::durable_tail_codec::HDigest;
 use crate::durable_tail_store::{
     self as store, Binding, DurableSource, PendingRecord, ReadOutcome,
 };
@@ -342,6 +343,26 @@ fn invalid_pi_keys_and_digests_are_never_accepted() {
     let scratch = Scratch::new();
     let path = scratch.write(&ledger_lines().0);
     let (reduction, _) = full_read(&path);
+    let encoded = body(&reduction);
+    let key = reduction
+        .accumulator
+        .seen_pi_usage_keys
+        .keys()
+        .next()
+        .unwrap();
+    let mut h = Enc::bytes(32);
+    key.put_h(&mut h, "PiSection.usage_keys").unwrap();
+    let h = h.into_bytes();
+    let positions = encoded
+        .windows(h.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == h).then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        positions.len(),
+        1,
+        "locate the fixed H key in the Pi record"
+    );
     for invalid in [
         String::new(),
         "a".repeat(63),
@@ -349,6 +370,20 @@ fn invalid_pi_keys_and_digests_are_never_accepted() {
         "g".repeat(64),
         "A".repeat(64),
     ] {
+        // A legacy/free-form string is not a valid fixed-width H key on the
+        // wire, even when its text has the old response-id shape.
+        let mut text = Enc::bytes(128);
+        invalid.put(&mut text).unwrap();
+        let mut malformed = encoded.clone();
+        malformed.splice(positions[0]..positions[0] + 32, text.into_bytes());
+        assert!(
+            verify(&malformed).is_err(),
+            "verify accepted a string in place of an H key"
+        );
+        assert!(
+            decode(&malformed, SnapshotSource::Pi).is_err(),
+            "decode accepted a string in place of an H key"
+        );
         for container in 0..4 {
             let mut changed = reduction.clone();
             let ledger = &mut changed.accumulator.seen_pi_usage_keys;
