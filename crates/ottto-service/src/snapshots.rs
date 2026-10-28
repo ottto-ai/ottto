@@ -3,6 +3,7 @@ use crate::codex_scan_diagnostics::{
     ParentUnresolvableCauses, RecoveryLineage, StateRowFieldDiffs, UnreadableCause,
     UnreadableCauses, LINEAGE_SAMPLES,
 };
+use crate::local_resource_diagnostics::{line_delivery_unselected, UnselectedReason};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
@@ -41031,10 +41032,7 @@ fn refresh_retained_codex_roster(
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
             {
-                crate::local_resource_diagnostics::line_delivery_unselected(
-                    source.api_slug(),
-                    crate::local_resource_diagnostics::UnselectedReason::Age,
-                );
+                line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
             traversal.counts.discovered_file_count += 1;
@@ -41047,10 +41045,7 @@ fn refresh_retained_codex_roster(
                     &path,
                     &mut traversal.oversized_discovery,
                 );
-                crate::local_resource_diagnostics::line_delivery_unselected(
-                    source.api_slug(),
-                    crate::local_resource_diagnostics::UnselectedReason::Size,
-                );
+                line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
                 continue;
             }
             if let Some(existing) = traversal
@@ -41372,10 +41367,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
             {
-                crate::local_resource_diagnostics::line_delivery_unselected(
-                    source.api_slug(),
-                    crate::local_resource_diagnostics::UnselectedReason::Age,
-                );
+                line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
             traversal.counts.discovered_file_count += 1;
@@ -41388,10 +41380,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     &path,
                     &mut traversal.oversized_discovery,
                 );
-                crate::local_resource_diagnostics::line_delivery_unselected(
-                    source.api_slug(),
-                    crate::local_resource_diagnostics::UnselectedReason::Size,
-                );
+                line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
                 continue;
             }
             if let Some(existing) = traversal
