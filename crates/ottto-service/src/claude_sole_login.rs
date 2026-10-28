@@ -118,7 +118,7 @@ fn pair(value: &serde_json::Value) -> Option<Pair> {
     let oauth = value.get("oauthAccount")?;
     let field = |name, role| {
         let value = oauth.get(name)?.as_str()?;
-        uuid::Uuid::parse_str(value).ok()?;
+        crate::claude_local_otel::canonical_uuid(value)?;
         billing_identity_hash("anthropic", role, value)
     };
     Some((
