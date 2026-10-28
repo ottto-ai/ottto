@@ -672,8 +672,26 @@ not distinct sessions, decoded bytes or money. No path or session id is included
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
 | `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
 | `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |
+| `CompressedAdmissionRefused` | Transient decoder reservation or singleton yield |
 
 These refusals authorize neither discovery nor a decoder. A refusal publishes no
 empty or zero-cost replacement body: previous accepted output remains stale, or
 usage remains unknown. Raw bounded samples of compressed physical objects remain
 legal identity observations; they establish no decoded-offset certificate.
+
+A paid compressed-input decoder reserves the existing SharedCache credit under
+retained → cursor before taking the durable Stores leaf lock. It keeps an
+fixed admission floor (one 8 MiB primary entry plus side-ledger bytes) free
+for primary Tail reads; admission never evicts or charges retained bytes twice.
+Only one paid decoder is live per process, with the existing 2 GiB decoded cap.
+A short reservation or busy singleton yields `None`, counts
+`CompressedAdmissionRefused` on `codex_zst_refused`, and changes no acquisition
+evidence. Callers disclose the yielded file in the unreadable census.
+
+On close, `codex_zst_input` on the #799 carrier reports consumed
+`codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder thread
+`codex_zst_cpu_micros`, including failures. There is no content or path in these
+counts. Callers close the decoder and explicitly release after Stores drops.
+Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
+cancellation/unwind safety net. Stores-held debug assertions guard admission and
+explicit release, including real durable I/O paths.

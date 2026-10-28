@@ -38,8 +38,10 @@ pub(crate) enum CodexZstCause {
     HeaderUnfunded,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded,
+    #[serde(rename = "CompressedAdmissionRefused")]
+    AdmissionRefused,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::CompatibilityUnfunded as usize + 1;
+const CODEX_ZST_CAUSES: usize = CodexZstCause::AdmissionRefused as usize + 1;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -625,7 +627,7 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
 pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
     traversal_point("durable_tail_alarm", source, counts);
 }
-fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
+pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),
@@ -1154,6 +1156,29 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compressed_causes_have_distinct_pinned_indices() {
+        use super::CodexZstCause::*;
+        const ALL: [super::CodexZstCause; super::CODEX_ZST_CAUSES] = [
+            ReplayNotAuthorized,
+            ProofParentUnsupported,
+            ProofChildUnsupported,
+            ParentSideUnsupported,
+            DurableTailUnsupported,
+            GroupProbeUnsupported,
+            GroupReadUnsupported,
+            ParentLedgerUnbound,
+            PhysicalOffsetUnsupported,
+            HeaderUnfunded,
+            CompatibilityUnfunded,
+            AdmissionRefused,
+        ];
+        assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
+        for (index, cause) in ALL.iter().enumerate() {
+            assert_eq!(*cause as usize, index);
+        }
+    }
+
     use super::*;
 
     #[test]

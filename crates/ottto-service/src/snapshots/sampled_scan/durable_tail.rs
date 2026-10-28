@@ -396,9 +396,35 @@ fn refuse_class(refuse: Refuse) -> &'static str {
     }
 }
 
+// Stores is a leaf lock; decoder admission/accounting must stay outside it.
+thread_local! { static STORES_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+pub(super) fn stores_held() -> bool {
+    STORES_HELD.with(std::cell::Cell::get)
+}
+pub(super) struct StoresGuard<'a>(std::sync::MutexGuard<'a, Stores>);
+impl std::ops::Deref for StoresGuard<'_> {
+    type Target = Stores;
+    fn deref(&self) -> &Stores {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for StoresGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Stores {
+        &mut self.0
+    }
+}
+impl Drop for StoresGuard<'_> {
+    fn drop(&mut self) {
+        STORES_HELD.with(|held| held.set(false));
+    }
+}
+
 impl SharedCache {
-    fn durable(&self) -> Option<std::sync::MutexGuard<'_, Stores>> {
-        self.durable.lock().ok()
+    pub(super) fn durable(&self) -> Option<StoresGuard<'_>> {
+        debug_assert!(!stores_held(), "Stores cannot be nested");
+        let guard = self.durable.lock().ok()?;
+        STORES_HELD.with(|held| held.set(true));
+        Some(StoresGuard(guard))
     }
 
     /// Selects `source`'s store for this pass, the sibling of `index_path`,

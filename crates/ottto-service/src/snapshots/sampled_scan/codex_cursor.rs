@@ -3756,6 +3756,58 @@ impl Drop for CursorCredit {
     }
 }
 
+// Reserve under retained -> cursor BEFORE taking durable Stores; carry only
+// the owner across I/O. Drop Stores before release, including unwind/early exits.
+// Never account from encode/write. Free room only: no primary/proof eviction.
+static DECODER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(in crate::snapshots) struct DecoderOwner(Option<CursorCredit>);
+impl DecoderOwner {
+    pub(in crate::snapshots) fn acquire(cache: &Arc<SharedCache>, bytes: usize) -> Option<Self> {
+        debug_assert!(!super::durable_tail::stores_held(), "reserve before Stores");
+        use std::sync::atomic::Ordering::SeqCst;
+        if DECODER_LIVE.swap(true, SeqCst) {
+            return None;
+        }
+        match cache.cursor_claim(bytes, true) {
+            Some(credit) => Some(Self(Some(credit))),
+            None => {
+                DECODER_LIVE.store(false, SeqCst);
+                None
+            }
+        }
+    }
+    // Normal completion/error calls this after destroying the decoder.
+    pub(in crate::snapshots) fn release(mut self) {
+        debug_assert!(!super::durable_tail::stores_held(), "release after Stores");
+        self.refund();
+    }
+    fn refund(&mut self) {
+        if let Some(credit) = self.0.take() {
+            credit.refund();
+            DECODER_LIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+impl Drop for DecoderOwner {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_zst_owner",
+                "codex",
+                &BTreeMap::from([("leaked_release", 1_u64)]),
+            );
+        }
+        if cursor_held() {
+            // Strand the charged claim and singleton; never re-lock during Drop.
+            if let Some(mut credit) = self.0.take() {
+                credit.settled = true;
+            }
+            return;
+        }
+        self.refund(); // cancellation/unwind safety net, observable as a leak
+    }
+}
+
 /// Checked: a claim that is not outstanding on this state is corrupt
 /// accounting. Fail closed: the state measures unbounded from then on.
 fn settle_claim(cursor: &mut CursorState, id: u64, bytes: usize) {
@@ -4051,10 +4103,20 @@ impl SharedCache {
     /// later measurement (`cursor_resident`, another admission, a retained
     /// insert) sees it until the credit is settled. None: nothing claimed.
     fn cursor_reserve(self: &Arc<Self>, charge: usize) -> Option<CursorCredit> {
+        self.cursor_claim(charge, false)
+    }
+    fn cursor_claim(self: &Arc<Self>, charge: usize, free_only: bool) -> Option<CursorCredit> {
         let mut retained = self.retained().ok()?;
         let claimed = self
             .with_cursor(|cursor| {
-                if !admit_locked(&mut retained, cursor, charge, true, Admitter::Main) {
+                let admitted = if free_only {
+                    charge
+                        .checked_add(super::ENTRY_BYTES + super::side_ledger::SIDE_LEDGER_BYTES)
+                        .is_some_and(|with_floor| proof_free_room(&retained, cursor, with_floor))
+                } else {
+                    admit_locked(&mut retained, cursor, charge, true, Admitter::Main)
+                };
+                if !admitted {
                     return None;
                 }
                 cursor.reserved = cursor.reserved.checked_add(charge)?;
