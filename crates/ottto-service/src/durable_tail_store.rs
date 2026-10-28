@@ -630,7 +630,7 @@ impl DurableTailStore {
 
     /// U holds. T14 gets one counted rebuild pass per process; if it still
     /// cannot be replaced, later passes hold until restart or replacement.
-    pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
+    pub(crate) fn hold(&mut self, key: &Digest32, restore_recheck: bool) -> Option<Refusal> {
         let result = self.classify(key, "guard");
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
         match result {
@@ -646,7 +646,7 @@ impl DurableTailStore {
                 }
                 None
             }
-            Err(Refusal::Corrupt) if self.rebuilt[key] => None,
+            Err(Refusal::Corrupt) if restore_recheck && self.rebuilt[key] => None,
             Ok(_) => None,
             Err(reason) => Some(reason),
         }

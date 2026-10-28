@@ -400,12 +400,21 @@ impl SharedCache {
         snapshot_source: SnapshotSource,
         key: &str,
     ) -> Option<store::Refusal> {
+        self.durable_guard(snapshot_source, key, false)
+    }
+
+    fn durable_guard(
+        &self,
+        snapshot_source: SnapshotSource,
+        key: &str,
+        restore_recheck: bool,
+    ) -> Option<store::Refusal> {
         let source = durable_source(snapshot_source)?;
         self.durable()?
             .slot(source)
             .as_mut()?
             .store
-            .hold(&store::key_digest(source, key))
+            .hold(&store::key_digest(source, key), restore_recheck)
     }
 
     pub(in crate::snapshots) fn durable_hold_exit(
@@ -459,7 +468,7 @@ impl SharedCache {
         ) {
             Some(taken) => RestoreOutcome::Restored(Box::new(taken)),
             None => self
-                .durable_hold(snapshot_source, key)
+                .durable_guard(snapshot_source, key, true)
                 .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
         }
     }
