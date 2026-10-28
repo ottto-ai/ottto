@@ -66,8 +66,26 @@ pub(crate) enum CrashPoint {
     SaveGc,
     RestartOne,
     RestartTwo,
+    BeforeDirectoryCreate,
+    DirectoryCreated,
+    BeforeParentSync,
+    ParentSynced,
+    BeforePrepare,
+    Prepared,
+    BeforeNativeFinish,
+    NativeFinishOk,
+    NativeFinishError,
+    BeforeRetireUnlink,
+    RetiredUnlink,
+    BeforeRetireSync,
+    RetiredSynced,
+    BeforeNativeEffects,
+    AfterNativeEffects,
+    BeforeCodexPublication,
 }
 impl CrashPoint {
+    // Preserve the existing M1 executable matrix. Later points must not be
+    // appended here until its child driver actually traverses those paths.
     pub(crate) const ALL: [Self; 16] = [
         Self::OldWriter,
         Self::Restore,
@@ -85,6 +103,30 @@ impl CrashPoint {
         Self::SaveGc,
         Self::RestartOne,
         Self::RestartTwo,
+    ];
+    /// Additional physical store edges wired on this fixture branch. The
+    /// retirement edges refer to classified remove_keys, never temp cleanup.
+    pub(crate) const STORE_EXTENSION: [Self; 6] = [
+        Self::BeforeDirectoryCreate,
+        Self::DirectoryCreated,
+        Self::BeforeRetireUnlink,
+        Self::RetiredUnlink,
+        Self::BeforeRetireSync,
+        Self::RetiredSynced,
+    ];
+    /// Names reserved for the owning a0/a1/E2 call sites. They are NOT a
+    /// runnable matrix on M1; reach() must be placed at the real boundaries.
+    pub(crate) const LIVE_EXTENSION: [Self; 10] = [
+        Self::BeforeParentSync,
+        Self::ParentSynced,
+        Self::BeforePrepare,
+        Self::Prepared,
+        Self::BeforeNativeFinish,
+        Self::NativeFinishOk,
+        Self::NativeFinishError,
+        Self::BeforeNativeEffects,
+        Self::AfterNativeEffects,
+        Self::BeforeCodexPublication,
     ];
     pub(crate) fn name(self) -> String {
         format!("{self:?}")
@@ -484,4 +526,157 @@ pub(crate) mod money_oracle {
             "quiet restart emitted a new body"
         );
     }
+}
+
+/// Reuses the acquisition clock. This changes neither a process allowance nor
+/// a daily budget: those owners must consume the same clock when implemented.
+pub(crate) fn with_scan_clock<T>(now: u64, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::TEST_NOW.with(|clock| clock.set(self.0));
+        }
+    }
+    let _reset = Reset(super::TEST_NOW.with(|clock| clock.replace(Some(now))));
+    run()
+}
+
+/// Snapshots only real native state supplied by a caller, including empty
+/// values. No disk reads, fabricated debt, ACK, or new authority. Call before
+/// and after the held finish path, then compare the relevant fields exactly.
+pub(crate) fn native_effects(
+    index: &super::super::ScanIndex,
+    scan: &super::super::SourceScanResult,
+) -> Value {
+    json!({
+        "files": index.files,
+        "accepted": index.accepted_snapshot_fingerprints,
+        "parent_ledgers": index.codex_parent_ownership_ledgers,
+        "parent_refs": index.codex_parent_ownership_refs,
+        "proofs": index.codex_parent_prefix_proofs,
+        "proof_seq": index.codex_parent_proof_seq,
+        "proof_parents_live": index.codex_parent_proof_parents_live,
+        "side": index.codex_parent_side,
+        "side_generation": index.codex_parent_side_generation,
+        "side_requests": index.codex_parent_side_requests,
+        "blocked": index.codex_state_only_blocked_session_ids,
+        "blocked_by_file": index.codex_state_only_blocked_by_file,
+        "pending_finalizations": scan.pending_finalization.len(),
+        "witnesses": scan.snapshots.iter().map(|item|
+            (item.source_session_id.clone(),
+             super::super::snapshot_upload_body_witness(item)))
+            .collect::<BTreeMap<_, _>>(),
+        "census": {
+            "complete": scan.census_complete,
+            "state_complete": scan.state_census_complete,
+            "sidecar_complete": scan.sidecar_census_complete,
+            "sessions": scan.scanned_session_count,
+            "ownership_incomplete": scan.ownership_incomplete_file_count,
+            "terminal_ownership_incomplete": scan.terminal_ownership_incomplete_file_count,
+            "residue_keys": scan.census_residue_index_key_count,
+            "residue_blocked": scan.census_residue_blocked_session_count,
+            "residue_archived": scan.census_residue_archived_rollout_count,
+        },
+    })
+}
+
+/// A scoped error at a REAL store call. Install on the worker thread. Existing
+/// rename/dir-sync hooks are preserved. Reaching the nth edge is mandatory:
+/// callers assert hits(), so an unvisited injection cannot pass as a hold.
+pub(crate) struct StoreFailure {
+    previous: Option<crate::durable_tail_store::test_hooks::TransitionHook>,
+    hits: std::rc::Rc<Cell<usize>>,
+}
+impl StoreFailure {
+    pub(crate) fn hits(&self) -> usize {
+        self.hits.get()
+    }
+}
+impl Drop for StoreFailure {
+    fn drop(&mut self) {
+        crate::durable_tail_store::test_hooks::replace_transition_hook(self.previous.take());
+    }
+}
+pub(crate) fn fail_store_at(point: CrashPoint, nth: usize) -> StoreFailure {
+    assert!(nth > 0);
+    assert!(matches!(
+        point,
+        CrashPoint::BeforeDirectoryCreate
+            | CrashPoint::DirectoryCreated
+            | CrashPoint::BeforeRename
+            | CrashPoint::BeforeDirectorySync
+            | CrashPoint::BeforeRetireUnlink
+            | CrashPoint::RetiredUnlink
+            | CrashPoint::BeforeRetireSync
+            | CrashPoint::RetiredSynced
+    ));
+    let hits = std::rc::Rc::new(Cell::new(0));
+    let count = std::rc::Rc::clone(&hits);
+    let previous = crate::durable_tail_store::test_hooks::replace_transition_hook(Some(Box::new(
+        move |reached, _| {
+            if reached == point {
+                let n = count.get().checked_add(1).expect("edge counter overflow");
+                count.set(n);
+                if n == nth {
+                    return Err(std::io::Error::other(format!("injected {point:?}")));
+                }
+            }
+            Ok(())
+        },
+    )));
+    StoreFailure { previous, hits }
+}
+
+#[test]
+fn scan_clock_restores_after_nested_scope_and_unwind() {
+    with_scan_clock(100, || {
+        assert_eq!(super::now_seconds(), 100);
+        with_scan_clock(200, || assert_eq!(super::now_seconds(), 200));
+        assert_eq!(super::now_seconds(), 100);
+        assert!(std::panic::catch_unwind(|| with_scan_clock(300, || panic!("cancel"))).is_err());
+        assert_eq!(super::now_seconds(), 100);
+    });
+}
+
+#[test]
+fn transition_failure_restores_outer_hook_after_unwind() {
+    use crate::durable_tail_store::test_hooks;
+    let outer = fail_store_at(CrashPoint::BeforeDirectoryCreate, 2);
+    assert!(std::panic::catch_unwind(|| {
+        let inner = fail_store_at(CrashPoint::BeforeDirectoryCreate, 1);
+        assert!(test_hooks::transition_edge(
+            CrashPoint::BeforeDirectoryCreate,
+            Path::new("synthetic")
+        )
+        .is_err());
+        assert_eq!(inner.hits(), 1);
+        panic!("cancel");
+    })
+    .is_err());
+    assert_eq!(outer.hits(), 0);
+    assert!(
+        test_hooks::transition_edge(CrashPoint::BeforeDirectoryCreate, Path::new("synthetic"))
+            .is_ok()
+    );
+    assert!(
+        test_hooks::transition_edge(CrashPoint::BeforeDirectoryCreate, Path::new("synthetic"))
+            .is_err()
+    );
+    assert_eq!(outer.hits(), 2);
+}
+
+/// Protect the existing matrix while publishing new names for owners. This
+/// checks vocabulary only; it is not evidence that live call sites execute.
+#[test]
+fn crash_extension_names_are_disjoint_from_the_m1_matrix() {
+    let mut names = BTreeSet::new();
+    for point in CrashPoint::ALL
+        .into_iter()
+        .chain(CrashPoint::STORE_EXTENSION)
+        .chain(CrashPoint::LIVE_EXTENSION)
+    {
+        assert!(names.insert(point.name()), "duplicate boundary {point:?}");
+    }
+    assert_eq!(names.len(), 32);
+    assert!(names.contains("BeforeCodexPublication"));
 }

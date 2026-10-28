@@ -2141,3 +2141,158 @@ fn unoffered_started_rebuild_survives_save_until_its_replacement_is_offered() {
     assert!(store.rebuilt.is_empty());
     assert_eq!(store.counters().t14_rebuild_full_started, 1);
 }
+
+/// Exercise the shared fixture's real failure seams without assigning a1
+/// publication/owed semantics to this older store. Unlink failure keeps the
+/// predecessor; sync failure is unproved retirement even if the name is gone.
+#[test]
+fn transition_store_failure_controls_and_verified_retirement() {
+    use crate::snapshots::sampled_scan::transition_fixture::{fail_store_at, CrashPoint};
+    for point in [
+        CrashPoint::BeforeDirectoryCreate,
+        CrashPoint::DirectoryCreated,
+        CrashPoint::BeforeRename,
+        CrashPoint::BeforeDirectorySync,
+    ] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("input.jsonl", b"{}\n");
+        let mut store = scratch.store();
+        let record = pending(binding("c", "s", ("e", None)), certificate(&path), 3);
+        let fault = fail_store_at(point, 1);
+        assert!(store.write_after_save(&lock, 1, vec![record]).is_err());
+        assert_eq!(
+            fault.hits(),
+            1,
+            "{point:?}: actual failure seam not reached"
+        );
+    }
+    for point in [CrashPoint::BeforeRetireUnlink, CrashPoint::BeforeRetireSync] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let path = scratch.transcript("input.jsonl", b"{}\n");
+        let mut store = scratch.store();
+        let record = pending(binding("c", "s", ("e", None)), certificate(&path), 3);
+        let key = record.binding.key;
+        assert_eq!(
+            store
+                .write_after_save(&lock, 1, vec![record])
+                .unwrap()
+                .written,
+            1
+        );
+        let file = record_file(&store, &key);
+        let before = fs::read(&file).unwrap();
+        let fault = fail_store_at(point, 1);
+        assert!(store.remove_keys(&lock, &BTreeSet::from([key])).is_err());
+        assert_eq!(fault.hits(), 1);
+        assert_eq!(
+            store.counters.records_invalidated, 0,
+            "no retirement receipt"
+        );
+        if point == CrashPoint::BeforeRetireUnlink {
+            assert_eq!(fs::read(&file).unwrap(), before);
+        } else {
+            assert!(!file.exists(), "unlink happened, directory sync did not");
+        }
+        drop(fault);
+        // A fresh healthy record for the same key is removed and synchronized.
+        // Do not pretend retry of the absent key proves the prior failed sync.
+        let fresh = pending(binding("c", "s", ("fresh", None)), certificate(&path), 4);
+        assert_eq!(
+            store
+                .write_after_save(&lock, 2, vec![fresh])
+                .unwrap()
+                .written,
+            1
+        );
+        assert_eq!(store.remove_keys(&lock, &BTreeSet::from([key])).unwrap(), 1);
+        assert!(!file.exists());
+        assert_eq!(store.counters.records_invalidated, 1);
+    }
+}
+
+#[test]
+fn shared_transition_store_crash_child() {
+    use crate::snapshots::sampled_scan::transition_fixture::{arm_crashes, CrashPoint};
+    let Some(root) = std::env::var_os("OTTTO_TRANSITION_STORE_ROOT") else {
+        return;
+    };
+    let scratch = Scratch {
+        root: PathBuf::from(root).join("state"),
+    };
+    fs::create_dir_all(&scratch.root).unwrap();
+    fs::set_permissions(&scratch.root, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("input.jsonl", b"{}\n");
+    let mut store = scratch.store();
+    let record = pending(binding("c", "s", ("e", None)), certificate(&path), 3);
+    let key = record.binding.key;
+    let requested = std::env::var("OTTTO_TRANSITION_CRASH").unwrap();
+    if [
+        CrashPoint::BeforeDirectoryCreate,
+        CrashPoint::DirectoryCreated,
+    ]
+    .iter()
+    .any(|point| point.name() == requested)
+    {
+        arm_crashes();
+    }
+    assert_eq!(
+        store
+            .write_after_save(&lock, 1, vec![record])
+            .unwrap()
+            .written,
+        1
+    );
+    arm_crashes();
+    store.remove_keys(&lock, &BTreeSet::from([key])).unwrap();
+    panic!("requested store crash edge was not reached");
+}
+
+#[test]
+fn shared_transition_store_crashes_reach_physical_edges() {
+    use crate::snapshots::sampled_scan::transition_fixture::{assert_child_killed, CrashPoint};
+    for point in CrashPoint::STORE_EXTENSION {
+        let scratch = Scratch::new();
+        let marker = scratch.root.join("reached");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("durable_tail_store::tests::shared_transition_store_crash_child")
+            .args(["--nocapture", "--test-threads=1"])
+            .env("OTTTO_TRANSITION_STORE_ROOT", &scratch.root)
+            .env("OTTTO_TRANSITION_CRASH", point.name())
+            .env("OTTTO_TRANSITION_MARKER", &marker)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("child timed out before {point:?}; forced kill is not crash evidence");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_child_killed(status, &marker, point);
+        let state = scratch.root.join("state");
+        let store_dir = store_dir_for_index(&state.join("index.json"));
+        if point == CrashPoint::BeforeDirectoryCreate {
+            assert!(!store_dir.exists());
+        } else {
+            assert!(store_dir.is_dir());
+            let mut store = DurableTailStore::new(store_dir, DurableSource::ClaudeCode);
+            let key = binding("c", "s", ("e", None)).key;
+            if point == CrashPoint::BeforeRetireUnlink {
+                let record = found(store.read(&key, &placeholder_allowlist()));
+                assert_eq!(record.index_generation, 1);
+                assert_eq!(record.record.body, placeholder_body(3, 21));
+            } else {
+                assert!(store.inventory().unwrap().is_empty(), "{point:?}");
+            }
+        }
+    }
+}

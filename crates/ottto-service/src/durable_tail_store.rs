@@ -1023,13 +1023,21 @@ impl DurableTailStore {
         for key in keys {
             let path = self.record_path(key);
             if matches!(self.classify(key, "delete"), Ok(Some(_))) {
+                #[cfg(test)]
+                test_hooks::transition_edge(CrashPoint::BeforeRetireUnlink, &path)?;
                 remove_if_present(&path)?;
+                #[cfg(test)]
+                test_hooks::transition_edge(CrashPoint::RetiredUnlink, &path)?;
                 removed += 1;
             }
             self.durable.remove(key);
         }
         if removed > 0 {
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::BeforeRetireSync, &self.dir)?;
             sync_dir(&self.dir)?;
+            #[cfg(test)]
+            test_hooks::transition_edge(CrashPoint::RetiredSynced, &self.dir)?;
             self.counters.records_invalidated += removed as u64;
             let (on_disk, unlisted) = self.scan_disk()?;
             self.set_disk_level(&on_disk, unlisted);
@@ -1125,10 +1133,14 @@ fn parse_hex_digest(text: &str) -> Option<Digest32> {
 }
 
 fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    test_hooks::transition_edge(CrashPoint::BeforeDirectoryCreate, dir)?;
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
+    #[cfg(test)]
+    test_hooks::transition_edge(CrashPoint::DirectoryCreated, dir)?;
     // `mkdir` masks the mode with the umask; pin it.
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
@@ -1481,6 +1493,7 @@ fn decode(bytes: &[u8], allowlist: &Digest32) -> Result<DurableRecord, Refusal> 
 /// Test-only filesystem faults and deterministic GC ordering.
 #[cfg(test)]
 pub(crate) mod test_hooks {
+    use super::{reach, CrashPoint};
     use std::cell::RefCell;
     use std::io;
     use std::path::Path;
@@ -1488,8 +1501,10 @@ pub(crate) mod test_hooks {
     type Hook = Box<dyn FnMut(&Path, &Path) -> io::Result<()>>;
     type DirHook = Box<dyn FnMut(&Path) -> io::Result<()>>;
     type AccessHook = Box<dyn FnMut(&Path, &str) -> io::Result<()>>;
+    pub(crate) type TransitionHook = Box<dyn FnMut(CrashPoint, &Path) -> io::Result<()>>;
 
     thread_local! {
+        static TRANSITION: RefCell<Option<TransitionHook>> = const { RefCell::new(None) };
         static BEFORE_RENAME: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static BEFORE_DIR_SYNC: RefCell<Option<DirHook>> = const { RefCell::new(None) };
         static BEFORE_ACCESS: RefCell<Option<AccessHook>> = const { RefCell::new(None) };
@@ -1521,6 +1536,16 @@ pub(crate) mod test_hooks {
         }
         entries
     }
+    pub(crate) fn replace_transition_hook(hook: Option<TransitionHook>) -> Option<TransitionHook> {
+        TRANSITION.with(|slot| slot.replace(hook))
+    }
+    pub(crate) fn transition_edge(point: CrashPoint, path: &Path) -> io::Result<()> {
+        reach(point);
+        TRANSITION.with(|slot| match slot.borrow_mut().as_mut() {
+            Some(hook) => hook(point, path),
+            None => Ok(()),
+        })
+    }
 
     /// The uid the store treats as its own (a foreign owner without root).
     pub(crate) fn set_uid(uid: Option<u32>) {
@@ -1537,12 +1562,14 @@ pub(crate) mod test_hooks {
         BEFORE_DIR_SYNC.with(|slot| *slot.borrow_mut() = hook);
     }
     pub(super) fn before_rename(temp: &Path, path: &Path) -> io::Result<()> {
+        transition_edge(CrashPoint::BeforeRename, path)?;
         BEFORE_RENAME.with(|slot| match slot.borrow_mut().as_mut() {
             Some(hook) => hook(temp, path),
             None => Ok(()),
         })
     }
     pub(super) fn before_dir_sync(dir: &Path) -> io::Result<()> {
+        transition_edge(CrashPoint::BeforeDirectorySync, dir)?;
         BEFORE_DIR_SYNC.with(|slot| match slot.borrow_mut().as_mut() {
             Some(hook) => hook(dir),
             None => Ok(()),
