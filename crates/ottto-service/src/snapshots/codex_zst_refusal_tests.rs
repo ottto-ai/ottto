@@ -79,7 +79,7 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         assert!(parse_codex_jsonl_file(&path, "2026-10-28T10:00:00Z", "fixture".into()).is_err());
         assert!(parse_codex_jsonl_file(&path, "2026-10-28T10:00:00Z", "fixture".into()).is_err());
     });
-    assert_refused(CodexZstCause::ConstructorUnfunded, || {
+    assert_refused(CodexZstCause::ParserStateRequired, || {
         assert!(OwnedJsonlParser::new(
             file(),
             &path,
@@ -108,7 +108,9 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
     assert_refused(CodexZstCause::ProofChildUnsupported, || {
         assert!(CodexProofReader::child("fixture".into(), path.clone(), file()).is_err());
     });
-    assert!(codex_file_join::header_reduction_witness(&member, None).is_err());
+    assert_refused(CodexZstCause::HeaderInvalid, || {
+        assert!(codex_file_join::header_reduction_witness(&member, None).is_err());
+    });
     assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
         assert!(sampled_scan::codex_cursor::LiveWitness::read(&path, &file(), 8).is_none());
     });
@@ -120,9 +122,13 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         &inventory_paths,
         Some(&directories),
     );
-    while !inventory.step(&CodexTitleMetadata::default()) {}
-    assert!(inventory.headers.is_empty());
-    assert!(inventory.refused.contains_key(&local_index_key(&path)));
+    assert_refused(CodexZstCause::AdmissionRefused, || {
+        while !inventory.step(&CodexTitleMetadata::default()) {}
+        assert!(inventory.headers.is_empty());
+        assert!(inventory.refused.contains_key(&local_index_key(&path)));
+        assert!(!inventory.complete);
+        assert_eq!(inventory.read_bytes, 0);
+    });
     let paths = BTreeSet::from([local_index_key(&path)]);
     let roots = [root.clone()];
     let census = CodexParentCensus::new(&roots, &paths);

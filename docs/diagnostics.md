@@ -692,13 +692,16 @@ A short reservation or busy singleton yields `None`, counts
 `CompressedAdmissionRefused` on `codex_zst_refused`, and changes no acquisition
 evidence. Callers disclose the yielded file in the unreadable census.
 
-On close, `codex_zst_input` on the #799 carrier reports consumed
-`codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder thread
-`codex_zst_cpu_micros`, including failures. There is no content or path in these
-counts. Callers close the decoder and explicitly release after Stores drops.
-Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
-cancellation/unwind safety net. Stores-held debug assertions guard admission and
-explicit release, including real durable I/O paths.
+A funded main-scan archive attempt emits `codex_zst_input` once when its decoder
+closes. Counts `codex_zst_compressed_bytes`, `codex_zst_decoded_bytes`, and
+`codex_zst_cpu_micros` measure physical File input (including read-ahead), decoded
+output and thread CPU spent decoding, including failed attempts.
+`codex_zst_compressed_consumed_bytes` separately measures input consumption in
+successful decoder steps. The counts contain no path, owner or content. Decoder credit is held through the shared cache admission; only one
+funded decoder may be live in the process. Physical offset certificates remain
+unsupported for archives.
+
+Callers explicitly release after Stores drops; Drop release is a cancellation safety net.
 
 Archive disposition stays `pending` until the final body is ACK-settled.
 Each admitted attempt clears its own body witness; only successful output
@@ -748,16 +751,31 @@ index reloads, reset on admission or process restart, and are cleared when a key
 is retired. A bounded process map holds at most 256 SHA-256
 identities and byte counters; at capacity, a new identity evicts the lowest hash. No streak is serialized or changes archive
 evidence. Decoder input and leaked-release fields are per-event counts.
-Archive inventory uses a separate stamp-bound `header_validated` projection. This
-is metadata, never acquisition, money, a physical checkpoint or an ACK. Its paid
-first-record decoder stops at 64 KiB decoded and 128 KiB physical input, closes
-within the inventory step, and is reused without decoding while the stamp matches.
-`codex_zst_inventory` reports `codex_aux_reads.header_read_attempts.inventory`,
-`codex_aux_reads.header_read_bytes.inventory` (physical input including read-ahead),
-`codex_zst_inventory_decoded_bytes` and `codex_zst_inventory_physical_bytes`. These
-are the S2 partial inventory purpose, outside Full/body totals. `codex_zst_input`
-reports the same physical input as an encoding view; do not sum the two views.
-`CompressedHeaderInvalid` identifies an invalid owning header.
+Archive inventory uses a stamp-bound `header_validated` projection with no
+acquisition, money, checkpoint or ACK authority. One paid attempt per stamp emits
+only `codex_zst_inventory`, never `codex_zst_input`. Its counters include
+`codex_aux_reads.header_read_attempts.inventory`, `header_read_bytes.inventory`
+(physical File input including read-ahead), `codex_zst_inventory_physical_bytes`,
+`codex_zst_inventory_compressed_consumed_bytes` (successful decoder steps),
+`codex_zst_inventory_decoded_bytes` and `codex_zst_inventory_cpu_micros`.
+
+Inventory uses an 8 KiB output buffer, retains only the first newline-terminated
+record in a Vec capped at 64 KiB, and caps physical input at 128 KiB. Read-ahead
+can decode beyond that newline; zstd internal block work also costs CPU. Those
+bytes and CPU are measured. Physical bytes charge inventory's read bound;
+actual decoded bytes also charge E2-4's per-pass singleton budget. HeaderWork's
+CPU accumulator stops new header attempts at 30 CPU-s. 11b-1 must supply actual
+AC/utility-QoS permission and fold that CPU into its shared catch-up accumulator;
+permission defaults to denied. This slice does not activate discovery/catch-up.
+
+`CompressedHeaderInvalid` is a counted per-archive hold when no projection can be
+used. That member is excluded without making other owners' inventory incomplete.
+Full acquisition can capture a complete first line up to the JSONL line cap;
+64 KiB is only the inventory bound. Inventory never writes the acquisition owner.
+These are validation/selection effects; there is no money formula change.
+Archive identity requires `payload.id` plus a matching filename candidate;
+double-UUID names outside that set receive counted `CompressedOwnerUnproven`
+holds. Universal archive coverage is not claimed.
 `CompressedParserStateRequired` identifies an accidental plain-constructor call
 for an archive; the paid main parser uses its stateful factory.
 `codex_zst_refused` reader failures also enter the unreadable census at their

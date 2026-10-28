@@ -243,9 +243,10 @@ pub(super) fn header_reduction_witness(
     archive: Option<&codex_compressed_input::ValidatedHeader>,
 ) -> Result<String> {
     if is_compressed_codex_rollout(Some(&candidate.path), None) {
-        return archive
-            .map(|header| header.digest.clone())
-            .context("archive header evidence unavailable");
+        return archive.map(|header| header.digest.clone()).ok_or_else(|| {
+            crate::local_resource_diagnostics::codex_zst_refused(CodexZstCause::HeaderInvalid);
+            anyhow::anyhow!("archive header evidence unavailable")
+        });
     }
     read_header_bytes(candidate).map(|(bytes, _, _)| format!("{:x}", Sha256::digest(bytes)))
 }
@@ -260,6 +261,8 @@ pub(super) struct HeaderInventory {
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
     pub(super) read_bytes: usize,
+    pub(super) held_archives: BTreeSet<String>,
+    pub(super) archive_work: codex_compressed_input::HeaderWork,
     /// Roster files whose first record was refused, each with the metadata
     /// witness seen at the refusal (`None` when it could not be read). This is
     /// the evidence a held page waits on; see `CodexInventoryHold`.
@@ -293,6 +296,8 @@ impl HeaderInventory {
             complete: paths.len() <= MAX_HEADER_FILES
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
+            held_archives: BTreeSet::new(),
+            archive_work: codex_compressed_input::HeaderWork::default(),
             refused: BTreeMap::new(),
             bounded_out: paths.len() > MAX_HEADER_FILES
                 || !directories.is_some_and(|value| value.stable),
@@ -338,6 +343,8 @@ impl HeaderInventory {
             return false;
         };
         let key = local_index_key(&path);
+        let compressed = is_compressed_codex_rollout(Some(&path), None);
+        let mut excluded = false;
         let result = (|| -> Result<HeaderWitness> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
@@ -370,19 +377,20 @@ impl HeaderInventory {
                 &ClaudeTitleMetadata::default(),
                 None,
             );
-            let compressed = is_compressed_codex_rollout(Some(&candidate.path), None);
             let (header, retried) = if compressed {
+                let before = self.archive_work.physical_bytes;
+                let result =
+                    index.inventory_archive_header(&candidate, cache, &mut self.archive_work);
+                excluded = index
+                    .files
+                    .get(&key)
+                    .and_then(|e| e.archive.as_ref())
+                    .is_some_and(|a| a.invalid_header(&stat));
+                self.read_bytes = self
+                    .read_bytes
+                    .saturating_add((self.archive_work.physical_bytes - before) as usize);
                 (
-                    index
-                        .inventory_archive_header(&candidate, cache)
-                        .map(|(header, bytes)| {
-                            (
-                                header.owner,
-                                header.created_unix_ms,
-                                metadata_witness(&stat),
-                                bytes,
-                            )
-                        }),
+                    result.map(|(h, _)| (h.owner, h.created_unix_ms, metadata_witness(&stat), 0)),
                     0,
                 )
             } else {
@@ -407,10 +415,15 @@ impl HeaderInventory {
         })();
         match result {
             Ok(header) => self.headers.push(header),
+            Err(_) if excluded => {
+                self.held_archives.insert(key);
+            }
             Err(_) => {
                 self.complete = false;
                 // A failed read may have consumed its whole bounded prefix.
-                self.read_bytes = self.read_bytes.saturating_add(MAX_HEADER_BYTES + 1);
+                if !compressed {
+                    self.read_bytes = self.read_bytes.saturating_add(MAX_HEADER_BYTES + 1);
+                }
                 let witness = path_witness(Path::new(&key));
                 self.refused.insert(key, witness);
             }
@@ -483,7 +496,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, archive_stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, held_archives, archive_work, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {

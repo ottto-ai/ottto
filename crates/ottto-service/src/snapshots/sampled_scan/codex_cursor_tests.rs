@@ -13800,7 +13800,14 @@ fn inventory_decoder_releases_without_waiting_for_stores_bounded_join() {
         let mut state = ScanIndex::default();
         let candidate = crate::snapshots::codex_zst_refusal_tests::candidate(&path);
         let success = state
-            .inventory_archive_header(&candidate, Some(&worker_cache))
+            .inventory_archive_header(
+                &candidate,
+                Some(&worker_cache),
+                &mut crate::snapshots::codex_compressed_input::HeaderWork {
+                    allowed: true,
+                    ..Default::default()
+                },
+            )
             .is_ok();
         done_tx
             .send((success, worker_cache.cursor_reserved()))

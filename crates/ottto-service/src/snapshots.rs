@@ -507,7 +507,8 @@ pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v34";
 // after the price-line effective date are revisited; older rollouts are never
 // re-read for it. That is file selection only, not a guaranteed superset: a
 // rollout copied or restored with an older preserved mtime is missed, and
-// archive acquisitions remain subject to their separate disposition. Inside a revisited file
+// compressed `.jsonl.zst` rollouts are not discovered until 11b, so recent
+// history is restated only where its `.jsonl` is still present. Inside a revisited file
 // only requests dated on or after that instant gain a bucket, so older hours
 // re-parse to the rows they already had. The instant is fixed, not relative to
 // now, so the revisit set never moves; each file settles once its fingerprint
@@ -26781,13 +26782,33 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
-                    if !inventory.step_with_archive(
+                    let before = inventory.archive_work.decoded_bytes;
+                    inventory.archive_work.allowed &= codex_page
+                        .singleton_remaining(sampled_scan::codex_cursor::Limits::current())
+                        >= codex_file_join::MAX_HEADER_BYTES as u64;
+                    let done = inventory.step_with_archive(
                         &codex_title_metadata,
                         index,
                         sampling.as_ref().map(|context| &context.cache),
-                    ) {
+                    );
+                    codex_page.charge(false, inventory.archive_work.decoded_bytes - before);
+                    if !done {
                         pending!();
                     }
+                    identified_candidates.retain(|candidate| {
+                        let key = local_index_key(&candidate.path);
+                        if !inventory.held_archives.contains(&key) {
+                            return true;
+                        }
+                        census.record_unreadable(UnreadableCause::Reduction, 1);
+                        residue_index_keys.insert(key);
+                        codex_state_only_blocked_session_ids.extend(
+                            codex_session_id_candidates_from_path(
+                                &candidate.path.with_extension(""),
+                            ),
+                        );
+                        false
+                    });
                     let selected = identified_candidates
                         .iter()
                         .map(|candidate| local_index_key(&candidate.path))
@@ -31123,7 +31144,7 @@ impl OwnedSourceScan {
                                 &codex_title_metadata,
                                 &claude_title_metadata,
                                 claude_effort_support_dir_ref,
-                                index.archive_header(&candidate.path),
+                                None,
                             )
                             .is_some(),
                         };
@@ -34314,15 +34335,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             self.finished = true;
             return Ok(JsonlReaderStep::Complete(*report));
         }
-        if self.capture_header
-            && line_start == 0
-            && line_complete
-            && !overflowed
-            && buf.len() < codex_file_join::MAX_HEADER_BYTES
-        {
-            buf.push(b'\n');
-            self.header_validated = codex_compressed_input::ValidatedHeader::from_bytes(buf);
-            buf.pop();
+        if self.capture_header && line_start == 0 && line_complete && !overflowed {
+            self.header_validated = codex_compressed_input::ValidatedHeader::from_line(buf);
         }
         // M1 durable warm-cache: the line's position in the file, for the
         // marks of re-derived fields. Known only on a positioned read.
@@ -48413,11 +48427,13 @@ impl ScanIndex {
                 Some(CandidateParseReason::NewFile),
             );
         };
-        if entry.archive.is_some() {
-            return (
-                CandidateDecision::Parse,
-                Some(CandidateParseReason::UnknownOutcome),
-            );
+        if let Some(archive) = &entry.archive {
+            let reason = if matches!(archive.disposition, ArchiveDisposition::HeaderValidated) {
+                CandidateParseReason::NewFile
+            } else {
+                CandidateParseReason::UnknownOutcome
+            };
+            return (CandidateDecision::Parse, Some(reason));
         }
         if let Some((root_session_id, member)) = claude_index_path_family_member(&candidate.path) {
             if self

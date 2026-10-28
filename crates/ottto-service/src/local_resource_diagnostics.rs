@@ -1192,8 +1192,7 @@ mod tests {
             GroupReadUnsupported,
             ParentLedgerUnbound,
             PhysicalOffsetUnsupported,
-            HeaderUnfunded,
-            CompatibilityUnfunded,
+            CompatibilityUnsupported,
             AdmissionRefused,
             DecodeFailed,
             OwnerUnproven,
@@ -1201,6 +1200,8 @@ mod tests {
             SettlementStuck,
             ConstructorUnfunded,
             DecodedOverLimit,
+            ParserStateRequired,
+            HeaderInvalid,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         for (index, cause) in ALL.iter().enumerate() {
