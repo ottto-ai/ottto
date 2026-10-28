@@ -1,3 +1,4 @@
+mod account_nicknames;
 pub mod active_sessions;
 pub mod adaptive_collector;
 pub mod agent_configs;
@@ -55,6 +56,7 @@ pub(crate) mod quota_credit_model;
 mod relay_auth;
 mod retry_tls;
 pub mod session_attribution;
+pub mod session_launch;
 pub mod snapshot_audit;
 pub mod snapshot_client;
 pub(crate) mod snapshot_retry;
@@ -248,6 +250,7 @@ impl ControlToken {
 
 #[derive(Debug, Clone)]
 pub struct LocalDaemon {
+    session_launch: Arc<Mutex<session_launch::Registry>>,
     transcript_cache: Arc<snapshots::sampled_scan::SharedCache>,
     footprint_cwds: Arc<context_footprint::CwdProjection>,
     native_comparison: Arc<snapshots::claude_native_comparison::lifecycle::Lifecycle>,
@@ -464,6 +467,7 @@ impl LocalDaemon {
     ) -> Self {
         let now = now.into();
         Self {
+            session_launch: Arc::default(),
             transcript_cache: Arc::new(snapshots::sampled_scan::SharedCache::default()),
             footprint_cwds: Arc::default(),
             native_comparison: Arc::new(

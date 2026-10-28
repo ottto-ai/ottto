@@ -42,6 +42,8 @@ struct Record {
     pid: u32,
     session_id: String,
     proc_start: String,
+    #[serde(default)]
+    cwd: Option<String>,
     pid_domain: Option<String>,
     kind: Option<String>,
     name: Option<String>,
@@ -73,6 +75,20 @@ pub(crate) fn session_processes(root: &Path) -> Vec<SessionProcess> {
 #[cfg(not(test))]
 pub(crate) fn collect(root: &Path) -> Registrations {
     collect_with_processes(root, process_starts)
+}
+
+/// Only a live registration with its original process-start witness may
+/// contribute a folder. Each root retains the existing 16-file/8 KiB bounds.
+pub(crate) fn collect_cwds(root: &Path) -> Vec<String> {
+    let records = read_records(root, MAX_FILES);
+    let starts = process_starts(&records.iter().map(|record| record.pid).collect::<Vec<_>>());
+    records
+        .into_iter()
+        .filter(|record| {
+            starts.get(&record.pid).map(String::as_str) == Some(record.proc_start.trim())
+        })
+        .filter_map(|record| record.cwd)
+        .collect()
 }
 
 fn collect_with_processes(

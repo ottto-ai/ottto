@@ -1,0 +1,444 @@
+//! Display-only nicknames, revision ordered and bound to a live device/org.
+//! No polling, offline writes, registration or nickname logging.
+use ottto_core::{default_support_dir, FileAccountStore, FileDeviceStore, LocalDeviceBinding};
+use ottto_protocol::{
+    AccountNicknameOutcomeV1 as Outcome, AccountNicknamePairV1 as Pair, AccountNicknameSetResultV1,
+    AccountNicknameV1 as Entry, AccountNicknamesV1, LocalAccountState, SecretString,
+    SessionLaunchProviderV1 as Provider,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
+
+const CACHE_NAME: &str = "account-nicknames.json";
+const MAX_ENTRIES: usize = 2000;
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Generation {
+    binding: String,
+    epoch: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Cache {
+    generation: String,
+    entries: Vec<Entry>,
+    refreshed: i64,
+    capability: bool,
+    #[serde(skip)]
+    rejected: bool,
+}
+
+/// Call while the identity lifecycle lock is held. The epoch fences requests
+/// already in flight even if a failed mutation restores the same disk binding.
+pub(crate) fn invalidate_locked() {
+    EPOCH.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut cache) = CACHE.lock() {
+        *cache = None;
+    }
+    let _ = fs::remove_file(default_support_dir().join(CACHE_NAME));
+}
+
+fn generation_locked() -> Option<Generation> {
+    if crate::control::identity_mutation_in_progress() {
+        return None;
+    }
+    let account = FileAccountStore::default().load().ok()?;
+    if account.state != LocalAccountState::Connected {
+        return None;
+    }
+    let device = FileDeviceStore::default().load().ok()??;
+    let credential = FileDeviceStore::default()
+        .load_with_credential_generation()
+        .ok()
+        .flatten();
+    let material = serde_json::to_vec(&(
+        &device.device_id,
+        &device.machine_id,
+        credential.map(|value| value.credential_generation),
+        account.user?.id,
+        account.organization?.id,
+        account.connected_at,
+        crate::snapshot_sync::snapshot_api_base_url(),
+    ))
+    .ok()?;
+    Some(Generation {
+        binding: format!("{:x}", Sha256::digest(material)),
+        epoch: EPOCH.load(Ordering::Acquire),
+    })
+}
+
+pub(crate) fn generation() -> Option<Generation> {
+    let _lock = crate::control::lock_setup_run_binding();
+    generation_locked()
+}
+
+pub(crate) fn generation_for_device(device: &LocalDeviceBinding) -> Option<Generation> {
+    let _lock = crate::control::try_lock_setup_run_binding()?;
+    if FileDeviceStore::default().load().ok().flatten().as_ref() != Some(device) {
+        return None;
+    }
+    generation_locked()
+}
+
+fn load_cache(generation: &Generation) -> Cache {
+    let path = default_support_dir().join(CACHE_NAME);
+    let read = || -> Option<Cache> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+            .ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.len() > 2 * 1024 * 1024
+        {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(2 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        let cache: Cache = serde_json::from_slice(&bytes).ok()?;
+        (cache.generation == generation.binding && cache.entries.len() <= MAX_ENTRIES)
+            .then_some(cache)
+    };
+    if let Some(cache) = read() {
+        return cache;
+    }
+    let _ = fs::remove_file(path);
+    Cache {
+        generation: generation.binding.clone(),
+        ..Default::default()
+    }
+}
+
+fn persist(cache: &Cache, support: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(support)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    let token = ottto_core::generate_control_token()
+        .map_err(|_| std::io::Error::other("cache unavailable"))?;
+    let temporary = support.join(format!(".account-nicknames-{token}.tmp"));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        let bytes =
+            serde_json::to_vec(cache).map_err(|_| std::io::Error::other("cache unavailable"))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, support.join(CACHE_NAME))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+pub(crate) fn read() -> AccountNicknamesV1 {
+    let _lock = crate::control::lock_setup_run_binding();
+    let Some(generation) = generation_locked() else {
+        return AccountNicknamesV1 {
+            entries: Some(Vec::new()),
+            stale: Some(true),
+            connected: Some(false),
+        };
+    };
+    let Ok(mut state) = CACHE.lock() else {
+        return AccountNicknamesV1::default();
+    };
+    if state
+        .as_ref()
+        .is_none_or(|cache| cache.generation != generation.binding)
+    {
+        *state = Some(load_cache(&generation));
+    }
+    let cache = state.as_ref().expect("cache initialized");
+    AccountNicknamesV1 {
+        entries: Some(cache.entries.clone()),
+        stale: Some(
+            cache.rejected
+                || time::OffsetDateTime::now_utc()
+                    .unix_timestamp()
+                    .saturating_sub(cache.refreshed)
+                    > 900,
+        ),
+        connected: Some(cache.capability && !cache.rejected),
+    }
+}
+
+/// Called on an ordinary upload response. Absence is deliberately a no-op.
+pub(crate) fn apply_upload(generation: Option<&Generation>, entries: Option<&[Entry]>) {
+    let (Some(generation), Some(entries)) = (generation, entries) else {
+        return;
+    };
+    let Some(_lock) = crate::control::try_lock_setup_run_binding() else {
+        return;
+    };
+    if generation_locked().as_ref() != Some(generation) {
+        return;
+    }
+    let Ok(mut state) = CACHE.lock() else {
+        return;
+    };
+    if state
+        .as_ref()
+        .is_none_or(|cache| cache.generation != generation.binding)
+    {
+        *state = Some(load_cache(generation));
+    }
+    let cache = state.as_mut().expect("cache initialized");
+    merge(cache, entries);
+    cache.capability = true;
+    cache.refreshed = time::OffsetDateTime::now_utc().unix_timestamp();
+    let _ = persist(cache, &default_support_dir());
+}
+
+fn valid_pair(pair: &Pair) -> bool {
+    pair.source != Provider::Unknown
+        && pair
+            .account_identifier_hash
+            .as_deref()
+            .is_some_and(strong_hash)
+        && pair
+            .organization_identifier_hash
+            .as_deref()
+            .is_some_and(|org| org.is_empty() || strong_hash(org))
+}
+
+fn strong_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn merge(cache: &mut Cache, entries: &[Entry]) {
+    for entry in entries.iter().take(MAX_ENTRIES) {
+        let (Some(pair), Some(revision)) = (&entry.pair, entry.revision) else {
+            continue;
+        };
+        if !valid_pair(pair)
+            || revision == 0
+            || entry
+                .nickname
+                .as_ref()
+                .is_some_and(|text| normalize(Some(text.expose_secret())).is_err())
+        {
+            continue;
+        }
+        if let Some(current) = cache
+            .entries
+            .iter_mut()
+            .find(|current| current.pair.as_ref() == Some(pair))
+        {
+            if revision > current.revision.unwrap_or(0) {
+                *current = entry.clone();
+            }
+        } else if cache.entries.len() < MAX_ENTRIES {
+            cache.entries.push(entry.clone());
+        }
+    }
+}
+
+pub(crate) fn normalize(text: Option<&str>) -> Result<Option<String>, ()> {
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    // Reject controls even at the ends; trimming cannot hide newlines/bidi.
+    if text.chars().any(|ch| ch.is_control() || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) { return Err(()); }
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if text.chars().count() > 40 {
+        return Err(());
+    }
+    if text.split_whitespace().any(|word| {
+        word.split_once('@').is_some_and(|(left, right)| {
+            !left.is_empty()
+                && right
+                    .split_once('.')
+                    .is_some_and(|(host, suffix)| !host.is_empty() && !suffix.is_empty())
+        })
+    }) {
+        return Err(());
+    }
+    Ok(Some(text.to_owned()))
+}
+
+pub(crate) fn set(
+    pair: Pair,
+    nickname: Option<SecretString>,
+    base_revision: Option<u64>,
+) -> AccountNicknameSetResultV1 {
+    let finish = |outcome| AccountNicknameSetResultV1 {
+        outcome: Some(outcome),
+        entry: None,
+    };
+    let Ok(nickname) = normalize(nickname.as_ref().map(SecretString::expose_secret)) else {
+        return finish(Outcome::Invalid);
+    };
+    if !valid_pair(&pair) {
+        return finish(Outcome::Invalid);
+    }
+    let Some(generation) = generation() else {
+        return finish(Outcome::NotConnected);
+    };
+    let status = read();
+    if status.connected != Some(true) {
+        return finish(
+            if status
+                .entries
+                .as_ref()
+                .is_some_and(|entries| !entries.is_empty())
+            {
+                Outcome::NotConnected
+            } else {
+                Outcome::Unavailable
+            },
+        );
+    }
+    let Ok((device, secret)) = crate::snapshot_client::load_snapshot_device_credentials() else {
+        return finish(Outcome::NotConnected);
+    };
+    if generation_for_device(&device).as_ref() != Some(&generation) {
+        return finish(Outcome::NotConnected);
+    }
+    let Some(machine_id) = device.machine_id.as_deref() else {
+        return finish(Outcome::NotConnected);
+    };
+    let source = match pair.source {
+        Provider::ClaudeCode => crate::snapshots::SnapshotSource::ClaudeCode,
+        Provider::Codex => crate::snapshots::SnapshotSource::Codex,
+        Provider::Unknown => return finish(Outcome::Invalid),
+    };
+    if !device
+        .sources
+        .iter()
+        .any(|registered| registered == source.api_slug())
+    {
+        return finish(Outcome::NotConnected);
+    }
+    let client = crate::snapshot_client::SnapshotApiClient::new(
+        crate::snapshot_sync::snapshot_api_base_url(),
+    );
+    let token = match client.issue_relay_token(&device, &secret, source) {
+        Ok(token) => token,
+        Err(error) => {
+            if error
+                .downcast_ref::<crate::snapshot_client::RelayTokenAuthorizationRejected>()
+                .is_some()
+            {
+                reject(&generation);
+                return finish(Outcome::NotConnected);
+            }
+            return finish(Outcome::Unavailable);
+        }
+    };
+    if generation_for_device(&device).as_ref() != Some(&generation) {
+        return finish(Outcome::NotConnected);
+    }
+    let mut payload = serde_json::json!({ "machine_id":machine_id, "source":pair.source,
+        "account_identifier_hash":pair.account_identifier_hash,
+        "organization_identifier_hash":pair.organization_identifier_hash,
+        "nickname":nickname });
+    if let Some(revision) = base_revision {
+        payload["base_revision"] = serde_json::json!(revision);
+    }
+    match client.put_account_nickname(&token, &payload) {
+        Ok(Some(entry)) if entry.pair.as_ref() == Some(&pair) && entry.revision.is_some() => {
+            if self::generation().as_ref() != Some(&generation) {
+                return finish(Outcome::NotConnected);
+            }
+            apply_upload(Some(&generation), Some(std::slice::from_ref(&entry)));
+            AccountNicknameSetResultV1 {
+                outcome: Some(Outcome::Saved),
+                entry: Some(entry),
+            }
+        }
+        Err(401 | 403) => {
+            reject(&generation);
+            finish(Outcome::NotConnected)
+        }
+        Err(404) => finish(Outcome::TargetUnknown),
+        Err(400 | 422) => finish(Outcome::Invalid),
+        _ => finish(Outcome::Unavailable),
+    }
+}
+
+fn reject(generation: &Generation) {
+    let _lock = crate::control::lock_setup_run_binding();
+    if generation_locked().as_ref() != Some(generation) {
+        return;
+    }
+    if let Ok(mut state) = CACHE.lock() {
+        if let Some(cache) = state.as_mut() {
+            cache.rejected = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn entry(revision: u64, nickname: Option<&str>) -> Entry {
+        Entry {
+            pair: Some(Pair {
+                source: Provider::Codex,
+                account_identifier_hash: Some("a".repeat(64)),
+                organization_identifier_hash: Some(String::new()),
+            }),
+            revision: Some(revision),
+            nickname: nickname.map(SecretString::new),
+        }
+    }
+    #[test]
+    fn revisions_and_tombstones_cannot_be_rolled_back() {
+        let mut cache = Cache::default();
+        merge(&mut cache, &[entry(2, Some("חדש")), entry(1, Some("old"))]);
+        assert_eq!(cache.entries[0].revision, Some(2));
+        merge(&mut cache, &[entry(3, None), entry(2, Some("old"))]);
+        assert!(cache.entries[0].nickname.is_none());
+        assert!(!format!("{:?}", entry(4, Some("private text"))).contains("private text"));
+    }
+    #[test]
+    fn nickname_validation_is_unicode_and_private() {
+        assert_eq!(
+            normalize(Some("  העבודה של רון 🚀  ")).unwrap(),
+            Some("העבודה של רון 🚀".into())
+        );
+        for text in [
+            "a@example.invalid",
+            "line\nbreak",
+            "\u{202e}hidden",
+            "\u{2067}hidden",
+        ] {
+            assert!(normalize(Some(text)).is_err());
+        }
+        assert!(normalize(Some(&"a".repeat(41))).is_err());
+        assert_eq!(normalize(Some("  ")).unwrap(), None);
+    }
+}

@@ -30,6 +30,28 @@ pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
     first_program_in(executable_search_dirs_for_program(program), program)
 }
 
+/// Interactive launches honor the user's PATH before native/npm prefixes and
+/// finally Codex desktop bundles. Claude Desktop's private CLI is excluded.
+pub(crate) fn interactive_cli_path(program: &str, home: &Path) -> Option<PathBuf> {
+    if program == "claude" {
+        return claude_default_login_executable_path(home);
+    }
+    let mut dirs = executable_search_dirs_from(
+        env::var_os(COMMAND_SEARCH_PATH_ENV).or_else(|| env::var_os("PATH")),
+        Some(home.as_os_str().to_owned()),
+        true,
+    );
+    if program == "codex" && env::var_os(COMMAND_SEARCH_PATH_ENV).is_none() {
+        dirs.extend(codex_desktop_bundle_dirs(&[
+            PathBuf::from("/Applications"),
+            home.join("Applications"),
+        ]));
+    }
+    dirs.into_iter()
+        .map(|dir| dir.join(program))
+        .find(|path| is_absolute_executable(path))
+}
+
 fn first_program_in(dirs: impl IntoIterator<Item = PathBuf>, program: &str) -> Option<PathBuf> {
     dirs.into_iter().find_map(|dir| {
         let candidate = dir.join(program);

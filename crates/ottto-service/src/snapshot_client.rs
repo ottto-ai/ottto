@@ -1583,6 +1583,9 @@ pub struct AgentStatusSnapshotUploadRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentStatusSnapshotUploadResponse {
+    /// Optional display metadata: absent/malformed must never fail ingest.
+    #[serde(default, deserialize_with = "decode_account_nicknames")]
+    pub account_nicknames: Option<Vec<ottto_protocol::AccountNicknameV1>>,
     pub accepted: u64,
     pub machine_id: String,
     pub sources: Vec<String>,
@@ -1593,6 +1596,18 @@ pub struct AgentStatusSnapshotUploadResponse {
     pub machine_icon_url: Option<String>,
     #[serde(default)]
     pub machine_icon_version: Option<i64>,
+}
+
+fn decode_account_nicknames<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<ottto_protocol::AccountNicknameV1>>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_array().map(|values| {
+        values
+            .iter()
+            .filter_map(|value| serde_json::from_value(value.clone()).ok())
+            .collect()
+    }))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1632,6 +1647,11 @@ fn require_cloud_session_success(
 
 #[derive(Debug, Clone)]
 pub struct SnapshotApiClient {
+    nickname_generations: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<[u8; 32], crate::account_nicknames::Generation>,
+        >,
+    >,
     api_base_url: String,
     #[cfg(test)]
     bounded_retry_loopback_http_for_test: bool,
@@ -1675,6 +1695,7 @@ impl SnapshotApiClient {
         // See `net_resilience` for the 2026-07-15 incident this hardens against.
         let (agent, batch_agent) = crate::net_resilience::shared_agents();
         Self {
+            nickname_generations: Default::default(),
             api_base_url: api_base_url.into(),
             #[cfg(test)]
             bounded_retry_loopback_http_for_test: false,
@@ -1807,6 +1828,12 @@ impl SnapshotApiClient {
         timeout: Duration,
         response_cap: Option<usize>,
     ) -> Result<String> {
+        let nickname_generation =
+            if self.matches_api_base(&crate::snapshot_sync::snapshot_api_base_url()) {
+                crate::account_nicknames::generation_for_device(device)
+            } else {
+                None
+            };
         let mut probe = crate::relay_auth::Probe::begin(
             &self.api_base_url,
             device,
@@ -1853,6 +1880,16 @@ impl SnapshotApiClient {
         }
         .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
         probe.success();
+        if let Some(generation) = nickname_generation {
+            use sha2::Digest;
+            let key: [u8; 32] = sha2::Sha256::digest(response.token.as_bytes()).into();
+            if let Ok(mut generations) = self.nickname_generations.lock() {
+                if generations.len() >= 32 {
+                    generations.clear();
+                }
+                generations.insert(key, generation);
+            }
+        }
         Ok(response.token)
     }
 
@@ -2368,6 +2405,42 @@ impl SnapshotApiClient {
             .map_err(|error| anyhow!("parse snapshot status response failed: {error}"))
     }
 
+    /// One explicit write through the existing relay credential. No redirects,
+    /// no body parsing before 2xx admission, no raw error body or request logs.
+    pub(crate) fn put_account_nickname(
+        &self,
+        relay_token: &str,
+        body: &Value,
+    ) -> std::result::Result<Option<ottto_protocol::AccountNicknameV1>, u16> {
+        let response = credential_timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT)
+            .put(&self.api_url("/api/v1/agent-status/account-nickname"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(body)
+            .map_err(|error| match error {
+                ureq::Error::Status(code, _) => code,
+                _ => 0,
+            })?;
+        if !(200..300).contains(&response.status()) {
+            return Err(response.status());
+        }
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| 0u16)?;
+        if bytes.len() > 65536 {
+            return Err(0);
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| 0u16)?;
+        let value = value
+            .get("account_nickname")
+            .or_else(|| value.get("entry"))
+            .unwrap_or(&value);
+        Ok(serde_json::from_value(value.clone()).ok())
+    }
+
     pub fn upload_agent_status(
         &self,
         relay_token: &str,
@@ -2380,9 +2453,23 @@ impl SnapshotApiClient {
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
         {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse agent status response failed: {error}")),
+            Ok(response) => {
+                let response: AgentStatusSnapshotUploadResponse = response
+                    .into_json()
+                    .map_err(|error| anyhow!("parse agent status response failed: {error}"))?;
+                use sha2::Digest;
+                let key: [u8; 32] = sha2::Sha256::digest(relay_token.as_bytes()).into();
+                let generation = self
+                    .nickname_generations
+                    .lock()
+                    .ok()
+                    .and_then(|generations| generations.get(&key).cloned());
+                crate::account_nicknames::apply_upload(
+                    generation.as_ref(),
+                    response.account_nicknames.as_deref(),
+                );
+                Ok(response)
+            }
             Err(ureq::Error::Status(code, response)) => {
                 Err(anyhow::Error::new(UploadFailureDiagnostics::http(
                     "agent status upload",

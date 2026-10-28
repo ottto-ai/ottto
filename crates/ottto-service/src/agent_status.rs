@@ -3653,7 +3653,7 @@ fn claude_signed_in_account_without_identity(
 /// A non-OAuth way the default Claude Code login authenticates. Claude Code
 /// gives these precedence over the stored OAuth login.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaudeAlternativeAuth {
+pub(crate) enum ClaudeAlternativeAuth {
     Bedrock,
     Vertex,
     ApiKey,
@@ -3720,6 +3720,24 @@ fn claude_alternative_auth(
                 .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         })
         .collect::<Vec<_>>();
+    claude_alternative_auth_layers(
+        &layers,
+        ambient,
+        oauth_usable,
+        approved_api_key_suffixes,
+        stored_console_key,
+    )
+}
+
+/// The same precedence evaluator for a caller that has already read and
+/// validated all layers (highest precedence first).
+pub(crate) fn claude_alternative_auth_layers(
+    layers: &[Value],
+    ambient: &dyn Fn(&str) -> Option<String>,
+    oauth_usable: bool,
+    approved_api_key_suffixes: &[String],
+    stored_console_key: bool,
+) -> Option<ClaudeAlternativeAuth> {
     let present = |value: &Value| match value {
         Value::String(text) => !text.trim().is_empty(),
         Value::Null => false,
@@ -17431,6 +17449,34 @@ fn require_claude_auth_identity_agreement(
         return Err(ClaudeSlotProbeFailure::IdentityMismatch);
     }
     Ok(())
+}
+
+/// Local claims only: compare with the accepted slot binding, never adopt.
+pub(crate) fn session_launch_claude_identity(
+    slot: &ClaudeConfigDirSlot,
+    home: &Path,
+) -> Option<(String, String)> {
+    let identity = read_claude_cli_oauth_account(&slot.identity_path(home))?;
+    Some((
+        billing_identity_hash("anthropic", "account", identity.account_uuid.as_deref()?)?,
+        identity
+            .organization_uuid
+            .as_deref()
+            .and_then(|org| billing_identity_hash("anthropic", "organization", org))
+            .unwrap_or_default(),
+    ))
+}
+
+pub(crate) fn session_launch_codex_identity(
+    home: &Path,
+    trust: CodexHomeTrust,
+) -> Option<(String, String)> {
+    let credential = read_codex_auth_credentials_at(home, trust).ok()??;
+    let (account, workspace) = codex_credential_claimed_ids(&credential)?;
+    Some((
+        billing_identity_hash("openai", "account", &account)?,
+        billing_identity_hash("openai", "workspace", &workspace)?,
+    ))
 }
 
 fn read_claude_cli_oauth_account(path: &Path) -> Option<ClaudeCliOauthAccount> {
