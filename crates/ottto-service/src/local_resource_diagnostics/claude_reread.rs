@@ -61,6 +61,8 @@ impl Rearm {
 pub(crate) struct Counts {
     #[serde(flatten)]
     pub(crate) absence: super::claude_absence::Counts,
+    #[serde(flatten)]
+    pub(crate) contract: super::claude_contract::Counts,
     #[serde(skip_serializing_if = "Rearm::is_empty")]
     pub(crate) claude_reread: Rearm,
     #[serde(skip_serializing_if = "CachePage::is_empty")]
@@ -114,6 +116,7 @@ pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
 }
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
+        self.contract.merge(other.contract);
         self.claude_reread.merge(other.claude_reread);
         self.absence.0 =
             std::array::from_fn(|i| self.absence.0[i].saturating_add(other.absence.0[i]));

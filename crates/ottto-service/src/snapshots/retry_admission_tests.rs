@@ -888,6 +888,7 @@ fn stale_carry_batch_diagnostics_discard_failed_larger_attempts() {
         None,
         CARRY_RETRY,
         &mut diagnostics,
+        claude_contract_debt_scope(&fixture.index),
     );
     assert_eq!(carry.roots.len(), 1);
     assert_eq!(covered.len(), 1);

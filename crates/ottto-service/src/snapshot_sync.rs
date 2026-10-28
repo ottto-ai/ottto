@@ -11,6 +11,7 @@ use crate::codex_scan_diagnostics::{self, CodexScanDiagnostics, MAX_LOCAL_DIAGNO
 use crate::detected_uses::{
     aggregate_detected_uses, merge_detected_uses, DETECTED_USE_RETENTION_DAYS,
 };
+use crate::local_resource_diagnostics::claude_contract;
 use crate::session_attribution::SessionAttributionContext;
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
@@ -5832,13 +5833,31 @@ fn prepare_sync_source_inner(
         diagnostic.emit();
     }
     let scan_started_at = current_rfc3339();
-    let relay_token = client.issue_relay_token(device, device_secret, source)?;
-    let mut activity_hint = client.get_activity_hint(&relay_token)?;
+    let count_failure = |error, fetch| {
+        if source == SnapshotSource::ClaudeCode {
+            claude_contract::note(|counts| {
+                let permit = &mut counts.request_identity_permit;
+                if fetch {
+                    permit.fetch_failed += 1;
+                } else {
+                    permit.hint_failed += 1;
+                }
+            });
+        }
+        error
+    };
+    let relay_token = client
+        .issue_relay_token(device, device_secret, source)
+        .map_err(|error| count_failure(error, true))?;
+    let mut activity_hint = client
+        .get_activity_hint(&relay_token)
+        .map_err(|error| count_failure(error, false))?;
     // Treat the activity hint as the only authority for the semantic evidence
     // window. Missing/malformed hints already fail JSON decoding; future
     // out-of-contract widths fail here before any scan or receipt can
     // manufacture a fallback policy. Zero is an explicit tombstone control.
-    let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)?;
+    let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)
+        .map_err(|error| count_failure(error, false))?;
     let context_curve_enabled = source != SnapshotSource::Pi
         && activity_hint.session_context_curve_contract.as_deref()
             == Some(CONTEXT_CURVE_CONTRACT_VERSION);
@@ -5849,6 +5868,12 @@ fn prepare_sync_source_inner(
     // only an emitting cycle uses, so they follow this cycle's permit, not the
     // compiled switch alone. Finish recomputes the permit from the same hint.
     let request_identity_capture = cycle_request_identity_permit(source, &activity_hint).is_some();
+    if source == SnapshotSource::ClaudeCode {
+        claude_contract::note(|counts| {
+            counts.request_identity_permit.permitted += u64::from(request_identity_capture);
+            counts.request_identity_permit.denied += u64::from(!request_identity_capture);
+        });
+    }
     // The server's scan directive was parsed and discarded before this. It is a
     // cost lever, so it may only lengthen the local cadence (see
     // `negotiated_wait`), never shorten it.
@@ -6068,6 +6093,13 @@ fn prepare_sync_source_inner(
     {
         upload_progress.save(&upload_progress_path)?;
     }
+    if source == SnapshotSource::ClaudeCode {
+        claude_contract::prepare_context(
+            &serde_json::to_vec(&upload_policy).expect("upload policy is serializable"),
+            checkpoint_namespace.as_deref(),
+            cache_observations_enabled,
+        );
+    }
     index.activate_upload_context(cycle_upload_context(
         upload_policy,
         checkpoint_namespace.as_deref(),
@@ -6280,6 +6312,9 @@ fn prepare_sync_source_inner(
     .with_reread_persistence()
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_codex_side_pass(codex_side_pass);
+    if source == SnapshotSource::ClaudeCode {
+        scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
+    }
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
     }

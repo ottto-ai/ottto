@@ -897,3 +897,134 @@ fn preparation_error_preserves_normalization_counts_with_and_without_a_lease() {
         assert!(!crate::local_resource_diagnostics::claude_reread::active());
     }
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+fn identity_permit_counts_each_success_and_denial_once_through_real_prepare() {
+    for leased in [false, true] {
+        let _enabled = leased.then(crate::snapshots::claude_native_comparison::enable_for_test);
+        let fixture = IdentityPipelineHome::new();
+        for (name, extra, outcome) in [
+            (
+                "count-permitted",
+                r#","session_request_identity_contract":"own_request_identity_rows:v1""#,
+                "permitted",
+            ),
+            (
+                "count-null",
+                r#","session_request_identity_contract":null"#,
+                "denied",
+            ),
+            (
+                "count-unknown",
+                r#","session_request_identity_contract":"unknown""#,
+                "denied",
+            ),
+        ] {
+            let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+                identity_pipeline_cycle(&fixture, name, extra)
+            });
+            result.unwrap();
+            let counts = rows
+                .iter()
+                .filter_map(|row| row["counts"]["request_identity_permit"][outcome].as_u64())
+                .collect::<Vec<_>>();
+            assert_eq!(counts, [1], "leased={leased}/{name}: {rows:?}");
+        }
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+fn identity_permit_transport_errors_reach_existing_carrier_without_contract_observation() {
+    for leased in [false, true] {
+        let _enabled = leased.then(crate::snapshots::claude_native_comparison::enable_for_test);
+        for failure in ["fetch", "hint", "invalid_hint"] {
+            let fetch = failure == "fetch";
+            let invalid_hint = failure == "invalid_hint";
+            let fixture = IdentityPipelineHome::new();
+            let _cadence = IdentityPipelineCadence::new();
+            let support = fixture.base.join("failure-support");
+            std::fs::create_dir_all(&support).unwrap();
+            let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let client =
+                SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+            let server = std::thread::spawn(move || {
+                for step in 0..if fetch { 1 } else { 2 } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    read_complete_http_request(&mut stream);
+                    let token = !fetch && step == 0;
+                    let body = if token {
+                        r#"{"token":"synthetic-token","expires_at":"2026-08-02T10:00:00Z"}"#
+                    } else if invalid_hint {
+                        r#"{"source":"claude_code","server_time":"2026-08-02T10:00:00Z","last_data_at":null,"record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":18446744073709551615,"recommended_scan_after":"2026-08-02T10:05:00Z"}"#
+                    } else {
+                        r#"{"error":"synthetic"}"#
+                    };
+                    let status = if token || invalid_hint {
+                        "200 OK"
+                    } else {
+                        "500 Internal Server Error"
+                    };
+                    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            let device = report_kind_test_device();
+            let namespace = snapshot_upload_destination_namespace(&device, "device-secret");
+            let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+                &snapshot_index_path(&support, SnapshotSource::ClaudeCode),
+                &namespace,
+            ));
+            let mut saved = serde_json::to_value(ScanIndex::default()).unwrap();
+            saved["claude_request_identity_contract"] =
+                serde_json::json!(crate::snapshots::claude_request_identity::COLLECTOR);
+            saved["claude_request_identity_contract_changed"] = serde_json::json!(true);
+            std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+            let bytes = serde_json::to_vec(&saved).unwrap();
+            std::fs::write(&index_path, &bytes).unwrap();
+            let daemon = test_daemon("otm_test");
+            let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+            let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+                prepare_sync_source(
+                    &client,
+                    &device,
+                    "device-secret",
+                    SnapshotSource::ClaudeCode,
+                    "otm_test",
+                    &fixture.home,
+                    &support,
+                    &daemon,
+                    &mut transport,
+                    [7; 32],
+                    false,
+                )
+            });
+            assert!(result.is_err());
+            server.join().unwrap();
+            assert_eq!(
+                std::fs::read(&index_path).unwrap(),
+                bytes,
+                "error preserves last contract and latch"
+            );
+            let field = if fetch { "fetch_failed" } else { "hint_failed" };
+            let events = rows
+                .iter()
+                .filter(|row| {
+                    row["counts"]["request_identity_permit"][field]
+                        .as_u64()
+                        .is_some()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 1, "leased={leased}/{field}: {rows:?}");
+            assert_eq!(events[0]["stage"], "native_comparison_decision");
+            assert_eq!(events[0]["counts"]["request_identity_permit"][field], 1);
+            assert!(events[0]["counts"]
+                .get("identity_contract_transition")
+                .is_none());
+            assert!(!crate::local_resource_diagnostics::claude_reread::active());
+        }
+    }
+}

@@ -4,6 +4,8 @@ use crate::codex_scan_diagnostics::{
     UnreadableCauses, LINEAGE_SAMPLES,
 };
 use crate::local_resource_diagnostics::claude_absence::Parent;
+use crate::local_resource_diagnostics::claude_contract;
+use crate::local_resource_diagnostics::{line_delivery_unselected, UnselectedReason};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
@@ -114,6 +116,9 @@ pub(crate) use local_context_points::LocalContextPoint;
 use local_context_points::{local_context_points_recent, LocalContextPoints};
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
+pub(crate) mod line_delivery;
+#[cfg(test)]
+mod line_delivery_tests;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod sampled_audit;
@@ -5506,12 +5511,52 @@ fn claude_stale_member_independently_accepted(
             )
 }
 
+// Only contract debt may be deferred. The scope is captured before start resets
+// settlement; None means unknown or sweep-wide debt. Existing member checks
+// still own ACK, list, account, quarantine and negative identity evidence.
+fn claude_accepted_retry_start_admitted(
+    index: &ScanIndex,
+    scope: Option<&BTreeSet<String>>,
+) -> bool {
+    (!index.claude_request_identity_contract_changed || scope.is_some())
+        && index.claude_request_identity_contract.is_some()
+        && claude_accepted_ledger_is_current(index)
+        && index.upload_context_fingerprint == index.active_upload_context_fingerprint
+}
+
+fn claude_contract_debt_scope(index: &ScanIndex) -> Option<&BTreeSet<String>> {
+    static EMPTY: BTreeSet<String> = BTreeSet::new();
+    if !index.bounded_sweep_had_unsettled_upload {
+        Some(&EMPTY)
+    } else if index.unsettled_cause_bits() == UnsettledUploadCause::CompletedBlockingHolds.bit() {
+        index
+            .claude_full_rearm_progress
+            .held_family_roots
+            .as_ref()
+            .filter(|roots| held_family_scope_has_writer_shape(roots))
+    } else {
+        None
+    }
+}
+
 fn claude_stale_member_accepted_retry_evidence(
     index: &ScanIndex,
     key: &str,
     entry: &ScanIndexEntry,
     pending: &ClaudeUsageFamilyPending,
+    debt_scope: Option<&BTreeSet<String>>,
 ) -> bool {
+    if index.claude_request_identity_contract_changed
+        && (pending.invalid
+            || !debt_scope.is_some_and(|roots| {
+                claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+                    roots.is_empty() || !roots.contains(&claude_full_rearm_root_digest(member.root))
+                })
+            })
+            || index.effective_upload_body_witness_revision_requires_adoption(key))
+    {
+        return false;
+    }
     let idless = pending.invalid
         && pending.idless_revision == Some(claude_idless_revision(&entry.source_file_fingerprint));
     claude_stale_member_independently_accepted(index, key, entry)
@@ -5552,15 +5597,21 @@ fn claude_stream_accepted_retry_carry(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
 ) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
-    claude_stream_accepted_retry_carry_observed(index, stale, &mut Default::default())
+    claude_stream_accepted_retry_carry_observed(
+        index,
+        stale,
+        &mut Default::default(),
+        claude_contract_debt_scope(index),
+    )
 }
 
 fn claude_stream_accepted_retry_carry_observed(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
     diagnostics: &mut StaleCarryRejectionCounts,
+    debt_scope: Option<&BTreeSet<String>>,
 ) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
-    let result = claude_stream_accepted_retry_carry_inner(index, stale, diagnostics);
+    let result = claude_stream_accepted_retry_carry_inner(index, stale, diagnostics, debt_scope);
     if let Err(refusal) = result.as_ref() {
         // Early capacity refusals precede member qualification. A late replay
         // reserve refusal rejects only the roots that passed that qualification.
@@ -5576,6 +5627,7 @@ fn claude_stream_accepted_retry_carry_inner(
     index: &ScanIndex,
     stale: &BTreeSet<String>,
     diagnostics: &mut StaleCarryRejectionCounts,
+    debt_scope: Option<&BTreeSet<String>>,
 ) -> Result<ClaudeStaleFamilyCarry, ClaudeRetryAdmissionRefusal> {
     use crate::heap_layout_bound::{tree_nodes, Counter};
     if !crate::heap_layout_bound::layout_supported() {
@@ -5676,7 +5728,13 @@ fn claude_stream_accepted_retry_carry_inner(
                     })
                 })
             || !family.iter().all(|(_, key)| {
-                claude_stale_member_accepted_retry_evidence(index, key, &index.files[*key], pending)
+                claude_stale_member_accepted_retry_evidence(
+                    index,
+                    key,
+                    &index.files[*key],
+                    pending,
+                    debt_scope,
+                )
             })
         {
             continue;
@@ -5687,7 +5745,11 @@ fn claude_stream_accepted_retry_carry_inner(
             .ok_or(ClaudeRetryAdmissionRefusal::Structure)?;
     }
     diagnostics.reject(
-        StaleCarryRejection::MemberEvidence,
+        if index.claude_request_identity_contract_changed {
+            StaleCarryRejection::Contract
+        } else {
+            StaleCarryRejection::MemberEvidence
+        },
         stale.len().saturating_sub(carried.len()),
     );
     diagnostics.eligible_before_funding = carried.len() as u64;
@@ -5722,6 +5784,7 @@ fn claude_fence_closed_retry_carry(
         prior_unsettled_upload,
         scoped_retry_allowed,
         &mut Default::default(),
+        claude_contract_debt_scope(index),
     )
 }
 
@@ -5732,6 +5795,7 @@ fn claude_fence_closed_retry_carry_observed(
     prior_unsettled_upload: bool,
     scoped_retry_allowed: bool,
     diagnostics: &mut StaleCarryRejectionCounts,
+    debt_scope: Option<&BTreeSet<String>>,
 ) -> ClaudeStaleFamilyCarry {
     #[cfg(test)]
     if KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get) {
@@ -5741,11 +5805,8 @@ fn claude_fence_closed_retry_carry_observed(
     let needs_independent_acceptance =
         prior_unsettled_upload || claude_stale_rearm_can_reopen_fence(index, stale);
     let legacy_admitted = !needs_independent_acceptance && claude_stale_carry_start_admitted(index);
-    let accepted_admitted = scoped_retry_allowed
-        && !index.claude_request_identity_contract_changed
-        && index.claude_request_identity_contract.is_some()
-        && claude_accepted_ledger_is_current(index)
-        && index.upload_context_fingerprint == index.active_upload_context_fingerprint;
+    let accepted_admitted =
+        scoped_retry_allowed && claude_accepted_retry_start_admitted(index, debt_scope);
     if !same_context_retry || stale.is_empty() || (!legacy_admitted && !accepted_admitted) {
         diagnostics.reject(
             StaleCarryRejectionCounts::start_gate(index, same_context_retry),
@@ -5810,7 +5871,9 @@ fn claude_fence_closed_retry_carry_observed(
                 .claude_usage_family_pending
                 .get(root_session_id)
                 .is_some_and(|pending| {
-                    claude_stale_member_accepted_retry_evidence(index, index_key, entry, pending)
+                    claude_stale_member_accepted_retry_evidence(
+                        index, index_key, entry, pending, debt_scope,
+                    )
                 });
     }
     let mut legacy_witnesses = Vec::with_capacity(legacy_witness_count);
@@ -5927,7 +5990,11 @@ fn claude_fence_closed_retry_carry_observed(
             || !shared_owners.contains(root_session_id)
     });
     diagnostics.reject(
-        StaleCarryRejection::MemberEvidence,
+        if index.claude_request_identity_contract_changed {
+            StaleCarryRejection::Contract
+        } else {
+            StaleCarryRejection::MemberEvidence
+        },
         stale.len().saturating_sub(carried.len()),
     );
     diagnostics.eligible_before_funding = carried.len() as u64;
@@ -9806,6 +9873,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             && identity_contract_recorded
             && sweep_fully_settled
         {
+            claude_contract::note(|counts| {
+                counts.identity_contract_latch.cleared +=
+                    u64::from(index.claude_request_identity_contract_changed)
+            });
             index.claude_request_identity_contract_changed = false;
         }
         let mut unchanged_proof_roots = if unchanged_proof_gate && !proven.is_empty() {
@@ -25278,6 +25349,8 @@ pub(crate) struct OwnedSourceScan {
     /// Stage 1 hunk A: the ticket this page's pause minted, carried across
     /// `step` calls into the result.
     continuation_ticket: Option<sampled_scan::codex_cursor::CodexCursorTicket>,
+    /// LD: this pass's line observer, if one is registered.
+    line_delivery: Option<line_delivery::LineDelivery>,
 }
 struct OwnedActiveFile {
     comparison_target: bool,
@@ -25867,7 +25940,11 @@ impl OwnedSourceScan {
         if source == SnapshotSource::ClaudeCode {
             index.observe_claude_request_identity_contract(claude_request_identity_capture);
         }
-        ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+        let progress =
+            ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+        if source == SnapshotSource::ClaudeCode && progress == TraversalProgress::Started {
+            index.record_started_claude_request_identity_contract(claude_request_identity_capture);
+        }
         let next_generation_hints;
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
@@ -26482,6 +26559,7 @@ impl OwnedSourceScan {
             codex_selected_flags,
             codex_side_pass: None,
             continuation_ticket: None,
+            line_delivery: None,
         }
     }
     /// U1a-2a: the pass's C14 namespace and gate (`None` for other sources).
@@ -26610,7 +26688,7 @@ impl OwnedSourceScan {
         }
         let Self {
             mut native_comparison,
-            resource_probe,
+            mut resource_probe,
             mut sampling,
             durable_guard,
             index: mut index_storage,
@@ -26660,6 +26738,7 @@ impl OwnedSourceScan {
             codex_selected_flags,
             codex_side_pass,
             mut continuation_ticket,
+            mut line_delivery,
         } = self;
         // Held while this scan object runs the shared cursor job.
         let (mut active_file, mut codex_cursor_lease) = active_frame.into_parts();
@@ -27601,6 +27680,9 @@ impl OwnedSourceScan {
                     index.note_reread_refusal(None);
                     pending!();
                 }
+                if let Some(delivery) = line_delivery.as_mut() {
+                    delivery.begin_armed(&active);
+                }
                 let mut group_end = None;
                 let stepped = if active.group.is_some() {
                     // A group job: one record of the current member, or one
@@ -27640,6 +27722,8 @@ impl OwnedSourceScan {
                             Ok(false)
                         }
                     }
+                } else if let Some(delivery) = line_delivery.as_mut() {
+                    delivery.step(&mut active.parser)
                 } else {
                     active.parser.step()
                 };
@@ -27957,6 +28041,10 @@ impl OwnedSourceScan {
                         sampled_scan::codex_cursor::dequeue(index, &active.candidate);
                         census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
+                    }
+                    // LD: the replay is a fresh Full delivery from 0.
+                    if let Some(delivery) = line_delivery.as_mut() {
+                        delivery.arm();
                     }
                     active_file = Some(active);
                     pending!();
@@ -30654,6 +30742,12 @@ impl OwnedSourceScan {
                         source.api_slug(),
                     );
                 }
+                if let Some(delivery) = line_delivery.as_mut() {
+                    if active_file.is_none() {
+                        delivery.left_active();
+                    }
+                    resource_probe.line_delivery = Some(delivery.take_page());
+                }
                 resource_probe.collection_with_account_pending(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {
@@ -32096,8 +32190,14 @@ impl OwnedSourceScan {
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
             }
+            if let Some(delivery) = line_delivery.as_mut() {
+                delivery.arm();
+            }
             active_file = Some(active);
             pending!();
+        }
+        if let (None, Some(delivery)) = (&active_file, line_delivery.as_mut()) {
+            delivery.left_active();
         }
         Ok(OwnedSourceScanStep::Pending(Self {
             native_comparison,
@@ -32154,6 +32254,7 @@ impl OwnedSourceScan {
             codex_selected_flags,
             codex_side_pass,
             continuation_ticket,
+            line_delivery,
         }))
     }
 }
@@ -33001,16 +33102,26 @@ impl OwnedJsonlParser {
         })
     }
     fn step(&mut self) -> Result<bool> {
+        self.step_delivering(None)
+    }
+    fn step_delivering(&mut self, on_line: Option<line_delivery::LineTap<'_>>) -> Result<bool> {
         #[cfg(test)]
         if let Some(path) = self.source_read_probe.take() {
             terminal_contract_retry::record_source_acquisition(&path);
         }
-        self.step_with_observer(|_| {})
+        self.step_observed(|_| {}, on_line)
     }
     fn step_with_observer(&mut self, observe: impl FnMut(&Value)) -> Result<bool> {
+        self.step_observed(observe, None)
+    }
+    fn step_observed(
+        &mut self,
+        observe: impl FnMut(&Value),
+        on_line: Option<line_delivery::LineTap<'_>>,
+    ) -> Result<bool> {
         self.assert_reread_ticket();
         anyhow::ensure!(self.reread_read_allowed(), "reread ticket expired");
-        let step = self.with_line_sink(observe, |reader, sink| reader.step(sink))?;
+        let step = self.with_line_sink(observe, |reader, sink| reader.step_lines(sink, on_line))?;
         Ok(matches!(step, JsonlReaderStep::Complete(_)))
     }
 
@@ -33990,6 +34101,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             early,
             self.max_line_bytes,
             self.salvage_codex_envelope,
+            None,
             &mut on_value,
         );
         self.buf.clear();
@@ -33997,6 +34109,14 @@ impl<R: BufRead> BoundedJsonlReader<R> {
     }
 
     fn step(&mut self, on_value: impl FnMut(&Value)) -> std::io::Result<JsonlReaderStep> {
+        self.step_lines(on_value, None)
+    }
+
+    fn step_lines(
+        &mut self,
+        on_value: impl FnMut(&Value),
+        on_line: Option<line_delivery::LineTap<'_>>,
+    ) -> std::io::Result<JsonlReaderStep> {
         if let Some(kind) = self.failure {
             return Err(std::io::Error::new(
                 kind,
@@ -34015,7 +34135,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         if self.skipping.is_none() {
             self.buf.clear();
         }
-        let result = self.read_step(on_value);
+        let result = self.read_step(on_value, on_line);
         // Values have been consumed synchronously and dropped. Retain only the
         // existing buffer capacity; no logical raw row survives this return.
         // A paused overlong skip keeps no bytes (E4); a withheld final
@@ -34031,7 +34151,13 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         result
     }
 
-    fn read_step(&mut self, mut on_value: impl FnMut(&Value)) -> std::io::Result<JsonlReaderStep> {
+    fn read_step(
+        &mut self,
+        mut on_value: impl FnMut(&Value),
+        on_line: Option<line_delivery::LineTap<'_>>,
+    ) -> std::io::Result<JsonlReaderStep> {
+        // Where this line started, even when its overlong skip paused.
+        let line_start = self.last_line_end;
         let reader = &mut self.reader;
         let buf = &mut self.buf;
         let report = &mut self.report;
@@ -34163,6 +34289,10 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                 early,
                 max_line_bytes,
                 salvage_codex_envelope,
+                // An unterminated trailing line reaches money only, never LD.
+                on_line
+                    .filter(|_| line_complete)
+                    .map(|tap| (self.consumed - line_start, tap)),
                 &mut on_value,
             )
         });
@@ -34172,7 +34302,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
 }
 
 /// Count and apply one physical line held in `buf` (newline-terminated, or a
-/// trailing line at EOF). Shared by every read path.
+/// trailing line at EOF). Shared by every read path; `deliver` is LD's tap.
+#[allow(clippy::too_many_arguments)]
 fn apply_physical_line(
     buf: &mut Vec<u8>,
     report: &mut JsonlReadReport,
@@ -34180,11 +34311,16 @@ fn apply_physical_line(
     early: Option<EarlySalvage>,
     max_line_bytes: usize,
     salvage_codex_envelope: bool,
+    deliver: Option<(u64, line_delivery::LineTap<'_>)>,
     on_value: &mut impl FnMut(&Value),
 ) {
     report.physical_line_count += 1;
     if overflowed {
         report.over_line_cap_count += 1;
+        if let Some((length, tap)) = deliver {
+            // Never a salvaged envelope.
+            tap(length, &line_delivery::PhysicalLine { value: None });
+        }
         // Codex created-thread ownership requires a gap-free ordinal and
         // timestamp stream. Image-bearing response/compaction rows carry
         // that structural envelope before their huge payload. Preserve
@@ -34210,16 +34346,29 @@ fn apply_physical_line(
     if bytes.last() == Some(&b'\r') {
         bytes = &bytes[..bytes.len() - 1];
     }
-    match std::str::from_utf8(bytes) {
-        Ok(line) if line.trim().is_empty() => {}
+    let value = match std::str::from_utf8(bytes) {
+        Ok(line) if line.trim().is_empty() => None,
         Ok(line) => match serde_json::from_str::<Value>(line) {
             Ok(value) => {
                 report.parsed_json_line_count += 1;
-                on_value(&value);
+                Some(value)
             }
-            Err(_) => report.malformed_json_line_count += 1,
+            Err(_) => {
+                report.malformed_json_line_count += 1;
+                None
+            }
         },
-        Err(_) => report.invalid_utf8_line_count += 1,
+        Err(_) => {
+            report.invalid_utf8_line_count += 1;
+            None
+        }
+    };
+    if let Some((length, tap)) = deliver {
+        let value = value.as_ref();
+        tap(length, &line_delivery::PhysicalLine { value });
+    }
+    if let Some(value) = value {
+        on_value(&value);
     }
 }
 
@@ -40027,15 +40176,33 @@ fn unhealthy_scan_retry_delay_seconds(attempt: u8) -> u64 {
         .min(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TraversalProgress {
+    Started,
+    Resumed,
+}
+
 fn ensure_bounded_traversal(
     source: SnapshotSource,
     roots: &[PathBuf],
     index: &mut ScanIndex,
     collected_at: &str,
     backfill_window_days: u64,
-) {
+) -> TraversalProgress {
     let context_fingerprint =
         scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
+    let context_observation = (source == SnapshotSource::ClaudeCode).then(|| {
+        claude_contract::compare_context(claude_contract::TraversalContext {
+            retained: index
+                .traversal
+                .as_ref()
+                .map(|t| t.context_fingerprint.as_str()),
+            backfill: backfill_window_days,
+            active: index.active_upload_context_fingerprint.as_deref(),
+            replay: index.historical_replay_generation.as_deref(),
+            roots,
+        })
+    });
     let plan_clock = index
         .traversal
         .as_ref()
@@ -40259,9 +40426,15 @@ fn ensure_bounded_traversal(
             plan_revision_changed,
         ) {
             index.traversal = None;
-            ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+            return ensure_bounded_traversal(
+                source,
+                roots,
+                index,
+                collected_at,
+                backfill_window_days,
+            );
         }
-        return;
+        return TraversalProgress::Resumed;
     };
 
     plan_held |= index.reread_plan(source, collected_at, &context_fingerprint);
@@ -40284,7 +40457,16 @@ fn ensure_bounded_traversal(
     // new partial settlement stamps the marker again before persistence.
     let prior_unsettled_upload = index.bounded_sweep_had_unsettled_upload;
     let prior_unsettled_causes = index.bounded_sweep_unsettled_causes;
+    let debt_scope_known = claude_contract_debt_scope(index).is_some();
     let prior_held_family_roots = index.claude_full_rearm_progress.held_family_roots.take();
+    let empty_debt_scope = BTreeSet::new();
+    let debt_scope = if !prior_unsettled_upload {
+        Some(&empty_debt_scope)
+    } else if debt_scope_known {
+        prior_held_family_roots.as_ref()
+    } else {
+        None
+    };
     index.bounded_sweep_had_unsettled_upload = plan_held && prior_unsettled_upload;
     index.bounded_sweep_unsettled_causes = 0;
     // A carry belongs to the traversal that started it; this start replaces it.
@@ -40358,10 +40540,7 @@ fn ensure_bounded_traversal(
             && scoped_retry_allowed
             && full_rearm_window_roots.is_empty()
             && index.claude_full_rearm_progress.full_rearm_window.is_none()
-            && !index.claude_request_identity_contract_changed
-            && index.claude_request_identity_contract.is_some()
-            && claude_accepted_ledger_is_current(index)
-            && index.upload_context_fingerprint == index.active_upload_context_fingerprint
+            && claude_accepted_retry_start_admitted(index, debt_scope)
             && (prior_admission.is_some()
                 || !claude_stale_family_carry_scratch_admitted(
                     index,
@@ -40397,6 +40576,7 @@ fn ensure_bounded_traversal(
                     index,
                     &stale_pending_roots,
                     &mut stale_carry_rejection_counts,
+                    debt_scope,
                 )
             };
             match whole {
@@ -40413,6 +40593,7 @@ fn ensure_bounded_traversal(
                             prior_admission.as_ref(),
                             collected_at,
                             &mut stale_carry_rejection_counts,
+                            debt_scope,
                         );
                         // Discard failed speculative whole/batch attempts. Roots
                         // outside the selected batch retain its first whole-set
@@ -40433,7 +40614,7 @@ fn ensure_bounded_traversal(
                         index.claude_full_rearm_progress.held_family_roots =
                             prior_held_family_roots;
                         eprintln!("local snapshot census deferred a stale Claude retry: {} pending families exceed bounded carry/cancellation scratch; no fingerprints cleared", stale_pending_roots.len());
-                        return;
+                        return TraversalProgress::Resumed;
                     }
                 }
             }
@@ -40451,6 +40632,7 @@ fn ensure_bounded_traversal(
                 prior_unsettled_upload,
                 scoped_retry_allowed,
                 &mut stale_carry_rejection_counts,
+                debt_scope,
             )
         } else if retry_can_reopen {
             stale_carry_rejection_counts.reject(
@@ -40472,6 +40654,7 @@ fn ensure_bounded_traversal(
                 false,
                 false,
                 &mut stale_carry_rejection_counts,
+                debt_scope,
             )
         };
         let ClaudeStaleFamilyCarry {
@@ -40546,6 +40729,13 @@ fn ensure_bounded_traversal(
         );
         // Freeze counts before the stale-start clear. No counter is an input
         // to carry, capping, tripwire admission, proof or fingerprint mutation.
+        if index.claude_request_identity_contract_changed {
+            claude_contract::note(|counts| {
+                counts.deferred_by_contract_debt = counts
+                    .deferred_by_contract_debt
+                    .saturating_add(carried_roots.len() as u64);
+            });
+        }
         stale_carry_rejection_counts.final_carried = carried_roots.len() as u64;
         stale_carry_rejection_counts.record_before_clear(stale_pending_roots.len());
         let mut rearmed_file_count = 0_usize;
@@ -40772,6 +40962,9 @@ fn ensure_bounded_traversal(
         ownership_incomplete_file_count: census.ownership_incomplete_file_count,
         ..ScanTraversalCounts::default()
     };
+    if let Some(parts) = context_observation {
+        claude_contract::started_context(&context_fingerprint, parts, roots);
+    }
     index.traversal = Some(ScanTraversalCheckpoint {
         context_fingerprint,
         census_window_end: collected_at.to_string(),
@@ -40804,6 +40997,7 @@ fn ensure_bounded_traversal(
     {
         claude_retry_queue_due_families(index, collected_at);
     }
+    TraversalProgress::Started
 }
 
 /// Keep fitting pages together. Dedicated scheduling is only useful when
@@ -41054,6 +41248,7 @@ fn refresh_retained_codex_roster(
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
             {
+                line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
             traversal.counts.discovered_file_count += 1;
@@ -41066,6 +41261,7 @@ fn refresh_retained_codex_roster(
                     &path,
                     &mut traversal.oversized_discovery,
                 );
+                line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
                 continue;
             }
             if let Some(existing) = traversal
@@ -41387,6 +41583,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
             {
+                line_delivery_unselected(source.api_slug(), UnselectedReason::Age);
                 continue;
             }
             traversal.counts.discovered_file_count += 1;
@@ -41399,6 +41596,7 @@ fn advance_bounded_directory_traversal_with_budget(
                     &path,
                     &mut traversal.oversized_discovery,
                 );
+                line_delivery_unselected(source.api_slug(), UnselectedReason::Size);
                 continue;
             }
             if let Some(existing) = traversal
@@ -43852,6 +44050,20 @@ impl ScanIndex {
         if self.claude_request_identity_contract.as_deref() == Some(contract) {
             return;
         }
+        use claude_request_identity::{COLLECTOR, E2_GROUPING};
+        claude_contract::note(|counts| {
+            counts.identity_contract_latch.set +=
+                u64::from(!self.claude_request_identity_contract_changed);
+            let prior = self.claude_request_identity_contract.as_deref();
+            let transitions = &mut counts.identity_contract_transition;
+            transitions.from_empty += u64::from(prior == Some("") && !contract.is_empty());
+            transitions.to_empty +=
+                u64::from(matches!(prior, Some(COLLECTOR | E2_GROUPING)) && contract.is_empty());
+            transitions.collector_e2_grouping += u64::from(matches!(
+                (prior, contract),
+                (Some(COLLECTOR), E2_GROUPING) | (Some(E2_GROUPING), COLLECTOR)
+            ));
+        });
         self.claude_request_identity_contract_changed = true;
         let e2_adoption = claude_request_money::e2::enabled()
             && contract == claude_request_identity::E2_GROUPING
@@ -43884,7 +44096,36 @@ impl ScanIndex {
         } else {
             CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL
         };
+        if self.traversal.is_some()
+            && self.claude_request_identity_contract.as_deref() != Some(recorded)
+        {
+            claude_contract::note(|counts| {
+                counts
+                    .identity_contract_transition
+                    .mid_traversal_placeholder += 1
+            });
+        }
         self.claude_request_identity_contract = Some(recorded.to_owned());
+    }
+
+    // A genuine replacement starts under the already-observed contract. Do not
+    // observe/adopt twice: re-owing belongs before prepare's committed baseline.
+    fn record_started_claude_request_identity_contract(&mut self, permitted: bool) {
+        let contract = claude_request_identity::cycle_contract(permitted);
+        if matches!(
+            self.claude_request_identity_contract.as_deref(),
+            Some(
+                CLAUDE_E2_IDENTITY_ADOPTION_PENDING
+                    | CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL
+            )
+        ) {
+            claude_contract::note(|counts| {
+                counts
+                    .identity_contract_transition
+                    .mid_traversal_placeholder += 1
+            });
+        }
+        self.claude_request_identity_contract = Some(contract.to_owned());
     }
 
     #[cfg(test)]
@@ -88607,7 +88848,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reread_required, reread_ticket, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);

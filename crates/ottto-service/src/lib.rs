@@ -249,6 +249,7 @@ impl ControlToken {
 #[derive(Debug, Clone)]
 pub struct LocalDaemon {
     transcript_cache: Arc<snapshots::sampled_scan::SharedCache>,
+    footprint_cwds: Arc<context_footprint::CwdProjection>,
     native_comparison: Arc<snapshots::claude_native_comparison::lifecycle::Lifecycle>,
     inner: Arc<Mutex<DaemonState>>,
     control_token: ControlToken,
@@ -464,6 +465,7 @@ impl LocalDaemon {
         let now = now.into();
         Self {
             transcript_cache: Arc::new(snapshots::sampled_scan::SharedCache::default()),
+            footprint_cwds: Arc::default(),
             native_comparison: Arc::new(
                 snapshots::claude_native_comparison::lifecycle::Lifecycle::default(),
             ),

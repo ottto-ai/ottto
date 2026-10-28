@@ -16,6 +16,17 @@ const HEALTHY: [&str; 5] = [
 #[test]
 #[serial(source_manifests)]
 fn structural_reread_observe_counts_all_triggers_for_seven_days_without_changing_reads() {
+    // The real multi-page fixture retains several large debug ScanIndex frames.
+    // Keep its full body and thread-local guards together on an explicit test stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_structural_reread_observe_fixture)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn run_structural_reread_observe_fixture() {
     // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion (E2 rule 5).
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !c1a_layout_supported("structural-reread-seven-days-observe") {
