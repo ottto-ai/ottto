@@ -442,6 +442,66 @@ observations stay local and never enter wire payloads or uploads. The reason
 counters are counts-only; the set digest is a content-free aggregate of
 canonical digests, not collected content.
 
+## Claude Carry Rebind and Start Operands
+
+Schema 2's existing `bounded_traversal_transition` carrier adds the following
+closed event/reason pairs for `source: claude_code`. Each emitted row has
+`count: 1`: the unit is a **transition**, not members, distinct files, transcript
+bytes or a process-lifetime total.
+
+| `event` | Closed `reason` domain | Observation |
+| --- | --- | --- |
+| `carry_rebind` | `process_only` | Consistently bound retained scheduling moves to the current process. `carry_at_start.window: true` identifies the window subset. |
+| `base_rewind` | `process`, `context`, `window`, `missing`, `refund` | Retained scheduling takes BASE fallback, or replay funding is refused. This does not measure physical reads or guarantee that a traversal existed to rewind. |
+
+The exhausted non-window terminal exception discards scheduling without
+rewinding members and emits neither event. A rebind followed by a refund refusal
+can emit both events in one invocation. These are separate transitions, not a
+partition of files. Missing rows do not establish zero events: local stderr
+observations are best effort.
+
+A Claude `event: starting` row includes `claude_carry_at_start`, captured before
+provenance repair/reset. The two events above use the same fixed shape under
+`carry_at_start`, captured at their respective decision edges:
+
+- `roots`, `capped`, `replay`: nonnegative counts of retained root obligations,
+  capped-root obligations and queued replay entries. These are inventory gauges
+  at capture, not transition counters, member counts or bytes; do not sum them
+  across rows.
+- `window`: whether a retained full-rearm window exists.
+- `admission_present`, `admission_complete`, `admission_progressed`: admission
+  state bits. If admission is absent, the latter two are false; consult presence
+  before interpreting them.
+- `process_changed_since_last_start`: `true` or `false` when the carry origin's
+  process operand is available; JSON `null` (`None`) means unavailable/missing
+  origin, **not false**. It compares the retained token at capture, not wall time.
+
+A matching retained traversal that actually starts again also reports
+`claude_start_operands_echfulapd`: exactly nine booleans in the fixed order
+**[E,C,H,F,U,L,A,P,D]**, evaluated by the real decision before reset/re-arm.
+Fresh or mismatched traversals omit this field; omission is not nine false bits.
+A resume does not emit a new `starting` row.
+
+| Operand | Meaning |
+| --- | --- |
+| E | No pending directories, no pending census-member candidates, and no carry replay. |
+| C | Oversized-discovery clock retry is required. |
+| H | Retained traversal counts have errors. |
+| F | A bound RetryPending family is due after the retained census start. |
+| U | Unsettled causes include a cause other than CompletedBlockingHolds. |
+| L | Oversized-discovery recovery-floor retry is due. |
+| A | A same-context, non-window prior admission is present. |
+| P | That admission is incomplete and has progressed. |
+| D | The ordinary retry deadline is eligible, including the existing missing/invalid-clock or implausibly future-deadline fallback. |
+
+All labels and field names above are closed; state bits have domain
+`false|true`, with only the process operand also allowing `null`. These local
+observations carry **no read/settlement authority**: they grant no Full read,
+accepted body, census/coverage proof, ACK or settlement credit. They add no wire
+fields, persisted state, transcript content, raw identifiers, paths or process
+tokens. A zero-read rebind describes this scheduling transition, not a later
+acquisition pass or a measured zero-byte filesystem receipt.
+
 ## Claude Re-read Attribution Counters
 
 Schema 2's existing `native_collection_page` and `native_comparison_decision`
