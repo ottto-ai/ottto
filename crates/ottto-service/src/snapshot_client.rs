@@ -1652,6 +1652,10 @@ impl SnapshotApiClient {
         crate::relay_auth::binding_key(&self.api_base_url, device, secret, source.api_slug())
     }
 
+    pub(crate) fn api_base_seal(&self) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(self.api_base_url.as_bytes()).into()
+    }
     pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
         self.api_base_url == expected
     }

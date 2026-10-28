@@ -6227,6 +6227,7 @@ fn prepare_sync_source_inner(
             &activity_hint,
             &upload_destination_namespace,
             &backfill_state,
+            client.api_base_seal(),
         )
     } else {
         None
@@ -18272,6 +18273,7 @@ mod tests {
 
     #[test]
     fn connection_cap_refusal_never_selects_environment_or_default_endpoint() {
+        use std::fs;
         let root = test_dir("connection-cap-endpoint");
         fs::create_dir_all(&root).unwrap();
         let path = root.join("connection.json");

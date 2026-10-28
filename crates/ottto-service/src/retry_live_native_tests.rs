@@ -25,6 +25,7 @@ fn bounded_retry_cutoff_shape_refuses_before_typed_map_decode() {
             &f.hint,
             &f.progress.destination_namespace_hash,
             &ordinary,
+            [0; 32],
         )
     });
     eprintln!(
@@ -70,6 +71,7 @@ fn bounded_retry_cutoff_node_boundary_preserves_ordinary_state() {
             &f.hint,
             &f.progress.destination_namespace_hash,
             &ordinary,
+            [0; 32],
         );
         assert_eq!(live.is_some(), expected);
         if let Some(live) = live {
@@ -163,6 +165,7 @@ impl PiLiveFixture {
             &hint,
             &progress.destination_namespace_hash,
             &Default::default(),
+            [0; 32],
         )
         .unwrap();
         assert_eq!(
@@ -323,7 +326,8 @@ fn bounded_retry_live_inputs_decline_rewrites_replacements_new_paths_and_cutoff(
         &f.support,
         &f.hint,
         "synthetic",
-        &Default::default()
+        &Default::default(),
+        [0; 32],
     )
     .is_none());
     let mut hint = PiLiveFixture::hint();
@@ -923,4 +927,56 @@ fn pi_retry_checkpoint_comparison_accepts_both_native_encodings() {
             !bounded_snapshot_retry::checkpoint_matches(&f.index_path, &changed, false).unwrap()
         );
     }
+}
+
+#[test]
+#[serial(client_report)]
+fn retained_endpoint_change_refuses_before_relay_token_or_post() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut f = PiLiveFixture::new();
+    let original = SnapshotApiClient::new("https://original.invalid");
+    let live = live_snapshot_retry::LiveAuthority::capture(
+        SnapshotSource::Pi,
+        &f.home.0,
+        &f.support,
+        &f.hint,
+        &f.progress.destination_namespace_hash,
+        &Default::default(),
+        original.api_base_seal(),
+    )
+    .unwrap();
+    assert!(live.validate_endpoint(&original).is_ok());
+    f.live = Some(live);
+    let mut owner = f.capture(Duration::ZERO);
+    let before = std::fs::read(&f.index_path).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let changed = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
+        .with_bounded_retry_loopback_http_for_test();
+    let device = bounded_native_device();
+    let mut attempted = 0;
+    owner.isolated_boundary(|page| {
+        attempted += 1;
+        let live = page.take_live_authority()?;
+        let result = page.turn_live(
+            &changed,
+            &device,
+            "synthetic-secret",
+            live.policy(),
+            &mut || live.validate_endpoint(&changed),
+        );
+        assert!(result.is_err());
+        assert_eq!(page.budget.posts_left(), 3);
+        page.restore_live_authority(live);
+        result
+    });
+    assert_eq!(attempted, 1);
+    assert_eq!(std::fs::read(&f.index_path).unwrap(), before);
+    listener.set_nonblocking(true).unwrap();
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
 }

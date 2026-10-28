@@ -8,6 +8,7 @@ pub(super) struct LiveAuthority {
     inputs: crate::snapshots::PiRetryInputs,
     policy: [u8; 32],
     destination: String,
+    endpoint: [u8; 32],
     backfill_path: PathBuf,
     backfill: Option<[u8; 32]>,
 }
@@ -64,6 +65,7 @@ impl LiveAuthority {
         hint: &crate::snapshot_client::ActivityHintResponse,
         destination: &str,
         backfill: &crate::backfill::BackfillState,
+        endpoint: [u8; 32],
     ) -> Option<Self> {
         if source != SnapshotSource::Pi {
             return None;
@@ -96,6 +98,7 @@ impl LiveAuthority {
             inputs,
             policy,
             destination: destination.to_owned(),
+            endpoint,
             backfill_path,
             backfill: seal,
         })
@@ -127,6 +130,13 @@ impl LiveAuthority {
         Ok(())
     }
 
+    pub(super) fn validate_endpoint(&self, client: &SnapshotApiClient) -> Result<()> {
+        anyhow::ensure!(
+            self.endpoint == client.api_base_seal(),
+            "optional snapshot endpoint changed"
+        );
+        Ok(())
+    }
     pub(super) fn policy(&self) -> &[u8; 32] {
         &self.policy
     }
@@ -140,6 +150,7 @@ impl HeapLayoutBound for LiveAuthority {
             inputs,
             policy: _,
             destination,
+            endpoint: _,
             backfill_path,
             backfill: _,
         } = self;
@@ -273,6 +284,7 @@ impl LiveRetryOwner {
             let authority = page.authority();
             let live = page.take_live_authority()?;
             let mut validate = || {
+                live.validate_endpoint(&client)?;
                 anyhow::ensure!(
                     daemon.snapshot_retry_running().unwrap_or(false),
                     "snapshot daemon stopped"
