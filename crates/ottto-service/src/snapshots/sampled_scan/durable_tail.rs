@@ -168,7 +168,7 @@ struct Slot {
     namespace: Scope,
     identity_capture: bool,
     /// Keys held (U) by this source, and the totals the last alarm reported:
-    /// [held, t14_rebuild, mode_repaired, disabled].
+    /// [held, t14_rebuild, mode_repaired, disabled, rebuild_full].
     held: u64,
     reported: [u64; 5],
 }
@@ -432,13 +432,14 @@ impl SharedCache {
         &self,
         source: SnapshotSource,
         key: &str,
+        start: bool,
     ) -> Option<store::Refusal> {
         let source = durable_source(source)?;
         self.durable()?
             .slot(source)
             .as_mut()?
             .store
-            .full_hold(&store::key_digest(source, key))
+            .full_hold(&store::key_digest(source, key), start)
     }
 
     pub(in crate::snapshots) fn durable_hold_exit(
@@ -449,14 +450,14 @@ impl SharedCache {
         candidate: &CandidateFile,
         census: &mut ScanCensus,
     ) {
+        let kept = source == SnapshotSource::ClaudeCode
+            && claude_request_census::retain_held(index, candidate);
         if reason == store::Refusal::Corrupt {
             if let Some(mut stores) = self.durable() {
                 Counters::bump(&mut stores.counters.not_persisted, "known_corrupt_held");
             }
             return;
         }
-        let kept = source == SnapshotSource::ClaudeCode
-            && claude_request_census::retain_held(index, candidate);
         if let Some(mut stores) = self.durable() {
             stores.counters.durable_held[reason as usize] += 1;
             if source == SnapshotSource::ClaudeCode {
@@ -914,7 +915,7 @@ impl SharedCache {
     /// Local alarm on the `local_resources` carrier (#799), counts only: this
     /// source's held keys, T14 rebuilds and mode repairs since the last
     /// report (with totals), and once, the cause that disabled the store.
-    /// A held key keeps the source's census retryable for the whole hold.
+    /// A U hold keeps the source census retryable; T14 holds keep it healthy.
     pub(crate) fn durable_alarm(&self, snapshot_source: SnapshotSource) {
         #[derive(serde::Serialize)]
         struct Alarm {

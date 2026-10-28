@@ -1486,6 +1486,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
         let cache = SharedCache::default();
         cache.durable_begin_pass(source, &index_path, &namespace, false);
         assert_eq!(cache.durable_hold(source, &key), None);
+        assert_eq!(cache.durable_full_hold(source, &key, true), None);
         let admitted = cache.insert_admitted(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
@@ -1518,7 +1519,7 @@ fn t14_without_retention_or_encodable_reduction_holds_on_later_passes() {
             cache.durable_begin_pass(source, &index_path, &namespace, false);
             assert_eq!(
                 cache.durable_hold(source, &key),
-                Some(store::Refusal::Corrupt)
+                (arm == "retention").then_some(store::Refusal::Corrupt)
             );
             let (counts, stats) = cache.durable_counters(source).unwrap();
             assert_eq!(stats.t14_rebuild, 1);
@@ -1795,8 +1796,48 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
             <= 1
     ));
     assert_eq!(std::fs::read(&record).unwrap(), corrupt);
+    // P2 review: preserve size/mtime while replacing the object. The healthy
+    // production exit must still invalidate stale request-hash authority.
+    let mut index = index;
+    assert!(index.claude_request_census.contains_key(&key));
+    let replacement = held.with_extension("replacement");
+    let bytes = std::fs::read(&held).unwrap();
+    std::fs::write(&replacement, &bytes[..accepted.size_bytes as usize]).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(accepted.modified_unix_seconds),
+        )
+        .unwrap();
+    std::fs::rename(&replacement, &held).unwrap();
+    let mut census = ScanCensus::default();
+    let candidate = candidate_from_traversal_path(
+        source,
+        ScanTraversalPath {
+            scan_root: sessions.clone(),
+            path: held.clone(),
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut census,
+        None,
+        365,
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    cache.durable_hold_exit(
+        source,
+        store::Refusal::Corrupt,
+        &mut index,
+        &candidate,
+        &mut census,
+    );
+    assert!(!index.claude_request_census.contains_key(&key));
+    assert_eq!(census.unreadable_path_count, 0);
     let mut restarted = DurableTailStore::new(disk.dir().to_path_buf(), DurableSource::ClaudeCode);
-    assert_eq!(restarted.full_hold(&digest), None);
+    assert_eq!(restarted.full_hold(&digest, true), None);
     assert_eq!(
         restarted.counters().known_corrupt_rebuild_after_restart,
         1,

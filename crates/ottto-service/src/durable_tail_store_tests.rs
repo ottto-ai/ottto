@@ -1877,12 +1877,12 @@ fn rebuilt_t14_is_memory_only_and_never_reaches_the_writer() {
         );
         assert_eq!(
             cold.hold(&b.key, false),
-            Some(Refusal::Corrupt),
-            "second outer guard in the same pass must hold"
+            None,
+            "unstarted allowance survives scheduling deferral"
         );
-        assert_eq!(cold.full_hold(&b.key), None);
+        assert_eq!(cold.full_hold(&b.key, true), None);
         assert_eq!(cold.counters().known_corrupt_rebuild_after_restart, 1);
-        assert_eq!(cold.full_hold(&b.key), Some(Refusal::Corrupt));
+        assert_eq!(cold.full_hold(&b.key, true), Some(Refusal::Corrupt));
         let mut replacement = pending(b.clone(), certificate(&transcript), 2);
         if arm == "budget" {
             replacement.body.resize(RECORD_BYTES, 0);
@@ -2035,4 +2035,36 @@ fn non_format_io_errors_disable_at_every_read_boundary_without_spending_t14() {
             assert_eq!(fs::read(&record).unwrap(), before);
         }
     }
+}
+
+#[test]
+fn scheduling_deferral_preserves_t14_allowance_until_full_actually_starts() {
+    let scratch = Scratch::new();
+    let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let b = binding("acct", "scope", ("fp", None));
+    let mut store = scratch.store();
+    ensure_private_dir(store.dir()).unwrap();
+    let mut bytes = encode(&DurableRecord {
+        record: pending(b.clone(), certificate(&transcript), 1),
+        index_generation: 1,
+    });
+    *bytes.last_mut().unwrap() ^= 1;
+    put_record(&record_file(&store, &b.key), &bytes);
+    for _ in 0..3 {
+        store.begin_pass();
+        assert_eq!(store.hold(&b.key, false), None);
+        assert_eq!(
+            store.full_hold(&b.key, false),
+            None,
+            "plan/defer does not spend"
+        );
+        assert_eq!(store.counters().known_corrupt_rebuild_after_restart, 0);
+    }
+    assert_eq!(store.full_hold(&b.key, true), None);
+    assert_eq!(store.counters().known_corrupt_rebuild_after_restart, 1);
+    store.begin_pass();
+    assert_eq!(store.hold(&b.key, false), Some(Refusal::Corrupt));
+    assert_eq!(store.full_hold(&b.key, true), Some(Refusal::Corrupt));
+    assert_eq!(store.counters().t14_rebuild, 1);
+    assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), bytes);
 }

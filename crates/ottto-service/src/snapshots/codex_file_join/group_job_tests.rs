@@ -3013,7 +3013,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &scope, false);
     assert_eq!(
-        cache.durable_full_hold(source, &key),
+        cache.durable_full_hold(source, &key, true),
         None,
         "initial group rebuild attempt"
     );

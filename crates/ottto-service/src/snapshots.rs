@@ -27506,6 +27506,17 @@ impl OwnedSourceScan {
                         }
                     }
                 }
+                #[cfg(unix)]
+                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                    if let Some((member, reason)) = group_members.iter().find_map(|member| {
+                        cache
+                            .durable_full_hold(source, &local_index_key(&member.path), true)
+                            .map(|reason| (member, reason))
+                    }) {
+                        cache.durable_hold_exit(source, reason, index, member, &mut census);
+                        pending!();
+                    }
+                }
                 active_file = Some(job);
                 pending!();
             }
@@ -27622,7 +27633,11 @@ impl OwnedSourceScan {
                         if let Some((member, reason)) = group.members.iter().find_map(|member| {
                             Some((
                                 member,
-                                cache.durable_full_hold(source, &local_index_key(&member.path))?,
+                                cache.durable_full_hold(
+                                    source,
+                                    &local_index_key(&member.path),
+                                    false,
+                                )?,
                             ))
                         }) {
                             cache.durable_hold_exit(source, reason, index, member, &mut census);
@@ -31995,21 +32010,6 @@ impl OwnedSourceScan {
                     }
                 }
             }
-            #[cfg(unix)]
-            if side_origin.is_none()
-                && file_sampling.as_ref().map_or(true, |a| {
-                    matches!(a.mode, crate::transcript_acquisition::ReadMode::Full(_))
-                })
-            {
-                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) =
-                        cache.durable_full_hold(source, &local_index_key(&candidate.path))
-                    {
-                        cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
-                        pending!();
-                    }
-                }
-            }
             if index
                 .files
                 .get(&local_index_key(&candidate.path))
@@ -32180,6 +32180,29 @@ impl OwnedSourceScan {
                         &active.candidate,
                     );
                     pending!();
+                }
+            }
+            #[cfg(unix)]
+            if active.side_origin.is_none()
+                && active.sampling.as_ref().map_or(true, |a| {
+                    matches!(a.mode, crate::transcript_acquisition::ReadMode::Full(_))
+                })
+            {
+                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                    if let Some(reason) = cache.durable_full_hold(
+                        source,
+                        &local_index_key(&active.candidate.path),
+                        true,
+                    ) {
+                        cache.durable_hold_exit(
+                            source,
+                            reason,
+                            index,
+                            &active.candidate,
+                            &mut census,
+                        );
+                        pending!();
+                    }
                 }
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
