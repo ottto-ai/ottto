@@ -110,6 +110,8 @@ pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
+#[doc(hidden)]
+pub mod h527_candidates;
 #[cfg(test)]
 mod launch_demand_tests;
 #[cfg(test)]

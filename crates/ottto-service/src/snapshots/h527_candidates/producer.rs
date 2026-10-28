@@ -1,0 +1,3401 @@
+//! Offline producer of h527 diagnostic candidates from one explicit input
+//! bundle (`h527_producer_input:v2`).
+//!
+//! It reads only the files the bundle names: the 18 target transcripts and
+//! every `.jsonl` file under the named peer roots, plus an optional read-only
+//! snapshot of the existing census index. It never touches upload progress,
+//! sidecars or network, and writes only
+//! to its own new output directory.
+//!
+//! Steps, in this order:
+//!
+//! 1. Parse each target with the unchanged Claude parser. A target needs a
+//!    complete parse, exactly one item, and totals equal to native-request
+//!    usage plus disclosed id-less residual usage.
+//! 2. Plan the peer walk from metadata alone, within explicit entry, file and
+//!    byte budgets. Any budget overrun or over-cap peer is counted and holds
+//!    every target before a single peer byte is read: never a partial census.
+//!    Then stream every planned peer file once, as of its size when opened, and
+//!    compare native request ids exactly, in memory, against all 18 targets. A
+//!    shrunk, rewritten or unreadable file, a compressed transcript or an
+//!    unparseable id-bearing line leaves coverage unknown, and then every
+//!    target is held without a body. Vanished peers use existing census ids,
+//!    else hold only related lineages after a final re-stat.
+//! 3. Resolve every fork-copied line, in peer and target files alike, per line:
+//!    it belongs to the session it names only if that session (or the source
+//!    its own copy names, recursively) counts the request. Otherwise its source
+//!    is absent and the copy is conservative peer evidence.
+//! 4. Fix the counting allocation (B2) for the whole batch before any body or
+//!    money exists: an id seen in any peer is excluded from every target; an
+//!    id shared only by targets is kept by the first-ACKed target, else the
+//!    smaller session key hash. B2 is counting only. It is not ownership.
+//! 5. Re-parse each target with the same parser, dropping only the lines of
+//!    its excluded request ids, and reconcile kept ids, per-request usage, item
+//!    totals and usage rows exactly. The ordinary daemon serializer then writes
+//!    the one-item batch body.
+//! 6. Record, for every kept shared request, the keeping root and its tag
+//!    state. This producer never applies a Contract-5 request-identity permit
+//!    (pinned here, whatever the ordinary pipeline does), so every request
+//!    stays untagged under its starting subscription; a parsed, rebuilt or
+//!    serialized body carrying request identity is held as unsupported.
+//!
+//! Bodies go only into the unqualified diagnostic artifact. The operator
+//! packet for the same run keeps every member held without a body.
+use super::{
+    local_exclusion_disclosure_json, ordinary_batch_body, sha256_hex, validate_members,
+    validate_scope, ApprovedMember, Conservation, CopyScreen, ExcludedTokenCounts, HeldReason,
+    LocalExclusionSummary, OperatorScope, Packet, PacketMember, ProducerBuild,
+    CANDIDATES_CONTRACT_VERSION, DISCLOSED_RESIDUAL_STATEMENT,
+};
+use crate::snapshots::{
+    apply_claude_code_line, apply_upload_policy, claude_code_delta_usage,
+    claude_fork_line_provenance, claude_index_path_member_ref, claude_request_id_set_fingerprint,
+    claude_request_money, claude_subagent_identity, opened_object_identity,
+    scan_file_fingerprint_with_opened_identity, string_at, ClaudeForkLineProvenance,
+    ClaudeTitleMetadata, OwnedJsonlParser, ScanIndex, SnapshotAccumulator, SnapshotItem,
+    SnapshotSource, SnapshotUploadPolicy, UsageTotals, MAX_JSONL_FILE_BYTES, MAX_JSONL_LINE_BYTES,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+pub(crate) const PRODUCER_INPUT_CONTRACT_VERSION: &str = "h527_producer_input:v2";
+pub(crate) const PRODUCER_ARTIFACT_CONTRACT_VERSION: &str = "h527_producer_diagnostic:v3";
+const PRODUCER_SUMMARY_CONTRACT_VERSION: &str = "h527_producer_summary:v1";
+const PRODUCER_DISCLOSURES_CONTRACT_VERSION: &str = "h527_producer_disclosures:v1";
+const B2_ALLOCATION_RULE: &str =
+    "peer_excludes_all_targets_then_first_acked_else_smaller_session_key_sha256:v1";
+const REQUEST_WITNESS_SCHEME: &str = "sha256_hex(native_request_id):v1";
+const PATH_WITNESS_SCHEME: &str = "sha256_hex(canonical_path_utf8_lossy):v1";
+const ESTIMATE_LABEL: &str =
+    "EXPORTER ESTIMATE at catalog prices; never server canonical admitted money";
+const COPY_SCREEN_NOT_RUN_REASON: &str =
+    "server copy screen was not run by the local producer; no screen artifact exists";
+const MAX_INPUT_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+/// Targets go through the ordinary parser. Their cap is pinned at 256 MiB so a
+/// later raise of the parser's own cap does not silently change which targets
+/// this producer reads; a larger target is unreadable and held.
+const TARGET_FILE_BYTES_CAP: u64 = 256 * 1024 * 1024;
+const _: () = assert!(TARGET_FILE_BYTES_CAP <= MAX_JSONL_FILE_BYTES);
+/// Peers are streamed line by line and never parsed whole, so their cap does
+/// not follow the parser's file cap; memory stays bounded by `max_line_bytes`.
+/// A peer over the run's `max_peer_file_bytes` is counted and holds every
+/// target.
+const PEER_FILE_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
+/// Exact decimal rates are stored as integers of 1e-12 USD per million tokens.
+const RATE_FRACTION_DIGITS: usize = 12;
+/// Tokens x (1e-12 USD per 1e6 tokens) => 1e-18 USD units.
+const COST_FRACTION_DIGITS: usize = 18;
+const PEER_ROOT_CLASSES: [&str; 6] = ["projects", "slot", "held", "archive", "quarantine", "other"];
+const COMPRESSED_EXTENSIONS: [&str; 7] = ["zst", "gz", "xz", "bz2", "lz4", "br", "zip"];
+/// Pipeline stages this offline producer does not reproduce. Each one is
+/// disclosed rather than imitated; SESSION's read-only prepare and the SOURCE,
+/// COST and SI reviews see their effect on the actual body.
+const NOT_REPRODUCED_STAGES: [&str; 6] = [
+    "claude_local_evidence_and_contract5_permit: no request tags, untagged rows",
+    "session_account_binding: no sidecar account evidence attached, creator gate not evaluated",
+    "desktop_title_metadata: no desktop-store title or identity evidence",
+    "attribution_context: no launch attribution facts",
+    "backfill_cutoff: not evaluated",
+    "cache_head_identity: cache observations not attached, as with cache upload disabled",
+];
+
+// SOURCE R4: all additional state is private to this offline diagnostic.
+use crate::snapshots::claude_request_census::{claude_request_hash, ClaudeRequestCensus};
+#[cfg(test)]
+thread_local! {
+    static AFTER_BUILDS_FOR_TEST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static AFTER_PLAN_FOR_TEST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+#[cfg(test)]
+thread_local! { static TUPLE_HASH_COUNT_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+const VANISHED_ON_OPEN: &str = "vanished_on_open";
+const MAX_CENSUS_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone)]
+struct MissingUsage {
+    response_key: Option<String>,
+    tuple: Option<String>,
+    dims: Dims,
+}
+fn sum_missing(missing: &[MissingUsage]) -> Option<Dims> {
+    missing
+        .iter()
+        .try_fold(Dims::default(), |sum, usage| sum.checked_add(usage.dims))
+}
+fn usage_tuple(
+    timestamp: Option<&str>,
+    model: Option<&str>,
+    usage: &UsageTotals,
+) -> Option<String> {
+    let (timestamp, model) = (timestamp?, model?);
+    #[cfg(test)]
+    TUPLE_HASH_COUNT_TEST.with(|count| count.set(count.get() + 1));
+    // Missing timestamp/model never establishes a copy. Hash only typed data,
+    // never transcript text. All eight counting dimensions participate.
+    Some(sha256_hex(
+        serde_json::to_string(&(timestamp, model, Dims::of_usage(usage).fields()))
+            .ok()?
+            .as_bytes(),
+    ))
+}
+fn line_usage_tuple(value: &Value) -> Option<String> {
+    if claude_fork_line_provenance(value) != ClaudeForkLineProvenance::None {
+        return None;
+    }
+    usage_tuple(
+        string_at(value, &["timestamp"])
+            .or_else(|| string_at(value, &["created_at"]))
+            .or_else(|| string_at(value, &["message", "created_at"]))
+            .as_deref(),
+        string_at(value, &["message", "model"])
+            .or_else(|| string_at(value, &["model"]))
+            .or_else(|| string_at(value, &["payload", "model"]))
+            .as_deref(),
+        &claude_code_delta_usage(value)?,
+    )
+}
+thread_local! {
+    static MISSING_RESPONSE_KEYS: RefCell<BTreeMap<u64, String>> = const { RefCell::new(BTreeMap::new()) };
+    static EXCLUDED_RESPONSE_KEYS: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+    static EXCLUDED_TUPLES: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+}
+struct ResponseKeyCapture(BTreeMap<u64, String>);
+impl ResponseKeyCapture {
+    fn install() -> Self {
+        Self(MISSING_RESPONSE_KEYS.with(|cell| cell.take()))
+    }
+}
+impl Drop for ResponseKeyCapture {
+    fn drop(&mut self) {
+        MISSING_RESPONSE_KEYS.with(|cell| {
+            cell.replace(std::mem::take(&mut self.0));
+        });
+    }
+}
+struct TupleExclusionGuard(BTreeSet<String>, BTreeSet<String>);
+impl TupleExclusionGuard {
+    fn install(tuples: BTreeSet<String>, keys: BTreeSet<String>) -> Self {
+        Self(
+            EXCLUDED_TUPLES.with(|cell| cell.replace(tuples)),
+            EXCLUDED_RESPONSE_KEYS.with(|cell| cell.replace(keys)),
+        )
+    }
+}
+impl Drop for TupleExclusionGuard {
+    fn drop(&mut self) {
+        EXCLUDED_TUPLES.with(|cell| {
+            cell.replace(std::mem::take(&mut self.0));
+        });
+        EXCLUDED_RESPONSE_KEYS.with(|cell| {
+            cell.replace(std::mem::take(&mut self.1));
+        });
+    }
+}
+
+#[derive(Deserialize)]
+struct CensusFields {
+    generation: u64,
+    #[serde(default)]
+    claude_request_census: ClaudeRequestCensus,
+}
+struct CensusSnapshot {
+    generation: u64,
+    sha256: String,
+    stamp: (u64, Option<std::time::SystemTime>, u64, u64),
+    records: ClaudeRequestCensus,
+}
+fn census_stamp(path: &Path) -> Result<(u64, Option<std::time::SystemTime>, u64, u64), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "census index stat refused")?;
+    if !metadata.is_file() {
+        return Err("census index must be a regular file".into());
+    }
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let identity = (0, 0);
+    Ok((
+        metadata.len(),
+        metadata.modified().ok(),
+        identity.0,
+        identity.1,
+    ))
+}
+impl CensusSnapshot {
+    fn read(path: &Path) -> Result<Self, String> {
+        let stamp = census_stamp(path)?;
+        let bytes =
+            read_bounded(path, MAX_CENSUS_INDEX_BYTES).map_err(|_| "census index read refused")?;
+        let fields: CensusFields =
+            serde_json::from_slice(&bytes).map_err(|_| "census index decode refused")?;
+        if census_stamp(path)? != stamp {
+            return Err(
+                "census index changed while copying; retry only after operator review".into(),
+            );
+        }
+        Ok(Self {
+            generation: fields.generation,
+            sha256: sha256_hex(&bytes),
+            stamp,
+            records: fields.claude_request_census,
+        })
+    }
+    fn verify(&self, path: &Path) -> Result<(), String> {
+        let before = census_stamp(path)?;
+        let (_, sha) = hash_file(path, MAX_CENSUS_INDEX_BYTES)
+            .map_err(|_| "census index verification refused")?;
+        if before != self.stamp || census_stamp(path)? != self.stamp || sha != self.sha256 {
+            return Err("census index changed during run; no output published".into());
+        }
+        Ok(())
+    }
+}
+
+fn family_root(path: &Path) -> Option<&str> {
+    claude_index_path_member_ref(path).map(|member| member.root)
+}
+fn project_name(path: &Path) -> Option<&std::ffi::OsStr> {
+    let root = family_root(path)?;
+    if let Some(subagents) = crate::snapshots::claude_family_subagents_dir(path, root) {
+        subagents.parent()?.parent()?.file_name()
+    } else {
+        path.parent()?.file_name()
+    }
+}
+fn root_id(session: &str) -> &str {
+    if session.starts_with("\u{1f}project:") {
+        session
+    } else {
+        session.split("_agent-").next().unwrap_or(session)
+    }
+}
+fn register_path_lineage(path: &Path, edges: &mut BTreeSet<(String, String)>) {
+    if let Some((root, project)) = family_root(path).zip(project_name(path)) {
+        edges.insert((
+            root.to_string(),
+            format!("\u{1f}project:{}", project.to_string_lossy()),
+        ));
+    }
+}
+fn same_lineage(left: &Path, right: &Path, edges: &BTreeSet<(String, String)>) -> bool {
+    let (Some(left_root), Some(right_root)) = (family_root(left), family_root(right)) else {
+        // An unclassifiable vanished path cannot prove non-lineage.
+        return true;
+    };
+    if left_root == right_root
+        || project_name(left)
+            .zip(project_name(right))
+            .is_some_and(|(a, b)| a == b)
+    {
+        return true;
+    }
+    let mut reached = BTreeSet::from([left_root.to_string()]);
+    loop {
+        let before = reached.len();
+        for (a, b) in edges {
+            let (a, b) = (root_id(a), root_id(b));
+            if reached.contains(a) || reached.contains(b) {
+                reached.insert(a.to_string());
+                reached.insert(b.to_string());
+            }
+        }
+        if reached.contains(right_root) {
+            return true;
+        }
+        if reached.len() == before {
+            return false;
+        }
+    }
+}
+fn resolve_vanished(
+    peer: &PlannedPeer,
+    input: &ProducerInput,
+    originals: &[TargetParse],
+    census: Option<&CensusSnapshot>,
+    scan: &mut PeerScan,
+    coverage: &mut GlobalCoverage,
+) {
+    let record = census
+        .and_then(|snapshot| snapshot.records.get(&peer.path.to_string_lossy()))
+        .filter(|record| record.proves_scan());
+    let witness = path_sha256(&peer.path);
+    let owner_index = claude_index_path_member_ref(&peer.path)
+        .map(|member| member.into_owned().1)
+        .and_then(|owner| {
+            input
+                .targets
+                .iter()
+                .position(|target| target.source_session_id == owner)
+        });
+    if let Some(record) = record {
+        if let Some(owner) = owner_index {
+            let owned_hashes = originals[owner]
+                .request_ids
+                .iter()
+                .flatten()
+                .map(|id| claude_request_hash(id))
+                .collect::<BTreeSet<_>>();
+            for hash in record.request_hashes() {
+                if !owned_hashes.contains(hash) {
+                    // The census has only prefixes, not recoverable native IDs.
+                    // This set supplies only count/emptiness to the same owner
+                    // refusal used by live divergent replicas.
+                    scan.replica_divergent_ids[owner].insert(format!("census-prefix:{hash:016x}"));
+                }
+            }
+        }
+        for (index, original) in originals.iter().enumerate() {
+            for request_id in original.request_ids.iter().flatten() {
+                if record.holds_hash(claude_request_hash(request_id)) {
+                    // Same-session replicas are the target's own counter. Their
+                    // shared native IDs remain in B2, exactly as for live peers.
+                    if owner_index.is_some_and(|owner| {
+                        originals[owner]
+                            .request_ids
+                            .as_ref()
+                            .is_some_and(|ids| ids.contains(request_id))
+                    }) {
+                        continue;
+                    }
+                    scan.hits[index]
+                        .entry(request_id.clone())
+                        .or_insert_with(|| PeerHit {
+                            path_sha256: witness.clone(),
+                            owner_session_sha256: None,
+                            line_count: 0,
+                            inherited_from_absent_source: false,
+                        });
+                }
+            }
+        }
+        scan.vanished_census_used += 1;
+        scan.files.push(json!({"class": input.peer_roots[peer.root_index].class, "path_sha256": witness, "classification": "vanished_census_used", "census_hash_scheme": "sha256_prefix_64bit", "collision_policy": "possible_money_under_count_on_hash_collision"}));
+        if !record.unverified_or_twin() && record.can_bind_recomposed_body() {
+            return;
+        }
+        // Positive IDs survive even an incomplete census. Its negative claims
+        // are unavailable, so additionally hold only its lineage.
+    }
+    scan.vanished_no_census += 1;
+    scan.vanished_no_census_paths.push(peer.path.clone());
+    let mut held = Vec::new();
+    for (index, target) in input.targets.iter().enumerate() {
+        if same_lineage(&target.transcript_path, &peer.path, &scan.lineage_edges) {
+            scan.lineage_held.insert(index);
+            held.push(target.session_key_sha256.clone());
+        }
+    }
+    if record.is_some() {
+        if let Some(row) = scan.files.last_mut() {
+            row["incomplete_census_lineage_hold"] = json!(held);
+        }
+    } else {
+        scan.files.push(json!({"class": input.peer_roots[peer.root_index].class, "path_sha256": witness, "classification": "vanished_no_census", "held_targets": held}));
+    }
+    let _ = coverage; // Other coverage failures retain their existing gate.
+}
+
+// ---------------------------------------------------------------------------
+// Input bundle
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProducerInput {
+    pub(crate) contract_version: String,
+    pub(crate) scope: InputScope,
+    /// Deterministic body collection timestamp (RFC 3339).
+    pub(crate) collected_at: String,
+    pub(crate) upload_policy: InputUploadPolicy,
+    pub(crate) context_curve_enabled: bool,
+    pub(crate) targets: Vec<InputTarget>,
+    pub(crate) peer_roots: Vec<InputPeerRoot>,
+    pub(crate) bounds: InputBounds,
+    #[serde(default)]
+    pub(crate) catalog_prices: Option<CatalogPrices>,
+    /// Existing daemon scan index, opened read-only. No default discovery.
+    #[serde(default)]
+    pub(crate) census_index_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InputScope {
+    pub(crate) operation_id: String,
+    pub(crate) user_id: String,
+    pub(crate) organization_id: String,
+    pub(crate) device_id: String,
+    pub(crate) machine_id: String,
+    pub(crate) producer_revision: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InputUploadPolicy {
+    pub(crate) session_titles_enabled: bool,
+    pub(crate) workspace_labels_enabled: bool,
+    pub(crate) session_artifacts_enabled: bool,
+    pub(crate) session_attribution_enabled: bool,
+    pub(crate) session_attribution_labels_enabled: bool,
+}
+
+impl From<InputUploadPolicy> for SnapshotUploadPolicy {
+    fn from(policy: InputUploadPolicy) -> Self {
+        Self {
+            session_titles_enabled: policy.session_titles_enabled,
+            workspace_labels_enabled: policy.workspace_labels_enabled,
+            session_artifacts_enabled: policy.session_artifacts_enabled,
+            session_attribution_enabled: policy.session_attribution_enabled,
+            session_attribution_labels_enabled: policy.session_attribution_labels_enabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InputTarget {
+    pub(crate) source_session_id: String,
+    pub(crate) session_key_sha256: String,
+    pub(crate) prior_refusal_body_witness: String,
+    pub(crate) transcript_path: PathBuf,
+    /// SOURCE's first-ACK order for this session's accepted history, if known.
+    /// Lower is earlier. Absent sorts after every known value.
+    pub(crate) b2_first_ack_order: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InputPeerRoot {
+    pub(crate) class: String,
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InputBounds {
+    /// Directory entries the metadata walk may examine across all peer roots.
+    pub(crate) max_walk_entries: u64,
+    pub(crate) max_peer_files: u64,
+    pub(crate) max_peer_total_bytes: u64,
+    pub(crate) max_peer_file_bytes: u64,
+    pub(crate) max_line_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CatalogPrices {
+    pub(crate) publication: CatalogPublication,
+    /// Keyed `<model>|<context_bucket>`, the parser's own selector bucket, or
+    /// `<model>|none` for a request the parser stamped with no bucket.
+    pub(crate) rates_usd_per_mtok: BTreeMap<String, CatalogRates>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CatalogPublication {
+    pub(crate) source: String,
+    pub(crate) revision: String,
+    pub(crate) sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CatalogRates {
+    pub(crate) input: String,
+    pub(crate) output: String,
+    pub(crate) cache_read: String,
+    pub(crate) cache_creation_5m: String,
+    pub(crate) cache_creation_1h: String,
+}
+
+// ---------------------------------------------------------------------------
+// Output
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProducerOutput {
+    /// Unqualified diagnostic artifact. Local review evidence only.
+    pub(crate) artifact_json: String,
+    pub(crate) artifact_sha256: String,
+    /// The frozen operator packet; every member held, no body fields.
+    pub(crate) candidate_bundle_json: String,
+    pub(crate) candidate_bundle_sha256: String,
+    /// Per-target disclosure records, only when a catalog estimate exists.
+    pub(crate) disclosures_json: Option<String>,
+    /// Content-free run summary.
+    pub(crate) summary: Value,
+}
+
+/// Operator entry: read the bundle, produce, and write the outputs into a new
+/// private directory. Returns the content-free summary as JSON text.
+pub fn run_operator_producer(input_path: &Path, out_dir: &Path) -> Result<String, String> {
+    let input_bytes = read_bounded(input_path, MAX_INPUT_BUNDLE_BYTES)
+        .map_err(|error| format!("input bundle: {error}"))?;
+    let input: ProducerInput =
+        serde_json::from_slice(&input_bytes).map_err(|error| format!("input bundle: {error}"))?;
+    let producer = ProducerBuild::current()?;
+    let output = produce(&input, &sha256_hex(&input_bytes), &producer)?;
+    write_outputs(out_dir, &output)?;
+    serde_json::to_string_pretty(&output.summary).map_err(|error| format!("summary: {error}"))
+}
+
+fn write_outputs(out_dir: &Path, output: &ProducerOutput) -> Result<(), String> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder
+        .create(out_dir)
+        .map_err(|error| format!("output directory must be new: {error}"))?;
+    let mut files = vec![
+        ("artifact.json", output.artifact_json.as_str()),
+        (
+            "candidate-bundle.json",
+            output.candidate_bundle_json.as_str(),
+        ),
+    ];
+    if let Some(disclosures) = output.disclosures_json.as_deref() {
+        files.push(("disclosures.json", disclosures));
+    }
+    let summary = serde_json::to_string_pretty(&output.summary)
+        .map_err(|error| format!("summary: {error}"))?;
+    files.push(("summary.json", summary.as_str()));
+    for (name, contents) in files {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(out_dir.join(name))
+            .map_err(|error| format!("write {name}: {error}"))?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("write {name}: {error}"))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Token dimensions
+
+/// The eight counters the producer reconciles. Transcript usage has no
+/// separate unattributed cache-creation dimension, so the disclosure's
+/// `cache_creation_unattributed_input_tokens` is zero by construction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Dims {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_creation_5m: u64,
+    cache_creation_1h: u64,
+    reasoning_output: u64,
+    unattributed_total: u64,
+    request_count: u64,
+}
+
+impl Dims {
+    fn of_usage(usage: &UsageTotals) -> Self {
+        Self {
+            input: usage.input_tokens,
+            output: usage.output_tokens,
+            cache_read: usage.cache_read_tokens,
+            cache_creation_5m: usage.cache_creation_5m_tokens,
+            cache_creation_1h: usage.cache_creation_1h_tokens,
+            reasoning_output: usage.reasoning_output_tokens,
+            unattributed_total: usage.unattributed_total_tokens,
+            request_count: usage.request_count,
+        }
+    }
+
+    fn of_item(item: &SnapshotItem) -> Self {
+        Self {
+            input: item.input_tokens,
+            output: item.output_tokens,
+            cache_read: item.cache_read_tokens,
+            cache_creation_5m: item.cache_creation_5m_tokens,
+            cache_creation_1h: item.cache_creation_1h_tokens,
+            reasoning_output: item.reasoning_output_tokens,
+            unattributed_total: item.unattributed_total_tokens,
+            request_count: item.request_count,
+        }
+    }
+
+    fn of_row(row: &crate::snapshots::SnapshotModelUsage) -> Self {
+        Self {
+            input: row.input_tokens,
+            output: row.output_tokens,
+            cache_read: row.cache_read_tokens,
+            cache_creation_5m: row.cache_creation_5m_tokens,
+            cache_creation_1h: row.cache_creation_1h_tokens,
+            reasoning_output: row.reasoning_output_tokens,
+            unattributed_total: row.unattributed_total_tokens,
+            request_count: row.request_count,
+        }
+    }
+
+    fn fields(self) -> [u64; 8] {
+        [
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_creation_5m,
+            self.cache_creation_1h,
+            self.reasoning_output,
+            self.unattributed_total,
+            self.request_count,
+        ]
+    }
+
+    fn from_fields(fields: [u64; 8]) -> Self {
+        Self {
+            input: fields[0],
+            output: fields[1],
+            cache_read: fields[2],
+            cache_creation_5m: fields[3],
+            cache_creation_1h: fields[4],
+            reasoning_output: fields[5],
+            unattributed_total: fields[6],
+            request_count: fields[7],
+        }
+    }
+
+    fn checked_add(self, other: Self) -> Option<Self> {
+        let (a, b) = (self.fields(), other.fields());
+        let mut out = [0_u64; 8];
+        for index in 0..8 {
+            out[index] = a[index].checked_add(b[index])?;
+        }
+        Some(Self::from_fields(out))
+    }
+
+    fn checked_sub(self, other: Self) -> Option<Self> {
+        let (a, b) = (self.fields(), other.fields());
+        let mut out = [0_u64; 8];
+        for index in 0..8 {
+            out[index] = a[index].checked_sub(b[index])?;
+        }
+        Some(Self::from_fields(out))
+    }
+
+    fn json(self) -> Value {
+        json!({
+            "input_tokens": self.input,
+            "output_tokens": self.output,
+            "cache_read_tokens": self.cache_read,
+            "cache_creation_5m_tokens": self.cache_creation_5m,
+            "cache_creation_1h_tokens": self.cache_creation_1h,
+            "cache_creation_unattributed_input_tokens": 0,
+            "reasoning_output_tokens": self.reasoning_output,
+            "unattributed_total_tokens": self.unattributed_total,
+            "request_count": self.request_count,
+        })
+    }
+
+    fn excluded_token_counts(self) -> ExcludedTokenCounts {
+        ExcludedTokenCounts {
+            input_tokens: self.input,
+            output_tokens: self.output,
+            cache_read_tokens: self.cache_read,
+            cache_creation_5m_tokens: self.cache_creation_5m,
+            cache_creation_1h_tokens: self.cache_creation_1h,
+            cache_creation_unattributed_input_tokens: 0,
+            reasoning_output_tokens: self.reasoning_output,
+            unattributed_total_tokens: self.unattributed_total,
+        }
+    }
+}
+
+fn sum_dims<'a>(usages: impl IntoIterator<Item = &'a UsageTotals>) -> Option<Dims> {
+    usages.into_iter().try_fold(Dims::default(), |sum, usage| {
+        sum.checked_add(Dims::of_usage(usage))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Canonical parse with an optional exact request-id exclusion
+
+thread_local! {
+    /// Request ids the current re-parse drops. Set only inside
+    /// `parse_target_transcript` and cleared by its guard.
+    static EXCLUDED_REQUEST_IDS: RefCell<Option<BTreeSet<String>>> = const { RefCell::new(None) };
+}
+
+struct ExclusionGuard;
+
+impl ExclusionGuard {
+    fn install(excluded: BTreeSet<String>) -> Self {
+        EXCLUDED_REQUEST_IDS.with(|cell| *cell.borrow_mut() = Some(excluded));
+        Self
+    }
+}
+
+impl Drop for ExclusionGuard {
+    fn drop(&mut self) {
+        EXCLUDED_REQUEST_IDS.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+fn line_request_id(value: &Value) -> Option<String> {
+    string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]))
+}
+
+/// The ordinary Claude line step, except that an owned line whose request id
+/// is excluded is skipped whole: its usage, tools, timing and content leave
+/// the session exactly as a fork-copied line does. Fork-marked lines always
+/// reach the ordinary step unchanged, so their own provenance handling holds.
+fn apply_claude_code_line_excluding(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    let response_key = line_request_id(value)
+        .is_none()
+        .then(|| crate::snapshots::claude_code_usage_dedup_key(value))
+        .flatten();
+    let excluded_key = response_key.as_ref().is_some_and(|key| {
+        EXCLUDED_RESPONSE_KEYS.with(|cell| cell.borrow().contains(&sha256_hex(key.as_bytes())))
+    });
+    let excluded = claude_fork_line_provenance(value) == ClaudeForkLineProvenance::None
+        && (excluded_key
+            || line_request_id(value).is_none()
+                && line_usage_tuple(value).is_some_and(|tuple| {
+                    EXCLUDED_TUPLES.with(|cell| cell.borrow().contains(&tuple))
+                })
+            || line_request_id(value).is_some_and(|request_id| {
+                EXCLUDED_REQUEST_IDS.with(|cell| {
+                    cell.borrow()
+                        .as_ref()
+                        .is_some_and(|excluded| excluded.contains(&request_id))
+                })
+            }));
+    if excluded {
+        // Same first step as the ordinary line: the session id is file-level.
+        if accumulator.source_session_id.is_none() {
+            accumulator.source_session_id = string_at(value, &["sessionId"])
+                .or_else(|| string_at(value, &["session_id"]))
+                .or_else(|| string_at(value, &["conversation_id"]));
+        }
+        return;
+    }
+    apply_claude_code_line(value, accumulator);
+    if let Some(key) = response_key {
+        if let Some(response) = accumulator.claude_responses.get_mut(&key) {
+            MISSING_RESPONSE_KEYS.with(|cell| {
+                cell.borrow_mut()
+                    .insert(response.sequence, sha256_hex(key.as_bytes()));
+            });
+        }
+    }
+}
+
+struct ParsedTarget {
+    missing: Vec<MissingUsage>,
+    lineage_edges: BTreeSet<(String, String)>,
+    complete: bool,
+    snapshots: Vec<SnapshotItem>,
+}
+
+/// The production open, opened-object identity and fingerprint, then the
+/// ordinary parser. The scan fingerprint carries no sidecar part, because
+/// sidecars are not read here.
+///
+/// The targets are protected-list families, which the daemon reads
+/// fold-absent: ordinary pre-E2 money with native per-hour buckets, never the
+/// E2 request-owned fold. The parse reproduces exactly that read by listing
+/// the target's own family in an otherwise empty index.
+fn parse_target_transcript(
+    path: &Path,
+    collected_at: &str,
+    artifacts_enabled: bool,
+    context_curve_enabled: bool,
+    excluded: Option<BTreeSet<String>>,
+) -> Result<ParsedTarget, String> {
+    let _capture = ResponseKeyCapture::install();
+    let source = SnapshotSource::ClaudeCode;
+    let mut file = File::open(path).map_err(|error| format!("open: {error}"))?;
+    let opened =
+        opened_object_identity(source, &mut file).map_err(|error| format!("open: {error}"))?;
+    let metadata = file.metadata().map_err(|error| format!("stat: {error}"))?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default();
+    let fingerprint = scan_file_fingerprint_with_opened_identity(
+        path,
+        metadata.len(),
+        modified_unix_nanos,
+        source.scan_identity_version(),
+        "",
+        &opened,
+    );
+    let (apply_line, _guard): (fn(&Value, &mut SnapshotAccumulator), _) = match excluded {
+        Some(excluded) => (
+            apply_claude_code_line_excluding,
+            Some(ExclusionGuard::install(excluded)),
+        ),
+        None => (apply_claude_code_line_excluding, None),
+    };
+    let mut listed = ScanIndex::default();
+    if let Some(member) = claude_index_path_member_ref(path) {
+        listed.claude_reemission_exclusions.list_root(member.root);
+    }
+    let mut parser = OwnedJsonlParser::new(
+        file,
+        path,
+        source,
+        apply_line,
+        None,
+        None,
+        None,
+        artifacts_enabled,
+        context_curve_enabled,
+    )
+    .map_err(|error| format!("parse: {error:#}"))?;
+    while !parser.step().map_err(|error| format!("parse: {error:#}"))? {}
+    // Reuse the ordinary resolver's already-buffered responses, including its
+    // progressive-record deduplication. No extra transcript read.
+    let mut missing = Vec::new();
+    for response in parser.accumulator.claude_responses.values() {
+        if let Ok(response) = response
+            .clone()
+            .resolve_classified(&parser.accumulator.claude_responses.selectors)
+        {
+            if response.request_id.is_none() {
+                missing.push(MissingUsage {
+                    response_key: MISSING_RESPONSE_KEYS
+                        .with(|cell| cell.borrow().get(&response.sequence).cloned()),
+                    tuple: usage_tuple(
+                        response.terminal_timestamp.as_deref(),
+                        response.model.as_deref(),
+                        &response.usage,
+                    ),
+                    dims: Dims::of_usage(&response.usage),
+                });
+            }
+        }
+    }
+    let lineage_edges = parser
+        .accumulator
+        .claude_fork_parent
+        .as_ref()
+        .zip(parser.accumulator.source_session_id.as_ref())
+        .map(|(parent, child)| BTreeSet::from([(parent.clone(), child.clone())]))
+        .unwrap_or_default();
+    let parsed = parser
+        .finish_with_repository_identity(
+            &opened,
+            path,
+            collected_at,
+            fingerprint,
+            None,
+            Some(&ClaudeTitleMetadata::default()),
+            None,
+            None,
+            Some(claude_request_money::e2::ReadContext {
+                index: &listed,
+                path,
+                twins: &std::cell::OnceCell::new(),
+            }),
+        )
+        .map_err(|error| format!("parse: {error:#}"))?;
+    Ok(ParsedTarget {
+        missing,
+        lineage_edges,
+        complete: parsed.complete(),
+        snapshots: parsed.snapshots,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Producer
+
+#[derive(Debug, Clone)]
+struct TargetHold {
+    reason: HeldReason,
+    detail: String,
+}
+
+impl TargetHold {
+    fn new(reason: HeldReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+}
+
+struct TargetFile {
+    canonical_path: Option<PathBuf>,
+    path_sha256: String,
+    size_bytes: Option<u64>,
+    content_sha256: Option<String>,
+    error: Option<String>,
+}
+
+/// One target's canonical parse. `request_ids` is every native id it counts
+/// whenever the parse established them, even if the target itself is held:
+/// a held target's ids still take part in the batch allocation.
+struct TargetParse {
+    request_ids: Option<BTreeSet<String>>,
+    original: Result<OriginalTarget, TargetHold>,
+}
+
+struct OriginalTarget {
+    missing: Vec<MissingUsage>,
+    lineage_edges: BTreeSet<(String, String)>,
+    item: SnapshotItem,
+    request_ids: BTreeSet<String>,
+    totals: Dims,
+}
+
+/// Why the request sets of the whole batch cannot be trusted. Any entry holds
+/// every target without a body.
+#[derive(Default)]
+struct GlobalCoverage {
+    unknown: Vec<String>,
+    cap_overflow: Vec<String>,
+}
+
+impl GlobalCoverage {
+    fn complete(&self) -> bool {
+        self.unknown.is_empty() && self.cap_overflow.is_empty()
+    }
+
+    fn held_reason(&self) -> Option<HeldReason> {
+        if !self.cap_overflow.is_empty() {
+            Some(HeldReason::CapOverflow)
+        } else if !self.unknown.is_empty() {
+            Some(HeldReason::IncompleteCensus)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PeerHit {
+    /// Path witness of the file holding the first evidence: a peer file or,
+    /// for a fork copy inside another target, that target's transcript.
+    path_sha256: String,
+    owner_session_sha256: Option<String>,
+    line_count: u64,
+    /// The only evidence is a fork-copied line whose named source session
+    /// does not count the request anywhere in the census.
+    inherited_from_absent_source: bool,
+}
+
+/// A fork-copied line, in a peer or a target file, carrying a request some
+/// target counts. The parser never counts it in its own file, so it is not
+/// evidence that any session counts the id; it is resolved per line after the
+/// whole census is read.
+struct CopyClaim {
+    request_id: String,
+    /// The direct source session its `forkedFrom` names.
+    named_session: Option<String>,
+    /// The session that owns the file holding the copy.
+    holder_session: Option<String>,
+    path_sha256: String,
+}
+
+/// One peer transcript the metadata walk planned to read.
+struct PlannedPeer {
+    root_index: usize,
+    path: PathBuf,
+    size_bytes: u64,
+}
+
+#[derive(Default)]
+struct PeerScan {
+    roots: Vec<Value>,
+    files: Vec<Value>,
+    file_count: u64,
+    total_bytes: u64,
+    /// Breadth of the metadata walk: every directory entry examined, and the
+    /// directories listed.
+    walk_entry_count: u64,
+    walk_directory_count: u64,
+    planned_file_count: u64,
+    planned_bytes: u64,
+    over_cap_file_count: u64,
+    /// Peers that grew while read. Each is read as of its size when opened,
+    /// the same snapshot as a file created after the walk.
+    grown_during_read_count: u64,
+    /// Unparseable id-bearing final lines of grown peers: a record still being
+    /// written when the file was opened.
+    in_flight_tail_line_count: u64,
+    ignored_file_count: u64,
+    duplicate_path_count: u64,
+    covered_symlink_count: u64,
+    target_file_occurrences: u64,
+    unidentified_usage_line_count: u64,
+    /// Per target: request id -> first peer evidence.
+    hits: Vec<BTreeMap<String, PeerHit>>,
+    /// Per target: lines naming the target's own session (replicas, own forks).
+    same_session_line_count: Vec<u64>,
+    /// Lines in a replica of one target carrying a request that target counts
+    /// and other targets share. That overlap is between targets, so B2
+    /// allocates it; the replica is not independent peer evidence.
+    shared_target_replica_line_count: u64,
+    /// Per target: owned (not fork-copied) id-bearing usage lines naming the
+    /// target's own session whose id the target does not count.
+    replica_divergent_ids: Vec<BTreeSet<String>>,
+    copies: Vec<CopyClaim>,
+    /// Session -> target-held request ids it owns (not fork-copied) in a
+    /// scanned peer file.
+    owned_held_ids: BTreeMap<String, BTreeSet<String>>,
+    target_inherited_copy_line_count: u64,
+    inherited_resolved_line_count: u64,
+    inherited_absent_source_line_count: u64,
+    vanished_census_used: u64,
+    vanished_no_census: u64,
+    vanished_no_census_paths: Vec<PathBuf>,
+    lineage_held: BTreeSet<usize>,
+    lineage_edges: BTreeSet<(String, String)>,
+    tuple_hits: Vec<BTreeSet<String>>,
+    target_ranks: Vec<(Option<u64>, String)>,
+    tuple_targets: BTreeMap<String, BTreeSet<usize>>,
+    target_native_tuples: Vec<BTreeSet<String>>,
+    target_missing_tuples: Vec<BTreeMap<String, u64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Keeper {
+    /// Excluded from every holder; the index names a holder whose peer hits
+    /// carry the witness.
+    Peer(usize),
+    Target(usize),
+}
+
+struct Allocation {
+    /// Per target: excluded request id -> keeper.
+    excluded: Vec<BTreeMap<String, Keeper>>,
+    /// Per target: kept request id -> other targets that also hold it.
+    kept_shared: Vec<BTreeMap<String, Vec<usize>>>,
+    entries: Vec<Value>,
+    order: Vec<usize>,
+    sha256: String,
+}
+
+/// Build the artifact, the held operator packet and optional disclosures.
+pub(crate) fn produce(
+    input: &ProducerInput,
+    input_sha256: &str,
+    producer: &ProducerBuild,
+) -> Result<ProducerOutput, String> {
+    if input.contract_version != PRODUCER_INPUT_CONTRACT_VERSION {
+        return Err(format!(
+            "input contract_version must be {PRODUCER_INPUT_CONTRACT_VERSION}"
+        ));
+    }
+    let scope = OperatorScope {
+        operation_id: input.scope.operation_id.clone(),
+        user_id: input.scope.user_id.clone(),
+        organization_id: input.scope.organization_id.clone(),
+        device_id: input.scope.device_id.clone(),
+        machine_id: input.scope.machine_id.clone(),
+        producer_revision: input.scope.producer_revision.clone(),
+    };
+    let members = input
+        .targets
+        .iter()
+        .map(|target| ApprovedMember {
+            source_session_id: target.source_session_id.clone(),
+            session_key_sha256: target.session_key_sha256.clone(),
+            prior_refusal_body_witness: target.prior_refusal_body_witness.clone(),
+        })
+        .collect::<Vec<_>>();
+    validate_scope(&scope)?;
+    validate_members(&scope, &members)?;
+    time::OffsetDateTime::parse(
+        &input.collected_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| "collected_at must be RFC 3339".to_string())?;
+    validate_bounds(&input.bounds)?;
+    if input.peer_roots.is_empty() {
+        return Err("at least one peer root is required".to_string());
+    }
+    for root in &input.peer_roots {
+        if !PEER_ROOT_CLASSES.contains(&root.class.as_str()) {
+            return Err(format!(
+                "peer root class must be one of {PEER_ROOT_CLASSES:?}"
+            ));
+        }
+    }
+    if let Some(prices) = &input.catalog_prices {
+        validate_prices(prices)?;
+    }
+    let upload_policy = SnapshotUploadPolicy::from(input.upload_policy);
+    let target_count = input.targets.len();
+    let census = input
+        .census_index_path
+        .as_deref()
+        .map(CensusSnapshot::read)
+        .transpose()?;
+    let mut coverage = GlobalCoverage::default();
+
+    // 1. Targets: exact files and canonical original request sets.
+    let mut files = Vec::with_capacity(target_count);
+    let mut originals = Vec::with_capacity(target_count);
+    for (index, target) in input.targets.iter().enumerate() {
+        let file = target_file(&target.transcript_path);
+        let parse = match &file.error {
+            Some(error) => TargetParse {
+                request_ids: None,
+                original: Err(TargetHold::new(
+                    HeldReason::MissingEvidence,
+                    format!("transcript unreadable: {error}"),
+                )),
+            },
+            None => original_target(target, &input.collected_at, upload_policy, input),
+        };
+        if parse.request_ids.is_none() {
+            coverage
+                .unknown
+                .push(format!("target {index} request set unknown"));
+        }
+        files.push(file);
+        originals.push(parse);
+    }
+    let mut seen_paths = BTreeSet::new();
+    for path in files.iter().filter_map(|file| file.canonical_path.as_ref()) {
+        if !seen_paths.insert(path.clone()) {
+            return Err("target transcript paths must be distinct".to_string());
+        }
+    }
+
+    // 2. Peers: one bounded streaming pass, exact native id comparison.
+    let peers = scan_peers(input, &files, &originals, &mut coverage, census.as_ref());
+
+    // 3. B2 allocation for the whole batch, frozen before bodies and money.
+    let allocation = allocate(input, &originals, &peers)?;
+
+    // 4-5. Rebuild, reconcile and serialize each target.
+    let mut target_reports = Vec::with_capacity(target_count);
+    let mut packet_reasons = Vec::with_capacity(target_count);
+    let mut estimates = Vec::with_capacity(target_count);
+    for index in 0..target_count {
+        let built = build_target(
+            index,
+            input,
+            &scope,
+            &members,
+            upload_policy,
+            producer,
+            &files[index],
+            &originals[index].original,
+            &peers,
+            &allocation,
+            &coverage,
+        );
+        packet_reasons.push(built.reason);
+        estimates.push(built.estimate);
+        target_reports.push(built.report);
+    }
+
+    #[cfg(test)]
+    AFTER_BUILDS_FOR_TEST.with(|cell| {
+        if let Some(run) = cell.borrow_mut().take() {
+            run();
+        }
+    });
+    // SOURCE requires the one no-census re-stat at the end of the run, after
+    // rebuilds. The lineage holds above were provisional; a reappeared peer or
+    // failed stat refuses publication of the entire run, with no partial body.
+    for path in &peers.vanished_no_census_paths {
+        if !fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(
+                "vanished peer reappeared or end-of-run stat refused; no output published".into(),
+            );
+        }
+    }
+
+    // Held operator packet, each member bound to its content-free report.
+    let mut report_shas = Vec::with_capacity(target_count);
+    for report in &target_reports {
+        let mut content_free = report.clone();
+        if let Some(body) = content_free.get_mut("body").and_then(Value::as_object_mut) {
+            body.remove("unqualified_batch_request_json");
+        }
+        let canonical = crate::canonical_json::canonicalize(&content_free)
+            .map_err(|error| format!("target report: {error}"))?;
+        report_shas.push(sha256_hex(&canonical));
+    }
+    let packet = Packet {
+        contract_version: CANDIDATES_CONTRACT_VERSION,
+        operation_id: &scope.operation_id,
+        user_id: &scope.user_id,
+        organization_id: &scope.organization_id,
+        device_id: &scope.device_id,
+        machine_id: &scope.machine_id,
+        producer_revision: &scope.producer_revision,
+        collector_version: &producer.collector_version,
+        scope_session_keys: members
+            .iter()
+            .map(|member| member.session_key_sha256.as_str())
+            .collect(),
+        members: members
+            .iter()
+            .zip(&packet_reasons)
+            .zip(&report_shas)
+            .map(|((member, reason), report_sha)| PacketMember {
+                source_session_id: &member.source_session_id,
+                session_key_sha256: &member.session_key_sha256,
+                prior_refusal_body_witness: &member.prior_refusal_body_witness,
+                disposition: "held",
+                reason: reason.as_str(),
+                qualification_report_sha256: report_sha.clone(),
+                cross_session_conservation: Conservation::Unknown.as_str(),
+            })
+            .collect(),
+    };
+    let candidate_bundle_json =
+        serde_json::to_string(&packet).map_err(|error| format!("packet encoding: {error}"))?;
+    let report_bindings = members
+        .iter()
+        .zip(&report_shas)
+        .map(|(member, sha)| {
+            json!({
+                "session_key_sha256": member.session_key_sha256,
+                "qualification_report_sha256": sha,
+            })
+        })
+        .collect::<Vec<_>>();
+    let candidate_bundle_sha256 = sha256_hex(candidate_bundle_json.as_bytes());
+
+    let computed_count = target_reports
+        .iter()
+        .filter(|report| report["candidate_status"] == "computed_unqualified")
+        .count();
+    // Built apart: as part of one artifact literal it exceeds the json! macro
+    // recursion limit.
+    let input_manifest = json!({
+        "bounds": {
+            "max_walk_entries": input.bounds.max_walk_entries,
+            "max_peer_files": input.bounds.max_peer_files,
+            "max_peer_total_bytes": input.bounds.max_peer_total_bytes,
+            "max_peer_file_bytes": input.bounds.max_peer_file_bytes,
+            "max_line_bytes": input.bounds.max_line_bytes,
+        },
+        "target_files": files.iter().map(|file| json!({
+            "path_sha256": file.path_sha256,
+            "size_bytes": file.size_bytes,
+            "content_sha256": file.content_sha256,
+            "unreadable": file.error,
+        })).collect::<Vec<_>>(),
+        "peer_roots": peers.roots,
+        "peer_files": peers.files,
+        "walk_entry_count": peers.walk_entry_count,
+        "walk_directory_count": peers.walk_directory_count,
+        "planned_peer_file_count": peers.planned_file_count,
+        "planned_peer_bytes": peers.planned_bytes,
+        "over_cap_peer_file_count": peers.over_cap_file_count,
+        "peer_file_count": peers.file_count,
+        "cumulative_peer_bytes_read": peers.total_bytes,
+        "peer_grown_during_read_count": peers.grown_during_read_count,
+        "peer_in_flight_tail_line_count": peers.in_flight_tail_line_count,
+        "ignored_non_transcript_file_count": peers.ignored_file_count,
+        "duplicate_path_count": peers.duplicate_path_count,
+        "covered_symlink_count": peers.covered_symlink_count,
+        "target_file_occurrences_under_peer_roots": peers.target_file_occurrences,
+        "peer_unidentified_usage_line_count": peers.unidentified_usage_line_count,
+        "shared_target_replica_line_count": peers.shared_target_replica_line_count,
+        "target_inherited_copy_line_count": peers.target_inherited_copy_line_count,
+        "inherited_copy_resolved_line_count": peers.inherited_resolved_line_count,
+        "inherited_copy_absent_source_line_count": peers.inherited_absent_source_line_count,
+        "vanished_census_used": peers.vanished_census_used,
+        "vanished_census_limit": "owned request IDs only; inherited fork lines and vanished-file fork edges unavailable",
+        "vanished_no_census": {"peers": peers.vanished_no_census, "held_targets": peers.lineage_held.len()},
+        "census_snapshot": census.as_ref().map(|census| json!({"generation": census.generation, "sha256": census.sha256})),
+        "peer_unidentified_usage_note": "usage lines without a native request id cannot be compared; disclosed, not excluded",
+    });
+    let artifact = json!({
+        "contract_version": PRODUCER_ARTIFACT_CONTRACT_VERSION,
+        "local_only": true,
+        "admission_authority": "none",
+        "conservation_basis_note": "disclosed residual review input; never strict conservation certification",
+        "residual_statement": DISCLOSED_RESIDUAL_STATEMENT,
+        "operation_id": scope.operation_id,
+        "user_id": scope.user_id,
+        "organization_id": scope.organization_id,
+        "device_id": scope.device_id,
+        "machine_id": scope.machine_id,
+        "producer_revision": scope.producer_revision,
+        "producer_revision_source": super::PRODUCER_REVISION_SOURCE,
+        "producer_binary_sha256": producer.binary_sha256,
+        "collector_version": producer.collector_version,
+        "input_bundle_sha256": input_sha256,
+        "collected_at": input.collected_at,
+        "upload_policy": {
+            "session_titles_enabled": upload_policy.session_titles_enabled,
+            "workspace_labels_enabled": upload_policy.workspace_labels_enabled,
+            "session_artifacts_enabled": upload_policy.session_artifacts_enabled,
+            "session_attribution_enabled": upload_policy.session_attribution_enabled,
+            "session_attribution_labels_enabled": upload_policy.session_attribution_labels_enabled,
+        },
+        "context_curve_enabled": input.context_curve_enabled,
+        "not_reproduced_stages": NOT_REPRODUCED_STAGES,
+        "request_witness_scheme": REQUEST_WITNESS_SCHEME,
+        "request_set_fingerprint_scheme": "claude_request_id_set:v1",
+        "path_witness_scheme": PATH_WITNESS_SCHEME,
+        "scope_session_keys": members.iter().map(|member| member.session_key_sha256.as_str()).collect::<Vec<_>>(),
+        "input_manifest": input_manifest,
+        "global_coverage": {
+            "complete": coverage.complete() && peers.lineage_held.is_empty(),
+            "unknown": coverage.unknown,
+            "cap_overflow": coverage.cap_overflow,
+        },
+        "b2_allocation": {
+            "rule": B2_ALLOCATION_RULE,
+            "identity_rule": super::B2_IDENTITY_RULE,
+            "frozen_before_money": true,
+            "order": allocation.order.iter().map(|index| json!({
+                "session_key_sha256": members[*index].session_key_sha256,
+                "first_ack_order": input.targets[*index].b2_first_ack_order,
+            })).collect::<Vec<_>>(),
+            "entries": allocation.entries,
+            "sha256": allocation.sha256,
+        },
+        "qualification_gaps": [
+            "source_cost_si_review_of_this_artifact_pending",
+            "session_readonly_prepare_pending",
+            "approved_conservation_pending",
+            "producer_revision_unverified",
+        ],
+        "qualification_report_scheme": "sha256(rfc8785(target report with the body bytes removed and the body sha256 kept))",
+        "qualification_reports": report_bindings,
+        "targets": target_reports,
+    });
+    let artifact_json =
+        serde_json::to_string(&artifact).map_err(|error| format!("artifact encoding: {error}"))?;
+    let artifact_sha256 = sha256_hex(artifact_json.as_bytes());
+
+    // Disclosures pin the artifact; only targets with an available estimate.
+    let disclosures_json = match &input.catalog_prices {
+        Some(prices) => {
+            let mut records = Vec::new();
+            for (index, estimate) in estimates.iter().enumerate() {
+                let Some((excluded, dollars)) = estimate else {
+                    continue;
+                };
+                let summary = LocalExclusionSummary {
+                    exclusion_artifact_sha256: artifact_sha256.clone(),
+                    excluded_request_count: excluded.request_count,
+                    excluded_token_counts: excluded.excluded_token_counts(),
+                    excluded_catalog_cost_usd: dollars.clone(),
+                    copy_screen: CopyScreen::NotRun {
+                        reason: COPY_SCREEN_NOT_RUN_REASON.to_string(),
+                    },
+                };
+                let record = local_exclusion_disclosure_json(&scope, &members, &summary)?;
+                let disclosure_sha256 = sha256_hex(record.as_bytes());
+                // The frozen record names only the batch scope; this binds it
+                // to its target.
+                let target_binding_sha256 = sha256_hex(
+                    format!("{}\n{disclosure_sha256}", members[index].session_key_sha256)
+                        .as_bytes(),
+                );
+                records.push(json!({
+                    "session_key_sha256": members[index].session_key_sha256,
+                    "disclosure_sha256": disclosure_sha256,
+                    "target_binding_sha256": target_binding_sha256,
+                    "disclosure_json": record,
+                }));
+            }
+            let disclosures = json!({
+                "contract_version": PRODUCER_DISCLOSURES_CONTRACT_VERSION,
+                "exclusion_artifact_sha256": artifact_sha256,
+                "estimate_label": ESTIMATE_LABEL,
+                "catalog_publication": {
+                    "source": prices.publication.source,
+                    "revision": prices.publication.revision,
+                    "sha256": prices.publication.sha256,
+                },
+                "records": records,
+            });
+            Some(
+                serde_json::to_string(&disclosures)
+                    .map_err(|error| format!("disclosures encoding: {error}"))?,
+            )
+        }
+        None => None,
+    };
+
+    let mut reason_counts = BTreeMap::<&str, u64>::new();
+    for reason in &packet_reasons {
+        *reason_counts.entry(reason.as_str()).or_default() += 1;
+    }
+    let summary = json!({
+        "contract_version": PRODUCER_SUMMARY_CONTRACT_VERSION,
+        "artifact_sha256": artifact_sha256,
+        "candidate_bundle_sha256": candidate_bundle_sha256,
+        "disclosures_sha256": disclosures_json.as_deref().map(|json| sha256_hex(json.as_bytes())),
+        "input_bundle_sha256": input_sha256,
+        "global_coverage_complete": coverage.complete() && peers.lineage_held.is_empty(),
+        "computed_unqualified_candidates": computed_count,
+        "held_packet_members": target_count,
+        "held_reason_counts": reason_counts,
+        "peer_file_count": peers.file_count,
+        "cumulative_peer_bytes_read": peers.total_bytes,
+        "b2_allocation_sha256": allocation.sha256,
+        "admission_authority": "none",
+    });
+    // Refuse concurrent state publication even if no vanished peer used it.
+    // Atomic replacement, same-generation rewrites and in-place writes are all
+    // detected by the content digest plus opened/path metadata and generation.
+    if let (Some(path), Some(snapshot)) = (&input.census_index_path, &census) {
+        snapshot.verify(path)?;
+    }
+
+    Ok(ProducerOutput {
+        artifact_json,
+        artifact_sha256,
+        candidate_bundle_json,
+        candidate_bundle_sha256,
+        disclosures_json,
+        summary,
+    })
+}
+
+fn validate_bounds(bounds: &InputBounds) -> Result<(), String> {
+    if bounds.max_walk_entries == 0
+        || bounds.max_peer_files == 0
+        || bounds.max_peer_total_bytes == 0
+        || bounds.max_peer_file_bytes == 0
+        || bounds.max_line_bytes == 0
+    {
+        return Err("every bound must be positive".to_string());
+    }
+    if bounds.max_peer_file_bytes > PEER_FILE_BYTES_CEILING
+        || bounds.max_line_bytes > MAX_JSONL_LINE_BYTES as u64
+    {
+        return Err(
+            "bounds may not exceed the peer file ceiling or the parser's line cap".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_prices(prices: &CatalogPrices) -> Result<(), String> {
+    if !super::is_lower_hex(&prices.publication.sha256, 64)
+        || prices.publication.source.trim().is_empty()
+        || prices.publication.revision.trim().is_empty()
+    {
+        return Err("catalog publication needs source, revision and a 64-hex sha256".to_string());
+    }
+    for (key, rates) in &prices.rates_usd_per_mtok {
+        if key.split_once('|').is_none() {
+            return Err("catalog rate keys are <model>|<context_bucket>".to_string());
+        }
+        for rate in [
+            &rates.input,
+            &rates.output,
+            &rates.cache_read,
+            &rates.cache_creation_5m,
+            &rates.cache_creation_1h,
+        ] {
+            if parse_rate(rate).is_none() {
+                return Err(format!(
+                    "catalog rates must be exact decimals with at most {RATE_FRACTION_DIGITS} fraction digits"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(cap + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > cap {
+        return Err(format!("larger than {cap} bytes"));
+    }
+    Ok(bytes)
+}
+
+fn path_sha256(path: &Path) -> String {
+    sha256_hex(path.to_string_lossy().as_bytes())
+}
+
+fn hash_file(path: &Path, cap: u64) -> Result<(u64, String), String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let mut reader = file.take(cap + 1);
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        digest.update(&buffer[..read]);
+    }
+    if total > cap {
+        return Err(format!("larger than {cap} bytes"));
+    }
+    Ok((total, format!("{:x}", digest.finalize())))
+}
+
+fn target_file(path: &Path) -> TargetFile {
+    let unreadable = |error: String| TargetFile {
+        canonical_path: None,
+        path_sha256: path_sha256(path),
+        size_bytes: None,
+        content_sha256: None,
+        error: Some(error),
+    };
+    let canonical_path = match fs::canonicalize(path) {
+        Ok(canonical) if canonical != path => {
+            // The parser and the unchanged-file checks must read one path.
+            return unreadable("transcript_path is not canonical".to_string());
+        }
+        Ok(path) if path.is_file() => path,
+        Ok(_) => return unreadable("not a regular file".to_string()),
+        Err(error) => return unreadable(error.to_string()),
+    };
+    match hash_file(&canonical_path, TARGET_FILE_BYTES_CAP) {
+        Ok((size_bytes, content_sha256)) => TargetFile {
+            path_sha256: path_sha256(&canonical_path),
+            canonical_path: Some(canonical_path),
+            size_bytes: Some(size_bytes),
+            content_sha256: Some(content_sha256),
+            error: None,
+        },
+        Err(error) => unreadable(error),
+    }
+}
+
+/// Canonical parse of one unchanged target and its exact request set.
+fn original_target(
+    target: &InputTarget,
+    collected_at: &str,
+    upload_policy: SnapshotUploadPolicy,
+    input: &ProducerInput,
+) -> TargetParse {
+    let unknown = |detail: String| TargetParse {
+        request_ids: None,
+        original: Err(TargetHold::new(HeldReason::MissingEvidence, detail)),
+    };
+    let parsed = match parse_target_transcript(
+        &target.transcript_path,
+        collected_at,
+        upload_policy.session_artifacts_enabled,
+        input.context_curve_enabled,
+        None,
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => return unknown(error),
+    };
+    if !parsed.complete {
+        return unknown("transcript parse incomplete".to_string());
+    }
+    let item = match single_item(parsed.snapshots, &target.source_session_id) {
+        Ok(item) => item,
+        Err(hold) => {
+            return TargetParse {
+                request_ids: None,
+                original: Err(hold),
+            }
+        }
+    };
+    let request_ids = item.claude_usage_request_ids.clone();
+    let held = |detail: &str| TargetParse {
+        request_ids: Some(request_ids.clone()),
+        original: Err(TargetHold::new(HeldReason::MissingEvidence, detail)),
+    };
+    // Id-less responses are disclosed residuals, not missing money. A duplicate
+    // native id on distinct responses is still unsupported.
+    if item.claude_usage_occurrences.len() != request_ids.len() {
+        return held("native request occurrence set does not reconcile");
+    }
+    if item.request_count == 0 {
+        return held("no counted usage");
+    }
+    let totals = Dims::of_item(&item);
+    let occurrence_sum = sum_dims(
+        item.claude_usage_occurrences
+            .values()
+            .map(|occurrence| &occurrence.usage),
+    );
+    let missing_sum = sum_missing(&parsed.missing);
+    if occurrence_sum.and_then(|dims| dims.checked_add(missing_sum?)) != Some(totals) {
+        return held("unsupported grain: item totals differ from per-request usage");
+    }
+    if let Some(detail) = row_mismatch(&item, totals) {
+        return held(detail);
+    }
+    if has_request_identity_evidence(&item) {
+        return held("unsupported: body carries request identity evidence");
+    }
+    if item.claude_money.is_some() {
+        return held(
+            "unsupported: E2 request-owned fold applied; only the ordinary read is produced",
+        );
+    }
+    TargetParse {
+        request_ids: Some(request_ids.clone()),
+        original: Ok(OriginalTarget {
+            missing: parsed.missing,
+            lineage_edges: parsed.lineage_edges,
+            item,
+            request_ids,
+            totals,
+        }),
+    }
+}
+
+fn single_item(snapshots: Vec<SnapshotItem>, session_id: &str) -> Result<SnapshotItem, TargetHold> {
+    let total = snapshots.len();
+    let mut matching = snapshots
+        .into_iter()
+        .filter(|item| item.source_session_id == session_id)
+        .collect::<Vec<_>>();
+    match (total, matching.len()) {
+        (1, 1) => Ok(matching.remove(0)),
+        (_, 0) => Err(TargetHold::new(
+            HeldReason::MissingEvidence,
+            "transcript has no item for the target session",
+        )),
+        _ => Err(TargetHold::new(
+            HeldReason::UnknownOwner,
+            "transcript yields more than one item",
+        )),
+    }
+}
+
+/// Present usage rows must add up to the item totals exactly.
+fn row_mismatch(item: &SnapshotItem, totals: Dims) -> Option<&'static str> {
+    if !item.model_usage.is_empty() {
+        let sum = item
+            .model_usage
+            .iter()
+            .try_fold(Dims::default(), |sum, row| {
+                sum.checked_add(Dims::of_row(row))
+            });
+        if sum != Some(totals) {
+            return Some("unsupported grain: model rows differ from item totals");
+        }
+    }
+    if !item.usage_buckets.is_empty() {
+        let sum = item
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+            .try_fold(Dims::default(), |sum, row| {
+                sum.checked_add(Dims::of_row(row))
+            });
+        if sum != Some(totals) {
+            return Some("unsupported grain: bucket rows differ from item totals");
+        }
+    }
+    None
+}
+
+fn has_request_identity_evidence(item: &SnapshotItem) -> bool {
+    !item.request_evidence.is_empty()
+        || item.request_identity_refusals > 0
+        || item
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+            .chain(&item.model_usage)
+            .any(|row| row.evidence_ref.is_some() || row.identity_parts.is_some())
+}
+
+/// The parser's own session-id rule: the first line naming one fixes it for
+/// the whole file.
+fn line_session_id(value: &Value) -> Option<String> {
+    string_at(value, &["sessionId"])
+        .or_else(|| string_at(value, &["session_id"]))
+        .or_else(|| string_at(value, &["conversation_id"]))
+}
+
+fn transcript_like_compressed(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains(".jsonl.")
+        && COMPRESSED_EXTENSIONS
+            .iter()
+            .any(|extension| lower.ends_with(&format!(".{extension}")))
+}
+
+fn scan_peers(
+    input: &ProducerInput,
+    targets: &[TargetFile],
+    originals: &[TargetParse],
+    coverage: &mut GlobalCoverage,
+    census: Option<&CensusSnapshot>,
+) -> PeerScan {
+    let target_count = targets.len();
+    let mut scan = PeerScan {
+        hits: vec![BTreeMap::new(); target_count],
+        tuple_hits: vec![BTreeSet::new(); target_count],
+        target_native_tuples: vec![BTreeSet::new(); target_count],
+        target_missing_tuples: vec![BTreeMap::new(); target_count],
+        target_ranks: input
+            .targets
+            .iter()
+            .map(|target| (target.b2_first_ack_order, target.session_key_sha256.clone()))
+            .collect(),
+        same_session_line_count: vec![0; target_count],
+        shared_target_replica_line_count: 0,
+        replica_divergent_ids: vec![BTreeSet::new(); target_count],
+        ..PeerScan::default()
+    };
+    // Exact native id -> targets that count it.
+    let holders = request_holders(originals);
+    let session_index = input
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| (target.source_session_id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let target_paths = targets
+        .iter()
+        .filter_map(|file| file.canonical_path.clone())
+        .collect::<BTreeSet<_>>();
+    // Index canonical target tuples once. Native-only inputs do no matching
+    // hashes at all; no peer line rehashes an owner's occurrence collection.
+    for (index, original) in originals.iter().enumerate() {
+        if let Ok(original) = &original.original {
+            for tuple in original
+                .missing
+                .iter()
+                .filter_map(|missing| missing.tuple.as_ref())
+            {
+                scan.tuple_targets
+                    .entry(tuple.clone())
+                    .or_default()
+                    .insert(index);
+                *scan.target_missing_tuples[index]
+                    .entry(tuple.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+    if !scan.tuple_targets.is_empty() {
+        for (index, original) in originals.iter().enumerate() {
+            if let Ok(original) = &original.original {
+                scan.target_native_tuples[index] = original
+                    .item
+                    .claude_usage_occurrences
+                    .values()
+                    .filter_map(|usage| {
+                        usage_tuple(
+                            usage.timestamp.as_deref(),
+                            usage.model.as_deref(),
+                            &usage.usage,
+                        )
+                    })
+                    .collect();
+            }
+        }
+        for (tuple, indexes) in &scan.tuple_targets {
+            for &index in indexes {
+                for other_index in 0..target_count {
+                    if index == other_index {
+                        continue;
+                    }
+                    let rank = |i: usize| {
+                        (
+                            scan.target_ranks[i].0.is_none(),
+                            scan.target_ranks[i].0,
+                            &scan.target_ranks[i].1,
+                        )
+                    };
+                    if scan.target_native_tuples[other_index].contains(tuple)
+                        || (rank(other_index) < rank(index)
+                            && scan.target_missing_tuples[other_index].contains_key(tuple))
+                    {
+                        scan.tuple_hits[index].insert(format!(
+                            "{}\n{tuple}",
+                            input.targets[other_index].transcript_path.to_string_lossy()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let mut canonical_roots = Vec::new();
+    for root in &input.peer_roots {
+        match fs::canonicalize(&root.path) {
+            Ok(path) if path.is_dir() => canonical_roots.push((root.class.as_str(), path)),
+            _ => coverage
+                .unknown
+                .push(format!("peer root {} unreadable", path_sha256(&root.path))),
+        }
+    }
+
+    // Plan from metadata alone; no peer content is read unless the whole plan
+    // fits every budget.
+    let planned = plan_peer_walk(
+        input.bounds,
+        &canonical_roots,
+        &target_paths,
+        &mut scan,
+        coverage,
+    );
+    for target in &input.targets {
+        register_path_lineage(&target.transcript_path, &mut scan.lineage_edges);
+    }
+    for peer in &planned {
+        register_path_lineage(&peer.path, &mut scan.lineage_edges);
+    }
+    for indexes in holders.values() {
+        for pair in indexes.windows(2) {
+            scan.lineage_edges.insert((
+                root_id(&input.targets[pair[0]].source_session_id).to_string(),
+                root_id(&input.targets[pair[1]].source_session_id).to_string(),
+            ));
+        }
+    }
+    #[cfg(test)]
+    AFTER_PLAN_FOR_TEST.with(|cell| {
+        if let Some(run) = cell.borrow_mut().take() {
+            run();
+        }
+    });
+    let mut vanished = Vec::new();
+    let mut root_totals = vec![(0_u64, 0_u64); canonical_roots.len()];
+    if coverage.cap_overflow.is_empty() {
+        for peer in &planned {
+            if scan.total_bytes.saturating_add(peer.size_bytes) > input.bounds.max_peer_total_bytes
+            {
+                coverage
+                    .cap_overflow
+                    .push("max_peer_total_bytes reached while reading".to_string());
+                break;
+            }
+            let bytes_before = scan.total_bytes;
+            // Only an ENOENT on the initial open gets the vanished-peer rule.
+            // Later read/stat failures retain the existing global fail-closed gate.
+            if fs::metadata(&peer.path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                vanished.push(peer);
+                scan.file_count += 1;
+                root_totals[peer.root_index].0 += 1;
+                continue;
+            }
+            let outcome = scan_peer_file(
+                &peer.path,
+                input.bounds,
+                &holders,
+                &session_index,
+                originals,
+                &mut scan,
+            );
+            scan.file_count += 1;
+            root_totals[peer.root_index].0 += 1;
+            root_totals[peer.root_index].1 += scan.total_bytes - bytes_before;
+            let class = canonical_roots[peer.root_index].0;
+            match outcome {
+                Ok((bytes, content_sha256)) => {
+                    scan.files.push(json!({
+                        "class": class,
+                        "path_sha256": path_sha256(&peer.path),
+                        "size_bytes": bytes,
+                        "content_sha256": content_sha256,
+                    }));
+                }
+                Err(detail) if detail == VANISHED_ON_OPEN => {
+                    vanished.push(peer);
+                }
+                Err(detail) => {
+                    scan.files.push(json!({
+                        "class": class,
+                        "path_sha256": path_sha256(&peer.path),
+                        "unknown": detail,
+                    }));
+                    coverage
+                        .unknown
+                        .push(format!("peer file {}: {detail}", path_sha256(&peer.path)));
+                }
+            }
+        }
+    }
+    for ((class, root), (files, bytes)) in canonical_roots.iter().zip(root_totals) {
+        scan.roots.push(json!({
+            "class": class,
+            "path_sha256": path_sha256(root),
+            "transcript_file_count": files,
+            "bytes_read": bytes,
+        }));
+    }
+    // A census that never read a target's own tree cannot see its peers.
+    if !canonical_roots
+        .iter()
+        .any(|(class, _)| *class == "projects")
+    {
+        coverage
+            .unknown
+            .push("no projects root was scanned".to_string());
+    }
+    for file in targets {
+        if let Some(path) = &file.canonical_path {
+            if !canonical_roots
+                .iter()
+                .any(|(_, root)| path.starts_with(root))
+            {
+                coverage.unknown.push(format!(
+                    "target {} is under no scanned peer root",
+                    file.path_sha256
+                ));
+            }
+        }
+    }
+    scan_target_copies(input, targets, originals, &holders, &mut scan, coverage);
+    resolve_fork_copies(&mut scan, &holders, &session_index, originals);
+    for original in originals
+        .iter()
+        .filter_map(|parse| parse.original.as_ref().ok())
+    {
+        scan.lineage_edges
+            .extend(original.lineage_edges.iter().cloned());
+    }
+    // Compute provisional lineage holds. Their single re-stat is deferred until
+    // after target rebuilds, before any run output is published.
+    for peer in vanished {
+        resolve_vanished(peer, input, originals, census, &mut scan, coverage);
+    }
+    scan
+}
+
+/// The metadata walk: every entry under every root is counted against
+/// `max_walk_entries`, and every peer transcript is sized against the file
+/// cap. The plan's file count and bytes must fit the run's budgets. Any
+/// overrun is recorded as a cap overflow, and then nothing is read.
+fn plan_peer_walk(
+    bounds: InputBounds,
+    canonical_roots: &[(&str, PathBuf)],
+    target_paths: &BTreeSet<PathBuf>,
+    scan: &mut PeerScan,
+    coverage: &mut GlobalCoverage,
+) -> Vec<PlannedPeer> {
+    let mut planned = Vec::new();
+    let mut visited = BTreeSet::new();
+    'roots: for (root_index, (_, root)) in canonical_roots.iter().enumerate() {
+        let mut stack = vec![root.clone()];
+        while let Some(directory) = stack.pop() {
+            scan.walk_directory_count += 1;
+            let mut entries = match list_directory_within(
+                &directory,
+                bounds.max_walk_entries,
+                &mut scan.walk_entry_count,
+            ) {
+                Ok(Some(entries)) => entries,
+                Ok(None) => {
+                    coverage
+                        .cap_overflow
+                        .push("max_walk_entries reached".to_string());
+                    break 'roots;
+                }
+                Err(_) => {
+                    coverage.unknown.push(format!(
+                        "peer directory {} unreadable",
+                        path_sha256(&directory)
+                    ));
+                    continue;
+                }
+            };
+            entries.sort_by_key(|entry| entry.file_name());
+            let mut subdirectories = Vec::new();
+            for entry in entries {
+                let path = entry.path();
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    coverage
+                        .unknown
+                        .push(format!("peer entry {} unreadable", path_sha256(&path)));
+                    continue;
+                };
+                if metadata.file_type().is_symlink() {
+                    // Covered only when the walk reaches the same content under
+                    // a transcript name.
+                    let names_transcript = |path: &Path| {
+                        path.file_name()
+                            .is_some_and(|name| name.to_string_lossy().ends_with(".jsonl"))
+                    };
+                    let covered = fs::canonicalize(&path).is_ok_and(|resolved| {
+                        canonical_roots
+                            .iter()
+                            .any(|(_, root)| resolved.starts_with(root))
+                            && (!names_transcript(&path) || names_transcript(&resolved))
+                    });
+                    if covered {
+                        scan.covered_symlink_count += 1;
+                    } else {
+                        coverage
+                            .unknown
+                            .push(format!("uncovered symlink {}", path_sha256(&path)));
+                    }
+                    continue;
+                }
+                if metadata.is_dir() {
+                    subdirectories.push(path);
+                    continue;
+                }
+                if !metadata.is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if transcript_like_compressed(&name) {
+                    coverage.unknown.push(format!(
+                        "unsupported compressed transcript {}",
+                        path_sha256(&path)
+                    ));
+                    continue;
+                }
+                if !name.ends_with(".jsonl") {
+                    scan.ignored_file_count += 1;
+                    continue;
+                }
+                if !visited.insert(path.clone()) {
+                    scan.duplicate_path_count += 1;
+                    continue;
+                }
+                if target_paths.contains(&path) {
+                    scan.target_file_occurrences += 1;
+                    continue;
+                }
+                if metadata.len() > bounds.max_peer_file_bytes {
+                    scan.over_cap_file_count += 1;
+                    coverage.cap_overflow.push(format!(
+                        "peer file {} over max_peer_file_bytes",
+                        path_sha256(&path)
+                    ));
+                    continue;
+                }
+                scan.planned_file_count += 1;
+                scan.planned_bytes = scan.planned_bytes.saturating_add(metadata.len());
+                planned.push(PlannedPeer {
+                    root_index,
+                    path,
+                    size_bytes: metadata.len(),
+                });
+            }
+            // Reversed so the stack visits directory names in ascending order.
+            stack.extend(subdirectories.into_iter().rev());
+        }
+    }
+    if scan.planned_file_count > bounds.max_peer_files {
+        coverage.cap_overflow.push(format!(
+            "max_peer_files exceeded: {} planned",
+            scan.planned_file_count
+        ));
+    }
+    if scan.planned_bytes > bounds.max_peer_total_bytes {
+        coverage.cap_overflow.push(format!(
+            "max_peer_total_bytes exceeded: {} planned",
+            scan.planned_bytes
+        ));
+    }
+    planned
+}
+
+/// One directory's entries, each charged to the walk budget as it is read, so
+/// a huge directory is never listed past the budget. `None`: the budget ran
+/// out inside this directory.
+fn list_directory_within(
+    directory: &Path,
+    max_walk_entries: u64,
+    walk_entry_count: &mut u64,
+) -> std::io::Result<Option<Vec<fs::DirEntry>>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        *walk_entry_count += 1;
+        if *walk_entry_count > max_walk_entries {
+            return Ok(None);
+        }
+        entries.push(entry?);
+    }
+    Ok(Some(entries))
+}
+
+/// Fork-copied lines inside the targets' own transcripts. The parser skips
+/// them, so only this pass sees them. The file must still be the bytes the
+/// target was parsed from.
+fn scan_target_copies(
+    input: &ProducerInput,
+    targets: &[TargetFile],
+    originals: &[TargetParse],
+    holders: &BTreeMap<&str, Vec<usize>>,
+    scan: &mut PeerScan,
+    coverage: &mut GlobalCoverage,
+) {
+    for (index, file) in targets.iter().enumerate() {
+        let Some(path) = &file.canonical_path else {
+            continue;
+        };
+        if originals[index].request_ids.is_none() {
+            continue;
+        }
+        let holder = input.targets[index].source_session_id.clone();
+        match read_target_copies(path, holders) {
+            Ok(TargetCopies {
+                size_bytes,
+                content_sha256,
+                copies,
+                lineage_edges,
+            }) if Some(size_bytes) == file.size_bytes
+                && Some(&content_sha256) == file.content_sha256.as_ref() =>
+            {
+                scan.lineage_edges.extend(lineage_edges);
+                scan.target_inherited_copy_line_count += copies.len() as u64;
+                scan.copies
+                    .extend(
+                        copies
+                            .into_iter()
+                            .map(|(request_id, named_session)| CopyClaim {
+                                request_id,
+                                named_session,
+                                holder_session: Some(holder.clone()),
+                                path_sha256: file.path_sha256.clone(),
+                            }),
+                    );
+            }
+            Ok(_) => coverage.unknown.push(format!(
+                "target {} changed before its fork copies were read",
+                file.path_sha256
+            )),
+            Err(error) => coverage.unknown.push(format!(
+                "target {} fork copies unreadable: {error}",
+                file.path_sha256
+            )),
+        }
+    }
+}
+
+/// A target transcript's bytes as read, and its fork copies of held requests.
+struct TargetCopies {
+    size_bytes: u64,
+    content_sha256: String,
+    /// (request id, the source session the copy names)
+    copies: Vec<(String, Option<String>)>,
+    lineage_edges: BTreeSet<(String, String)>,
+}
+
+/// Stream one target transcript for its fork-copied lines carrying a request
+/// some target counts.
+fn read_target_copies(
+    path: &Path,
+    holders: &BTreeMap<&str, Vec<usize>>,
+) -> Result<TargetCopies, String> {
+    let file = File::open(path).map_err(|error| format!("open: {error}"))?;
+    let mut reader = BufReader::new(file.take(TARGET_FILE_BYTES_CAP + 1));
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut line = Vec::new();
+    let mut copies = Vec::new();
+    let mut lineage_edges = BTreeSet::new();
+    loop {
+        line.clear();
+        let read = (&mut reader)
+            .take(MAX_JSONL_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("read: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        digest.update(&line);
+        let text = line.strip_suffix(b"\n").unwrap_or(&line);
+        if !contains(text, b"\"forkedFrom\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(text) else {
+            continue;
+        };
+        if let Some((owner, parent)) = line_session_id(&value).zip(forked_from_session(&value)) {
+            lineage_edges.insert((owner, parent));
+        }
+        if claude_fork_line_provenance(&value) != ClaudeForkLineProvenance::Inherited
+            || claude_code_delta_usage(&value).is_none()
+        {
+            continue;
+        }
+        if let Some(request_id) = line_request_id(&value) {
+            if holders.contains_key(request_id.as_str()) {
+                copies.push((request_id, forked_from_session(&value)));
+            }
+        }
+    }
+    Ok(TargetCopies {
+        size_bytes: total,
+        content_sha256: format!("{:x}", digest.finalize()),
+        copies,
+        lineage_edges,
+    })
+}
+
+fn forked_from_session(value: &Value) -> Option<String> {
+    value
+        .get("forkedFrom")
+        .and_then(|forked| forked.get("sessionId").or_else(|| forked.get("session_id")))
+        .and_then(Value::as_str)
+        .map(|session| session.trim().to_string())
+        .filter(|session| !session.is_empty())
+}
+
+/// A fork-copied line names its direct source session. The copy adds nothing
+/// when that source counts the request itself: a target whose request set
+/// holds it, or a session owning it in a scanned peer file (that owned line
+/// already produced its own evidence). Otherwise the source's own copy of the
+/// same request, if any, is followed to the session it names, and so on. A
+/// copy with no such counting source anywhere in the census (deleted, never
+/// scanned, or present but not holding the request) is kept as conservative
+/// peer evidence: an undercount, never a double count.
+fn resolve_fork_copies(
+    scan: &mut PeerScan,
+    holders: &BTreeMap<&str, Vec<usize>>,
+    session_index: &BTreeMap<&str, usize>,
+    originals: &[TargetParse],
+) {
+    let copies = std::mem::take(&mut scan.copies);
+    let accounted = {
+        let mut copies_by_holder = BTreeMap::<(&str, &str), Vec<&str>>::new();
+        for copy in &copies {
+            if let (Some(holder), Some(named)) = (&copy.holder_session, &copy.named_session) {
+                copies_by_holder
+                    .entry((holder.as_str(), copy.request_id.as_str()))
+                    .or_default()
+                    .push(named.as_str());
+            }
+        }
+        let owned_held_ids = &scan.owned_held_ids;
+        let counts = |session: &str, request_id: &str| {
+            session_index.get(session).is_some_and(|index| {
+                originals[*index]
+                    .request_ids
+                    .as_ref()
+                    .is_some_and(|request_ids| request_ids.contains(request_id))
+            }) || owned_held_ids
+                .get(session)
+                .is_some_and(|request_ids| request_ids.contains(request_id))
+        };
+        copies
+            .iter()
+            .map(|copy| {
+                let request_id = copy.request_id.as_str();
+                let mut visited = BTreeSet::new();
+                let mut pending = copy
+                    .named_session
+                    .as_deref()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                while let Some(session) = pending.pop() {
+                    if !visited.insert(session) {
+                        continue;
+                    }
+                    if counts(session, request_id) {
+                        return true;
+                    }
+                    pending.extend(
+                        copies_by_holder
+                            .get(&(session, request_id))
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    );
+                }
+                false
+            })
+            .collect::<Vec<_>>()
+    };
+    for (copy, accounted) in copies.into_iter().zip(accounted) {
+        if accounted {
+            scan.inherited_resolved_line_count += 1;
+            continue;
+        }
+        scan.inherited_absent_source_line_count += 1;
+        for &target in holders.get(copy.request_id.as_str()).into_iter().flatten() {
+            scan.hits[target]
+                .entry(copy.request_id.clone())
+                .or_insert_with(|| PeerHit {
+                    path_sha256: copy.path_sha256.clone(),
+                    owner_session_sha256: copy
+                        .named_session
+                        .as_deref()
+                        .map(|session| sha256_hex(session.as_bytes())),
+                    line_count: 0,
+                    inherited_from_absent_source: true,
+                })
+                .line_count += 1;
+        }
+    }
+}
+
+/// Stream one peer transcript as of its size when opened. Returns its byte
+/// count and content hash; an error leaves coverage unknown.
+fn scan_peer_file(
+    path: &Path,
+    bounds: InputBounds,
+    holders: &BTreeMap<&str, Vec<usize>>,
+    session_index: &BTreeMap<&str, usize>,
+    originals: &[TargetParse],
+    scan: &mut PeerScan,
+) -> Result<(u64, String), String> {
+    let file = File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            VANISHED_ON_OPEN.to_string()
+        } else {
+            format!("open: {error}")
+        }
+    })?;
+    let before = file.metadata().map_err(|error| format!("stat: {error}"))?;
+    let opened_len = before.len();
+    if opened_len > bounds.max_peer_file_bytes {
+        return Err("over max_peer_file_bytes when opened".to_string());
+    }
+    let mut reader = BufReader::new(file.take(opened_len));
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut line = Vec::new();
+    let path_witness = path_sha256(path);
+    // A subagent transcript is keyed by its path, like the parser does.
+    let subagent_session =
+        claude_subagent_identity(path).map(|identity| identity.source_session_id());
+    let mut file_session = None::<String>;
+    let mut copies = Vec::new();
+    let mut lineage_owner_bound = false;
+    let mut replica_responses: Option<SnapshotAccumulator> = None;
+    let mut idless_before_owner = false;
+    loop {
+        line.clear();
+        let read = (&mut reader)
+            .take(bounds.max_line_bytes + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("read: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        // Charged as read, so a failed or growing file still spends the budget.
+        scan.total_bytes += read as u64;
+        if total > bounds.max_peer_file_bytes || scan.total_bytes > bounds.max_peer_total_bytes {
+            return Err("read past the peer byte bounds".to_string());
+        }
+        digest.update(&line);
+        let terminated = line.last() == Some(&b'\n');
+        if read as u64 > bounds.max_line_bytes && !terminated {
+            return Err("line over max_line_bytes".to_string());
+        }
+        let text = line.strip_suffix(b"\n").unwrap_or(&line);
+        let has_id_key = contains(text, b"\"requestId\"") || contains(text, b"\"request_id\"");
+        let may_name_session = file_session.is_none()
+            && [
+                &b"\"sessionId\""[..],
+                b"\"session_id\"",
+                b"\"conversation_id\"",
+            ]
+            .iter()
+            .any(|key| contains(text, key));
+        if !has_id_key
+            && !may_name_session
+            && !contains(text, b"usage")
+            && !contains(text, b"parentSessionId")
+            && !contains(text, b"forkedFrom")
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(text) else {
+            if has_id_key {
+                // The unterminated last line of a file that has grown since it
+                // was opened is a record still being written: not yet history.
+                let in_flight = !terminated
+                    && total == opened_len
+                    && reader
+                        .get_ref()
+                        .get_ref()
+                        .metadata()
+                        .is_ok_and(|now| now.len() > opened_len);
+                if in_flight {
+                    scan.in_flight_tail_line_count += 1;
+                    continue;
+                }
+                return Err("unparseable line with a request id key".to_string());
+            }
+            continue;
+        };
+        if file_session.is_none() {
+            file_session = line_session_id(&value);
+        }
+        let owner = subagent_session.as_ref().or(file_session.as_ref());
+        if !lineage_owner_bound {
+            if let Some((owner, root)) = owner.zip(family_root(path)) {
+                scan.lineage_edges.insert((owner.clone(), root.to_string()));
+                lineage_owner_bound = true;
+            }
+        }
+        let owner_index = owner
+            .and_then(|owner| session_index.get(owner.as_str()))
+            .copied();
+        for parent in [
+            forked_from_session(&value),
+            string_at(&value, &["parentSessionId"]),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(owner) = owner {
+                scan.lineage_edges.insert((owner.clone(), parent));
+            }
+        }
+        // Match only tuples actually requested by a target. All owner native
+        // and residual membership checks use precomputed indexes, never scans.
+        if !scan.tuple_targets.is_empty() {
+            if let Some(tuple) = line_usage_tuple(&value) {
+                if let Some(indexes) = scan.tuple_targets.get(&tuple) {
+                    for &index in indexes {
+                        if owner_index == Some(index) {
+                            continue;
+                        }
+                        if let Some(other) = owner_index {
+                            let rank = |i: usize| {
+                                (
+                                    scan.target_ranks[i].0.is_none(),
+                                    scan.target_ranks[i].0,
+                                    &scan.target_ranks[i].1,
+                                )
+                            };
+                            let canonical_keeper = scan.target_native_tuples[other]
+                                .contains(&tuple)
+                                || (rank(other) < rank(index)
+                                    && scan.target_missing_tuples[other].contains_key(&tuple));
+                            if !canonical_keeper {
+                                continue;
+                            }
+                        }
+                        scan.tuple_hits[index]
+                            .insert(format!("{}\n{tuple}", path.to_string_lossy()));
+                    }
+                }
+            }
+        }
+        let provenance = claude_fork_line_provenance(&value);
+        let counted_usage = claude_code_delta_usage(&value).is_some();
+        let Some(request_id) = line_request_id(&value) else {
+            if counted_usage && provenance == ClaudeForkLineProvenance::None {
+                scan.unidentified_usage_line_count += 1;
+                if owner.is_none() {
+                    idless_before_owner = true;
+                }
+                if owner_index.is_some() {
+                    // Buffer only the few owned id-less replica responses with
+                    // the ordinary response resolver. Progressive physical rows
+                    // must not falsely look like extra canonical usage.
+                    let accumulator = replica_responses.get_or_insert_with(|| {
+                        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+                        accumulator.artifacts_enabled = false;
+                        accumulator.context_curve_enabled = false;
+                        accumulator
+                    });
+                    apply_claude_code_line(&value, accumulator);
+                }
+            }
+            continue;
+        };
+        if !counted_usage {
+            continue;
+        }
+        let owner = match provenance {
+            ClaudeForkLineProvenance::Inherited => {
+                if holders.contains_key(request_id.as_str()) {
+                    copies.push((request_id, forked_from_session(&value)));
+                }
+                continue;
+            }
+            ClaudeForkLineProvenance::Invalid => {
+                return Err("malformed fork marker on a request line".to_string());
+            }
+            ClaudeForkLineProvenance::None => {
+                subagent_session.clone().or_else(|| file_session.clone())
+            }
+        };
+        let owner_target = owner
+            .as_deref()
+            .and_then(|owner| session_index.get(owner))
+            .copied();
+        let mut owner_counts_it = false;
+        if let Some(own_index) = owner_target {
+            owner_counts_it = originals[own_index]
+                .request_ids
+                .as_ref()
+                .is_some_and(|request_ids| request_ids.contains(&request_id));
+            if !owner_counts_it {
+                scan.replica_divergent_ids[own_index].insert(request_id.clone());
+            }
+        }
+        let Some(target_indexes) = holders.get(request_id.as_str()) else {
+            continue;
+        };
+        if let Some(owner) = &owner {
+            scan.owned_held_ids
+                .entry(owner.clone())
+                .or_default()
+                .insert(request_id.clone());
+        }
+        if owner_counts_it {
+            // A replica of a target that counts this id: its own line for the
+            // owner, a target-to-target share for the rest, which B2 allocates.
+            for &target in target_indexes {
+                if Some(target) == owner_target {
+                    scan.same_session_line_count[target] += 1;
+                } else {
+                    scan.shared_target_replica_line_count += 1;
+                }
+            }
+            continue;
+        }
+        for &target in target_indexes {
+            scan.hits[target]
+                .entry(request_id.clone())
+                .or_insert_with(|| PeerHit {
+                    path_sha256: path_witness.clone(),
+                    owner_session_sha256: owner
+                        .as_deref()
+                        .map(|owner| sha256_hex(owner.as_bytes())),
+                    line_count: 0,
+                    inherited_from_absent_source: false,
+                })
+                .line_count += 1;
+        }
+    }
+    let after = reader
+        .get_ref()
+        .get_ref()
+        .metadata()
+        .map_err(|error| format!("stat: {error}"))?;
+    // Shrunk, or rewritten at the same size: the bytes read are not a snapshot.
+    if total != opened_len
+        || after.len() < opened_len
+        || (after.len() == opened_len && before.modified().ok() != after.modified().ok())
+    {
+        return Err("file changed while read".to_string());
+    }
+    if after.len() > opened_len {
+        scan.grown_during_read_count += 1;
+    }
+    let holder_session = subagent_session.or(file_session);
+    if idless_before_owner {
+        if let Some(owner) = holder_session
+            .as_ref()
+            .and_then(|owner| session_index.get(owner.as_str()))
+        {
+            // Existing owner refusal, without buffering an unknown owner's
+            // transcript. Late ownership cannot erase earlier usage evidence.
+            scan.replica_divergent_ids[*owner].insert("idless-before-owner".into());
+        }
+    }
+    if let Some((owner, responses)) = holder_session
+        .as_ref()
+        .and_then(|owner| session_index.get(owner.as_str()))
+        .copied()
+        .zip(replica_responses)
+    {
+        // Compare id-less responses to the owner's id-less response multiset.
+        // A replica that changes a native response to id-less is uncertain and
+        // holds its owner; native tuple equality must not hide an extra line.
+        let allowed = &scan.target_missing_tuples[owner];
+        if responses.claude_response_record_count
+            >= crate::snapshots::MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE
+        {
+            scan.replica_divergent_ids[owner].insert("idless-replica-response-cap".into());
+        }
+        let mut seen = BTreeMap::<String, u64>::new();
+        for response in responses.claude_responses.values() {
+            let resolved = response
+                .clone()
+                .resolve_classified(&responses.claude_responses.selectors);
+            let tuple = resolved.ok().and_then(|response| {
+                usage_tuple(
+                    response.terminal_timestamp.as_deref(),
+                    response.model.as_deref(),
+                    &response.usage,
+                )
+            });
+            match tuple {
+                Some(tuple) => {
+                    let count = seen.entry(tuple.clone()).or_default();
+                    *count += 1;
+                    if *count > allowed.get(&tuple).copied().unwrap_or_default() {
+                        scan.replica_divergent_ids[owner]
+                            .insert(format!("idless-tuple:{tuple}:{count}"));
+                    }
+                }
+                None => {
+                    scan.replica_divergent_ids[owner].insert("idless-replica-unresolved".into());
+                }
+            }
+        }
+    }
+    scan.copies.extend(
+        copies
+            .into_iter()
+            .map(|(request_id, named_session)| CopyClaim {
+                request_id,
+                named_session,
+                holder_session: holder_session.clone(),
+                path_sha256: path_witness.clone(),
+            }),
+    );
+    Ok((total, format!("{:x}", digest.finalize())))
+}
+
+/// Exact native id -> every target whose request set counts it.
+fn request_holders(originals: &[TargetParse]) -> BTreeMap<&str, Vec<usize>> {
+    let mut holders = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, parse) in originals.iter().enumerate() {
+        for request_id in parse.request_ids.iter().flatten() {
+            holders.entry(request_id.as_str()).or_default().push(index);
+        }
+    }
+    holders
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn allocate(
+    input: &ProducerInput,
+    originals: &[TargetParse],
+    peers: &PeerScan,
+) -> Result<Allocation, String> {
+    let target_count = originals.len();
+    let mut order = (0..target_count).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        let key = |index: &usize| {
+            let target = &input.targets[*index];
+            (
+                target.b2_first_ack_order.is_none(),
+                target.b2_first_ack_order,
+                target.session_key_sha256.clone(),
+            )
+        };
+        key(left).cmp(&key(right))
+    });
+    let mut rank = vec![0_usize; target_count];
+    for (position, index) in order.iter().enumerate() {
+        rank[*index] = position;
+    }
+    let holders = request_holders(originals);
+    let mut excluded = vec![BTreeMap::new(); target_count];
+    let mut kept_shared = vec![BTreeMap::new(); target_count];
+    let mut entries = Vec::new();
+    for (request_id, holding) in &holders {
+        let peer_witness = holding
+            .iter()
+            .copied()
+            .find(|target| peers.hits[*target].contains_key(*request_id));
+        if peer_witness.is_none() && holding.len() < 2 {
+            continue;
+        }
+        let keeper = if let Some(witness) = peer_witness {
+            Keeper::Peer(witness)
+        } else {
+            Keeper::Target(
+                *holding
+                    .iter()
+                    .min_by_key(|target| rank[**target])
+                    .expect("shared request has holders"),
+            )
+        };
+        for &target in holding {
+            if keeper == Keeper::Target(target) {
+                kept_shared[target].insert(
+                    (*request_id).to_string(),
+                    holding
+                        .iter()
+                        .copied()
+                        .filter(|other| *other != target)
+                        .collect(),
+                );
+            } else {
+                excluded[target].insert((*request_id).to_string(), keeper.clone());
+            }
+        }
+        let mut holder_keys = holding
+            .iter()
+            .map(|target| input.targets[*target].session_key_sha256.clone())
+            .collect::<Vec<_>>();
+        holder_keys.sort();
+        entries.push((
+            sha256_hex(request_id.as_bytes()),
+            json!({
+                "request_sha256": sha256_hex(request_id.as_bytes()),
+                "holder_session_key_sha256s": holder_keys,
+                "kept_by": match keeper {
+                    Keeper::Peer(_) => "peer".to_string(),
+                    Keeper::Target(target) => input.targets[target].session_key_sha256.clone(),
+                },
+            }),
+        ));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let entries = entries
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect::<Vec<_>>();
+    let digest_body = json!({
+        "rule": B2_ALLOCATION_RULE,
+        "order": order.iter().map(|index| input.targets[*index].session_key_sha256.as_str()).collect::<Vec<_>>(),
+        "entries": entries,
+    });
+    let sha256 = crate::canonical_json::canonicalize(&digest_body)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| format!("allocation digest: {error}"))?;
+    Ok(Allocation {
+        excluded,
+        kept_shared,
+        entries,
+        order,
+        sha256,
+    })
+}
+
+struct BuiltTarget {
+    reason: HeldReason,
+    report: Value,
+    /// Excluded dimensions and exact catalog dollars, when available.
+    estimate: Option<(Dims, String)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_target(
+    index: usize,
+    input: &ProducerInput,
+    scope: &OperatorScope,
+    members: &[ApprovedMember],
+    upload_policy: SnapshotUploadPolicy,
+    producer: &ProducerBuild,
+    file: &TargetFile,
+    original: &Result<OriginalTarget, TargetHold>,
+    peers: &PeerScan,
+    allocation: &Allocation,
+    coverage: &GlobalCoverage,
+) -> BuiltTarget {
+    let target = &input.targets[index];
+    let member = &members[index];
+    let mut report = json!({
+        "source_session_id": member.source_session_id,
+        "session_key_sha256": member.session_key_sha256,
+        "prior_refusal_body_witness": member.prior_refusal_body_witness,
+        "transcript_path_sha256": file.path_sha256,
+        "transcript_content_sha256": file.content_sha256,
+        "b2_first_ack_order": target.b2_first_ack_order,
+        "cross_session_conservation": Conservation::Unknown.as_str(),
+        "same_session_peer_line_count": peers.same_session_line_count[index],
+        "lineage_coverage_complete": coverage.complete() && !peers.lineage_held.contains(&index),
+    });
+    let hold = |mut report: Value, hold: TargetHold| {
+        report["candidate_status"] = json!("held");
+        report["held_reason"] = json!(hold.reason.as_str());
+        report["held_detail"] = json!(hold.detail);
+        BuiltTarget {
+            reason: hold.reason,
+            report,
+            estimate: None,
+        }
+    };
+    let original = match original {
+        Ok(original) => original,
+        Err(error) => return hold(report, error.clone()),
+    };
+    report["original"] = json!({
+        "request_count": original.request_ids.len(),
+        "request_set_fingerprint": request_set_fingerprint(&original.request_ids),
+        "totals": original.totals.json(),
+    });
+    let initial_residual = sum_missing(&original.missing).expect("validated missing sum");
+    report["missing_evidence_counted"] = json!({"lines": initial_residual.request_count, "totals": initial_residual.json(), "usd": Value::Null, "usd_basis": "admission_catalog_required"});
+    if let Some(reason) = coverage.held_reason().or_else(|| {
+        peers
+            .lineage_held
+            .contains(&index)
+            .then_some(HeldReason::IncompleteCensus)
+    }) {
+        return hold(
+            report,
+            TargetHold::new(
+                reason,
+                "peer coverage incomplete for this target; no partition or body",
+            ),
+        );
+    }
+    if !peers.replica_divergent_ids[index].is_empty() {
+        return hold(
+            report,
+            TargetHold::new(
+                HeldReason::UnknownOwner,
+                format!(
+                    "another local copy of this session counts {} request(s) this transcript does not",
+                    peers.replica_divergent_ids[index].len()
+                ),
+            ),
+        );
+    }
+
+    // Exact partition fixed by the frozen allocation.
+    let excluded_map = &allocation.excluded[index];
+    let excluded_ids = excluded_map.keys().cloned().collect::<BTreeSet<_>>();
+    let kept_ids = original
+        .request_ids
+        .difference(&excluded_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let usage_of = |ids: &BTreeSet<String>| {
+        ids.iter()
+            .map(|id| {
+                original
+                    .item
+                    .claude_usage_occurrences
+                    .get(id)
+                    .map(|occurrence| &occurrence.usage)
+            })
+            .collect::<Option<Vec<_>>>()
+            .and_then(sum_dims)
+    };
+    let matched = original
+        .missing
+        .iter()
+        .filter(|missing| {
+            missing.tuple.as_ref().is_some_and(|tuple| {
+                peers.tuple_hits[index].iter().any(|hit| {
+                    hit.rsplit_once('\n').is_some_and(|(path, found)| {
+                        found == tuple
+                            && same_lineage(
+                                &target.transcript_path,
+                                Path::new(path),
+                                &peers.lineage_edges,
+                            )
+                    })
+                })
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let matched_tuples = matched
+        .iter()
+        .filter_map(|missing| missing.tuple.clone())
+        .collect::<BTreeSet<_>>();
+    let missing_dims = sum_missing(&original.missing).expect("validated missing sum");
+    let matched_dims = sum_missing(&matched).expect("subset sum");
+    let residual_dims = missing_dims.checked_sub(matched_dims).expect("subset");
+    report["missing_evidence_counted"] = json!({"lines": residual_dims.request_count, "totals": residual_dims.json(), "usd": Value::Null, "usd_basis": "admission_catalog_required"});
+    report["missing_evidence_matched_by_tuple"] =
+        json!({"lines": matched.len(), "totals": matched_dims.json()});
+    let (Some(excluded_dims), Some(kept_dims)) = (
+        usage_of(&excluded_ids).and_then(|dims| dims.checked_add(matched_dims)),
+        usage_of(&kept_ids).and_then(|dims| dims.checked_add(residual_dims)),
+    ) else {
+        return hold(
+            report,
+            TargetHold::new(
+                HeldReason::MissingEvidence,
+                "per-request usage does not reconcile",
+            ),
+        );
+    };
+    let mut excluded_witnesses = Vec::with_capacity(excluded_map.len());
+    for (request_id, keeper) in excluded_map {
+        let mut witness = json!({
+            "request_sha256": sha256_hex(request_id.as_bytes()),
+        });
+        match keeper {
+            Keeper::Peer(witness_target) => {
+                let Some(hit) = peers.hits[*witness_target].get(request_id) else {
+                    return hold(
+                        report,
+                        TargetHold::new(
+                            HeldReason::MissingEvidence,
+                            "peer exclusion has no recorded witness",
+                        ),
+                    );
+                };
+                witness["cause"] = json!(if hit.inherited_from_absent_source {
+                    "inherited_from_absent_source"
+                } else {
+                    "peer_overlap"
+                });
+                witness["peer_path_sha256"] = json!(hit.path_sha256);
+                witness["peer_owner_session_sha256"] = json!(hit.owner_session_sha256);
+                witness["peer_line_count"] = if hit.line_count == 0 {
+                    Value::Null
+                } else {
+                    json!(hit.line_count)
+                };
+                if hit.line_count == 0 {
+                    witness["evidence_basis"] = json!("vanished_census_used");
+                }
+            }
+            Keeper::Target(keeper) => {
+                witness["cause"] = json!("b2_other_target");
+                witness["kept_by_session_key_sha256"] = json!(members[*keeper].session_key_sha256);
+            }
+        }
+        excluded_witnesses.push(witness);
+    }
+    excluded_witnesses.sort_by(|left, right| {
+        left["request_sha256"]
+            .as_str()
+            .cmp(&right["request_sha256"].as_str())
+    });
+    report["partition"] = json!({
+        "excluded": {
+            "request_count": excluded_ids.len(),
+            "request_set_fingerprint": request_set_fingerprint(&excluded_ids),
+            "peer_overlap_count": excluded_map.values().filter(|keeper| matches!(keeper, Keeper::Peer(_))).count(),
+            "b2_other_target_count": excluded_map.values().filter(|keeper| matches!(keeper, Keeper::Target(_))).count(),
+            "totals": excluded_dims.json(),
+            "witnesses": excluded_witnesses,
+        },
+        "kept": {
+            "request_count": kept_ids.len(),
+            "request_set_fingerprint": request_set_fingerprint(&kept_ids),
+            "totals": kept_dims.json(),
+        },
+    });
+    if kept_ids.is_empty() && residual_dims.request_count == 0 {
+        return hold(
+            report,
+            TargetHold::new(HeldReason::MissingEvidence, "every request is excluded"),
+        );
+    }
+
+    // Rebuild through the same parser, then reconcile exactly.
+    let matched_keys = matched
+        .iter()
+        .filter_map(|missing| missing.response_key.clone())
+        .collect();
+    let keyless_tuples = matched
+        .iter()
+        .filter(|missing| missing.response_key.is_none())
+        .filter_map(|missing| missing.tuple.clone())
+        .collect();
+    let _tuple_guard = TupleExclusionGuard::install(keyless_tuples, matched_keys);
+    let mut item = if excluded_ids.is_empty() && matched_tuples.is_empty() {
+        original.item.clone()
+    } else {
+        let parsed = match parse_target_transcript(
+            &target.transcript_path,
+            &input.collected_at,
+            upload_policy.session_artifacts_enabled,
+            input.context_curve_enabled,
+            Some(excluded_ids.clone()),
+        ) {
+            Ok(parsed) if parsed.complete => parsed,
+            Ok(_) => {
+                return hold(
+                    report,
+                    TargetHold::new(HeldReason::MissingEvidence, "rebuild parse incomplete"),
+                )
+            }
+            Err(error) => {
+                return hold(
+                    report,
+                    TargetHold::new(HeldReason::MissingEvidence, format!("rebuild: {error}")),
+                )
+            }
+        };
+        match single_item(parsed.snapshots, &target.source_session_id) {
+            Ok(item) => item,
+            Err(error) => return hold(report, error),
+        }
+    };
+    if let Some(detail) = reconcile(original, &item, &kept_ids, excluded_dims, kept_dims) {
+        return hold(report, TargetHold::new(HeldReason::MissingEvidence, detail));
+    }
+    let identity_changes = allocation_identity_changes(&original.item, &item);
+    if identity_changes > 0 {
+        return hold(
+            report,
+            TargetHold::new(
+                HeldReason::UnknownOwner,
+                "exclusion changed identity-bearing body fields",
+            ),
+        );
+    }
+
+    // Ordinary upload policy and serializer; cache upload stays disabled.
+    apply_upload_policy(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_mut(&mut item),
+        upload_policy,
+    );
+    item.cache_observations = None;
+    item.cache_observations_state = None;
+    item.cache_base_head_etag = None;
+    let body = match ordinary_batch_body(scope, &item, upload_policy, producer) {
+        Ok(body) => body,
+        Err(error) => return hold(report, TargetHold::new(HeldReason::MissingEvidence, error)),
+    };
+    // Pinned untagged: checked on the exact bytes, not inferred from the
+    // pipeline stages this producer happens to skip.
+    let body_identity = match serialized_request_identity(&body) {
+        Ok(identity) if identity.untagged() => identity,
+        Ok(_) => {
+            return hold(
+                report,
+                TargetHold::new(
+                    HeldReason::MissingEvidence,
+                    "unsupported: serialized body carries request identity; this producer is untagged only",
+                ),
+            )
+        }
+        Err(error) => return hold(report, TargetHold::new(HeldReason::MissingEvidence, error)),
+    };
+    let unchanged = file
+        .canonical_path
+        .as_ref()
+        .and_then(|path| hash_file(path, TARGET_FILE_BYTES_CAP).ok())
+        .is_some_and(|(size, sha)| {
+            Some(size) == file.size_bytes && Some(&sha) == file.content_sha256.as_ref()
+        });
+    if !unchanged {
+        return hold(
+            report,
+            TargetHold::new(
+                HeldReason::MissingEvidence,
+                "target transcript changed during the run",
+            ),
+        );
+    }
+
+    // SI: every kept shared request, its keeping root and tag state.
+    let receipt_entries = allocation.kept_shared[index]
+        .iter()
+        .map(|(request_id, others)| {
+            let mut other_keys = others
+                .iter()
+                .map(|other| members[*other].session_key_sha256.clone())
+                .collect::<Vec<_>>();
+            other_keys.sort();
+            (
+                sha256_hex(request_id.as_bytes()),
+                json!({
+                    "request_sha256": sha256_hex(request_id.as_bytes()),
+                    "keeping_root_session_key_sha256": member.session_key_sha256,
+                    "other_holder_session_key_sha256s": other_keys,
+                    "tag_state": "untagged",
+                    "evidence_root_session_key_sha256": Value::Null,
+                    "evidence_basis": Value::Null,
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect::<Vec<_>>();
+    let receipt_group_sha256 = match crate::canonical_json::canonicalize(&json!(receipt_entries)) {
+        Ok(bytes) => sha256_hex(&bytes),
+        Err(error) => {
+            return hold(
+                report,
+                TargetHold::new(
+                    HeldReason::MissingEvidence,
+                    format!("receipt digest: {error}"),
+                ),
+            )
+        }
+    };
+    report["identity_receipt"] = json!({
+        "identity_rule": super::B2_IDENTITY_RULE,
+        "kept_shared_request_count": receipt_entries.len(),
+        "tagged_count": 0,
+        "untagged_count": receipt_entries.len(),
+        "group_sha256": receipt_group_sha256,
+        "entries": receipt_entries,
+        "body_request_evidence_count": body_identity.request_evidence,
+        "body_rows_with_identity": body_identity.rows_with_identity,
+        "body_session_account_evidence_present": item.session_account_evidence.is_some(),
+        "allocation_identity_changes": identity_changes,
+        "note": "no Contract-5 permit in this producer: every kept request is untagged under its starting subscription; an identity-less body cannot authorize replacing an existing name",
+    });
+    let estimate = if matched.is_empty() {
+        estimate_dollars(input.catalog_prices.as_ref(), original, &excluded_ids)
+    } else {
+        Err("tuple exclusions require admission catalog valuation")
+    };
+    report["exclusion_estimate"] = match &estimate {
+        Ok(dollars) => json!({
+            "label": ESTIMATE_LABEL,
+            "excluded_catalog_cost_usd": dollars,
+        }),
+        Err(reason) => json!({
+            "label": ESTIMATE_LABEL,
+            "excluded_catalog_cost_usd": Value::Null,
+            "unavailable_reason": reason,
+        }),
+    };
+    report["body"] = json!({
+        "unqualified_batch_request_sha256": sha256_hex(body.as_bytes()),
+        "unqualified_batch_request_json": body,
+        "item_snapshot_fingerprint": item.snapshot_fingerprint,
+        "item_totals": Dims::of_item(&item).json(),
+    });
+    report["candidate_status"] = json!("computed_unqualified");
+    report["held_reason"] = json!(HeldReason::MissingEvidence.as_str());
+    report["held_detail"] = json!("awaiting SESSION read-only prepare and SOURCE/COST/SI review");
+    BuiltTarget {
+        reason: HeldReason::MissingEvidence,
+        report,
+        estimate: estimate.ok().map(|dollars| (excluded_dims, dollars)),
+    }
+}
+
+/// Request identity found in a serialized ordinary batch body.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BodyIdentity {
+    request_evidence: u64,
+    request_identity_refusals: u64,
+    rows_with_identity: u64,
+}
+
+impl BodyIdentity {
+    fn untagged(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// This producer never applies a Contract-5 request-identity permit, whatever
+/// the ordinary pipeline does at the time, so a body it emits must carry no
+/// request evidence, no identity refusals and no usage row with an evidence
+/// reference or identity parts.
+fn serialized_request_identity(body: &str) -> Result<BodyIdentity, String> {
+    let body: Value =
+        serde_json::from_str(body).map_err(|error| format!("body identity check: {error}"))?;
+    let snapshots = body
+        .get("snapshots")
+        .and_then(Value::as_array)
+        .ok_or("body identity check: no snapshots")?;
+    let mut identity = BodyIdentity::default();
+    for item in snapshots {
+        identity.request_evidence += item
+            .get("request_evidence")
+            .and_then(Value::as_array)
+            .map_or(0, |evidence| evidence.len() as u64);
+        identity.request_identity_refusals += item
+            .get("request_identity_refusals")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let bucket_rows = item
+            .get("usage_buckets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|bucket| bucket.get("model_usage").and_then(Value::as_array))
+            .flatten();
+        let item_rows = item
+            .get("model_usage")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        identity.rows_with_identity += item_rows
+            .chain(bucket_rows)
+            .filter(|row| {
+                ["evidence_ref", "identity_parts"]
+                    .iter()
+                    .any(|key| row.get(*key).is_some_and(|value| !value.is_null()))
+            })
+            .count() as u64;
+    }
+    Ok(identity)
+}
+
+fn request_set_fingerprint(request_ids: &BTreeSet<String>) -> String {
+    let hashes = request_ids
+        .iter()
+        .map(|request_id| sha256_hex(request_id.as_bytes()))
+        .collect::<BTreeSet<_>>();
+    claude_request_id_set_fingerprint(&hashes)
+}
+
+/// Exact reconciliation of the rebuilt item against the original partition.
+fn reconcile(
+    original: &OriginalTarget,
+    rebuilt: &SnapshotItem,
+    kept_ids: &BTreeSet<String>,
+    excluded_dims: Dims,
+    kept_dims: Dims,
+) -> Option<&'static str> {
+    if &rebuilt.claude_usage_request_ids != kept_ids
+        || rebuilt.claude_usage_occurrences.len() != kept_ids.len()
+    {
+        return Some("rebuilt request set differs from the kept partition");
+    }
+    for request_id in kept_ids {
+        let (Some(before), Some(after)) = (
+            original.item.claude_usage_occurrences.get(request_id),
+            rebuilt.claude_usage_occurrences.get(request_id),
+        ) else {
+            return Some("rebuilt request set differs from the kept partition");
+        };
+        if before.usage != after.usage
+            || before.model != after.model
+            || before.reasoning_effort != after.reasoning_effort
+            || before.timestamp != after.timestamp
+            || before.selector != after.selector
+            || before.effective_input_context != after.effective_input_context
+        {
+            return Some("a kept request changed when excluded requests were removed");
+        }
+    }
+    let rebuilt_totals = Dims::of_item(rebuilt);
+    if rebuilt_totals != kept_dims
+        || original.totals.checked_sub(excluded_dims) != Some(rebuilt_totals)
+    {
+        return Some("rebuilt totals do not reconcile with kept and excluded requests");
+    }
+    if let Some(detail) = row_mismatch(rebuilt, rebuilt_totals) {
+        return Some(detail);
+    }
+    if has_request_identity_evidence(rebuilt) {
+        return Some("unsupported: rebuilt body carries request identity evidence");
+    }
+    None
+}
+
+/// Identity-bearing fields the counting allocation must leave unchanged.
+fn allocation_identity_changes(original: &SnapshotItem, rebuilt: &SnapshotItem) -> u64 {
+    let accounts = |item: &SnapshotItem| {
+        item.model_usage
+            .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| &bucket.model_usage),
+            )
+            .filter_map(|row| row.account_identifier_hash.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let names = |item: &SnapshotItem| {
+        (
+            item.session_display_name.clone(),
+            item.session_display_name_source.clone(),
+            item.workspace_hash.clone(),
+            item.workspace_display_label.clone(),
+            item.workspace_label_source.clone(),
+            item.repository_hash.clone(),
+            item.repository_label.clone(),
+            item.repository_identity_source.clone(),
+            item.workspace_kind.clone(),
+            item.originator.clone(),
+        )
+    };
+    u64::from(original.session_account_evidence != rebuilt.session_account_evidence)
+        + u64::from(accounts(original) != accounts(rebuilt))
+        + u64::from(names(original) != names(rebuilt))
+        + u64::from(original.origin != rebuilt.origin)
+}
+
+/// Exact decimal catalog estimate over the excluded requests.
+fn estimate_dollars(
+    prices: Option<&CatalogPrices>,
+    original: &OriginalTarget,
+    excluded_ids: &BTreeSet<String>,
+) -> Result<String, &'static str> {
+    let prices = prices.ok_or("catalog_prices_not_supplied")?;
+    let mut total = 0_u128;
+    for request_id in excluded_ids {
+        let occurrence = original
+            .item
+            .claude_usage_occurrences
+            .get(request_id)
+            .ok_or("missing_request_occurrence")?;
+        let usage = &occurrence.usage;
+        if usage.reasoning_output_tokens > 0 || usage.unattributed_total_tokens > 0 {
+            return Err("unpriced_dimension");
+        }
+        // Rates are keyed by model and context bucket only; any other
+        // non-default pricing selector would be priced wrongly.
+        for (field, value) in &occurrence.selector.context {
+            let default = match field.as_str() {
+                "service_tier" | "speed_mode" | "mode" => value == "standard",
+                "batch_mode" => value == "false",
+                // Cloud gateways (regional endpoints) are not catalog-priced.
+                "gateway_provider" => value == "anthropic",
+                "region_mode" => matches!(value.as_str(), "global" | "not_available"),
+                _ => true,
+            };
+            if !default {
+                return Err("unpriced_dimension");
+            }
+        }
+        let model = occurrence.model.as_deref().ok_or("unpriced_model")?;
+        // The parser stamps a context bucket only for models with a provider
+        // price line. A request without one is keyed `<model>|none`, a rate
+        // the table supplies only for a model whose price does not depend on
+        // prompt length.
+        let bucket = occurrence
+            .selector
+            .context
+            .get("context_bucket")
+            .map_or("none", String::as_str);
+        let rates = prices
+            .rates_usd_per_mtok
+            .get(&format!("{model}|{bucket}"))
+            .ok_or("unpriced_model")?;
+        for (tokens, rate) in [
+            (usage.input_tokens, &rates.input),
+            (usage.output_tokens, &rates.output),
+            (usage.cache_read_tokens, &rates.cache_read),
+            (usage.cache_creation_5m_tokens, &rates.cache_creation_5m),
+            (usage.cache_creation_1h_tokens, &rates.cache_creation_1h),
+        ] {
+            let rate = parse_rate(rate).ok_or("unpriced_model")?;
+            total = u128::from(tokens)
+                .checked_mul(rate)
+                .and_then(|cost| total.checked_add(cost))
+                .ok_or("estimate_overflow")?;
+        }
+    }
+    Ok(format_scaled(total, COST_FRACTION_DIGITS))
+}
+
+/// Exact nonnegative decimal -> integer scaled by 10^12.
+fn parse_rate(value: &str) -> Option<u128> {
+    if !super::is_exact_decimal(value) {
+        return None;
+    }
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if fraction.len() > RATE_FRACTION_DIGITS {
+        return None;
+    }
+    let whole = whole.parse::<u128>().ok()?;
+    let fraction = format!("{fraction:0<width$}", width = RATE_FRACTION_DIGITS)
+        .parse::<u128>()
+        .ok()?;
+    whole
+        .checked_mul(10_u128.pow(RATE_FRACTION_DIGITS as u32))?
+        .checked_add(fraction)
+}
+
+/// Plain decimal for an integer scaled by 10^digits, trailing zeros trimmed.
+fn format_scaled(value: u128, digits: usize) -> String {
+    let scale = 10_u128.pow(digits as u32);
+    let whole = value / scale;
+    let fraction = format!("{:0>digits$}", value % scale);
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    }
+}
+
+#[cfg(test)]
+mod tests;
