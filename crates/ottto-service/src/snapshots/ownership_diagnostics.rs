@@ -46,7 +46,7 @@ impl Counts {
             }
         }
     }
-    pub(super) fn merge(&mut self, page: Self) {
+    pub(super) fn merge(&mut self, page: &Self) {
         for (a, b) in self.contributions.iter_mut().zip(page.contributions) {
             *a += b;
         }

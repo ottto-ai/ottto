@@ -17,7 +17,7 @@ fn cause_cardinality_and_all_contribution_slots_are_pinned() {
     for (i, cause) in all.into_iter().enumerate() {
         page.add(cause, [format!("private-{i}.jsonl")]);
     }
-    traversal.merge(page);
+    traversal.merge(&page);
     conserved(&traversal, N);
     assert_eq!(traversal.summary(N).0[..N], [1; N]);
     assert_eq!(traversal.summary(N).1[..N], [1; N]);
@@ -31,13 +31,13 @@ fn repeated_key_adds_two_contributions_and_one_distinct_first_cause_wins() {
     let mut generation = Counts::default();
     let mut first = generation.page(2);
     first.add(INVENTORY, ["same.jsonl", "same.jsonl"]);
-    generation.merge(first);
+    generation.merge(&first);
     let (c, d, _) = generation.summary(2);
     assert_eq!(c[INVENTORY], 2);
     assert_eq!(d[INVENTORY], 1);
     let mut next = generation.page(2);
     next.add(CREATED, ["same.jsonl"]);
-    generation.merge(next);
+    generation.merge(&next);
     let (c, d, _) = generation.summary(3);
     assert_eq!(c[CREATED], 1);
     assert_eq!(d[CREATED], 0);

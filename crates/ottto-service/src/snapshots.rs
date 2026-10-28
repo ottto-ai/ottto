@@ -30051,7 +30051,7 @@ impl OwnedSourceScan {
                         census.recognized_usage_drop_count;
                     traversal.counts.ownership_incomplete_file_count +=
                         census.ownership_incomplete_file_count;
-                    traversal.counts.causes.merge(census.causes);
+                    traversal.counts.causes.merge(&census.causes);
                     traversal.counts.zero_snapshot_usage_evidence_count +=
                         census.zero_snapshot_usage_evidence_count;
                     traversal.counts.dropped_usage_record_count = traversal
