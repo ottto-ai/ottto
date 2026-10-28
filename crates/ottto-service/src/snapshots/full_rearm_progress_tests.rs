@@ -1163,28 +1163,28 @@ fn always_on_terminal_at(
 /// complete request identity (login and organization). `account_checked`
 /// keeps the legacy account check on the row; covering one of the parent's
 /// four requests, it withholds the session account for incomplete request
-/// evidence. Unchecked, the account stays unknown and contract 5 tags it.
+/// evidence. Unchecked, the account stays unknown and contract 5 does not
+/// tag the body (`valid_login`).
 fn write_parent_sidecars(rearm: &Rearm, support: &Path, identity: bool, account_checked: bool) {
     write_sidecar_rows(
         rearm,
         support,
         identity,
-        account_checked,
-        &[("req_1", "", 10)],
+        &[("req_1", "", 10, account_checked)],
     );
 }
 
-/// Paired rows for each `(request, agent, output tokens)`, the fixture's own
-/// token counts; otherwise as `write_parent_sidecars`.
+/// Paired rows for each `(request, agent, output tokens, account checked)`,
+/// with the fixture's own token counts; otherwise as `write_parent_sidecars`.
 fn write_sidecar_rows(
     rearm: &Rearm,
     support: &Path,
     identity: bool,
-    account_checked: bool,
-    requests: &[(&str, &str, u64)],
+    requests: &[(&str, &str, u64, bool)],
 ) {
     let (mut api_rows, mut trace_rows) = (String::new(), String::new());
-    for (sequence, &(request, agent, output_tokens)) in requests.iter().enumerate() {
+    for (sequence, &(request, agent, output_tokens, account_checked)) in requests.iter().enumerate()
+    {
         let mut api = complete_api_row(
             &rearm.parent,
             request,
@@ -1352,13 +1352,16 @@ fn always_on_terminals_keep_the_structural_suppression() {
 }
 
 /// SOURCE condition (2026-10-28 review of #840): the permitted shape with
-/// real tagged bodies. The index records E2, the structural baseline is
-/// built with evidence, and every request of the family has a paired row
-/// with complete request identity and D1's account-checked login, so the
-/// account is bound, not withheld, and the parent's contract-5 body is
-/// tagged. The census identity is kept (request-id hashes only: the one
-/// structural child invalidation, nothing more), and every due terminal
-/// after the first skips: no fingerprint is cleared, nothing reads Full.
+/// real tagged bodies. The index records E2 and the structural baseline is
+/// built with evidence. Every request of the family has a paired row with
+/// complete request identity; `req_1`'s also carries D1's account-checked
+/// login, so contract 5 tags the parent's body, and the other rows are
+/// unchecked, so the legacy account path neither binds nor withholds the
+/// session account (full checked coverage binds it and keeps the legacy
+/// body; partial checked coverage alone withholds it, the control below).
+/// The census identity is kept (request-id hashes only: the one structural
+/// child invalidation, nothing more), and every due terminal after the
+/// first skips: no fingerprint is cleared, nothing reads Full.
 #[test]
 fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
@@ -1370,13 +1373,12 @@ fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
             &rearm,
             &support,
             true,
-            true,
             &[
-                ("req_1", "", 10),
-                ("req_2", "", 10),
-                ("req_3", "", 10),
-                ("req_4", "", 10),
-                ("req_5", "a4d1585d310070d0f", 1),
+                ("req_1", "", 10, true),
+                ("req_2", "", 10, false),
+                ("req_3", "", 10, false),
+                ("req_4", "", 10, false),
+                ("req_5", "a4d1585d310070d0f", 1, false),
             ],
         );
         let mut index = rearm.index();

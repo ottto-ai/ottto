@@ -1085,10 +1085,7 @@ mod durable_restart {
         let second = Arc::new(SharedCache::default());
         state.begin(&second);
         f.append_transcript(1);
-        let cached = enriched(
-            &f,
-            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
-        );
+        let cached = raw_scan(&f, prior, Some(second.clone()), |_| {});
         assert_layout_mode(cached.modes, (0, 1, 0));
         if crate::heap_layout_bound::layout_supported() {
             assert_eq!(cached.reasons[FullReason::StateMissing.slot()], 0);
