@@ -75,7 +75,7 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
     .unwrap();
     let member = candidate(&path);
     let file = || File::open(&path).unwrap();
-    assert_refused(CodexZstCause::CompatibilityUnfunded, || {
+    assert_refused(CodexZstCause::CompatibilityUnsupported, || {
         assert!(parse_codex_jsonl_file(&path, "2026-10-28T10:00:00Z", "fixture".into()).is_err());
         assert!(parse_codex_jsonl_file(&path, "2026-10-28T10:00:00Z", "fixture".into()).is_err());
     });
@@ -108,9 +108,7 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
     assert_refused(CodexZstCause::ProofChildUnsupported, || {
         assert!(CodexProofReader::child("fixture".into(), path.clone(), file()).is_err());
     });
-    assert_refused(CodexZstCause::HeaderUnfunded, || {
-        assert!(codex_file_join::header_reduction_witness(&member).is_err());
-    });
+    assert!(codex_file_join::header_reduction_witness(&member, None).is_err());
     assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
         assert!(sampled_scan::codex_cursor::LiveWitness::read(&path, &file(), 8).is_none());
     });
@@ -122,11 +120,9 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         &inventory_paths,
         Some(&directories),
     );
-    assert_refused(CodexZstCause::HeaderUnfunded, || {
-        while !inventory.step(&CodexTitleMetadata::default()) {}
-        assert!(inventory.headers.is_empty());
-        assert!(inventory.refused.contains_key(&local_index_key(&path)));
-    });
+    while !inventory.step(&CodexTitleMetadata::default()) {}
+    assert!(inventory.headers.is_empty());
+    assert!(inventory.refused.contains_key(&local_index_key(&path)));
     let paths = BTreeSet::from([local_index_key(&path)]);
     let roots = [root.clone()];
     let census = CodexParentCensus::new(&roots, &paths);
@@ -151,6 +147,20 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         );
         assert!(parent.is_err());
         assert!(retained.is_none());
+    });
+    assert_refused(CodexZstCause::ParserStateRequired, || {
+        assert!(OwnedJsonlParser::new(
+            file(),
+            &path,
+            SnapshotSource::Codex,
+            apply_codex_line,
+            Some(&CodexTitleMetadata::default()),
+            None,
+            None,
+            false,
+            true
+        )
+        .is_err());
     });
     let source = SnapshotSource::Codex;
     let index = ScanIndex::default();

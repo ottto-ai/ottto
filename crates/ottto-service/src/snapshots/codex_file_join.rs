@@ -148,6 +148,7 @@ pub(super) struct HeaderWitness {
     pub(super) home: PathBuf,
     pub(super) created_unix_ms: Option<i64>,
     metadata: String,
+    archive_stamp: Option<crate::transcript_acquisition::FileStamp>,
 }
 pub(super) fn member_home(root: &Path) -> PathBuf {
     root.ancestors()
@@ -164,7 +165,11 @@ pub(super) fn member_home(root: &Path) -> PathBuf {
 // One bounded secure acquisition path; semantic inventory and sampled-scope
 // witnesses both use it. Only inventory performs native header decoding.
 fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usize)> {
-    refuse_compressed_codex(Some(&candidate.path), None, CodexZstCause::HeaderUnfunded)?;
+    refuse_compressed_codex(
+        Some(&candidate.path),
+        None,
+        CodexZstCause::GroupReadUnsupported,
+    )?;
     let file = open_candidate_beneath_root(candidate)?;
     let before = file.metadata()?;
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
@@ -233,7 +238,15 @@ pub(super) fn path_witness(path: &Path) -> Option<String> {
 }
 /// Raw header digest for a file whose owning header the native inventory has
 /// already established. No extra decoded Value is retained or allocated.
-pub(super) fn header_reduction_witness(candidate: &CandidateFile) -> Result<String> {
+pub(super) fn header_reduction_witness(
+    candidate: &CandidateFile,
+    archive: Option<&codex_compressed_input::ValidatedHeader>,
+) -> Result<String> {
+    if is_compressed_codex_rollout(Some(&candidate.path), None) {
+        return archive
+            .map(|header| header.digest.clone())
+            .context("archive header evidence unavailable");
+    }
     read_header_bytes(candidate).map(|(bytes, _, _)| format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -294,7 +307,16 @@ impl HeaderInventory {
             .map(|index| self.headers[index].owner.as_str())
     }
 
+    #[cfg(test)]
     pub(super) fn step(&mut self, metadata: &CodexTitleMetadata) -> bool {
+        self.step_with_archive(metadata, &mut ScanIndex::default(), None)
+    }
+    pub(super) fn step_with_archive(
+        &mut self,
+        metadata: &CodexTitleMetadata,
+        index: &mut ScanIndex,
+        cache: Option<&Arc<sampled_scan::SharedCache>>,
+    ) -> bool {
         let Some(path) = self.pending.pop_front() else {
             return true;
         };
@@ -348,7 +370,24 @@ impl HeaderInventory {
                 &ClaudeTitleMetadata::default(),
                 None,
             );
-            let (header, retried) = read_header_settled(&candidate);
+            let compressed = is_compressed_codex_rollout(Some(&candidate.path), None);
+            let (header, retried) = if compressed {
+                (
+                    index
+                        .inventory_archive_header(&candidate, cache)
+                        .map(|(header, bytes)| {
+                            (
+                                header.owner,
+                                header.created_unix_ms,
+                                metadata_witness(&stat),
+                                bytes,
+                            )
+                        }),
+                    0,
+                )
+            } else {
+                read_header_settled(&candidate)
+            };
             // Each abandoned attempt may have consumed its whole bounded prefix.
             self.read_bytes = self
                 .read_bytes
@@ -361,6 +400,9 @@ impl HeaderInventory {
                 owner,
                 created_unix_ms,
                 metadata: witness,
+                archive_stamp: compressed
+                    .then(|| crate::transcript_acquisition::FileStamp::capture(stat))
+                    .transpose()?,
             })
         })();
         match result {
@@ -422,6 +464,13 @@ impl HeaderInventory {
             if metadata_witness(&stat) == header.metadata {
                 continue;
             }
+            if let Some(stamp) = &header.archive_stamp {
+                anyhow::ensure!(
+                    stamp.same_content(&crate::transcript_acquisition::FileStamp::capture(stat)?),
+                    "archive header stamp changed"
+                );
+                continue;
+            }
             let (current_owner, _, _, _) = read_header(&header.candidate)?;
             anyhow::ensure!(
                 current_owner == header.owner
@@ -433,7 +482,7 @@ impl HeaderInventory {
     }
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
-crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata);
+crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, archive_stamp);
 crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, refused, bounded_out);
 
 #[derive(Clone, Debug)]
@@ -823,9 +872,7 @@ pub(super) enum JoinRefusal {
     CandidateCopy,
     V2UiOnlyTurn,
     V2UnboundUi,
-    /// A `history_base.thread_id` names no member of this owner's group:
-    /// typically a compressed (`.zst`, not yet scanned) predecessor, or
-    /// another owner's file named without `forked_from_id`.
+    /// A `history_base.thread_id` names no member of this owner's group.
     MissingPredecessor,
     /// A chain refusal (`Gap`, `Overlap`) of a legacy group replayed in
     /// chronological order because its probes exceeded their budget (R1-M1,

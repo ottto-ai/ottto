@@ -5778,6 +5778,7 @@ pub(in crate::snapshots) fn resume_paused_job(
             context.codex,
             context.claude,
             context.support,
+            None,
         )
         .map(|dependency| {
             sampling.file_scope(
@@ -5952,6 +5953,7 @@ pub(in crate::snapshots) fn revalidate(
         inputs.codex,
         inputs.claude,
         inputs.support,
+        None,
     ) else {
         return Resume::Unavailable;
     };

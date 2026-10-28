@@ -507,8 +507,7 @@ pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v34";
 // after the price-line effective date are revisited; older rollouts are never
 // re-read for it. That is file selection only, not a guaranteed superset: a
 // rollout copied or restored with an older preserved mtime is missed, and
-// compressed `.jsonl.zst` rollouts are never scanned at all, so recent history
-// is restated only where its `.jsonl` is still present. Inside a revisited file
+// archive acquisitions remain subject to their separate disposition. Inside a revisited file
 // only requests dated on or after that instant gain a bucket, so older hours
 // re-parse to the rows they already had. The instant is fixed, not relative to
 // now, so the revisit set never moves; each file settles once its fingerprint
@@ -21257,7 +21256,7 @@ impl CodexParentUnresolvable {
             }
             // Identity evidence (`Absent`, `Duplicated`, `NotRegular`).
             _ => {
-                "ottto-service: codex fork(s) held: parent rollout absent (or present only compressed, .jsonl.zst, which is not read yet), duplicated or not a regular file; child held until the parent changes"
+                "ottto-service: codex fork(s) held: parent rollout absent, unavailable for lineage proof, duplicated or not a regular file; child held until the parent evidence changes"
             }
         }
     }
@@ -26782,7 +26781,11 @@ impl OwnedSourceScan {
             }
             if source == SnapshotSource::Codex && !codex_join_prepared {
                 if let Some(inventory) = codex_join_inventory.as_mut() {
-                    if !inventory.step(&codex_title_metadata) {
+                    if !inventory.step_with_archive(
+                        &codex_title_metadata,
+                        index,
+                        sampling.as_ref().map(|context| &context.cache),
+                    ) {
                         pending!();
                     }
                     let selected = identified_candidates
@@ -27700,6 +27703,7 @@ impl OwnedSourceScan {
                             &codex_title_metadata,
                             &claude_title_metadata,
                             claude_effort_support_dir_ref,
+                            index.archive_header(&member.path),
                         )?;
                         Some(context.file_scope(
                             source,
@@ -27731,6 +27735,15 @@ impl OwnedSourceScan {
                 } else {
                     active.parser.step()
                 };
+                if let Some(header) = active.parser.reader.header_validated.take() {
+                    if let Some(evidence) = index
+                        .files
+                        .get_mut(&local_index_key(&active.candidate.path))
+                        .and_then(|e| e.archive.as_mut())
+                    {
+                        evidence.header_validated = Some(header);
+                    }
+                }
                 if source == SnapshotSource::Codex {
                     let consumed = active.parser.reader.consumed_bytes();
                     let moved = codex_file_join::take_charge(&mut active);
@@ -28128,6 +28141,7 @@ impl OwnedSourceScan {
                         &codex_title_metadata,
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
+                        index.archive_header(&candidate.path),
                     )
                     .map(|dependency| {
                         context.file_scope(
@@ -28316,6 +28330,7 @@ impl OwnedSourceScan {
                         &codex_title_metadata,
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
+                        index.archive_header(&candidate.path),
                     )?;
                     let digest = sampled_scan::codex_cursor::memo_digest(
                         index,
@@ -28464,6 +28479,7 @@ impl OwnedSourceScan {
                             &codex_title_metadata,
                             &claude_title_metadata,
                             claude_effort_support_dir_ref,
+                            index.archive_header(&candidate.path),
                         )
                         .zip(sampling.as_ref())
                         .map(|(dependency, context)| {
@@ -31107,6 +31123,7 @@ impl OwnedSourceScan {
                                 &codex_title_metadata,
                                 &claude_title_metadata,
                                 claude_effort_support_dir_ref,
+                                index.archive_header(&candidate.path),
                             )
                             .is_some(),
                         };
@@ -31228,6 +31245,15 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            if source == SnapshotSource::Codex
+                && index
+                    .files
+                    .get(&local_index_key(&candidate.path))
+                    .and_then(|e| e.archive.as_ref())
+                    .is_some_and(|a| a.quiet(&opened_file))
+            {
+                pending!();
+            }
             if let Some(context) = sampling.as_ref().filter(|_| {
                 source == SnapshotSource::Codex
                     && !is_compressed_codex_rollout(Some(&candidate.path), None)
@@ -31310,6 +31336,7 @@ impl OwnedSourceScan {
                         &codex_title_metadata,
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
+                        index.archive_header(&candidate.path),
                     )
                     .and_then(|dependencies| {
                         sampled_scan::codex_cursor::memo_digest(
@@ -31413,6 +31440,7 @@ impl OwnedSourceScan {
                                 &codex_title_metadata,
                                 &claude_title_metadata,
                                 claude_effort_support_dir_ref,
+                                index.archive_header(&candidate.path),
                             )
                             .as_deref(),
                         )
@@ -31738,6 +31766,7 @@ impl OwnedSourceScan {
                         &codex_title_metadata,
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
+                        index.archive_header(&candidate.path),
                     );
                     context
                         .admission
@@ -31971,6 +32000,7 @@ impl OwnedSourceScan {
                         &codex_title_metadata,
                         &claude_title_metadata,
                         claude_effort_support_dir_ref,
+                        index.archive_header(&candidate.path),
                     );
                     context
                         .admission
@@ -32111,6 +32141,7 @@ impl OwnedSourceScan {
                             &codex_title_metadata,
                             &claude_title_metadata,
                             claude_effort_support_dir_ref,
+                            index.archive_header(&candidate.path),
                         );
                         let owner = codex_join_inventory
                             .as_ref()
@@ -32696,7 +32727,7 @@ fn parse_codex_jsonl_file_with_diagnostics(
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<ParsedSnapshotFile> {
-    refuse_compressed_codex(Some(path), None, CodexZstCause::CompatibilityUnfunded)?;
+    refuse_compressed_codex(Some(path), None, CodexZstCause::CompatibilityUnsupported)?;
     parse_jsonl_file(
         path,
         collected_at,
@@ -33016,7 +33047,7 @@ impl OwnedJsonlParser {
         context_curve_enabled: bool,
     ) -> Result<Self> {
         if source == SnapshotSource::Codex {
-            refuse_compressed_codex(Some(path), None, CodexZstCause::ConstructorUnfunded)?;
+            refuse_compressed_codex(Some(path), None, CodexZstCause::ParserStateRequired)?;
         }
         Self::new_opened(
             OpenedInput::plain(file),
@@ -34022,6 +34053,8 @@ struct BoundedJsonlReader<R> {
     /// U1a-2a (fix round 2c, DM1): a proof reader's retained-growth room,
     /// handed in before each step. `None` for every other reader: no check.
     retain_room: Option<RetainRoom>,
+    capture_header: bool,
+    header_validated: Option<codex_compressed_input::ValidatedHeader>,
 }
 
 /// U1a-2a (fix rounds 2c/3, DM1, DB2): what a proof reader's paused
@@ -34061,6 +34094,8 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             sealed_fragment: None,
             sealed_prefix: None,
             retain_room: None,
+            capture_header: false,
+            header_validated: None,
         }
     }
 
@@ -34278,6 +34313,16 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             // Clean EOF with no pending bytes.
             self.finished = true;
             return Ok(JsonlReaderStep::Complete(*report));
+        }
+        if self.capture_header
+            && line_start == 0
+            && line_complete
+            && !overflowed
+            && buf.len() < codex_file_join::MAX_HEADER_BYTES
+        {
+            buf.push(b'\n');
+            self.header_validated = codex_compressed_input::ValidatedHeader::from_bytes(buf);
+            buf.pop();
         }
         // M1 durable warm-cache: the line's position in the file, for the
         // marks of re-derived fields. Known only on a positioned read.
@@ -89605,6 +89650,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
             sealed_fragment,
             sealed_prefix,
             retain_room,
+            capture_header,
+            header_validated,
         } = self;
         c.add(reader.capacity())?;
         buf.heap_bound(c)?;
@@ -89621,6 +89668,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
         last_line_end.heap_bound(c)?;
         sealed_fragment.heap_bound(c)?;
         sealed_prefix.heap_bound(c)?;
+        capture_header.heap_bound(c)?;
+        header_validated.heap_bound(c)?;
         retain_room.heap_bound(c)?;
         acquisition.heap_bound(c)
     }
