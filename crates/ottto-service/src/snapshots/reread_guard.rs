@@ -307,10 +307,8 @@ impl State {
             "upgrade_state_missing:{}",
             ottto_core::compiled_release_version()
         );
-        // One hash per indexed file for this release, not a 256-file grant cap.
-        // Old releases cannot constrain the current one and need no retention.
-        self.replayed
-            .retain(|name, _| !name.starts_with("upgrade_state_missing:") || name == &release);
+        // One hash per indexed file/release, not a 256-file grant cap.
+        // Keep other releases: rollback/re-upgrade must not mint another grant.
         if !self.replayed.entry(release).or_default().insert(id) {
             return false;
         }
