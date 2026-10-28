@@ -150,6 +150,7 @@ use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState}
 use claude_response_records::{
     ClaudeResponseBook, ClaudeSelectorTable, CompactClaudeResponseRecord, CompactClaudeSelector,
 };
+use codex_compressed_input::ArchiveDisposition;
 use codex_compressed_input::{is_compressed_codex_rollout, refuse_compressed_codex, OpenedInput};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 // Stage 1 (N2): the cursor side of a continuation page, for StateMissing's
@@ -4344,12 +4345,10 @@ pub struct ScanIndexEntry {
 }
 impl ScanIndexEntry {
     fn codex_recovery_is_pending(&self) -> bool {
-        self.archive.as_ref().is_some_and(|a| {
-            matches!(
-                a.disposition,
-                codex_compressed_input::ArchiveDisposition::Pending { .. }
-            )
-        }) || self.codex_captured_joined_member_set.is_some()
+        self.archive
+            .as_ref()
+            .is_some_and(|a| matches!(a.disposition, ArchiveDisposition::Pending { .. }))
+            || self.codex_captured_joined_member_set.is_some()
             || self.codex_captured_tier_receipt_required
             || self.codex_captured_tier_receipt.is_some()
             || self.codex_captured_uncommitted
@@ -42336,12 +42335,17 @@ fn open_and_identify_scan_candidate_with_rescue(
                 return None;
             }
         };
-    if source == SnapshotSource::Codex
-        && files
-            .get(&local_index_key(&candidate.path))
-            .and_then(|entry| entry.archive.as_ref())
-            .is_some_and(|archive| archive.quiet(&opened_file))
+    if let Some(archive) = files
+        .get(&local_index_key(&candidate.path))
+        .and_then(|entry| entry.archive.as_ref())
+        .filter(|archive| source == SnapshotSource::Codex && archive.quiet(&opened_file))
     {
+        if matches!(
+            archive.disposition,
+            ArchiveDisposition::Held { .. } | ArchiveDisposition::Refused { .. }
+        ) {
+            census.record_unreadable(UnreadableCause::Reduction, 1);
+        }
         return None;
     }
     if !verification_rescue

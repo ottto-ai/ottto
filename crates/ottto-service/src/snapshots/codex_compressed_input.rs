@@ -162,6 +162,7 @@ impl ArchiveEvidence {
         }
         self.owner.is_some() && complete
     }
+    // Delivery replay grants no decode authority for an ACK-settled archive.
     pub(super) fn quiet(&self, file: &File) -> bool {
         self.matches(file)
             && !matches!(self.disposition, ArchiveDisposition::Pending { retry_after, .. } if super::sampled_scan::now_seconds() >= retry_after)
@@ -887,7 +888,12 @@ pub(in crate::snapshots) mod tests {
                 state.files[&key].archive.as_ref().unwrap().disposition,
                 ArchiveDisposition::Acquired
             ));
-            for state in [state.clone(), checkpoint(&state)] {
+            let mut replay = state.clone();
+            assert!(replay.prepare_historical_replay("explicit-replay".into()));
+            assert!(replay.accepted_snapshot_fingerprints.is_empty());
+            // SOURCE first-read-only: replay resets delivery facts but cannot
+            // authorize a second body read or manufacture an entity ACK.
+            for state in [state.clone(), checkpoint(&state), replay] {
                 let (_, result, rows, _) = archive_pass(&f, state, true, None);
                 assert_eq!(decodes(&rows), 0);
                 assert!(result.snapshots.is_empty());
@@ -1000,6 +1006,7 @@ pub(in crate::snapshots) mod tests {
                     let (saved, result, rows, _) = archive_pass(&f, checkpoint(&state), true, None);
                     assert_eq!(decodes(&rows), 0);
                     assert!(result.snapshots.is_empty());
+                    assert!(result.unreadable_path_count > 0);
                     assert!(saved.codex_parent_ownership_ledgers.is_empty());
                     assert!(saved.accepted_snapshot_fingerprints.is_empty());
                     state = saved;
@@ -1043,6 +1050,7 @@ pub(in crate::snapshots) mod tests {
             let (_, result, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
             assert_eq!(decodes(&rows), 0);
             assert!(result.snapshots.is_empty());
+            assert!(result.unreadable_path_count > 0);
         }
     }
     #[test]
@@ -1074,7 +1082,9 @@ pub(in crate::snapshots) mod tests {
             assert!(restored.files[&key].last_snapshot_fingerprint.is_none());
             restored.migrate(f.candidate());
             restored.record(f.candidate(), None, ScanParseOutcome::Unknown);
+            let unhealthy = matches!(restored.files[&key].archive.as_ref().unwrap().disposition, ArchiveDisposition::Held { .. } | ArchiveDisposition::Refused { .. });
             let (_, result, rows, _) = archive_pass(&f, checkpoint(&restored), true, None);
+            assert_eq!(result.unreadable_path_count > 0, unhealthy);
             assert_eq!(decodes(&rows), 0);
             assert!(result.snapshots.is_empty());
         }

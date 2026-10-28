@@ -1999,8 +1999,7 @@ pub(super) fn new_source_parser(
             index.codex_state_only_blocked_session_ids.extend(
                 codex_session_id_candidates_from_path(&candidate.path.with_extension("")),
             );
-            index.files.entry(key.clone()).or_default();
-            index.files.get_mut(&key).expect("archive entry").archive = Some(evidence);
+            index.files.entry(key).or_default().archive = Some(evidence);
             match cache.and_then(|cache| OpenedInput::funded(file, cache).ok()) {
                 Some(input) => input,
                 None => {
