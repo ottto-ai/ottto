@@ -2826,7 +2826,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestCensusCoverage {
 /// duplicates) and the census-unknown families. Coverage, path-owner, shared
 /// and unknown-key trees plus merge buffers are bounded before allocation;
 /// their peak requested layout is reported separately. No hash is copied.
-// Live census/load/retirement tests use this join as their member-status oracle.
+// Tests use member_status to protect live census coverage, duplicate handling and retirement.
 #[cfg(test)]
 pub(crate) struct ClaudeRequestCensusJoin {
     counts: ClaudeRequestCensusShadowCounts,

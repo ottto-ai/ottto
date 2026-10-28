@@ -4725,6 +4725,7 @@ fn retired_reread_new_writer_keeps_previous_default_contract() {
 fn retired_census_shadow_keeps_old_map_and_array_custody() {
     let seed = every_persisted_field_fixture();
     let expected = serde_json::to_value(&seed).unwrap();
+    let expected_bytes = serde_json::to_vec(&seed).unwrap();
     let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
     let mut old = expected.clone();
     old["claude_request_census_shadow"] = serde_json::json!({"o":true,"f":7,"d":9});
@@ -4782,6 +4783,11 @@ fn retired_census_shadow_keeps_old_map_and_array_custody() {
                 expected,
                 "all selection/identity fields unchanged"
             );
+            assert_eq!(
+                serde_json::to_vec(&decoded).unwrap(),
+                expected_bytes,
+                "EVERY surviving field is byte-identical, including identity and replay state"
+            );
             fs::write(&path, bytes).unwrap();
             decoded.save(&path).expect("CAS discards retired evidence");
             let reloaded = ScanIndex::load(&path).unwrap();
@@ -4822,6 +4828,13 @@ fn retired_census_shadow_new_writer_loads_with_previous_default_contract() {
     }
     let seed = every_persisted_field_fixture();
     let bytes = serde_json::to_vec(&seed).unwrap();
+    let serialized = std::str::from_utf8(&bytes).unwrap();
+    for retired in ["claude_request_census_shadow", "derivation_drift", "d"] {
+        assert!(
+            !serialized.contains(&format!("\"{retired}\":")),
+            "new writer must never emit retired diagnostic {retired}"
+        );
+    }
     let old: PreviousIndex =
         serde_json::from_slice(&bytes).expect("previous reader defaults shadow");
     assert_eq!(old.claude_request_census_shadow, PreviousShadow::default());
