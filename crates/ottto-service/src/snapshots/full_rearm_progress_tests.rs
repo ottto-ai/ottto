@@ -503,8 +503,7 @@ fn record_basis_change_rearms_once() {
             .as_ref()
             .unwrap()
             .basis,
-        claude_full_rearm_native_basis(&index, claude_request_identity::cycle_contract(false))
-            .unwrap()
+        claude_full_rearm_record_basis(claude_request_identity::cycle_contract(false))
     );
     assert!(
         rearm
@@ -3160,215 +3159,6 @@ fn attribution_keys_and_request_sink_refusal_are_diagnostic_only() {
 }
 
 #[test]
-fn native_roster_hash_birth_and_qualification_changes_rearm_once_and_latch_debt() {
-    use claude_request_census::{
-        ClaudeRequestBirth, ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
-    };
-    for cause in [
-        "add-holder",
-        "remove-holder",
-        "hash-ownership",
-        "birth",
-        "qualification",
-        "stub",
-    ] {
-        let mut rearm = Rearm::new();
-        let mut index = rearm.index();
-        rearm.add_other_family(&mut index);
-        let key = rearm.other_key();
-        let record = ClaudeRequestCensusRecord::synthetic_for_test(
-            &"1".repeat(64),
-            CENSUS_CLOCK,
-            ClaudeRequestCensusShape::Exact,
-            vec![1, 2],
-        )
-        .with_birth_for_test(Some(ClaudeRequestBirth {
-            unix_seconds: 1,
-            device: 2,
-            inode: 3,
-        }));
-        index
-            .claude_request_census
-            .insert_for_test(&key, record.clone());
-        let mut items = rearm.items.clone();
-        items.push(rearm.other_family(false));
-        items[0].claude_account_withheld_reason =
-            Some(CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE);
-        rearm.establish(&mut index, &items);
-        let before = index.clone();
-        match cause {
-            "add-holder" => {
-                let new_key = local_index_key(
-                    &rearm
-                        .root
-                        .join("c8888888-8888-4888-8888-888888888888.jsonl"),
-                );
-                insert_file(&mut index, &new_key, "new-holder", 512);
-                // Real copy in a second native holder, not a telemetry claim.
-                index
-                    .claude_request_census
-                    .insert_for_test(&new_key, record.clone());
-            }
-            "remove-holder" => {
-                index.files.remove(&key);
-            }
-            "hash-ownership" => {
-                index.claude_request_census.insert_for_test(
-                    &key,
-                    ClaudeRequestCensusRecord::synthetic_for_test(
-                        &"1".repeat(64),
-                        CENSUS_CLOCK,
-                        ClaudeRequestCensusShape::Exact,
-                        vec![1, 3],
-                    ),
-                );
-            }
-            "birth" => {
-                index.claude_request_census.insert_for_test(
-                    &key,
-                    record.clone().with_birth_for_test(Some(ClaudeRequestBirth {
-                        unix_seconds: 1,
-                        device: 2,
-                        inode: 4,
-                    })),
-                );
-            }
-            "qualification" => {
-                index
-                    .claude_request_census
-                    .insert_for_test(&key, record.clone().with_unverified_for_test(true));
-            }
-            "stub" => index
-                .claude_request_census
-                .invalidate_keeping_birth_for_test(&key),
-            _ => unreachable!(),
-        }
-        assert_ne!(
-            claude_full_rearm_native_basis(&before, "test"),
-            claude_full_rearm_native_basis(&index, "test"),
-            "{cause}"
-        );
-        // Exercise the actual terminal seam directly so coverage acquisition
-        // does not mask a native projection change outside invalid families.
-        let families = BTreeSet::from([rearm.parent.clone(), OTHER_ROOT.to_string()]);
-        let non_due = claude_full_rearm_structural_terminal(
-            &mut index,
-            WINDOW,
-            &families,
-            true,
-            true,
-            false,
-            false,
-            Some(CENSUS_CLOCK),
-            claude_request_identity::cycle_contract(false),
-        );
-        assert!(!non_due);
-        assert!(
-            index.claude_full_rearm_progress.structural_rearm_owed,
-            "{cause}"
-        );
-        let mut changed_items = items.clone();
-        if cause == "add-holder" {
-            let new_root = "c8888888-8888-4888-8888-888888888888";
-            let mut copy = rearm.other_family(false);
-            copy.source_session_id = new_root.to_string();
-            for fact in &mut copy.attribution_facts {
-                if fact.value == OTHER_ROOT {
-                    fact.value = new_root.to_string();
-                }
-            }
-            changed_items.push(copy);
-        } else if cause == "remove-holder" {
-            changed_items.retain(|item| item.source_session_id != OTHER_ROOT);
-        }
-        let changed = index.clone();
-        for (phase, phase_items) in [("changed", &changed_items), ("stable", &changed_items)] {
-            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-            let disposition = rearm.fold(
-                &mut index,
-                phase_items,
-                true,
-                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-            );
-            assert_eq!(
-                disposition.duplicate_census.full_rearm,
-                phase == "changed",
-                "{cause}/{phase}"
-            );
-            assert_eq!(
-                disposition.full_rearm_suppression.full_rearm_suppressed,
-                phase == "stable",
-                "{cause}/{phase}"
-            );
-            assert!(index.claude_duplicate_request_witness_overflowed);
-            if phase == "changed" {
-                assert!(index
-                    .files
-                    .values()
-                    .all(|entry| entry.source_file_fingerprint.is_empty()));
-                for (key, entry) in &mut index.files {
-                    entry.source_file_fingerprint =
-                        changed.files[key].source_file_fingerprint.clone();
-                }
-            } else {
-                assert!(index
-                    .files
-                    .values()
-                    .all(|entry| !entry.source_file_fingerprint.is_empty()));
-            }
-        }
-        // A non-due change then revert still owes a due replay, even though
-        // the basis has returned to the currently recorded native state.
-        index.files = before.files.clone();
-        index.claude_request_census = before.claude_request_census.clone();
-        assert!(!claude_full_rearm_structural_terminal(
-            &mut index,
-            WINDOW,
-            &families,
-            true,
-            true,
-            false,
-            false,
-            Some(CENSUS_CLOCK),
-            claude_request_identity::cycle_contract(false)
-        ));
-        assert!(index.claude_full_rearm_progress.structural_rearm_owed);
-        index.files = changed.files.clone();
-        index.claude_request_census = changed.claude_request_census.clone();
-        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-        let owed = rearm.fold(
-            &mut index,
-            &changed_items,
-            true,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        );
-        assert!(owed.duplicate_census.full_rearm, "{cause}");
-        // Return to the original native roster and pay its one change, then
-        // contrast sidecar-only refresh against that settled baseline.
-        index = before.clone();
-        // Telemetry-inclusive fingerprints and observation clocks are excluded.
-        let refreshed = ClaudeRequestCensusRecord::synthetic_for_test(
-            &"2".repeat(64),
-            CENSUS_CLOCK + 1,
-            ClaudeRequestCensusShape::Exact,
-            vec![1, 2],
-        )
-        .with_birth_for_test(record.birth());
-        index.claude_request_census.insert_for_test(&key, refreshed);
-        assert_eq!(
-            claude_full_rearm_native_basis(&before, "test"),
-            claude_full_rearm_native_basis(&index, "test")
-        );
-        assert!(
-            rearm
-                .terminal(&mut index, &items)
-                .suppression
-                .full_rearm_suppressed
-        );
-    }
-}
-
-#[test]
 fn ignored_reasons_follow_window_scope_and_exclude_independent_or_empty_clears() {
     let rearm = Rearm::new();
     let mut index = rearm.index();
@@ -3505,4 +3295,218 @@ fn ignored_savings_exclude_independent_proof_clears_and_non_due_passes() {
         "earlier-page proof correction still clears independently"
     );
     assert_ignored(&diagnostics(scope.finish()), "withheld_account", 2);
+}
+
+fn reidentify_native(item: &mut SnapshotItem, session: &str, prefix: Option<&str>) {
+    let old_root = claude_snapshot_family_root(item);
+    item.source_session_id = session.to_string();
+    let root = session
+        .split_once("_agent-")
+        .map_or(session, |(root, _)| root);
+    for fact in &mut item.attribution_facts {
+        if fact.value == old_root {
+            fact.value = root.to_string();
+        }
+    }
+    if let Some(prefix) = prefix {
+        let rekey = |id: &str| format!("{prefix}-{id}");
+        item.claude_usage_request_ids = item
+            .claude_usage_request_ids
+            .iter()
+            .map(|id| rekey(id))
+            .collect();
+        item.claude_usage_occurrences = std::mem::take(&mut item.claude_usage_occurrences)
+            .into_iter()
+            .map(|(id, occurrence)| (rekey(&id), occurrence))
+            .collect();
+    }
+}
+
+#[test]
+fn native_cross_family_copy_keeps_vetoing_every_due_terminal_and_is_counted() {
+    const COPY: &str = "c8888888-8888-4888-8888-888888888888";
+    let mut rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.add_other_family(&mut index);
+    let other = rearm.other_family(false);
+    let mut items = rearm.items.clone();
+    items.push(other.clone());
+    rearm.establish(&mut index, &items);
+    let copy_key = local_index_key(&rearm.root.join(format!("{COPY}.jsonl")));
+    insert_file(&mut index, &copy_key, "copy-revision", 512);
+    rearm.sources.insert(copy_key, "copy-revision".to_string());
+    let mut copy = other;
+    reidentify_native(&mut copy, COPY, None);
+    items.push(copy);
+    items[0].request_identity_refusals = 1;
+    items[0].claude_account_withheld_reason =
+        Some(CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE);
+    for _ in 0..3 {
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        let run = rearm.terminal(&mut index, &items);
+        assert!(run.counts.full_rearm, "{run:?}");
+        assert!(run.counts.fence_after && run.counts.census_invalid);
+        assert!(!run.suppression.full_rearm_suppressed);
+        assert_eq!(run.rearmed_files, 4);
+        assert!(
+            index.claude_duplicate_request_owners.is_empty(),
+            "no positive ownership from the negative query"
+        );
+        let counts = diagnostics(scope.finish());
+        assert_eq!(counts["rearm_structural_native_duplicate"], 1);
+        assert!(
+            counts.get("rearm_veto_ignored").is_none(),
+            "a rearming terminal reports no ignored veto: {counts}"
+        );
+    }
+    // Presence is measured only at due closed-fence terminals.
+    let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+    index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(CENSUS_CLOCK + 1000);
+    rearm.fold(
+        &mut index,
+        &items,
+        true,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+    );
+    assert!(diagnostics(scope.finish())
+        .get("rearm_structural_native_duplicate")
+        .is_none());
+}
+
+#[test]
+fn unique_native_growth_and_retirement_do_not_rearm_through_removed_vetoes() {
+    use claude_request_census::{ClaudeRequestCensusRecord, ClaudeRequestCensusShape};
+    const NEXT: &str = "2026-08-03T07:10:00Z";
+    const NEW: &str = "c8888888-8888-4888-8888-888888888888";
+    for cause in [
+        "unique-append",
+        "unique-session",
+        "unique-member",
+        "retirement",
+    ] {
+        let mut rearm = Rearm::new();
+        let mut index = rearm.index();
+        rearm.add_other_family(&mut index);
+        let mut items = rearm.items.clone();
+        items.push(rearm.other_family(false));
+        let key = rearm.other_key();
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"1".repeat(64),
+            CENSUS_CLOCK,
+            ClaudeRequestCensusShape::Exact,
+            vec![1, 2],
+        );
+        index
+            .claude_request_census
+            .insert_for_test(&key, record.clone());
+        rearm.establish(&mut index, &items);
+        let basis = index
+            .claude_full_rearm_progress
+            .structural_record
+            .as_ref()
+            .unwrap()
+            .basis
+            .clone();
+        match cause {
+            "unique-append" => {
+                let other = items.last_mut().unwrap();
+                let mut occurrence = other
+                    .claude_usage_occurrences
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                occurrence.sequence += 100;
+                other
+                    .claude_usage_request_ids
+                    .insert("unique-appended-request".to_string());
+                other
+                    .claude_usage_occurrences
+                    .insert("unique-appended-request".to_string(), occurrence);
+                other.request_count += 1;
+                index.claude_request_census.insert_for_test(
+                    &key,
+                    ClaudeRequestCensusRecord::synthetic_for_test(
+                        &"2".repeat(64),
+                        CENSUS_CLOCK + 86400,
+                        ClaudeRequestCensusShape::Exact,
+                        vec![1, 2, 3],
+                    ),
+                );
+            }
+            "unique-session" | "unique-member" => {
+                let mut unique = rearm.other_family(false);
+                let session = if cause == "unique-member" {
+                    format!("{OTHER_ROOT}_agent-unique")
+                } else {
+                    NEW.to_string()
+                };
+                reidentify_native(&mut unique, &session, Some("unique"));
+                let path = if cause == "unique-member" {
+                    rearm
+                        .root
+                        .join(OTHER_ROOT)
+                        .join("subagents/agent-unique.jsonl")
+                } else {
+                    rearm.root.join(format!("{NEW}.jsonl"))
+                };
+                let key = local_index_key(&path);
+                insert_file(&mut index, &key, "unique-revision", 512);
+                rearm
+                    .sources
+                    .insert(key.clone(), "unique-revision".to_string());
+                index.claude_request_census.insert_for_test(
+                    &key,
+                    ClaudeRequestCensusRecord::synthetic_for_test(
+                        &"3".repeat(64),
+                        CENSUS_CLOCK + 86400,
+                        ClaudeRequestCensusShape::Exact,
+                        vec![3, 4],
+                    ),
+                );
+                items.push(unique);
+            }
+            "retirement" => {
+                let mut retired = record;
+                retired.retire();
+                assert!(retired.request_hashes().is_empty());
+                index.claude_request_census.insert_for_test(&key, retired);
+            }
+            _ => unreachable!(),
+        }
+        items[0].claude_account_withheld_reason = Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS);
+        items[0].request_identity_refusals = 1;
+        let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+        let disposition = apply_claude_reported_usage_with_index_and_limits(
+            &mut items,
+            &Default::default(),
+            &Default::default(),
+            &mut index,
+            true,
+            NEXT,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            None,
+        );
+        let run = rearm.reread(&mut index, &disposition);
+        assert!(run.suppression.full_rearm_suppressed, "{cause}: {run:?}");
+        assert_eq!(run.rearmed_files, 0, "{cause}");
+        assert_eq!(
+            index
+                .claude_full_rearm_progress
+                .structural_record
+                .as_ref()
+                .unwrap()
+                .basis,
+            basis
+        );
+        let counts = diagnostics(scope.finish());
+        assert_ignored(&counts, "withheld_account", index.files.len() as u64);
+        assert_ignored(&counts, "identity_refusals", index.files.len() as u64);
+        assert!(
+            counts.get("rearm_structural_native_duplicate").is_none(),
+            "{cause}: {counts}"
+        );
+    }
 }

@@ -107,6 +107,13 @@ pub(crate) fn ignored_vetoes(mask: u16, preserved: u64) {
     });
 }
 
+pub(crate) fn structural_native_duplicate() {
+    update(|counts| {
+        counts.rearm_structural_native_duplicate =
+            counts.rearm_structural_native_duplicate.saturating_add(1)
+    });
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Rearm {
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -180,6 +187,8 @@ pub(crate) struct Counts {
     pub(crate) rearm_veto_ignored: IgnoredVetoCounts,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) rearm_fingerprints_preserved: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) rearm_structural_native_duplicate: u64,
     #[serde(flatten)]
     pub(crate) absence: super::claude_absence::Counts,
     #[serde(flatten)]
@@ -238,6 +247,9 @@ pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
         self.rearm_veto_ignored.merge(other.rearm_veto_ignored);
+        self.rearm_structural_native_duplicate = self
+            .rearm_structural_native_duplicate
+            .saturating_add(other.rearm_structural_native_duplicate);
         self.rearm_fingerprints_preserved = self
             .rearm_fingerprints_preserved
             .saturating_add(other.rearm_fingerprints_preserved);
@@ -551,5 +563,17 @@ mod ignored_tests {
             u64::MAX
         );
         assert_eq!(Scope::begin(true).finish(), Counts::default());
+        let scope = Scope::begin(true);
+        structural_native_duplicate();
+        let mut native = scope.finish();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::json!({"rearm_structural_native_duplicate": 1})
+        );
+        native.rearm_structural_native_duplicate = u64::MAX;
+        let mut extra = Counts::default();
+        extra.rearm_structural_native_duplicate = 1;
+        native.merge(extra);
+        assert_eq!(native.rearm_structural_native_duplicate, u64::MAX);
     }
 }

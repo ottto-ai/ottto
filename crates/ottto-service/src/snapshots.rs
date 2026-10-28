@@ -6914,33 +6914,6 @@ fn claude_full_rearm_record_basis(identity_contract: &str) -> String {
     )
 }
 
-/// Cost-only native roster/ownership projection. No sidecar fingerprint, window,
-/// accounting or telemetry record enters this digest; missing and stub differ.
-fn claude_full_rearm_native_basis(index: &ScanIndex, contract: &str) -> Option<String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
-    let mut digest = Sha256::new();
-    digest.update(b"claude_full_rearm_native_basis:v1\0");
-    digest.update(claude_full_rearm_record_basis(contract));
-    for (position, key) in index.files.keys().enumerate() {
-        if position % 256 == 0 && std::time::Instant::now() >= deadline {
-            return None;
-        }
-        if claude_index_path_member_ref(Path::new(key)).is_none() {
-            continue;
-        }
-        digest.update((key.len() as u64).to_be_bytes());
-        digest.update(key.as_bytes());
-        let record = index.claude_request_census.retry_carry_record(key);
-        digest.update([u8::from(record.is_some())]);
-        if let Some(record) = record {
-            digest.update(record.native_rearm_digest(deadline)?);
-        }
-    }
-    let mut hex = format!("{:x}", digest.finalize());
-    hex.truncate(32);
-    Some(hex)
-}
-
 #[cfg(test)]
 thread_local! {
     static CLAUDE_FULL_REARM_NONEMPTY_DIGESTS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -9087,13 +9060,13 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 )
             });
     duplicate_census.census_invalid = duplicate_census_invalid;
-    // SI-1: an own-byte structural failure masks cross-file duplicates among
-    // otherwise valid families, with or without a full rearm. Once that family
-    // is gone, the next valid complete census can detect those duplicates.
-    let detected_duplicate_request_owners = if census_complete && !duplicate_census_invalid {
+    // Reuse the native census join for a negative scheduling veto even when
+    // an invalid family masks positive duplicate-dependent ownership outputs.
+    // Stable native copies deliberately veto every due suppression (SOURCE).
+    let native_duplicate_request_owners = if census_complete {
         let mut owners = BTreeMap::<String, BTreeSet<(String, String)>>::new();
         for (root_session_id, pending) in &index.claude_usage_family_pending {
-            if pending.invalid || pending.census_window_end != census_window_end {
+            if pending.census_window_end != census_window_end {
                 continue;
             }
             for (member_session_id, occurrences) in &pending.member_occurrences {
@@ -9122,6 +9095,24 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .collect::<BTreeMap<_, _>>()
     } else {
         BTreeMap::new()
+    };
+    let native_duplicate_veto = !native_duplicate_request_owners.is_empty()
+        || !index.claude_duplicate_request_owners.is_empty();
+    if native_duplicate_veto {
+        index.claude_full_rearm_progress.observe_page(
+            &[],
+            &index.claude_usage_family_pending,
+            census_window_end,
+            &duplicate_census,
+            true,
+        );
+    }
+    // Keep the pre-existing ownership mask; the broader negative query above
+    // never grants ownership, changes attribution or enters a money path.
+    let detected_duplicate_request_owners = if duplicate_census_invalid {
+        BTreeMap::new()
+    } else {
+        native_duplicate_request_owners
     };
     let duplicated_request_hashes = index
         .claude_duplicate_request_owners
@@ -9803,6 +9794,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 == Some(claude_request_identity::cycle_contract(identity.is_some()))
             && !index.claude_full_rearm_progress.other_invalidation_observed;
         let full_rearm = full_rearm_due && !full_rearm_suppressed && !post_rebuild_skipped;
+        if full_rearm_due && stays_closed && native_duplicate_veto {
+            crate::local_resource_diagnostics::claude_reread::structural_native_duplicate();
+        }
         if !index.claude_duplicate_request_witness_overflowed {
             index.claude_duplicate_fence_rearm_attempt = 0;
             index.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
@@ -10605,16 +10599,6 @@ fn claude_full_rearm_structural_terminal(
     if !fence_stays_closed {
         return false;
     }
-    let Some(basis) = claude_full_rearm_native_basis(index, identity_contract) else {
-        // Incomplete bounded observation cannot certify an unchanged baseline.
-        index.claude_full_rearm_progress.structural_rearm_owed = true;
-        return false;
-    };
-    index.claude_full_rearm_progress.structural_rearm_owed |= index
-        .claude_full_rearm_progress
-        .structural_record
-        .as_ref()
-        .is_some_and(|record| record.basis != basis);
     let progress = &index.claude_full_rearm_progress;
     let observed = progress.observed_window.as_deref() == Some(census_window_end);
     let mut current = BTreeSet::new();

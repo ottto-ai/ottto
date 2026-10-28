@@ -534,9 +534,14 @@ reason mask; the existing page scope/merge carries published counts.
 
 These are scheduling diagnostics, never proof or attribution. Request refusal,
 identity refusal, proof, input-consistency and rebuild classes can read native
-facts as well as telemetry. Changed native roster, held hashes, physical birth
-or qualification state still invalidate the structural scheduling basis.
-Sidecar bytes alone do not change that native basis. Strict loader/read-health
+facts as well as telemetry. Native transcript duplicates retain a structural veto even under an unrelated
+invalid family. A stable native copy keeps vetoing every due terminal by design.
+`counts.rearm_structural_native_duplicate` counts due closed-fence terminals
+where this native-duplicate veto is present (other vetoes may coexist). It is
+sparse, saturating and count-only. Unique appends, unique new sessions/members
+and routine census retirement do not enter a scheduling projection: no such
+projection is added. Telemetry duplicate rows/multi-root claims alone do not
+activate this native veto. Strict loader/read-health
 failures remain retryable even when their malformed rows would also fail a
 semantic reducer. No extra reader, output stream or persisted diagnostic state
 is introduced.
