@@ -626,10 +626,14 @@ impl DurableTailStore {
             let n = header.len();
             self.counters.guard_header_bytes += n as u64;
             let binding = match decode_header(&header, key, self.source) {
-                Err(Refusal::Corrupt) if header.get(236) == Some(&1) => {
+                Err(Refusal::Corrupt)
+                    if header[8..10] == 2_u16.to_le_bytes() && header.get(236) == Some(&1) =>
+                {
                     return Err(Refusal::RecoveryOpen)
                 }
-                Err(Refusal::Corrupt) if header.get(236) == Some(&2) => {
+                Err(Refusal::Corrupt)
+                    if header[8..10] == 2_u16.to_le_bytes() && header.get(236) == Some(&2) =>
+                {
                     return Err(Refusal::SpentCarrier)
                 }
                 result => result?,
@@ -773,8 +777,15 @@ impl DurableTailStore {
             // A T14 predecessor is the rebuild's to replace.
             let corrupt = match self.classify(&record.binding.key, "overwrite") {
                 Err(Refusal::Corrupt) => true,
-                Err(_) => {
-                    self.counters.store_write_skipped[0] += 1;
+                Err(reason) => {
+                    self.counters.store_write_skipped[if matches!(
+                        reason,
+                        Refusal::RecoveryOpen | Refusal::SpentCarrier
+                    ) {
+                        2
+                    } else {
+                        0
+                    }] += 1;
                     continue;
                 }
                 Ok(Some(old)) => {
@@ -791,6 +802,11 @@ impl DurableTailStore {
                     }
                     if same && old.record.binding.scope == record.binding.scope {
                         record.metadata.reuse_814 = old.record.metadata.reuse_814;
+                        if record.binding.entry == old.record.binding.entry
+                            && record.certificate == old.record.certificate
+                        {
+                            record.metadata.protocol = old.record.metadata.protocol;
+                        }
                     }
                     false
                 }
@@ -1241,7 +1257,7 @@ fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<
     let pin = match tag {
         1 => "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
         2 => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
-        _ => return Err(Refusal::Unknown),
+        _ => "", // Future v2-only sources need no v1 pin.
     };
     let current = crate::snapshots::durable_allowlist(source);
     if !matches!(format, 1 | 2)

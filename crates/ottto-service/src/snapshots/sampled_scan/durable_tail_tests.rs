@@ -1497,12 +1497,33 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             metadata: store::Metadata::default(),
         };
         let bytes = store::tests::pinned_v1_bytes(&pending, 1);
-        let decoded = codec::decode(&pending.body, source).unwrap();
-        let fact = decoded.counting().unwrap();
+        let lock = test_locks::hold(&root);
+        let dir = root.join("store");
+        std::fs::create_dir_all(&dir).unwrap();
+        let disk = dir.join(format!(
+            "{}.rec",
+            pending
+                .binding
+                .key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        std::fs::write(&disk, &bytes).unwrap();
+        std::fs::set_permissions(&disk, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let mut store = DurableTailStore::new(dir, DurableSource::Codex);
+        let old = match store.read(&pending.binding.key, &pending.allowlist) {
+            ReadOutcome::Found(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(old.format, 1);
+        let fact = codec::decode(&old.record.body, source)
+            .unwrap()
+            .counting()
+            .unwrap();
         assert_eq!(fact.0, Some(0));
         assert_eq!(fact.1, version);
-        let lock = test_locks::hold(&root);
-        let mut store = DurableTailStore::new(root.join("store"), DurableSource::Codex);
         let mut current = pending.clone();
         current.metadata.counting = fact;
         store.write_after_save(lock, 1, vec![current]).unwrap();
@@ -1515,7 +1536,6 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             next.record.metadata.ack_owner,
             store::ack_owner(&pending.binding.key, &pending.certificate)
         );
-        assert!(!bytes.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 }
