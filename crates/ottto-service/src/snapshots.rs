@@ -27600,6 +27600,19 @@ impl OwnedSourceScan {
                         }
                     }
 
+                    let siblings = inventory
+                        .first_read_archives
+                        .iter()
+                        .filter(|key| {
+                            codex_session_id_candidates_from_path(
+                                &Path::new(key).with_extension(""),
+                            )
+                            .iter()
+                            .any(|owner| inventory.bound_owner_has_sibling(Path::new(key), owner))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    inventory.deferred_archives.extend(siblings);
                     let unresolved = &inventory.held_owners;
                     residue_blocked_session_ids.extend(unresolved.iter().cloned());
                     codex_state_only_blocked_session_ids.extend(unresolved.iter().cloned());
@@ -27621,6 +27634,12 @@ impl OwnedSourceScan {
                                 .owner_for_path(&candidate.path)
                                 .is_some_and(|owner| deferred_owners.contains(owner))
                     };
+                    residue_index_keys.extend(
+                        identified_candidates
+                            .iter()
+                            .filter(|candidate| deferred(candidate))
+                            .map(|candidate| local_index_key(&candidate.path)),
+                    );
                     sampled_scan::codex_cursor::requeue_members(
                         index,
                         &codex_selected_flags,
@@ -27631,9 +27650,6 @@ impl OwnedSourceScan {
                     identified_candidates.retain(|candidate| !deferred(candidate));
                     identified_candidates.retain(|candidate| {
                         let key = local_index_key(&candidate.path);
-                        if inventory.first_read_archives.contains(&key) {
-                            return true;
-                        }
                         let owner = inventory.owner_for_path(&candidate.path);
                         if !inventory.held_archives.contains(&key)
                             && !owner.is_some_and(|o| unresolved.contains(o))
@@ -29918,12 +29934,6 @@ impl OwnedSourceScan {
                     codex_state_only_blocked_session_ids.extend(owners);
                     pending!();
                 }
-                let archive_singleton = codex_join_inventory
-                    .as_ref()
-                    .zip(archive_owner.as_deref())
-                    .map_or(true, |(inventory, owner)| {
-                        !inventory.bound_owner_has_sibling(&candidate.path, owner)
-                    });
                 if let Some(evidence) = index
                     .files
                     .get_mut(&local_index_key(&candidate.path))
@@ -29932,13 +29942,6 @@ impl OwnedSourceScan {
                     index
                         .codex_state_only_blocked_session_ids
                         .extend(archive_owner.iter().cloned());
-                    if !archive_singleton {
-                        evidence.disposition = ArchiveDisposition::Held {
-                            cause: CodexZstCause::OutputHeld,
-                        };
-                        codex_zst_refused(CodexZstCause::OutputHeld);
-                        pending!();
-                    }
                     if !evidence.finish(archive_owner, &candidate.path, &parsed_file) {
                         if let Some(cause) = evidence.terminal_cause() {
                             census.archive_residue(&candidate.path, Some(evidence), cause);

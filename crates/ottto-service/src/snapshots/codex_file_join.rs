@@ -762,20 +762,16 @@ impl HeaderInventory {
         })();
         match result {
             Ok(Some(header)) => self.headers.push(header),
-            Ok(None) if deferred => {
-                self.held_owners
-                    .extend(codex_session_id_candidates_from_path(
-                        &Path::new(&key).with_extension(""),
-                    ));
-                self.pending.push_back(PathBuf::from(&key));
-                self.deferred_archives.insert(key);
-                return HeaderStep::Deferred;
-            }
             Ok(None) => {
                 self.held_owners
                     .extend(codex_session_id_candidates_from_path(
                         &Path::new(&key).with_extension(""),
                     ));
+                if deferred {
+                    self.pending.push_back(PathBuf::from(&key));
+                    self.deferred_archives.insert(key);
+                    return HeaderStep::Deferred;
+                }
                 self.first_read_archives.insert(key);
             }
             Err(_) if excluded => {
