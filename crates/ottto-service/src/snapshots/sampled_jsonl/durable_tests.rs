@@ -1485,3 +1485,157 @@ fn structural_verifier_large_body_still_allocates_nothing() {
         Err(Corrupt)
     );
 }
+
+include!("selector_compatibility_tests.rs");
+
+#[test]
+fn rejected_selector_candidates_never_save_and_restore_tail_equals_full() {
+    use crate::local_resource_diagnostics::observe_selector_rejections;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let scratch = Scratch::new("selector-rejection");
+        let inject = |line: String| {
+            let mut value: Value = serde_json::from_str(&line).unwrap();
+            value["selector_context"] = json!({"service_tier":"priority", "plan_window_bucket":"/tmp/BUCKET_SAVE_CANARY",
+                "/tmp/KEY_SAVE_CANARY":"VALUE_SAVE_CANARY"});
+            value.to_string()
+        };
+        let lines = match source {
+            SnapshotSource::ClaudeCode => claude_lines(2, 2),
+            _ => codex_lines(),
+        };
+        let lines: Vec<_> = lines.into_iter().map(inject).collect();
+        let path = scratch.write("t.jsonl", &lines);
+        let ((reduction, checkpoint), counts) =
+            observe_selector_rejections(|| full_read(&path, source));
+        assert!(
+            counts.selector_key_rejected_unknown > 0 && counts.selector_key_rejected_format > 0
+        );
+        assert!(!reduction
+            .accumulator
+            .current_selector
+            .context
+            .contains_key("plan_window_bucket"));
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
+        for secret in ["BUCKET_SAVE_CANARY", "KEY_SAVE_CANARY", "VALUE_SAVE_CANARY"] {
+            assert!(occurrences(&body, secret.as_bytes()).is_empty());
+        }
+        let birth = birth_unix_nanos(&fs::metadata(&path).unwrap());
+        let certificate = checkpoint.durable_certificate(birth).unwrap();
+        // Save through the production single-writer store and inspect its envelope.
+        let state = Scratch(crate::test_scratch::private_dir("selector-record"));
+        let lock = crate::locked_state_dir::LockedStateDir::acquire(&state.0).unwrap();
+        use crate::durable_tail_store::{
+            Binding, DurableSource, DurableTailStore, PendingRecord, ReadOutcome,
+        };
+        let durable_source = match source {
+            SnapshotSource::ClaudeCode => DurableSource::ClaudeCode,
+            _ => DurableSource::Codex,
+        };
+        let mut store = DurableTailStore::new(state.0.join("records"), durable_source);
+        let saved = store
+            .write_after_save(
+                &lock,
+                1,
+                vec![PendingRecord {
+                    binding: Binding {
+                        source: durable_source,
+                        key: [0; 32],
+                        context: [1; 32],
+                        scope: [2; 32],
+                        entry: [3; 32],
+                    },
+                    certificate: certificate.clone(),
+                    body: body.clone(),
+                    allowlist: allowlist_digest(source),
+                }],
+            )
+            .unwrap();
+        assert_eq!(saved.written, 1);
+        let record_path = fs::read_dir(store.dir())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            fs::metadata(&record_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let envelope = fs::read(record_path).unwrap();
+        for secret in ["BUCKET_SAVE_CANARY", "KEY_SAVE_CANARY", "VALUE_SAVE_CANARY"] {
+            assert!(occurrences(&envelope, secret.as_bytes()).is_empty());
+        }
+        match store.read(&[0; 32], &allowlist_digest(source)) {
+            ReadOutcome::Found(record) => assert_eq!(record.record.body, body),
+            other => panic!("{other:?}"),
+        }
+
+        let suffix = match source {
+            SnapshotSource::ClaudeCode => vec![claude_append()],
+            _ => codex_append(),
+        };
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for line in suffix.into_iter().map(inject) {
+            writeln!(file, "{line}").unwrap();
+        }
+        drop(file);
+        let (checkpoint, _) = certificate
+            .restore(&mut File::open(&path).unwrap(), scope())
+            .unwrap();
+        let (restored, _) = restore(&path, &body, source).unwrap();
+        let mut continued = parser(&path, source);
+        assert_eq!(
+            continued
+                .prepare_acquisition(
+                    Some(Retained {
+                        checkpoint,
+                        state: restored
+                    }),
+                    &scope(),
+                    None,
+                    NOW
+                )
+                .unwrap(),
+            ReadMode::Tail
+        );
+        while !continued.step().unwrap() {}
+        let saved = encode(
+            &continued.reduction_copy(),
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
+        for secret in ["BUCKET_SAVE_CANARY", "KEY_SAVE_CANARY", "VALUE_SAVE_CANARY"] {
+            assert!(occurrences(&saved, secret.as_bytes()).is_empty());
+        }
+        let dirty = cold_items(&path, source);
+        assert!(!dirty["items"].as_array().unwrap().is_empty());
+        assert_eq!(items(continued, &path, source), dirty);
+        // Reuse the physical file so birth/inode cannot affect the comparison.
+        let clean = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).unwrap();
+                value["selector_context"] = json!({"service_tier":"priority"});
+                value.to_string()
+            })
+            .collect::<Vec<_>>();
+        fs::write(&path, clean.join("\n") + "\n").unwrap();
+        assert_eq!(dirty, cold_items(&path, source));
+    }
+}
+
+#[test]
+fn valid_selector_records_have_zero_rejections() {
+    let (_, counts) = crate::local_resource_diagnostics::observe_selector_rejections(
+        selector_compatibility_tests::valid_native_bodies_records_tier_and_plan_receipt,
+    );
+    assert_eq!(counts.selector_key_rejected_unknown, 0);
+    assert_eq!(counts.selector_key_rejected_format, 0);
+}

@@ -901,6 +901,88 @@ fn e2_resolver_conflict_is_counted_and_emitted() {
 }
 
 #[test]
+fn e2_malformed_only_plan_bucket_matches_absent_money_rows_without_conflicts() {
+    with_enabled(|| {
+        let p = root_file("selector-malformed-only");
+        let index = ScanIndex::default();
+        let first = line("progress", &at(1), 10);
+        let mut last = line("progress", &at(2), 20);
+        last["message"]["usage"]["output_tokens"] = json!(2);
+        let clean = [first, last];
+        let mut dirty = clean.clone();
+        // Only one progressive observation carries the malformed candidate.
+        dirty[0]["selector_context"] = json!({"plan_window_bucket":"/tmp/BAD_BUCKET"});
+        let mut evidence = row("progress", 2, 20);
+        evidence.output_tokens = 2;
+        let read = sidecar(&[refingerprint(evidence)]);
+        let run = |lines: &[Value]| {
+            publish(
+                vec![parse(&p, Some(t0()), &index, lines)],
+                Some(&read),
+                TelemetryRead::Loaded,
+                &index,
+            )
+        };
+        let clean = run(&clean);
+        let (dirty, counts) =
+            crate::local_resource_diagnostics::observe_selector_rejections(|| run(&dirty));
+        assert!(counts.selector_key_rejected_format > 0);
+        assert_eq!(counts.selector_key_rejected_unknown, 0);
+        assert!(!clean.is_empty());
+        let clean_body = &fold(&clean[0]).entity;
+        let dirty_body = &fold(&dirty[0]).entity;
+        assert!(!clean_body.grains.is_empty());
+        assert_eq!(
+            dirty_body.grains.keys().collect::<Vec<_>>(),
+            clean_body.grains.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(dirty_body.totals(), clean_body.totals()); // tokens and request counts
+        let costs =
+            |body: &ClaudeEntityBody| body.grains.values().map(|g| g.cost_micros).sum::<u64>();
+        assert!(costs(clean_body) > 0);
+        assert_eq!(costs(dirty_body), costs(clean_body));
+        assert_eq!(clean_body.resolver_conflicts, 0);
+        assert_eq!(dirty_body.resolver_conflicts, 0);
+        assert!(!dirty_body.held && !clean_body.held);
+        assert_eq!(
+            serde_json::to_value(&dirty).unwrap(),
+            serde_json::to_value(&clean).unwrap()
+        );
+        cleanup(&[&p]);
+    });
+}
+
+#[test]
+fn e2_malformed_nested_bucket_exposes_conflicting_valid_root_buckets() {
+    with_enabled(|| {
+        let p = root_file("selector-mixed-precedence");
+        let index = ScanIndex::default();
+        let mut first = line("progress", &at(1), 10);
+        let mut last = line("progress", &at(2), 20);
+        first["plan_window_bucket"] = json!(20598);
+        last["plan_window_bucket"] = json!(20599);
+        let mut observations = [first, last];
+        for (value, expected) in observations.iter_mut().zip(["20598", "20599"]) {
+            value["selector_context"] = json!({"plan_window_bucket":"bad"});
+            // The common malformed nested override no longer hides valid disagreements.
+            let selector = crate::snapshots::claude_code_selector_from_line(value);
+            assert_eq!(
+                selector
+                    .context
+                    .get("plan_window_bucket")
+                    .map(String::as_str),
+                Some(expected)
+            );
+        }
+        let item = parse(&p, Some(t0()), &index, &observations);
+        assert_eq!(fold(&item).entity.resolver_conflicts, 1);
+        let got = publish(vec![item], None, TelemetryRead::Loaded, &index);
+        assert_eq!(got[0].resolver_conflict_count, Some(1));
+        cleanup(&[&p]);
+    });
+}
+
+#[test]
 fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     let first = root_file("withheld-a");
     let copy = root_file("withheld-b");
