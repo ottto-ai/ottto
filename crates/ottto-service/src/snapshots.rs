@@ -47708,6 +47708,7 @@ impl ScanIndex {
         );
         let mut result = ScanIndex {
             claude_money_birth_store,
+            native_comparison_restore: self.native_comparison_restore.clone(),
             codex_counting_moved_evidence: self.codex_counting_moved_evidence.clone(),
             // The working map, bounded: its slots were freed only against the
             // committed state this page loaded or by its eviction order, and a
