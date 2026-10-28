@@ -482,7 +482,9 @@ fn verify_entries<'a, K: Ord>(
     let mut sorted = true;
     for i in 0..len {
         let current = key(d)?;
-        sorted &= previous.as_ref().map_or(true, |p| p < &current);
+        if let Some(p) = previous.as_ref() {
+            sorted &= p < &current;
+        }
         if !sorted {
             let mut earlier = Dec {
                 bytes: d.bytes,
@@ -1170,8 +1172,14 @@ macro_rules! durable_field {
     (verify E, $d:ident, $ty:ty) => {};
     (verify I, $d:ident, $ty:ty) => {};
     (verify $c:ident, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
-    (key_type H, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigestKey>::View<'a> };
-    (key_type $c:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::DurableKey>::View<'a> };
+    (key_type X, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
+    (key_type E, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
+    (key_type I, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
+    (key X, $d:ident, $ty:ty) => { compile_error!("X/E/I fields cannot appear in durable keys") };
+    (key E, $d:ident, $ty:ty) => { compile_error!("X/E/I fields cannot appear in durable keys") };
+    (key I, $d:ident, $ty:ty) => { compile_error!("X/E/I fields cannot appear in durable keys") };
+    (key_type H, $ty:ty, $lt:lifetime) => { <$ty as $crate::durable_tail_codec::HDigestKey>::View<$lt> };
+    (key_type $c:ident, $ty:ty, $lt:lifetime) => { <$ty as $crate::durable_tail_codec::DurableKey>::View<$lt> };
     (key H, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigestKey>::key_h($d)? };
     (key $c:ident, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::DurableKey>::key($d)? };
     (shape X, $s:ident, $f:ident, $ty:ty) => {{
@@ -1208,7 +1216,7 @@ macro_rules! durable_struct {
     };
     (@key $t:ident ( $($c:ident $f:ident : $ty:ty),* $(,)? )) => {
         impl $crate::durable_tail_codec::DurableKey for $t {
-            type View<'a> = ($($crate::durable_tail_codec::durable_field!(key_type $c, $ty),)*);
+            type View<'a> = ($($crate::durable_tail_codec::durable_field!(key_type $c, $ty, 'a),)*);
             fn key<'a>(d: &mut $crate::durable_tail_codec::Dec<'a>) -> Result<Self::View<'a>, $crate::durable_tail_codec::Corrupt> {
                 Ok(($($crate::durable_tail_codec::durable_field!(key $c, d, $ty),)*))
             }
@@ -1458,6 +1466,24 @@ pub(crate) fn trace_verify(f: impl FnOnce()) -> Vec<(usize, bool)> {
 mod tests {
     use super::*;
 
+    fn round_bytes<T: Durable>(value: T) {
+        let mut e = Enc::bytes(1 << 20);
+        value.put(&mut e).expect("encode");
+        let bytes = e.into_bytes();
+        let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            let mut d = Dec::new(&bytes);
+            T::verify(&mut d).and_then(|()| d.finish())
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(stats.allocations, 0, "{stats:?}");
+        let mut d = Dec::new(&bytes);
+        let restored = T::take(&mut d).expect("decode");
+        d.finish().expect("consumed");
+        let mut e = Enc::bytes(1 << 20);
+        restored.put(&mut e).expect("reencode");
+        assert_eq!(e.into_bytes(), bytes);
+    }
+
     fn round<T: Durable + PartialEq + std::fmt::Debug>(value: T) {
         let mut e = Enc::bytes(1 << 20);
         value.put(&mut e).expect("encode");
@@ -1484,12 +1510,12 @@ mod tests {
         round(None::<String>);
         round(Box::new(String::from("boxed")));
         round((1_u8, 2_u16));
-        round(crate::owned_heap::OwnedVec::from(vec![String::from(
+        round_bytes(crate::owned_heap::OwnedVec::from(vec![String::from(
             "owned",
         )]));
         let mut owned = crate::owned_heap::OwnedMap::new();
         owned.insert(String::from("key"), 3_u64);
-        round(owned);
+        round_bytes(owned);
         round(u64::MAX);
         round(i64::MIN);
         round(-1_i64);
@@ -1571,13 +1597,13 @@ mod tests {
         agrees::<ProbeKind>(&[0x7f]);
     }
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug)]
     struct HContainers(crate::owned_heap::OwnedVec<Option<String>>);
     durable_struct!(HContainers(H hashes: crate::owned_heap::OwnedVec<Option<String>>));
 
     #[test]
     fn verifier_walks_h_containers_and_rejects_duplicate_h_keys() {
-        round(HContainers(crate::owned_heap::OwnedVec::from(vec![
+        round_bytes(HContainers(crate::owned_heap::OwnedVec::from(vec![
             None,
             Some("a".repeat(64)),
         ])));
@@ -1725,6 +1751,7 @@ mod tests {
             !bytes.windows(6).any(|w| w == b"canary"),
             "X is never written"
         );
+        agrees::<Probe>(&bytes);
         let back = Probe::take(&mut Dec::new(&bytes)).expect("decode");
         assert_eq!(back.count, 7);
         assert_eq!(back.id, "req_local");

@@ -1332,11 +1332,13 @@ fn codec_budget_receipt() {
 /// Decode all stored sections, excluding the caller's independent source
 /// binding check. This is the structural acceptance oracle for `verify`.
 fn structurally_decodes(body: &[u8]) -> bool {
-    let mut d = Dec::new(body);
-    CachedJsonlReduction::take(&mut d)
-        .and_then(|_| Rederive::take(&mut d))
-        .and_then(|_| d.finish())
-        .is_ok()
+    [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ]
+    .into_iter()
+    .any(|source| decode(body, source).is_ok())
 }
 
 fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
