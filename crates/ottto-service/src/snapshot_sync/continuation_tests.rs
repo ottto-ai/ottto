@@ -2193,6 +2193,8 @@ fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
                 &mut preparation,
                 &mut scan,
                 Some(8 * 1024 * 1024),
+                &Arc::default(),
+                Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
             )(ticket)
             .expect("real finish admits carried evidence under an 8 MiB retained allowance")
         });

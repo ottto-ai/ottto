@@ -26077,6 +26077,7 @@ impl OwnedSourceScan {
             codex_side_pass: None,
             continuation_ticket: None,
             line_delivery: None,
+            codex_versions: None,
         }
     }
 
