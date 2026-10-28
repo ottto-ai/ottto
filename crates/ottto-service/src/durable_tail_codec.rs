@@ -321,7 +321,11 @@ impl<T: HDigest> HDigest for Option<T> {
     fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
         match d.varint()? {
             0 => Ok(()),
-            1 => T::verify_h(d),
+            1 => {
+                #[cfg(test)]
+                VERIFY_PRESENT_OPTIONS.with(|count| count.set(count.get() + 1));
+                T::verify_h(d)
+            }
             _ => Err(Corrupt),
         }
     }
@@ -357,6 +361,16 @@ impl<T: HDigestKey + Ord> HDigest for BTreeSet<T> {
     }
 }
 
+fn verify_seq(
+    d: &mut Dec<'_>,
+    mut item: impl FnMut(&mut Dec<'_>) -> Result<(), Corrupt>,
+) -> Result<(), Corrupt> {
+    for _ in 0..d.take_len()? {
+        item(d)?;
+    }
+    Ok(())
+}
+
 impl<T: HDigest + crate::heap_layout_bound::HeapLayoutBound> HDigest
     for crate::owned_heap::OwnedVec<T>
 {
@@ -373,10 +387,7 @@ impl<T: HDigest + crate::heap_layout_bound::HeapLayoutBound> HDigest
         Ok(Self::from(out))
     }
     fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        for _ in 0..d.take_len()? {
-            T::verify_h(d)?;
-        }
-        Ok(())
+        verify_seq(d, T::verify_h)
     }
     fn shape_h(s: &mut Shape) {
         s.push("OwnedVec<");
@@ -508,6 +519,16 @@ pub(crate) trait DurableEmpty {
     fn durable_empty(&self) -> bool;
 }
 
+// Scalar validation stays identical to decode, including ranges and labels.
+macro_rules! scalar_verify {
+    ($($raw_tag:ident)?) => {
+        fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+            $(#[cfg(test)] $raw_tag(d.at, false);)?
+            Self::take(d).map(|_| ())
+        }
+    };
+}
+
 impl Durable for u64 {
     fn put(&self, e: &mut Enc) -> Result<(), Refuse> {
         e.varint(*self)
@@ -515,9 +536,7 @@ impl Durable for u64 {
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         d.varint()
     }
-    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        Self::take(d).map(|_| ())
-    }
+    scalar_verify!();
     fn shape(s: &mut Shape) {
         s.push("u64");
     }
@@ -530,9 +549,7 @@ impl Durable for usize {
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         Self::try_from(d.varint()?).map_err(|_| Corrupt)
     }
-    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        Self::take(d).map(|_| ())
-    }
+    scalar_verify!();
     fn shape(s: &mut Shape) {
         s.push("usize");
     }
@@ -547,9 +564,7 @@ macro_rules! narrow_unsigned {
             fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
                 <$t>::try_from(d.varint()?).map_err(|_| Corrupt)
             }
-            fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-                Self::take(d).map(|_| ())
-            }
+            scalar_verify!();
             fn shape(s: &mut Shape) {
                 s.push(stringify!($t));
             }
@@ -585,9 +600,7 @@ impl Durable for i64 {
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         take_signed(d)
     }
-    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        Self::take(d).map(|_| ())
-    }
+    scalar_verify!();
     fn shape(s: &mut Shape) {
         s.push("i64");
     }
@@ -600,9 +613,7 @@ impl Durable for i32 {
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         Self::try_from(take_signed(d)?).map_err(|_| Corrupt)
     }
-    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        Self::take(d).map(|_| ())
-    }
+    scalar_verify!();
     fn shape(s: &mut Shape) {
         s.push("i32");
     }
@@ -616,9 +627,7 @@ impl Durable for i128 {
         let bytes: [u8; 16] = d.raw(16)?.try_into().map_err(|_| Corrupt)?;
         Ok(Self::from_le_bytes(bytes))
     }
-    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        Self::take(d).map(|_| ())
-    }
+    scalar_verify!();
     fn shape(s: &mut Shape) {
         s.push("i128");
     }
@@ -632,9 +641,7 @@ impl Durable for u128 {
         let bytes: [u8; 16] = d.raw(16)?.try_into().map_err(|_| Corrupt)?;
         Ok(Self::from_le_bytes(bytes))
     }
-    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        Self::take(d).map(|_| ())
-    }
+    scalar_verify!();
     fn shape(s: &mut Shape) {
         s.push("u128");
     }
@@ -647,9 +654,7 @@ impl Durable for std::num::NonZeroU64 {
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         Self::new(d.varint()?).ok_or(Corrupt)
     }
-    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        Self::take(d).map(|_| ())
-    }
+    scalar_verify!();
     fn shape(s: &mut Shape) {
         s.push("NonZeroU64");
     }
@@ -666,11 +671,7 @@ impl Durable for bool {
             _ => Err(Corrupt),
         }
     }
-    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        #[cfg(test)]
-        note_verify_visit(d.at, false);
-        Self::take(d).map(|_| ())
-    }
+    scalar_verify!(note_verify_visit);
     fn shape(s: &mut Shape) {
         s.push("bool");
     }
@@ -688,9 +689,7 @@ impl Durable for () {
     fn take(_: &mut Dec<'_>) -> Result<Self, Corrupt> {
         Ok(())
     }
-    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        Self::take(d).map(|_| ())
-    }
+    scalar_verify!();
     fn shape(s: &mut Shape) {
         s.push("()");
     }
@@ -768,9 +767,7 @@ impl Durable for &'static str {
         let index = usize::try_from(d.varint()?).map_err(|_| Corrupt)?;
         STATIC_LABELS.get(index).copied().ok_or(Corrupt)
     }
-    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        Self::take(d).map(|_| ())
-    }
+    scalar_verify!();
     fn shape(s: &mut Shape) {
         s.push("static_label");
         for label in STATIC_LABELS {
@@ -801,7 +798,11 @@ impl<T: Durable> Durable for Option<T> {
         note_verify_visit(d.at, false);
         match d.raw(1)?[0] {
             0 => Ok(()),
-            1 => T::verify(d),
+            1 => {
+                #[cfg(test)]
+                VERIFY_PRESENT_OPTIONS.with(|count| count.set(count.get() + 1));
+                T::verify(d)
+            }
             _ => Err(Corrupt),
         }
     }
@@ -857,10 +858,7 @@ impl<T: Durable> Durable for Vec<T> {
         Ok(out)
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        for _ in 0..d.take_len()? {
-            T::verify(d)?;
-        }
-        Ok(())
+        verify_seq(d, T::verify)
     }
     fn shape(s: &mut Shape) {
         s.push("Vec<");
@@ -882,10 +880,7 @@ impl<T: Durable> Durable for VecDeque<T> {
         Vec::<T>::take(d).map(VecDeque::from)
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        for _ in 0..d.take_len()? {
-            T::verify(d)?;
-        }
-        Ok(())
+        Vec::<T>::verify(d)
     }
     fn shape(s: &mut Shape) {
         s.push("VecDeque<");
@@ -1004,10 +999,7 @@ impl<T: Durable + crate::heap_layout_bound::HeapLayoutBound> Durable
         Vec::<T>::take(d).map(Self::from)
     }
     fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
-        for _ in 0..d.take_len()? {
-            T::verify(d)?;
-        }
-        Ok(())
+        Vec::<T>::verify(d)
     }
     fn shape(s: &mut Shape) {
         s.push("OwnedVec<");
@@ -1171,7 +1163,12 @@ macro_rules! durable_field {
     (verify X, $d:ident, $ty:ty) => {};
     (verify E, $d:ident, $ty:ty) => {};
     (verify I, $d:ident, $ty:ty) => {};
-    (verify $c:ident, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
+    (verify N, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
+    (verify U, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
+    (verify L, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
+    (verify D, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
+    (verify P, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
+    (verify $other:ident, $d:ident, $ty:ty) => { compile_error!("unknown durable field class in verify") };
     (key_type X, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type E, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
     (key_type I, $ty:ty, $lt:lifetime) => { compile_error!("X/E/I fields cannot appear in durable keys") };
@@ -1445,6 +1442,7 @@ pub(crate) fn take_l_spans() -> Vec<(usize, usize, &'static str)> {
 // varint (including tags/lengths) and every raw optional/bool tag visited.
 #[cfg(test)]
 thread_local! {
+    static VERIFY_PRESENT_OPTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static VERIFY_VISITS: std::cell::RefCell<Option<Vec<(usize, bool)>>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
@@ -1456,10 +1454,12 @@ fn note_verify_visit(at: usize, varint: bool) {
     });
 }
 #[cfg(test)]
-pub(crate) fn trace_verify(f: impl FnOnce()) -> Vec<(usize, bool)> {
+pub(crate) fn trace_verify(f: impl FnOnce()) -> (Vec<(usize, bool)>, usize) {
+    VERIFY_PRESENT_OPTIONS.with(|count| count.set(0));
     VERIFY_VISITS.with(|visits| *visits.borrow_mut() = Some(Vec::new()));
     f();
-    VERIFY_VISITS.with(|visits| visits.borrow_mut().take().unwrap())
+    let visits = VERIFY_VISITS.with(|visits| visits.borrow_mut().take().unwrap());
+    (visits, VERIFY_PRESENT_OPTIONS.with(std::cell::Cell::get))
 }
 
 #[cfg(test)]

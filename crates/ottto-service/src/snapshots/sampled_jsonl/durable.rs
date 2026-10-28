@@ -157,6 +157,7 @@ pub(crate) fn encode(
 
 /// Structural body verification only: no reduction, re-derivation or live
 /// inputs. The caller separately checks source/binding and envelope integrity.
+/// Precondition: check size, mode and the envelope trailer before this walk.
 pub(crate) fn verify(body: &[u8]) -> Result<(), Corrupt> {
     let mut d = Dec::new(body);
     CachedJsonlReduction::verify(&mut d)?;

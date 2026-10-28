@@ -1350,22 +1350,25 @@ fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
 #[test]
 fn structural_verifier_real_records_truncations_tags_lengths_and_mutation_corpus() {
     let scratch = Scratch::new("structural-verifier");
-    for (source, name, lines) in [
+    for (source, name, lines, min_present_options) in [
         (
             SnapshotSource::ClaudeCode,
             "claude.jsonl",
             claude_lines(2, 2),
+            10,
         ),
-        (SnapshotSource::Codex, "codex.jsonl", codex_lines()),
+        (SnapshotSource::Codex, "codex.jsonl", codex_lines(), 10),
         (
             SnapshotSource::ClaudeCode,
             "held-claude.jsonl",
             claude_held_request_lines("verify-canary"),
+            10,
         ),
         (
             SnapshotSource::Codex,
             "instructions-codex.jsonl",
             codex_instruction_lines("verify-canary"),
+            10,
         ),
     ] {
         let path = scratch.write(name, &lines);
@@ -1382,8 +1385,13 @@ fn structural_verifier_real_records_truncations_tags_lengths_and_mutation_corpus
                 "{name} prefix {end}"
             );
         }
-        let mut visits =
+        let (mut visits, present_options) =
             crate::durable_tail_codec::trace_verify(|| assert_eq!(verify(&body), Ok(())));
+        assert!(
+            present_options >= min_present_options,
+            "{name}: walked {present_options} populated optional sections, expected >= {min_present_options}"
+        );
+        println!("verifier fixture {name}: {present_options} populated optional sections");
         visits.sort_unstable();
         visits.dedup();
         assert!(visits.iter().any(|(_, varint)| *varint));
@@ -1431,6 +1439,33 @@ fn structural_verifier_real_records_truncations_tags_lengths_and_mutation_corpus
             mutated.push(byte);
             assert_eq!(verified_without_allocation(&mutated), Err(Corrupt));
         }
+    }
+}
+
+#[test]
+fn structural_verifier_nonempty_selector_capture() {
+    let mut capture = crate::snapshots::SelectorCapture::default();
+    capture.insert("service_tier", "priority".into(), "derived_from_logs_2");
+    assert!(!capture.context.is_empty());
+    assert!(!capture.sources.is_empty());
+    let mut e = Enc::bytes(1024);
+    capture.put(&mut e).unwrap();
+    let body = e.into_bytes();
+    let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut d = Dec::new(&body);
+        crate::snapshots::SelectorCapture::verify(&mut d).and_then(|()| d.finish())
+    });
+    assert_eq!(result, Ok(()));
+    assert_eq!(stats.allocations, 0, "{stats:?}");
+    let mut d = Dec::new(&body);
+    let restored = crate::snapshots::SelectorCapture::take(&mut d).unwrap();
+    d.finish().unwrap();
+    assert_eq!(restored, capture);
+    for end in 0..body.len() {
+        let mut d = Dec::new(&body[..end]);
+        assert!(crate::snapshots::SelectorCapture::verify(&mut d)
+            .and_then(|()| d.finish())
+            .is_err());
     }
 }
 
