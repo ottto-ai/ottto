@@ -1014,3 +1014,43 @@ fn missing_spent_fields_and_malformed_context_never_mint_a3_permission() {
         .unwrap()
         .contains("synthetic raw text"));
 }
+
+#[test]
+fn missing_only_spent_generation_is_exhausted_until_an_independent_user_change() {
+    let f = ArchiveFixture::new(b"stamp-only");
+    let key = local_index_key(&f.0);
+    let mut evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+    evidence.user_change = true;
+    evidence.user_context = Some(user_context("A"));
+    evidence.user_generation = 1;
+    let mut value = serde_json::to_value(&evidence).unwrap();
+    value.as_object_mut().unwrap().remove("user_change_spent");
+    let restored: ArchiveEvidence = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(restored.user_change_spent, u64::MAX);
+    assert_eq!(restored.user_generation, 1);
+    let mut index = ScanIndex::default();
+    index.files.entry(key.clone()).or_default().archive = Some(Box::new(restored));
+    index.activate_archive_user_context(user_context("A"));
+    assert!(index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .archive
+        .as_mut()
+        .unwrap()
+        .stop_exhausted());
+    assert!(archive_evidence(&index, &f).user_change);
+    index.activate_archive_user_context(user_context("B"));
+    let archive = index.files.get_mut(&key).unwrap().archive.as_mut().unwrap();
+    assert_eq!(archive.user_generation, 2);
+    assert_eq!(archive.user_change_spent, 1);
+    assert!(
+        !archive.stop_exhausted(),
+        "new independent grant remains available"
+    );
+    // The other asymmetric missing-field case must also stay closed.
+    value["user_change_spent"] = serde_json::json!(1);
+    value.as_object_mut().unwrap().remove("user_generation");
+    let mut restored: ArchiveEvidence = serde_json::from_value(value).unwrap();
+    assert!(restored.stop_exhausted());
+}

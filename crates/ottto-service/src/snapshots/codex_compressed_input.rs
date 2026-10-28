@@ -189,8 +189,11 @@ pub(crate) struct ArchiveEvidence {
     pub(super) user_context: Option<String>,
     #[serde(default)]
     pub(super) user_generation: u64,
-    #[serde(default)]
+    #[serde(default = "exhausted_archive_generation")]
     pub(super) user_change_spent: u64,
+}
+fn exhausted_archive_generation() -> u64 {
+    u64::MAX
 }
 // H: only the domain-separated policy digest is retained, never setting values.
 fn valid_archive_context(context: &str) -> bool {
@@ -863,6 +866,8 @@ impl super::ScanIndex {
             archive.user_context = Some(context.clone());
             if changed && (archive.body_witness.is_some() || archive.user_change) {
                 archive.user_change = true;
+                // Only an independent policy transition replaces an absent-field sentinel.
+                archive.user_change_spent = archive.user_generation;
                 if let Some(next) = archive.user_generation.checked_add(1) {
                     archive.user_generation = next;
                 } else {
