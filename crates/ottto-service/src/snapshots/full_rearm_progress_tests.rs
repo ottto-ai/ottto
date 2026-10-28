@@ -2376,7 +2376,7 @@ fn scanner_seals_only_actual_complete_rebuild_reads() {
 }
 
 #[test]
-fn structural_family_masks_valid_cross_file_duplicate_with_or_without_full_rearm() {
+fn structural_family_masks_duplicate_ownership_but_native_copy_still_rearms() {
     const THIRD_ROOT: &str = "d6666666-6666-4666-8666-666666666666";
     let mut rearm = Rearm::new();
     let mut fix = rearm.index();
@@ -2395,6 +2395,9 @@ fn structural_family_masks_valid_cross_file_duplicate_with_or_without_full_rearm
         first.claude_usage_request_ids,
         second.claude_usage_request_ids
     );
+    let mut baseline = rearm.items.clone();
+    baseline.push(first.clone());
+    rearm.establish(&mut fix, &baseline);
     let third_key = local_index_key(&rearm.root.join(format!("{THIRD_ROOT}.jsonl")));
     rearm
         .sources
@@ -2402,12 +2405,13 @@ fn structural_family_masks_valid_cross_file_duplicate_with_or_without_full_rearm
     insert_file(&mut fix, &third_key, "rev-third", 512);
     let mut items = rearm.items.clone();
     items.extend([first.clone(), second.clone()]);
-    rearm.establish(&mut fix, &items);
     let mut base = fix.clone();
-    let skipped = rearm.terminal(&mut fix, &items);
+    let kept = rearm.terminal(&mut fix, &items);
     let paid = rearm.base_terminal(&mut base, &items);
-    assert!(!skipped.counts.full_rearm);
-    assert!(paid.counts.full_rearm);
+    assert!(kept.counts.full_rearm && paid.counts.full_rearm);
+    assert!(!kept.suppression.full_rearm_suppressed);
+    assert_eq!(kept.rearmed_files, 4);
+    assert_eq!(paid.rearmed_files, 4);
     for index in [&fix, &base] {
         assert!(index.claude_duplicate_request_witness_overflowed);
         assert!(
@@ -2415,7 +2419,7 @@ fn structural_family_masks_valid_cross_file_duplicate_with_or_without_full_rearm
             "the structural family masks even valid cross-file duplicates"
         );
     }
-    assert!(skipped.counts.census_invalid && paid.counts.census_invalid);
+    assert!(kept.counts.census_invalid && paid.counts.census_invalid);
     // The traversal retires the structural family, leaving both valid owners.
     rearm.sources.retain(|key, _| {
         claude_index_path_member_ref(Path::new(key)).is_some_and(|m| m.root != rearm.parent)
@@ -2525,11 +2529,11 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
         )
         .unwrap();
         let roots = [rearm.root.clone()];
-        let scan = |index: &mut ScanIndex| {
+        let scan = |index: &mut ScanIndex, window: &str| {
             scan_source_roots_with_test_limit_and_claude_support(
                 &roots,
                 index,
-                WINDOW,
+                window,
                 BACKFILL_WINDOW_DAYS,
                 100,
                 &support,
@@ -2551,7 +2555,7 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
             );
         };
         let mut index = rearm.index();
-        let mut initial = scan(&mut index);
+        let mut initial = scan(&mut index, WINDOW);
         assert_eq!(initial.scanned_file_count, 4);
         assert!(initial.census_complete);
         enrich(&mut initial, &mut index);
@@ -2563,12 +2567,23 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
                 .collect::<BTreeSet<_>>()
         };
         assert_eq!(family(&initial.snapshots).len(), 2);
-        assert!(initial
+        let initial_parent = initial
             .snapshots
             .iter()
-            .filter(|item| claude_snapshot_family_root(item) == OTHER_ROOT)
-            .all(|item| item.claude_account_withheld_reason
-                == Some(CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE)));
+            .find(|item| item.source_session_id == OTHER_ROOT)
+            .unwrap();
+        assert_eq!(
+            initial_parent.claude_account_withheld_reason,
+            Some(CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE)
+        );
+        assert!(
+            initial
+                .snapshots
+                .iter()
+                .filter(|item| claude_snapshot_family_root(item) == OTHER_ROOT)
+                .all(|item| exact_session_account_hash(item).is_none()),
+            "neither member is bound by partial coverage"
+        );
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut initial, &mut index);
         // Normalize the helper's simulated reread revisions to the actual scanner's.
         rearm.sources = index
@@ -2591,13 +2606,13 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
 
         // Consume the first paid re-arm's real scanner window, then verify
         // that the unchanged, withheld family no longer requests a re-arm.
-        let mut paid = scan(&mut index);
+        let mut paid = scan(&mut index, WINDOW);
         enrich(&mut paid, &mut index);
         let quiet = rearm.terminal(&mut index, &paid.snapshots);
         assert!(quiet.suppression.full_rearm_suppressed, "{quiet:?}");
         assert_eq!(quiet.rearmed_files, 0);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut paid, &mut index);
-        let unchanged = scan(&mut index);
+        let unchanged = scan(&mut index, WINDOW);
         assert_eq!(
             unchanged.scanned_file_count, 0,
             "no unchanged transcript re-read"
@@ -2613,7 +2628,7 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
             writeln!(file, "{}", serde_json::to_string(&row(n)).unwrap()).unwrap();
         }
         drop(file);
-        let mut completed = scan(&mut index);
+        let mut completed = scan(&mut index, "2026-08-02T08:10:00Z");
         assert_eq!(
             completed.scanned_file_count, 2,
             "only the complete family reselects"
@@ -3064,17 +3079,22 @@ fn semantic_refusal_keys_follow_real_proof_reconstruction_inputs_and_rebuild_bra
         } else {
             // Incremental reconstruction reads the retained witness; it does
             // not overwrite it with a new proof from the changed page input.
-            fold_reports(&rearm, &mut index, &mut [changed], &api, &trace, false);
-            // Terminal reasons accumulated on the earlier page remain visible.
-            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-            let disposition = fold_reports(
+            fold_reports(
                 &rearm,
                 &mut index,
-                &mut rearm.items.clone(),
+                &mut [changed.clone()],
                 &api,
                 &trace,
-                true,
+                false,
             );
+            // Terminal reasons accumulated on the earlier page remain visible.
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+            // Keep the refused family on the terminal page: an earlier-page
+            // successful proof has its own independent fingerprint clear.
+            let mut terminal_items = rearm.items.clone();
+            terminal_items.push(changed);
+            let disposition =
+                fold_reports(&rearm, &mut index, &mut terminal_items, &api, &trace, true);
             let run = rearm.reread(&mut index, &disposition);
             assert!(run.suppression.full_rearm_suppressed, "{cause}: {run:?}");
             assert_eq!(run.rearmed_files, 0);
@@ -3097,6 +3117,14 @@ fn attribution_keys_and_request_sink_refusal_are_diagnostic_only() {
         let mut api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
         let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
         if kind == IgnoredVeto::RequestsRefused {
+            let (matching, _) = reports_for(&items[0]);
+            assert!(rebuild_claude_reported_usage(
+                &mut items[0],
+                &matching.evidence[&rearm.parent],
+                &BTreeSet::new(),
+                None
+            ));
+            assert!(!items[0].usage_buckets.is_empty());
             // Missing evidence alone is Missing, not Refused. A checked row
             // without a login exercises a genuine InvalidEvidence refusal.
             let request = items[0].claude_usage_request_ids.first().unwrap();
@@ -3177,10 +3205,12 @@ fn attribution_keys_and_request_sink_refusal_are_diagnostic_only() {
 
 #[test]
 fn ignored_reasons_follow_window_scope_and_exclude_independent_or_empty_clears() {
-    let rearm = Rearm::new();
+    let mut rearm = Rearm::new();
     let mut index = rearm.index();
-    rearm.establish(&mut index, &rearm.items);
+    rearm.add_other_family(&mut index);
     let mut items = rearm.items.clone();
+    items.push(rearm.other_family(false));
+    rearm.establish(&mut index, &items);
     items[0].claude_account_withheld_reason = Some(CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS);
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     // A nonterminal page captures the reason without reporting savings.
@@ -3193,18 +3223,22 @@ fn ignored_reasons_follow_window_scope_and_exclude_independent_or_empty_clears()
     assert_eq!(diagnostics(Default::default()), serde_json::json!({}));
     let mut persisted = serde_json::to_value(&index).unwrap();
     assert!(!persisted.to_string().contains("ignored_vetoes"));
-    // Independent post-proof clear excludes one nonempty fingerprint; the
-    // other is already empty and cannot count as preserved savings.
-    let keys = rearm.sources.keys().cloned().collect::<Vec<_>>();
+    // The already-empty entry is outside the recorded invalid family, so
+    // it does not change that family's structural fingerprint basis.
     index
         .files
-        .get_mut(&keys[0])
+        .get_mut(&rearm.other_key())
         .unwrap()
         .source_file_fingerprint
         .clear();
     let run = rearm.terminal(&mut index, &rearm.items);
     assert!(!run.counts.full_rearm);
-    assert_ignored(&diagnostics(scope.finish()), "withheld_account", 1);
+    assert!(run.suppression.full_rearm_suppressed);
+    assert_eq!(
+        run.rearmed_files, 1,
+        "only the entry already empty before terminal"
+    );
+    assert_ignored(&diagnostics(scope.finish()), "withheld_account", 2);
     // Process-local masks are intentionally not restored from serialized state.
     persisted["claude_full_rearm_progress"]["ignored_vetoes"] = serde_json::json!(65535);
     let restored: ScanIndex = serde_json::from_value(persisted).unwrap();
@@ -3222,11 +3256,18 @@ fn bound_retry_pending_authority_survives_unrelated_suppression_and_offers_its_o
     let mut index = rearm.index();
     rearm.add_other_family(&mut index);
     let mut items = rearm.items.clone();
-    let other = rearm.other_family(false);
+    let revision = "1".repeat(64);
+    let mut other = rearm.other_family(false);
+    other.source_file_fingerprint = Some(revision.clone());
+    index
+        .files
+        .get_mut(&rearm.other_key())
+        .unwrap()
+        .source_file_fingerprint = revision.clone();
+    rearm.sources.insert(rearm.other_key(), revision.clone());
     items.push(other.clone());
     rearm.establish(&mut index, &items);
-    let revision = "held-native-revision";
-    index.insert_retry_pending_claude_authority_at_revision_for_test(OTHER_ROOT, revision);
+    index.insert_retry_pending_claude_authority_at_revision_for_test(OTHER_ROOT, &revision);
     let before = index.claude_usage_authority_quarantine[OTHER_ROOT].clone();
     let (api, trace) = reports_for(&other);
     let mut malformed = api.clone();
@@ -3300,6 +3341,7 @@ fn ignored_savings_exclude_independent_proof_clears_and_non_due_passes() {
     assert!(diagnostics(scope.finish())
         .get("rearm_veto_ignored")
         .is_none());
+    fold_reports(&rearm, &mut index, &mut [other], &api, &trace, false);
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
     let disposition = fold_reports(&rearm, &mut index, &mut page, &api, &trace, true);
