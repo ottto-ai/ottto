@@ -125,6 +125,22 @@ mod line_delivery_tests;
 mod pi_retry_inputs;
 mod sampled_audit;
 mod sampled_jsonl;
+/// Structural verification plus the nested source binding `decode` enforces.
+#[cfg(unix)]
+pub(crate) fn verify_durable_body(
+    body: &[u8],
+    source: crate::durable_tail_store::DurableSource,
+) -> bool {
+    let mut d = crate::durable_tail_codec::Dec::new(body);
+    let nested = <SnapshotSource as crate::durable_tail_codec::Durable>::take(&mut d).ok();
+    nested.and_then(sampled_scan::durable_tail::durable_source) == Some(source)
+        && sampled_jsonl::durable::verify(body).is_ok()
+}
+#[cfg(all(test, unix))]
+pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
+    sampled_jsonl::durable::store_fixture_body(source, count, sum)
+}
+
 pub(crate) mod sampled_scan;
 mod stale_carry_diagnostics;
 #[cfg(test)]
@@ -3092,7 +3108,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
 /// M1 durable warm-cache reuse: selects this source's store (beside
 /// `index_path`) for the pass and binds the pass's sampled scope and
 /// identity-capture mode, which its records bind to. A freshly loaded index
-/// (absent, quarantined or undecodable) removes the store: its records bind
+/// (absent, quarantined or undecodable) selectively cleans the store: records bind
 /// to an index that no longer exists. Removal needs the state-directory
 /// lock; selecting the store and restoring from it need none.
 #[cfg(unix)]
@@ -3136,6 +3152,7 @@ pub(crate) fn durable_after_save(
     if let Some((counters, store)) = cache.durable_counters(source) {
         eprintln!("{}", counters.summary(source, &store));
     }
+    cache.durable_alarm(source);
 }
 
 /// U1a-2a (C14), Codex only: open the pass's side-ledger gate, then prune
@@ -25290,6 +25307,7 @@ pub(crate) struct OwnedSourceScan {
     native_comparison: Option<claude_native_comparison::NativePhase>,
     resource_probe: crate::local_resource_diagnostics::Probe,
     sampling: Option<sampled_scan::Context>,
+    durable_guard: Option<std::sync::Weak<sampled_scan::SharedCache>>,
     source: SnapshotSource,
     /// Configured scan roots, for a Codex census close that starts the next
     /// generation in the same page (G1 carry).
@@ -26513,6 +26531,7 @@ impl OwnedSourceScan {
             native_comparison: None,
             resource_probe,
             sampling: None,
+            durable_guard: None,
             source,
             roots: roots.to_vec(),
             index: owned_index,
@@ -26693,6 +26712,7 @@ impl OwnedSourceScan {
             mut native_comparison,
             mut resource_probe,
             mut sampling,
+            durable_guard,
             index: mut index_storage,
             source,
             roots,
@@ -27640,6 +27660,19 @@ impl OwnedSourceScan {
                     {
                         index.mark_bounded_sweep_unsettled();
                         pending!();
+                    }
+                    // Grouped members bypass the per-candidate guard: one held member holds the group.
+                    #[cfg(unix)]
+                    if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                        if let Some((member, reason)) = group.members.iter().find_map(|member| {
+                            Some((
+                                member,
+                                cache.durable_hold(source, &local_index_key(&member.path))?,
+                            ))
+                        }) {
+                            cache.durable_hold_exit(source, reason, index, member, &mut census);
+                            pending!();
+                        }
                     }
                     // M-5 (b): a group whose attempt already ended as terminal
                     // debt in this generation is not attempted again; its
@@ -31220,6 +31253,17 @@ impl OwnedSourceScan {
                 }
                 CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
             }
+            #[cfg(unix)]
+            if side_plan.is_none() {
+                if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
+                    if let Some(reason) =
+                        cache.durable_hold(source, &local_index_key(&candidate.path))
+                    {
+                        cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
+                        pending!();
+                    }
+                }
+            }
             if let Some(context) = sampling
                 .as_ref()
                 .filter(|_| source == SnapshotSource::Codex)
@@ -31814,7 +31858,7 @@ impl OwnedSourceScan {
                                     index,
                                     &interpretation,
                                 ) {
-                                    Some(taken) => {
+                                    sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => {
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -31824,7 +31868,19 @@ impl OwnedSourceScan {
                                         );
                                         (Some(taken.retained), Some(admission))
                                     }
-                                    None => (None, taken_admission),
+                                    sampled_scan::durable_tail::RestoreOutcome::Miss => {
+                                        (None, taken_admission)
+                                    }
+                                    sampled_scan::durable_tail::RestoreOutcome::Held(reason) => {
+                                        context.cache.durable_hold_exit(
+                                            source,
+                                            reason,
+                                            index,
+                                            &candidate,
+                                            &mut census,
+                                        );
+                                        pending!();
+                                    }
                                 }
                             }
                             retained => (retained, taken_admission),
@@ -32173,6 +32229,7 @@ impl OwnedSourceScan {
             native_comparison,
             resource_probe,
             sampling,
+            durable_guard,
             source,
             roots,
             index: index_storage,
@@ -89170,7 +89227,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reread_required, reread_ticket, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
