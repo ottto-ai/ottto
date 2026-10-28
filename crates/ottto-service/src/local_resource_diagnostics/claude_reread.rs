@@ -556,6 +556,10 @@ mod ignored_tests {
     use super::*;
     #[test]
     fn ignored_keys_are_sparse_saturating_and_page_local() {
+        assert_eq!(IgnoredVeto::ALL.len(), 12, "closed diagnostic cardinality");
+        assert!(IgnoredVeto::ALL
+            .iter()
+            .all(|(kind, _)| kind.bit() < (1 << 12)));
         assert_eq!(
             serde_json::to_value(Counts::default()).unwrap(),
             serde_json::json!({})

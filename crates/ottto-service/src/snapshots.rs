@@ -12266,7 +12266,7 @@ fn derive_claude_legacy_usage_exclusions(
     exclusions
 }
 
-#[allow(dead_code)] // Option compatibility facade; the fold also records the Result reason.
+#[cfg(test)] // Keep the report Option facade for regression callers.
 fn claude_legacy_request_owners(
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
     trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
