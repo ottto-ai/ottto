@@ -726,6 +726,8 @@ impl SharedCache {
             return Err(MissClass::BudgetRefused);
         }
         stores.counters.restored += 1;
+        #[cfg(test)]
+        super::transition_fixture::reach(super::transition_fixture::CrashPoint::Restore);
         drop(stores);
         self.take(key).ok_or(MissClass::TakeLost)
     }

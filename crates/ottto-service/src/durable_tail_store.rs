@@ -32,6 +32,8 @@
 //!   (`SingleWriter`); this layer adds no lock of its own.
 #![cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
 
+#[cfg(test)]
+use crate::snapshots::sampled_scan::transition_fixture::{reach, CrashPoint};
 use crate::transcript_acquisition::DurableCertificate;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1300,8 +1302,14 @@ fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&temp)?;
+        #[cfg(test)]
+        reach(CrashPoint::BeforeTempWrite);
         file.write_all(bytes)?;
+        #[cfg(test)]
+        reach(CrashPoint::TempWritten);
         file.sync_all()?;
+        #[cfg(test)]
+        reach(CrashPoint::FileSynced);
         drop(file);
         #[cfg(test)]
         test_hooks::before_rename(&temp, path)?;
