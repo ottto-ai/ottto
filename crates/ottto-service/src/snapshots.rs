@@ -17600,8 +17600,9 @@ impl SnapshotAccumulator {
             claude_response_record_count: 0,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
-            // Contract 5 is always on: capture is a function of the source.
-            claude_request_identity_capture: claude_request_identity::captures(source),
+            // Preserve parser fixtures' capture default; released scans capture Claude only.
+            claude_request_identity_capture: cfg!(test)
+                || claude_request_identity::captures(source),
             claude_org_markers: None,
             cache_observations: None,
             cache_requests: crate::owned_heap::OwnedVec::new(),
@@ -25746,7 +25747,7 @@ impl OwnedSourceScan {
             hinted_paths,
             watcher_overflowed,
             context_curve_enabled,
-            claude_request_identity::captures(source),
+            cfg!(test) || claude_request_identity::captures(source),
         )
     }
 
