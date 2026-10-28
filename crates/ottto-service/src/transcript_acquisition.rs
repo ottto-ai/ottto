@@ -1905,7 +1905,11 @@ mod tests {
                 .unwrap();
             let source = store::DurableSource::Codex;
             let key = store::key_digest(source, "certificate-roundtrip");
-            let allowlist = store::allowlist_digest(&["certificate-only-fixture"]);
+            // The store preserves unknown shapes, so use the shipped v1
+            // Codex allowlist and its existing real-codec fixture body.
+            let pin = "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1";
+            let allowlist =
+                std::array::from_fn(|i| u8::from_str_radix(&pin[2 * i..2 * i + 2], 16).unwrap());
             let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
             let saved = store::PendingRecord {
                 binding: store::Binding {
@@ -1916,7 +1920,11 @@ mod tests {
                     entry: store::entry_digest("certificate-fixture", None),
                 },
                 certificate: cp.durable_certificate(0).unwrap(),
-                body: Vec::new(),
+                body: crate::snapshots::durable_store_fixture_body(
+                    crate::snapshots::SnapshotSource::Codex,
+                    1,
+                    7,
+                ),
                 allowlist,
             };
             assert_eq!(
