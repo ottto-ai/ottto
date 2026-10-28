@@ -34,6 +34,11 @@ pub(in crate::snapshots) fn new_group_parser(
     context_curve: bool,
     evidence: codex_counting_version::AckEvidence,
 ) -> Result<OwnedJsonlParser> {
+    refuse_compressed_codex(
+        Some(&member.path),
+        None,
+        CodexZstCause::GroupReadUnsupported,
+    )?;
     let mut parser = OwnedJsonlParser::new(
         file,
         &member.path,
@@ -464,6 +469,15 @@ impl GroupBoot {
     /// One legacy-shape member up to its first native record, bounded.
     fn probe(&mut self, i: usize) -> Boot {
         let member = &self.group.members[i];
+        if refuse_compressed_codex(
+            Some(&member.path),
+            None,
+            CodexZstCause::GroupProbeUnsupported,
+        )
+        .is_err()
+        {
+            return Boot::Strict;
+        }
         let cap = self.probe_allowance.min(PROBE_BYTES as u64);
         let result = (|| -> std::io::Result<(Option<Tokens>, bool, u64)> {
             let file = open_candidate_beneath_root(member)?;
@@ -478,6 +492,8 @@ impl GroupBoot {
                     // EOF (or a withheld tail) before any native record.
                     return Ok((None, read > cap, read));
                 }
+                #[cfg(test)]
+                codex_zst_refusal_tests::jsonl_parse_attempted();
                 if let Some(before) = serde_json::from_slice::<Value>(&line)
                     .ok()
                     .as_ref()
@@ -702,6 +718,12 @@ pub(in crate::snapshots) struct JobInputs<'a> {
 }
 
 fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, GroupEnd> {
+    refuse_compressed_codex(
+        Some(&member.path),
+        None,
+        CodexZstCause::GroupReadUnsupported,
+    )
+    .map_err(|_| GroupEnd::Strict)?;
     match open_candidate_file(SnapshotSource::Codex, member) {
         Ok(file) => Ok(file),
         // The member vanished or was renamed: membership changed.
@@ -724,6 +746,12 @@ fn legacy_tee(
     artifacts: bool,
     context_curve: bool,
 ) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
+    refuse_compressed_codex(
+        Some(&member.path),
+        None,
+        CodexZstCause::GroupReadUnsupported,
+    )
+    .map_err(|_| GroupEnd::Strict)?;
     if !legacy_expected.contains_key(&local_index_key(&member.path)) {
         return Ok(None);
     }
@@ -1318,7 +1346,7 @@ pub(in crate::snapshots) fn end_group(
                 // A refusal in the live member is witnessed at its refused
                 // offset; one before any complete record is not memoized.
                 let live = live_failed
-                    .then(|| cursor::LiveWitness::read(held, offset))
+                    .then(|| cursor::LiveWitness::read(&active.candidate.path, held, offset))
                     .flatten();
                 if let (Some(digest), Some(stamp)) = (group.memo_digest.clone(), anchor) {
                     if !live_failed || live.is_some() {

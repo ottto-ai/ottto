@@ -615,3 +615,29 @@ counts as `hint_failed`, before any contract observation. While a placeholder
 is stored, permit flaps remain visible in permit outcomes but cannot be
 classified into `from_empty`, `to_empty` or `collector_e2_grouping` from that
 unknown prior contract.
+
+## Compressed Codex reader refusals
+
+The existing `local_resources` carrier emits stage `codex_zst_refused` with
+`counts.codex_zst_refused{cause}`: a sparse map containing the incremented,
+saturating process-lifetime counter for that cause. These count refused attempts,
+not distinct sessions, decoded bytes or money. No path or session id is included.
+
+| Cause | Unsupported boundary |
+| --- | --- |
+| `CompressedReplayNotAuthorized` | Tail/protected-tier replay reopen |
+| `CompressedProofParentUnsupported` | Proof parent reader |
+| `CompressedProofChildUnsupported` | Proof child reader |
+| `CompressedParentSideUnsupported` | Parent side acquisition |
+| `CompressedDurableTailUnsupported` | Durable certificate restore and rederive |
+| `CompressedGroupProbeUnsupported` | Group ordering probe |
+| `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
+| `CompressedParentLedgerUnbound` | Parent identity without archive ledger binding |
+| `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
+| `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
+| `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |
+
+These refusals authorize neither discovery nor a decoder. A refusal publishes no
+empty or zero-cost replacement body: previous accepted output remains stale, or
+usage remains unknown. Raw bounded samples of compressed physical objects remain
+legal identity observations; they establish no decoded-offset certificate.
