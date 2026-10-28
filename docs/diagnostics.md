@@ -695,3 +695,21 @@ counts. Callers close the decoder and explicitly release after Stores drops.
 Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
+
+## Ambiguous Codex state-only coverage
+
+The existing `local_resources` carrier emits stage
+`codex_state_only_ambiguous_identity` with
+`counts.codex_state_only_ambiguous_identity: 1` once per ambiguous rollout index
+entry per state-only pass when no filename candidate matches a committed body
+owner with a last accepted fingerprint. Sum these observations to count refusal
+decisions, not distinct sessions or money. No path, identity or token value is
+logged; no new persisted state or read is introduced.
+
+When trusted metadata supports both the legacy full-remainder and modern UUID
+identities of a timestamp-shaped filename, prior coverage uses the existing
+committed counting/protected owner plus its accepted fingerprint. Without that
+binding, both candidates are withheld from state-only output, preserving any
+previous exclusive body and its token/model breakdown. Unambiguous legacy and
+modern names retain their existing fallback behavior. This affects Codex only;
+Claude and Pi collection are unchanged.

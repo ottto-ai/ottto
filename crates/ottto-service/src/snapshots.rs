@@ -32362,26 +32362,39 @@ fn append_codex_state_only_snapshots(
         .iter()
         .map(|snapshot| resolve_codex_identity(snapshot.source_session_id.as_str()))
         .collect();
-    // Sessions whose rollout was parsed into a snapshot in a PRIOR scan run.
-    // The incremental scan skips unchanged rollout files, so they are absent
-    // from this run's `snapshots`, but their split snapshot already reached the
-    // backend — re-emitting a state-only total would overwrite it with an
-    // unattributed "Other" (the bug this fix targets). We recover those session
-    // ids from the persisted scan index. Two correctness points:
-    //   * Only entries that actually produced a snapshot count
-    //     (`last_snapshot_fingerprint` is set). `index.record` runs for every
-    //     scanned file, including a rollout that parsed to zero usage rows; such
-    //     a session has no split snapshot, so it MUST still fall through to a
-    //     state-only total or its tokens would be dropped entirely.
-    //   * Session ids are derived from the rollout filename, so coverage does
-    //     not depend on the state DB `rollout_path` matching the scan path
-    //     byte-for-byte (home symlinks, relative paths, case differences).
-    let covered_in_prior_runs: BTreeSet<String> = index
-        .files
-        .iter()
-        .filter(|(_, entry)| entry.last_snapshot_fingerprint.is_some())
-        .filter_map(|(path, _)| metadata.identity_from_path_evidence(Path::new(path)))
-        .collect();
+    // Unchanged rollouts are absent from this page, but their committed split
+    // bodies must not be replaced by unattributed state totals. An ambiguous
+    // filename needs the owner bound to the entry's last accepted body; sidecar
+    // support for both filename grammars cannot choose that owner.
+    let mut covered_in_prior_runs = BTreeSet::new();
+    for (path, entry) in &index.files {
+        let path = Path::new(path);
+        if let Some(identity) = metadata.identity_from_path_evidence(path) {
+            if entry.last_snapshot_fingerprint.is_some() {
+                covered_in_prior_runs.insert(identity);
+            }
+            continue;
+        }
+        let candidates = codex_session_id_candidates_from_path(path);
+        if candidates.len() < 2 {
+            continue;
+        }
+        let committed_owner = entry.last_snapshot_fingerprint.as_ref().and_then(|_| {
+            candidates.iter().find(|identity| {
+                let binding = codex_protected_owner(identity);
+                entry.codex_counting_owner.as_ref() == Some(&binding)
+                    || entry.codex_protected_owner.as_ref() == Some(&binding)
+            })
+        });
+        if let Some(owner) = committed_owner {
+            covered_in_prior_runs.insert(owner.clone());
+        } else {
+            // No accepted owner: neither candidate is safe to replace. This is
+            // suppression only, never positive body/account/ownership evidence.
+            covered_in_prior_runs.extend(candidates);
+            crate::local_resource_diagnostics::codex_state_only_ambiguous_identity();
+        }
+    }
     let mut scanned_session_count = 0;
     let protected = index
         .files
@@ -58617,6 +58630,223 @@ mod tests {
             != Some("total_only")));
 
         let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    fn ambiguous_state_only_fixture(owner: &str) -> (CodexTitleMetadata, ScanIndex, SnapshotItem) {
+        let modern = "019e253c-9999-7000-9000-cccccccccccc";
+        let legacy = format!("2026-05-14T10-00-00-{modern}");
+        let dir = temp_dir("codex-ambiguous-state-only");
+        let path = dir.join(format!("rollout-{legacy}.jsonl"));
+        fs::write(
+            &path,
+            [
+                json!({"timestamp":"2026-05-14T10:00:00Z","type":"session_meta","payload":{"id":owner}}),
+                json!({"timestamp":"2026-05-14T10:00:01Z","type":"turn_context","payload":{"turn_id":"fixture-turn","model":"gpt-5.5"}}),
+                codex_test_token_line("2026-05-14T10:00:02Z", None, (50, 8, 9, 1), Some((50, 8, 9, 1))),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n") + "\n",
+        )
+        .unwrap();
+        let native = parse_codex_jsonl_file(&path, "2026-05-14T10:04:00Z", "fixture".into())
+            .unwrap()
+            .remove(0);
+        assert_eq!(native.source_session_id, owner);
+        assert_eq!(native.input_tokens, 50);
+        assert_eq!(native.cache_read_tokens, 8);
+        assert_eq!(native.output_tokens, 9);
+        assert_eq!(native.reasoning_output_tokens, 1);
+        assert_eq!(native.unattributed_total_tokens, 0);
+        assert_eq!(native.model_usage[0].model, "gpt-5.5");
+        assert_eq!(
+            native.usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        let mut metadata = CodexTitleMetadata::default();
+        for identity in [legacy, modern.to_string()] {
+            metadata.state_threads.insert(
+                identity,
+                CodexStateThread {
+                    tokens_used: 900,
+                    model: Some("state-model".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(metadata.identity_from_path_evidence(&path).is_none());
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&path),
+            serde_json::from_value(json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 1,
+                "source_file_fingerprint": "fixture",
+                "last_snapshot_fingerprint": native.snapshot_fingerprint,
+                "last_upload_body_witness": snapshot_upload_body_witness(&native),
+                "codex_counting_owner": codex_protected_owner(owner)
+            }))
+            .unwrap(),
+        );
+        fs::remove_dir_all(dir).unwrap();
+        (metadata, index, native)
+    }
+
+    #[test]
+    fn codex_ambiguous_filename_keeps_both_forms_of_committed_exclusive_body() {
+        for owner in [
+            "019e253c-9999-7000-9000-cccccccccccc",
+            "2026-05-14T10-00-00-019e253c-9999-7000-9000-cccccccccccc",
+        ] {
+            let (metadata, index, native) = ambiguous_state_only_fixture(owner);
+            for mut index in [
+                index.clone(),
+                serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap(),
+            ] {
+                let before = serde_json::to_value(&index).unwrap();
+                let mut replacements = Vec::new();
+                let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                    append_codex_state_only_snapshots(
+                        &mut replacements,
+                        &metadata,
+                        "2026-05-14T11:04:00Z",
+                        &mut index,
+                        &BTreeSet::new(),
+                    )
+                });
+                assert!(!replacements
+                    .iter()
+                    .any(|item| item.source_session_id == owner));
+                assert_eq!(
+                    replacements.len(),
+                    1,
+                    "the other, unowned state row still falls back"
+                );
+                assert!(rows.is_empty(), "a committed owner supplies coverage");
+                // Model an already-uploaded exclusive body and apply the new batch.
+                let witness = snapshot_upload_body_witness(&native);
+                let mut uploaded = BTreeMap::from([(owner.to_string(), native.clone())]);
+                for replacement in replacements {
+                    uploaded.insert(replacement.source_session_id.clone(), replacement);
+                }
+                assert_eq!(uploaded[owner].model_usage, native.model_usage);
+                assert_eq!(snapshot_upload_body_witness(&uploaded[owner]), witness);
+                assert_eq!(serde_json::to_value(&index).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_ambiguous_filename_without_committed_owner_withholds_and_counts() {
+        for binding in [
+            None,
+            Some("malformed".to_string()),
+            Some(codex_protected_owner("unrelated")),
+        ] {
+            let (metadata, mut index, _) =
+                ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
+            index
+                .files
+                .values_mut()
+                .next()
+                .unwrap()
+                .codex_counting_owner = binding;
+            let mut replacements = Vec::new();
+            let ((count, _), rows) = crate::local_resource_diagnostics::capture(|| {
+                append_codex_state_only_snapshots(
+                    &mut replacements,
+                    &metadata,
+                    "2026-05-14T11:04:00Z",
+                    &mut index,
+                    &BTreeSet::new(),
+                )
+            });
+            assert_eq!(count, 0);
+            assert!(replacements.is_empty());
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["stage"], "codex_state_only_ambiguous_identity");
+            assert_eq!(rows[0]["source"], "codex");
+            assert_eq!(
+                rows[0]["counts"],
+                json!({"codex_state_only_ambiguous_identity": 1})
+            );
+        }
+        let (metadata, mut index, _) =
+            ambiguous_state_only_fixture("019e253c-9999-7000-9000-cccccccccccc");
+        index
+            .files
+            .values_mut()
+            .next()
+            .unwrap()
+            .last_snapshot_fingerprint = None;
+        let mut replacements = Vec::new();
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            append_codex_state_only_snapshots(
+                &mut replacements,
+                &metadata,
+                "2026-05-14T11:04:00Z",
+                &mut index,
+                &BTreeSet::new(),
+            )
+        });
+        assert!(
+            replacements.is_empty(),
+            "a parse owner without an accepted fingerprint grants no coverage"
+        );
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn codex_unambiguous_legacy_and_modern_state_only_controls_are_unchanged() {
+        let modern = "019e253c-9999-7000-9000-cccccccccccc";
+        let legacy = format!("2026-05-14T10-00-00-{modern}");
+        for (name, owner) in [
+            (
+                "rollout-plain-legacy.jsonl".to_string(),
+                "plain-legacy".to_string(),
+            ),
+            (format!("rollout-{modern}.jsonl"), modern.to_string()),
+            (format!("rollout-{legacy}.jsonl"), legacy.clone()),
+            (format!("rollout-{legacy}.jsonl"), modern.to_string()),
+        ] {
+            for accepted in [false, true] {
+                let (_, mut index, _) = ambiguous_state_only_fixture(modern);
+                let mut entry = index.files.pop_first().unwrap().1;
+                entry.codex_counting_owner = None;
+                entry.last_snapshot_fingerprint = accepted.then(|| "accepted".to_string());
+                index.files.insert(name.clone(), entry);
+                let mut metadata = CodexTitleMetadata::default();
+                metadata.state_threads.insert(
+                    owner.clone(),
+                    CodexStateThread {
+                        tokens_used: 900,
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(
+                    metadata.identity_from_path_evidence(Path::new(&name)),
+                    Some(owner.clone())
+                );
+                let mut replacements = Vec::new();
+                let ((count, _), rows) = crate::local_resource_diagnostics::capture(|| {
+                    append_codex_state_only_snapshots(
+                        &mut replacements,
+                        &metadata,
+                        "2026-05-14T11:04:00Z",
+                        &mut index,
+                        &BTreeSet::new(),
+                    )
+                });
+                assert_eq!(count, usize::from(!accepted));
+                assert_eq!(replacements.len(), usize::from(!accepted));
+                if !accepted {
+                    assert_eq!(replacements[0].source_session_id, owner);
+                    assert_eq!(replacements[0].unattributed_total_tokens, 900);
+                }
+                assert!(rows.is_empty());
+            }
+        }
     }
 
     #[test]
