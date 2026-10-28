@@ -15,8 +15,8 @@
 //!   record, in a bounded batch.
 //!
 //! The stores live beside the RAM cache for the process lifetime and are not
-//! part of its state budget: each holds at most `MAX_RECORDS` 64-byte digest
-//! pairs (`STORES_RESIDENT_BOUND`).
+//! part of its state budget: each holds at most `MAX_RECORDS` digest and
+//! verification-stamp entries (`STORES_RESIDENT_BOUND`).
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -66,6 +66,8 @@ pub(crate) struct Counters {
     pub(crate) restored: u64,
     pub(crate) missing: u64,
     pub(crate) refused_record: u64,
+    pub(crate) durable_held: [u64; 5],
+    pub(crate) held_census: [u64; 2],
     pub(crate) ineligible: BTreeMap<&'static str, u64>,
     pub(crate) certificate_refused: BTreeMap<&'static str, u64>,
     pub(crate) corrupt_body: u64,
@@ -107,8 +109,9 @@ impl Counters {
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
-             bytes_read={} refused{{corrupt:{},newer:{},older:{},allowlist:{},unusable:{}}} \
-             unusable{{errno:{},mode:{},shape:{}}} \
+             bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
+             guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
+             uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={}",
             source.api_slug(),
@@ -135,14 +138,15 @@ impl Counters {
             store.records_clean,
             store.budget_refused,
             store.bytes_read,
-            store.refused_corrupt,
-            store.refused_newer,
-            store.refused_older,
-            store.refused_allowlist,
-            store.refused_unusable,
-            store.unusable_errno,
-            store.unusable_mode,
-            store.unusable_shape,
+            store.format_hold,
+            self.durable_held,
+            self.held_census,
+            store.guard_header_bytes,
+            store.guard_verify_bytes,
+            store.delete_verify_bytes,
+            store.overwrite_verify_bytes,
+            store.uninventoried_records,
+            store.store_write_skipped,
             store.gc_records_deleted,
             store.gc_records_read,
             store.gc_bytes_read,
@@ -162,6 +166,10 @@ struct Slot {
     /// The pass's sampled scope and identity-capture mode.
     namespace: Scope,
     identity_capture: bool,
+    /// Keys held (U) by this source, and the totals the last alarm reported:
+    /// [held, t14_rebuild, mode_repaired, disabled].
+    held: u64,
+    reported: [u64; 4],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -371,17 +379,57 @@ impl SharedCache {
         let slot = stores.slot(source);
         if let Some(current) = slot.as_mut().filter(|current| current.dir == dir) {
             current.decided.clear();
+            current.store.begin_pass();
             current.namespace = namespace.clone();
             current.identity_capture = identity_capture;
         } else {
             *slot = Some(Slot {
-                store: DurableTailStore::new(dir.clone()),
+                store: DurableTailStore::new(dir.clone(), source),
                 dir,
                 decided: BTreeMap::new(),
                 namespace: namespace.clone(),
                 identity_capture,
+                held: 0,
+                reported: [0; 4],
             });
         }
+    }
+
+    pub(crate) fn durable_hold(
+        &self,
+        snapshot_source: SnapshotSource,
+        key: &str,
+    ) -> Option<store::Refusal> {
+        let source = durable_source(snapshot_source)?;
+        self.durable()?
+            .slot(source)
+            .as_mut()?
+            .store
+            .hold(&store::key_digest(source, key))
+    }
+
+    pub(in crate::snapshots) fn durable_hold_exit(
+        &self,
+        source: SnapshotSource,
+        reason: store::Refusal,
+        index: &mut ScanIndex,
+        candidate: &CandidateFile,
+        census: &mut ScanCensus,
+    ) {
+        let kept = source == SnapshotSource::ClaudeCode
+            && claude_request_census::retain_held(index, candidate);
+        if let Some(mut stores) = self.durable() {
+            stores.counters.durable_held[reason as usize] += 1;
+            if source == SnapshotSource::ClaudeCode {
+                stores.counters.held_census[usize::from(!kept)] += 1;
+            }
+            if let Some(durable) = durable_source(source) {
+                if let Some(slot) = stores.slot(durable).as_mut() {
+                    slot.held += 1;
+                }
+            }
+        }
+        census.record_unreadable(UnreadableCause::Reduction, 1);
     }
 
     /// Restores `key` from the durable store into the RAM cache and takes it,
@@ -390,6 +438,34 @@ impl SharedCache {
     /// serves the bounded re-derivation, and the read plan repositions it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn durable_restore(
+        &self,
+        snapshot_source: SnapshotSource,
+        key: &str,
+        path: &Path,
+        scope: &Scope,
+        held: &mut File,
+        index: &ScanIndex,
+        interpretation: &Interpretation<'_>,
+    ) -> RestoreOutcome {
+        // The common guard held U/T14 before acquisition; this sees class changes since.
+        match self.restore_known(
+            snapshot_source,
+            key,
+            path,
+            scope,
+            held,
+            index,
+            interpretation,
+        ) {
+            Some(taken) => RestoreOutcome::Restored(Box::new(taken)),
+            None => self
+                .durable_hold(snapshot_source, key)
+                .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_known(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
@@ -759,7 +835,7 @@ impl SharedCache {
         slot.store.gc(writer, &context, &allowlist, &keep)
     }
 
-    /// Index reset or uninstall: the store goes with the index.
+    /// Fresh-index cleanup uses the same verified, bounded GC; U/T14 survive.
     pub(crate) fn durable_remove<W: SingleWriter>(
         &self,
         writer: &W,
@@ -772,7 +848,12 @@ impl SharedCache {
             return Ok(());
         };
         match stores.slot(source).as_mut() {
-            Some(slot) => slot.store.remove_all(writer),
+            Some(slot) => slot.store.gc(
+                writer,
+                &[0; 32],
+                &codec::allowlist_digest(snapshot_source),
+                &BTreeMap::new(),
+            ),
             None => Ok(()),
         }
     }
@@ -791,6 +872,51 @@ impl SharedCache {
         }
     }
 
+    /// Local alarm on the `local_resources` carrier (#799), counts only: this
+    /// source's held keys, T14 rebuilds and mode repairs since the last
+    /// report (with totals), and once, the cause that disabled the store.
+    /// A held key keeps the source's census retryable for the whole hold.
+    pub(crate) fn durable_alarm(&self, snapshot_source: SnapshotSource) {
+        #[derive(serde::Serialize)]
+        struct Alarm {
+            held_keys: [u64; 2],
+            t14_rebuild: [u64; 2],
+            mode_repaired: [u64; 2],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            store_disabled: Option<&'static str>,
+        }
+        let Some(source) = durable_source(snapshot_source) else {
+            return;
+        };
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        let Some(slot) = stores.slot(source).as_mut() else {
+            return;
+        };
+        let (store, disabled) = (slot.store.counters(), slot.store.disabled());
+        let now = [
+            slot.held,
+            store.t14_rebuild,
+            store.mode_repaired,
+            u64::from(disabled.is_some()),
+        ];
+        let last = std::mem::replace(&mut slot.reported, now);
+        drop(stores);
+        if now != last {
+            let pair = |n: usize| [now[n].saturating_sub(last[n]), now[n]];
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                snapshot_source.api_slug(),
+                &Alarm {
+                    held_keys: pair(0),
+                    t14_rebuild: pair(1),
+                    mode_repaired: pair(2),
+                    store_disabled: disabled.filter(|_| last[3] == 0),
+                },
+            );
+        }
+    }
+
     /// This process's durable counts and the source's store counters.
     pub(crate) fn durable_counters(
         &self,
@@ -802,6 +928,12 @@ impl SharedCache {
         let store = stores.slot(source).as_ref()?.store.counters();
         Some((counters, store))
     }
+}
+
+pub(crate) enum RestoreOutcome {
+    Restored(Box<Taken<CachedJsonlReduction>>),
+    Miss,
+    Held(store::Refusal),
 }
 
 enum Failure {
