@@ -923,6 +923,8 @@ impl Controller {
                 }),
             });
         }
+        // A debt-free comparison boundary resets the pending-debt gauge.
+        crate::local_resource_diagnostics::native_comparison_restore_unavailable(0, 0);
         // Only fallback restoration needs the full graph. Retire it before
         // allocating plans/window metadata, moving its existing window string.
         let native_terminal = terminal.map(TerminalTraversal::into_native_census);
@@ -1197,8 +1199,13 @@ impl SelectedFallback {
     /// deferred file cannot be finalized as an empty or semantic-no-op file.
     pub(crate) fn withhold(&self, scan: &mut SourceScanResult) {
         eprintln!("local snapshot comparison deferred: reason=native_comparison_unavailable sources={} target_files={}; prior accepted bodies unchanged", self.withheld_sources.len(), self.targets.len());
+        let before = scan.snapshots.len();
         scan.snapshots
             .retain(|item| !self.withheld_sources.contains(&item.source_session_id));
+        crate::local_resource_diagnostics::native_comparison_restore_unavailable(
+            before - scan.snapshots.len(),
+            self.withheld_sources.len(),
+        );
     }
 
     pub(crate) fn after_native_fold(&self, scan: &mut SourceScanResult, index: &mut ScanIndex) {

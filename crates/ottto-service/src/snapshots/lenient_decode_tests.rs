@@ -836,6 +836,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
         previous_snapshot_fingerprint: Some("previous-group".into()),
         previous_upload_body_witness: None,
         parse_complete: true,
+        complete_native_reduction: false,
         diagnostic_reason: FileReason::Complete,
         parsed_snapshot_count: 1,
         effective_upload_body_witness_revision: 0,

@@ -210,6 +210,9 @@ impl OwnedJsonlParser {
             accumulator.codex_sidecar_projected_next_ordinal =
                 self.accumulator.codex_sidecar_projected_next_ordinal;
             self.accumulator = accumulator;
+            // prepare's scope/object/dependency checks admitted the whole
+            // retained prefix; Unchanged/Tail finish that same reduction.
+            self.complete_native_prefix = true;
             self.reader.report = report;
             self.recognized_usage_drop_count = recognized_usage_drop_count;
             self.positive_recognized_usage_count = positive_recognized_usage_count;

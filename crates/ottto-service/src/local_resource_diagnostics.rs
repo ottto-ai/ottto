@@ -647,6 +647,24 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
     });
 }
 
+/// Comparison bodies actually withheld and unresolved source debt at this
+/// boundary. The latter is a gauge, not coverage or a settlement receipt.
+pub(crate) fn native_comparison_restore_unavailable(bodies: usize, pending: usize) {
+    #[derive(Serialize)]
+    struct Counts {
+        native_comparison_disclosed_restore_unavailable: usize,
+        native_comparison_pending_debt: usize,
+    }
+    traversal_point(
+        "native_comparison_restore_unavailable",
+        "claude_code",
+        &Counts {
+            native_comparison_disclosed_restore_unavailable: bodies,
+            native_comparison_pending_debt: pending,
+        },
+    );
+}
+
 /// One preparation/page observation, never a permit or authority input.
 /// None means that boundary was not reached, not a known false/zero result.
 #[derive(Clone, Copy, Debug, Default, Serialize)]

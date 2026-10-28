@@ -2168,7 +2168,14 @@ impl Controller {
         )?;
         self.native_frontier = next_frontier;
         self.awaiting_targets = selection.queued > 0;
-        if selection.requires_base || !selection.unresolved_sources.is_empty() {
+        if !self.awaiting_targets && selection.unresolved_sources.is_empty() {
+            self.acquisition
+                .merge(scan.take_native_comparison_acquisition(&mut self.qualification));
+        }
+        if selection.requires_base
+            || !selection.unresolved_sources.is_empty()
+            || !self.acquisition.unresolved_sources.is_empty()
+        {
             self.failed = true;
             self.acquisition
                 .unresolved_sources
@@ -2191,7 +2198,6 @@ pub(crate) struct Qualification {
     envelope_roots: Vec<String>,
     envelope_by_hash: Vec<EnvelopeMember>,
     pending: BTreeMap<String, PendingComparison>,
-    unknown_native_sources: BTreeSet<String>,
     revoked_roots: DescriptorSet,
     native_corrections: DescriptorMap<NativeCorrection>,
     correction_revoked_keys: DescriptorSet,
@@ -2241,6 +2247,60 @@ struct PendingComparison {
     required_revisions: BTreeMap<String, String>,
     candidates: Vec<CandidateFile>,
     available: bool,
+}
+
+// Only this pass's one unambiguous, loss-free native completion is evidence.
+fn completed_reduction(candidate: &CandidateFile, pending: &[PendingIndexFinalization]) -> bool {
+    let key = local_index_key(&candidate.path);
+    let mut reads = pending.iter().filter(|read| read.index_key == key);
+    let Some(read) = reads.next() else {
+        return false;
+    };
+    reads.next().is_none()
+        && read.parse_complete
+        && read.complete_native_reduction
+        && read.source_file_fingerprint == candidate.source_file_fingerprint
+}
+
+impl PendingComparison {
+    fn covered_by(
+        &self,
+        root: &str,
+        native: &[SnapshotItem],
+        pending: &[PendingIndexFinalization],
+    ) -> bool {
+        self.available
+            && self.candidates.iter().all(|candidate| {
+                completed_reduction(candidate, pending)
+                    && claude_index_path_family_member(&candidate.path).is_some_and(|(r, m)| {
+                        r == root
+                            && self.required_revisions.get(&m)
+                                == Some(&candidate.source_file_fingerprint)
+                    })
+            })
+            && self.required_revisions.iter().all(|(member, revision)| {
+                let mut bodies = native.iter().filter(|item| {
+                    &item.source_session_id == member
+                        && claude_snapshot_family_root_ref(item) == root
+                });
+                let Some(body) = bodies.next() else {
+                    return false;
+                };
+                bodies.next().is_none()
+                    && body.source_file_fingerprint.as_ref() == Some(revision)
+                    && {
+                        let mut reads = pending.iter().filter(|read| {
+                            claude_index_path_family_member(Path::new(&read.index_key))
+                                .is_some_and(|(r, m)| r == root && &m == member)
+                        });
+                        reads.next().is_some_and(|read| {
+                            read.parse_complete
+                                && read.complete_native_reduction
+                                && &read.source_file_fingerprint == revision
+                        }) && reads.next().is_none()
+                    }
+            })
+    }
 }
 
 /// Temporary matching lives synchronously inside the existing moving credit.
@@ -2433,7 +2493,7 @@ impl Qualification {
         &mut self,
         native: &[SnapshotItem],
         frontier: usize,
-        remaining_files: usize,
+        _remaining_files: usize,
         pending: &[PendingIndexFinalization],
         file_limit: usize,
         mut recovery: Option<&mut RecoveryBudget<'_>>,
@@ -2497,19 +2557,9 @@ impl Qualification {
                     }
                 }
                 None => {
-                    if recovery.is_some() {
-                        // No exact native novelty is not a positive S/Q3 hit.
-                        // Withdraw optional negatives and use ordinary BASE;
-                        // never create an invisible generic-session deferral.
-                        result.requires_base = true;
-                    } else {
-                        // Preserved logical full-path prototype adapter.
-                        self.unknown_native_sources
-                            .insert(item.source_session_id.clone());
-                        result
-                            .unresolved_sources
-                            .insert(item.source_session_id.clone());
-                    }
+                    // Unknown novelty withdraws optional negatives and uses
+                    // ordinary BASE. It is not a positive comparison hit.
+                    result.requires_base = true;
                 }
             }
         }
@@ -2544,7 +2594,7 @@ impl Qualification {
                 }
             }
         }
-        let mut candidates = Vec::new();
+        let candidates = Vec::new();
         for (root, sources) in sources_by_root {
             if recovery.is_some() {
                 let bytes = self.families.get(&root).and_then(|family| {
@@ -2587,35 +2637,6 @@ impl Qualification {
             self.correction_forbidden_roots.insert(root.clone());
             self.native_corrections
                 .retain(|_, receipt| receipt.root() != root);
-            // Shipping acquisition policy is deliberately deferred-only. A
-            // real hit can queue A for the NEXT ordinary BASE pass, never an
-            // optional in-pass target body. Oversized/latched/exited roots use
-            // BASE immediately; removing this root also withdraws negatives.
-            if let Some(recovery) = recovery.as_mut() {
-                let new_local = sources
-                    .iter()
-                    .filter(|source| {
-                        pending.iter().any(|read| {
-                            !recovery.previous.files.contains_key(&read.index_key)
-                                && !recovery
-                                    .previous
-                                    .file_snapshot_fingerprints
-                                    .contains_key(&read.index_key)
-                                && claude_index_path_member_ref(Path::new(&read.index_key))
-                                    .is_some_and(|member| member.matches_member(source))
-                        })
-                    })
-                    .count();
-                if !recovery.lease.defer_family(
-                    &root,
-                    family.members.len() > file_limit,
-                    (sources.len(), new_local),
-                    recovery.credit,
-                )? {
-                    continue;
-                }
-            }
-            result.matched_roots += 1;
             let mut required_revisions = family
                 .certified
                 .values()
@@ -2634,31 +2655,55 @@ impl Qualification {
                 .members
                 .iter()
                 .all(|member| required_revisions.contains_key(member));
-            let available = recovery.is_none()
-                && complete_selected_family
-                && candidates.len().saturating_add(family.certified.len()) <= remaining_files;
+            let oversized_family = family.members.len() > file_limit;
             let targets = family
                 .certified
                 .into_values()
                 .map(|skip| skip.candidate)
                 .collect::<Vec<_>>();
-            if available {
-                candidates.extend(targets.iter().cloned());
-            } else {
-                result.unresolved_sources.extend(sources.iter().cloned());
+            let plan = PendingComparison {
+                sources,
+                required_revisions,
+                candidates: targets,
+                available: complete_selected_family,
+            };
+            // Already parsed page bodies can cover the whole frozen plan.
+            // Otherwise defer to BASE; never enqueue an immediate Full.
+            if !plan.covered_by(&root, native, pending) {
+                // Missing reduction coverage can queue NEXT BASE recovery;
+                // exact page coverage incurs no deferral or family latch.
+                if let Some(recovery) = recovery.as_mut() {
+                    let new_local = plan
+                        .sources
+                        .iter()
+                        .filter(|source| {
+                            pending.iter().any(|read| {
+                                !recovery.previous.files.contains_key(&read.index_key)
+                                    && !recovery
+                                        .previous
+                                        .file_snapshot_fingerprints
+                                        .contains_key(&read.index_key)
+                                    && claude_index_path_member_ref(Path::new(&read.index_key))
+                                        .is_some_and(|member| member.matches_member(source))
+                            })
+                        })
+                        .count();
+                    if !recovery.lease.defer_family(
+                        &root,
+                        oversized_family,
+                        (plan.sources.len(), new_local),
+                        recovery.credit,
+                    )? {
+                        continue;
+                    }
+                }
+                result
+                    .unresolved_sources
+                    .extend(plan.sources.iter().cloned());
             }
+            result.matched_roots += 1;
             assert!(
-                self.pending
-                    .insert(
-                        root,
-                        PendingComparison {
-                            sources,
-                            required_revisions,
-                            candidates: targets,
-                            available,
-                        }
-                    )
-                    .is_none(),
+                self.pending.insert(root, plan).is_none(),
                 "withdrawn roots cannot acquire a second plan"
             );
         }
@@ -2689,57 +2734,19 @@ impl Qualification {
         pending: &[PendingIndexFinalization],
         healthy: bool,
     ) -> TargetAcquisition {
-        let mut native_revisions = BTreeMap::<String, BTreeMap<&str, Option<&str>>>::new();
-        for item in native {
-            native_revisions
-                .entry(claude_snapshot_family_root(item))
-                .or_default()
-                .entry(&item.source_session_id)
-                .and_modify(|revision| *revision = None)
-                .or_insert(
-                    item.source_file_fingerprint
-                        .as_deref()
-                        .filter(|fp| !fp.is_empty()),
-                );
-        }
-        let mut completed_by_key = BTreeMap::<&str, Option<&PendingIndexFinalization>>::new();
-        for read in pending {
-            completed_by_key
-                .entry(&read.index_key)
-                .and_modify(|read| *read = None)
-                .or_insert(Some(read));
-        }
-        let mut outcome = TargetAcquisition {
-            unresolved_sources: std::mem::take(&mut self.unknown_native_sources),
-            ..Default::default()
-        };
+        let mut outcome = TargetAcquisition::default();
         for (root, plan) in std::mem::take(&mut self.pending) {
-            // Queueing, a restored entry or a cached snapshot cannot stand in
-            // for this pass's completed full native read at the expected fp.
+            // The parser completion carries whole-reduction provenance from
+            // either a fresh parse or validated RAM/#806 reuse. A raw suffix,
+            // old accepted body/hash, or queued job supplies no such witness.
             let completed = plan
                 .candidates
                 .iter()
-                .filter(|candidate| {
-                    completed_by_key
-                        .get(local_index_key(&candidate.path).as_str())
-                        .and_then(|read| *read)
-                        .is_some_and(|read| {
-                            read.parse_complete
-                                && read.source_file_fingerprint == candidate.source_file_fingerprint
-                        })
-                })
+                .filter(|candidate| completed_reduction(candidate, pending))
                 .count();
             outcome.completed_target_files =
                 outcome.completed_target_files.saturating_add(completed);
-            let acquired = plan.available
-                && healthy
-                && completed == plan.candidates.len()
-                && plan.required_revisions.iter().all(|(member, revision)| {
-                    native_revisions
-                        .get(&root)
-                        .and_then(|members| members.get(member.as_str()))
-                        .is_some_and(|actual| *actual == Some(revision.as_str()))
-                });
+            let acquired = healthy && plan.covered_by(&root, native, pending);
             if acquired {
                 outcome.acquired_roots.insert(root);
                 outcome.ready_for_fold_sources.extend(plan.sources);
@@ -2891,7 +2898,7 @@ crate::heap_layout_bound::fields!(NativePhase; disabled, retained_target_bytes, 
 crate::heap_layout_bound::fields!(FrozenFamily; proof, members, envelope, certified, prior_native, paired_roots);
 crate::heap_layout_bound::fields!(FrozenNativePrior; revision, request_fingerprint, occurrence_fingerprint, assigned);
 crate::heap_layout_bound::fields!(Controller; qualification, required_roots, native_frontier, ordinary_body_frontier, awaiting_targets, failed, acquisition);
-crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, unknown_native_sources, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
+crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
 crate::heap_layout_bound::fields!(WindowEligibility; census_window_end, roots, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
 crate::heap_layout_bound::fields!(WindowRoot; proof, certified);
 

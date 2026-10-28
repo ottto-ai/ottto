@@ -7581,6 +7581,8 @@ struct PendingIndexFinalization {
     previous_snapshot_fingerprint: Option<String>,
     previous_upload_body_witness: Option<String>,
     parse_complete: bool,
+    /// Loss-free native finish over the complete reduction, never body/ACK state.
+    complete_native_reduction: bool,
     diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
@@ -28775,6 +28777,7 @@ impl OwnedSourceScan {
                 };
                 let claude_grown_prefix =
                     source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
+                let complete_native_prefix = parser.complete_native_prefix;
                 let parsed_file = parser.finish_with_repository_identity(
                     &candidate.opened_object_identity,
                     &candidate.path,
@@ -29096,6 +29099,14 @@ impl OwnedSourceScan {
                     );
                 }
                 let parse_complete = parsed_file.complete();
+                let complete_native_reduction = source == SnapshotSource::ClaudeCode
+                    && complete_native_prefix
+                    && parse_complete
+                    && sampled_jsonl::loss_free_source_report(
+                        &parsed_file.report,
+                        parsed_file.recognized_usage_drop_count,
+                        parsed_file.dropped_usage_record_count,
+                    );
                 // Claude response conflicts may be discovered only by native
                 // finalization. A prefix cannot publish that late loss: it
                 // would have neither a committed audit marker nor necessarily
@@ -29634,6 +29645,7 @@ impl OwnedSourceScan {
                             previous_snapshot_fingerprint: index.last_snapshot_fingerprint(alias),
                             previous_upload_body_witness: index.last_upload_body_witness(alias),
                             parse_complete,
+                            complete_native_reduction: false, // Codex joined alias.
                             diagnostic_reason,
                             parsed_snapshot_count: parsed.len(),
                             effective_upload_body_witness_revision: index
@@ -29701,6 +29713,7 @@ impl OwnedSourceScan {
                         .then_some(previous_upload_body_witness)
                         .flatten(),
                     parse_complete,
+                    complete_native_reduction,
                     diagnostic_reason,
                     parsed_snapshot_count,
                     effective_upload_body_witness_revision: index
@@ -32966,6 +32979,8 @@ type LineSink<'a> = &'a mut dyn FnMut(&Value);
 struct OwnedJsonlParser {
     #[cfg(test)]
     source_read_probe: Option<PathBuf>,
+    /// False for a parser opened on a raw suffix; validated reuse restores it.
+    complete_native_prefix: bool,
     reader: BoundedJsonlReader<OpenedInput>,
     accumulator: SnapshotAccumulator,
     source: SnapshotSource,
@@ -33011,7 +33026,7 @@ impl OwnedJsonlParser {
     /// input arrives with its decoder credit already paid.
     #[allow(clippy::too_many_arguments)]
     fn new_opened(
-        reader: OpenedInput,
+        mut reader: OpenedInput,
         path: &Path,
         source: SnapshotSource,
         apply_line: fn(&Value, &mut SnapshotAccumulator),
@@ -33051,9 +33066,12 @@ impl OwnedJsonlParser {
             claude_opened_birth = opened.as_ref().and_then(claude_opened_file_birth);
         }
 
+        let complete_native_prefix =
+            source == SnapshotSource::ClaudeCode && reader.get_mut().stream_position()? == 0;
         Ok(Self {
             #[cfg(test)]
             source_read_probe: Some(path.to_owned()),
+            complete_native_prefix,
             reader: BoundedJsonlReader::new(
                 reader,
                 jsonl_line_cap(),
@@ -89170,9 +89188,9 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
-crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
+crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, complete_native_prefix, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, complete_native_reduction, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::durable_tail_codec::durable_struct!(key RowKey {
