@@ -65,6 +65,7 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
     let pending = keys
         .iter()
         .map(|key| PendingRecord {
+            metadata: crate::durable_tail_store::Metadata::default(),
             binding: Binding {
                 source: DurableSource::Codex,
                 key: store::key_digest(DurableSource::Codex, key),
@@ -295,6 +296,16 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
                 lock,
                 index.generation,
                 vec![PendingRecord {
+                    metadata: store::Metadata {
+                        namespace: store::namespace_digest(
+                            &namespace.0,
+                            &interpretation.identity_contract,
+                        ),
+                        body_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
+                            source,
+                        ),
+                        ..store::Metadata::default()
+                    },
                     binding,
                     certificate: certificate(&path, &scope),
                     body,
@@ -445,6 +456,16 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
                 lock,
                 index.generation,
                 vec![PendingRecord {
+                    metadata: store::Metadata {
+                        namespace: store::namespace_digest(
+                            &namespace.0,
+                            &interpretation.identity_contract,
+                        ),
+                        body_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
+                            source,
+                        ),
+                        ..store::Metadata::default()
+                    },
                     binding: binding.clone(),
                     certificate: certificate(&path, &scope),
                     body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
@@ -852,6 +873,16 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 // production fresh-index cleanup must delete it.
                 let absent_key = store::key_digest(ds, "/synthetic/absent-known.jsonl");
                 let record = |key| PendingRecord {
+                    metadata: store::Metadata {
+                        namespace: store::namespace_digest(
+                            &namespace.0,
+                            &interpretation.identity_contract,
+                        ),
+                        body_revision: crate::snapshot_sync::effective_upload_body_witness_revision(
+                            source,
+                        ),
+                        ..store::Metadata::default()
+                    },
                     binding: Binding {
                         source: ds,
                         key,
@@ -884,7 +915,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     let end = bytes.len() - 1;
                     bytes[end] ^= 1;
                 } else {
-                    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+                    bytes[8..10].copy_from_slice(&(store::FORMAT_VERSION + 1).to_le_bytes());
                     let end = bytes.len() - 32;
                     let trailer = Sha256::digest(&bytes[..end]);
                     bytes[end..].copy_from_slice(&trailer);
@@ -1105,7 +1136,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 } else {
-                    assert_eq!(counts.durable_held, [0; 5]);
+                    assert_eq!(counts.durable_held, [0; 8]);
                 }
                 assert_eq!(counts.restored, 0);
                 let _ = std::fs::remove_dir_all(root);
@@ -1136,6 +1167,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     std::fs::write(&cert_path, b"{}\n").unwrap();
     let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
     let pending = PendingRecord {
+        metadata: crate::durable_tail_store::Metadata::default(),
         binding: Binding {
             source: ds,
             key: store::key_digest(ds, key),
@@ -1155,12 +1187,14 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
         .unwrap()
         .path();
     let mut bytes = std::fs::read(&record_path).unwrap();
-    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[8..10].copy_from_slice(&(store::FORMAT_VERSION + 1).to_le_bytes());
     std::fs::write(&record_path, &bytes).unwrap();
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, false);
     assert!(
-        cache.durable_hold(source, key).is_some(),
+        cache
+            .durable_hold(source, key, None, &ScanIndex::default())
+            .is_some(),
         "control: U holds"
     );
     let _own = OwnUid;
@@ -1170,7 +1204,10 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
         for _ in 0..2 {
             fresh.durable_begin_pass(source, &index_path, &namespace, false);
-            assert_eq!(fresh.durable_hold(source, key), None);
+            assert_eq!(
+                fresh.durable_hold(source, key, None, &ScanIndex::default()),
+                None
+            );
             fresh.durable_alarm(source);
         }
     });
@@ -1203,6 +1240,7 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     let pending = [indexed, absent]
         .iter()
         .map(|key| PendingRecord {
+            metadata: crate::durable_tail_store::Metadata::default(),
             binding: Binding {
                 source: ds,
                 key: store::key_digest(ds, key),

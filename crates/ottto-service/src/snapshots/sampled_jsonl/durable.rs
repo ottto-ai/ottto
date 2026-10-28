@@ -194,6 +194,14 @@ pub(crate) struct RederiveReceipt {
 }
 
 impl Decoded {
+    pub(crate) fn counting(&self) -> Option<(Option<i64>, u8, u8)> {
+        self.reduction
+            .accumulator
+            .codex_counting
+            .as_deref()
+            .map(|c| c.durable_contract())
+    }
+
     /// How far the head re-parse must read: the latest mark of a field to
     /// re-derive. 0 when nothing needs the head.
     pub(crate) fn head_end(&self) -> Result<u64, Refuse> {

@@ -2909,7 +2909,12 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         let dir = store::store_dir_for_index(&index_path);
         let hex = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let record = dir.join(format!("{hex}.rec"));
-        let bytes = [b"ottto-dt".as_slice(), &2_u16.to_le_bytes(), &[7_u8; 64]].concat();
+        let bytes = [
+            b"ottto-dt".as_slice(),
+            &(crate::durable_tail_store::FORMAT_VERSION + 1).to_le_bytes(),
+            &[7_u8; 64],
+        ]
+        .concat();
         if held {
             fs::create_dir_all(&dir).unwrap();
             fs::write(&record, &bytes).unwrap();
@@ -2921,7 +2926,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
             assert_eq!(fs::read(&record).unwrap(), bytes);
             assert!(durable.durable_held[store::Refusal::NewerFormat as usize] >= 1);
         } else {
-            assert_eq!(durable.durable_held, [0; 5]);
+            assert_eq!(durable.durable_held, [0; 8]);
         }
         scanned.push(result.scanned_file_count);
         fs::remove_dir_all(root).unwrap();

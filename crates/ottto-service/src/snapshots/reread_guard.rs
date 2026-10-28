@@ -287,6 +287,40 @@ impl State {
     pub(super) fn begin_selection(&mut self) {
         self.require_save = false;
     }
+    /// O3: use the existing durable replay ledger and pre-read reservation
+    /// receipt. Restart loses the unused ticket, never the spent release/key.
+    pub(super) fn upgrade_missing(&mut self, key: &str) -> bool {
+        if self.closed {
+            return false;
+        }
+        let id = KeyHash::of(key);
+        if let Some(r) = self
+            .reservations
+            .get_mut(&id)
+            .filter(|r| r.replay && r.saved && !r.claimed)
+        {
+            r.claimed = true;
+            return true;
+        }
+        let keys = self
+            .replayed
+            .entry(concat!("upgrade_state_missing:", env!("CARGO_PKG_VERSION")).into())
+            .or_default();
+        if keys.len() >= MAX_TRACKED_KEYS || !keys.insert(id) {
+            return false;
+        }
+        self.reservations.insert(
+            id,
+            Reservation {
+                wall: now(),
+                born: monotonic_millis(),
+                saved: false,
+                claimed: false,
+                replay: true,
+            },
+        );
+        false
+    }
     pub(super) fn needs_save(&self) -> bool {
         self.reservations.values().any(|r| !r.saved)
     }
