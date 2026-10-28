@@ -3255,7 +3255,7 @@ fn e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps() {
 }
 
 /// SOURCE C1 (#825 interim (b)): a real e2 identity-contract latch clear
-/// (`""` → `E2_GROUPING`, cleared at a census terminal) keeps every
+/// (a non-E2 record → `E2_GROUPING`, cleared at a census terminal) keeps every
 /// `STAMPED_WITHOUT_PERMIT` bit and the gauge. Only a permitted restamp
 /// clears a bit afterwards (under option (a), only its own re-owe would).
 #[test]
@@ -3281,9 +3281,10 @@ fn e2_latch_clear_keeps_permit_marks_and_the_gauge() {
         let before = fixture.cycle("2026-08-02T08:30:00Z", E2_HISTORY_UPGRADE);
         let stamped = marks(&before.index);
         assert!(stamped.iter().all(|m| m & STAMPED_WITHOUT_PERMIT != 0));
+        // The fixture's scan-start observation records the collector.
         assert_eq!(
             before.index.claude_request_identity_contract_for_test().0,
-            Some("")
+            Some(crate::snapshots::claude_request_identity::COLLECTOR)
         );
         let mut saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
@@ -3309,8 +3310,8 @@ fn e2_latch_clear_keeps_permit_marks_and_the_gauge() {
                     assert_eq!(marks(&page.index), stamped, "hour={hour}: bits kept");
                     assert_eq!(gauge, HISTORY_SESSIONS.len() as u64, "hour={hour}");
                 }
-                // Observed "" → E2 sets the latch at hour 9's prepare; only
-                // the census terminal clears it.
+                // The observed flip to E2 sets the latch at hour 9's prepare;
+                // only the census terminal clears it.
                 assert_eq!(latch.last(), Some(&(Some(E2_GROUPING.to_owned()), false)));
                 let first = HISTORY_SESSIONS[0];
                 fixture.append(first, "req_0_2");
