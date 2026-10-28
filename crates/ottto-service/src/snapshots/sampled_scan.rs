@@ -18,6 +18,8 @@ pub(super) mod codex_cursor;
 #[cfg(unix)]
 pub(super) mod durable_tail;
 pub(super) mod side_ledger;
+#[cfg(all(test, unix))]
+pub(crate) mod transition_fixture;
 
 /// The retained-copy cache behind `SharedCache::retained`.
 pub(super) type RetainedCache = TranscriptCache<CachedJsonlReduction>;

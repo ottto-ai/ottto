@@ -682,6 +682,8 @@ impl SharedCache {
             return None;
         }
         stores.counters.restored += 1;
+        #[cfg(test)]
+        super::transition_fixture::reach(super::transition_fixture::CrashPoint::Restore);
         drop(stores);
         self.take(key)
     }
