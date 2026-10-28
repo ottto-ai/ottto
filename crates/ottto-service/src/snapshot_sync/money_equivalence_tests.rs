@@ -1465,11 +1465,14 @@ fn pi_cli_fork_preserves_double_count() {
         .skip(1)
         .map(|s| s.to_owned() + "\n")
         .collect::<String>();
-    std::fs::write(
-        &fork,
-        pi_header("synthetic-fork-session", 3, Some("synthetic-parent.jsonl")) + &copied,
-    )
+    let mut header: Value = serde_json::from_str(&pi_header(
+        "synthetic-fork-session",
+        3,
+        Some("synthetic-parent.jsonl"),
+    ))
     .unwrap();
+    header["timestamp"] = json!("2026-10-27T07:00:00Z");
+    std::fs::write(&fork, pi_json(header) + &copied).unwrap();
     input_clock(&fork);
     pi_grow(
         &path,
