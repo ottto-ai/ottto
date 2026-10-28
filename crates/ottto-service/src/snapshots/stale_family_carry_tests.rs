@@ -2595,7 +2595,8 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
 
 /// A restart after a red terminal discards the process-local carry decision,
 /// then recomputes from durable acceptance, fingerprints and witnesses. A
-/// context change, mid-walk checkpoint or lost acceptance still keeps BASE.
+/// context change or lost acceptance still keeps BASE. An active, consistently
+/// bound mid-walk checkpoint now rebinds without restarting.
 #[test]
 fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2683,6 +2684,7 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
                 );
             });
             assert!(!rows.iter().any(|row| row["counts"]["event"] == "starting"));
+            assert!(rebind_counts(&rows, "base_rewind").is_empty());
             assert!(fixture.index.claude_stale_family_carry.is_empty());
             assert_eq!(
                 serde_json::to_value(&fixture.index).unwrap()["files"],
@@ -2692,6 +2694,21 @@ fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state()
                 scoped_retry_full_reads(&fixture.index, &fixture.candidates),
                 0
             );
+        }
+        if case == "mid_walk" {
+            let (progress, rows) = rebind_no_open(&mut fixture.index);
+            assert_eq!(progress, TraversalProgress::Resumed);
+            assert_eq!(rebind_counts(&rows, "carry_rebind").len(), 1);
+            assert!(rebind_counts(&rows, "starting").is_empty());
+            assert_eq!(
+                serde_json::to_value(&fixture.index).unwrap()["files"],
+                before["files"]
+            );
+            assert_eq!(
+                scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+                0
+            );
+            continue;
         }
         let days = BACKFILL_WINDOW_DAYS + u64::from(case == "context");
         let row = carry_start(&mut fixture.index, CARRY_SECOND_RETRY, days);
@@ -3322,7 +3339,7 @@ fn scoped_retry_preserves_actual_rearms_and_selection() {
     );
 
     if supported {
-        // Invalid carry provenance re-arms its actual roots plus a replay-only
+        // Cross-context carry provenance re-arms its actual roots plus a replay-only
         // key outside them. The consumed replay ordering cannot affect reads.
         let extra = fixture
             .candidates
@@ -3342,7 +3359,7 @@ fn scoped_retry_preserves_actual_rearms_and_selection() {
             .origin
             .as_mut()
             .unwrap()
-            .process = claude_full_rearm_process().wrapping_add(1);
+            .context_fingerprint = "inconsistent-context".into();
         fixture
             .index
             .traversal
@@ -4447,3 +4464,5 @@ fn scanner_records_actual_contract_only_when_its_traversal_starts() {
         "a real resumed page retains the placeholder"
     );
 }
+
+include!("carry_rebind_tests.rs");

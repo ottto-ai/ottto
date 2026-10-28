@@ -49,6 +49,11 @@ pub(super) struct Starting {
     /// exactly when it is false.
     prior_unsettled_causes: Vec<&'static str>,
     previous: Option<Previous>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) claude_carry_at_start: Option<super::ClaudeCarryAtStart>,
+    /// E/C/H/F/U/L/A/P/D, evaluated by the real start decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) claude_start_operands_echfulapd: Option<[bool; 9]>,
     new_retry_attempt: u8,
     pub(super) stale_pending_families: usize,
     pub(super) rearmed_index_files: usize,
@@ -116,6 +121,8 @@ impl Starting {
             prior_unsettled_upload: index.bounded_sweep_had_unsettled_upload,
             prior_unsettled_causes: UnsettledUploadCause::names(index.unsettled_cause_bits()),
             previous,
+            claude_carry_at_start: None,
+            claude_start_operands_echfulapd: None,
             new_retry_attempt: attempt,
             stale_pending_families: 0,
             rearmed_index_files: 0,
@@ -1111,6 +1118,17 @@ mod tests {
         starting.rearmed_index_files = usize::MAX;
         starting.carried_pending_families = usize::MAX;
         starting.carried_index_files = usize::MAX;
+        starting.claude_carry_at_start = Some(super::super::ClaudeCarryAtStart {
+            roots: usize::MAX,
+            capped: usize::MAX,
+            replay: usize::MAX,
+            window: false,
+            admission_present: false,
+            admission_complete: false,
+            admission_progressed: false,
+            process_changed_since_last_start: Some(false),
+        });
+        starting.claude_start_operands_echfulapd = Some([false; 9]);
         starting.rearm_window_families = usize::MAX;
         starting.rearm_window_carried_families = usize::MAX;
         starting.rearm_window_rearmed_files = usize::MAX;

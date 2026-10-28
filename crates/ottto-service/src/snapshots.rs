@@ -2431,7 +2431,8 @@ struct ClaudeStructuralInvalidRecord {
 
 /// Fix 2: the census windows whose pending came from a full re-arm (and the
 /// one stale re-arm allowed after it), in one traversal context of one
-/// daemon process. Another context or a restart ignores it (BASE).
+/// daemon process. A consistent retained carry may rebind its scheduling
+/// window after restart; another context or a lost binding stays BASE.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ClaudeFullRearmWindow {
     context_fingerprint: String,
@@ -6031,7 +6032,7 @@ fn claude_fence_closed_retry_carry_observed(
 /// Fix 2 at a traversal start: a start right after a full re-arm terminal
 /// opens a full-rearm window in this context and process; a later start
 /// whose prior traversal needed a clean follow-up or an unhealthy retry
-/// returns that window's census window ends. Another context or a restart drops it (BASE).
+/// returns that window's census window ends. An unbound process/context drops it (BASE).
 fn claude_full_rearm_window_at_start(
     index: &mut ScanIndex,
     context_fingerprint: &str,
@@ -6348,6 +6349,7 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
         })
     });
     let roots_count = carry.roots.union(&carry.capped_roots).count();
+    note_claude_carry_transition(index, "base_rewind", "refund");
     let carry = &mut index.claude_stale_family_carry;
     let mut rearmed = 0_usize;
     for (index_key, entry) in &mut index.files {
@@ -6963,8 +6965,116 @@ fn claude_full_rearm_member_digests(
         .collect()
 }
 
-/// Identity of this daemon process for Fix 2's window: a restart is BASE.
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_FULL_REARM_PROCESS_FOR_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static CLAUDE_CARRY_FORBID_OPEN_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+struct ClaudeCarryProcessForTest(Option<u64>);
+#[cfg(test)]
+impl ClaudeCarryProcessForTest {
+    fn new(process: u64) -> Self {
+        Self(CLAUDE_FULL_REARM_PROCESS_FOR_TEST.with(|p| p.replace(Some(process))))
+    }
+}
+#[cfg(test)]
+impl Drop for ClaudeCarryProcessForTest {
+    fn drop(&mut self) {
+        CLAUDE_FULL_REARM_PROCESS_FOR_TEST.with(|p| p.set(self.0));
+    }
+}
+
+/// Count-only operands captured before provenance repair, on the #799 carrier.
+/// Counts are obligations at entry, never census/acceptance/read credit.
+#[derive(Serialize)]
+struct ClaudeCarryAtStart {
+    roots: usize,
+    capped: usize,
+    replay: usize,
+    window: bool,
+    admission_present: bool,
+    admission_complete: bool,
+    admission_progressed: bool,
+    // None means no retained process operand, rather than "same process".
+    process_changed_since_last_start: Option<bool>,
+}
+
+impl ClaudeCarryAtStart {
+    fn capture(index: &ScanIndex) -> Self {
+        let carry = &index.claude_stale_family_carry;
+        let admission = carry.origin.as_ref().and_then(|o| o.admission.as_ref());
+        Self {
+            roots: carry.roots.len(),
+            capped: carry.capped_roots.len(),
+            replay: carry.replay.len(),
+            window: index.claude_full_rearm_progress.full_rearm_window.is_some(),
+            admission_present: admission.is_some(),
+            admission_complete: admission.is_some_and(|a| a.complete),
+            admission_progressed: admission.is_some_and(|a| a.progressed),
+            process_changed_since_last_start: carry
+                .origin
+                .as_ref()
+                .map(|o| o.process != claude_full_rearm_process()),
+        }
+    }
+}
+
+/// One transition per emitted count (not a process total). Fixed reason domain:
+/// rebind: process_only; rewind: process/context/window/missing/refund.
+/// Window is a subset of process_only. No persisted counter or read permission.
+fn note_claude_carry_transition(index: &ScanIndex, event: &'static str, reason: &'static str) {
+    #[derive(Serialize)]
+    struct Counts {
+        event: &'static str,
+        reason: &'static str,
+        count: u8,
+        carry_at_start: ClaudeCarryAtStart,
+    }
+    crate::local_resource_diagnostics::traversal_transition(
+        SnapshotSource::ClaudeCode.api_slug(),
+        &Counts {
+            event,
+            reason,
+            count: 1,
+            carry_at_start: ClaudeCarryAtStart::capture(index),
+        },
+    );
+}
+
+/// Capped obligations must still bind to the window's persisted member
+/// revisions. Reuse Fix 2's priced digest scratch, without transcript I/O.
+fn claude_capped_carry_window_binding_matches(index: &ScanIndex) -> bool {
+    let capped = &index.claude_stale_family_carry.capped_roots;
+    if capped.is_empty() {
+        return true;
+    }
+    let Some(window) = index.claude_full_rearm_progress.full_rearm_window.as_ref() else {
+        return false;
+    };
+    if !claude_full_rearm_window_scratch_admitted(index, capped) {
+        return false;
+    }
+    let roots = capped
+        .iter()
+        .map(|root| claude_full_rearm_root_digest(root))
+        .collect();
+    let current = claude_full_rearm_member_digests(index, &roots);
+    capped.iter().all(|root| {
+        let digest = claude_full_rearm_root_digest(root);
+        current.get(&digest).and_then(Option::as_ref).is_some()
+            && window.member_digests.get(&digest) == current.get(&digest)
+    })
+}
+
+/// Identity of this daemon process. Only consistently bound scheduling state
+/// may cross a process change; a complete-read proof remains process-local.
 fn claude_full_rearm_process() -> u64 {
+    #[cfg(test)]
+    if let Some(process) = CLAUDE_FULL_REARM_PROCESS_FOR_TEST.with(std::cell::Cell::get) {
+        return process;
+    }
     static PROCESS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PROCESS.get_or_init(|| {
         let nanos = SystemTime::now()
@@ -40318,6 +40428,91 @@ fn ensure_bounded_traversal(
             origin.context_fingerprint == context_fingerprint && !origin.full_rearm_window
         })
         .and_then(|origin| origin.admission.clone());
+    let carry_at_start =
+        (source == SnapshotSource::ClaudeCode).then(|| ClaudeCarryAtStart::capture(index));
+    let carry = &index.claude_stale_family_carry;
+    let process = claude_full_rearm_process();
+    let context_valid = carry.origin.as_ref().is_some_and(|origin| {
+        origin.context_fingerprint == context_fingerprint
+            && index.traversal.as_ref().map_or(true, |t| {
+                t.context_fingerprint == origin.context_fingerprint
+            })
+    });
+    let window_binding_valid = !index.claude_full_rearm_progress.full_rearm_window_next
+        && carry.origin.as_ref().is_some_and(|origin| {
+            (carry.capped_roots.is_empty() || origin.full_rearm_window)
+                && if origin.full_rearm_window {
+                    index
+                        .claude_full_rearm_progress
+                        .full_rearm_window
+                        .as_ref()
+                        .is_some_and(|window| {
+                            window.context_fingerprint == origin.context_fingerprint
+                                && window.process == origin.process
+                                && !window.window_ends.is_empty()
+                        })
+                } else {
+                    index.claude_full_rearm_progress.full_rearm_window.is_none()
+                        && !index.claude_full_rearm_progress.full_rearm_window_next
+                }
+        });
+    let mut window_origin_invalid = index
+        .claude_full_rearm_progress
+        .full_rearm_window
+        .as_ref()
+        .is_some_and(|window| {
+            window.process != claude_full_rearm_process()
+                || window.context_fingerprint != context_fingerprint
+        });
+    // An exhausted red non-window carry needs no mid-walk position repair.
+    // After a same-context restart, discard its process-local decision but
+    // keep the committed fingerprints and durable retry checkpoint. The next
+    // due start recomputes every family's eligibility from durable evidence.
+    // Active walks/windows may rebind below. Missing provenance and
+    // context/window inconsistencies keep BASE.
+    let recompute_terminal_carry = !window_origin_invalid
+        && index.claude_full_rearm_progress.full_rearm_window.is_none()
+        && !index.claude_full_rearm_progress.full_rearm_window_next
+        && carry.capped_roots.is_empty()
+        && carry.replay.is_empty()
+        && carry.origin.as_ref().is_some_and(|origin| {
+            !origin.full_rearm_window
+                && origin.process != claude_full_rearm_process()
+                && origin.context_fingerprint == context_fingerprint
+        })
+        && index.traversal.as_ref().is_some_and(|traversal| {
+            traversal.context_fingerprint == context_fingerprint
+                && traversal.pending_directories.is_empty()
+                && traversal.pending_candidates.is_empty()
+                && (traversal.counts.has_errors() || prior_admission.is_some())
+        });
+    let window_binding_valid = window_binding_valid
+        && (carry.origin.as_ref().map_or(true, |o| o.process == process)
+            || !context_valid
+            || claude_capped_carry_window_binding_matches(index));
+    let process_only_mismatch = source == SnapshotSource::ClaudeCode
+        && !carry.is_empty()
+        && index.traversal.is_some()
+        && !recompute_terminal_carry
+        && context_valid
+        && window_binding_valid
+        && carry.origin.as_ref().is_some_and(|o| o.process != process);
+    if process_only_mismatch {
+        // These serialized obligations grant no proof/ACK/census credit. Fix 2
+        // consumes only the bound window/ends/member digests. Never revive the
+        // separate rebuild_read_full or complete_rebuild_read lost on decode.
+        note_claude_carry_transition(index, "carry_rebind", "process_only");
+        window_origin_invalid = false;
+        index
+            .claude_stale_family_carry
+            .origin
+            .as_mut()
+            .unwrap()
+            .process = process;
+        if let Some(window) = index.claude_full_rearm_progress.full_rearm_window.as_mut() {
+            window.process = process;
+        }
+    }
     let carry = &index.claude_stale_family_carry;
     let carry_origin_valid = carry.origin.as_ref().is_some_and(|origin| {
         origin.context_fingerprint == context_fingerprint
@@ -40337,39 +40532,23 @@ fn ensure_bounded_traversal(
                             && !window.window_ends.is_empty()
                     }))
     });
-    let window_origin_invalid = index
-        .claude_full_rearm_progress
-        .full_rearm_window
-        .as_ref()
-        .is_some_and(|window| {
-            window.process != claude_full_rearm_process()
-                || window.context_fingerprint != context_fingerprint
-        });
-    // An exhausted red non-window carry needs no mid-walk position repair.
-    // After a same-context restart, discard its process-local decision but
-    // keep the committed fingerprints and durable retry checkpoint. The next
-    // due start recomputes every family's eligibility from durable evidence.
-    // Active walks, Fix 2 windows, missing provenance and context changes keep
-    // the existing BASE rewind below.
-    let recompute_terminal_carry = !window_origin_invalid
-        && index.claude_full_rearm_progress.full_rearm_window.is_none()
-        && !index.claude_full_rearm_progress.full_rearm_window_next
-        && carry.capped_roots.is_empty()
-        && carry.replay.is_empty()
-        && carry.origin.as_ref().is_some_and(|origin| {
-            !origin.full_rearm_window
-                && origin.process != claude_full_rearm_process()
-                && origin.context_fingerprint == context_fingerprint
-        })
-        && index.traversal.as_ref().is_some_and(|traversal| {
-            traversal.context_fingerprint == context_fingerprint
-                && traversal.pending_directories.is_empty()
-                && traversal.pending_candidates.is_empty()
-                && (traversal.counts.has_errors() || prior_admission.is_some())
-        });
     if source == SnapshotSource::ClaudeCode
         && (window_origin_invalid || (!carry.is_empty() && !carry_origin_valid))
     {
+        let reason = if carry.origin.is_none() {
+            "missing"
+        } else if !context_valid {
+            "context"
+        } else if !window_binding_valid {
+            "window"
+        } else {
+            "process"
+        };
+        // The exhausted-carry exception discards scheduling only; it did not
+        // rewind members and must not inflate the restart rewind counter.
+        if !recompute_terminal_carry {
+            note_claude_carry_transition(index, "base_rewind", reason);
+        }
         index.claude_full_rearm_progress.full_rearm_window = None;
         index.claude_full_rearm_progress.full_rearm_window_next = false;
         // Validate retained provenance before refund or candidate selection.
@@ -40398,6 +40577,7 @@ fn ensure_bounded_traversal(
         .traversal
         .as_ref()
         .is_some_and(|traversal| traversal.context_fingerprint == context_fingerprint);
+    let mut start_operands = None;
     let retry_attempt = if let Some(traversal) = index
         .traversal
         .as_ref()
@@ -40424,15 +40604,17 @@ fn ensure_bounded_traversal(
         let unsettled_retry_required =
             index.unsettled_cause_bits() & !UnsettledUploadCause::CompletedBlockingHolds.bit() != 0;
         let floor_retry_due = oversized_discovery::floor_retry_due(source, traversal, collected_at);
-        let terminal_unhealthy = traversal.pending_directories.is_empty()
+        let empty = traversal.pending_directories.is_empty()
             && !traversal
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member)
-            && index.claude_stale_family_carry.replay.is_empty()
-            && (oversized_discovery::clock_retry_required(source, traversal)
-                || (traversal.counts.has_errors()
-                    && (family_retry_due || unsettled_retry_required || floor_retry_due))
+            && index.claude_stale_family_carry.replay.is_empty();
+        let clock_retry = oversized_discovery::clock_retry_required(source, traversal);
+        let errors = traversal.counts.has_errors();
+        let terminal_unhealthy = empty
+            && (clock_retry
+                || (errors && (family_retry_due || unsettled_retry_required || floor_retry_due))
                 || prior_admission.is_some());
         // What clears the latch: a generation that completes drops the
         // traversal, and a changed scan context takes the `else` branch below;
@@ -40442,25 +40624,35 @@ fn ensure_bounded_traversal(
         // absurdly far ahead, or missing altogether (an index persisted before
         // the deadline existed) is due now. The retry depends on the clock
         // alone, never on new input arriving.
-        let retry_due = floor_retry_due
-            || prior_admission
-                .as_ref()
-                .is_some_and(|state| !state.complete && state.progressed)
-            || match rfc3339_unix_seconds(collected_at) {
-                Some(now) => {
-                    traversal
-                        .unhealthy_retry_not_before_unix_seconds
-                        .map_or(true, |deadline| {
-                            now >= deadline
-                                || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
-                        })
-                        || family_retry_due
-                }
-                // A malformed or backwards observation clock must not turn the
-                // durable red witness into a permanent fence. Retrying remains
-                // bounded by the per-tick traversal limits.
-                None => true,
-            };
+        let admission_progressed = prior_admission
+            .as_ref()
+            .is_some_and(|state| !state.complete && state.progressed);
+        let deadline_due = match rfc3339_unix_seconds(collected_at) {
+            Some(now) => {
+                traversal
+                    .unhealthy_retry_not_before_unix_seconds
+                    .map_or(true, |deadline| {
+                        now >= deadline
+                            || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
+                    })
+            }
+            // Missing/backwards clocks retain the existing bounded fallback.
+            None => true,
+        };
+        let retry_due = floor_retry_due || admission_progressed || deadline_due || family_retry_due;
+        // Fixed order E/C/H/F/U/L/A/P/D; values come from the actual decision,
+        // before reset/rearm. A fresh/mismatched traversal has no operand row.
+        start_operands = Some([
+            empty,
+            clock_retry,
+            errors,
+            family_retry_due,
+            unsettled_retry_required,
+            floor_retry_due,
+            prior_admission.is_some(),
+            admission_progressed,
+            deadline_due,
+        ]);
         (terminal_unhealthy && retry_due).then(|| {
             traversal
                 .unhealthy_retry_attempt
@@ -40511,6 +40703,11 @@ fn ensure_bounded_traversal(
         prior_traversal_context_matches,
         retry_attempt,
     );
+
+    transition.claude_carry_at_start = carry_at_start;
+    transition.claude_start_operands_echfulapd = (source == SnapshotSource::ClaudeCode)
+        .then_some(start_operands)
+        .flatten();
 
     // A prior partially settled page may have advanced its traversal past an
     // entity whose replacement was not accepted. Finishing that generation
@@ -42305,6 +42502,9 @@ fn open_and_identify_scan_candidate_with_rescue(
 
 #[cfg(unix)]
 fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<File> {
+    #[cfg(test)]
+    CLAUDE_CARRY_FORBID_OPEN_FOR_TEST
+        .with(|f| assert!(!f.get(), "carry transition opened transcript"));
     let relative = candidate
         .path
         .strip_prefix(&candidate.scan_root)
@@ -42362,6 +42562,9 @@ fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<Fil
 
 #[cfg(not(unix))]
 fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<File> {
+    #[cfg(test)]
+    CLAUDE_CARRY_FORBID_OPEN_FOR_TEST
+        .with(|f| assert!(!f.get(), "carry transition opened transcript"));
     let relative = candidate
         .path
         .strip_prefix(&candidate.scan_root)
