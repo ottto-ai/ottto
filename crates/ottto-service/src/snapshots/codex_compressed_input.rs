@@ -1089,10 +1089,10 @@ pub(in crate::snapshots) mod tests {
                 matches!(index.files[&local_index_key(&f.0)].archive.as_ref().unwrap().disposition,
                 ArchiveDisposition::Refused { cause: actual } if actual == cause)
             );
-            if limit.is_some() {
+            if let Some(limit) = limit {
                 assert!(rows.iter().any(|r| r["counts"]["codex_zst_decoded_bytes"]
                     .as_u64()
-                    .is_some_and(|n| n > limit.unwrap())));
+                    .is_some_and(|n| n > limit)));
             }
             let (_, result, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
             assert_eq!(decodes(&rows), 0);
@@ -1483,7 +1483,7 @@ pub(in crate::snapshots) mod tests {
             Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
         )
         .unwrap();
-        let workers = vec![id.to_string()];
+        let workers = [id.to_string()];
         for _ in 0..10 {
             if context.prepare_launch_step(&workers).unwrap() {
                 break;
@@ -1666,7 +1666,7 @@ pub(in crate::snapshots) mod tests {
                 .map(|r| serde_json::to_string(r).unwrap() + "\n")
                 .collect::<String>()
         };
-        let inherited = vec![turn("parent-turn-1"), usage(100, 80, 10, 2)];
+        let inherited = [turn("parent-turn-1"), usage(100, 80, 10, 2)];
         let mut header = meta("compressed-fixture");
         header["payload"]["forked_from_id"] = json!(parent);
         let child = jsonl(vec![
@@ -1677,7 +1677,7 @@ pub(in crate::snapshots) mod tests {
             usage(130, 100, 14, 3),
         ]);
         let f = ArchiveFixture::new(&zstd::stream::encode_all(child.as_bytes(), 1).unwrap());
-        let roots = vec![f.0.parent().unwrap().to_owned()];
+        let roots = [f.0.parent().unwrap().to_owned()];
         let (index, result, rows, ends) =
             archive_pass_with(&f, ScanIndex::default(), true, None, &roots, |_| {});
         assert_eq!(decodes(&rows), 1);
@@ -1717,7 +1717,7 @@ pub(in crate::snapshots) mod tests {
         }
         assert!(index.codex_parent_ownership_ledgers.contains_key(parent));
         let key = local_index_key(&f.0);
-        let (saved, result, rows, _) = archive_pass_with(&f, index, true, None, &roots, |_| {});
+        let (mut saved, result, rows, _) = archive_pass_with(&f, index, true, None, &roots, |_| {});
         assert_eq!(
             decodes(&rows),
             0,
@@ -1727,7 +1727,6 @@ pub(in crate::snapshots) mod tests {
             .snapshots
             .iter()
             .any(|s| s.source_session_id == "compressed-fixture"));
-        let mut saved = saved;
         retry_due(&mut saved, &key);
         let (after, result, rows, _) = archive_pass_with(&f, saved, true, None, &roots, |_| {});
         assert_eq!(decodes(&rows), 1);
@@ -1743,7 +1742,11 @@ pub(in crate::snapshots) mod tests {
                 child.cache_read_tokens,
                 child.output_tokens
             ),
-            (10, 20, 4)
+            (30, 20, 4)
+        );
+        assert_eq!(
+            child.provenance.input_token_scope.as_deref(),
+            Some("inclusive_cached")
         );
     }
 }
