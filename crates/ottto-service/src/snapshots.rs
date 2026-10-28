@@ -58651,7 +58651,7 @@ mod tests {
             &path,
             [
                 json!({"timestamp":"2026-05-14T10:00:00Z","type":"session_meta","payload":{"id":owner}}),
-                json!({"timestamp":"2026-05-14T10:00:01Z","type":"turn_context","payload":{"turn_id":"fixture-turn","model":"gpt-5.5"}}),
+                json!({"timestamp":"2026-05-14T10:00:01Z","type":"turn_context","payload":{"turn_id":"fixture-turn","model":"gpt-5.6-sol"}}),
                 codex_test_token_line("2026-05-14T10:00:02Z", None, (50, 8, 9, 1), Some((50, 8, 9, 1))),
             ]
             .iter()
@@ -58677,7 +58677,7 @@ mod tests {
         assert_eq!(native.output_tokens, 9);
         assert_eq!(native.reasoning_output_tokens, 1);
         assert_eq!(native.unattributed_total_tokens, 0);
-        assert_eq!(native.model_usage[0].model, "gpt-5.5");
+        assert_eq!(native.model_usage[0].model, "gpt-5.6-sol");
         assert_eq!(
             native.usage_accounting_contract.as_deref(),
             Some("session_exclusive_reported_usage:v1")
@@ -58785,7 +58785,7 @@ mod tests {
                 "header coverage does not cover unrelated filename candidates"
             );
             assert_eq!(native.input_tokens, 50);
-            assert_eq!(native.model_usage[0].model, "gpt-5.5");
+            assert_eq!(native.model_usage[0].model, "gpt-5.6-sol");
         }
     }
 

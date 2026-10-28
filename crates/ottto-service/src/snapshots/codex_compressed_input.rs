@@ -512,7 +512,7 @@ pub(in crate::snapshots) mod tests {
         metadata.state_threads.insert(
             owner.into(),
             CodexStateThread {
-                tokens_used: 440,
+                tokens_used: 825,
                 model: Some("gpt-synthetic".into()),
                 ..Default::default()
             },
@@ -527,7 +527,7 @@ pub(in crate::snapshots) mod tests {
             &BTreeSet::new(),
         );
         assert_eq!(earlier.len(), 1);
-        assert_eq!(earlier[0].unattributed_total_tokens, 440);
+        assert_eq!(earlier[0].unattributed_total_tokens, 825);
         assert!(earlier[0].usage_accounting_contract.is_none());
         index
             .codex_state_only_snapshot_fingerprints
@@ -562,9 +562,10 @@ pub(in crate::snapshots) mod tests {
             Some("session_exclusive_reported_usage:v1")
         );
         assert_eq!(native.unattributed_total_tokens, 0);
-        assert_eq!(native.input_tokens, 400);
-        assert_eq!(native.cache_read_tokens, 200);
-        assert_eq!(native.output_tokens, 40);
+        // The shared fixture reports last-token deltas 100 + 250 + 400.
+        assert_eq!(native.input_tokens, 750);
+        assert_eq!(native.cache_read_tokens, 375);
+        assert_eq!(native.output_tokens, 75);
         assert_eq!(native.model_usage[0].model, "gpt-synthetic");
         append_codex_state_only_snapshots(
             &mut parsed.snapshots,
