@@ -2697,34 +2697,11 @@ impl SnapshotApiClient {
     /// POST a per-day context-composition capture to the composition ingest
     /// endpoint. Auth is the same source-scoped relay token used for snapshot
     /// batches; the backend validates the relay principal and enforces the
-    /// agent_source scope. The body is the pre-built request JSON (aggregates
-    /// only; the backend rejects unknown fields and absolute paths with 422).
-    pub fn upload_context_composition(&self, relay_token: &str, request: &Value) -> Result<Value> {
-        match self
-            .agent
-            .post(&self.api_url("/api/v1/context-composition/snapshot"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse context composition response failed: {error}")),
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
-                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
-                    status: code,
-                    suppressed: false,
-                }))
-            }
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow!("backend rejected context composition: HTTP {code}"))
-            }
-            Err(error) => Err(anyhow!("upload context composition failed: {error}")),
-        }
-    }
-
-    /// The composition upload from its serialized body, so the bytes the
-    /// run counts are the bytes sent (the same body `send_json` would send).
+    /// agent_source scope. The body holds aggregates only; the backend rejects
+    /// unknown fields and absolute paths with 422.
+    ///
+    /// Sends the serialized body, so the bytes the run counts are the bytes
+    /// sent (identical to what `send_json` would send).
     pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
         match self
             .agent

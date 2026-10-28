@@ -238,6 +238,7 @@ impl Page {
             SnapshotSource::ClaudeCode,
             &mut self.scan,
             &mut self.index,
+            true,
             snapshot_upload_body_witness,
         );
         let holds = LocalHoldSettlement::classify(

@@ -47,6 +47,8 @@ pub(crate) use claude_history_upgrade::{
 mod claude_history_upgrade_tests;
 mod claude_reemission_exclusions;
 #[cfg(test)]
+mod permit_mark_tests;
+#[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
@@ -7754,6 +7756,7 @@ pub fn finalize_scan_after_policy(
         source,
         result,
         index,
+        claude_request_identity::capture_by_default(),
         snapshot_upload_body_witness,
     );
 }
@@ -7834,10 +7837,14 @@ pub(crate) fn prepare_codex_recovery_diagnostics(
 /// The witness function sees recomputed semantic fingerprints and must return
 /// a stable witness for both file no-op suppression and quarantine retries.
 /// It does not modify the local snapshot items or semantic entity identity.
+/// `claude_request_identity_permitted` is this cycle's runtime identity
+/// permit (never the recorded contract): a Claude revision-3 stamp without
+/// it carries `STAMPED_WITHOUT_PERMIT`, and one with it clears that bit.
 pub fn finalize_scan_after_policy_with_body_witness(
     source: SnapshotSource,
     result: &mut SourceScanResult,
     index: &mut ScanIndex,
+    claude_request_identity_permitted: bool,
     mut body_witness: impl FnMut(&SnapshotItem) -> String,
 ) {
     // Backstop of the one emission seam: no held history body is finalized.
@@ -7976,13 +7983,24 @@ pub fn finalize_scan_after_policy_with_body_witness(
                         == Some(pending.source_file_fingerprint.as_str())
                 })
                 .peekable();
+            let store = &mut index.claude_money_birth_store;
+            let permit_mark = claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
+            let kept = store
+                .money_marks(claude_money_birth_store::location_key(&pending.index_key))
+                & permit_mark;
             if items.peek().is_some() {
-                let marks = items.fold(0, |marks, item| {
+                let marks = items.fold(kept, |marks, item| {
                     marks | claude_request_money::e2::money_marks(item)
                 });
-                index
-                    .claude_money_birth_store
-                    .set_money_marks(&pending.index_key, marks);
+                store.set_money_marks(&pending.index_key, marks);
+            }
+            // Every revision-3 stamp, also with no items: the permit bit.
+            if pending.effective_upload_body_witness_revision == 3 {
+                store.set_money_mark(
+                    &pending.index_key,
+                    permit_mark,
+                    !claude_request_identity_permitted,
+                );
             }
         }
         if let Some(diagnostic) = result.local_codex_diagnostics.as_mut() {
@@ -8054,6 +8072,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .semantic_noop_count
                 .saturating_add(pending.parsed_snapshot_count);
         }
+    }
+    if source == SnapshotSource::ClaudeCode {
+        index.note_claude_permit_debt();
     }
     result.snapshots.retain(|snapshot| {
         !carried_noop_entities.contains(&snapshot.snapshot_fingerprint)
@@ -16881,49 +16902,6 @@ impl CodexTurnTraceMap {
     }
 }
 
-/// Local opt-out for the experimental Codex fast-mode trace read. Defaults on;
-/// set `OTTTO_CODEX_FAST_MODE_TRACE=off` (also accepts `0`/`false`/`no`/
-/// `disabled`) to skip new `logs_2.sqlite` reads. Protected old decisions remain
-/// subject to exact file-owned receipt replay. The master local-usage switch
-/// (`local_usage_reconciliation_enabled`) already gates all collection; this is
-/// a finer opt-out specific to reading the undocumented debug DB.
-fn codex_fast_mode_trace_enabled() -> bool {
-    codex_fast_mode_trace_enabled_from(std::env::var("OTTTO_CODEX_FAST_MODE_TRACE").ok().as_deref())
-}
-
-fn codex_fast_mode_trace_enabled_from(value: Option<&str>) -> bool {
-    match value {
-        Some(raw) => !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "off" | "0" | "false" | "no" | "disabled"
-        ),
-        None => true,
-    }
-}
-
-/// Finer opt-out (mirrors `codex_fast_mode_trace_enabled`) for the per-session
-/// Claude Code `workflows/` directory stat that detects dynamic workflow
-/// orchestration. `OTTTO_CLAUDE_WORKFLOW_DETECT=off` (or 0/false/no/disabled)
-/// skips the filesystem probe entirely, after which every Claude session
-/// reports no workflow-orchestration signal.
-fn claude_workflow_detect_enabled() -> bool {
-    claude_workflow_detect_enabled_from(
-        std::env::var("OTTTO_CLAUDE_WORKFLOW_DETECT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn claude_workflow_detect_enabled_from(value: Option<&str>) -> bool {
-    match value {
-        Some(raw) => !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "off" | "0" | "false" | "no" | "disabled"
-        ),
-        None => true,
-    }
-}
-
 /// Local opt-IN for capturing Claude Code per-turn work-attribution
 /// (`attributionAgent`/`Skill`/`Plugin`/`McpServer`/`McpTool`) off each
 /// assistant+usage line into the per-turn `SelectorCapture`. Subagent
@@ -20110,7 +20088,7 @@ impl SnapshotAccumulator {
         // of the `<sessionId>.jsonl` we just parsed. Stat it so the backend can
         // surface a per-session "workflow orchestration ran" signal. Best-effort
         // only: absence/errors -> false, never load-bearing for collection.
-        if self.source == SnapshotSource::ClaudeCode && claude_workflow_detect_enabled() {
+        if self.source == SnapshotSource::ClaudeCode {
             let workflows_dir = path.with_extension("").join("workflows");
             self.origin.used_workflow_orchestration =
                 Some(claude_workflows_dir_has_manifest(&workflows_dir));
@@ -25929,15 +25907,13 @@ impl OwnedSourceScan {
             index.traversal = None;
         }
         // Read the per-turn fast-mode signal once per cycle (logs_2 is large); share
-        // it read-only across every session file via Arc. Skipped when the local
-        // opt-out is set.
-        let codex_turn_traces =
-            (source == SnapshotSource::Codex && codex_fast_mode_trace_enabled()).then(|| {
-                Arc::new(CodexTurnTraceMap::load_from_roots(
-                    roots,
-                    backfill_window_days,
-                ))
-            });
+        // it read-only across every session file via Arc.
+        let codex_turn_traces = (source == SnapshotSource::Codex).then(|| {
+            Arc::new(CodexTurnTraceMap::load_from_roots(
+                roots,
+                backfill_window_days,
+            ))
+        });
         if source == SnapshotSource::ClaudeCode {
             index.observe_claude_request_identity_contract(claude_request_identity_capture);
         }
@@ -30734,6 +30710,9 @@ impl OwnedSourceScan {
                         codex_cursor: context.cache.cursor_diagnostics(&codex_page),
                     }
                 });
+                if source == SnapshotSource::ClaudeCode {
+                    index.note_claude_permit_gauge();
+                }
                 if sampled_acquisition.is_some() {
                     crate::local_resource_diagnostics::cache_lifecycle_totals();
                     crate::local_resource_diagnostics::codex_memo_lifecycle_totals(
@@ -33694,7 +33673,7 @@ fn recognized_usage_shape_was_dropped(source: SnapshotSource, value: &Value) -> 
         }
         SnapshotSource::Pi => {
             pi_usage_event(value)
-                && value.pointer("/message/usage").is_some()
+                && pi_usage_value(value).is_some()
                 && pi_message_usage(value).is_none()
         }
     }
@@ -37418,8 +37397,41 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                 .set_model(string_at(value, &["modelId"]).or_else(|| string_at(value, &["model"])));
             accumulator.note_pi_time(pi_timestamp_field(value));
         }
+        // Pi 0.81.0+ bills summary generation on these entries and 0.86.0+
+        // writes `usage` entries (e.g. cache warming); Pi's session totals add
+        // each exactly once and no assistant message repeats them.
+        Some("compaction" | "branch_summary" | "usage") => {
+            apply_pi_entry_usage(value, accumulator);
+            accumulator.note_pi_time(pi_timestamp_field(value));
+        }
         _ => {}
     }
+}
+
+/// Usage carried on a Pi entry rather than an assistant message. It has no
+/// response id, so every occurrence counts and the dedup ledger is untouched.
+/// `usage` entries name their model; summaries run on the session's current
+/// model, which `place_usage` falls back to when `model` is None.
+fn apply_pi_entry_usage(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    let Some(usage) = pi_message_usage(value) else {
+        return;
+    };
+    let timestamp = pi_timestamp_value(value.get("timestamp"));
+    if timestamp.is_none() && value.get("timestamp").is_some() {
+        if !usage.is_zero() {
+            accumulator.note_dropped_usage();
+        }
+        return;
+    }
+    let mut selector = accumulator.current_selector.clone();
+    selector.merge(pi_selector_from_usage_message(value));
+    accumulator.add_usage_with_selector(
+        string_at(value, &["model"]),
+        usage,
+        selector,
+        timestamp.as_deref(),
+        None,
+    );
 }
 
 fn pi_message_role(value: &Value) -> Option<String> {
@@ -37428,8 +37440,24 @@ fn pi_message_role(value: &Value) -> Option<String> {
 
 fn pi_usage_event(value: &Value) -> bool {
     string_eq_at(value, &["type"], "message_end")
+        || pi_entry_carries_usage(value)
         || (string_eq_at(value, &["type"], "message")
             && pi_message_role(value).as_deref() == Some("assistant"))
+}
+
+fn pi_entry_carries_usage(value: &Value) -> bool {
+    matches!(
+        string_at(value, &["type"]).as_deref(),
+        Some("compaction" | "branch_summary" | "usage")
+    )
+}
+
+fn pi_usage_value(value: &Value) -> Option<&Value> {
+    if pi_entry_carries_usage(value) {
+        value.get("usage")
+    } else {
+        value.pointer("/message/usage")
+    }
 }
 
 fn pi_usage_dedup_key(value: &Value) -> Option<String> {
@@ -37673,7 +37701,7 @@ fn activity_bucket_from_timestamp(value: &str) -> Option<(String, String)> {
 }
 
 fn pi_message_usage(value: &Value) -> Option<UsageTotals> {
-    let usage = value.pointer("/message/usage")?;
+    let usage = pi_usage_value(value)?;
     if !usage_object_has_numeric_field(
         usage,
         &[
@@ -43761,6 +43789,7 @@ impl ScanIndex {
             .or_insert_with(|| claude_history_upgrade::GatedHistory {
                 index_key: key,
                 held: None,
+                permitted: hold.is_none(),
                 literal_denied: false,
                 previous,
                 local: BTreeSet::new(),
@@ -43781,6 +43810,7 @@ impl ScanIndex {
             .get_mut(&candidate.source_file_fingerprint)
         {
             gated.literal_denied = true;
+            gated.permitted = false;
         }
     }
 
@@ -44040,12 +44070,87 @@ impl ScanIndex {
         })
     }
 
+    /// E3 gauge (#799 page carrier, SOURCE C2): Claude files carrying
+    /// `STAMPED_WITHOUT_PERMIT`, read from the store at every collection page
+    /// end and at finalization.
+    fn note_claude_permit_gauge(&self) {
+        crate::local_resource_diagnostics::claude_reread::stamped_without_permit(
+            self.claude_money_birth_store
+                .money_mark_count(claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT),
+        );
+    }
+
+    /// E3 counts only (#799 page carrier): the permit-bit gauge, and each
+    /// upgrade the gate permitted this page that finalized below the active
+    /// revision, by its hold.
+    fn note_claude_permit_debt(&self) {
+        use crate::local_resource_diagnostics::claude_reread::{self, NotStamped};
+        if !claude_reread::active() {
+            return;
+        }
+        self.note_claude_permit_gauge();
+        let active = self.active_effective_upload_body_witness_revision;
+        for gated in self.claude_history_emission.files.values() {
+            if !gated.permitted
+                || self
+                    .files
+                    .get(&gated.index_key)
+                    .map_or(0, |entry| entry.effective_upload_body_witness_revision)
+                    >= active
+            {
+                continue;
+            }
+            claude_reread::history_permitted_not_stamped(match gated.held {
+                Some(HistoryHold::TelemetryUnread) => NotStamped::TelemetryUnread,
+                Some(_) => NotStamped::Held,
+                None => NotStamped::Other,
+            });
+        }
+    }
+
+    /// E3: a partial save keeps the committed entry of each `restored` key.
+    /// The permit bit follows the kept entry, and an upgrade the gate
+    /// permitted that stamped on this page but does not commit counts as
+    /// not accepted.
+    fn restore_committed_claude_permit_marks<'a>(
+        &self,
+        previous: &ScanIndex,
+        store: &mut claude_money_birth_store::BirthStore,
+        restored: impl IntoIterator<Item = &'a String>,
+    ) {
+        let active = self.active_effective_upload_body_witness_revision;
+        let revision = |index: &ScanIndex, key: &String| {
+            index
+                .files
+                .get(key)
+                .map_or(0, |entry| entry.effective_upload_body_witness_revision)
+        };
+        for key in restored {
+            store.restore_permit_mark(key, &previous.claude_money_birth_store);
+            if revision(self, key) >= active
+                && revision(previous, key) < active
+                && self.files.get(key).is_some_and(|entry| {
+                    self.claude_history_emission
+                        .files
+                        .get(&entry.source_file_fingerprint)
+                        .is_some_and(|gated| gated.permitted)
+                })
+            {
+                crate::local_resource_diagnostics::claude_reread::history_permitted_not_stamped(
+                    crate::local_resource_diagnostics::claude_reread::NotStamped::NotAccepted,
+                );
+            }
+        }
+    }
+
     /// Record the contract-5 contract a prepared Claude cycle builds bodies
     /// under. Any difference from the record, including an unknown record,
     /// sets the contract latch. A difference seen while a traversal is under
     /// way records a placeholder that matches no contract, so that traversal's
     /// terminal cannot clear the latch; the next traversal start records the
-    /// contract it runs under.
+    /// contract it runs under. Files stamped revision 3 without the permit
+    /// carry `STAMPED_WITHOUT_PERMIT` (Ron's routine re-read rule, card G):
+    /// a late permit re-owes none of them; the page gauge discloses them.
     pub(crate) fn observe_claude_request_identity_contract(&mut self, permitted: bool) {
         let contract = claude_request_identity::cycle_contract(permitted);
         if self.claude_request_identity_contract.as_deref() == Some(contract) {
@@ -44069,27 +44174,6 @@ impl ScanIndex {
         let e2_adoption = claude_request_money::e2::enabled()
             && contract == claude_request_identity::E2_GROUPING
             && self.active_effective_upload_body_witness_revision == 3;
-        if e2_adoption
-            && self.claude_request_identity_contract.as_deref()
-                != Some(CLAUDE_E2_IDENTITY_ADOPTION_PENDING)
-        {
-            // A late cohort permit may arrive AFTER revision 3. Reuse its
-            // paced debt rather than clearing fingerprints at the terminal.
-            // At the normal flip these files already owe revision 3, so this
-            // adds no read. A mid-traversal marker prevents re-owing twice.
-            let exclusions = &self.claude_reemission_exclusions;
-            for (key, entry) in &mut self.files {
-                if claude_index_path_member_ref(Path::new(key))
-                    .is_some_and(|member| !exclusions.excludes(member.root, member.subagent_stem))
-                {
-                    claude_history_upgrade::re_owe(
-                        &mut entry.effective_upload_body_witness_revision,
-                        2,
-                        3,
-                    );
-                }
-            }
-        }
         let recorded = if self.traversal.is_none() {
             contract
         } else if e2_adoption {
@@ -47024,6 +47108,11 @@ impl ScanIndex {
         result
             .claude_money_birth_store
             .preserve_missing_from(&previous.claude_money_birth_store);
+        self.restore_committed_claude_permit_marks(
+            previous,
+            &mut result.claude_money_birth_store,
+            &held_keys,
+        );
         for key in &held_keys {
             let reparse = self
                 .files
@@ -47146,6 +47235,9 @@ impl ScanIndex {
             .preserve_missing_from(&previous.claude_money_birth_store);
         let empty_advances = self.claude_empty_map_advances(previous);
         let held_keys = self.locally_held_keys(held);
+        let mut store = std::mem::take(&mut self.claude_money_birth_store);
+        self.restore_committed_claude_permit_marks(previous, &mut store, &held_keys);
+        self.claude_money_birth_store = store;
         let placeholders =
             self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
         for key in &held_keys {
@@ -47482,6 +47574,19 @@ impl ScanIndex {
         }
         let mut claude_money_birth_store = self.claude_money_birth_store.clone();
         claude_money_birth_store.preserve_missing_from(&previous.claude_money_birth_store);
+        self.restore_committed_claude_permit_marks(
+            previous,
+            &mut claude_money_birth_store,
+            self.files
+                .keys()
+                .filter(|key| !safe_keys.contains(*key))
+                .chain(
+                    previous
+                        .files
+                        .keys()
+                        .filter(|key| !self.files.contains_key(*key)),
+                ),
+        );
         let mut result = ScanIndex {
             claude_money_birth_store,
             codex_counting_moved_evidence: self.codex_counting_moved_evidence.clone(),
@@ -60598,20 +60703,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_fast_mode_trace_opt_out_defaults_on() {
-        assert!(codex_fast_mode_trace_enabled_from(None));
-        assert!(codex_fast_mode_trace_enabled_from(Some("on")));
-        assert!(codex_fast_mode_trace_enabled_from(Some("1")));
-        assert!(codex_fast_mode_trace_enabled_from(Some("")));
-        for off in ["off", "0", "false", "no", "disabled", "OFF", " Off "] {
-            assert!(
-                !codex_fast_mode_trace_enabled_from(Some(off)),
-                "expected {off:?} to disable the trace"
-            );
-        }
-    }
-
-    #[test]
     fn claude_attribution_capture_opt_in_defaults_off() {
         // Default OFF: absent env, and any unrecognized/explicit-off value.
         assert!(!claude_attribution_capture_enabled_from(None));
@@ -68793,15 +68884,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_workflow_detect_env_opt_out_parses() {
-        assert!(claude_workflow_detect_enabled_from(None));
-        assert!(claude_workflow_detect_enabled_from(Some("on")));
-        assert!(!claude_workflow_detect_enabled_from(Some("off")));
-        assert!(!claude_workflow_detect_enabled_from(Some("0")));
-        assert!(!claude_workflow_detect_enabled_from(Some(" Disabled ")));
-    }
-
-    #[test]
     fn claude_code_parser_sums_message_usage_and_uses_summary_title() {
         // Parse-stage native hours: gate on, e2::finish_page emits the hours.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
@@ -73456,6 +73538,7 @@ mod tests {
             SnapshotSource::Codex,
             &mut scan,
             &mut index,
+            true,
             snapshot_upload_body_witness,
         );
         assert_eq!((scan.snapshots.len(), scan.semantic_noop_count), (143, 0));
@@ -73608,6 +73691,7 @@ mod tests {
                 SnapshotSource::Codex,
                 &mut scan,
                 &mut index,
+                true,
                 snapshot_upload_body_witness,
             );
             assert_eq!(scan.snapshots.len(), if mixed { 3 } else { 2 });
@@ -74506,6 +74590,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
                 &mut explicit,
                 &mut explicit_index,
+                true,
                 snapshot_upload_body_witness,
             );
             assert_eq!(wrapped.snapshots.len(), expected_count);
@@ -74536,6 +74621,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &mut first,
             &mut index,
+            true,
             curve_omitted_body_witness,
         );
         assert_eq!(serde_json::to_vec(&first.snapshots[0]).unwrap(), raw_bytes);
@@ -74552,6 +74638,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
                 &mut scan,
                 &mut index,
+                true,
                 |item| {
                     if omitted {
                         curve_omitted_body_witness(item)
@@ -74581,6 +74668,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &mut first,
             &mut index,
+            true,
             curve_omitted_body_witness,
         );
         let item = &first.snapshots[0];
@@ -74602,6 +74690,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
                 &mut retry,
                 &mut retry_index,
+                true,
                 |item| {
                     calls.set(calls.get() + 1);
                     curve_omitted_body_witness(item)
@@ -77831,6 +77920,198 @@ mod tests {
         aggregate.add(&invalid);
         assert!(!aggregate.reported);
         assert_eq!(aggregate.snapshot_cost(), None);
+    }
+
+    #[test]
+    fn pi_summary_usage_adds_once_after_assistant_in_the_envelope_hour() {
+        for entry_type in ["compaction", "branch_summary"] {
+            let path = temp_file(&format!("pi-{entry_type}-usage"));
+            let summary = serde_json::json!({
+                "type": entry_type, "timestamp": "2026-07-22T09:00:01Z",
+                "usage": {"input": 20, "output": 5, "cost": {"total": 0.002}}
+            });
+            fs::write(
+                &path,
+                format!(
+                    "{}\n{}\n{}\n",
+                    serde_json::json!({"type": "session", "id": "fixture-session",
+                    "timestamp": "2026-07-22T08:00:00Z"}),
+                    serde_json::json!({"type": "message", "message": {
+                    "role": "assistant", "model": "gpt-5.4", "provider": "openai",
+                    "responseId": "fixture-response", "timestamp": "2026-07-22T08:59:59Z",
+                    "usage": {"input": 12, "output": 4, "cost": {"total": 0.001}}}}),
+                    summary,
+                ),
+            )
+            .expect("write summary fixture");
+            let item = parse_pi_jsonl_file(&path, "2026-07-22T09:02:00Z", "fp".into())
+                .expect("parse")
+                .remove(0);
+            assert_eq!(item.request_count, 2);
+            assert_eq!(item.input_tokens, 32);
+            assert_eq!(item.output_tokens, 9);
+            assert_eq!(
+                item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                Some("0.003")
+            );
+            assert_eq!(item.usage_buckets.len(), 2);
+            let bucket = item
+                .usage_buckets
+                .iter()
+                .find(|b| b.bucket_start == "2026-07-22T09:00:00Z")
+                .unwrap();
+            assert_eq!(bucket.model_usage.len(), 1);
+            let row = &bucket.model_usage[0];
+            assert_eq!(row.model, "gpt-5.4");
+            assert_eq!(row.request_count, 1);
+            assert_eq!(row.input_tokens, 20);
+            assert_eq!(row.cost_usd.as_deref(), Some("0.002"));
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn pi_usage_entries_use_own_model_provider_and_count_every_kind_and_occurrence() {
+        let path = temp_file("pi-usage-entry-kinds");
+        let mut fixture = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "model_change", "modelId": "gemini-2.5-pro"
+            })
+        );
+        for kind in ["cache_warm", "future_kind", "cache_warm"] {
+            let entry = serde_json::json!({
+                "type": "usage", "kind": kind, "id": "fixture-entry",
+                "responseId": "fixture-response", "provider": "openai", "model": "gpt-5.4",
+                "timestamp": "2026-07-22T09:00:01Z",
+                "usage": {"input": 10, "output": 2, "cacheRead": 3, "cacheWrite": 4,
+                    "cost": {"total": 0.001}}
+            });
+            fixture.push_str(&format!("{entry}\n"));
+        }
+        fs::write(&path, &fixture).expect("write usage entry fixture");
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T09:02:00Z", "fp".into())
+            .expect("parse")
+            .remove(0);
+        assert_eq!(item.request_count, 3);
+        assert_eq!(item.model_usage.len(), 1);
+        let row = &item.model_usage[0];
+        assert_eq!(row.model, "gpt-5.4");
+        assert_eq!(row.model_provider.as_deref(), Some("openai"));
+        assert_eq!(row.input_tokens, 30);
+        assert_eq!(row.output_tokens, 6);
+        assert_eq!(row.cache_read_tokens, 9);
+        assert_eq!(row.cache_creation_5m_tokens, 12);
+        assert_eq!(row.cost_usd.as_deref(), Some("0.003"));
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Pi);
+        for line in fixture.lines() {
+            apply_pi_line(&serde_json::from_str(line).unwrap(), &mut accumulator);
+        }
+        assert!(accumulator.seen_pi_usage_keys.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_entry_only_files_have_usage_coverage_without_false_drops() {
+        for entry_type in ["compaction", "branch_summary", "usage"] {
+            let root = temp_dir(&format!("pi-{entry_type}-only"));
+            fs::write(
+                root.join("session.jsonl"),
+                format!(
+                    "{}\n{}\n{}\n",
+                    serde_json::json!({"type": "session", "id": "fixture-session",
+                    "timestamp": "2026-07-22T08:00:00Z"}),
+                    serde_json::json!({"type": "model_change", "modelId": "gpt-5.4"}),
+                    serde_json::json!({"type": entry_type, "timestamp": "2026-07-22T08:01:00Z",
+                    "usage": {"input": 20, "output": 5}}),
+                ),
+            )
+            .expect("write entry-only fixture");
+            let scan = scan_source_roots(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut ScanIndex::default(),
+                "2026-07-22T08:02:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("scan entry-only fixture");
+            assert_eq!(scan.snapshots.len(), 1);
+            assert_eq!(scan.snapshots[0].request_count, 1);
+            assert_eq!(scan.snapshots[0].model_usage[0].model, "gpt-5.4");
+            assert_eq!(scan.dropped_usage_record_count, 0);
+            assert_eq!(scan.zero_snapshot_usage_evidence_count, 0);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn pi_entry_usage_invalid_time_and_malformed_usage_are_counted_as_drops() {
+        for entry_type in ["compaction", "branch_summary", "usage"] {
+            for (timestamp, usage) in [
+                ("invalid", serde_json::json!({"input": 20})),
+                (
+                    "2026-07-22T08:01:00Z",
+                    serde_json::json!({"input": "invalid"}),
+                ),
+            ] {
+                let root = temp_dir(&format!("pi-{entry_type}-drop"));
+                fs::write(root.join("session.jsonl"), format!("{}\n{}\n",
+                    serde_json::json!({"type": "session", "id": "fixture-session",
+                        "timestamp": "2026-07-22T08:00:00Z"}),
+                    serde_json::json!({"type": entry_type, "timestamp": timestamp, "usage": usage}),
+                )).expect("write dropped entry fixture");
+                let scan = scan_source_roots(
+                    SnapshotSource::Pi,
+                    std::slice::from_ref(&root),
+                    &mut ScanIndex::default(),
+                    "2026-07-22T08:02:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                )
+                .expect("scan dropped entry fixture");
+                assert!(scan.snapshots.is_empty());
+                assert_eq!(scan.dropped_usage_record_count, 1);
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[test]
+    fn pi_summary_without_usage_and_error_turn_keep_existing_request_counts() {
+        let path = temp_file("pi-summary-without-usage-error-turn");
+        let mut fixture = String::new();
+        for entry in [
+            serde_json::json!({"type": "session", "id": "fixture-session",
+                "timestamp": "2026-07-22T08:00:00Z"}),
+            serde_json::json!({"type": "model_change", "modelId": "gpt-5.4"}),
+            serde_json::json!({"type": "message", "message": {"role": "assistant",
+                "model": "gpt-5.4", "timestamp": "2026-07-22T08:00:01Z",
+                "usage": {"input": 12, "output": 4, "cost": {"total": 0.001}}}}),
+            serde_json::json!({"type": "compaction", "timestamp": "2026-07-22T08:01:00Z"}),
+            serde_json::json!({"type": "branch_summary", "timestamp": "2026-07-22T08:01:01Z"}),
+            serde_json::json!({"type": "message", "message": {"role": "assistant",
+                "model": "gpt-5.4", "stopReason": "error", "timestamp": "2026-07-22T08:01:02Z",
+                "usage": {"input": 0, "output": 0, "cost": {"total": 0}}}}),
+        ] {
+            assert!(!recognized_usage_shape_was_dropped(
+                SnapshotSource::Pi,
+                &entry
+            ));
+            fixture.push_str(&format!("{entry}\n"));
+        }
+        fs::write(&path, fixture).expect("write error turn fixture");
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".into())
+            .expect("parse")
+            .remove(0);
+        assert_eq!(item.request_count, 1);
+        // The all-zero error usage is parsed with request_count=1, but the
+        // existing zero-token placement gate does not add it to the snapshot.
+        assert_eq!(item.input_tokens, 12);
+        assert_eq!(item.output_tokens, 4);
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.001")
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

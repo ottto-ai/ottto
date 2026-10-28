@@ -1,11 +1,14 @@
-//! Text and token measurement (ported 1:1 from the reference), the residency
-//! model, line dates and transcript reading.
+//! Shared text and token measurement, with test-only residency, line dates
+//! and whole-file reading for the V1 parser oracle.
 
 use super::CHARS_PER_TOKEN;
 use serde_json::Value;
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
-use time::{format_description::well_known::Rfc3339, Date, OffsetDateTime, UtcOffset};
+use time::Date;
+#[cfg(test)]
+use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
 // -------------------------------------------------------------------------
 // Primitive measurement helpers (ported 1:1 from the reference).
@@ -142,11 +145,13 @@ pub(super) fn extract_blocks_text_and_images(content: Option<&Value>) -> (String
 
 /// residency_multiplier(L) = number of assistant/model turns strictly after L
 /// and strictly before the next compaction boundary.
+#[cfg(test)]
 pub(super) struct ResidencyModel {
     pub(super) assistant: Vec<usize>,
     pub(super) compaction: Vec<usize>,
 }
 
+#[cfg(test)]
 impl ResidencyModel {
     pub(super) fn new(mut assistant: Vec<usize>, mut compaction: Vec<usize>) -> Self {
         assistant.sort_unstable();
@@ -175,6 +180,7 @@ impl ResidencyModel {
 // Line timestamp / date helpers.
 // -------------------------------------------------------------------------
 
+#[cfg(test)]
 pub(super) fn parse_timestamp(value: &Value) -> Option<OffsetDateTime> {
     let text = value
         .get("timestamp")
@@ -187,6 +193,7 @@ pub(super) fn parse_timestamp(value: &Value) -> Option<OffsetDateTime> {
 
 /// The UTC date to bucket a line under, and its parsed timestamp. Falls back to
 /// the transcript file's date when the line carries no parseable timestamp.
+#[cfg(test)]
 pub(super) fn line_date(value: &Value, fallback: Date) -> (Date, Option<OffsetDateTime>) {
     match parse_timestamp(value) {
         Some(ts) => (ts.date(), Some(ts)),
@@ -203,12 +210,7 @@ pub(super) fn date_ymd(date: Date) -> String {
     )
 }
 
-pub(super) fn iso_utc(ts: OffsetDateTime) -> String {
-    ts.to_offset(UtcOffset::UTC)
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
+#[cfg(test)]
 pub(super) fn read_jsonl(path: &Path) -> std::io::Result<Vec<Value>> {
     let text = fs::read_to_string(path)?;
     let mut out = Vec::new();
@@ -235,6 +237,7 @@ pub(super) fn is_truthy_json(value: &Value) -> bool {
     }
 }
 
+#[cfg(test)]
 pub(super) fn basename(path: &Path) -> String {
     path.file_name()
         .and_then(|n| n.to_str())

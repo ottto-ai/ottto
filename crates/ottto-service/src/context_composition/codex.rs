@@ -1,24 +1,31 @@
-//! Codex rollout parsing.
+//! Shared Codex MCP decoding and a test-only whole-file parser oracle.
 
+#[cfg(test)]
 use super::measure::{
-    basename_stem, estimate_text_tokens, extract_blocks_text_and_images, line_date,
-    parse_timestamp, python_json_dumps, read_jsonl, ResidencyModel,
+    basename_stem, estimate_text_tokens, line_date, parse_timestamp, read_jsonl, ResidencyModel,
 };
+use super::measure::{extract_blocks_text_and_images, python_json_dumps};
+#[cfg(test)]
 use super::report::{Weight, WorkspaceReport};
+#[cfg(test)]
 use super::IMAGE_NOMINAL_TOKENS;
-use crate::composition_kinds::{
-    self as kinds, Agent, CallClass, ContentLabel, Kind, LineCtx, Verdict,
-};
+#[cfg(test)]
+use crate::composition_kinds::{self as kinds, CallClass, ContentLabel, Kind, LineCtx, Verdict};
 use serde_json::Value;
+#[cfg(test)]
 use std::borrow::Cow;
+#[cfg(test)]
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::path::Path;
+#[cfg(test)]
 use time::{Date, OffsetDateTime};
 
 // -------------------------------------------------------------------------
 // Codex parsing (ported 1:1 from the reference).
 // -------------------------------------------------------------------------
 
+#[cfg(test)]
 pub(crate) fn parse_codex_session(
     path: &Path,
     report: &mut WorkspaceReport,
@@ -52,7 +59,7 @@ pub(crate) fn parse_codex_session(
         report.copied_history_sessions += 1;
     }
 
-    let ctx = LineCtx::v1(Agent::Codex);
+    let ctx = LineCtx::v1();
 
     // Pass 1: call_id -> call class; residency markers.
     let mut callmap: BTreeMap<String, CallClass> = BTreeMap::new();
@@ -254,6 +261,7 @@ pub(crate) fn parse_codex_session(
 /// A call's own input text: `input` (custom-tool calls), else `arguments`
 /// (function calls), else the local-shell action's command words joined by
 /// spaces; "" when it has none.
+#[cfg(test)]
 fn codex_call_input<'a>(
     payload_type: &str,
     payload: &'a serde_json::Map<String, Value>,
@@ -280,6 +288,7 @@ fn codex_call_input<'a>(
 /// The counted text blocks of a user message, joined per kind (first-seen
 /// order). Codex's per-block `content_item_kinds` labels apply only when they
 /// line up with the blocks.
+#[cfg(test)]
 pub(super) fn codex_user_counted_text(
     ctx: &LineCtx,
     payload: &serde_json::Map<String, Value>,
@@ -319,6 +328,7 @@ pub(super) fn codex_user_counted_text(
 /// session header's fork markers as the session sink does. `None` means the
 /// rollout is a fork whose copied part has no boundary in the file (a legacy
 /// user fork, or a legacy subagent fork without its trigger turn).
+#[cfg(test)]
 pub(super) fn codex_copied_records(lines: &[Value]) -> Option<Vec<bool>> {
     let meta = lines
         .iter()
@@ -396,6 +406,7 @@ pub(super) fn codex_mcp_result_text_and_images(result: Option<&Value>) -> (Strin
     }
 }
 
+#[cfg(test)]
 pub(super) fn codex_output_text_and_images(output: Option<&Value>) -> (String, u64) {
     match output {
         Some(Value::String(s)) => (s.clone(), 0),

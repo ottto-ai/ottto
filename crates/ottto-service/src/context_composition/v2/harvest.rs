@@ -417,12 +417,9 @@ pub(super) fn lock_state(dir: &Path) -> std::io::Result<Option<File>> {
 }
 
 /// Private service entry point. It starts neither the daemon nor any other
-/// collector. The existing release gate also applies to direct invocation.
+/// collector.
 #[doc(hidden)]
 pub fn run_context_composition_worker() -> Result<()> {
-    if !super::changed_days_enabled() {
-        return Err(anyhow!("changed-days composition reader is disabled"));
-    }
     set_utility_qos();
     let support_dir = ottto_core::default_support_dir();
     let Some(_lease) = lock_state(&state_dir(&support_dir))? else {

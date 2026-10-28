@@ -6,11 +6,11 @@ use super::*;
 use serde_json::json;
 
 fn claude() -> LineCtx<'static> {
-    LineCtx::v1(Agent::Claude)
+    LineCtx::v1()
 }
 
 fn codex() -> LineCtx<'static> {
-    LineCtx::v1(Agent::Codex)
+    LineCtx::v1()
 }
 
 fn counted(verdict: Verdict) -> Option<&'static str> {

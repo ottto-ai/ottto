@@ -2534,7 +2534,6 @@ fn parse_state_round_trips() {
 
     // An open call keeps every share (kind, part, weight, file, tool).
     let ctx = crate::composition_kinds::LineCtx::v2(
-        crate::composition_kinds::Agent::Claude,
         crate::composition_kinds::Request1::No,
         Some(Path::new("/w")),
         false,
@@ -5445,35 +5444,6 @@ fn failed_missing_pin_reset_with_equal_offset_stays_pending_after_crash() {
     assert!(stats.checkpoint_restarts > 0);
     assert_eq!(total_tokens(&env.scope(Source::Claude).agg), before);
     env.cleanup();
-}
-
-#[test]
-fn changed_days_reader_runs_in_this_build() {
-    // The daemon starts this reader, and the worker runs, instead of the
-    // kinds_version 1 harvest.
-    assert!(changed_days_enabled());
-}
-
-#[test]
-fn changed_days_switch_rules() {
-    // Switch on: the reader runs in every build, whatever the override says.
-    for debug_build in [false, true] {
-        for value in [None, Some("0"), Some("off"), Some("1")] {
-            assert!(changed_days_gate(true, debug_build, value));
-        }
-    }
-    // Switch off: the kinds_version 1 harvest runs; release builds ignore
-    // the override.
-    for value in [None, Some("0"), Some("off"), Some("1"), Some("true")] {
-        assert!(!changed_days_gate(false, false, value));
-    }
-    // Switch off, debug build: only a truthy override turns the reader on.
-    for value in [None, Some(""), Some("0"), Some("off"), Some("no")] {
-        assert!(!changed_days_gate(false, true, value));
-    }
-    for value in ["1", "true", " on ", "YES"] {
-        assert!(changed_days_gate(false, true, Some(value)));
-    }
 }
 
 #[path = "tests/a34.rs"]

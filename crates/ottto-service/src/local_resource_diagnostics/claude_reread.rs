@@ -31,6 +31,17 @@ pub(crate) struct Rearm {
     pub(crate) retry_admission_cleared: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) authority_normalization_cleared: u64,
+    /// Gauge, not an event: Claude files carrying `STAMPED_WITHOUT_PERMIT`.
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) stamped_without_permit: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) history_permitted_not_stamped_not_accepted: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) history_permitted_not_stamped_telemetry_unread: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) history_permitted_not_stamped_held: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) history_permitted_not_stamped_other: u64,
 }
 impl Rearm {
     fn merge(&mut self, other: Self) {
@@ -49,8 +60,15 @@ impl Rearm {
             account_reproof_cleared,
             retry_admission_offered,
             retry_admission_cleared,
-            authority_normalization_cleared
+            authority_normalization_cleared,
+            history_permitted_not_stamped_not_accepted,
+            history_permitted_not_stamped_telemetry_unread,
+            history_permitted_not_stamped_held,
+            history_permitted_not_stamped_other
         );
+        self.stamped_without_permit = self
+            .stamped_without_permit
+            .max(other.stamped_without_permit);
     }
     fn is_empty(&self) -> bool {
         *self == Self::default()
@@ -253,6 +271,28 @@ pub(crate) fn clear(site: ClearSite, nonempty: bool) {
         };
         *calls = calls.saturating_add(u64::from(count_call));
         *cleared = cleared.saturating_add(u64::from(nonempty));
+    });
+}
+pub(crate) fn stamped_without_permit(files: u64) {
+    update(|counts| counts.claude_reread.stamped_without_permit = files);
+}
+/// Why an upgrade the history gate permitted this page did not stamp.
+pub(crate) enum NotStamped {
+    NotAccepted,
+    TelemetryUnread,
+    Held,
+    Other,
+}
+pub(crate) fn history_permitted_not_stamped(reason: NotStamped) {
+    update(|counts| {
+        let c = &mut counts.claude_reread;
+        let n = match reason {
+            NotStamped::NotAccepted => &mut c.history_permitted_not_stamped_not_accepted,
+            NotStamped::TelemetryUnread => &mut c.history_permitted_not_stamped_telemetry_unread,
+            NotStamped::Held => &mut c.history_permitted_not_stamped_held,
+            NotStamped::Other => &mut c.history_permitted_not_stamped_other,
+        };
+        *n = n.saturating_add(1);
     });
 }
 pub(crate) fn authority_normalization(cleared: u64) {
