@@ -1920,6 +1920,101 @@ fn pi_restored_counts_and_pairs_continue_with_suffix_only_tail() {
     );
 }
 
+/// Header, system line and first prompt (head-derived X fields) plus usage:
+/// written after a save, restored through the shared cache on a restart,
+/// continued by Tail, and finished as a cold Full of the grown file.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_shared_cache_restore_rederives_head_fields_then_tails_to_cold_full() {
+    use crate::snapshots::sampled_scan::durable_tail::{Interpretation, RestoreOutcome};
+    use crate::snapshots::sampled_scan::SharedCache;
+    let source = SnapshotSource::Pi;
+    let at = "2026-10-20T10:00:01Z";
+    let state = crate::test_scratch::private_dir("ottto-dt-pi-shared");
+    let lock = crate::locked_state_dir::test_locks::hold(&state);
+    let path = state.join("pi.jsonl");
+    fs::write(
+        &path,
+        [
+            json!({"type":"session","version":3,"id":"pi-restore-fixture","timestamp":at,
+                "cwd":"/tmp/pi-restore-fixture"}),
+            json!({"type":"message","timestamp":at,"message":{"role":"system",
+                "content":"synthetic system message"}}),
+            json!({"type":"message","timestamp":at,"message":{"role":"user",
+                "content":[{"type":"text","text":"synthetic first prompt"}]}}),
+            pi_record("message", Some("first"), 10),
+        ]
+        .map(|line| line.to_string() + "\n")
+        .concat(),
+    )
+    .unwrap();
+    let (reduction, checkpoint) = full_read(&path, source);
+    let acc = &reduction.accumulator;
+    assert!(acc.workspace_path.is_some() && acc.first_prompt_title.is_some());
+    let retained_digest = full_digest(&reduction);
+    let key = local_index_key(&path);
+    let index_path = state.join("index.json");
+    let namespace = Scope("pi-shared-restore".into());
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(json!({"size_bytes":fs::metadata(&path).unwrap().len(),
+            "modified_unix_seconds":1,"source_file_fingerprint":"fp"}))
+        .unwrap(),
+    );
+    let first = SharedCache::default();
+    first.durable_begin_pass(source, &index_path, &namespace, false);
+    assert!(first.insert_admitted(
+        key.clone(),
+        CompletedNativeAcquisition {
+            checkpoint,
+            reduction: Some(reduction),
+            released: None,
+            unsealed: false,
+        },
+        0
+    ));
+    first.durable_note_selection(&key, "fp");
+    index.save(&index_path).unwrap();
+    let receipt = first
+        .durable_write_after_save(lock, source, &index)
+        .unwrap();
+    assert_eq!(receipt.written, 1);
+    drop(first);
+
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(file, "{}", pi_record("message", Some("second"), 20)).unwrap();
+    drop(file);
+    let loaded = ScanIndex::load(&index_path).unwrap();
+    let restart = SharedCache::default();
+    restart.durable_begin_pass(source, &index_path, &namespace, false);
+    let interpretation = Interpretation::of(source, &key, &loaded, false, &namespace);
+    let RestoreOutcome::Restored(taken) = restart.durable_restore(
+        source,
+        &key,
+        &path,
+        &scope(),
+        &mut File::open(&path).unwrap(),
+        &loaded,
+        &interpretation,
+    ) else {
+        let (counts, disk) = restart.durable_counters(source).unwrap();
+        panic!("Pi restore: {}", counts.summary(source, &disk));
+    };
+    assert_eq!(restart.durable_counters(source).unwrap().0.restored, 1);
+    assert_eq!(full_digest(&taken.retained.state), retained_digest);
+    let mut continued = parser(&path, source);
+    assert_eq!(
+        continued
+            .prepare_acquisition(Some(taken.retained), &scope(), None, NOW)
+            .unwrap(),
+        ReadMode::Tail
+    );
+    while !continued.step().unwrap() {}
+    assert_eq!(items(continued, &path, source), cold_items(&path, source));
+    let _ = fs::remove_dir_all(state);
+}
+
 #[test]
 fn pi_occurrence_identity_keeps_timestamp_normalization_and_selector_inputs() {
     let value = pi_record("message", Some("normalized"), 10);
