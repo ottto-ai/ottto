@@ -3183,7 +3183,6 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
             .all(|entry| entry.effective_upload_body_witness_revision == 3));
         // The permit-era record: contract `""`, and #825's bit on one file.
         let mut old = ScanIndex::load(&fixture.index_path).unwrap();
-        old.claude_request_identity_contract = Some(String::new());
         let marked = HistoryFixture::key(&old, HISTORY_SESSIONS[0]);
         let kept = old
             .claude_money_birth_store
@@ -3193,6 +3192,7 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
         old.save(&fixture.index_path).unwrap();
         let mut saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+        saved["claude_request_identity_contract"] = serde_json::json!("");
         saved["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
         saved["claude_duplicate_fence_next_full_rearm_unix_seconds"] =
             serde_json::json!(1785711600u64);
