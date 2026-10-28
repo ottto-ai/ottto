@@ -617,8 +617,7 @@ not distinct sessions, decoded bytes or money. No path or session id is included
 | `CompressedGroupReadUnsupported` | Initial member, member swap and legacy tee |
 | `CompressedParentLedgerUnbound` | Parent identity without archive ledger binding |
 | `CompressedPhysicalOffsetUnsupported` | Physical acquisition, cursor and memo offsets |
-| `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
-| `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |
+| `CompressedCompatibilityUnsupported` | Stateless compatibility parser is plain-only |
 
 These refusals authorize neither discovery nor a decoder. A refusal publishes no
 empty or zero-cost replacement body: previous accepted output remains stale, or
@@ -641,3 +640,18 @@ with counted cause `CompressedSettlementStuck`; no empty or zero-cost body is
 substituted. Settled, empty, held and refused stamps remain quiet until content
 changes. Decoder safety-net release emits `codex_zst_owner.counts.leaked_release`;
 normal completion and error paths release explicitly after any Stores guard.
+
+Archive inventory uses a separate stamp-bound `header_validated` projection. This
+is metadata, never acquisition, money, a physical checkpoint or an ACK. Its paid
+first-record decoder stops at 64 KiB decoded and 128 KiB physical input, closes
+within the inventory step, and is reused without decoding while the stamp matches.
+`codex_zst_inventory` reports `codex_aux_reads.header_read_attempts.inventory`,
+`codex_aux_reads.header_read_bytes.inventory` (physical input including read-ahead),
+`codex_zst_inventory_decoded_bytes` and `codex_zst_inventory_physical_bytes`. These
+are the S2 partial inventory purpose, outside Full/body totals. `codex_zst_input`
+reports the same physical input as an encoding view; do not sum the two views.
+`CompressedHeaderInvalid` identifies an invalid owning header.
+`CompressedParserStateRequired` identifies an accidental plain-constructor call
+for an archive; the paid main parser uses its stateful factory.
+`codex_zst_refused` reader failures also enter the unreadable census at their
+caller; the direct compatibility API has no census. Refusals retain prior output.

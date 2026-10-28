@@ -2025,6 +2025,7 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
+    parser.reader.capture_header = parser.reader.reader.is_compressed();
     if !parser.reader.reader.is_compressed() {
         parser.bind_reread(index, candidate);
     }
@@ -2060,12 +2061,13 @@ pub(super) fn reduction_dependencies(
     codex: &CodexTitleMetadata,
     claude: &ClaudeTitleMetadata,
     support: Option<&Path>,
+    archive_header: Option<&codex_compressed_input::ValidatedHeader>,
 ) -> Option<String> {
     if source == SnapshotSource::Codex {
         Some(sha256_hex(&[
             "codex_reduction_dependencies:v1",
             &codex.path_reduction_fingerprint(&candidate.path),
-            &codex_file_join::header_reduction_witness(candidate).ok()?,
+            &codex_file_join::header_reduction_witness(candidate, archive_header).ok()?,
         ]))
     } else {
         let mut scoped = candidate.clone();

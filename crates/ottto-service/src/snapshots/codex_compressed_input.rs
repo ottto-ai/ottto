@@ -1,8 +1,4 @@
-//! Bounded `.jsonl.zst` rollout input behind the one opened-object parser seam.
-//! Discovery does not enumerate compressed rollouts yet. Activation must also
-//! bind the header, plain/compressed twin identity and decoder credit at each
-//! open site before it constructs `OpenedInput::compressed`.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Paid bounded archive input and stamp-bound metadata; no physical checkpoints.
 use crate::local_resource_diagnostics::{codex_zst_refused, CodexZstCause};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -92,15 +88,68 @@ pub(crate) struct ArchiveEvidence {
     pub(super) logical_id: String,
     pub(super) owner: Option<String>,
     pub(super) disposition: ArchiveDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) header_validated: Option<ValidatedHeader>,
+    #[serde(default)]
+    header_attempted: bool,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ArchiveDisposition {
+    HeaderValidated,
     Acquired,
     Empty,
     Pending { attempts: u8, retry_after: u64 },
     Held { cause: CodexZstCause },
     Refused { cause: CodexZstCause },
 }
+/// SOURCE Q3b: metadata only, never a group member or completion certificate.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct ValidatedHeader {
+    pub(super) owner: String,
+    pub(super) digest: String,
+    pub(super) created_unix_ms: Option<i64>,
+    #[serde(default, deserialize_with = "bounded_cli_version")]
+    cli_version: Option<String>,
+}
+fn bounded_cli_version<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Option<String>, D::Error> {
+    use serde::Deserialize;
+    Ok(Option::<String>::deserialize(de)?.filter(|s| ValidatedHeader::bounded_version(s)))
+}
+impl ValidatedHeader {
+    pub(super) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        use super::*;
+        if bytes.len() > codex_file_join::MAX_HEADER_BYTES || bytes.last() != Some(&b'\n') {
+            return None;
+        }
+        let value: Value = serde_json::from_slice(bytes).ok()?;
+        let meta = codex_session_meta_payload(&value)?;
+        Some(Self {
+            owner: resolve_codex_identity_option(codex_identity_at(meta, &["id"]))?,
+            digest: format!("{:x}", Sha256::digest(bytes)),
+            created_unix_ms: meta
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(|ts| OffsetDateTime::parse(ts, &Rfc3339).ok())
+                .and_then(|ts| i64::try_from(ts.unix_timestamp_nanos() / 1_000_000).ok()),
+            cli_version: meta
+                .get("cli_version")
+                .and_then(Value::as_str)
+                .filter(|s| Self::bounded_version(s))
+                .map(str::to_owned),
+        })
+    }
+    fn bounded_version(s: &str) -> bool {
+        s.len() <= 64 && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+    }
+    pub(super) fn cli_version(&self) -> Option<&str> {
+        self.cli_version
+            .as_deref()
+            .filter(|s| Self::bounded_version(s))
+    }
+}
+crate::heap_layout_bound::fields!(ValidatedHeader; owner, digest, created_unix_ms, cli_version);
 impl ArchiveEvidence {
     pub(super) fn begin(file: &File, path: &Path, previous: Option<&Self>) -> io::Result<Self> {
         let logical = path.with_extension("");
@@ -128,6 +177,12 @@ impl ArchiveEvidence {
                 .content_only(),
             logical_id,
             owner: None,
+            header_attempted: previous
+                .filter(|a| a.matches(file))
+                .is_some_and(|a| a.header_attempted),
+            header_validated: previous
+                .filter(|a| a.matches(file))
+                .and_then(|a| a.header_validated.clone()),
             disposition: ArchiveDisposition::Pending {
                 attempts,
                 retry_after: now.saturating_add(6 * 3600),
@@ -144,6 +199,11 @@ impl ArchiveEvidence {
         use ArchiveDisposition::*;
         let logical = path.with_extension("");
         self.owner = owner
+            .filter(|owner| {
+                self.header_validated
+                    .as_ref()
+                    .is_some_and(|h| h.owner == *owner)
+            })
             .filter(|owner| super::codex_session_id_candidates_from_path(&logical).contains(owner));
         if let Some(owner) = &self.owner {
             self.logical_id = owner.clone();
@@ -165,6 +225,7 @@ impl ArchiveEvidence {
     // Delivery replay grants no decode authority for an ACK-settled archive.
     pub(super) fn quiet(&self, file: &File) -> bool {
         self.matches(file)
+            && !matches!(self.disposition, ArchiveDisposition::HeaderValidated)
             && !matches!(self.disposition, ArchiveDisposition::Pending { retry_after, .. } if super::sampled_scan::now_seconds() >= retry_after)
     }
     pub(super) fn settle(&mut self, accepted: bool) {
@@ -190,7 +251,8 @@ impl ArchiveEvidence {
 /// EOF is successful only after a complete frame (including checksum). Supports
 /// concatenated frames; a truncated last frame is never a successful prefix.
 pub(super) struct BoundedDecoder<R: Read> {
-    input: BufReader<R>,
+    input: BufReader<io::Take<R>>,
+    physical_limit: u64,
     context: DCtx<'static>,
     reserved: usize,
     remaining: u64,
@@ -212,7 +274,8 @@ impl<R: Read> BoundedDecoder<R> {
             .set_parameter(DParameter::WindowLogMax(WINDOW_LOG))
             .map_err(|_| invalid("cannot bound compressed rollout window"))?;
         Ok(Self {
-            input: BufReader::with_capacity(BUFFER_BYTES, input),
+            input: BufReader::with_capacity(BUFFER_BYTES, input.take(u64::MAX)),
+            physical_limit: u64::MAX,
             context,
             reserved,
             remaining: decoded_limit,
@@ -307,7 +370,10 @@ impl<R: Read> Drop for BoundedDecoder<R> {
             "codex_zst_input",
             "codex",
             &std::collections::BTreeMap::from([
-                ("codex_zst_compressed_bytes", self.compressed_bytes),
+                (
+                    "codex_zst_compressed_bytes",
+                    self.physical_limit - self.input.get_ref().limit(),
+                ),
                 ("codex_zst_decoded_bytes", self.decoded_bytes),
                 ("codex_zst_cpu_micros", self.cpu_micros),
             ]),
@@ -363,6 +429,18 @@ impl OpenedInput {
         }
         input
     }
+    fn header_only(self) -> Self {
+        match self {
+            Self::Compressed(reader, owner) => {
+                let mut decoder = reader.into_inner();
+                decoder.remaining = super::codex_file_join::MAX_HEADER_BYTES as u64;
+                decoder.physical_limit = 2 * super::codex_file_join::MAX_HEADER_BYTES as u64;
+                decoder.input.get_mut().set_limit(decoder.physical_limit);
+                Self::Compressed(Box::new(BufReader::with_capacity(1, decoder)), owner)
+            }
+            plain => plain,
+        }
+    }
     pub(super) fn close(self) {
         if let Self::Compressed(reader, owner) = self {
             drop(reader);
@@ -381,14 +459,14 @@ impl OpenedInput {
     pub(super) fn get_ref(&self) -> &File {
         match self {
             Self::Plain(reader) => reader.get_ref(),
-            Self::Compressed(reader, _) => reader.get_ref().input.get_ref(),
+            Self::Compressed(reader, _) => reader.get_ref().input.get_ref().get_ref(),
         }
     }
 
     pub(super) fn get_mut(&mut self) -> &mut File {
         match self {
             Self::Plain(reader) => reader.get_mut(),
-            Self::Compressed(reader, _) => reader.get_mut().input.get_mut(),
+            Self::Compressed(reader, _) => reader.get_mut().input.get_mut().get_mut(),
         }
     }
 
@@ -442,6 +520,99 @@ impl BufRead for OpenedInput {
 }
 
 impl super::ScanIndex {
+    pub(crate) fn codex_archive_cli_version(&self, path: &Path) -> Option<&str> {
+        self.archive_header(path)?.cli_version()
+    }
+    pub(super) fn archive_header(&self, path: &Path) -> Option<&ValidatedHeader> {
+        let archive = self
+            .files
+            .get(&super::local_index_key(path))?
+            .archive
+            .as_ref()?;
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        let stamp = crate::transcript_acquisition::FileStamp::capture(meta).ok()?;
+        archive.stamp.same_content(&stamp).then_some(())?;
+        archive.header_validated.as_ref()
+    }
+    pub(super) fn inventory_archive_header(
+        &mut self,
+        candidate: &super::CandidateFile,
+        cache: Option<&std::sync::Arc<super::sampled_scan::SharedCache>>,
+    ) -> super::Result<(ValidatedHeader, usize)> {
+        use super::*;
+        let file = open_candidate_beneath_root(candidate)?;
+        let key = local_index_key(&candidate.path);
+        let old = self
+            .files
+            .get(&key)
+            .and_then(|e| e.archive.as_ref())
+            .filter(|a| a.matches(&file));
+        if let Some(header) = old.and_then(|a| a.header_validated.as_ref()) {
+            return Ok((header.clone(), 0));
+        }
+        anyhow::ensure!(
+            old.map_or(true, |a| !a.header_attempted
+                && matches!(a.disposition, ArchiveDisposition::HeaderValidated)),
+            "archive header unavailable without another read"
+        );
+        let mut evidence = ArchiveEvidence::begin(&file, &candidate.path, old)?;
+        evidence.disposition = ArchiveDisposition::HeaderValidated;
+        evidence.header_attempted = true;
+        self.files.entry(key.clone()).or_default().archive = Some(evidence);
+        let mut input =
+            OpenedInput::funded(file, cache.context("archive header admission unavailable")?)?
+                .header_only();
+        let mut bytes = Vec::new();
+        let result = (|| -> Result<ValidatedHeader> {
+            (&mut input)
+                .take(codex_file_join::MAX_HEADER_BYTES as u64)
+                .read_until(b'\n', &mut bytes)?;
+            let header =
+                ValidatedHeader::from_bytes(&bytes).context("invalid archive owning header")?;
+            let evidence = self.files[&key].archive.as_ref().expect("header attempt");
+            anyhow::ensure!(
+                evidence.matches(input.get_ref()),
+                "archive changed during header read"
+            );
+            anyhow::ensure!(
+                codex_session_id_candidates_from_path(&candidate.path.with_extension(""))
+                    .contains(&header.owner),
+                "archive header owner mismatch"
+            );
+            Ok(header)
+        })();
+        let (physical, decoded) = match &input {
+            OpenedInput::Compressed(r, _) => (
+                r.get_ref().physical_limit - r.get_ref().input.get_ref().limit(),
+                r.get_ref().decoded_bytes,
+            ),
+            _ => unreachable!(),
+        };
+        // S2 partial inventory purpose: physical includes read-ahead and error bytes.
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_zst_inventory",
+            "codex",
+            &serde_json::json!({
+                "codex_aux_reads": {"header_read_attempts": {"inventory": 1}, "header_read_bytes": {"inventory": physical}},
+                "codex_zst_inventory_decoded_bytes": decoded,
+                "codex_zst_inventory_physical_bytes": physical,
+            }),
+        );
+        input.close();
+        let evidence = self
+            .files
+            .get_mut(&key)
+            .and_then(|e| e.archive.as_mut())
+            .expect("header attempt");
+        if let Ok(header) = &result {
+            evidence.logical_id = header.owner.clone();
+            evidence.owner = Some(header.owner.clone());
+            evidence.header_validated = Some(header.clone());
+        } else {
+            codex_zst_refused(CodexZstCause::HeaderInvalid);
+        }
+        result.map(|header| (header, decoded as usize))
+    }
     pub(crate) fn settle_archive_bodies(
         &mut self,
         accepted: &std::collections::BTreeMap<String, String>,
@@ -477,7 +648,7 @@ impl super::ScanIndex {
         }
     }
 }
-crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, disposition);
+crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, disposition, header_validated, header_attempted);
 impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)
@@ -486,6 +657,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
 
 #[cfg(test)]
 pub(in crate::snapshots) mod tests {
+    include!("codex_archive_header_tests.rs");
     use super::super::*;
     use super::*;
     use crate::transcript_acquisition::Scope;

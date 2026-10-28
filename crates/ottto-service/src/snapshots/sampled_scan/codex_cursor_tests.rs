@@ -13632,3 +13632,57 @@ fn decoder_owner_outlives_stores_guard_on_normal_early_return_and_unwind() {
         DecoderOwner::acquire(&cache, 1024).unwrap().release();
     }
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn inventory_decoder_releases_without_waiting_for_stores_bounded_join() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap();
+    let root = crate::test_scratch::private_dir("header-lock-order");
+    let path = root.join("rollout-synthetic.jsonl.zst");
+    std::fs::write(
+        &path,
+        zstd::stream::encode_all(
+            &b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"synthetic\"}}\n"[..],
+            1,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let held_cache = cache.clone();
+    let holder = std::thread::spawn(move || {
+        let guard = held_cache.durable.lock().unwrap();
+        ready_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(guard);
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let worker_cache = cache.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut state = ScanIndex::default();
+        let candidate = crate::snapshots::codex_zst_refusal_tests::candidate(&path);
+        let success = state
+            .inventory_archive_header(&candidate, Some(&worker_cache))
+            .is_ok();
+        done_tx
+            .send((success, worker_cache.cursor_reserved()))
+            .unwrap();
+    });
+    let completed = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    worker.join().unwrap();
+    assert_eq!(
+        completed.unwrap(),
+        (true, 0),
+        "decode and refund never enter Stores"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

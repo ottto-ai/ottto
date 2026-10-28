@@ -34,10 +34,8 @@ pub(crate) enum CodexZstCause {
     ParentLedgerUnbound,
     #[serde(rename = "CompressedPhysicalOffsetUnsupported")]
     PhysicalOffsetUnsupported,
-    #[serde(rename = "CompressedHeaderUnfunded")]
-    HeaderUnfunded,
-    #[serde(rename = "CompressedCompatibilityUnfunded")]
-    CompatibilityUnfunded,
+    #[serde(rename = "CompressedCompatibilityUnsupported")]
+    CompatibilityUnsupported,
     #[serde(rename = "CompressedAdmissionRefused")]
     AdmissionRefused,
     #[serde(rename = "CompressedDecodeFailed")]
@@ -48,8 +46,14 @@ pub(crate) enum CodexZstCause {
     OutputHeld,
     #[serde(rename = "CompressedSettlementStuck")]
     SettlementStuck,
+    #[serde(rename = "CompressedParserStateRequired")]
+    ParserStateRequired,
+    #[serde(rename = "CompressedHeaderInvalid")]
+    HeaderInvalid,
+    #[doc(hidden)]
+    __Count,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::SettlementStuck as usize + 1;
+const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
