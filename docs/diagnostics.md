@@ -205,10 +205,12 @@ counts, with no paths or values:
   - `footprint_observer_evicted_files`: files dropped at the cap, oldest
     modification time first.
   - `footprint_observer_cwd_dropped`: cwd values over 4 KiB, not kept.
-  - `footprint_observer_incomplete_files`: deliveries that ended before their
-    read completed, or appended or unchanged reads of a file whose earlier
-    lines this process never saw (restart, durable restore or eviction),
-    counted once per file. What was delivered is kept.
+  - `footprint_observer_incomplete_files`: each delivery that ended before
+    its read completed, plus the first appended or unchanged read of a file
+    whose earlier lines this process never saw (restart, durable restore or
+    eviction). That second count repeats only after the file stops being held
+    (evicted, aged out or without a modification time). What was delivered is
+    kept.
 
 ## Private Codex Census Outcomes
 
