@@ -115,6 +115,8 @@ thread_local! {
     static AFTER_BUILDS_FOR_TEST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static AFTER_PLAN_FOR_TEST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
+#[cfg(test)]
+thread_local! { static TUPLE_HASH_COUNT_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 const VANISHED_ON_OPEN: &str = "vanished_on_open";
 const MAX_CENSUS_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -134,10 +136,13 @@ fn usage_tuple(
     model: Option<&str>,
     usage: &UsageTotals,
 ) -> Option<String> {
+    let (timestamp, model) = (timestamp?, model?);
+    #[cfg(test)]
+    TUPLE_HASH_COUNT_TEST.with(|count| count.set(count.get() + 1));
     // Missing timestamp/model never establishes a copy. Hash only typed data,
     // never transcript text. All eight counting dimensions participate.
     Some(sha256_hex(
-        serde_json::to_string(&(timestamp?, model?, Dims::of_usage(usage).fields()))
+        serde_json::to_string(&(timestamp, model, Dims::of_usage(usage).fields()))
             .ok()?
             .as_bytes(),
     ))
@@ -1054,6 +1059,9 @@ struct PeerScan {
     lineage_edges: BTreeSet<(String, String)>,
     tuple_hits: Vec<BTreeSet<String>>,
     target_ranks: Vec<(Option<u64>, String)>,
+    tuple_targets: BTreeMap<String, BTreeSet<usize>>,
+    target_native_tuples: Vec<BTreeSet<String>>,
+    target_missing_tuples: Vec<BTreeMap<String, u64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1734,6 +1742,8 @@ fn scan_peers(
     let mut scan = PeerScan {
         hits: vec![BTreeMap::new(); target_count],
         tuple_hits: vec![BTreeSet::new(); target_count],
+        target_native_tuples: vec![BTreeSet::new(); target_count],
+        target_missing_tuples: vec![BTreeMap::new(); target_count],
         target_ranks: input
             .targets
             .iter()
@@ -1756,47 +1766,64 @@ fn scan_peers(
         .iter()
         .filter_map(|file| file.canonical_path.clone())
         .collect::<BTreeSet<_>>();
+    // Index canonical target tuples once. Native-only inputs do no matching
+    // hashes at all; no peer line rehashes an owner's occurrence collection.
     for (index, original) in originals.iter().enumerate() {
-        let Ok(original) = &original.original else {
-            continue;
-        };
-        for (other_index, other) in originals.iter().enumerate() {
-            if index == other_index {
-                continue;
+        if let Ok(original) = &original.original {
+            for tuple in original
+                .missing
+                .iter()
+                .filter_map(|missing| missing.tuple.as_ref())
+            {
+                scan.tuple_targets
+                    .entry(tuple.clone())
+                    .or_default()
+                    .insert(index);
+                *scan.target_missing_tuples[index]
+                    .entry(tuple.clone())
+                    .or_default() += 1;
             }
-            let Ok(other) = &other.original else {
-                continue;
-            };
-            for missing in &original.missing {
-                let Some(tuple) = &missing.tuple else {
-                    continue;
-                };
-                let native_match = other.item.claude_usage_occurrences.values().any(|usage| {
-                    usage_tuple(
-                        usage.timestamp.as_deref(),
-                        usage.model.as_deref(),
-                        &usage.usage,
-                    )
-                    .as_ref()
-                        == Some(tuple)
-                });
-                let rank = |i: usize| {
-                    (
-                        input.targets[i].b2_first_ack_order.is_none(),
-                        input.targets[i].b2_first_ack_order,
-                        &input.targets[i].session_key_sha256,
-                    )
-                };
-                let residual_match = rank(other_index) < rank(index)
-                    && other
-                        .missing
-                        .iter()
-                        .any(|missing| missing.tuple.as_ref() == Some(tuple));
-                if native_match || residual_match {
-                    scan.tuple_hits[index].insert(format!(
-                        "{}\n{tuple}",
-                        input.targets[other_index].transcript_path.to_string_lossy()
-                    ));
+        }
+    }
+    if !scan.tuple_targets.is_empty() {
+        for (index, original) in originals.iter().enumerate() {
+            if let Ok(original) = &original.original {
+                scan.target_native_tuples[index] = original
+                    .item
+                    .claude_usage_occurrences
+                    .values()
+                    .filter_map(|usage| {
+                        usage_tuple(
+                            usage.timestamp.as_deref(),
+                            usage.model.as_deref(),
+                            &usage.usage,
+                        )
+                    })
+                    .collect();
+            }
+        }
+        for (tuple, indexes) in &scan.tuple_targets {
+            for &index in indexes {
+                for other_index in 0..target_count {
+                    if index == other_index {
+                        continue;
+                    }
+                    let rank = |i: usize| {
+                        (
+                            scan.target_ranks[i].0.is_none(),
+                            scan.target_ranks[i].0,
+                            &scan.target_ranks[i].1,
+                        )
+                    };
+                    if scan.target_native_tuples[other_index].contains(tuple)
+                        || (rank(other_index) < rank(index)
+                            && scan.target_missing_tuples[other_index].contains_key(tuple))
+                    {
+                        scan.tuple_hits[index].insert(format!(
+                            "{}\n{tuple}",
+                            input.targets[other_index].transcript_path.to_string_lossy()
+                        ));
+                    }
                 }
             }
         }
@@ -2341,6 +2368,8 @@ fn scan_peer_file(
         claude_subagent_identity(path).map(|identity| identity.source_session_id());
     let mut file_session = None::<String>;
     let mut copies = Vec::new();
+    let mut lineage_owner_bound = false;
+    let mut replica_responses: Option<SnapshotAccumulator> = None;
     loop {
         line.clear();
         let read = (&mut reader)
@@ -2402,6 +2431,15 @@ fn scan_peer_file(
             file_session = line_session_id(&value);
         }
         let owner = subagent_session.as_ref().or(file_session.as_ref());
+        if !lineage_owner_bound {
+            if let Some((owner, root)) = owner.zip(family_root(path)) {
+                scan.lineage_edges.insert((owner.clone(), root.to_string()));
+                lineage_owner_bound = true;
+            }
+        }
+        let owner_index = owner
+            .and_then(|owner| session_index.get(owner.as_str()))
+            .copied();
         for parent in [
             forked_from_session(&value),
             string_at(&value, &["parentSessionId"]),
@@ -2413,52 +2451,33 @@ fn scan_peer_file(
                 scan.lineage_edges.insert((owner.clone(), parent));
             }
         }
-        // Retain only tuples that a target's already-resolved id-less response
-        // needs. Same-lineage check is repeated after the full graph is known.
-        if let Some(tuple) = line_usage_tuple(&value) {
-            for (index, original) in originals.iter().enumerate() {
-                let owner_index = owner
-                    .and_then(|owner| session_index.get(owner.as_str()))
-                    .copied();
-                if owner_index == Some(index) {
-                    continue;
-                }
-                if let Some(other_index) = owner_index {
-                    let Ok(other) = &originals[other_index].original else {
-                        continue;
-                    };
-                    let rank = |i: usize| {
-                        (
-                            scan.target_ranks[i].0.is_none(),
-                            scan.target_ranks[i].0,
-                            &scan.target_ranks[i].1,
-                        )
-                    };
-                    let native_match = other.item.claude_usage_occurrences.values().any(|usage| {
-                        usage_tuple(
-                            usage.timestamp.as_deref(),
-                            usage.model.as_deref(),
-                            &usage.usage,
-                        )
-                        .as_ref()
-                            == Some(&tuple)
-                    });
-                    let residual_match = rank(other_index) < rank(index)
-                        && other
-                            .missing
-                            .iter()
-                            .any(|missing| missing.tuple.as_ref() == Some(&tuple));
-                    if !native_match && !residual_match {
-                        continue;
+        // Match only tuples actually requested by a target. All owner native
+        // and residual membership checks use precomputed indexes, never scans.
+        if !scan.tuple_targets.is_empty() {
+            if let Some(tuple) = line_usage_tuple(&value) {
+                if let Some(indexes) = scan.tuple_targets.get(&tuple) {
+                    for &index in indexes {
+                        if owner_index == Some(index) {
+                            continue;
+                        }
+                        if let Some(other) = owner_index {
+                            let rank = |i: usize| {
+                                (
+                                    scan.target_ranks[i].0.is_none(),
+                                    scan.target_ranks[i].0,
+                                    &scan.target_ranks[i].1,
+                                )
+                            };
+                            if !scan.target_native_tuples[other].contains(&tuple)
+                                && !(rank(other) < rank(index)
+                                    && scan.target_missing_tuples[other].contains_key(&tuple))
+                            {
+                                continue;
+                            }
+                        }
+                        scan.tuple_hits[index]
+                            .insert(format!("{}\n{tuple}", path.to_string_lossy()));
                     }
-                }
-                if original.original.as_ref().is_ok_and(|original| {
-                    original
-                        .missing
-                        .iter()
-                        .any(|missing| missing.tuple.as_ref() == Some(&tuple))
-                }) {
-                    scan.tuple_hits[index].insert(format!("{}\n{}", path.to_string_lossy(), tuple));
                 }
             }
         }
@@ -2467,6 +2486,18 @@ fn scan_peer_file(
         let Some(request_id) = line_request_id(&value) else {
             if counted_usage && provenance == ClaudeForkLineProvenance::None {
                 scan.unidentified_usage_line_count += 1;
+                if owner_index.is_some() {
+                    // Buffer only the few owned id-less replica responses with
+                    // the ordinary response resolver. Progressive physical rows
+                    // must not falsely look like extra canonical usage.
+                    let accumulator = replica_responses.get_or_insert_with(|| {
+                        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+                        accumulator.artifacts_enabled = false;
+                        accumulator.context_curve_enabled = false;
+                        accumulator
+                    });
+                    apply_claude_code_line(&value, accumulator);
+                }
             }
             continue;
         };
@@ -2552,6 +2583,48 @@ fn scan_peer_file(
         scan.grown_during_read_count += 1;
     }
     let holder_session = subagent_session.or(file_session);
+    if let Some((owner, responses)) = holder_session
+        .as_ref()
+        .and_then(|owner| session_index.get(owner.as_str()))
+        .copied()
+        .zip(replica_responses)
+    {
+        // Compare id-less responses to the owner's id-less response multiset.
+        // A replica that changes a native response to id-less is uncertain and
+        // holds its owner; native tuple equality must not hide an extra line.
+        let allowed = &scan.target_missing_tuples[owner];
+        if responses.claude_response_record_count
+            >= crate::snapshots::MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE
+        {
+            scan.replica_divergent_ids[owner].insert("idless-replica-response-cap".into());
+        }
+        let mut seen = BTreeMap::<String, u64>::new();
+        for response in responses.claude_responses.values() {
+            let resolved = response
+                .clone()
+                .resolve_classified(&responses.claude_responses.selectors);
+            let tuple = resolved.ok().and_then(|response| {
+                usage_tuple(
+                    response.terminal_timestamp.as_deref(),
+                    response.model.as_deref(),
+                    &response.usage,
+                )
+            });
+            match tuple {
+                Some(tuple) => {
+                    let count = seen.entry(tuple.clone()).or_default();
+                    *count += 1;
+                    if *count > allowed.get(&tuple).copied().unwrap_or_default() {
+                        scan.replica_divergent_ids[owner]
+                            .insert(format!("idless-tuple:{tuple}:{count}"));
+                    }
+                }
+                None => {
+                    scan.replica_divergent_ids[owner].insert("idless-replica-unresolved".into());
+                }
+            }
+        }
+    }
     scan.copies.extend(
         copies
             .into_iter()

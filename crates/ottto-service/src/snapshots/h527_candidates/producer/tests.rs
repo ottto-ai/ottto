@@ -1451,3 +1451,93 @@ fn source_r4_incomplete_census_uses_positive_ids_and_holds_lineage() {
     assert_eq!(output.summary["computed_unqualified_candidates"], 0);
     fs::remove_dir_all(fixture.root).unwrap();
 }
+
+#[test]
+fn source_r4_renamed_peer_preserves_observed_copy_lineage() {
+    let fixture = fixture();
+    let peer = add_vanishing_peer(&fixture.input, "proj-vanished");
+    let renamed = fixture.input.peer_roots[0]
+        .path
+        .join("proj-a")
+        .join("renamed.jsonl");
+    write_lines(
+        &renamed,
+        &[fork_copy(
+            &session_id(903),
+            &session_id(900),
+            ("not-target", 1, 1, 0),
+            "renamed-edge",
+        )],
+    );
+    vanish_after_plan(peer);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    assert_eq!(
+        artifact["input_manifest"]["vanished_no_census"]["held_targets"],
+        18
+    );
+    assert_eq!(
+        target_report(&artifact, 18)["held_reason"],
+        "incomplete_census"
+    );
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_idless_replica_divergence_uses_resolved_responses() {
+    for extra in [false, true] {
+        let fixture = fixture();
+        let target = &fixture.input.targets[17];
+        let mut a = assistant_line(
+            &target.source_session_id,
+            4,
+            ("owned-idless-a", 123, 7, 456),
+        );
+        a.as_object_mut().unwrap().remove("requestId");
+        let mut target_lines =
+            transcript_lines(&target.source_session_id, &[("req-t18-a", 25, 2, 100)]);
+        target_lines.push(a.clone());
+        write_lines(&target.transcript_path, &target_lines);
+        let mut replica_lines =
+            transcript_lines(&target.source_session_id, &[("req-t18-a", 25, 2, 100)]);
+        let mut progressive = a.clone();
+        progressive["timestamp"] = json!("2026-09-02T06:04:00Z");
+        progressive["message"]["usage"]["output_tokens"] = json!(1);
+        replica_lines.extend([progressive, a]);
+        if extra {
+            let mut b = assistant_line(&target.source_session_id, 6, ("extra-idless-b", 12, 3, 0));
+            b.as_object_mut().unwrap().remove("requestId");
+            replica_lines.push(b);
+        }
+        write_lines(
+            &fixture.input.peer_roots[1]
+                .path
+                .join("replica")
+                .join(format!("{}.jsonl", session_id(18))),
+            &replica_lines,
+        );
+        let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+        let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+        let report = target_report(&artifact, 18);
+        if extra {
+            assert_eq!(report["held_reason"], "unknown_owner");
+            assert!(report.get("body").is_none());
+        } else {
+            assert_eq!(
+                report["candidate_status"], "computed_unqualified",
+                "{report}"
+            );
+            assert_eq!(report["body"]["item_totals"]["input_tokens"], 148);
+        }
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+}
+
+#[test]
+fn source_r4_native_only_corpus_does_no_tuple_hashing() {
+    let fixture = fixture();
+    TUPLE_HASH_COUNT_TEST.with(|count| count.set(0));
+    let _output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    assert_eq!(TUPLE_HASH_COUNT_TEST.with(std::cell::Cell::get), 0);
+    fs::remove_dir_all(fixture.root).unwrap();
+}

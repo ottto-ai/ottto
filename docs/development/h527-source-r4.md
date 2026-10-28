@@ -83,3 +83,27 @@ Changes the consumer must understand:
 
 The second corpus run requires a new explicit operator go. This change does
 not authorize that run, installation, daemon state changes or admission.
+
+## Census-only limits and final matching implementation
+
+SOURCE's vanished-census rule reuses the owned request-ID prefixes the daemon
+already saved. Those records do not contain inherited fork lines or the vanished
+file's fork edges. The producer cannot reconstruct that missing evidence or
+apply absent-source exclusions to unseen copied lines. This is a disclosed
+limit of the approved census reuse, not strict conservation proof; SOURCE/SI
+and admission must retain this limit when reviewing the unqualified diagnostic.
+A complete local-coverage flag follows that approved census policy and does
+not certify reconstruction of every historical inherited line. No new transcript
+reads or blanket hold of all census-backed peers are added.
+
+Observed peer session IDs are connected to their filename-derived path families,
+so renamed copies retain project/fork lineage. Id-less responses in same-session
+replicas are resolved with the ordinary response resolver in memory during the
+same streaming read. Extra, unresolved or over-cap replica responses hold their
+owner; identical progressive replicas keep the owner's count. A native-to-idless
+identity change conservatively holds the owner. Only owned id-less replica
+responses are buffered, bounded by the existing ordinary response-record cap.
+
+Tuple membership indexes are built once from the already-resolved targets. A
+native-only target corpus performs no tuple hashes; per-peer matching uses
+indexed lookups and never re-hashes a target's full native occurrence collection.
