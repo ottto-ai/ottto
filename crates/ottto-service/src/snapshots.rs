@@ -42126,10 +42126,6 @@ fn resolve_configured_scan_root(
     }
 }
 
-/// Open the exact transcript object without following a final-component
-/// symlink, capture its stable object identity and a bounded content witness,
-/// then rewind it for the parser. Discovery metadata is never trusted as the
-/// parse identity: a replacement between enumeration and open is reparsed.
 #[cfg(test)]
 thread_local! {
     static RETRY_TRANSCRIPT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -42139,6 +42135,10 @@ pub(crate) fn retry_transcript_opens_for_test() -> usize {
     RETRY_TRANSCRIPT_OPENS.with(std::cell::Cell::get)
 }
 
+/// Open the exact transcript object without following a final-component
+/// symlink, capture its stable object identity and a bounded content witness,
+/// then rewind it for the parser. Discovery metadata is never trusted as the
+/// parse identity: a replacement between enumeration and open is reparsed.
 fn open_candidate_file(
     source: SnapshotSource,
     candidate: &mut CandidateFile,

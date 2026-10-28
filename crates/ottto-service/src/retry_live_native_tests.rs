@@ -73,7 +73,8 @@ fn bounded_retry_cutoff_node_boundary_preserves_ordinary_state() {
         );
         assert_eq!(live.is_some(), expected);
         if let Some(live) = live {
-            live.validate_capture(&f.home.0, &f.items).unwrap();
+            live.validate_capture(&f.home.0, &f.items, &f.working)
+                .unwrap();
         }
         assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
         assert_eq!(crate::backfill::load_backfill_state(&f.support), ordinary);
@@ -189,7 +190,7 @@ impl PiLiveFixture {
         assert!(crate::snapshots::retry_transcript_opens_for_test() > opens_before);
         let items = scan.snapshots;
         let opens_after_scan = crate::snapshots::retry_transcript_opens_for_test();
-        live.validate_capture(&home.0, &items).unwrap();
+        live.validate_capture(&home.0, &items, &working).unwrap();
         assert_eq!(
             crate::snapshots::retry_transcript_opens_for_test(),
             opens_after_scan
@@ -304,13 +305,13 @@ fn bounded_retry_live_inputs_decline_rewrites_replacements_new_paths_and_cutoff(
                 .unwrap();
             }
             "workspace" => f.items[0].workspace_hash = Some("b".repeat(64)),
-            _ => f.items[0].source_file_fingerprint = None,
+            _ => f.items[0].source_file_fingerprint = Some("b".repeat(64)),
         }
         assert!(
             f.live
                 .as_ref()
                 .unwrap()
-                .validate_capture(&f.home.0, &f.items)
+                .validate_capture(&f.home.0, &f.items, &f.working)
                 .is_err(),
             "{change}"
         );
@@ -413,6 +414,30 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
             .unwrap()["snapshots"]
                 .clone()
         };
+        let shed = attempt_snapshot_page(
+            &f.items,
+            &[0],
+            "pi",
+            &mut f.progress,
+            &mut 0,
+            &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+            &snapshot_upload_body_witness,
+            &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+            &mut |items| {
+                assert_eq!(
+                    serde_json::to_value(&items).unwrap(),
+                    serde_json::to_value(&f.items).unwrap()
+                );
+                Err(anyhow::Error::new(UploadShed {
+                    status: 429,
+                    retry_after: Some(Duration::from_millis(30)),
+                    code: None,
+                }))
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(shed.downcast_ref::<UploadShed>().unwrap().status, 429);
         let mut owner = f.capture(Duration::from_millis(30));
         assert!(owner.enabled());
         let opens_before_retry = crate::snapshots::retry_transcript_opens_for_test();
@@ -815,7 +840,7 @@ fn pi_retry_stat_witness_ignores_chmod_but_refuses_append_and_mtime() {
             f.live
                 .as_ref()
                 .unwrap()
-                .validate_capture(&f.home.0, &f.items)
+                .validate_capture(&f.home.0, &f.items, &f.working)
                 .is_ok(),
             change == "chmod",
             "{change}"
@@ -863,4 +888,25 @@ fn pi_retry_index_representation_transition_refuses_before_post() {
     });
     assert_eq!(turns, 1);
     assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn pi_retry_checkpoint_comparison_accepts_both_native_encodings() {
+    let f = PiLiveFixture::new();
+    for pretty in [false, true] {
+        let bytes = if pretty {
+            serde_json::to_vec_pretty(&f.baseline).unwrap()
+        } else {
+            serde_json::to_vec(&f.baseline).unwrap()
+        };
+        std::fs::write(&f.index_path, bytes).unwrap();
+        assert!(
+            bounded_snapshot_retry::checkpoint_matches(&f.index_path, &f.baseline, false).unwrap()
+        );
+        let mut changed = f.baseline.clone();
+        changed.schema_version += 1;
+        assert!(
+            !bounded_snapshot_retry::checkpoint_matches(&f.index_path, &changed, false).unwrap()
+        );
+    }
 }

@@ -113,10 +113,15 @@ impl LiveAuthority {
         self.inputs.validate()
     }
 
-    pub(super) fn validate_capture(&self, home: &Path, items: &[SnapshotItem]) -> Result<()> {
+    pub(super) fn validate_capture(
+        &self,
+        home: &Path,
+        items: &[SnapshotItem],
+        index: &ScanIndex,
+    ) -> Result<()> {
         self.validate_inputs(home)?;
         anyhow::ensure!(
-            self.inputs.covers(items),
+            self.inputs.covers(items, index),
             "optional Pi body lacks stat closure authority"
         );
         Ok(())
@@ -194,7 +199,7 @@ impl LiveRetryOwner {
             || working.legacy_settlement_ledger_needs_migration()
             || committed.legacy_settlement_ledger_needs_migration()
             || live.destination() != progress.destination_namespace_hash
-            || live.validate_capture(home, items).is_err()
+            || live.validate_capture(home, items, working).is_err()
         {
             return false;
         }

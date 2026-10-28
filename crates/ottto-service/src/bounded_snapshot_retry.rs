@@ -4,7 +4,7 @@ use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::snapshot_retry::RetryBudget;
 
-/// Requested-layout temporary peak (retained owner charged separately):
+/// Provisional requested-layout reservation (retained owner charged separately):
 /// 4H for outgoing clone, selected checkpoint/restoration, ACK maps and JSON
 /// comparisons; 4 MiB auxiliary decode (8192 nodes, capped 128 KiB input);
 /// 4 MiB encoded index/request/response copies, gzip and ACK response growth;
@@ -12,7 +12,8 @@ use crate::snapshot_retry::RetryBudget;
 /// hence H <= 1 MiB. Initial checkpoint validation streams a comparison and
 /// allocates no auxiliary native state or serialized index copies. Native ACK
 /// and selected-index writers retain their bounded decoders. This is a
-/// requested-layout envelope; allocator slack and process RSS are separate.
+/// requested-layout envelope measured by the native boundary fixture, not a
+/// universal decoder/TLS proof; allocator slack and process RSS are separate.
 const SEND_BUDGET: usize = 20 * 1024 * 1024;
 const SEND_FIXED: usize = 16 * 1024 * 1024;
 const RETAINED_BUDGET: usize =
@@ -27,7 +28,11 @@ fn turn_peak_bound(retained: usize) -> Option<usize> {
 
 // Compare exactly the native writer's encoding, without decoding competing
 // state. A differently formatted checkpoint safely returns to ordinary work.
-fn checkpoint_matches<T: Serialize>(path: &Path, expected: &T, pretty: bool) -> Result<bool> {
+pub(super) fn checkpoint_matches<T: Serialize>(
+    path: &Path,
+    expected: &T,
+    pretty: bool,
+) -> Result<bool> {
     struct Compare<'a>(&'a [u8]);
     impl std::io::Write for Compare<'_> {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -51,6 +56,17 @@ fn checkpoint_matches<T: Serialize>(path: &Path, expected: &T, pretty: bool) -> 
         serde_json::to_writer_pretty(&mut compare, expected)
     } else {
         serde_json::to_writer(&mut compare, expected)
+    };
+    if result.is_ok() && compare.0.is_empty() {
+        return Ok(true);
+    }
+    // The native index writer uses pretty JSON when decode holds exist.
+    // Both encodings compare the same captured representation, without decode.
+    compare.0 = &bytes;
+    let result = if pretty {
+        serde_json::to_writer(&mut compare, expected)
+    } else {
+        serde_json::to_writer_pretty(&mut compare, expected)
     };
     Ok(result.is_ok() && compare.0.is_empty())
 }

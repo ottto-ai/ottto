@@ -115,7 +115,7 @@ impl PiRetryInputs {
         Ok(())
     }
 
-    pub(crate) fn covers(&self, items: &[SnapshotItem]) -> bool {
+    pub(crate) fn covers(&self, items: &[SnapshotItem], index: &ScanIndex) -> bool {
         items.iter().all(|item| {
             // Workspace/repository identity can read mutable Git metadata
             // outside these frozen transcript roots. Decline that graph until
@@ -126,11 +126,14 @@ impl PiRetryInputs {
                 && item.repository_label_source.is_none()
                 && item.repository_identity_source.is_none()
                 && item.workspace_kind.is_none()
-                // Identity tags come from the completed parse. The stat closure
-                // covers every transcript in the root, not a second fingerprint
-                // minted by reopening an individual file.
-                && self.paths.iter().any(|input| input.is_file)
-                && item.source_file_fingerprint.as_ref().is_some_and(|fp| !fp.is_empty())
+                // Reuse the completed scan's path/fingerprint association.
+                // Never mint a second identity by opening a transcript here.
+                && item.source_file_fingerprint.as_ref().is_some_and(|fp| {
+                    !fp.is_empty() && self.paths.iter().filter(|input| input.is_file).any(|input| {
+                        index.files.get(input.path.to_string_lossy().as_ref())
+                            .is_some_and(|entry| &entry.source_file_fingerprint == fp)
+                    })
+                })
         })
     }
 }
