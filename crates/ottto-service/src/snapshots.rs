@@ -31737,6 +31737,9 @@ impl OwnedSourceScan {
                         // M1: on a RAM miss, a durable record may restore
                         // the copy (charged to the RAM cache, then taken as
                         // a retained copy); any refusal leaves the read Full.
+                        // #814's E2 held-new flag is RAM-only in M1: a miss
+                        // carries it false, and a restore needs the
+                        // committed index entry, so it never widens reuse.
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]

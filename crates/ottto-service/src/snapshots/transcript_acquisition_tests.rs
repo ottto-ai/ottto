@@ -1325,7 +1325,12 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
 /// scope no longer binds), and the traces now mark the observed turn
 /// priority (the restored copy's priority re-check refuses reuse), or the key
 /// becomes a referenced parent (no record I/O). Nonempty #660 maps are unchanged
-/// by restore + Tail and byte-equal to the cold Full maps.
+/// by restore + Tail and byte-equal to the cold Full maps. Legacy-ACK
+/// stickiness (Lead B r8 condition 2): a dated root header that a fresh read
+/// would count as V2, seeded with a prior Legacy ACK, writes a Legacy record;
+/// restore + Tail keeps Legacy and equals the cold Full's body, census and
+/// counting state. The restore itself is proven where the layout is
+/// supported (macOS); elsewhere the arm reads Full to the same oracle.
 #[cfg(unix)]
 #[test]
 fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
@@ -1334,14 +1339,25 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
     let _cutover = codex_counting_version::TestCutover::set(0);
     let capture = claude_request_identity::capture_by_default();
     let namespace = Scope("durable-codex".into());
-    for (v2, arm) in [false, true].into_iter().flat_map(|v2| {
-        ["restore", "view_changed", "priority_changed", "parent_ref"].map(|arm| (v2, arm))
-    }) {
+    let arms = [
+        "restore",
+        "view_changed",
+        "priority_changed",
+        "parent_ref",
+        "legacy_ack_restore",
+    ];
+    for (v2, arm) in [false, true]
+        .into_iter()
+        .flat_map(|v2| arms.map(|arm| (v2, arm)))
+        .filter(|&(v2, arm)| !v2 || arm != "legacy_ack_restore")
+    {
+        let legacy_ack = arm == "legacy_ack_restore";
         let fixture = ScanFixture::new(source);
         // A dated origin can select V2; an undated origin stays Legacy.
         // The Legacy -> V2 view-change control needs a dated header with
-        // prior Legacy ACK evidence, so either injected view is valid.
-        if v2 || arm == "view_changed" {
+        // prior Legacy ACK evidence, so either injected view is valid. The
+        // Legacy-ACK stickiness arm needs the same dated header and ACK.
+        if v2 || arm == "view_changed" || legacy_ack {
             let text = fs::read_to_string(&fixture.file.0).unwrap();
             let mut meta: Value = serde_json::from_str(text.trim()).unwrap();
             meta["payload"]["timestamp"] = json!("2026-10-07T10:00:00Z");
@@ -1386,7 +1402,7 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         let first = Arc::new(sampled_scan::SharedCache::default());
         first.durable_begin_pass(source, &index_path, &namespace, capture);
         let mut initial = ScanIndex::default();
-        if !v2 && arm == "view_changed" {
+        if !v2 && (arm == "view_changed" || legacy_ack) {
             initial.files.insert(
                 local_index_key(&fixture.file.0),
                 serde_json::from_value(json!({
@@ -1521,7 +1537,8 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         );
         let (counters, store) = second.durable_counters(source).unwrap();
         eprintln!("{arm}: {}", counters.summary(source, &store));
-        let restored = matches!(arm, "restore" | "priority_changed") && supported;
+        let restored =
+            matches!(arm, "restore" | "priority_changed" | "legacy_ack_restore") && supported;
         if arm == "parent_ref" {
             assert_eq!(
                 counters.restore_attempts, 0,
@@ -1533,7 +1550,7 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         if supported && arm == "view_changed" {
             assert_eq!(counters.ineligible.get("scope"), Some(&1), "{arm}");
         }
-        let expected = if supported && arm == "restore" {
+        let expected = if supported && matches!(arm, "restore" | "legacy_ack_restore") {
             (0, 1, 0)
         } else {
             (1, 0, 0)
@@ -1557,9 +1574,73 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
             if arm == "view_changed" { !v2 } else { v2 },
             "never flip the loaded decision: {arm}",
         );
-        if arm == "restore" {
+        if matches!(arm, "restore" | "legacy_ack_restore") {
             assert_eq!(parent_records(&warm_index), before_parents);
             assert_eq!(parent_records(&warm_index), parent_records(&cold_index));
+        }
+        if legacy_ack {
+            assert!(!warm_index.files[&key].codex_counting_v2, "stays Legacy");
+            // Census and counting state of the restored generation equal the
+            // cold Full's; neither runs a V2 counting parse.
+            let census = |index: &ScanIndex, scan: &SourceScanResult| {
+                (
+                    [
+                        scan.scanned_session_count as u64,
+                        scan.over_line_cap_count as u64,
+                        scan.recognized_usage_drop_count as u64,
+                        scan.dropped_usage_record_count,
+                        scan.ownership_incomplete_file_count as u64,
+                        scan.zero_snapshot_usage_evidence_count as u64,
+                        scan.terminal_ownership_incomplete_file_count as u64,
+                        scan.terminal_zero_snapshot_usage_evidence_count as u64,
+                        scan.terminal_recognized_usage_drop_count as u64,
+                        scan.terminal_dropped_usage_record_count,
+                        scan.terminal_over_line_cap_count as u64,
+                        scan.census_residue_index_key_count as u64,
+                        scan.census_residue_archived_rollout_count as u64,
+                        scan.census_residue_blocked_session_count as u64,
+                    ],
+                    index.codex_state_only_blocked_session_ids.clone(),
+                    scan.codex_counting_v2
+                        .as_ref()
+                        .map_or(0, |receipts| receipts.v2_sessions),
+                )
+            };
+            let (warm_census, cold_census) =
+                (census(&warm_index, &scan), census(&cold_index, &full));
+            assert_eq!(warm_census, cold_census, "census: {arm}");
+            assert_eq!(warm_census.2, 0, "no V2 counting parse: {arm}");
+            let counting = |entry: &ScanIndexEntry| {
+                (
+                    entry.codex_counting_v2,
+                    entry.codex_counting_owner.clone(),
+                    entry.last_snapshot_fingerprint.clone(),
+                    entry.last_upload_body_witness.clone(),
+                    entry.effective_upload_body_witness_revision,
+                    entry.codex_applied_tier_receipt.clone(),
+                    entry.codex_applied_tier_receipt_required,
+                )
+            };
+            assert_eq!(
+                counting(&warm_index.files[&key]),
+                counting(&cold_index.files[&key]),
+                "counting state: {arm}"
+            );
+            // Premise: without the Legacy ACK the same dated file is V2, so
+            // the restored decision is stickiness, not the header's default.
+            let (fresh, _, _, _) = production_scan_at_with_setup(
+                &fixture,
+                source,
+                ScanIndex::default(),
+                None,
+                &namespace.0,
+                NOW,
+                live(false),
+            );
+            assert!(
+                fresh.files[&key].codex_counting_v2,
+                "a fresh read of the dated header chooses V2"
+            );
         }
         assert!(!scan.snapshots.is_empty(), "compare an emitted Codex body");
         assert_eq!(
