@@ -263,6 +263,8 @@ pub(super) struct HeaderInventory {
     pub(super) read_bytes: usize,
     pub(super) held_archives: BTreeSet<String>,
     pub(super) held_owners: BTreeSet<String>,
+    pub(super) first_read_archives: BTreeSet<String>,
+    pub(super) deferred_archives: BTreeSet<String>,
     pub(super) archive_work: codex_compressed_input::HeaderWork,
     /// Roster files whose first record was refused, each with the metadata
     /// witness seen at the refusal (`None` when it could not be read). This is
@@ -277,6 +279,13 @@ pub(super) struct HeaderInventory {
 /// inventory reads groups in.
 fn group_key(home: &Path, owner: &str) -> String {
     sha256_hex(&["codex_file_group:v1", &local_index_key(home), owner])
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HeaderStep {
+    Pending,
+    Deferred,
+    Complete,
 }
 
 impl HeaderInventory {
@@ -302,6 +311,8 @@ impl HeaderInventory {
             read_bytes: 0,
             held_archives: BTreeSet::new(),
             held_owners: BTreeSet::new(),
+            first_read_archives: BTreeSet::new(),
+            deferred_archives: BTreeSet::new(),
             archive_work: codex_compressed_input::HeaderWork::default(),
             refused: BTreeMap::new(),
             bounded_out: paths.len() > MAX_HEADER_FILES
@@ -319,22 +330,30 @@ impl HeaderInventory {
 
     #[cfg(test)]
     pub(super) fn step(&mut self, metadata: &CodexTitleMetadata) -> bool {
-        self.step_with_archive(metadata, &mut ScanIndex::default(), None)
+        self.step_with_archive(metadata, &mut ScanIndex::default(), None) == HeaderStep::Complete
     }
     pub(super) fn step_with_archive(
         &mut self,
         metadata: &CodexTitleMetadata,
         index: &mut ScanIndex,
         cache: Option<&Arc<sampled_scan::SharedCache>>,
-    ) -> bool {
+    ) -> HeaderStep {
+        // Every deferred path stays in custody for the next page, after plain work.
+        if self
+            .pending
+            .front()
+            .is_some_and(|path| self.deferred_archives.contains(&local_index_key(path)))
+        {
+            return HeaderStep::Complete;
+        }
         let Some(path) = self.pending.pop_front() else {
-            return true;
+            return HeaderStep::Complete;
         };
         if self.read_bytes >= MAX_HEADER_READ_BYTES || self.headers.len() >= MAX_HEADER_FILES {
             self.complete = false;
             self.bounded_out = true;
             self.pending.clear();
-            return true;
+            return HeaderStep::Complete;
         }
         let Some(scan_root) = self
             .roots
@@ -345,12 +364,14 @@ impl HeaderInventory {
         else {
             self.complete = false;
             self.bounded_out = true;
-            return false;
+            return HeaderStep::Pending;
         };
         let key = local_index_key(&path);
         let compressed = is_compressed_codex_rollout(Some(&path), None);
         let mut excluded = false;
-        let result = (|| -> Result<HeaderWitness> {
+        let mut deferred = false;
+        let mut bound_reached = false;
+        let result = (|| -> Result<Option<HeaderWitness>> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
                 stat.is_file() && !stat.file_type().is_symlink(),
@@ -395,7 +416,19 @@ impl HeaderInventory {
                     .read_bytes
                     .saturating_add((self.archive_work.physical_bytes - before) as usize);
                 (
-                    result.map(|(h, _)| (h.owner, h.created_unix_ms, metadata_witness(&stat), 0)),
+                    match result? {
+                        codex_compressed_input::HeaderRead::Validated(h) => {
+                            Ok((h.owner, h.created_unix_ms, metadata_witness(&stat), 0))
+                        }
+                        codex_compressed_input::HeaderRead::BoundReached => {
+                            bound_reached = true;
+                            return Ok(None);
+                        }
+                        codex_compressed_input::HeaderRead::Deferred => {
+                            deferred = true;
+                            return Ok(None);
+                        }
+                    },
                     0,
                 )
             } else {
@@ -407,7 +440,7 @@ impl HeaderInventory {
                 .saturating_add(retried.saturating_mul(MAX_HEADER_BYTES + 1));
             let (owner, created_unix_ms, witness, bytes) = header?;
             self.read_bytes = self.read_bytes.saturating_add(bytes);
-            Ok(HeaderWitness {
+            Ok(Some(HeaderWitness {
                 home: member_home(&candidate.scan_root),
                 candidate,
                 owner,
@@ -416,10 +449,27 @@ impl HeaderInventory {
                 archive_stamp: compressed
                     .then(|| crate::transcript_acquisition::FileStamp::capture(stat))
                     .transpose()?,
-            })
+            }))
         })();
         match result {
-            Ok(header) => self.headers.push(header),
+            Ok(Some(header)) => self.headers.push(header),
+            Ok(None) if deferred => {
+                self.held_owners
+                    .extend(codex_session_id_candidates_from_path(
+                        &Path::new(&key).with_extension(""),
+                    ));
+                self.pending.push_back(PathBuf::from(&key));
+                self.deferred_archives.insert(key);
+                return HeaderStep::Deferred;
+            }
+            Ok(None) if bound_reached => {
+                self.held_owners
+                    .extend(codex_session_id_candidates_from_path(
+                        &Path::new(&key).with_extension(""),
+                    ));
+                self.first_read_archives.insert(key);
+            }
+            Ok(None) => unreachable!("header outcome"),
             Err(_) if excluded => {
                 self.held_owners
                     .extend(codex_session_id_candidates_from_path(
@@ -441,7 +491,7 @@ impl HeaderInventory {
             self.complete = false;
             self.bounded_out = true;
         }
-        false
+        HeaderStep::Pending
     }
     pub(super) fn groups(&self) -> BTreeMap<String, Group> {
         let mut groups = BTreeMap::<String, Group>::new();
@@ -505,7 +555,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, archive_stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, refused, bounded_out, first_read_archives, deferred_archives);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {

@@ -86,6 +86,10 @@ impl LineDelivery {
             || active.side_origin.is_some()
             || active.comparison_target
             || active.group.is_some()
+            || super::is_compressed_codex_rollout(
+                Some(&active.candidate.path),
+                Some(&active.parser.reader.reader),
+            )
         {
             return;
         }
