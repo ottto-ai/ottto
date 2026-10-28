@@ -2684,6 +2684,71 @@ fn a_parent_held_wake_fires_on_a_refreshed_seal_only() {
     assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
 }
 
+/// E1 S3 (C1): proof wakes compare raw path stamps exactly, ctime included,
+/// as before S3. A path stamp carries no birth witness, so ctime is the only
+/// signal of a same-inode replacement or an mtime-restored rewrite until a
+/// birth fence exists (S3b). An untouched pair keeps a `Rewritten` wake
+/// asleep; a metadata-only change of C, or of P, fires it and C is proven.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn a_rewritten_proof_wake_fires_on_a_metadata_only_change() {
+    use std::os::unix::fs::PermissionsExt;
+    // A chmod, retried until the path stamp moves: ctime alone.
+    let chmod = |path: &Path| {
+        let before = OpenStamp::of_path(path).unwrap();
+        for _ in 0..2000 {
+            let mode = fs::metadata(path).unwrap().permissions().mode();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+            let after = OpenStamp::of_path(path).unwrap();
+            assert!(before.same_content(&after), "metadata only");
+            if after != before {
+                assert!(before.append_compatible(&after), "S3's shared rule");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("chmod never moved ctime");
+    };
+    for parent_changed in [false, true] {
+        let now = sampled_scan::now_seconds();
+        let mut scene = Scene::owed("hook-rewritten-ctime");
+        let key = scene.key();
+        let Some(CodexParentProofState::Owed(owed)) =
+            scene.index.codex_parent_prefix_proofs.get_mut(&key)
+        else {
+            panic!("not owed");
+        };
+        owed.wake = ProofWake::Rewritten {
+            parent: Some(OpenStamp::of_path(&scene.parent).unwrap()),
+            child: OpenStamp::of_path(&scene.child.path).unwrap(),
+        };
+        owed.not_before_unix_seconds = 0;
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let before = scene.owed_entry();
+
+        // Untouched: no wake, nothing read.
+        let mut page = PageBudget::default();
+        scene.hook_in(&cache, &hook_pass(), &mut page, now);
+        assert_eq!(spent(&page), 0, "parent_changed={parent_changed}");
+        assert_eq!(scene.owed_entry(), before);
+
+        if parent_changed {
+            chmod(&scene.parent);
+            // P's side record follows P, so only the wake decides.
+            scene.settle_side(now);
+        } else {
+            chmod(&scene.child.path);
+        }
+        let mut page = PageBudget::default();
+        scene.hook_in(&cache, &hook_pass(), &mut page, now);
+        assert_eq!(
+            (scene.proof().matched, scene.proof().owned),
+            (2, true),
+            "parent_changed={parent_changed}"
+        );
+    }
+}
+
 /// Fix round 5 (N1): a held completion whose parser was built before its
 /// entry turned `Proven` (a cursor job paused across the transition: no
 /// install, no refusal) does not memoize its hold, so the next page parses,

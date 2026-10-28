@@ -874,8 +874,9 @@ impl ScanIndex {
     ) -> bool {
         let child_now = OpenStamp::of_path(Path::new(child_key));
         let parent_now = || p_key.and_then(|p_key| OpenStamp::of_path(Path::new(p_key)));
+        // Exact stamps (E1 S3, C1): raw path stamps carry no birth witness.
         let grown = |then: &OpenStamp, now: Option<&OpenStamp>| {
-            now.is_some_and(|now| then.append_compatible(now))
+            now.is_some_and(|now| then.wake_compatible(now))
         };
         match wake {
             ProofWake::Due | ProofWake::Backoff => true,

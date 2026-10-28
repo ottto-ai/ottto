@@ -508,6 +508,26 @@ impl OpenStamp {
         self.dev == other.dev && self.ino == other.ino
     }
 
+    /// `transcript_acquisition::FileStamp::same_content`'s rule: the same
+    /// object, extent and nanosecond mtime; never ctime.
+    pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
+        self.same_object(other) && self.extent == other.extent && self.modified == other.modified
+    }
+
+    /// The memo and parked wake rule, on stamps `SharedCache::retained_stamp`
+    /// qualified: growth, or exactly the stamp. There a ctime-only change
+    /// whose content inputs and birth still match already carries the
+    /// stored ctime, and a birth or evidence mismatch keeps the live ctime,
+    /// so ctime is the birth witness here and stays compared. Not
+    /// `append_compatible`, which never compares ctime (E1 S3). Codex
+    /// parent-proof authority (the side record's parsed-stamp guard and the
+    /// proof wakes, on raw path stamps) keeps this rule too: there ctime is
+    /// the only witness of a same-inode replacement or an mtime-restored
+    /// rewrite until a birth fence exists (E1 S3b).
+    pub(in crate::snapshots) fn wake_compatible(&self, now: &Self) -> bool {
+        self.same_object(now) && (now.extent > self.extent || self == now)
+    }
+
     pub(in crate::snapshots) fn extent(&self) -> u64 {
         self.extent
     }
@@ -520,6 +540,9 @@ impl OpenStamp {
 impl crate::transcript_acquisition::StampIdentity for OpenStamp {
     fn same_object(&self, other: &Self) -> bool {
         OpenStamp::same_object(self, other)
+    }
+    fn same_content(&self, other: &Self) -> bool {
+        OpenStamp::same_content(self, other)
     }
     fn length(&self) -> u64 {
         self.extent
@@ -3327,6 +3350,12 @@ pub(in crate::snapshots) fn apply_eof_record(job: &mut OwnedActiveFile) {
 /// E1's predicate: a withheld record not yet applied, the held FD exactly
 /// the opened object (dev, ino, length, mtime, ctime) and the read at that
 /// length.
+///
+/// ctime stays here on purpose (E1 S3): an applied record gives up the S12
+/// grant for main's strict finish identity, whose opened-object digest
+/// still hashes ctime. Comparing content only would turn a ctime-only
+/// change into a finish refusal and a restart instead of a withheld record.
+/// It moves with that digest (the S3 follow-up).
 fn eof_record_due(job: &OwnedActiveFile) -> bool {
     let Some(meta) = job.cursor.as_ref().filter(|meta| !meta.eof_applied) else {
         return false;
@@ -4830,7 +4859,7 @@ impl SharedCache {
                 (if parked.exact {
                     parked.stamp == *now
                 } else {
-                    parked.stamp.append_compatible(now)
+                    parked.stamp.wake_compatible(now)
                 }) && parked.dependencies.as_deref() == dependencies
             }) {
                 parked.stamp = now;
@@ -5889,9 +5918,15 @@ pub(in crate::snapshots) fn revalidate(
 
 /// The group subset of the revalidation checklist (P2): the member being
 /// read is the same object without shrink or in-place edit; every member
-/// already read still names exactly its boot object; the group's reduction
+/// already read still names its boot object's content (`same_content`, at
+/// the exact boot length; a ctime-only change is not a change); the group's reduction
 /// dependencies, member set and counting view are unchanged; then the
-/// singleton's priority-decision and live-input rules.
+/// singleton's priority-decision and live-input rules. A member's path
+/// stamp carries no birth witness: an in-place same-length rewrite that
+/// restores mtime passes here, and a replacement is seen only through a new
+/// inode number, which APFS does not reuse (Linux would need a birth
+/// witness). The strict sealed-member validator before publication still
+/// compares ctime.
 fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resume {
     let (Some(meta), Some(group)) = (job.cursor.as_ref(), job.group.as_ref()) else {
         return Resume::Changed;
@@ -5910,7 +5945,9 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
         .iter()
         .zip(&group.stamps)
         .take(group.current)
-        .any(|(member, stamp)| OpenStamp::of_path(&member.path).as_ref() != Some(stamp));
+        .any(|(member, stamp)| {
+            !OpenStamp::of_path(&member.path).is_some_and(|now| now.same_content(stamp))
+        });
     if sealed_changed {
         return Resume::Changed;
     }
@@ -6397,7 +6434,7 @@ impl MemoEntry {
         let stamp_holds = if self.exact_stamp {
             self.stamp == now
         } else {
-            self.stamp.append_compatible(&now)
+            self.stamp.wake_compatible(&now)
         };
         (stamp_holds && self.dependencies_hold(digest, file, parent_now, sidecar_now))
             .then_some(now)
@@ -6414,8 +6451,8 @@ impl MemoEntry {
     ) -> Option<u64> {
         let now = OpenStamp::capture(file).ok()?;
         (self.exact_stamp
-            && now != self.stamp
-            && self.stamp.append_compatible(&now)
+            && now.extent > self.stamp.extent
+            && self.stamp.wake_compatible(&now)
             && self.dependencies_hold(digest, file, parent_now, sidecar_now))
         .then(|| now.extent())
     }

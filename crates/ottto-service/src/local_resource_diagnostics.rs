@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod cache_lifecycle;
+pub(crate) mod claude_absence;
 pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;

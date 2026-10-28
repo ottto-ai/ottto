@@ -69,6 +69,18 @@ impl Parent {
         fs::set_permissions(&self.path, fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
     }
 
+    /// A same-size edit outside both sealed windows that moves mtime: the
+    /// samples still match (Q-U28's cheap distinction cannot see it).
+    fn rewrite_middle(&self, at: u64) {
+        let mut byte = [0_u8];
+        self.file.read_exact_at(&mut byte, at).unwrap();
+        byte[0] = if byte[0] == b'#' { b'%' } else { b'#' };
+        self.writer().write_all_at(&byte, at).unwrap();
+        self.writer()
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+            .unwrap();
+    }
+
     /// A same-size edit inside the sealed head window.
     fn rewrite_head(&self) {
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -367,10 +379,14 @@ fn seal_refusals_route_to_the_request_path_and_the_rearm_table() {
     }
 }
 
-/// Q-U28 at admission: a ctime-only change refuses `SameSizeEdit`, the
-/// samples match, so it is the same object and takes the request path; a
-/// same-size rewrite of a sealed window is a new object that consumes the
-/// record and restarts the request.
+/// Q-U28 at admission: a ctime-only change refuses `SameSizeEdit` (a
+/// parent seal and its parsed-stamp guard keep the exact stamp, E1 S3 C1),
+/// the samples match, so it is the same object and takes the request path.
+/// A same-size rewrite between the sealed windows that moves mtime also
+/// matches both samples: refused `SameSizeEdit` and re-requested, never
+/// admitted. Both keep the held FD's position. A same-size rewrite of a
+/// sealed window is a new object that consumes the record and restarts the
+/// request.
 #[test]
 fn a_ctime_only_change_is_the_same_object_and_a_rewrite_consumes_the_record() {
     let mut parent = Parent::new("q-u28", 9_000);
@@ -378,11 +394,31 @@ fn a_ctime_only_change_is_the_same_object_and_a_rewrite_consumes_the_record() {
     let len = parent.len();
     let mut index = with_record(parent.record(SideVerdict::Settled, now));
     parent.touch_ctime();
+    parent.file.seek(SeekFrom::Start(123)).unwrap();
+    let (fenced, counts) = parent.fence(&mut index, len, now);
+    assert_eq!(
+        fenced,
+        SideFence::Refused(FullReason::SameSizeEdit),
+        "ctime only"
+    );
+    assert_eq!(counts.side_refusals, 1);
+    assert!(index.codex_parent_side.contains_key(KEY), "same object");
+    assert_eq!(index.codex_parent_side_requests[KEY].attempts, 0);
+    assert_eq!(parent.file.stream_position().unwrap(), 123, "position kept");
+
+    let mut index = with_record(parent.record(SideVerdict::Settled, now));
+    parent.rewrite_middle(SAMPLE_BYTES as u64 + 100);
     let (fenced, counts) = parent.fence(&mut index, len, now);
     assert_eq!(fenced, SideFence::Refused(FullReason::SameSizeEdit));
     assert_eq!(counts.side_refusals, 1);
     assert!(index.codex_parent_side.contains_key(KEY), "same object");
-    assert_eq!(index.codex_parent_side_requests[KEY].attempts, 0);
+    let requested = index.codex_parent_side_requests[KEY];
+    assert_eq!(
+        (requested.state, requested.attempts, requested.dev_ino),
+        (SideRequestState::Live, 0, parent.dev_ino()),
+        "re-requested"
+    );
+    assert_eq!(parent.file.stream_position().unwrap(), 123, "position kept");
 
     let mut index = with_record(parent.record(SideVerdict::Settled, now));
     let mut charged = parent.request(SideRequestState::Lossy, 4);

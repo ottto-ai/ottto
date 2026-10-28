@@ -234,6 +234,128 @@ fn open_stamp_delegation_matches_the_replaced_inline_predicate() {
         assert_eq!(base.append_compatible(&now), expected, "{case}");
         assert_eq!(inline, expected, "{case}: replaced inline predicate");
     }
+    // E1 S3: a ctime-only change is the same content, which the replaced
+    // inline predicate refused.
+    let ctime_only = OpenStamp {
+        changed: (5, 6),
+        ..base.clone()
+    };
+    assert_ne!(ctime_only, base, "structural equality keeps ctime");
+    assert!(base.same_content(&ctime_only));
+    assert!(base.append_compatible(&ctime_only), "ctime only");
+}
+
+/// Chmod `path` until its ctime moves (bounded retries absorb a coarse
+/// filesystem clock), asserting each time that object, extent and mtime are
+/// untouched: it returns only once exactly the ctime changed.
+fn metadata_only_chmod(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let before = OpenStamp::of_path(path).unwrap();
+    for _ in 0..2000 {
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+        let after = OpenStamp::of_path(path).unwrap();
+        assert!(after.same_content(&before), "chmod kept the content");
+        if after.changed != before.changed {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("chmod never moved ctime");
+}
+
+/// E1 S3: "only grew" (`grew_past_exact`) needs a real extent increase: a
+/// ctime-only or a moved-mtime change at equal extent is never counted as
+/// growth past an exact memo entry; an append is. The memo and parked wakes
+/// keep their full-stamp rule (`wake_compatible`): they compare stamps
+/// `retained_stamp` qualified, where a ctime-only change with matching
+/// content inputs and birth already carries the stored ctime
+/// (`retained_held_singleton_ignores_ctime_but_wakes_on_content_birth_and_inode`),
+/// so a live, unqualified ctime-only stamp still wakes them.
+#[test]
+fn grew_past_exact_needs_growth_and_wakes_keep_the_qualified_stamp() {
+    let temp = Temp::new("s3-exact", b"{\"n\":1}\n{\"n\":2}\n");
+    let file = File::open(&temp.0).unwrap();
+    let opened = OpenStamp::capture(&file).unwrap();
+    let entry = |exact: bool| {
+        MemoEntry::new(
+            "digest".into(),
+            LiveWitness::read(&file, 8).unwrap(),
+            opened.clone(),
+            None,
+            None,
+            disclosure(),
+        )
+        .growth_may_cure(exact)
+    };
+    let cache = SharedCache::default();
+    let park_with = |exact: bool| {
+        cache.with_cursor(|cursor| {
+            park(
+                cursor,
+                "key".into(),
+                Parked {
+                    stamp: opened.clone(),
+                    dependencies: None,
+                    disclosure: strict(DebtReason::ProbeBudgetOrder),
+                    used: 0,
+                    exact,
+                },
+            )
+        });
+    };
+    metadata_only_chmod(&temp.0);
+    let chmodded = OpenStamp::capture(&file).unwrap();
+    assert!(chmodded != opened && chmodded.same_content(&opened));
+    assert_eq!(
+        entry(true).grew_past_exact("digest", &file, None, ""),
+        None,
+        "a ctime-only change never only grew"
+    );
+    for exact in [true, false] {
+        assert!(
+            entry(exact).matches("digest", &file, None, "").is_none(),
+            "memo, exact={exact}: unqualified live ctime"
+        );
+        park_with(exact);
+        assert!(
+            cache.cursor_parked("key", &file, None).is_none(),
+            "parked, exact={exact}: unqualified live ctime"
+        );
+    }
+    // The qualified stamp (stored ctime) is the unchanged one: a hit.
+    let qualified = OpenStamp {
+        changed: opened.changed,
+        ..chmodded.clone()
+    };
+    for exact in [true, false] {
+        assert!(entry(exact)
+            .matches_stamp("digest", &file, None, "", qualified.clone())
+            .is_some());
+        park_with(exact);
+        assert!(cache
+            .cursor_parked_stamp("key", Some(qualified.clone()), None)
+            .is_some());
+    }
+
+    // A moved mtime at equal extent did not grow.
+    File::options()
+        .write(true)
+        .open(&temp.0)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH)
+        .unwrap();
+    assert_eq!(entry(true).grew_past_exact("digest", &file, None, ""), None);
+
+    // Growth: an exact entry misses and reports the grown extent; a
+    // non-exact one still hits.
+    temp.append(b"{\"n\":3}\n");
+    assert!(entry(true).matches("digest", &file, None, "").is_none());
+    assert_eq!(
+        entry(true).grew_past_exact("digest", &file, None, ""),
+        Some(24)
+    );
+    assert!(entry(false).matches("digest", &file, None, "").is_some());
 }
 
 fn reader_input() -> (Vec<u8>, u64, u64) {
@@ -6152,6 +6274,189 @@ fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
         counters(&cache)
     );
     assert_eq!(replayed_census(&hit), replayed_census(&reread));
+}
+
+/// SOURCE 1(b), B2's scan-level case (M1 durable warm-cache reuse): restore +
+/// Tail beside a non-empty held-fork memo and a non-empty parent ledger. One
+/// sessions root holds P (a complete ledger of real signatures), its kind
+/// (iii) fork C (held, memoized with P's ledger as its dependency) and a
+/// plain singleton S. Process 1 settles, saves and writes S's record under
+/// the state-directory lock. S grows (an unchanged file never reaches the
+/// read path). Process 2 (a fresh `SharedCache`, the saved index loaded,
+/// P's persisted ledger re-validated and re-injected by the scan) restores
+/// and Tails S on its first page while C is re-read and memoized again. The
+/// RAM copies are then released (`clear`, which keeps the memo, K6) and S
+/// grows again: the next page restores S from the same record with the memo
+/// non-empty and Tails it while C hits its memo. Each page's body, census,
+/// ledgers and #660 maps equal a cold Full (no cache) of the same index and
+/// files.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn durable_restore_then_tail_beside_a_held_fork_memo_and_parent_ledger_matches_cold_full() {
+    const SINGLE: &str = "019fa111-2222-7333-8444-cccccccccccc";
+    let source = SnapshotSource::Codex;
+    let namespace = Scope("cursor-fixture".into());
+    let capture = crate::snapshots::claude_request_identity::capture_by_default();
+    let home = ForkHome::new(&ForkHome::diverging_child(3));
+    fs::write(
+        home.fixture.file(SINGLE),
+        jsonl(&[
+            json!({"timestamp": "2026-10-07T08:40:00Z", "type": "session_meta",
+                "payload": {"id": SINGLE, "thread_source": "user"}}),
+            turn_record("2026-10-07T08:40:01Z", "single-turn-1"),
+            usage_record("2026-10-07T08:40:02Z", (100, 50, 10, 0), (100, 50, 10, 0)),
+        ]),
+    )
+    .unwrap();
+    let page = |index: ScanIndex, cache: Option<Arc<SharedCache>>, n: u64| {
+        let mut index = index;
+        index.traversal = None;
+        page_selections(
+            &home.fixture,
+            index,
+            cache,
+            "cursor-fixture",
+            &collected_at(n),
+            |_| {},
+            usize::MAX,
+        )
+    };
+    let body = |scan: &SourceScanResult| {
+        let mut snapshots = scan.snapshots.clone();
+        apply_upload_policy(source, &mut snapshots, SnapshotUploadPolicy::default());
+        serde_json::to_value(snapshots).unwrap()
+    };
+    // P's indexed ledger: complete, with real signatures.
+    let ledger_signed = |index: &ScanIndex| {
+        let ledger = index
+            .codex_parent_ownership_ledgers
+            .get(PARENT)
+            .expect("indexed parent ledger");
+        assert!(
+            ledger.scan_complete && !ledger.signatures.is_empty(),
+            "a non-empty complete parent ledger"
+        );
+        ledger.opened_object_identity.clone()
+    };
+    let parent_records = |index: &ScanIndex| {
+        (
+            serde_json::to_vec(&index.codex_parent_ownership_ledgers).unwrap(),
+            serde_json::to_vec(&index.codex_parent_side).unwrap(),
+            serde_json::to_vec(&index.codex_parent_side_requests).unwrap(),
+            serde_json::to_vec(&index.codex_parent_prefix_proofs).unwrap(),
+        )
+    };
+    let memo_depends_on = |cache: &SharedCache, identity: &str| {
+        let entry = home
+            .child_entry(cache)
+            .unwrap_or_else(|| panic!("C's hold is memoized: {}", counters(cache)));
+        let dep = entry.parent.as_ref().expect("parent dependency");
+        assert_eq!(
+            (dep.id.as_str(), dep.ledger.as_deref()),
+            (PARENT, Some(identity)),
+            "the memo used P's ledger"
+        );
+    };
+
+    // Process 1.
+    let state = home.fixture._dir.0.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let index_path = state.join("index.json");
+    let lock = crate::locked_state_dir::test_locks::hold(&state);
+    let first = Arc::new(SharedCache::default());
+    first.durable_begin_pass(source, &index_path, &namespace, capture);
+    let (mut index, settled, n) = home.settle(ScanIndex::default(), &first, 0);
+    let identity = ledger_signed(&index);
+    memo_depends_on(&first, &identity);
+    assert!(session_usage(&settled, CHILD).is_empty(), "C is held");
+    // S published on its first generation; the settled page is quiet for it.
+    let single_key = local_index_key(&home.fixture.file(SINGLE));
+    assert!(
+        index
+            .files
+            .get(&single_key)
+            .is_some_and(|entry| entry.last_snapshot_fingerprint.is_some()),
+        "S is indexed and published"
+    );
+    index.save(&index_path).unwrap();
+    first.durable_write_after_save(lock, source, &index);
+    let records = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+        .map_or(0, |entries| entries.count());
+    assert!(records >= 1, "S's record is written after the save");
+    drop(first);
+
+    // Process 2, first page: S restores and Tails (the restart) while C is
+    // re-read and memoized again against P's re-injected ledger.
+    let grow = |at: &str, total: (u64, u64, u64, u64)| {
+        home.fixture
+            .append(SINGLE, &jsonl(&[usage_record(at, total, (30, 20, 3, 0))]));
+    };
+    grow("2026-10-07T08:40:03Z", (130, 70, 13, 0));
+    let loaded = ScanIndex::load(&index_path).unwrap();
+    assert_eq!(ledger_signed(&loaded), identity, "the ledger persisted");
+    let second = Arc::new(SharedCache::default());
+    assert!(home.child_entry(&second).is_none(), "a restart has no memo");
+    second.durable_begin_pass(source, &index_path, &namespace, capture);
+    let (index_a, warm_a, selections_a) = page(loaded.clone(), Some(Arc::clone(&second)), n);
+    let (counters_a, store_a) = second.durable_counters(source).unwrap();
+    eprintln!(
+        "held-memo restart page: {}",
+        counters_a.summary(source, &store_a)
+    );
+    assert!(counters_a.restored >= 1, "S restores from its record");
+    assert!(selections_a.modes.1 >= 1, "S continues by Tail");
+    memo_depends_on(&second, &identity);
+    let (cold_index_a, cold_a, _) = page(loaded, None, n);
+    assert_eq!(body(&warm_a), body(&cold_a));
+    assert_eq!(census(&index_a, &warm_a), census(&cold_index_a, &cold_a));
+    assert_eq!(replayed_census(&warm_a), replayed_census(&cold_a));
+    assert_eq!(parent_records(&index_a), parent_records(&cold_index_a));
+
+    // Process 2 commits page A and rewrites S's record, which now binds the
+    // Tailed entry (a record never outlives its committed entry). Then the
+    // RAM copies are released (the memo survives) and S grows: the next page
+    // restores S again with the memo non-empty and Tails it; C hits.
+    let mut index_a = index_a;
+    index_a.save(&index_path).unwrap();
+    second.durable_write_after_save(lock, source, &index_a);
+    second.clear();
+    memo_depends_on(&second, &identity);
+    grow("2026-10-07T08:40:04Z", (160, 90, 16, 0));
+    assert_eq!(ledger_signed(&index_a), identity, "re-injected unchanged");
+    let hits = counter(&second, |c| c.memo_hits);
+    second.durable_begin_pass(source, &index_path, &namespace, capture);
+    let (warm_index, warm, selections) = page(index_a.clone(), Some(Arc::clone(&second)), n + 1);
+    let (counters_b, store_b) = second.durable_counters(source).unwrap();
+    eprintln!(
+        "held-memo tail page: {}",
+        counters_b.summary(source, &store_b)
+    );
+    assert_eq!(
+        counters_b.restored,
+        counters_a.restored + 1,
+        "S restores beside the memo"
+    );
+    assert_eq!(selections.modes.1, 1, "S continues by Tail");
+    assert_eq!(
+        counter(&second, |c| c.memo_hits),
+        hits + 1,
+        "C hits its memo: {}",
+        counters(&second)
+    );
+    let (cold_index, cold, _) = page(index_a, None, n + 1);
+    assert!(session_usage(&warm, CHILD).is_empty(), "C stays held");
+    assert!(session_usage(&cold, CHILD).is_empty(), "C stays held cold");
+    assert_ne!(
+        session_usage(&warm, SINGLE),
+        session_usage(&warm_a, SINGLE),
+        "S's second growth is published"
+    );
+    assert_eq!(session_usage(&warm, SINGLE), session_usage(&cold, SINGLE));
+    assert_eq!(body(&warm), body(&cold));
+    assert_eq!(census(&warm_index, &warm), census(&cold_index, &cold));
+    assert_eq!(replayed_census(&warm), replayed_census(&cold));
+    assert_eq!(ledger_signed(&warm_index), identity);
+    assert_eq!(parent_records(&warm_index), parent_records(&cold_index));
 }
 
 /// T15 (PR-P §2.4): a created thread never consults a parent ledger, so it

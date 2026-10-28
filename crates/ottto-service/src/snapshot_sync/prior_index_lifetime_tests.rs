@@ -454,34 +454,13 @@ fn money_unclocked(mut value: serde_json::Value) -> serde_json::Value {
     value
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum MoneyArm {
-    Unarmed,
-    Armed,
-    /// Armed, with the shadow's whole memory ceiling held: the page refuses.
-    ShadowRefused,
-    /// Armed, with the output batch's admission refused after the page.
-    BatchRefused,
-}
-
-/// Daemon parent (P1 parity): ONE real authoritative-caller control. The
-/// real prepare, rotation and finish run unarmed and armed from the same
-/// saved state (a populated money ledger, reloaded), at a tight native
-/// allowance (exactly what the native comparison needs) and one byte under
-/// it, with and without a failed selected-index save (#588: a competing
-/// writer wins the final CAS). Armed arms include a refused shadow page and
-/// a refused output batch. Every arm makes the same live decisions: the same
-/// index and progress bytes, offered bodies, ACKs, finish result and native
-/// allowance decisions. As in `same_input_finish_pair`, each finish takes
-/// the budget's first completed native input.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
-#[serial(claude_request_money_shadow)]
-fn money_shadow_real_caller_parity_at_tight_allowances() {
+fn e2_real_caller_parity_at_tight_allowances() {
     let _reread_clock = crate::snapshots::reread_guard::TestClock::at(current_unix_seconds());
-    use crate::snapshots::claude_request_money as money;
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -489,7 +468,6 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
     let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
     let cadence = IdentityPipelineCadence::new();
     let support = fixture.base.join("money-parity-support");
-    let _shadow_cleanup = money::ShadowTestCleanup::new(&support);
     let secrets = fixture.base.join("money-parity-secrets");
     std::fs::create_dir_all(&support).unwrap();
     std::fs::create_dir_all(&secrets).unwrap();
@@ -524,7 +502,7 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
     let retry_clock = current_unix_seconds();
     // The budget's first completed native input, shared by its arms.
     let mut common = BTreeMap::<(usize, bool), (ScanIndex, SourceScanResult, String)>::new();
-    let mut cycle = |budget: usize, conflict: bool, arm: MoneyArm, shared: bool| -> MoneyCycle {
+    let mut cycle = |budget: usize, conflict: bool, shared: bool| -> MoneyCycle {
         server.offered.lock().unwrap().clear();
         server.terminal.lock().unwrap().clear();
         cadence.next_due_cycle();
@@ -563,15 +541,6 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
             (index, scan)
         };
         let progress_path = preparation.upload_progress_path.clone();
-        let held = (arm == MoneyArm::ShadowRefused).then(|| {
-            money::ShadowReservation::admit(
-                money::SHADOW_MEMORY_CEILING_BYTES - money::reserved_for_test(),
-            )
-            .expect("hold the whole ceiling")
-        });
-        if arm == MoneyArm::BatchRefused {
-            money::set_page_fault_for_test(money::PageFault::BatchRefused);
-        }
         let guard = Guard::new(
             false,
             conflict.then(|| index_path.clone()),
@@ -595,8 +564,6 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
             )
         });
         drop(guard);
-        money::set_page_fault_for_test(money::PageFault::None);
-        drop(held);
         let progress = match std::fs::read(progress_path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -622,25 +589,6 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
         }
     };
 
-    // Populate the money ledger with one armed cycle, save it and forget it;
-    // then a new response, so the compared cycle has work.
-    let _shadow_support = money::enable_shadow_for_test(&support);
-    // The writer supplies durable quota asynchronously; prime the fixture
-    // before requiring its first cycle to produce a persisted save.
-    money::store::prime_credit_for_test(&support, 0);
-    let populated = cycle(
-        crate::source_rotation::PARKED_BUDGET,
-        false,
-        MoneyArm::Armed,
-        false,
-    );
-    assert!(populated.ok, "{populated:?}");
-    money::store::flush();
-    money::store::forget_for_test(&support);
-    assert!(support
-        .join(money::store::LEDGER_DIR)
-        .join("meta.json")
-        .is_file());
     let transcript = fixture
         .home
         .join(".claude/projects/-synthetic-repo")
@@ -668,86 +616,29 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
             }
         }
     }
-    // The support directory (index, progress, sidecars, ledger, diagnostics)
+    // The support directory (index, progress and sidecars)
     // is put back before every arm; the transcripts are only read.
     let mut saved = Vec::new();
     files(&support, &mut saved);
-    let mut run = |budget: usize, conflict: bool, arm: MoneyArm| {
-        // Putting the saved directory back is a restart for it: the writer
-        // must hold no debt (an earlier arm's refused page latches one) that
-        // it would write into `support` while it is replaced.
-        money::store::restart_for_test(&support);
+    let mut run = |budget: usize, conflict: bool| {
         std::fs::remove_dir_all(&support).unwrap();
         for (path, bytes) in &saved {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
         }
-        let _shadow_support = if arm == MoneyArm::Unarmed {
-            money::disable_shadow_for_test(&support);
-            money::store::forget_for_test(&support);
-            None
-        } else {
-            let shadow = money::enable_shadow_for_test(&support);
-            let records = money::store::reload_for_test(&support);
-            assert!(records.is_some_and(|records| records > 0), "{records:?}");
-            Some(shadow)
-        };
-        let _ = money::take_shadow_lines_for_test();
-        let output = cycle(budget, conflict, arm, true);
-        money::store::flush();
-        let lines = money::take_shadow_lines_for_test();
-        let count = |name: &str| {
-            lines
-                .iter()
-                .map(|line| line["counts"][name].as_u64().unwrap())
-                .sum::<u64>()
-        };
-        match arm {
-            MoneyArm::Unarmed => assert!(lines.is_empty()),
-            MoneyArm::Armed => {
-                assert!(count("families") > 0, "{lines:?}");
-                assert_eq!(
-                    count("ledger_loading") + count("refused_budget"),
-                    0,
-                    "{lines:?}"
-                );
-                assert!(lines
-                    .iter()
-                    .all(|line| line["ledger"]["telemetry_records"].as_u64() > Some(0)));
-            }
-            MoneyArm::ShadowRefused => {
-                assert!(!lines.is_empty());
-                assert_eq!(count("families"), 0, "{lines:?}");
-                assert_eq!(count("refused_budget"), lines.len() as u64, "{lines:?}");
-            }
-            MoneyArm::BatchRefused => {
-                assert!(count("families") > 0, "{lines:?}");
-                assert_eq!(count("refused_budget"), lines.len() as u64, "{lines:?}");
-                assert_eq!(count("coverage_complete"), 0, "{lines:?}");
-            }
-        }
-        assert_eq!(
-            money::reserved_for_test(),
-            0,
-            "{arm:?}: admission is released"
-        );
-        output
+        cycle(budget, conflict, true)
     };
 
     // The native comparison's exact need at the full budget, then a budget
     // that leaves exactly that, and one byte less.
-    let full = run(
-        crate::source_rotation::PARKED_BUDGET,
-        false,
-        MoneyArm::Unarmed,
-    );
+    let full = run(crate::source_rotation::PARKED_BUDGET, false);
     let [(Some(remaining), Some(needed), true)] = full.allowance[..] else {
         panic!("one granted native allowance: {:?}", full.allowance);
     };
     let tight = crate::source_rotation::PARKED_BUDGET - (remaining - needed);
     for (budget, granted) in [(tight, true), (tight - 1, false)] {
         for conflict in [false, true] {
-            let baseline = run(budget, conflict, MoneyArm::Unarmed);
+            let baseline = run(budget, conflict);
             let remaining = needed - usize::from(!granted);
             assert_eq!(
                 baseline.allowance,
@@ -755,24 +646,9 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
                 "budget {budget}: the tight allowance"
             );
             assert_eq!(baseline.ok, !conflict, "{baseline:?}");
-            let arms: &[MoneyArm] = if granted && !conflict {
-                &[
-                    MoneyArm::Armed,
-                    MoneyArm::ShadowRefused,
-                    MoneyArm::BatchRefused,
-                ]
-            } else {
-                &[MoneyArm::Armed]
-            };
-            for arm in arms {
-                assert_eq!(
-                    run(budget, conflict, *arm),
-                    baseline,
-                    "{arm:?} at budget {budget}, conflict {conflict}: the same live decisions"
-                );
-            }
+            assert_eq!(run(budget, conflict), baseline,
+                "gate-on replay preserves bytes, ACKs and allowances at budget {budget}, conflict {conflict}");
         }
     }
-    money::disable_shadow_for_test(&support);
-    writeln!(std::io::stderr().lock(), "money_shadow_parity: real_caller=true native_needed={needed} tight_budget={tight} below_refused=true failed_selected_save=true ledger_reloaded=true shadow_refused=true batch_refused=true").unwrap();
+    writeln!(std::io::stderr().lock(), "e2_money_parity: real_caller=true native_needed={needed} tight_budget={tight} below_refused=true failed_selected_save=true replay_equal=true").unwrap();
 }

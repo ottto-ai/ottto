@@ -334,29 +334,3 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
     assert_eq!(sent.len(), 2);
     assert_eq!(sent[0], sent[1], "identical bytes on the resend");
 }
-
-#[test]
-fn e2_p1_off_page_never_loads_or_writes_the_ledger() {
-    // P1 is default-off in production; tests arm it per support dir. An
-    // unarmed page returns before any ledger load, tail advance or write.
-    let support = test_dir("e2-p1-off-no-ledger");
-    std::fs::create_dir_all(&support).unwrap();
-    crate::snapshots::claude_request_money::shadow_page(
-        &support,
-        &[],
-        &ScanIndex::default(),
-        &Default::default(),
-        &Default::default(),
-        true,
-        &crate::snapshots::claude_request_money::coverage::InterimFamilyCoverage {
-            census_complete: true,
-            fence_invalid: false,
-            authority_retry: false,
-        },
-    );
-    assert_eq!(
-        std::fs::read_dir(&support).unwrap().count(),
-        0,
-        "no ledger, tail, JSONL or marker file"
-    );
-}

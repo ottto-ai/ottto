@@ -31,11 +31,27 @@ pub(crate) struct CachedJsonlReduction {
 }
 crate::heap_layout_bound::fields!(CachedJsonlReduction; accumulator, report,
     recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
+crate::durable_tail_codec::durable_struct!(CachedJsonlReduction {
+    D accumulator: SnapshotAccumulator,
+    D report: JsonlReadReport,
+    N recognized_usage_drop_count: usize,
+    N positive_recognized_usage_count: usize,
+    N positive_usage_evidence: bool,
+});
+
+/// M1 durable warm-cache reuse: the record body and its re-derivation.
+#[cfg(unix)]
+pub(super) mod durable;
 impl CachedJsonlReduction {
     /// The copy's usage witness (`SnapshotAccumulator::usage_witness`), kept
     /// beside a taken copy for P1-RETAIN R0's Q-PR15 guard.
     pub(super) fn usage_witness(&self) -> u64 {
         self.accumulator.usage_witness()
+    }
+    /// The copy's source (M1: a durable record is written per source).
+    #[cfg(unix)]
+    pub(super) fn source(&self) -> SnapshotSource {
+        self.accumulator.source
     }
 }
 impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
@@ -349,6 +365,13 @@ impl OwnedJsonlParser {
             positive_recognized_usage_count: self.positive_recognized_usage_count,
             positive_usage_evidence: self.positive_usage_evidence,
         }
+    }
+
+    /// Offline durable-record controls need a real reduction even when this
+    /// platform cannot admit a retained RAM copy.
+    #[cfg(test)]
+    pub(super) fn durable_test_reduction_copy(&mut self) -> CachedJsonlReduction {
+        self.reduction_copy()
     }
 
     /// The charge of a copy beside its committed `checkpoint` (state,

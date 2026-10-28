@@ -11,6 +11,10 @@
 //! is. Resolution decodes each record back to `ClaudeResponseRecord` before
 //! the unchanged response merge, so finalized output is identical by
 //! construction.
+//!
+//! Raw request, message and tool-use ids here (class `L`) are never uploaded
+//! except where the upload contract already carries them; persisted only in
+//! the local durable-tail store.
 use super::cache_observations::OwnedRequest;
 use super::{
     BucketRowAccumulator, ClaudeResponseObservation, ClaudeResponseRecord,
@@ -51,22 +55,6 @@ impl ClaudeResponseBook {
     /// Responses in first-seen order.
     pub(super) fn values(&self) -> std::slice::Iter<'_, ClaudeResponseObservation> {
         self.responses.iter()
-    }
-
-    /// (response sequence, message id) of every response whose key carries a
-    /// message id (`claude_code_usage_dedup_key`'s `m` and `p` keys). Read
-    /// only by the P1 money shadow's armed capture; allocates nothing.
-    pub(super) fn message_keys(&self) -> impl Iterator<Item = (u64, &str)> + Clone + '_ {
-        self.index.iter().filter_map(|(key, slot)| {
-            let mut parts = key.split('\u{1f}');
-            match (parts.next(), parts.next()) {
-                (Some("m" | "p"), Some(message_id)) if !message_id.is_empty() => self
-                    .responses
-                    .get(*slot as usize)
-                    .map(|response| (response.sequence, message_id)),
-                _ => None,
-            }
-        })
     }
 
     pub(super) fn get_mut(
@@ -162,7 +150,7 @@ impl ClaudeResponseBook {
 pub(super) struct CompletionBounds {
     /// `decode_peak_bound`'s value.
     pub(super) peak: usize,
-    /// What `finalize_claude_responses_captured` and `into_items` build from
+    /// What `finalize_claude_responses_e2` and `into_items` build from
     /// these responses, with their finalize scratch; `None` when it cannot
     /// be bounded.
     pub(super) output: Option<usize>,
@@ -205,7 +193,7 @@ pub(super) const ROW_COPIES: usize = 5;
 pub(super) const RFC3339_TEXT_BYTES: usize = 128;
 /// `build_row_identity`'s `selector_hash`: 16 hex digits, or "base".
 const ROW_SELECTOR_HASH_BYTES: usize = 16;
-/// The `context_bucket` selector `finalize_claude_responses_captured` may
+/// The `context_bucket` selector `finalize_claude_responses_e2` may
 /// insert: its key in both maps, "long" or "short", and its source text.
 const CONTEXT_BUCKET_BYTES: usize =
     2 * "context_bucket".len() + "short".len() + "derived_from_effective_input_volume".len();
@@ -300,7 +288,7 @@ struct BookOutput {
 }
 
 impl BookOutput {
-    /// Adds one resolved response: what `finalize_claude_responses_captured`
+    /// Adds one resolved response: what `finalize_claude_responses_e2`
     /// builds from it (cache request, request-id set entry, occurrence with
     /// its selector `Arc`, the `shared_selectors` entry, a usage row and
     /// bucket, tool names) and what `into_items` clones from that row. A
@@ -323,7 +311,7 @@ impl BookOutput {
         if records == 0 {
             return Some(self);
         }
-        // `finalize_claude_responses_captured` may insert `context_bucket`.
+        // `finalize_claude_responses_e2` may insert `context_bucket`.
         let selector = selector_bytes.checked_add(CONTEXT_BUCKET_BYTES)?;
         let entries = selector_entries.checked_add(2)?;
         let row_copy = effort
@@ -471,6 +459,10 @@ pub(super) enum CompactClaudeSelector {
     Interned(u32),
     Inline(Box<SelectorCapture>),
 }
+crate::durable_tail_codec::durable_enum!(CompactClaudeSelector {
+    0 => Interned(N x0: u32),
+    1 => Inline(D x0: Box<SelectorCapture>),
+});
 
 impl From<SelectorCapture> for CompactClaudeSelector {
     fn from(selector: SelectorCapture) -> Self {
@@ -484,6 +476,10 @@ enum ClaudeRecordText {
     SameAsFirstRecord,
     Own(Option<String>),
 }
+crate::durable_tail_codec::durable_enum!(ClaudeRecordText {
+    0 => SameAsFirstRecord,
+    1 => Own(P x0: Option<String>),
+});
 
 impl ClaudeRecordText {
     fn encode(value: Option<String>, first: Option<&Self>) -> Self {
@@ -597,6 +593,10 @@ enum ClaudeSlot {
     Derived(ClaudeSlotTokens),
     Explicit(Box<RequestSlot>),
 }
+crate::durable_tail_codec::durable_enum!(ClaudeSlot {
+    0 => Derived(N x0: ClaudeSlotTokens),
+    1 => Explicit(D x0: Box<RequestSlot>),
+});
 
 impl ClaudeSlot {
     fn encode(
@@ -677,7 +677,15 @@ pub(super) struct CompactClaudeResponseRecord {
     timestamp: Option<String>,
     computed_effective_input_context: Option<u64>,
     selector: CompactClaudeSelector,
-    tool_uses: Vec<(String, String)>,
+    tool_uses: Vec<ClaudeToolUse>,
+}
+
+/// One retained tool use: the provider tool-use id apart from the tool
+/// name, so a durable record's `L` span is the id alone (M1, SOURCE P2-5).
+#[derive(Debug, Clone)]
+struct ClaudeToolUse {
+    id: String,
+    name: String,
 }
 
 impl CompactClaudeResponseRecord {
@@ -717,7 +725,10 @@ impl CompactClaudeResponseRecord {
             timestamp,
             computed_effective_input_context,
             selector,
-            tool_uses: tool_uses.into_iter().collect(),
+            tool_uses: tool_uses
+                .into_iter()
+                .map(|(id, name)| ClaudeToolUse { id, name })
+                .collect(),
         }
     }
 
@@ -763,7 +774,10 @@ impl CompactClaudeResponseRecord {
             request_id,
             timestamp,
             computed_effective_input_context,
-            tool_uses: tool_uses.into_iter().collect(),
+            tool_uses: tool_uses
+                .into_iter()
+                .map(|ClaudeToolUse { id, name }| (id, name))
+                .collect(),
         })
     }
 }
@@ -819,7 +833,7 @@ fn decoded_record_heap_bound(
     // Use per-element counters exactly like completed_heap_bound, so the
     // completion preflight does not inherit a per-line history visit wall.
     let mut tool_bytes = 0usize;
-    for (id, name) in tool_uses {
+    for ClaudeToolUse { id, name } in tool_uses {
         let mut tool = Counter::new(limit.checked_sub(c.bytes)?.checked_sub(tool_bytes)?);
         id.heap_bound(&mut tool)?;
         name.heap_bound(&mut tool)?;
@@ -866,7 +880,7 @@ fn record_output(
     text: RecordText<'_>,
     slot: &ClaudeSlot,
     selector: &SelectorCapture,
-    tool_uses: &[(String, String)],
+    tool_uses: &[ClaudeToolUse],
     limit: usize,
 ) -> Option<ResponseOutput> {
     let RecordText {
@@ -898,7 +912,7 @@ fn record_output(
     let context_bytes = text(&selector.context)?;
     let selector_bytes = context_bytes.checked_add(text(&selector.sources)?)?;
     let mut tool_bytes = 0usize;
-    for (id, name) in tool_uses {
+    for ClaudeToolUse { id, name } in tool_uses {
         tool_bytes = tool_bytes
             .checked_add(id.capacity())?
             .checked_add(name.capacity())?;
@@ -1043,10 +1057,53 @@ impl HeapLayoutBound for ClaudeSlot {
     }
 }
 crate::heap_layout_bound::fields!(ClaudeResponseBook; index, responses, selectors);
+crate::durable_tail_codec::durable_struct!(ClaudeResponseBook {
+    L index: OwnedMap<String, u32>,
+    D responses: OwnedVec<ClaudeResponseObservation>,
+    D selectors: ClaudeSelectorTable,
+});
 crate::heap_layout_bound::fields!(ClaudeSelectorTable; selectors);
+crate::durable_tail_codec::durable_struct!(ClaudeSelectorTable {
+    D selectors: OwnedVec<SelectorCapture>,
+});
 crate::heap_layout_bound::fields!(CompactClaudeUsage; input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, costs);
+crate::durable_tail_codec::durable_struct!(CompactClaudeUsage {
+    N input_tokens: u64,
+    N output_tokens: u64,
+    N cache_read_tokens: u64,
+    N cache_creation_5m_tokens: u64,
+    N cache_creation_1h_tokens: u64,
+    N reasoning_output_tokens: u64,
+    N unattributed_total_tokens: u64,
+    N request_count: u64,
+    N costs: Option<Box<UsageCosts>>,
+});
 crate::heap_layout_bound::fields!(ClaudeSlotTokens; prompt_tokens, cache_read_tokens, cache_creation_tokens, uncached_tokens, output_tokens);
+crate::durable_tail_codec::durable_struct!(ClaudeSlotTokens {
+    N prompt_tokens: Option<u64>,
+    N cache_read_tokens: Option<u64>,
+    N cache_creation_tokens: Option<u64>,
+    N uncached_tokens: Option<u64>,
+    N output_tokens: Option<u64>,
+});
+crate::heap_layout_bound::fields!(ClaudeToolUse; id, name);
+crate::durable_tail_codec::durable_struct!(ClaudeToolUse {
+    L id: String,
+    U name: String,
+});
 crate::heap_layout_bound::fields!(CompactClaudeResponseRecord; usage, slot, physical_sequence, model, reasoning_effort, request_id, timestamp, computed_effective_input_context, selector, tool_uses);
+crate::durable_tail_codec::durable_struct!(CompactClaudeResponseRecord {
+    N usage: CompactClaudeUsage,
+    D slot: ClaudeSlot,
+    N physical_sequence: u16,
+    U model: ClaudeRecordText,
+    U reasoning_effort: ClaudeRecordText,
+    L request_id: ClaudeRecordText,
+    N timestamp: Option<String>,
+    N computed_effective_input_context: Option<u64>,
+    D selector: CompactClaudeSelector,
+    D tool_uses: Vec<ClaudeToolUse>,
+});
 
 /// R1a R8 (T3): main's (`bc77deb9`) decode-peak preflight, verbatim except that
 /// the two book methods take the book as an argument. T3 pins the peak, the
@@ -1132,7 +1189,7 @@ pub(super) mod main_reference {
         // Use per-element counters exactly like completed_heap_bound, so the
         // completion preflight does not inherit a per-line history visit wall.
         let mut tool_bytes = 0usize;
-        for (id, name) in tool_uses {
+        for ClaudeToolUse { id, name } in tool_uses {
             let mut tool = Counter::new(limit.checked_sub(c.bytes)?.checked_sub(tool_bytes)?);
             id.heap_bound(&mut tool)?;
             name.heap_bound(&mut tool)?;
@@ -1186,6 +1243,35 @@ pub(super) mod main_reference {
 #[cfg(test)]
 mod output_tests {
     use super::*;
+
+    /// M1, SOURCE P2-5: a retained tool use is `{L id, U name}`. Its only `L`
+    /// span is the id, so an id copied into the name half would sit outside
+    /// every `L` span and fail the privacy canary.
+    #[test]
+    fn tool_use_l_span_is_the_id_alone() {
+        use crate::durable_tail_codec::{take_l_spans, Durable, Enc};
+        let id = "toolu_CANARYSPLITdt";
+        let name = "toolu_NAMEHALFdt";
+        let tool_uses = vec![ClaudeToolUse {
+            id: id.into(),
+            name: name.into(),
+        }];
+        take_l_spans();
+        let mut e = Enc::bytes(1 << 10);
+        tool_uses.put(&mut e).unwrap();
+        let body = e.into_bytes();
+        let spans = take_l_spans();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let (start, end, path) = spans[0];
+        assert_eq!(path, "ClaudeToolUse.id");
+        let at = |needle: &str| {
+            body.windows(needle.len())
+                .position(|window| window == needle.as_bytes())
+                .unwrap()
+        };
+        assert!(start <= at(id) && at(id) + id.len() <= end);
+        assert!(at(name) >= end || at(name) + name.len() <= start);
+    }
 
     /// R1a R1, R5, R7: output arithmetic that overflows is `None` (never a
     /// wrap or a panic), and a response that resolves to nothing adds nothing.

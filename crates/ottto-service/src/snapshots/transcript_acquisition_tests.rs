@@ -1314,6 +1314,342 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
         eprintln!("SAMPLED_LIVE_INPUTS inputs={inputs} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
     }
 }
+/// SOURCE B2: a Codex restart through the real scanner. A first process
+/// reads the rollout Full under an active counting cutover (the V2 view)
+/// with live turn traces and parent ledgers, saves, and writes its record
+/// under #801's lock. A restarted process (fresh RAM cache, same live inputs
+/// re-injected by the scan) restores the record, re-checks its observed
+/// priority turns against the traces, Tails the appended rows and publishes
+/// the cold Full's body. Refusal arms, each read Full to the cold Full's
+/// body: the counting view changes between write and restore (the record's
+/// scope no longer binds), and the traces now mark the observed turn
+/// priority (the restored copy's priority re-check refuses reuse), or the key
+/// becomes a referenced parent (no record I/O). Nonempty #660 maps are unchanged
+/// by restore + Tail and byte-equal to the cold Full maps. Legacy-ACK
+/// stickiness (Lead B r8 condition 2): a dated root header that a fresh read
+/// would count as V2, seeded with a prior Legacy ACK, writes a Legacy record;
+/// restore + Tail keeps Legacy and equals the cold Full's body, census and
+/// counting state. The restore itself is proven where the layout is
+/// supported (macOS); elsewhere the arm reads Full to the same oracle.
+#[cfg(unix)]
+#[test]
+fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
+    let source = SnapshotSource::Codex;
+    let supported = crate::heap_layout_bound::layout_supported();
+    let _cutover = codex_counting_version::TestCutover::set(0);
+    let capture = claude_request_identity::capture_by_default();
+    let namespace = Scope("durable-codex".into());
+    let arms = [
+        "restore",
+        "view_changed",
+        "priority_changed",
+        "parent_ref",
+        "legacy_ack_restore",
+    ];
+    for (v2, arm) in [false, true]
+        .into_iter()
+        .flat_map(|v2| arms.map(|arm| (v2, arm)))
+        .filter(|&(v2, arm)| !v2 || arm != "legacy_ack_restore")
+    {
+        let legacy_ack = arm == "legacy_ack_restore";
+        let fixture = ScanFixture::new(source);
+        // A dated origin can select V2; an undated origin stays Legacy.
+        // The Legacy -> V2 view-change control needs a dated header with
+        // prior Legacy ACK evidence, so either injected view is valid. The
+        // Legacy-ACK stickiness arm needs the same dated header and ACK.
+        if v2 || arm == "view_changed" || legacy_ack {
+            let text = fs::read_to_string(&fixture.file.0).unwrap();
+            let mut meta: Value = serde_json::from_str(text.trim()).unwrap();
+            meta["payload"]["timestamp"] = json!("2026-10-07T10:00:00Z");
+            fs::write(&fixture.file.0, meta.to_string() + "\n").unwrap();
+        }
+        fixture.file.append(
+            &json!({"type":"turn_context","timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"turn_id":"turn-b2-1","model":"fixture-model"}}),
+        );
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let live = |priority: bool| {
+            move |scan: &mut OwnedSourceScan| {
+                let mut turns = (0..64)
+                    .map(|n| format!("unrelated-turn-{n}"))
+                    .collect::<BTreeSet<_>>();
+                if priority {
+                    turns.insert("turn-b2-1".into());
+                }
+                scan.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
+                    priority_turns: turns,
+                    incomplete: false,
+                }));
+                scan.codex_parent_ownership_ledgers =
+                    Some(Arc::new(Mutex::new(BTreeMap::from([(
+                        "unrelated-parent".to_string(),
+                        CodexParentOwnershipLedger {
+                            signatures: Vec::new(),
+                            scan_complete: true,
+                            opened_object_identity: "synthetic-unrelated".into(),
+                            unresolvable: None,
+                            opened_changed_nanos: 0,
+                            opened_modified_nanos: 0,
+                            opened_birth_nanos: 0,
+                        },
+                    )]))));
+            }
+        };
+        let state = fixture.dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let index_path = state.join("index.json");
+        let lock = crate::locked_state_dir::test_locks::hold(&state);
+        let first = Arc::new(sampled_scan::SharedCache::default());
+        first.durable_begin_pass(source, &index_path, &namespace, capture);
+        let mut initial = ScanIndex::default();
+        if !v2 && (arm == "view_changed" || legacy_ack) {
+            initial.files.insert(
+                local_index_key(&fixture.file.0),
+                serde_json::from_value(json!({
+                    "size_bytes":0, "modified_unix_seconds":0,
+                    "source_file_fingerprint":"prior-legacy-source",
+                    "last_snapshot_fingerprint":"prior-legacy-ack"
+                }))
+                .unwrap(),
+            );
+        }
+        let (mut index, _, modes, _) = production_scan_at_with_setup(
+            &fixture,
+            source,
+            initial,
+            Some(first.clone()),
+            &namespace.0,
+            NOW,
+            live(false),
+        );
+        assert_eq!(modes, (1, 0, 0), "{arm}");
+        let key = local_index_key(&fixture.file.0);
+        assert_eq!(
+            index.files[&key].codex_counting_v2, v2,
+            "seed decision: {arm}"
+        );
+        index.save(&index_path).unwrap();
+        first.durable_write_after_save(lock, source, &index);
+        let records = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+            .map_or(0, |entries| entries.count());
+        assert_eq!(
+            records,
+            usize::from(supported),
+            "{arm}: written after the save"
+        );
+
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let mut loaded = ScanIndex::load(&index_path).unwrap();
+        let key = local_index_key(&fixture.file.0);
+        if arm == "view_changed" {
+            let entry = loaded.files.get_mut(&key).unwrap();
+            entry.codex_counting_v2 = !entry.codex_counting_v2;
+        }
+        if arm == "parent_ref" {
+            loaded
+                .codex_parent_ownership_refs
+                .insert("019fa111-2222-7333-8444-555555555555".into());
+        }
+        // Nonempty #660 records for an unrelated parent/child must survive
+        // the main retained-copy path byte-for-byte, including its real seal.
+        let (mut proof_parser, _, proof_scope) = native_parser(&fixture.file, source);
+        proof_parser
+            .prepare_acquisition(None, &proof_scope, None, 1_791_374_400)
+            .unwrap();
+        while !proof_parser.step().unwrap() {}
+        let seal = match proof_parser
+            .certify_without_retention(&proof_scope, 1_791_374_400)
+            .unwrap()
+        {
+            sampled_jsonl::SideCertificate::Certified { completed, .. } => completed
+                .checkpoint
+                .seal_as(1_791_374_400, &codex_parent_side_scope()),
+            _ => panic!("fixture proof checkpoint"),
+        };
+        let stamp =
+            sampled_scan::codex_cursor::OpenStamp::capture(&File::open(&fixture.file.0).unwrap())
+                .unwrap();
+        loaded.codex_parent_side.insert(
+            "unrelated-parent-key".into(),
+            CodexParentSide {
+                verdict: SideVerdict::Settled,
+                seal: seal.clone(),
+                parsed: stamp,
+                pace: None,
+                generation: 1,
+                referenced_epoch: 1,
+            },
+        );
+        loaded.codex_parent_side_requests.insert(
+            "unrelated-parent-key".into(),
+            SideRequest {
+                dev_ino: (0, 0),
+                needed_extent: 1,
+                state: SideRequestState::Live,
+                state_extent: 1,
+                state_ctime: (0, 0),
+                attempt_extent: 1,
+                attempt_ctime: (0, 0),
+                attempts: 1,
+                not_before_unix_seconds: u64::MAX,
+                needed_charge: None,
+                referenced_epoch: 1,
+            },
+        );
+        loaded.codex_parent_prefix_proofs.insert(
+            "unrelated-child-key".into(),
+            CodexParentProofState::Proven(CodexParentPrefixProof {
+                parent: "unrelated-parent".into(),
+                parent_seal: seal,
+                matched: 0,
+                child_digest: sha256_hex(&["unrelated-child-prefix"]),
+                owned: false,
+                published: false,
+            }),
+        );
+        // These are retained historical records outside this scan root.
+        // Census reconciliation must keep them; this control has no new
+        // disappearance or proof work to perform on the sentinel records.
+        for record_key in ["unrelated-parent-key", "unrelated-child-key"] {
+            let mut historical = loaded.files[&key].clone();
+            historical.codex_protected_owner = Some(sha256_hex(&["unrelated-history-owner"]));
+            assert!(historical.retain_history_evidence());
+            loaded.files.insert(record_key.into(), historical);
+        }
+        let parent_records = |index: &ScanIndex| {
+            (
+                serde_json::to_vec(&index.codex_parent_side).unwrap(),
+                serde_json::to_vec(&index.codex_parent_side_requests).unwrap(),
+                serde_json::to_vec(&index.codex_parent_prefix_proofs).unwrap(),
+            )
+        };
+        let before_parents = parent_records(&loaded);
+        let second = Arc::new(sampled_scan::SharedCache::default());
+        second.durable_begin_pass(source, &index_path, &namespace, capture);
+        let (warm_index, scan, modes, _) = production_scan_at_with_setup(
+            &fixture,
+            source,
+            loaded.clone(),
+            Some(second.clone()),
+            &namespace.0,
+            NOW,
+            live(arm == "priority_changed"),
+        );
+        let (counters, store) = second.durable_counters(source).unwrap();
+        eprintln!("{arm}: {}", counters.summary(source, &store));
+        let restored =
+            matches!(arm, "restore" | "priority_changed" | "legacy_ack_restore") && supported;
+        if arm == "parent_ref" {
+            assert_eq!(
+                counters.restore_attempts, 0,
+                "parent never attempts restore"
+            );
+            assert_eq!(store.records_read, 0, "parent never reads its record");
+        }
+        assert_eq!(counters.restored, u64::from(restored), "{arm}");
+        if supported && arm == "view_changed" {
+            assert_eq!(counters.ineligible.get("scope"), Some(&1), "{arm}");
+        }
+        let expected = if supported && matches!(arm, "restore" | "legacy_ack_restore") {
+            (0, 1, 0)
+        } else {
+            (1, 0, 0)
+        };
+        assert_eq!(modes, expected, "{arm}");
+        let (cold_index, full, _, _) = production_scan_at_with_setup(
+            &fixture,
+            source,
+            loaded,
+            None,
+            &namespace.0,
+            NOW,
+            live(arm == "priority_changed"),
+        );
+        assert_eq!(
+            warm_index.files[&key].codex_counting_v2, cold_index.files[&key].codex_counting_v2,
+            "restored counting decision: {arm}"
+        );
+        assert_eq!(
+            warm_index.files[&key].codex_counting_v2,
+            if arm == "view_changed" { !v2 } else { v2 },
+            "never flip the loaded decision: {arm}",
+        );
+        if matches!(arm, "restore" | "legacy_ack_restore") {
+            assert_eq!(parent_records(&warm_index), before_parents);
+            assert_eq!(parent_records(&warm_index), parent_records(&cold_index));
+        }
+        if legacy_ack {
+            assert!(!warm_index.files[&key].codex_counting_v2, "stays Legacy");
+            // Census and counting state of the restored generation equal the
+            // cold Full's; neither runs a V2 counting parse.
+            let census = |index: &ScanIndex, scan: &SourceScanResult| {
+                (
+                    [
+                        scan.scanned_session_count as u64,
+                        scan.over_line_cap_count as u64,
+                        scan.recognized_usage_drop_count as u64,
+                        scan.dropped_usage_record_count,
+                        scan.ownership_incomplete_file_count as u64,
+                        scan.zero_snapshot_usage_evidence_count as u64,
+                        scan.terminal_ownership_incomplete_file_count as u64,
+                        scan.terminal_zero_snapshot_usage_evidence_count as u64,
+                        scan.terminal_recognized_usage_drop_count as u64,
+                        scan.terminal_dropped_usage_record_count,
+                        scan.terminal_over_line_cap_count as u64,
+                        scan.census_residue_index_key_count as u64,
+                        scan.census_residue_archived_rollout_count as u64,
+                        scan.census_residue_blocked_session_count as u64,
+                    ],
+                    index.codex_state_only_blocked_session_ids.clone(),
+                    scan.codex_counting_v2
+                        .as_ref()
+                        .map_or(0, |receipts| receipts.v2_sessions),
+                )
+            };
+            let (warm_census, cold_census) =
+                (census(&warm_index, &scan), census(&cold_index, &full));
+            assert_eq!(warm_census, cold_census, "census: {arm}");
+            assert_eq!(warm_census.2, 0, "no V2 counting parse: {arm}");
+            let counting = |entry: &ScanIndexEntry| {
+                (
+                    entry.codex_counting_v2,
+                    entry.codex_counting_owner.clone(),
+                    entry.last_snapshot_fingerprint.clone(),
+                    entry.last_upload_body_witness.clone(),
+                    entry.effective_upload_body_witness_revision,
+                    entry.codex_applied_tier_receipt.clone(),
+                    entry.codex_applied_tier_receipt_required,
+                )
+            };
+            assert_eq!(
+                counting(&warm_index.files[&key]),
+                counting(&cold_index.files[&key]),
+                "counting state: {arm}"
+            );
+            // Premise: without the Legacy ACK the same dated file is V2, so
+            // the restored decision is stickiness, not the header's default.
+            let (fresh, _, _, _) = production_scan_at_with_setup(
+                &fixture,
+                source,
+                ScanIndex::default(),
+                None,
+                &namespace.0,
+                NOW,
+                live(false),
+            );
+            assert!(
+                fresh.files[&key].codex_counting_v2,
+                "a fresh read of the dated header chooses V2"
+            );
+        }
+        assert!(!scan.snapshots.is_empty(), "compare an emitted Codex body");
+        assert_eq!(
+            production_body(source, scan),
+            production_body(source, full),
+            "{arm}"
+        );
+    }
+}
 fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value {
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
     serde_json::to_value(scan.snapshots).unwrap()
