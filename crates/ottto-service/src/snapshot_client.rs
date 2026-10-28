@@ -3477,7 +3477,7 @@ mod tests {
             let response: AgentStatusSnapshotUploadResponse = serde_json::from_value(json!({"accepted":1,"machine_id":"synthetic","sources":["codex"],"account_nicknames":extra})).unwrap();
             assert!(response
                 .account_nicknames
-                .is_none_or(|entries| entries.is_empty()));
+                .map_or(true, |entries| entries.is_empty()));
         }
         let response: AgentStatusSnapshotUploadResponse = serde_json::from_value(
             json!({"accepted":1,"machine_id":"synthetic","sources":["codex"]}),

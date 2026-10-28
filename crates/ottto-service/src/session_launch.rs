@@ -663,7 +663,7 @@ fn validate_folder(path: &Path, home: &Path, support: &Path) -> Result<Validated
     if !path.is_absolute()
         || path
             .to_str()
-            .is_none_or(|path| path.chars().any(char::is_control))
+            .map_or(true, |path| path.chars().any(char::is_control))
     {
         return Err(block(Reason::FolderInvalid));
     }
@@ -672,7 +672,7 @@ fn validate_folder(path: &Path, home: &Path, support: &Path) -> Result<Validated
         .map_err(|_| block(Reason::FolderMissing))?;
     if path
         .to_str()
-        .is_none_or(|path| path.chars().any(char::is_control))
+        .map_or(true, |path| path.chars().any(char::is_control))
     {
         return Err(block(Reason::FolderInvalid));
     }

@@ -207,7 +207,7 @@ fn main_checkout_for_settings(cwd: &Path) -> Result<Option<PathBuf>, Block> {
                     .join(common.trim())
                     .canonicalize()
                     .map_err(|_| failure(Reason::SettingsUnreadable, Layer::Project))?;
-                if common.file_name().is_none_or(|name| name != ".git") {
+                if common.file_name().map_or(true, |name| name != ".git") {
                     return Err(failure(Reason::ConfigUnsupported, Layer::Project));
                 }
                 return Ok(common.parent().map(Path::to_path_buf));

@@ -250,7 +250,7 @@ fn collect(
             || candidate
                 .path
                 .to_str()
-                .is_none_or(|text| text.chars().any(char::is_control))
+                .map_or(true, |text| text.chars().any(char::is_control))
         {
             continue;
         }
@@ -260,7 +260,7 @@ fn collect(
             .unwrap_or_else(|_| candidate.path.clone());
         if canonical
             .to_str()
-            .is_none_or(|text| text.chars().any(char::is_control))
+            .map_or(true, |text| text.chars().any(char::is_control))
         {
             continue;
         }
@@ -299,11 +299,11 @@ fn collect(
         item.live = Some(item.live == Some(true) || candidate.live);
         item.with_this_login = Some(item.with_this_login == Some(true) || with_login);
         if let Some(root) = owned {
-            let providers = item.providers.get_or_insert_default();
+            let providers = item.providers.get_or_insert_with(Vec::new);
             if !providers.contains(&root.provider) {
                 providers.push(root.provider);
             }
-            let slots = item.slot_ids.get_or_insert_default();
+            let slots = item.slot_ids.get_or_insert_with(Vec::new);
             if !slots.contains(&root.slot) {
                 slots.push(root.slot.clone());
             }

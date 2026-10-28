@@ -188,7 +188,7 @@ pub(crate) fn read() -> AccountNicknamesV1 {
     };
     if state
         .as_ref()
-        .is_none_or(|cache| cache.generation != generation.binding)
+        .map_or(true, |cache| cache.generation != generation.binding)
     {
         *state = Some(load_cache(&generation));
     }
@@ -222,7 +222,7 @@ pub(crate) fn apply_upload(generation: Option<&Generation>, entries: Option<&[En
     };
     if state
         .as_ref()
-        .is_none_or(|cache| cache.generation != generation.binding)
+        .map_or(true, |cache| cache.generation != generation.binding)
     {
         *state = Some(load_cache(generation));
     }
@@ -427,7 +427,7 @@ pub(crate) fn set(
                 && entry
                     .nickname
                     .as_ref()
-                    .is_none_or(|text| normalize(Some(text.expose_secret())).is_ok()) =>
+                    .map_or(true, |text| normalize(Some(text.expose_secret())).is_ok()) =>
         {
             if self::generation().as_ref() != Some(&generation) {
                 return finish(Outcome::NotConnected);
