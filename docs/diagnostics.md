@@ -206,8 +206,9 @@ counts, with no paths or values:
     modification time first.
   - `footprint_observer_cwd_dropped`: cwd values over 4 KiB, not kept.
   - `footprint_observer_incomplete_files`: deliveries that ended before their
-    read completed, or appended lines of a file whose earlier lines this
-    process never saw (restart or eviction). What was delivered is kept.
+    read completed, or appended or unchanged reads of a file whose earlier
+    lines this process never saw (restart, durable restore or eviction),
+    counted once per file. What was delivered is kept.
 
 ## Private Codex Census Outcomes
 

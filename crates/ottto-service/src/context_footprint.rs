@@ -1342,9 +1342,11 @@ impl CwdProjection {
         let mut projection = self.lock();
         projection.cwd_dropped += dropped;
         let old = projection.files.remove(&file.object);
-        // A Tail of an unknown file follows a prefix this process never saw
-        // (restart or eviction): partial, like an interrupted read.
-        let unseen_prefix = old.is_none() && file.mode == DeliveryMode::Tail;
+        // A Tail or Unchanged read of an unknown file follows a prefix this
+        // process never saw (restart, durable restore or eviction): partial,
+        // like an interrupted read, and counted once since the file is then
+        // remembered even with no cwds.
+        let unseen_prefix = old.is_none() && file.mode != DeliveryMode::Full;
         projection.incomplete_files += u64::from(incomplete || unseen_prefix);
         let mut known = Vec::new();
         if let Some(old) = old {
@@ -1357,7 +1359,7 @@ impl CwdProjection {
         for cwd in &cwds {
             remember_cwd(&mut known, cwd);
         }
-        if let Some(mtime) = file.mtime.filter(|_| !known.is_empty()) {
+        if let Some(mtime) = file.mtime {
             let entry = ProjectedFile { mtime, cwds: known };
             projection.bytes += projected_bytes(&entry);
             projection.files.insert(file.object, entry);
@@ -3382,7 +3384,8 @@ mod tests {
         assert!(projected_bytes(entry) >= PROJECTED_FILE_BYTES + std::mem::size_of::<String>() + 6);
         drop(state);
 
-        // A file whose read named no cwd is not projected.
+        // A file whose read named no cwd is still remembered, so its later
+        // Unchanged reads are no missed prefix.
         let empty = root.join("empty.jsonl");
         fs::write(&empty, "").unwrap();
         let empty = claude_view(&empty, at, DeliveryMode::Full);
@@ -3392,7 +3395,40 @@ mod tests {
             &[json!({})],
             DeliveryEnd::Complete,
         );
-        assert!(projected(&projection, &empty).is_none());
+        assert_eq!(
+            projected(&projection, &empty).unwrap(),
+            Vec::<String>::new()
+        );
+        let unchanged = FileView {
+            mode: DeliveryMode::Unchanged,
+            ..empty
+        };
+        deliver(
+            &mut projection.observer(),
+            &unchanged,
+            &[],
+            DeliveryEnd::Complete,
+        );
+        assert_eq!(projection.lock().incomplete_files, 2);
+
+        // An Unchanged read of a file this process never saw (a durable
+        // restore after restart) missed its lines: counted once.
+        let restored = root.join("restored.jsonl");
+        fs::write(&restored, "").unwrap();
+        let restored = claude_view(&restored, at, DeliveryMode::Unchanged);
+        for _ in 0..2 {
+            deliver(
+                &mut projection.observer(),
+                &restored,
+                &[],
+                DeliveryEnd::Complete,
+            );
+        }
+        assert_eq!(projection.lock().incomplete_files, 3);
+        assert_eq!(
+            projected(&projection, &restored).unwrap(),
+            Vec::<String>::new()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3450,7 +3486,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_rebuilds_its_map_after_turnover_evictions_and_empty_full_reads() {
+    fn projection_rebuilds_its_map_after_evictions_and_pruning() {
         // The per-file charge covers a map of twice its files plus eight only
         // while one slot (entry and control byte at 7/8 load) is under 128 bytes.
         const _: () =
@@ -3465,42 +3501,17 @@ mod tests {
         let projection = Arc::new(CwdProjection::default());
         let mut observer = projection.observer();
         let short = [json!({"cwd": "/s"})];
-        let mut shorts = Vec::new();
         for index in 0..2_000 {
             let path = root.join(format!("short-{index:04}.jsonl"));
             fs::write(&path, "").unwrap();
             let view = claude_view(&path, start, DeliveryMode::Full);
             deliver(&mut observer, &view, &short, DeliveryEnd::Complete);
-            shorts.push(view);
+            assert!(within_charge(&projection.lock()));
         }
         assert_eq!(projection.lock().files.len(), 2_000);
 
-        // Turnover leaves tombstones that lower the reported capacity; the
-        // table's slots stay bounded by its files throughout.
-        let mut turned = Vec::new();
-        for (index, view) in shorts.iter().take(1_500).enumerate() {
-            deliver(&mut observer, view, &[json!({})], DeliveryEnd::Complete);
-            let path = root.join(format!("turned-{index:04}.jsonl"));
-            fs::write(&path, "").unwrap();
-            let fresh = claude_view(&path, start, DeliveryMode::Full);
-            deliver(&mut observer, &fresh, &short, DeliveryEnd::Complete);
-            assert!(within_charge(&projection.lock()));
-            turned.push(fresh);
-        }
-
-        // Full reads that name no cwd forget every file and release the map.
-        for view in shorts.iter().chain(&turned) {
-            deliver(&mut observer, view, &[json!({})], DeliveryEnd::Complete);
-            assert!(within_charge(&projection.lock()));
-        }
-        let state = projection.lock();
-        assert!(state.files.is_empty() && state.bytes == 0 && within_charge(&state));
-        drop(state);
-
-        // Newer large files evict the short ones; the map shrinks with them.
-        for view in &shorts {
-            deliver(&mut observer, view, &short, DeliveryEnd::Complete);
-        }
+        // Newer large files evict the short ones, whose tombstones lower the
+        // reported capacity; the table's slots stay bounded throughout.
         let large: Vec<Value> = (0..OBSERVED_CWDS_PER_FILE)
             .map(|i| json!({"cwd": format!("/{i}{}", "c".repeat(OBSERVED_CWD_MAX_BYTES - 2))}))
             .collect();
@@ -3517,7 +3528,16 @@ mod tests {
         }
         let state = projection.lock();
         assert_eq!((state.files.len(), state.evicted_files), (126, 2_004));
-        assert!(within_charge(&state));
+        drop(state);
+
+        // A cycle that forgets every file releases the table.
+        let later = start + RECENT_WORKSPACE_WINDOW * 2;
+        assert!(projection.recent_cwds(later).is_empty());
+        let state = projection.lock();
+        assert_eq!(
+            (state.bytes, state.table_slots, state.files.capacity()),
+            (0, 0, 0)
+        );
         drop(state);
         fs::remove_dir_all(root).unwrap();
     }
