@@ -740,11 +740,8 @@ pub(crate) struct RestoreCounts {
 }
 impl RestoreCounts {
     #[cfg(unix)]
-    pub(crate) fn record(
-        &mut self,
-        outcome: &crate::snapshots::sampled_scan::durable_tail::RestoreOutcome,
-    ) {
-        use crate::snapshots::sampled_scan::durable_tail::RestoreOutcome;
+    pub(crate) fn record(&mut self, outcome: &crate::snapshots::sampled_scan::RestoreOutcome) {
+        use crate::snapshots::sampled_scan::RestoreOutcome;
         let count = match outcome {
             RestoreOutcome::Restored(_) => &mut self.restored,
             RestoreOutcome::Held(_) => &mut self.held,
@@ -1157,7 +1154,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_counts_are_sparse_saturating_and_page_scoped() {
-        use crate::snapshots::sampled_scan::durable_tail::{MissClass, RestoreOutcome};
+        use crate::snapshots::sampled_scan::{MissClass, RestoreOutcome};
         let mut probe = Probe::start();
         let collection = |full_causes| CollectionCounts {
             scanned_files: 0,
