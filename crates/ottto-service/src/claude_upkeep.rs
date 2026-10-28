@@ -40,14 +40,6 @@ const UPKEEP_STATE_LOCK_FILE: &str = ".claude-background-upkeep-state.lock";
 pub(crate) const UPKEEP_DISABLED_FILE: &str = "claude-background-upkeep-disabled";
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Open product decision Q-A. `false` (recommended, current): a managed slot
-/// whose access login lapsed while its refresh grant is alive stays quiet
-/// ("Paused", the last reading shown with its age; Reconnect stays in the
-/// account menu). `true`: present it as needing sign-in
-/// (`credential_unavailable` + `attention_required`, the Mac app's "Sign in
-/// again" gate). Flipping it changes presentation only; nothing is spawned
-/// either way.
-pub(crate) const PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN: bool = false;
 const RELLOGIN_APPROACHING_SECONDS: i64 = 72 * 60 * 60;
 const INITIAL_BACKOFF_SECONDS: i64 = 5 * 60;
 const MAX_BACKOFF_SECONDS: i64 = 6 * 60 * 60;
@@ -533,11 +525,7 @@ fn observe_registered_slot_upkeep_reading(
                 | RefreshDecision::Running
                 | RefreshDecision::RetryWaiting => ClaudeConfigSlotUpkeepResultV1::InProgress,
                 RefreshDecision::Disabled | RefreshDecision::NotNeeded => {
-                    if PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
-                        ClaudeConfigSlotUpkeepResultV1::RefreshDue
-                    } else {
-                        ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
-                    }
+                    ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
                 }
             };
             let mut observation = observation_with_metadata(false, result, &metadata);
@@ -3116,11 +3104,7 @@ mod tests {
         assert!(observation.paused_awaiting_claude_refresh);
         assert_eq!(
             observation.status.result,
-            if PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
-                ClaudeConfigSlotUpkeepResultV1::RefreshDue
-            } else {
-                ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
-            }
+            ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
         );
         assert_eq!(
             observation.status.due_access_expires_at.as_deref(),

@@ -34,8 +34,7 @@ Collectors:
   best-effort) to mark fast-mode turns — a turn whose `response.create` request
   asked for `priority` is billed at the fast rate. Reads only the request type,
   `service_tier`, and the `turn.id` tracing span; never reads prompt, instruction,
-  response, or tool output, and never uploads raw content. Disabled with
-  `OTTTO_CODEX_FAST_MODE_TRACE=off`.
+  response, or tool output, and never uploads raw content.
 
 Raw prompts, responses, tool output, local paths, tokens, and credentials must not be uploaded by these collectors. Local enriched uploads stay aggregate and metadata-only unless a later manifest version explicitly declares a different upload boundary.
 
