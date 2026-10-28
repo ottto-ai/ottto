@@ -3150,6 +3150,7 @@ pub(crate) fn durable_after_save(
     if let Some((counters, store)) = cache.durable_counters(source) {
         eprintln!("{}", counters.summary(source, &store));
     }
+    cache.durable_alarm(source);
 }
 
 /// U1a-2a (C14), Codex only: open the pass's side-ledger gate, then prune

@@ -784,6 +784,9 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
 /// L23/F1: the production guard dominates all sampling, trust and dependency
 /// fallbacks. Kind `none` is the non-held control: the same fixture with no
 /// record reaches acquisition, and the arm's later gate observes its false value.
+/// C1: `known_corrupt` (T14) is not held: one counted rebuild, acquired like
+/// the control, record untouched before the save. C2: the pass's held keys and
+/// rebuilds reach the `local_resources` alarm for this source.
 #[test]
 fn common_hold_precedes_outer_gates_and_full_acquisition() {
     use sha2::{Digest, Sha256};
@@ -988,7 +991,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     )
                     .is_none());
                 }
-                let held = kind != "none";
+                let held = kind != "none" && !corrupt;
                 let mut completed = false;
                 let mut acquired = false;
                 let mut header_dropped = false;
@@ -1062,7 +1065,29 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         assert_eq!(matched, Some(0), "{source:?}/{bypass}: {name}");
                     }
                 }
-                let (counts, _) = cache.durable_counters(source).unwrap();
+                let (counts, store_counts) = cache.durable_counters(source).unwrap();
+                assert_eq!(
+                    store_counts.t14_rebuild,
+                    u64::from(corrupt && reachable),
+                    "{source:?}/{bypass}"
+                );
+                let ((), alarms) =
+                    crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
+                let alarmed = reachable && kind != "none";
+                assert_eq!(
+                    alarms.len(),
+                    usize::from(alarmed),
+                    "{source:?}/{kind}/{bypass}"
+                );
+                if alarmed {
+                    let alarm = &alarms[0];
+                    assert_eq!(alarm["stage"], "durable_tail_alarm");
+                    assert_eq!(alarm["source"], source.api_slug());
+                    let pair = |on: bool| serde_json::json!([u64::from(on), u64::from(on)]);
+                    assert_eq!(alarm["counts"]["held_keys"], pair(held));
+                    assert_eq!(alarm["counts"]["t14_rebuild"], pair(corrupt));
+                    assert!(alarm["counts"].get("store_disabled").is_none());
+                }
                 let class = [
                     "newer",
                     "unknown",
@@ -1075,7 +1100,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 if let Some(class) = class {
                     assert_eq!(
                         counts.durable_held[class],
-                        u64::from(reachable),
+                        u64::from(reachable && !corrupt),
                         "{source:?}/{corrupt}/{bypass}"
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
@@ -1087,6 +1112,75 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
             }
         }
     }
+}
+
+/// C1: a store this process does not own is disabled for the process with
+/// ONE store-level alarm on the `local_resources` carrier; a newer-format
+/// record in it is neither held nor rebuilt (memory-only, pre-#806).
+#[test]
+fn foreign_owned_store_alarms_once_and_holds_nothing() {
+    struct OwnUid;
+    impl Drop for OwnUid {
+        fn drop(&mut self) {
+            store::test_hooks::set_uid(None);
+        }
+    }
+    let root = crate::test_scratch::private_dir("ottto-dt-foreign-owner");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let ds = durable_source(source).unwrap();
+    let index_path = root.join("index.json");
+    let namespace = Scope("foreign-owner".into());
+    let key = "/synthetic/foreign-owner.jsonl";
+    let cert_path = root.join("certificate.jsonl");
+    std::fs::write(&cert_path, b"{}\n").unwrap();
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let pending = PendingRecord {
+        binding: Binding {
+            source: ds,
+            key: store::key_digest(ds, key),
+            context: [0; 32],
+            scope: [0; 32],
+            entry: [0; 32],
+        },
+        certificate: certificate(&cert_path, &namespace),
+        body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+        allowlist: codec::allowlist_digest(source),
+    };
+    disk.write_after_save(lock, 1, vec![pending]).unwrap();
+    let record_path = std::fs::read_dir(disk.dir())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut bytes = std::fs::read(&record_path).unwrap();
+    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    std::fs::write(&record_path, &bytes).unwrap();
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    assert!(
+        cache.durable_hold(source, key).is_some(),
+        "control: U holds"
+    );
+    let _own = OwnUid;
+    // SAFETY: geteuid has no preconditions.
+    store::test_hooks::set_uid(Some(unsafe { libc::geteuid() }.wrapping_add(1)));
+    let fresh = SharedCache::default();
+    let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+        for _ in 0..2 {
+            fresh.durable_begin_pass(source, &index_path, &namespace, false);
+            assert_eq!(fresh.durable_hold(source, key), None);
+            fresh.durable_alarm(source);
+        }
+    });
+    assert_eq!(alarms.len(), 1, "one store-level alarm");
+    let counts = &alarms[0]["counts"];
+    assert_eq!(counts["store_disabled"], "foreign_owner");
+    assert_eq!(counts["held_keys"], serde_json::json!([0, 0]));
+    assert_eq!(counts["t14_rebuild"], serde_json::json!([0, 0]));
+    assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Lead B (#829): a production post-save that skipped the per-pass setup

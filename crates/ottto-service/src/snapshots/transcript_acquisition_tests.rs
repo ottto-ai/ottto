@@ -1740,16 +1740,36 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     new_rollout.append(&usage(source, 50, 0, "fixture-model"));
     let second = Arc::new(sampled_scan::SharedCache::default());
     second.durable_begin_pass(source, &index_path, &namespace, capture);
-    let (mut warm, _, modes, _) = production_scan_at_with_setup(
+    let before = ScanIndex::load(&index_path).unwrap();
+    let (mut warm, warm_scan, modes, _) = production_scan_at_with_setup(
         &fixture,
         source,
-        ScanIndex::load(&index_path).unwrap(),
+        before.clone(),
         Some(second.clone()),
         &namespace.0,
         NOW,
         live,
     );
     assert_eq!(modes, if supported { (1, 1, 0) } else { (2, 0, 0) });
+    // Lead B: only the new key's durable record is deferred; its money
+    // uploads on this pass, equal to a cold Full of the same input.
+    let (_, cold_scan, _, _) =
+        production_scan_at_with_setup(&fixture, source, before, None, &namespace.0, NOW, live);
+    let new_session = |scan: &SourceScanResult| {
+        scan.snapshots
+            .iter()
+            .filter(|snapshot| snapshot.source_session_id == new_id)
+            .count()
+    };
+    assert!(
+        new_session(&warm_scan) > 0,
+        "the deferred key's body is emitted"
+    );
+    assert_eq!(new_session(&warm_scan), new_session(&cold_scan));
+    assert_eq!(
+        production_body(source, warm_scan),
+        production_body(source, cold_scan)
+    );
     warm.save(&index_path).unwrap();
     second.durable_write_after_save(lock, source, &warm);
     let (counters, store) = second.durable_counters(source).unwrap();
@@ -1758,7 +1778,7 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     // The known key is replaced; the new key is deferred, counted.
     assert_eq!(store.records_written, u64::from(supported));
     assert_eq!(store.budget_refused, 0);
-    assert_eq!(store.store_write_skipped, [0, 0, u64::from(supported)]);
+    assert_eq!(store.store_write_skipped, [0, u64::from(supported)]);
     if supported {
         assert_eq!(store.disk_records, bound as u64 + 2);
     }

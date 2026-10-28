@@ -143,6 +143,21 @@ source/encoding settings and distinguish idle, ordinary changes, import and
 recovery. A containing release and matching installation are required before
 calling these measurements installed evidence.
 
+### Durable Store Alarm
+
+A `durable_tail_alarm` record (schema 2 additive) follows a post-save pass
+whose durable-store counts for that source changed. Each count is
+`[since the last alarm, process total]`: `held_keys` (files held because their
+record has an unknown or newer format), `t14_rebuild` (known corrupt records
+read Full once and replaced after the save) and `mode_repaired` (store
+directory or records restored to owner-only). `store_disabled` appears once,
+with `foreign_owner`, `not_directory`, `mode_unrepairable` or `t14_breaker`
+(more than max(20, 2%) corrupt records in one pass), when the store becomes
+memory-only for the process. While a key is held, its source's census stays
+retryable (red) for the whole hold, so census close, retirement and
+account-family proof wait for that source; a held key is not yet terminal
+disclosed residue.
+
 ## Line Delivery Counters
 
 Schema 2's `native_collection_page` can add two sparse, counts-only objects.

@@ -17,7 +17,12 @@
 //!   only when its generation is at or below the loaded index's committed
 //!   generation and the index entry it was written for is still the
 //!   committed one. Anything else is Full; nothing is partially applied.
-//! - Unknown representations and known corruption hold acquisition and survive every mutation.
+//! - Unknown representations hold acquisition and survive every mutation. A
+//!   known corrupt record (T14) is one counted Full read, then replaced by the
+//!   post-save rename-over; nothing deletes it first. More than
+//!   `max(T14_BREAKER, 2%)` T14 records in one pass disable the store.
+//! - Owner or mode faults are store-level: our own entries get 0700/0600
+//!   back; a foreign owner disables the store for this process (memory-only).
 //! - No local path, transcript text, raw sample or raw identifier enters a
 //!   record envelope: the index key and the entry selection are digests, and
 //!   the certificate is content-free (`DurableCertificate`). Nothing here is
@@ -358,9 +363,12 @@ pub(crate) struct StoreCounters {
     pub(crate) records_read: u64,
     pub(crate) missing: u64,
     pub(crate) format_hold: [u64; 5],
-    /// Writes skipped: predecessor unknown, known corrupt, or a new key while
-    /// record files exceed `INVENTORY_BOUND` (offered again after the next save).
-    pub(crate) store_write_skipped: [u64; 3],
+    /// Writes skipped: predecessor unknown, or a new key while record files
+    /// exceed `INVENTORY_BOUND` (offered again after the next save).
+    pub(crate) store_write_skipped: [u64; 2],
+    /// T14 records read Full once to be rebuilt; owner-only modes restored.
+    pub(crate) t14_rebuild: u64,
+    pub(crate) mode_repaired: u64,
     pub(crate) guard_header_bytes: u64,
     pub(crate) guard_verify_bytes: u64,
     pub(crate) delete_verify_bytes: u64,
@@ -398,12 +406,23 @@ pub(crate) struct DurableTailStore {
     source: DurableSource,
     durable: BTreeMap<Digest32, (Option<Digest32>, Stamp)>,
     counters: StoreCounters,
+    /// The store-level fault that made this store memory-only for the process.
+    disabled: Option<&'static str>,
+    /// This pass: directory checked, [records loaded, T14 rebuilds], and the
+    /// rebuilt keys (at most `REBUILT_BOUND`; past it a repeat counts again).
+    checked: bool,
+    pass: [u64; 2],
+    rebuilt: BTreeSet<Digest32>,
 }
 
 /// The most record files one GC or inventory pass looks at. Twice the
 /// admission cap, so a full store plus its replacements always fits; any
 /// file past it is left untouched and counted.
 pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
+/// T14 rebuilds one pass allows before the store is disabled: more than
+/// `max(T14_BREAKER, 2% of the records loaded)`.
+pub(crate) const T14_BREAKER: u64 = 20;
+const REBUILT_BOUND: usize = 64;
 // A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
 const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp))>() <= 128);
 
@@ -414,7 +433,59 @@ impl DurableTailStore {
             durable: BTreeMap::new(),
             source,
             counters: StoreCounters::default(),
+            disabled: None,
+            checked: false,
+            pass: [0; 2],
+            rebuilt: BTreeSet::new(),
         }
+    }
+
+    /// A new pass: the directory is checked again and the T14 breaker resets.
+    pub(crate) fn begin_pass(&mut self) {
+        self.checked = false;
+        self.pass = [0; 2];
+        self.rebuilt.clear();
+    }
+
+    pub(crate) fn disabled(&self) -> Option<&'static str> {
+        self.disabled
+    }
+
+    fn disable(&mut self, cause: &'static str) {
+        if self.disabled.is_none() {
+            self.disabled = Some(cause);
+        }
+        self.durable.clear();
+    }
+
+    /// The store-level check, once per pass: a directory we own gets 0700
+    /// back; anything else disables the store (absent is fine).
+    fn usable(&mut self) -> bool {
+        if !self.checked && self.disabled.is_none() {
+            self.checked = true;
+            match fs::symlink_metadata(&self.dir) {
+                Ok(metadata) if !metadata.is_dir() => self.disable("not_directory"),
+                Ok(metadata) => {
+                    self.repair(&self.dir.clone(), &metadata, 0o700);
+                }
+                Err(_) => {}
+            }
+        }
+        self.disabled.is_none()
+    }
+
+    /// Our own entry gets `mode` back (counted); a foreign owner or a failed
+    /// repair disables the store.
+    fn repair(&mut self, path: &Path, metadata: &fs::Metadata, mode: u32) -> bool {
+        if metadata.uid() != our_uid() {
+            self.disable("foreign_owner");
+        } else if metadata.permissions().mode() & 0o777 != mode {
+            match fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+                Ok(()) => self.counters.mode_repaired += 1,
+                Err(_) => self.disable("mode_unrepairable"),
+            }
+        }
+        self.disabled.is_none()
     }
 
     pub(crate) fn dir(&self) -> &Path {
@@ -441,17 +512,34 @@ impl DurableTailStore {
         self.dir.join(format!("{}{RECORD_SUFFIX}", hex(key)))
     }
 
-    /// Header dispatch precedes size/mode checks. Only a verified known record licenses mutation.
+    /// Header dispatch precedes owner/mode and size checks. Only a verified
+    /// known record licenses mutation. `Ok(None)` also when the store is disabled.
     fn classify(&mut self, key: &Digest32, work: &str) -> Result<Option<Binding>, Refusal> {
+        if !self.usable() {
+            return Ok(None);
+        }
         let path = self.record_path(key);
         let result = (|| {
-            let mut file = match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&path)
-            {
+            let open = || {
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&path)
+            };
+            let mut file = match open() {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    let repaired = fs::symlink_metadata(&path)
+                        .is_ok_and(|m| m.is_file() && self.repair(&path, &m, 0o600));
+                    if self.disabled.is_some() {
+                        return Ok(None);
+                    }
+                    if !repaired {
+                        return Err(Refusal::Undecodable);
+                    }
+                    open().map_err(|_| Refusal::Undecodable)?
+                }
                 Err(_) => return Err(Refusal::Undecodable),
             };
             let mut header = Vec::with_capacity(HEADER_BYTES);
@@ -463,9 +551,13 @@ impl DurableTailStore {
             self.counters.guard_header_bytes += n as u64;
             let binding = decode_header(&header, key, self.source)?;
             let metadata = file.metadata().map_err(|_| Refusal::Corrupt)?;
+            if !self.repair(&path, &metadata, 0o600) {
+                return Ok(None);
+            }
+            // After any repair: its ctime moved.
+            let metadata = file.metadata().map_err(|_| Refusal::Corrupt)?;
             let stamp = Stamp::of(&metadata);
             if !metadata.is_file()
-                || metadata.permissions().mode() & 0o077 != 0
                 || metadata.len() > (RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES) as u64
             {
                 return Err(Refusal::Corrupt);
@@ -497,8 +589,27 @@ impl DurableTailStore {
         result
     }
 
+    /// U holds. T14 does not: the key is read Full once (counted) and its
+    /// record is overwritten after the save, unless the breaker disables the store.
     pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
-        self.classify(key, "guard").err()
+        let result = self.classify(key, "guard");
+        self.pass[0] += u64::from(!matches!(result, Ok(None)));
+        match result {
+            Err(Refusal::Corrupt) if !self.rebuilt.contains(key) => {
+                if self.pass[1] >= T14_BREAKER.max(self.pass[0] / 50) {
+                    self.disable("t14_breaker");
+                } else {
+                    self.pass[1] += 1;
+                    self.counters.t14_rebuild += 1;
+                    if self.rebuilt.len() < REBUILT_BOUND {
+                        self.rebuilt.insert(*key);
+                    }
+                }
+                None
+            }
+            Err(Refusal::Corrupt) | Ok(_) => None,
+            Err(reason) => Some(reason),
+        }
     }
 
     pub(crate) fn read(&mut self, key: &Digest32, allowlist: &Digest32) -> ReadOutcome {
@@ -543,16 +654,24 @@ impl DurableTailStore {
         self.check_writer(writer)?;
         let mut receipt = BatchReceipt::default();
         let mut dirty = Vec::new();
+        if !self.usable() {
+            return Ok(receipt);
+        }
         // The caller's bodies stay live for the whole batch.
         let pending_bytes = pending
             .iter()
             .map(|record| record.body.len())
             .sum::<usize>();
         for record in pending {
-            if let Err(reason) = self.classify(&record.binding.key, "overwrite") {
-                self.counters.store_write_skipped[usize::from(reason == Refusal::Corrupt)] += 1;
-                continue;
-            }
+            // A T14 predecessor is the rebuild's to replace.
+            let corrupt = match self.classify(&record.binding.key, "overwrite") {
+                Err(Refusal::Corrupt) => true,
+                Err(_) => {
+                    self.counters.store_write_skipped[0] += 1;
+                    continue;
+                }
+                Ok(_) => false,
+            };
             let content = content_digest(&record);
             if self
                 .durable
@@ -561,8 +680,11 @@ impl DurableTailStore {
             {
                 receipt.clean += 1;
             } else {
-                dirty.push((record, content));
+                dirty.push((record, content, corrupt));
             }
+        }
+        if !self.usable() {
+            return Ok(BatchReceipt::default());
         }
         if dirty.is_empty() {
             self.counters.records_clean += receipt.clean as u64;
@@ -571,7 +693,7 @@ impl DurableTailStore {
         ensure_private_dir(&self.dir)?;
         let (mut on_disk, mut unlisted) = self.scan_disk()?;
         let mut changed = false;
-        for (record, content) in dirty {
+        for (record, content, corrupt) in dirty {
             if receipt.written + receipt.budget_refused >= MAX_BATCH {
                 receipt.deferred += 1;
                 receipt.deferred_keys.push(record.binding.key);
@@ -594,7 +716,7 @@ impl DurableTailStore {
             if !on_disk.contains_key(&key)
                 && on_disk.len() as u64 + unlisted[0] > INVENTORY_BOUND as u64
             {
-                self.counters.store_write_skipped[2] += 1;
+                self.counters.store_write_skipped[1] += 1;
                 receipt.deferred_keys.push(key);
                 continue;
             }
@@ -616,8 +738,9 @@ impl DurableTailStore {
                 || (previous == 0 && on_disk.len() >= MAX_RECORDS)
             {
                 // A stale record for this key would bind to an older entry
-                // only; drop it so the refusal costs no disk.
-                if previous != 0 {
+                // only; drop it so the refusal costs no disk. A T14 record
+                // stays until a rebuild replaces it.
+                if previous != 0 && !corrupt {
                     remove_if_present(&path)?;
                     on_disk.remove(&key);
                     changed = true;
@@ -665,6 +788,9 @@ impl DurableTailStore {
         keep: &BTreeMap<Digest32, Option<Digest32>>,
     ) -> io::Result<()> {
         self.check_writer(writer)?;
+        if !self.usable() {
+            return Ok(());
+        }
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -743,6 +869,9 @@ impl DurableTailStore {
     /// The record keys on disk now, at most `INVENTORY_BOUND`: GC's caller
     /// looks up only these keys, never materializing the whole index.
     pub(crate) fn inventory(&self) -> io::Result<BTreeSet<Digest32>> {
+        if self.disabled.is_some() {
+            return Ok(BTreeSet::new());
+        }
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
@@ -774,6 +903,9 @@ impl DurableTailStore {
     ) -> io::Result<usize> {
         self.check_writer(writer)?;
         let mut removed = 0;
+        if !self.usable() {
+            return Ok(0);
+        }
         for key in keys {
             let path = self.record_path(key);
             if matches!(self.classify(key, "delete"), Ok(Some(_))) {
@@ -923,6 +1055,15 @@ impl Stamp {
         [m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()].hash(&mut hasher);
         Self(hasher.finish())
     }
+}
+
+fn our_uid() -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = test_hooks::uid() {
+        return uid;
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 fn dead_temp(name: &str) -> bool {
@@ -1214,6 +1355,15 @@ pub(crate) mod test_hooks {
     thread_local! {
         static BEFORE_RENAME: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static BEFORE_DIR_SYNC: RefCell<Option<DirHook>> = const { RefCell::new(None) };
+        static UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The uid the store treats as its own (a foreign owner without root).
+    pub(crate) fn set_uid(uid: Option<u32>) {
+        UID.with(|slot| slot.set(uid));
+    }
+    pub(super) fn uid() -> Option<u32> {
+        UID.with(std::cell::Cell::get)
     }
 
     pub(crate) fn set_before_rename(hook: Option<Hook>) {

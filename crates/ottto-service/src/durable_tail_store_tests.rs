@@ -806,7 +806,7 @@ fn gc_verifies_cold_records_and_preserves_corrupt_bodies() {
     ));
     store.gc(&lock, &context, &allowlist, &keep).unwrap();
     let last = store.counters();
-    assert!(damaged.exists(), "T14 remains held after a full read");
+    assert!(damaged.exists(), "T14 is kept until a rebuild replaces it");
     assert_eq!(last.gc_records_read - after.gc_records_read, 4);
     assert_eq!(last.disk_records, 4);
     for b in &bindings[1..] {
@@ -864,26 +864,213 @@ fn remove_keys_deletes_only_the_invalidated_records() {
     assert_eq!(store.remove_keys(&lock, &held).unwrap(), 0);
 }
 
+/// C1: owner-only mode faults on our own store are store-level and repaired
+/// in place (directory 0700, records 0600); nothing is rebuilt or held.
 #[test]
-fn a_record_readable_by_others_is_refused() {
+fn store_mode_faults_are_repaired_without_rebuilds() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let bindings = ["open", "closed"].map(|name| {
+        let mut b = binding("acct", "scope", ("fp", None));
+        b.key = key_digest(DurableSource::ClaudeCode, name);
+        b
+    });
     let mut store = scratch.store();
-    let b = binding("acct", "scope", ("fp", None));
     store
         .write_after_save(
             &lock,
             1,
-            vec![pending(b.clone(), certificate(&transcript), 1)],
+            bindings
+                .iter()
+                .map(|b| pending(b.clone(), certificate(&transcript), 1))
+                .collect(),
         )
         .unwrap();
-    let path = record_file(&store, &b.key);
-    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let paths = bindings.each_ref().map(|b| record_file(&store, &b.key));
+    let bytes = paths.each_ref().map(|path| fs::read(path).unwrap());
+    fs::set_permissions(&paths[0], fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&paths[1], fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(store.dir(), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cold = scratch.store();
+    for b in &bindings {
+        assert_eq!(cold.hold(&b.key), None);
+        found(cold.read(&b.key, &placeholder_allowlist()));
+    }
+    assert_eq!(mode(cold.dir()), 0o700);
+    for (path, bytes) in paths.iter().zip(&bytes) {
+        assert_eq!(mode(path), 0o600);
+        assert_eq!(&fs::read(path).unwrap(), bytes);
+    }
+    let counters = cold.counters();
+    assert_eq!(counters.mode_repaired, 3);
+    assert_eq!(counters.t14_rebuild, 0);
+    assert_eq!(counters.format_hold, [0; 5]);
+    assert_eq!(cold.disabled(), None);
+}
+
+/// Restores the store's own uid on drop.
+struct ForeignUid;
+impl ForeignUid {
+    fn set() -> Self {
+        // SAFETY: geteuid has no preconditions.
+        test_hooks::set_uid(Some(unsafe { libc::geteuid() }.wrapping_add(1)));
+        Self
+    }
+}
+impl Drop for ForeignUid {
+    fn drop(&mut self) {
+        test_hooks::set_uid(None);
+    }
+}
+
+/// C1: a store this process does not own is disabled for the process
+/// (memory-only, pre-#806): no hold, no rebuild, no restore, no mutation.
+#[test]
+fn foreign_owner_disables_the_store_without_rebuilds() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let bindings = ["valid", "corrupt", "newer"].map(|name| {
+        let mut b = binding("acct", "scope", ("fp", None));
+        b.key = key_digest(DurableSource::ClaudeCode, name);
+        b
+    });
+    let mut store = scratch.store();
+    store
+        .write_after_save(
+            &lock,
+            1,
+            bindings
+                .iter()
+                .map(|b| pending(b.clone(), certificate(&transcript), 1))
+                .collect(),
+        )
+        .unwrap();
+    let paths = bindings.each_ref().map(|b| record_file(&store, &b.key));
+    let mut corrupt = fs::read(&paths[1]).unwrap();
+    let end = corrupt.len() - 1;
+    corrupt[end] ^= 1;
+    put_record(&paths[1], &corrupt);
+    let mut newer = fs::read(&paths[2]).unwrap();
+    set_version(&mut newer, 2);
+    put_record(&paths[2], &newer);
+    let before = paths.each_ref().map(|path| fs::read(path).unwrap());
+    let _foreign = ForeignUid::set();
+    let mut cold = scratch.store();
+    for b in &bindings {
+        assert_eq!(cold.hold(&b.key), None);
+        assert_eq!(
+            cold.read(&b.key, &placeholder_allowlist()),
+            ReadOutcome::Missing
+        );
+    }
+    let receipt = cold
+        .write_after_save(
+            &lock,
+            2,
+            bindings
+                .iter()
+                .map(|b| pending(b.clone(), certificate(&transcript), 2))
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(receipt, BatchReceipt::default());
+    cold.gc(&lock, &[0; 32], &placeholder_allowlist(), &BTreeMap::new())
+        .unwrap();
     assert_eq!(
-        store.read(&b.key, &placeholder_allowlist()),
-        ReadOutcome::Refused(Refusal::Corrupt)
+        cold.remove_keys(&lock, &bindings.iter().map(|b| b.key).collect())
+            .unwrap(),
+        0
     );
+    assert!(cold.inventory().unwrap().is_empty());
+    cold.begin_pass();
+    assert_eq!(
+        cold.hold(&bindings[2].key),
+        None,
+        "disabled for the process"
+    );
+    assert_eq!(cold.disabled(), Some("foreign_owner"));
+    let counters = cold.counters();
+    assert_eq!((counters.t14_rebuild, counters.mode_repaired), (0, 0));
+    assert_eq!(counters.records_written, 0);
+    for (path, bytes) in paths.iter().zip(&before) {
+        assert_eq!(&fs::read(path).unwrap(), bytes);
+    }
+}
+
+/// C1: per-record T14 is one counted rebuild (Full, then the post-save
+/// overwrite; nothing deleted first). More than max(20, 2%) T14 records in
+/// one pass trip the breaker: no more rebuilds, the store is disabled.
+#[test]
+fn t14_rebuilds_are_counted_and_the_breaker_trips_past_twenty() {
+    for corrupt_count in [20_usize, 25] {
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let transcript = scratch.transcript("t.jsonl", b"{}\n");
+        let bindings = (0..100)
+            .map(|n| {
+                let mut b = binding("acct", "scope", ("fp", None));
+                b.key = key_digest(DurableSource::ClaudeCode, &format!("key-{n}"));
+                b
+            })
+            .collect::<Vec<_>>();
+        let mut store = scratch.store();
+        for chunk in bindings.chunks(MAX_BATCH) {
+            store
+                .write_after_save(
+                    &lock,
+                    1,
+                    chunk
+                        .iter()
+                        .map(|b| pending(b.clone(), certificate(&transcript), 1))
+                        .collect(),
+                )
+                .unwrap();
+        }
+        // Every fourth record is corrupt, interleaved with valid ones.
+        let corrupt = (0..corrupt_count).map(|n| n * 4).collect::<BTreeSet<_>>();
+        let mut kept = Vec::new();
+        for n in &corrupt {
+            let path = record_file(&store, &bindings[*n].key);
+            let mut bytes = fs::read(&path).unwrap();
+            let end = bytes.len() - 1;
+            bytes[end] ^= 1;
+            put_record(&path, &bytes);
+            kept.push((path, bytes));
+        }
+        let mut cold = scratch.store();
+        cold.begin_pass();
+        for b in &bindings {
+            assert_eq!(cold.hold(&b.key), None, "T14 and valid records never hold");
+        }
+        // A repeat in the same pass (the restore seam's re-check) counts once.
+        assert_eq!(cold.hold(&bindings[0].key), None);
+        let tripped = corrupt_count > 20;
+        assert_eq!(cold.counters().t14_rebuild, 20);
+        assert_eq!(cold.disabled(), tripped.then_some("t14_breaker"));
+        for (path, bytes) in &kept {
+            assert_eq!(&fs::read(path).unwrap(), bytes, "nothing deleted first");
+        }
+        // The save after the Full reads: the rebuild overwrites each T14.
+        let rebuild = corrupt
+            .iter()
+            .map(|n| pending(bindings[*n].clone(), certificate(&transcript), 2))
+            .collect::<Vec<_>>();
+        let receipt = cold.write_after_save(&lock, 2, rebuild).unwrap();
+        assert_eq!(receipt.written, if tripped { 0 } else { 20 });
+        for n in &corrupt {
+            let outcome = scratch
+                .store()
+                .read(&bindings[*n].key, &placeholder_allowlist());
+            if tripped {
+                assert_eq!(outcome, ReadOutcome::Refused(Refusal::Corrupt));
+            } else {
+                assert_eq!(found(outcome).index_generation, 2);
+            }
+        }
+    }
 }
 
 fn admits(path: &Path, certificate: &DurableCertificate) -> Result<DurableAdmission, FullReason> {
@@ -1169,6 +1356,8 @@ fn store_budget_receipt() {
 }
 
 /// K21/L20/L24: every seam starts with an empty memo, without a preceding read.
+/// U is preserved and held. T14 (C1) is preserved by every seam except the
+/// rebuild's own overwrite, and is never held: one counted rebuild instead.
 #[test]
 fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
     for kind in [
@@ -1183,7 +1372,6 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
         "debt_tag",
         "unbindable",
         "undecodable",
-        "mode",
         "oversized_newer",
     ] {
         for seam in [
@@ -1247,7 +1435,6 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                     set_version(&mut bytes, 1);
                     Refusal::Corrupt
                 }
-                "mode" => Refusal::Corrupt,
                 _ => {
                     let end = bytes.len() - 1;
                     bytes[end] ^= 1;
@@ -1255,9 +1442,8 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                 }
             };
             put_record(&path, &bytes);
-            if kind == "mode" {
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-            }
+            let t14 = reason == Refusal::Corrupt;
+            let rebuilt = t14 && seam == "overwrite";
             let mut cold = scratch.store();
             match seam {
                 "read" => assert_eq!(
@@ -1279,7 +1465,7 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                         replacement.body.resize(RECORD_BYTES, 0);
                     }
                     let receipt = cold.write_after_save(&lock, 2, vec![replacement]).unwrap();
-                    assert_eq!(receipt.written, 0);
+                    assert_eq!(receipt.written, usize::from(rebuilt), "{kind} x {seam}");
                 }
                 _ => {
                     assert_eq!(
@@ -1288,12 +1474,23 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                     );
                 }
             }
-            assert_eq!(fs::read(&path).unwrap(), bytes, "{kind} x {seam}");
-            assert_eq!(cold.hold(&b.key), Some(reason), "{kind} x {seam}");
             assert!(cold.counters().format_hold[reason as usize] > 0);
+            if rebuilt {
+                let record = found(scratch.store().read(&b.key, &placeholder_allowlist()));
+                assert_eq!(record.index_generation, 2, "{kind} rebuilt");
+                continue;
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{kind} x {seam}");
+            let held = (!t14).then_some(reason);
+            assert_eq!(cold.hold(&b.key), held, "{kind} x {seam}");
+            assert_eq!(
+                cold.counters().t14_rebuild,
+                u64::from(t14),
+                "{kind} x {seam}"
+            );
             assert_eq!(
                 scratch.store().hold(&b.key),
-                Some(reason),
+                held,
                 "restart {kind} x {seam}"
             );
         }
@@ -1325,7 +1522,9 @@ fn exact_predecessor_memo_reuses_verification_and_invalidates_on_change() {
     let end = bytes.len() - 1;
     bytes[end] ^= 1;
     put_record(&path, &bytes);
-    assert_eq!(cold.hold(&b.key), Some(Refusal::Corrupt));
+    // T14 is not held: one counted rebuild.
+    assert_eq!(cold.hold(&b.key), None);
+    assert_eq!(cold.counters().t14_rebuild, 1);
     assert!(cold.counters().guard_verify_bytes > verified);
 }
 
@@ -1354,14 +1553,14 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
     symlink(&transcript, &link).unwrap();
     let directory = store.dir().join(format!("{}.rec", hex(&[2; 32])));
     fs::create_dir(&directory).unwrap();
+    // A group-readable U record: header dispatch precedes the mode repair.
     let unsafe_path = store.dir().join(format!("{}.rec", hex(&[3; 32])));
-    put_record(
-        &unsafe_path,
-        &encode(&DurableRecord {
-            record: base,
-            index_generation: 1,
-        }),
-    );
+    let mut unsafe_bytes = encode(&DurableRecord {
+        record: base,
+        index_generation: 1,
+    });
+    set_version(&mut unsafe_bytes, 2);
+    put_record(&unsafe_path, &unsafe_bytes);
     fs::set_permissions(&unsafe_path, fs::Permissions::from_mode(0o644)).unwrap();
     // pid 1 is always alive and never this writer.
     let live = store.dir().join(format!(".{}.rec.1.tmp", hex(&b.key)));
@@ -1447,7 +1646,7 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
     assert_eq!(receipt.budget_refused, 0);
     assert_eq!(receipt.deferred_keys, vec![new.key]);
     let counters = store.counters();
-    assert_eq!(counters.store_write_skipped, [0, 0, 1]);
+    assert_eq!(counters.store_write_skipped, [0, 1]);
     assert_eq!(counters.disk_records, INVENTORY_BOUND as u64 + 1);
     assert!(!record_file(&store, &new.key).exists());
     let record = found(scratch.store().read(&b.key, &placeholder_allowlist()));

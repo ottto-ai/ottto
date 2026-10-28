@@ -2298,9 +2298,12 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
     );
 }
 
+/// C3: a Held original keeps its census (and the copy's proof) while its
+/// committed entry is unchanged, even when the file itself grew; a changed
+/// committed entry, another physical object or an unknown birth invalidates.
 #[cfg(unix)]
 #[test]
-fn held_original_keeps_dependent_copy_proof_only_for_unchanged_stamp() {
+fn held_original_keeps_dependent_copy_proof_only_while_committed_entry_unchanged() {
     use std::os::unix::fs::MetadataExt;
     let scratch = crate::test_scratch::ScratchDir::new("held-census-copy");
     let root = scratch.join("projects");
@@ -2352,23 +2355,53 @@ fn held_original_keeps_dependent_copy_proof_only_for_unchanged_stamp() {
     .unwrap();
     candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);
     candidate.source_file_fingerprint = record.fingerprint_hex_for_test();
-    assert!(claude_request_census::retain_held(&mut index, &candidate));
-    assert_eq!(index.claude_request_census.get(&original), Some(&record));
     assert_eq!(
-        claude_census_member_status(&index, &copy, &scan.census_window_end, true),
-        ClaudeCensusMemberStatus::SharesHash
+        index.files[&original].source_file_fingerprint,
+        record.fingerprint_hex_for_test(),
+        "the committed entry is the recorded version"
     );
+    for grown in [
+        "unchanged",
+        "file_fingerprint",
+        "file_mtime",
+        "entry_cleared",
+    ] {
+        let mut kept = index.clone();
+        let mut file = candidate.clone();
+        match grown {
+            "file_fingerprint" => file.source_file_fingerprint = "a".repeat(64),
+            "file_mtime" => file.modified_unix_seconds += 1,
+            "entry_cleared" => kept
+                .files
+                .get_mut(&original)
+                .unwrap()
+                .source_file_fingerprint
+                .clear(),
+            _ => {}
+        }
+        assert!(
+            claude_request_census::retain_held(&mut kept, &file),
+            "{grown}"
+        );
+        assert_eq!(kept.claude_request_census.get(&original), Some(&record));
+        assert_eq!(
+            claude_census_member_status(&kept, &copy, &scan.census_window_end, true),
+            ClaudeCensusMemberStatus::SharesHash,
+            "{grown}"
+        );
+    }
     for change in [
-        "size_or_fingerprint",
-        "mtime",
+        "entry_fingerprint",
+        "entry_modified",
         "replaced_inode",
         "unknown_birth",
     ] {
         let mut control = index.clone();
         let mut changed = candidate.clone();
+        let entry = control.files.get_mut(&original).unwrap();
         match change {
-            "size_or_fingerprint" => changed.source_file_fingerprint = "a".repeat(64),
-            "mtime" => changed.modified_unix_seconds += 1,
+            "entry_fingerprint" => entry.source_file_fingerprint = "a".repeat(64),
+            "entry_modified" => entry.modified_unix_seconds += 1,
             "replaced_inode" => {
                 changed.physical_identity = Some([metadata.dev(), metadata.ino().wrapping_add(1)])
             }
@@ -2402,11 +2435,13 @@ fn held_original_keeps_dependent_copy_proof_only_for_unchanged_stamp() {
 /// witnesses and money equal the cold arm's (original read Full), and the
 /// original's census record and last accepted body stay; a cold re-read of
 /// the unchanged original emits nothing new either, so emitted money is
-/// conserved. Changed-stamp control: the same hold invalidates the record
-/// (birth stub) and the copy loses its proof.
+/// conserved. C3: the original then GROWS while held (its committed entry is
+/// unchanged): the record, the copy's proof and the copy's emitted body stay
+/// the same. Committed-entry-changed control: the same hold invalidates the
+/// record (birth stub) and the copy loses its proof.
 #[cfg(unix)]
 #[test]
-fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidates() {
+fn held_original_production_exit_conserves_copy_money_while_committed_entry_unchanged() {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let scratch = crate::test_scratch::ScratchDir::new("held-census-production");
     let root = scratch.join("projects");
@@ -2482,7 +2517,7 @@ fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidat
             .collect::<Vec<_>>()
     };
     let mut cold = None;
-    for arm in ["cold", "held", "changed_stamp"] {
+    for arm in ["cold", "held", "held_grown", "entry_changed"] {
         let state = scratch.join(arm);
         let index_path = state.join("index.json");
         let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
@@ -2518,7 +2553,29 @@ fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidat
             )
             .unwrap();
         }
-        if arm == "changed_stamp" {
+        if arm == "held_grown" {
+            // The file grows in place (same object); the server still has
+            // the committed version.
+            census_write(
+                &root,
+                "held-original.jsonl",
+                &[
+                    census_response(
+                        "held-original",
+                        Some("req_held_shared"),
+                        "msg_held_shared",
+                        1,
+                        100,
+                    ),
+                    census_response(
+                        "held-original",
+                        Some("req_original_new"),
+                        "msg_original_new",
+                        3,
+                        70,
+                    ),
+                ],
+            );
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&original)
@@ -2526,6 +2583,13 @@ fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidat
             let modified = file.metadata().unwrap().modified().unwrap();
             file.set_modified(modified + std::time::Duration::from_secs(5))
                 .unwrap();
+        }
+        if arm == "entry_changed" {
+            index
+                .files
+                .get_mut(&original)
+                .unwrap()
+                .modified_unix_seconds += 5;
         }
         let mut scan = OwnedSourceScan::new(
             SnapshotSource::ClaudeCode,
@@ -2569,7 +2633,7 @@ fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidat
                 assert!(!session(&emitted, "dependent-copy").is_empty());
                 cold = Some((session(&emitted, "dependent-copy"), copy_entry(&index)));
             }
-            "held" => {
+            "held" | "held_grown" => {
                 assert_eq!(counts.durable_held.iter().sum::<u64>(), 1);
                 assert!(session(&emitted, "held-original").is_empty(), "no POST");
                 assert_eq!(accepted(&index), last_accepted, "last accepted body kept");
@@ -2582,8 +2646,8 @@ fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidat
                     assert_eq!(session(&emitted, "dependent-copy"), copy_body);
                     assert_eq!(copy_entry(&index), copy_witness);
                 } else {
-                    // No opened birth on this filesystem: the stamp cannot be
-                    // proven unchanged, so the existing invalidator runs.
+                    // No opened birth on this filesystem: the object cannot be
+                    // proven the same, so the existing invalidator runs.
                     assert_eq!(counts.held_census, [0, 1]);
                 }
             }

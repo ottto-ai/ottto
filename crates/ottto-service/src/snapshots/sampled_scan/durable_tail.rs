@@ -111,7 +111,7 @@ impl Counters {
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
-             uninventoried_records={} store_write_skipped[unknown,known_corrupt,inventory_overflow]={:?} \
+             uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={}",
             source.api_slug(),
@@ -166,6 +166,10 @@ struct Slot {
     /// The pass's sampled scope and identity-capture mode.
     namespace: Scope,
     identity_capture: bool,
+    /// Keys held (U) by this source, and the totals the last alarm reported:
+    /// [held, t14_rebuild, mode_repaired, disabled].
+    held: u64,
+    reported: [u64; 4],
 }
 
 /// Process-lifetime durable state beside the RAM cache.
@@ -375,6 +379,7 @@ impl SharedCache {
         let slot = stores.slot(source);
         if let Some(current) = slot.as_mut().filter(|current| current.dir == dir) {
             current.decided.clear();
+            current.store.begin_pass();
             current.namespace = namespace.clone();
             current.identity_capture = identity_capture;
         } else {
@@ -384,6 +389,8 @@ impl SharedCache {
                 decided: BTreeMap::new(),
                 namespace: namespace.clone(),
                 identity_capture,
+                held: 0,
+                reported: [0; 4],
             });
         }
     }
@@ -415,6 +422,11 @@ impl SharedCache {
             stores.counters.durable_held[reason as usize] += 1;
             if source == SnapshotSource::ClaudeCode {
                 stores.counters.held_census[usize::from(!kept)] += 1;
+            }
+            if let Some(durable) = durable_source(source) {
+                if let Some(slot) = stores.slot(durable).as_mut() {
+                    slot.held += 1;
+                }
             }
         }
         census.record_unreadable(UnreadableCause::Reduction, 1);
@@ -857,6 +869,51 @@ impl SharedCache {
             stores.touched.clear();
             stores.selected.clear();
             stores.counters.write_unlocked += 1;
+        }
+    }
+
+    /// Local alarm on the `local_resources` carrier (#799), counts only: this
+    /// source's held keys, T14 rebuilds and mode repairs since the last
+    /// report (with totals), and once, the cause that disabled the store.
+    /// A held key keeps the source's census retryable for the whole hold.
+    pub(crate) fn durable_alarm(&self, snapshot_source: SnapshotSource) {
+        #[derive(serde::Serialize)]
+        struct Alarm {
+            held_keys: [u64; 2],
+            t14_rebuild: [u64; 2],
+            mode_repaired: [u64; 2],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            store_disabled: Option<&'static str>,
+        }
+        let Some(source) = durable_source(snapshot_source) else {
+            return;
+        };
+        let Some(mut stores) = self.durable() else {
+            return;
+        };
+        let Some(slot) = stores.slot(source).as_mut() else {
+            return;
+        };
+        let (store, disabled) = (slot.store.counters(), slot.store.disabled());
+        let now = [
+            slot.held,
+            store.t14_rebuild,
+            store.mode_repaired,
+            u64::from(disabled.is_some()),
+        ];
+        let last = std::mem::replace(&mut slot.reported, now);
+        drop(stores);
+        if now != last {
+            let pair = |n: usize| [now[n].saturating_sub(last[n]), now[n]];
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                snapshot_source.api_slug(),
+                &Alarm {
+                    held_keys: pair(0),
+                    t14_rebuild: pair(1),
+                    mode_repaired: pair(2),
+                    store_disabled: disabled.filter(|_| last[3] == 0),
+                },
+            );
         }
     }
 
