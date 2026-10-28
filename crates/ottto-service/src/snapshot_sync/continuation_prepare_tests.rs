@@ -232,7 +232,7 @@ impl ContinuationFixture {
         let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
         self.ordinary_side_pass(&cache, true);
         let mut minted = self.preparation(true);
-        let mut inputs = take_continuation_inputs(&mut minted);
+        let mut inputs = take_continuation_inputs(&mut minted, &ScanIndex::default());
         let before = self.disk();
         assert_eq!(self.prepare_on(&cache, &mut inputs).err(), Some(refusal));
         assert_eq!(self.disk(), before, "no save, no claim, no reset");
@@ -249,7 +249,7 @@ pub(super) fn continuation_inputs_for_test(
 ) -> (ContinuationInputs, std::sync::Arc<AgentStatusCollection>) {
     let fixture = ContinuationFixture::quiescent("continuation-inputs-for-test");
     let mut preparation = fixture.preparation(attribution);
-    let inputs = take_continuation_inputs(&mut preparation);
+    let inputs = take_continuation_inputs(&mut preparation, &ScanIndex::default());
     let sentinel = std::sync::Arc::clone(&preparation.scan_agent_status_collection);
     drop(preparation);
     (inputs, sentinel)
@@ -264,7 +264,7 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
         .activity_hint
         .session_attribution_hmac_key
         .is_some());
-    let inputs = take_continuation_inputs(&mut preparation);
+    let inputs = take_continuation_inputs(&mut preparation, &ScanIndex::default());
     assert!(
         preparation.attribution_context.is_none(),
         "moved out, not copied"
@@ -292,7 +292,7 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
 fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     let fixture = ContinuationFixture::quiescent("continuation-prepare-parity");
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(&mut minted, &ScanIndex::default());
     let before = fixture.disk();
     let prepared = fixture
         .prepare(&mut inputs)
@@ -411,7 +411,7 @@ fn a_pending_historical_replay_refuses_the_continuation_prepare() {
     )
     .unwrap();
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(&mut minted, &ScanIndex::default());
     let before = fixture.disk();
     assert_eq!(
         fixture.prepare(&mut inputs).err(),
@@ -491,7 +491,7 @@ fn the_continuation_scope_is_the_ordinary_codex_scope() {
 fn no_continuation_output_serializes_the_attribution_key() {
     let fixture = ContinuationFixture::quiescent("continuation-no-key-output");
     let mut minted = fixture.preparation(true);
-    let mut inputs = take_continuation_inputs(&mut minted);
+    let mut inputs = take_continuation_inputs(&mut minted, &ScanIndex::default());
     let prepared = fixture
         .prepare(&mut inputs)
         .unwrap_or_else(|refusal| panic!("refused: {}", refusal.label()));
@@ -673,7 +673,7 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
         let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
         assert!(fixture.ordinary_side_pass(&cache, ordinary_saved));
         let mut minted = fixture.preparation(true);
-        let mut inputs = take_continuation_inputs(&mut minted);
+        let mut inputs = take_continuation_inputs(&mut minted, &ScanIndex::default());
         let before = fixture.disk();
         let prepared = fixture
             .prepare_on(&cache, &mut inputs)
@@ -686,4 +686,50 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
             "the next ordinary pass"
         );
     }
+}
+
+#[test]
+fn continuation_archive_cpu_survives_the_production_disk_reload() {
+    let fixture = ContinuationFixture::quiescent("continuation-archive-cpu");
+    let mut minted = fixture.preparation(false);
+    let (_, mut index) = fixture.load();
+    index.archive_pass.power = true;
+    index.archive_pass.started = true;
+    index.archive_pass.observe(Some(30_000_001), 1);
+    index.save(&fixture.index_path).unwrap();
+    assert_eq!(
+        fixture.load().1.archive_pass.cpu,
+        0,
+        "disk has no scheduling authority"
+    );
+    let mut inputs = take_continuation_inputs(&mut minted, &index);
+    let before = fixture.disk();
+    let prepared = fixture.prepare(&mut inputs).unwrap();
+    let restored = prepared.scan.as_ref().unwrap().native_comparison_inputs().0;
+    assert_eq!(restored.archive_pass.cpu, 30_000_001);
+    assert!(!restored.archive_pass.ready(u64::MAX));
+    assert_eq!(prepared.committed_index.archive_pass.cpu, 30_000_001);
+    drop(prepared);
+    let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
+    let outcome = run_continuation_scan(
+        &fixture.home,
+        &fixture.support_dir,
+        &cache,
+        &mut inputs,
+        &BTreeSet::new(),
+        Some(Duration::from_secs(300)),
+        Instant::now() + Duration::from_secs(20),
+    )
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        ContinuationScan::Uncommitted { .. } | ContinuationScan::Committed(_)
+    ));
+    assert!(inputs.archive_pass.cpu >= 30_000_001);
+    assert!(!inputs.archive_pass.ready(u64::MAX));
+    assert_eq!(
+        fixture.disk(),
+        before,
+        "pacing carry does not save a new record"
+    );
 }

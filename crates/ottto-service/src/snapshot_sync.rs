@@ -4658,7 +4658,9 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                     continuation::ticket_lifetime(self.codex_started),
                 )
                 // K2: moved out only when a ticket was minted.
-                .map(|ticket| ticket.with_inputs(take_continuation_inputs(&mut completed.0)))
+                .map(|ticket| {
+                    ticket.with_inputs(take_continuation_inputs(&mut completed.0, &completed.1))
+                })
             });
         let finished = crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
             self.finish_completed(completed)
@@ -6420,6 +6422,7 @@ fn prepare_sync_source_inner(
 /// every other end. Charged as process-retained memory
 /// (`continuation::retained_bound`).
 struct ContinuationInputs {
+    archive_pass: crate::snapshots::codex_archive_catchup::Pass,
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
@@ -6434,7 +6437,7 @@ struct ContinuationInputs {
     upload_progress_path: PathBuf,
 }
 
-crate::heap_layout_bound::fields!(ContinuationInputs; account_witness, activity_hint,
+crate::heap_layout_bound::fields!(ContinuationInputs; archive_pass, account_witness, activity_hint,
     receipt_window_days, context_curve_enabled, cache_observations_enabled,
     scan_agent_status_collection, attribution_context, upload_policy,
     upload_destination_namespace, receipt_client, index_path, upload_progress_path);
@@ -6452,13 +6455,17 @@ impl ContinuationInputs {
 /// page, taken before its finish. `finish_sync_source` never reads the
 /// attribution context, so moving it out changes nothing for the finish.
 /// Called only while continuation pages are enabled and a ticket was minted.
-fn take_continuation_inputs(preparation: &mut SourcePreparation) -> ContinuationInputs {
+fn take_continuation_inputs(
+    preparation: &mut SourcePreparation,
+    index: &ScanIndex,
+) -> ContinuationInputs {
     let mut activity_hint = preparation.activity_hint.clone();
     // The prepare took the raw key out of its hint already; never keep one.
     if let Some(mut key) = activity_hint.session_attribution_hmac_key.take() {
         key.zeroize();
     }
     ContinuationInputs {
+        archive_pass: index.archive_pass.clone(),
         account_witness: preparation.account_witness,
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
@@ -6568,6 +6575,7 @@ fn run_continuation_scan(
         match preparation.step() {
             SourcePreparationStep::Pending(next) => preparation = next,
             SourcePreparationStep::Refused(mut refused, _) => {
+                inputs.archive_pass.cpu = u64::MAX; // Lost step accounting cannot grant a new budget.
                 inputs.attribution_context = refused.attribution_context.take();
                 return Ok(ContinuationScan::StepRefused);
             }
@@ -6576,6 +6584,7 @@ fn run_continuation_scan(
                 index,
                 scan,
             } => {
+                inputs.archive_pass = index.archive_pass.clone();
                 if scan.continuation_committed() {
                     return Ok(ContinuationScan::Committed(Box::new((
                         preparation,
@@ -6620,6 +6629,7 @@ fn prepare_continuation_source(
     )?;
     let (mut index, _) =
         ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
+    index.archive_pass = inputs.archive_pass.clone();
     upload_progress.recover_ack_retirement_handoff(
         &mut index,
         &inputs.index_path,

@@ -7,7 +7,9 @@ walk entry points.
 
 The existing index carries RAM-only CPU and contention state from an ordinary
 page through its continuations and partial commits. The next ordinary pass
-resets that scheduling state. Unknown power denies acquisition; the temporary
+resets that scheduling state. Same-cycle continuation inputs carry it across
+the native adapter's disk reload; a refused step exhausts further CPU credit.
+Unknown power denies acquisition; the temporary
 platform adapter does not detect AC power. Native power/continuation integration
 remains required before discovery can admit archives.
 

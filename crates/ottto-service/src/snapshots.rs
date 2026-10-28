@@ -66,7 +66,7 @@ mod oversized_discovery;
 pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
 pub(crate) use tests::output as claude_request_account_output;
-mod codex_archive_catchup;
+pub(crate) mod codex_archive_catchup;
 mod codex_compressed_input;
 #[cfg(test)]
 mod codex_zst_refusal_tests;
@@ -3341,7 +3341,7 @@ pub struct ScanIndex {
     decode_holds: lenient_decode::Holds,
     /// RAM-only pacing spans ordinary + continuation pages, never durable authority.
     #[serde(skip)]
-    archive_pass: codex_archive_catchup::Pass,
+    pub(crate) archive_pass: codex_archive_catchup::Pass,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
