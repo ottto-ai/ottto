@@ -916,6 +916,7 @@ mod durable_restart {
             SOURCE,
             &mut run.result,
             &mut run.index,
+            true,
             snapshot_upload_body_witness,
         );
         let entity = format!(
