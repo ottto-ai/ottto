@@ -234,6 +234,128 @@ fn open_stamp_delegation_matches_the_replaced_inline_predicate() {
         assert_eq!(base.append_compatible(&now), expected, "{case}");
         assert_eq!(inline, expected, "{case}: replaced inline predicate");
     }
+    // E1 S3: a ctime-only change is the same content, which the replaced
+    // inline predicate refused.
+    let ctime_only = OpenStamp {
+        changed: (5, 6),
+        ..base.clone()
+    };
+    assert_ne!(ctime_only, base, "structural equality keeps ctime");
+    assert!(base.same_content(&ctime_only));
+    assert!(base.append_compatible(&ctime_only), "ctime only");
+}
+
+/// Chmod `path` until its ctime moves (bounded retries absorb a coarse
+/// filesystem clock), asserting each time that object, extent and mtime are
+/// untouched: it returns only once exactly the ctime changed.
+fn metadata_only_chmod(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let before = OpenStamp::of_path(path).unwrap();
+    for _ in 0..2000 {
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+        let after = OpenStamp::of_path(path).unwrap();
+        assert!(after.same_content(&before), "chmod kept the content");
+        if after.changed != before.changed {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("chmod never moved ctime");
+}
+
+/// E1 S3: "only grew" (`grew_past_exact`) needs a real extent increase: a
+/// ctime-only or a moved-mtime change at equal extent is never counted as
+/// growth past an exact memo entry; an append is. The memo and parked wakes
+/// keep their full-stamp rule (`wake_compatible`): they compare stamps
+/// `retained_stamp` qualified, where a ctime-only change with matching
+/// content inputs and birth already carries the stored ctime
+/// (`retained_held_singleton_ignores_ctime_but_wakes_on_content_birth_and_inode`),
+/// so a live, unqualified ctime-only stamp still wakes them.
+#[test]
+fn grew_past_exact_needs_growth_and_wakes_keep_the_qualified_stamp() {
+    let temp = Temp::new("s3-exact", b"{\"n\":1}\n{\"n\":2}\n");
+    let file = File::open(&temp.0).unwrap();
+    let opened = OpenStamp::capture(&file).unwrap();
+    let entry = |exact: bool| {
+        MemoEntry::new(
+            "digest".into(),
+            LiveWitness::read(&file, 8).unwrap(),
+            opened.clone(),
+            None,
+            None,
+            disclosure(),
+        )
+        .growth_may_cure(exact)
+    };
+    let cache = SharedCache::default();
+    let park_with = |exact: bool| {
+        cache.with_cursor(|cursor| {
+            park(
+                cursor,
+                "key".into(),
+                Parked {
+                    stamp: opened.clone(),
+                    dependencies: None,
+                    disclosure: strict(DebtReason::ProbeBudgetOrder),
+                    used: 0,
+                    exact,
+                },
+            )
+        });
+    };
+    metadata_only_chmod(&temp.0);
+    let chmodded = OpenStamp::capture(&file).unwrap();
+    assert!(chmodded != opened && chmodded.same_content(&opened));
+    assert_eq!(
+        entry(true).grew_past_exact("digest", &file, None, ""),
+        None,
+        "a ctime-only change never only grew"
+    );
+    for exact in [true, false] {
+        assert!(
+            entry(exact).matches("digest", &file, None, "").is_none(),
+            "memo, exact={exact}: unqualified live ctime"
+        );
+        park_with(exact);
+        assert!(
+            cache.cursor_parked("key", &file, None).is_none(),
+            "parked, exact={exact}: unqualified live ctime"
+        );
+    }
+    // The qualified stamp (stored ctime) is the unchanged one: a hit.
+    let qualified = OpenStamp {
+        changed: opened.changed,
+        ..chmodded.clone()
+    };
+    for exact in [true, false] {
+        assert!(entry(exact)
+            .matches_stamp("digest", &file, None, "", qualified.clone())
+            .is_some());
+        park_with(exact);
+        assert!(cache
+            .cursor_parked_stamp("key", Some(qualified.clone()), None)
+            .is_some());
+    }
+
+    // A moved mtime at equal extent did not grow.
+    File::options()
+        .write(true)
+        .open(&temp.0)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH)
+        .unwrap();
+    assert_eq!(entry(true).grew_past_exact("digest", &file, None, ""), None);
+
+    // Growth: an exact entry misses and reports the grown extent; a
+    // non-exact one still hits.
+    temp.append(b"{\"n\":3}\n");
+    assert!(entry(true).matches("digest", &file, None, "").is_none());
+    assert_eq!(
+        entry(true).grew_past_exact("digest", &file, None, ""),
+        Some(24)
+    );
+    assert!(entry(false).matches("digest", &file, None, "").is_some());
 }
 
 fn reader_input() -> (Vec<u8>, u64, u64) {

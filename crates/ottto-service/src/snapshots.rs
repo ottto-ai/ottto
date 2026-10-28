@@ -2959,7 +2959,7 @@ pub(in crate::snapshots) struct CodexParentSide {
     /// `Checkpoint::seal_as(commit_now, &codex_parent_side_scope())` of the
     /// certified checkpoint the verdict was parsed from.
     pub(in crate::snapshots) seal: crate::transcript_acquisition::PrefixSeal,
-    /// The unnormalized stamp the verdict parsed (`append_compatible`).
+    /// The unnormalized stamp the verdict parsed (`wake_compatible`).
     pub(in crate::snapshots) parsed: sampled_scan::codex_cursor::OpenStamp,
     /// A removed request's pacing, kept for a re-request of this object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -22730,7 +22730,7 @@ impl CodexParentPrefixProof {
     }
 }
 
-/// U1a: the stamp a wake compares with `OpenStamp::append_compatible`.
+/// U1a: the stamp a wake compares with `OpenStamp::wake_compatible`.
 #[allow(dead_code)] // first production callers are the proof job and finish
 pub(in crate::snapshots) type WakeStamp = sampled_scan::codex_cursor::OpenStamp;
 
@@ -24104,7 +24104,7 @@ fn release_departed_join_owners(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum SideFence {
     /// P's same-object, settled record covers `needed` and its seal admits
-    /// (`admits(.., &side scope, now, false)` ∧ `append_compatible`).
+    /// (`admits(.., &side scope, now, false)` ∧ `wake_compatible`).
     Admitted,
     /// P is over main's Codex cap: no side record is kept for it.
     FileCapHeld,
@@ -24175,7 +24175,7 @@ impl ScanIndex {
     /// a replace ends the old key's ledger generation); with no record the
     /// paced request path; a held record; step 5 (coverage); step 6, the one
     /// admission (`seal.admits(.., &side scope, now, false)` ∧
-    /// `parsed.append_compatible`), and the refusal routing table. Every
+    /// `parsed.wake_compatible`), and the refusal routing table. Every
     /// index write of the request is mirrored into an existing ledger entry
     /// for the key in the same step (only G7 creates entries).
     ///
@@ -24301,7 +24301,7 @@ impl ScanIndex {
             .and_then(|_| {
                 let now_stamp = sampled_scan::codex_cursor::OpenStamp::capture(file)
                     .map_err(|_| FullReason::Replaced)?;
-                if parsed.append_compatible(&now_stamp) {
+                if parsed.wake_compatible(&now_stamp) {
                     Ok(())
                 } else {
                     // Equal length to what was parsed, but changed: Q-U28.
@@ -24507,7 +24507,7 @@ pub(in crate::snapshots) struct SideMainParse {
     /// checkpoint.
     pub(in crate::snapshots) seal: crate::transcript_acquisition::PrefixSeal,
     /// The held FD's stamp, captured at or after the commit (never shorter
-    /// than what was parsed, so `append_compatible` can only refuse more).
+    /// than what was parsed, so `wake_compatible` can only refuse more).
     pub(in crate::snapshots) parsed: sampled_scan::codex_cursor::OpenStamp,
     pub(in crate::snapshots) verdict: SideVerdict,
     /// Applied bytes past the sealed offset: a singleton's
