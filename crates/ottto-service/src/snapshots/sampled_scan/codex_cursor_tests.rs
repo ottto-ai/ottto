@@ -13564,3 +13564,201 @@ fn compressed_memo_rechecks_refuse_decoded_offsets() {
             .is_none());
     });
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let primary = ScanRoot::new(40);
+        let peer = ScanRoot::new(40);
+        let cache = Arc::new(SharedCache::default());
+        let key = local_index_key(&primary.file(SESSION));
+        let peer_key = local_index_key(&peer.file(SESSION));
+        let mut index = ScanIndex::default();
+        for fixture in [&primary, &peer] {
+            let mut warm = ScanIndex::default();
+            for _ in 0..64 {
+                let (next, _) = page(fixture, warm, Some(Arc::clone(&cache)));
+                warm = next;
+                if cache
+                    .retained_checkpoint(&local_index_key(&fixture.file(SESSION)))
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            if std::ptr::eq(fixture, &primary) {
+                index = warm;
+            }
+        }
+        assert!(cache.retained_checkpoint(&key).is_some());
+        assert!(cache.retained_checkpoint(&peer_key).is_some());
+        let bytes = zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap();
+        let archive = Temp::new("decoder-floor", &bytes);
+        let credit = codex_compressed_input::compressed_input_credit().unwrap();
+        let floor = ENTRY_BYTES + super::super::side_ledger::SIDE_LEDGER_BYTES;
+        let budget = cache.cursor_resident()
+            + retained_floor(&cache)
+            + credit
+            + floor
+            + super::super::side_ledger::SIDE_LEDGER_BYTES;
+        with_test_state_budget(budget - 1, || {
+            assert!(OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                .unwrap()
+                .is_none());
+            assert_eq!(cache.cursor_reserved(), 0);
+        });
+        with_test_state_budget(budget, || {
+            let mut input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                .unwrap()
+                .unwrap();
+            input.read_exact(&mut [0; 1]).unwrap();
+            primary.append(SESSION, &token_line(41));
+            index.traversal = None;
+            let (_, scan, modes) =
+                page_in(&primary, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            assert_eq!(
+                modes,
+                (0, 1),
+                "a real primary Tail progresses during the decode"
+            );
+            assert_eq!(scan.snapshots.len(), 1);
+            assert!(
+                cache.retained_checkpoint(&peer_key).is_some(),
+                "decoder causes no extra eviction"
+            );
+            assert!(cache.retained_checkpoint(&key).is_some());
+            assert_eq!(cache.cursor_reserved(), credit);
+            input.close();
+        });
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_release_and_unwind_follow_the_production_stores_guard() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for unwind in [false, true] {
+        let cache = Arc::new(SharedCache::default());
+        let f = Temp::new(
+            "stores-owner",
+            &zstd::stream::encode_all(&b"synthetic"[..], 1).unwrap(),
+        );
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            let mut input = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+                .unwrap()
+                .unwrap();
+            input.read_exact(&mut [0; 1]).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let stores = cache.durable().unwrap();
+                assert!(super::super::durable_tail::stores_held());
+                if unwind {
+                    panic!("synthetic durable operation failure");
+                }
+                drop(stores);
+            }));
+            assert_eq!(result.is_err(), unwind);
+            assert!(!super::super::durable_tail::stores_held());
+            input.close();
+        });
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_owner"));
+    }
+    #[cfg(debug_assertions)]
+    {
+        let cache = Arc::new(SharedCache::default());
+        let guard = cache.durable().unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| DecoderOwner::acquire(
+                &cache, 1
+            )))
+            .is_err()
+        );
+        drop(guard);
+        DecoderOwner::acquire(&cache, 1).unwrap().release();
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_fixed_floor_admits_a_warm_cache_without_evicting_it() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let cache = Arc::new(SharedCache::default());
+        let key = local_index_key(&fixture.file(SESSION));
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            if cache.retained_checkpoint(&key).is_some() {
+                break;
+            }
+        }
+        let copy = cache.take(&key).expect("real retained reduction").retained;
+        // Two real reductions with large synthetic keys warm > 8 MiB, while
+        // each entry remains under ENTRY_BYTES. The graph is measured normally.
+        let warm_key = "a".repeat(5 * 1024 * 1024);
+        let peer_key = "b".repeat(5 * 1024 * 1024);
+        for key in [&warm_key, &peer_key] {
+            assert!(cache.retained().unwrap().insert(
+                key.clone(),
+                crate::transcript_cache::Retained {
+                    checkpoint: copy.checkpoint.clone(),
+                    state: copy.state.clone(),
+                }
+            ));
+        }
+        let warm = retained_floor(&cache);
+        assert!(warm > ENTRY_BYTES);
+        let credit = codex_compressed_input::compressed_input_credit().unwrap();
+        let side = super::super::side_ledger::SIDE_LEDGER_BYTES;
+        let budget = cache.cursor_resident() + warm + credit + ENTRY_BYTES + 2 * side;
+        // An explicit budget isolates the floor rule from zstd version sizing.
+        // The prior retained-sized floor would reject this same warm graph.
+        assert!(cache.cursor_resident() + 2 * warm + credit + 2 * side > budget);
+        with_test_state_budget(budget, || {
+            let owner = DecoderOwner::acquire(&cache, credit).expect("warm cache admits");
+            assert!(cache.retained_checkpoint(&warm_key).is_some());
+            assert!(cache.retained_checkpoint(&peer_key).is_some());
+            owner.release();
+        });
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_drop_under_cursor_strands_credit_without_relocking() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = Arc::new(SharedCache::default());
+    let owner = DecoderOwner::acquire(&cache, 4096).unwrap();
+    let ((), rows) = crate::local_resource_diagnostics::capture(|| {
+        cache.with_cursor(|_| drop(owner)).unwrap();
+    });
+    assert_eq!(
+        cache.cursor_reserved(),
+        4096,
+        "stranded, never under-accounted"
+    );
+    assert!(DECODER_LIVE.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(rows.iter().any(|r| r["counts"]["leaked_release"] == 1));
+    // Only the test repairs the intentionally stranded impossible-path state.
+    cache.with_cursor(|c| settle_claim(c, c.id, 4096)).unwrap();
+    DECODER_LIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    DecoderOwner::acquire(&cache, 4096).unwrap().release();
+}
