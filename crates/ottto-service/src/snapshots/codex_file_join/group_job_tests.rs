@@ -1539,7 +1539,6 @@ fn group_with_legacy_tee_is_byte_charged() {
         }
     }
     let metadata = CodexTitleMetadata::default();
-    boot.admit_for_test(&previous);
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
@@ -1691,7 +1690,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         }
     }
     let metadata = CodexTitleMetadata::default();
-    boot.admit_for_test(&previous);
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,

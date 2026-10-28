@@ -446,8 +446,8 @@ preparation/save events after work, without creating a comparison permit.
 - `account_reproof_calls`, `account_reproof_cleared`: invalid account witness
   reproof clear calls and actual nonempty-to-empty transitions.
 - `retry_admission_offered`, `retry_admission_cleared`: existing indexed members
-  in the actually offered oversized-family contiguous prefix, including offers
-  subsequently held by reread admission, and actual nonempty-to-empty clears.
+  in the actually offered oversized-family contiguous prefix, and actual
+  nonempty-to-empty clears.
   This family reserve is distinct from the transcript file byte cap.
 - `authority_normalization_cleared`: nonempty-to-empty transitions while dropping
   unbound authority records on working load/save. Discarded CAS probes are

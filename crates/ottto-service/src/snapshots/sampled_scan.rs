@@ -1989,7 +1989,6 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
-    parser.bind_reread(index, candidate);
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);

@@ -1604,7 +1604,6 @@ pub(super) mod tests {
             }
         }
         let metadata = CodexTitleMetadata::default();
-        boot.admit_for_test(index);
         let mut job = boot.into_job(JobInputs {
             metadata: &metadata,
             traces,
@@ -3734,7 +3733,6 @@ pub(super) mod tests {
             )
             .unwrap();
         }
-        boot.admit_for_test(&previous);
         let mut job = boot
             .into_job(JobInputs {
                 metadata: &metadata,

@@ -5462,17 +5462,7 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
-                if next
-                    .persist_reread_reservations(&mut self.committed_index, &self.index_path)
-                    .is_err()
-                {
-                    self.scan = Some(next);
-                    return SourcePreparationStep::Refused(
-                        self,
-                        crate::source_rotation::LocalRefusal("reread reservation save refused"),
-                    );
-                }
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -6315,7 +6305,6 @@ fn prepare_sync_source_inner(
         context_curve_enabled,
         request_identity_capture,
     )
-    .with_reread_persistence()
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_codex_side_pass(codex_side_pass);
     if source == SnapshotSource::ClaudeCode {
@@ -6685,7 +6674,6 @@ fn prepare_continuation_source(
         ordinary_equivalent,
     )
     .with_continuation_deadline(deadline)
-    .with_reread_persistence()
     .with_sampled_acquisition(
         std::sync::Arc::clone(cache),
         // K5: the ordinary Codex page's scope; Codex never captures.
@@ -22517,9 +22505,6 @@ mod tests {
                 }
                 mod oversized_discovery_pipeline_tests {
                     include!("snapshot_sync/oversized_discovery_pipeline_tests.rs");
-                }
-                mod structural_reread_guard_tests {
-                    include!("snapshot_sync/structural_reread_guard_tests.rs");
                 }
             }
         }
