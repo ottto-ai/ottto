@@ -1200,78 +1200,6 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Lead B (#829): a production post-save that skipped the per-pass setup
-/// never wipes valid records, even for keys the index does not hold. With
-/// the setup, ordinary GC keeps an indexed but undecided key and collects
-/// only the absent key's record (the control proving GC ran).
-#[test]
-fn save_without_per_pass_setup_keeps_valid_records() {
-    let root = crate::test_scratch::private_dir("ottto-dt-no-setup-save");
-    let lock = test_locks::hold(&root);
-    let source = SnapshotSource::ClaudeCode;
-    let ds = durable_source(source).unwrap();
-    let index_path = root.join("index.json");
-    let namespace = Scope("no-setup".into());
-    let transcript = root.join("t.jsonl");
-    std::fs::write(&transcript, b"{\"n\":1}\n").unwrap();
-    let context = store::context_digest(&namespace.0, None);
-    let (indexed, absent) = ("/synthetic/indexed.jsonl", "/synthetic/absent.jsonl");
-    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
-    let pending = [indexed, absent]
-        .iter()
-        .map(|key| PendingRecord {
-            binding: Binding {
-                source: ds,
-                key: store::key_digest(ds, key),
-                context,
-                scope: [0; 32],
-                entry: store::entry_digest("fp", None),
-            },
-            certificate: certificate(&transcript, &Scope("no-setup-file".into())),
-            body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
-            allowlist: codec::allowlist_digest(source),
-        })
-        .collect();
-    assert_eq!(disk.write_after_save(lock, 1, pending).unwrap().written, 2);
-    let path = |key: &str| {
-        let hex = store::key_digest(ds, key)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        disk.dir().join(format!("{hex}.rec"))
-    };
-    let before = [indexed, absent].map(|key| std::fs::read(path(key)).unwrap());
-    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!(
-        {"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"}
-    ))
-    .unwrap();
-    let mut index = ScanIndex::default();
-    index.files.insert(indexed.into(), entry);
-    for empty in [true, false] {
-        let saved = if empty {
-            ScanIndex::default()
-        } else {
-            index.clone()
-        };
-        let cache = SharedCache::default();
-        crate::snapshots::durable_after_save(&cache, &root, source, &saved);
-        assert!(
-            cache.durable_counters(source).is_none(),
-            "no slot, no store"
-        );
-        let after = [indexed, absent].map(|key| std::fs::read(path(key)).unwrap());
-        assert_eq!(after, before, "empty_index={empty}");
-    }
-    let cache = SharedCache::default();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
-    crate::snapshots::durable_after_save(&cache, &root, source, &index);
-    assert_eq!(std::fs::read(path(indexed)).unwrap(), before[0]);
-    assert!(!path(absent).exists());
-    let (_, disk_counters) = cache.durable_counters(source).unwrap();
-    assert_eq!(disk_counters.gc_records_deleted, 1);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 /// F1 needs the real acquisition/publication seam, beyond store-only outcomes.
 #[test]
 fn store_io_failures_emit_cold_production_body_without_holds() {
@@ -1900,4 +1828,76 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         "a restart gets one fresh attempt, not a persisted repetition count"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// Lead B (#829): a production post-save that skipped the per-pass setup
+/// never wipes valid records, even for keys the index does not hold. With
+/// the setup, ordinary GC keeps an indexed but undecided key and collects
+/// only the absent key's record (the control proving GC ran).
+#[test]
+fn save_without_per_pass_setup_keeps_valid_records() {
+    let root = crate::test_scratch::private_dir("ottto-dt-no-setup-save");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let ds = durable_source(source).unwrap();
+    let index_path = root.join("index.json");
+    let namespace = Scope("no-setup".into());
+    let transcript = root.join("t.jsonl");
+    std::fs::write(&transcript, b"{\"n\":1}\n").unwrap();
+    let context = store::context_digest(&namespace.0, None);
+    let (indexed, absent) = ("/synthetic/indexed.jsonl", "/synthetic/absent.jsonl");
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let pending = [indexed, absent]
+        .iter()
+        .map(|key| PendingRecord {
+            binding: Binding {
+                source: ds,
+                key: store::key_digest(ds, key),
+                context,
+                scope: [0; 32],
+                entry: store::entry_digest("fp", None),
+            },
+            certificate: certificate(&transcript, &Scope("no-setup-file".into())),
+            body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+            allowlist: codec::allowlist_digest(source),
+        })
+        .collect();
+    assert_eq!(disk.write_after_save(lock, 1, pending).unwrap().written, 2);
+    let path = |key: &str| {
+        let hex = store::key_digest(ds, key)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        disk.dir().join(format!("{hex}.rec"))
+    };
+    let before = [indexed, absent].map(|key| std::fs::read(path(key)).unwrap());
+    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!(
+        {"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"}
+    ))
+    .unwrap();
+    let mut index = ScanIndex::default();
+    index.files.insert(indexed.into(), entry);
+    for empty in [true, false] {
+        let saved = if empty {
+            ScanIndex::default()
+        } else {
+            index.clone()
+        };
+        let cache = SharedCache::default();
+        crate::snapshots::durable_after_save(&cache, &root, source, &saved);
+        assert!(
+            cache.durable_counters(source).is_none(),
+            "no slot, no store"
+        );
+        let after = [indexed, absent].map(|key| std::fs::read(path(key)).unwrap());
+        assert_eq!(after, before, "empty_index={empty}");
+    }
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    crate::snapshots::durable_after_save(&cache, &root, source, &index);
+    assert_eq!(std::fs::read(path(indexed)).unwrap(), before[0]);
+    assert!(!path(absent).exists());
+    let (_, disk_counters) = cache.durable_counters(source).unwrap();
+    assert_eq!(disk_counters.gc_records_deleted, 1);
+    let _ = std::fs::remove_dir_all(&root);
 }

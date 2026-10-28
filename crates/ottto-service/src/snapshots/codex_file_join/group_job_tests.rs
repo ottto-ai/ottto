@@ -2888,50 +2888,6 @@ fn retained_parked_group_and_sealed_dependencies_ignore_ctime_only_changes() {
     }
 }
 
-/// L23/F1: grouped members never reach the per-candidate guard, so a held
-/// member (here a newer binary's record) holds its whole joined group before
-/// acquisition: no member read, no POST body, the record byte-identical.
-#[cfg(unix)]
-#[test]
-fn durable_hold_on_one_member_holds_the_joined_group() {
-    use crate::durable_tail_store as store;
-    let mut scanned = Vec::new();
-    for held in [false, true] {
-        let (root, _) = fixture();
-        let cache = Arc::new(SharedCache::default());
-        let index_path = root.join("index.json");
-        let namespace = Scope("group-fixture".into());
-        cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, false);
-        let key = store::key_digest(
-            store::DurableSource::Codex,
-            &local_index_key(&root.join("sessions/a.jsonl")),
-        );
-        let dir = store::store_dir_for_index(&index_path);
-        let hex = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let record = dir.join(format!("{hex}.rec"));
-        let bytes = [b"ottto-dt".as_slice(), &2_u16.to_le_bytes(), &[7_u8; 64]].concat();
-        if held {
-            fs::create_dir_all(&dir).unwrap();
-            fs::write(&record, &bytes).unwrap();
-        }
-        let (_, result) = sampled(&root, ScanIndex::default(), 10, &cache);
-        let (durable, _) = cache.durable_counters(SnapshotSource::Codex).unwrap();
-        if held {
-            assert!(result.snapshots.is_empty(), "held group emits nothing");
-            assert_eq!(fs::read(&record).unwrap(), bytes);
-            assert!(durable.durable_held[store::Refusal::NewerFormat as usize] >= 1);
-        } else {
-            assert_eq!(durable.durable_held, [0; 5]);
-        }
-        scanned.push(result.scanned_file_count);
-        fs::remove_dir_all(root).unwrap();
-    }
-    assert!(
-        scanned[1] + 2 <= scanned[0],
-        "control acquires both members; the held group acquires neither: {scanned:?}"
-    );
-}
-
 /// B1: a spent T14 member holds its whole joined acquisition through the
 /// production exit WITHOUT making its source census unreadable. An unrelated
 /// session still publishes; the held group's accepted witnesses stay intact.
@@ -3017,6 +2973,14 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
         None,
         "initial group rebuild attempt"
     );
+    assert_eq!(
+        cache
+            .durable_counters(source)
+            .unwrap()
+            .1
+            .t14_rebuild_full_started,
+        1
+    );
     cache.durable_begin_pass(source, &index_path, &scope, false);
     // A healthy, unrelated singleton is selected in the same terminal pass.
     let peer_owner = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -3028,7 +2992,9 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     // singleton fingerprint does not force a joined acquisition).
     use std::io::Write;
     writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap()).unwrap();
-    let (index, result) = sampled_at(&root, index, 10, &cache, "2026-10-06T23:01:00Z");
+    // A later timestamp alone retains the prior traversal; start a fresh walk
+    // so both existing group members reach the production acquisition guard.
+    let (index, result) = next_generation(&root, index, &cache, 1);
     assert!(
         result.census_complete,
         "a known_corrupt group must not make source census red"
@@ -3045,8 +3011,52 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
         .any(|item| item.source_session_id == peer_owner));
     let (counts, stats) = cache.durable_counters(source).unwrap();
     assert_eq!(counts.durable_held, [0; 5]);
-    assert!(counts.not_persisted["known_corrupt_held"] > 0);
+    assert_eq!(counts.not_persisted.get("known_corrupt_held"), Some(&1));
     assert_eq!(stats.t14_rebuild_full_started, 1);
     assert_eq!(fs::read(&record).unwrap(), corrupt);
     fs::remove_dir_all(root).unwrap();
+}
+
+/// L23/F1: grouped members never reach the per-candidate guard, so a held
+/// member (here a newer binary's record) holds its whole joined group before
+/// acquisition: no member read, no POST body, the record byte-identical.
+#[cfg(unix)]
+#[test]
+fn durable_hold_on_one_member_holds_the_joined_group() {
+    use crate::durable_tail_store as store;
+    let mut scanned = Vec::new();
+    for held in [false, true] {
+        let (root, _) = fixture();
+        let cache = Arc::new(SharedCache::default());
+        let index_path = root.join("index.json");
+        let namespace = Scope("group-fixture".into());
+        cache.durable_begin_pass(SnapshotSource::Codex, &index_path, &namespace, false);
+        let key = store::key_digest(
+            store::DurableSource::Codex,
+            &local_index_key(&root.join("sessions/a.jsonl")),
+        );
+        let dir = store::store_dir_for_index(&index_path);
+        let hex = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let record = dir.join(format!("{hex}.rec"));
+        let bytes = [b"ottto-dt".as_slice(), &2_u16.to_le_bytes(), &[7_u8; 64]].concat();
+        if held {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(&record, &bytes).unwrap();
+        }
+        let (_, result) = sampled(&root, ScanIndex::default(), 10, &cache);
+        let (durable, _) = cache.durable_counters(SnapshotSource::Codex).unwrap();
+        if held {
+            assert!(result.snapshots.is_empty(), "held group emits nothing");
+            assert_eq!(fs::read(&record).unwrap(), bytes);
+            assert!(durable.durable_held[store::Refusal::NewerFormat as usize] >= 1);
+        } else {
+            assert_eq!(durable.durable_held, [0; 5]);
+        }
+        scanned.push(result.scanned_file_count);
+        fs::remove_dir_all(root).unwrap();
+    }
+    assert!(
+        scanned[1] + 2 <= scanned[0],
+        "control acquires both members; the held group acquires neither: {scanned:?}"
+    );
 }
