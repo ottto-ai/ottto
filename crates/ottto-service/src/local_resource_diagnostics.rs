@@ -51,6 +51,7 @@ pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedHeaderInvalid")]
     HeaderInvalid,
     #[doc(hidden)]
+    #[serde(skip)]
     __Count,
 }
 const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
