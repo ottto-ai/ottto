@@ -45,3 +45,11 @@ Regression coverage exercises a real semantic-only finalization change with
 unchanged additive evidence and control index/body parity, plus actual cold
 acquisition and census-blocked branches with unknown gates and full-reader body
 parity. These diagnostics do not establish supported-layout tail execution.
+
+Pi uses the shared sampled reader and a separate durable store slot. Its
+response-id ledger persists only domain-separated SHA-256 keys and occurrence
+digests. More than 65,536 response-id keys or an encoded record above 8 MiB
+refuses persistence without truncation, so a missing retained copy reads Full.
+`retained_refused_pi_ledger_cap` counts those refusals in the content-free
+`durable_tail source=pi` summary. The resident store-map bound is 96 KiB:
+one slot per source, three sources.
