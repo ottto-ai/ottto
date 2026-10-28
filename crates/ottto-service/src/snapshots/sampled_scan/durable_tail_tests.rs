@@ -1457,12 +1457,12 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
 #[test]
 fn v1_counting_provenance_comes_from_each_decoded_reduction() {
     use codex_counting_version::{AckEvidence, TestCutover};
-    let _cutover = TestCutover::set(0);
     for (timestamp, evidence, version) in [
         ("1969-01-01T00:00:00Z", AckEvidence::None, 1),
         ("2026-10-07T00:00:00Z", AckEvidence::None, 2),
         ("2026-10-07T00:00:00Z", AckEvidence::LegacyAcked, 1),
     ] {
+        let _cutover = TestCutover::set(0);
         let root = crate::test_scratch::private_dir("ottto-dt-v1-counting");
         let path = root.join("rollout.jsonl");
         std::fs::write(&path,serde_json::json!({"type":"session_meta","payload":{"id":"019fa111-2222-7333-8444-555555555555","timestamp":timestamp}}).to_string()+"\n").unwrap();
@@ -1487,14 +1487,37 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
         while !parser.step().unwrap() {}
         let reduction = parser.durable_test_reduction_copy();
         let body = codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
+        let key = local_index_key(&path);
+        let namespace = Scope("counting-namespace".into());
+        let index_path = root.join("index.json");
+        let mut index = ScanIndex::default();
+        let mut entry: ScanIndexEntry=serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"native-owned"})).unwrap();
+        if evidence == AckEvidence::LegacyAcked {
+            entry.last_snapshot_fingerprint = Some("prior-Legacy-ACK".into());
+        }
+        index.files.insert(key.clone(), entry);
+        index.save(&index_path).unwrap();
+        let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+        assert_eq!(
+            interpretation.counting_view,
+            if evidence == AckEvidence::None {
+                "0:none"
+            } else {
+                "0:legacy_acked"
+            }
+        );
         let pending = PendingRecord {
-            binding: Binding {
-                source: DurableSource::Codex,
-                key: store::key_digest(DurableSource::Codex, &local_index_key(&path)),
-                context: [0; 32],
-                scope: [0; 32],
-                entry: [0; 32],
-            },
+            binding: expected(
+                DurableSource::Codex,
+                source,
+                &key,
+                &scope,
+                &index,
+                &interpretation,
+                Some((1, codec::allowlist_digest(source))),
+            )
+            .unwrap()
+            .binding,
             certificate: certificate(&path, &scope),
             body,
             allowlist: codec::allowlist_digest(source),
@@ -1502,7 +1525,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
         };
         let bytes = store::tests::pinned_v1_bytes(&pending, 1);
         let lock = test_locks::hold(&root);
-        let dir = root.join("store");
+        let dir = store::store_dir_for_index(&index_path);
         std::fs::create_dir_all(&dir).unwrap();
         let disk = dir.join(format!(
             "{}.rec",
@@ -1516,7 +1539,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
         std::fs::write(&disk, &bytes).unwrap();
         std::fs::set_permissions(&disk, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .unwrap();
-        let mut store = DurableTailStore::new(dir, DurableSource::Codex);
+        let mut store = DurableTailStore::new(dir.clone(), DurableSource::Codex);
         let old = match store.read(&pending.binding.key, &pending.allowlist) {
             ReadOutcome::Found(r) => r,
             other => panic!("{other:?}"),
@@ -1528,18 +1551,111 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             .unwrap();
         assert_eq!(fact.0, Some(0));
         assert_eq!(fact.1, version);
-        let mut current = pending.clone();
-        current.metadata.counting = fact;
-        store.write_after_save(lock, 1, vec![current]).unwrap();
-        let next = match store.read(&pending.binding.key, &pending.allowlist) {
-            ReadOutcome::Found(r) => r,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(next.record.metadata.counting, fact);
-        assert_eq!(
-            next.record.metadata.ack_owner,
-            store::ack_owner(&pending.binding.key, &pending.certificate)
-        );
+        if crate::heap_layout_bound::layout_supported() {
+            let cache = SharedCache::default();
+            cache.durable_begin_pass(source, &index_path, &namespace, false);
+            let restored = cache
+                .durable_restore(
+                    source,
+                    &key,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &index,
+                    &interpretation,
+                )
+                .into_test_option()
+                .expect("v1 maps without content acquisition");
+            assert_eq!(restored.retained.state.durable_counting(), Some(fact));
+            cache.insert(
+                key.clone(),
+                sampled_jsonl::CompletedNativeAcquisition {
+                    checkpoint: restored.retained.checkpoint,
+                    reduction: Some(restored.retained.state),
+                    released: None,
+                    unsealed: false,
+                },
+                0,
+            );
+            cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                cache
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            let next = match store.read(&pending.binding.key, &pending.allowlist) {
+                ReadOutcome::Found(r) => r,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(next.format, 2);
+            assert_eq!(next.record.metadata.counting, fact);
+            assert_eq!(
+                next.record.metadata.ack_owner,
+                store::ack_owner(&pending.binding.key, &pending.certificate)
+            );
+            let restart = SharedCache::default();
+            restart.durable_begin_pass(source, &index_path, &namespace, false);
+            let second = restart
+                .durable_restore(
+                    source,
+                    &key,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &index,
+                    &interpretation,
+                )
+                .into_test_option()
+                .expect("v2 second restart");
+            assert_eq!(second.retained.state.durable_counting(), Some(fact));
+            // A record whose old pinned binding proves the configured cutover
+            // but whose own decoded cutover disagrees is R29, never mapped.
+            let _new_cutover = TestCutover::set(1);
+            let changed = Interpretation::of(source, &key, &index, false, &namespace);
+            let mut disagreement = pending.clone();
+            disagreement.binding = expected(
+                DurableSource::Codex,
+                source,
+                &key,
+                &scope,
+                &index,
+                &changed,
+                Some((1, pending.allowlist)),
+            )
+            .unwrap()
+            .binding;
+            std::fs::write(
+                &disk,
+                store::tests::pinned_v1_bytes(&disagreement, index.generation),
+            )
+            .unwrap();
+            let refused = SharedCache::default();
+            refused.durable_begin_pass(source, &index_path, &namespace, false);
+            assert!(refused
+                .durable_restore(
+                    source,
+                    &key,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &index,
+                    &changed
+                )
+                .into_test_option()
+                .is_none());
+            assert_eq!(
+                refused
+                    .durable_counters(source)
+                    .unwrap()
+                    .0
+                    .ineligible
+                    .get("scope"),
+                Some(&1)
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }
