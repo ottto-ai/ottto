@@ -26221,6 +26221,7 @@ impl OwnedSourceScan {
             pending_paths.extend(members);
             pending_paths.extend(rereads);
         }
+        let causes = traversal.counts.causes.page(index.files.len());
         if source == SnapshotSource::ClaudeCode {
             finish_claude_retry_selection(
                 index,
@@ -26232,7 +26233,7 @@ impl OwnedSourceScan {
         index.resume_census_window_end = Some(census_window_end.clone());
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
         let mut census = ScanCensus {
-            causes: traversal.counts.causes.page(index.files.len()),
+            causes,
             ..ScanCensus::default()
         };
         let codex_selected_flags = if source == SnapshotSource::Codex {
@@ -29927,7 +29928,7 @@ impl OwnedSourceScan {
                 census.ownership_incomplete_file_count += ownership_incomplete_file_count;
                 census.causes.add(
                     parsed_file.cause,
-                    std::iter::repeat(&candidate.path).take(ownership_incomplete_file_count),
+                    std::iter::repeat(Path::new(&index_key)).take(ownership_incomplete_file_count),
                 );
                 census.zero_snapshot_usage_evidence_count +=
                     usize::from(zero_snapshot_usage_evidence);

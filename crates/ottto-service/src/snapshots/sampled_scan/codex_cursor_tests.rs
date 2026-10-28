@@ -13770,6 +13770,7 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
     let candidate = CandidateFile {
         path: PathBuf::from("/synthetic/ownership-same.jsonl"),
         scan_root: PathBuf::from("/synthetic"),
+        physical_identity: None,
         size_bytes: 0,
         modified_unix_seconds: 0,
         modified_unix_nanos: 0,

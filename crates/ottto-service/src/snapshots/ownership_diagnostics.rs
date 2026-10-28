@@ -1,3 +1,4 @@
+use super::codex_compressed_input::is_compressed_codex_rollout;
 use super::*;
 use std::hash::{Hash, Hasher};
 pub(super) const INVENTORY: usize = 0;

@@ -104,8 +104,9 @@ fn index_restart_retains_contributions_but_resets_distinct_and_fresh_generation_
     let counts = &mut restored.traversal.as_mut().unwrap().counts;
     assert_eq!(counts.causes.summary(2).0[PARENT], 2);
     assert_eq!(counts.causes.summary(2).1, [0; N + 1]);
-    counts.causes = counts.causes.page(10);
-    counts.causes.add(PARENT, ["same.jsonl"]);
+    let mut page = counts.causes.page(10);
+    page.add(PARENT, ["same.jsonl"]);
+    counts.causes.merge(&page);
     counts.ownership_incomplete_file_count += 1;
     assert_eq!(counts.causes.summary(3).0[PARENT], 3);
     assert_eq!(counts.causes.summary(3).1[PARENT], 1);
