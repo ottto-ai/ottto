@@ -1962,18 +1962,12 @@ fn inventory_inputs() -> (PathBuf, ContinuationInputs) {
     let path = root.join("rollout-2026-10-24T00-00-00-019fa111-2222-7333-8444-555555555555.jsonl");
     std::fs::write(&path, br#"{"type":"session_meta","timestamp":"2026-10-24T00:00:00Z","payload":{"id":"019fa111-2222-7333-8444-555555555555","timestamp":"2026-10-24T00:00:00Z"}}
 "#).unwrap();
-    let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
-        SnapshotSource::Codex,
+    let evidence = crate::snapshots::CodexContinuationEvidence::certified_for_test(
         std::slice::from_ref(&root),
-        &mut ScanIndex::default(),
-        "2026-10-24T00:00:00Z",
-        30,
-        10,
-        false,
-    )
-    .unwrap();
+        &std::collections::BTreeSet::from([path.to_string_lossy().into_owned()]),
+    );
     let (mut inputs, _) = super::super::tests::continuation_inputs_for_test(false);
-    inputs.evidence = scan.take_continuation_evidence();
+    inputs.evidence = Some(evidence);
     assert!(inputs.evidence.as_ref().unwrap().content_unchanged());
     inputs.runtime_context = runtime_context();
     (root, inputs)

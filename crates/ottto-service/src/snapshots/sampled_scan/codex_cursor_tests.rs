@@ -1151,6 +1151,26 @@ thread_local! {
     pub(in crate::snapshots) static NATIVE_RANGES: std::cell::RefCell<Option<Vec<std::ops::Range<u64>>>> = const { std::cell::RefCell::new(None) };
     pub(in crate::snapshots) static EOF_APPLIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+// Build certified fixture evidence through the same constructor and header
+// steps as an ordinary scan, without retaining evidence from a completed scan.
+impl crate::snapshots::CodexContinuationEvidence {
+    pub(crate) fn certified_for_test(roots: &[PathBuf], paths: &BTreeSet<String>) -> Self {
+        let codex = CodexTitleMetadata::load_from_roots(roots);
+        let mut directories = codex_file_join::DirectoryCensus::new();
+        for root in roots {
+            directories.observe(root, &fs::symlink_metadata(root).unwrap());
+        }
+        let mut inventory = codex_file_join::HeaderInventory::new(roots, paths, Some(&directories));
+        while !inventory.step(&codex) {}
+        assert!(inventory.content_unchanged(), "certified fixture inventory");
+        Self {
+            inventory,
+            ledgers: None,
+            codex,
+            traces: None,
+        }
+    }
+}
 fn carry(root: &Path, scan: &mut SourceScanResult) {
     if let Some(evidence) = scan.take_continuation_evidence() {
         CARRIED.with(|v| {
@@ -11695,6 +11715,14 @@ fn continuation_prepares_no_group_attempt() {
         let members = cache.paused_members_for_test().expect("paused group");
         assert_eq!(members.len(), 2, "both members belong to the job");
         let started = first.jobs_started;
+        // Groups are not accelerated and mint no production ticket. This
+        // low-level resume test supplies certified fixture evidence explicitly.
+        assert!(carried(&sessions).is_none(), "group minted no ticket");
+        let evidence = crate::snapshots::CodexContinuationEvidence::certified_for_test(
+            std::slice::from_ref(&sessions),
+            &members,
+        );
+        CARRIED.with(|v| v.borrow_mut().insert(sessions.clone(), evidence));
         for _ in 0..128 {
             let resumed = counter(&cache, |c| c.jobs_resumed);
             let (next, scan) = continuation_page_in(
