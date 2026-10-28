@@ -728,7 +728,7 @@ fn version_probe_finds_the_selected_installs_shebang_interpreter() {
 }
 
 #[test]
-fn codex_system_and_cwd_configuration_are_presence_refused() {
+fn codex_system_configuration_is_presence_refused() {
     let scratch = crate::test_scratch::ScratchDir::new("codex-config-layers");
     let home = scratch.as_ref().join("home");
     let cwd = scratch.as_ref().join("project");
@@ -741,21 +741,22 @@ fn codex_system_and_cwd_configuration_are_presence_refused() {
     binding.claude_slot = None;
     binding.root = home.join(".codex");
     assert!(preflight::codex(&binding, &cwd, &system).is_ok());
-    for (path, layer) in [
-        (
-            system.join("config.toml"),
-            ottto_protocol::SessionLaunchSettingLayerV1::Managed,
-        ),
-        (
-            cwd.join("config.toml"),
-            ottto_protocol::SessionLaunchSettingLayerV1::Project,
-        ),
-    ] {
-        fs::write(&path, "model_provider = 'custom'\n").unwrap();
-        let error = preflight::codex(&binding, &cwd, &system).unwrap_err();
-        assert_eq!(error.reason, Reason::ConfigUnsupported);
-        assert_eq!(error.setting_layer, Some(layer));
-        fs::remove_file(path).unwrap();
-        assert!(preflight::codex(&binding, &cwd, &system).is_ok());
-    }
+    // The loader reads .codex/config.toml project files, not an unrelated
+    // application config.toml directly in cwd.
+    fs::write(
+        cwd.join("config.toml"),
+        "model_provider = 'unrelated-app'\n",
+    )
+    .unwrap();
+    assert!(preflight::codex(&binding, &cwd, &system).is_ok());
+    let path = system.join("config.toml");
+    fs::write(&path, "model_provider = 'custom'\n").unwrap();
+    let error = preflight::codex(&binding, &cwd, &system).unwrap_err();
+    assert_eq!(error.reason, Reason::ConfigUnsupported);
+    assert_eq!(
+        error.setting_layer,
+        Some(ottto_protocol::SessionLaunchSettingLayerV1::Managed)
+    );
+    fs::remove_file(path).unwrap();
+    assert!(preflight::codex(&binding, &cwd, &system).is_ok());
 }

@@ -100,7 +100,7 @@ files and policy helpers that cannot be evaluated statically refuse as
 Codex checks its selected `config.toml` and active profile. Non-OpenAI providers,
 redefined OpenAI providers, endpoint overrides, API login, a different forced
 workspace, or a credential store other than file are refused. System
-`/etc/codex/config.toml`, cwd `config.toml`, project `.codex/config.toml` and
+`/etc/codex/config.toml`, project `.codex/config.toml` and
 managed policy that this evaluator cannot evaluate are presence-refused.
 Reasons identify a typed settings layer, never a settings value or path.
 This conservative evaluator can reject a configuration the provider would

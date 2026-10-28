@@ -302,8 +302,7 @@ pub(super) fn codex(binding: &Binding, cwd: &Path, system_dir: &Path) -> Result<
     for ancestor in ancestors(cwd).filter(|ancestor| *ancestor != binding.user.home) {
         refuse_present(&ancestor.join(".codex/config.toml"), Layer::Project)?;
     }
-    // Codex 0.150 also loads cwd/config.toml and the system config layer.
-    refuse_present(&cwd.join("config.toml"), Layer::Project)?;
+    // Codex 0.150 also loads the system config layer.
     for name in ["config.toml", "managed_config.toml", "requirements.toml"] {
         refuse_present(&system_dir.join(name), Layer::Managed)?;
     }
