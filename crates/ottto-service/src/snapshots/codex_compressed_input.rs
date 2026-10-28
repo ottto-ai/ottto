@@ -1,8 +1,7 @@
 //! Bounded `.jsonl.zst` rollout input behind the one opened-object parser seam.
 //! Discovery does not enumerate compressed rollouts yet. Activation must also
-//! bind the header, plain/compressed twin identity and decoder credit at each
-//! open site before it constructs `OpenedInput::compressed`.
-#![cfg_attr(not(test), allow(dead_code))]
+//! bind plain/compressed twin identity and pacing before activation. Main-scan
+//! decoding already validates the owner and pays the DecoderOwner reservation.
 use crate::local_resource_diagnostics::{codex_zst_refused, CodexZstCause};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -76,6 +75,7 @@ pub(super) fn compressed_input_credit() -> io::Result<usize> {
 }
 
 fn thread_cpu_micros() -> u64 {
+    // SAFETY: all-zero integer timespec fields are valid.
     let mut spec: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: valid writable timespec, querying only the current thread.
     if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } != 0 {
@@ -412,13 +412,13 @@ impl OpenedInput {
         }
     }
 
-    /// Retained heap charge: funded input is already charged by SharedCache.
-    /// Unfunded test input charges its box, buffers and full decoder credit;
-    /// plain input charges exactly its buffer capacity.
+    /// Funded decoder memory is charged by its outstanding SharedCache claim.
+    /// Unfunded synthetic input charges its box, buffer and full decoder credit;
+    /// plain input charges only its buffer.
     pub(super) fn capacity(&self) -> usize {
         match self {
             Self::Plain(reader) => reader.capacity(),
-            Self::Compressed(_, Some(_)) => 0, // outstanding SharedCache claim owns this charge
+            Self::Compressed(_, Some(_)) => 0, // existing outstanding cache reservation
             Self::Compressed(reader, _) => {
                 let boxed = size_of::<BufReader<BoundedDecoder<File>>>();
                 boxed
@@ -482,12 +482,11 @@ impl super::ScanIndex {
                 .and_then(io::Error::get_ref)
                 .and_then(|e| e.downcast_ref::<CodexZstCause>())
         });
-        if let Some((archive, &cause)) = self
+        let archive = self
             .files
             .get_mut(&super::local_index_key(path))
-            .and_then(|entry| entry.archive.as_mut())
-            .zip(cause)
-        {
+            .and_then(|e| e.archive.as_mut());
+        if let Some((archive, &cause)) = archive.zip(cause) {
             archive.disposition = ArchiveDisposition::Refused { cause };
             codex_zst_refused(cause);
         }
@@ -818,7 +817,9 @@ pub(in crate::snapshots) mod tests {
         ignore = "funded decoder needs validated heap layout"
     )]
     fn archive_acquisition_money_identity_ld_and_failure_checkpoint_are_quiet() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = synthetic_rollout();
         let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
         let (mut index, result, rows, ends) = archive_pass(&f, ScanIndex::default(), true, None);
@@ -977,7 +978,9 @@ pub(in crate::snapshots) mod tests {
         ignore = "funded decoder needs validated heap layout"
     )]
     fn archive_retry_six_hour_bound_and_three_failed_settlements_hold() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let f =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
         let key = local_index_key(&f.0);
@@ -1048,7 +1051,9 @@ pub(in crate::snapshots) mod tests {
         ignore = "funded decoder needs validated heap layout"
     )]
     fn archive_failed_attempts_never_publish_and_refusals_survive_restart() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = synthetic_rollout();
         let valid = zstd::stream::encode_all(&bytes[..], 1).unwrap();
         let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
@@ -1106,14 +1111,25 @@ pub(in crate::snapshots) mod tests {
         ignore = "funded decoder needs validated heap layout"
     )]
     fn archive_empty_held_and_selected_held_restore_carry_only_evidence() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for bytes in [
             b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed-fixture\"}}\n".to_vec(),
             b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"wrong-owner\"}}\n".to_vec(),
             [synthetic_rollout(), b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\"bad\"}}}}\n".to_vec()].concat(),
         ] {
             let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
-            let (mut index, result, _, _) = archive_pass(&f, ScanIndex::default(), true, None);
+            let before = ScanIndex::default();
+            let proof_state = |index: &ScanIndex| serde_json::json!({
+                "proofs": index.codex_parent_prefix_proofs,
+                "side": index.codex_parent_side,
+                "evicted": index.codex_counting_evicted_legacy,
+                "evictions": index.codex_counting_evictions,
+            });
+            let baseline = proof_state(&before);
+            let (mut index, result, _, _) = archive_pass(&f, before, true, None);
+            assert_eq!(proof_state(&index), baseline);
             assert!(result.snapshots.is_empty());
             let key = local_index_key(&f.0);
             index.files.get_mut(&key).unwrap().last_snapshot_fingerprint =
@@ -1142,7 +1158,9 @@ pub(in crate::snapshots) mod tests {
         ignore = "funded decoder needs validated heap layout"
     )]
     fn archive_uses_logical_sidecar_classification_and_blocks_ambiguous_names() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let f =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
         let mut metadata = CodexTitleMetadata::default();
@@ -1198,7 +1216,9 @@ pub(in crate::snapshots) mod tests {
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn paid_decoder_closes_after_real_eof_early_read_error_and_caught_unwind() {
-        let _lock = DECODER_TEST_LOCK.lock().unwrap();
+        let _lock = DECODER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let encoded = zstd::stream::encode_all(&b"synthetic decoded content"[..], 1).unwrap();
         let valid = fixture(&encoded, ".zst");
         let corrupt = fixture(b"invalid frame", ".zst");
@@ -1250,7 +1270,9 @@ pub(in crate::snapshots) mod tests {
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn paid_decoder_yields_to_singleton_and_drop_safety_net_is_observable() {
-        let _lock = DECODER_TEST_LOCK.lock().unwrap();
+        let _lock = DECODER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let f = fixture(
             &zstd::stream::encode_all(&b"synthetic"[..], 1).unwrap(),
             ".zst",
@@ -1312,7 +1334,9 @@ pub(in crate::snapshots) mod tests {
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_admission_yields_without_consuming_evidence_or_a_retry() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let f =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
         let key = local_index_key(&f.0);
@@ -1361,7 +1385,9 @@ pub(in crate::snapshots) mod tests {
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_interrupted_third_attempt_sticks_and_content_change_resets_attempts() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = synthetic_rollout();
         let encoded = zstd::stream::encode_all(&bytes[..], 1).unwrap();
         let f = ArchiveFixture::new(&encoded);
@@ -1433,7 +1459,9 @@ pub(in crate::snapshots) mod tests {
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_identity_revalidation_failure_remains_pending_and_releases_owner() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let f =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
         let path = f.0.clone();
@@ -1459,7 +1487,9 @@ pub(in crate::snapshots) mod tests {
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_expired_launch_evidence_is_a_pending_finish_error() {
         use base64::Engine;
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let bytes = String::from_utf8(synthetic_rollout())
             .unwrap()
@@ -1508,6 +1538,86 @@ pub(in crate::snapshots) mod tests {
         index.archive_decode_error(&f.0, &error);
         assert_pending(&index, &f.0, 1);
         assert_eq!(cache.cursor_reserved(), 0);
+        for state in [index.clone(), checkpoint(&index)] {
+            let (_, result, rows, _) = archive_pass(&f, state, true, None);
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.snapshots.is_empty());
+            assert!(result.unreadable_path_count > 0);
+        }
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn pending_io_without_body_remains_disclosed_on_every_quiet_pass() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut index = ScanIndex::default();
+        let parser = factory(&f, &mut index, Some(&cache)).unwrap();
+        drop(parser); // interrupt the first read, without any body or ACK
+        index.archive_decode_error(&f.0, &io::Error::other("synthetic step EIO").into());
+        for _ in 0..3 {
+            let (next, result, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
+            assert_pending(&next, &f.0, 1);
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.snapshots.is_empty());
+            assert!(result.unreadable_path_count > 0);
+            index = next;
+        }
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn admission_starvation_alarms_at_twelve_passes_without_touching_evidence() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let mut index = ScanIndex::default();
+        for pass in 1..=14 {
+            let (next, result, rows, _) = archive_pass(&f, index, false, None);
+            assert!(next.files.is_empty());
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.unreadable_path_count > 0);
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["stage"] == "codex_zst_refused")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["stage"] == "codex_zst_admission_alarm")
+                    .count(),
+                usize::from(pass == 12)
+            );
+            index = next;
+        }
+        let (index, _, rows, _) = archive_pass(&f, index, true, None);
+        assert_eq!(decodes(&rows), 1);
+        assert!(index.compressed_admission_yields.is_empty());
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn actual_plain_codex_record_has_no_archive_allocation() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut f = ArchiveFixture::new(&synthetic_rollout());
+        let plain = f.0.with_extension("");
+        fs::rename(&f.0, &plain).unwrap();
+        f.0 = plain;
+        let (index, result, rows, _) = archive_pass(&f, ScanIndex::default(), true, None);
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(decodes(&rows), 0);
+        let entry = &index.files[&local_index_key(&f.0)];
+        assert!(entry.last_snapshot_fingerprint.is_some());
+        assert!(entry.archive.is_none());
+        let mut charge = crate::heap_layout_bound::Counter::new(usize::MAX);
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&entry.archive, &mut charge).unwrap();
+        assert_eq!(charge.bytes, 0);
     }
     #[test]
     fn decoder_read_io_is_not_a_sticky_content_refusal() {
@@ -1541,8 +1651,12 @@ pub(in crate::snapshots) mod tests {
         let f = ArchiveFixture::new(b"synthetic stamp only");
         let evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
         let key = local_index_key(&f.0);
+        let minimum = size_of::<ArchiveEvidence>() + evidence.logical_id.capacity();
         let mut index = ScanIndex::default();
         index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
+        let mut charge = crate::heap_layout_bound::Counter::new(usize::MAX);
+        index.files[&key].heap_bound(&mut charge).unwrap();
+        assert!(charge.bytes >= minimum, "boxed evidence must be charged");
         let saved = checkpoint(&index);
         let stub = &saved.files[&key];
         assert_eq!((stub.size_bytes, stub.modified_unix_seconds), (0, 0));
@@ -1558,7 +1672,9 @@ pub(in crate::snapshots) mod tests {
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_priority_receipt_survives_trace_expiry_and_lost_ack() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
         let mut records: Vec<Value> = synthetic_rollout()
             .split(|b| *b == b'\n')
@@ -1604,7 +1720,9 @@ pub(in crate::snapshots) mod tests {
     fn archive_v2_and_legacy_ack_evidence_carry_with_settled_bodies() {
         use super::super::codex_counting_version::AckEvidence;
         let _cutover = super::super::codex_counting_version::TestCutover::set(0);
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let f =
             ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
         let key = local_index_key(&f.0);
@@ -1656,7 +1774,9 @@ pub(in crate::snapshots) mod tests {
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
     fn archive_fork_child_before_plain_parent_recovers_exclusive_money_on_bounded_retry() {
-        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let parent = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
         let meta = |id: &str| json!({"timestamp":"2026-10-07T08:00:00Z","type":"session_meta","payload":{"id":id,"thread_source":"user"}});
         let turn = |id: &str| json!({"timestamp":"2026-10-07T08:00:01Z","type":"turn_context","payload":{"turn_id":id,"model":"gpt-synthetic"}});
@@ -1723,6 +1843,7 @@ pub(in crate::snapshots) mod tests {
             0,
             "parent arrival does not bypass six hours"
         );
+        assert!(result.unreadable_path_count > 0);
         assert!(!result
             .snapshots
             .iter()

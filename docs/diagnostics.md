@@ -765,7 +765,8 @@ substituted. Settled, empty, held and refused stamps remain quiet until content
 changes. Decoder safety-net release emits `codex_zst_owner.counts.leaked_release`;
 normal completion and error paths release explicitly after any Stores guard.
 
-Main-scan archive refusals and held results also increment the unreadable census,
+Main-scan archive refusals, held results and pending attempts without a current
+body also increment the unreadable census,
 including unchanged stamps skipped without a decoder. Admission refusal is a
 transient yield: it consumes no attempt or retry counter and changes no evidence.
 Only frame/checksum/truncation, decoded-limit and owner failures are sticky.
@@ -777,10 +778,18 @@ reported by `codex_zst_decoded_bytes`; unknown/stuck money is never reported as 
 for archives, including recovery reads, and are not generic Full rereads. A retry
 is counted only after funding succeeds. A changed same-content stamp resets to
 attempt 1; Stuck never retries without a stamp change. Pending(3) from an
-interrupted upload becomes Stuck at the next due admission without another
-decode or an invented ACK. LD observers see each admitted recovery delivery and
+interrupted upload becomes Stuck at the third attempt’s first unsettled finish,
+or the next due admission after a crash, without another decode or invented ACK. LD observers see each admitted recovery delivery and
 must deduplicate their derived results by the opened object.
 
 Archive body decoding remains undiscovered until the activation slice. User-change
 (A3) and approved code-replay (A4) correction handling is a separate prerequisite
 to that activation; this completion/reservation slice grants neither authority.
+
+Decoder admission keeps fixed headroom of one 8 MiB primary entry plus side-ledger
+bytes; the resident cache is charged once. Each admission yield increments the
+cumulative `codex_zst_refused` counter once per attempted archive per pass. After
+12 consecutive yields for an archive, `codex_zst_admission_alarm` discloses the
+starvation once, with `consecutive_yields: 12`. Runtime-only counts reset on
+admission or process restart; they never change archive evidence. Decoder input
+and leaked-release fields are per-event counts, not cumulative totals.
