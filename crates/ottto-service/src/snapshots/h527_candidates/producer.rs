@@ -1073,13 +1073,6 @@ pub(crate) fn produce(
     // 2. Peers: one bounded streaming pass, exact native id comparison.
     let peers = scan_peers(input, &files, &originals, &mut coverage, census.as_ref());
 
-    // Refuse concurrent state publication even if no vanished peer used it.
-    // Atomic replacement, same-generation rewrites and in-place writes are all
-    // detected by the content digest plus opened/path metadata and generation.
-    if let (Some(path), Some(snapshot)) = (&input.census_index_path, &census) {
-        snapshot.verify(path)?;
-    }
-
     // 3. B2 allocation for the whole batch, frozen before bodies and money.
     let allocation = allocate(input, &originals, &peers)?;
 
@@ -1335,6 +1328,13 @@ pub(crate) fn produce(
         "b2_allocation_sha256": allocation.sha256,
         "admission_authority": "none",
     });
+    // Refuse concurrent state publication even if no vanished peer used it.
+    // Atomic replacement, same-generation rewrites and in-place writes are all
+    // detected by the content digest plus opened/path metadata and generation.
+    if let (Some(path), Some(snapshot)) = (&input.census_index_path, &census) {
+        snapshot.verify(path)?;
+    }
+
     Ok(ProducerOutput {
         artifact_json,
         artifact_sha256,
@@ -1989,9 +1989,11 @@ fn scan_target_copies(
                 size_bytes,
                 content_sha256,
                 copies,
+                lineage_edges,
             }) if Some(size_bytes) == file.size_bytes
                 && Some(&content_sha256) == file.content_sha256.as_ref() =>
             {
+                scan.lineage_edges.extend(lineage_edges);
                 scan.target_inherited_copy_line_count += copies.len() as u64;
                 scan.copies
                     .extend(
