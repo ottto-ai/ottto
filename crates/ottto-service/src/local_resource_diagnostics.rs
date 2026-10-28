@@ -1205,7 +1205,6 @@ mod tests {
 
     use super::*;
 
-    use super::*;
 
     #[test]
     fn history_proof_correction_deferral_is_counted() {

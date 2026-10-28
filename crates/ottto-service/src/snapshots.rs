@@ -27862,7 +27862,7 @@ impl OwnedSourceScan {
                                 &active.candidate.path,
                             );
                         }
-                        index.archive_decode_error(&active.candidate.path, &_error);
+                        index.archive_decode_error(&active.candidate.path, &error);
                         active.parser.reader.reader.close();
                         census.record_unreadable(UnreadableCause::OpenRead, 1);
                         pending!();
