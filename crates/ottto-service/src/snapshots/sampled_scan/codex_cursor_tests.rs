@@ -13564,3 +13564,125 @@ fn compressed_memo_rechecks_refuse_decoded_offsets() {
             .is_none());
     });
 }
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_floor_preserves_a_real_primary_tail_and_other_retained_copy() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap();
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let primary = ScanRoot::new(40);
+        let peer = ScanRoot::new(40);
+        let cache = Arc::new(SharedCache::default());
+        let key = local_index_key(&primary.file(SESSION));
+        let peer_key = local_index_key(&peer.file(SESSION));
+        let mut index = ScanIndex::default();
+        for fixture in [&primary, &peer] {
+            let mut warm = ScanIndex::default();
+            for _ in 0..64 {
+                let (next, _) = page(fixture, warm, Some(Arc::clone(&cache)));
+                warm = next;
+                if cache
+                    .retained_checkpoint(&local_index_key(&fixture.file(SESSION)))
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            if std::ptr::eq(fixture, &primary) {
+                index = warm;
+            }
+        }
+        assert!(cache.retained_checkpoint(&key).is_some());
+        assert!(cache.retained_checkpoint(&peer_key).is_some());
+        let bytes = zstd::stream::encode_all(&b"synthetic archive"[..], 1).unwrap();
+        let archive = Temp::new("decoder-floor", &bytes);
+        let credit = codex_compressed_input::compressed_input_credit().unwrap();
+        let floor = admission_floor(&cache);
+        let budget = cache.cursor_resident()
+            + retained_floor(&cache)
+            + credit
+            + floor
+            + super::super::side_ledger::SIDE_LEDGER_BYTES;
+        with_test_state_budget(budget - 1, || {
+            assert!(OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                .unwrap()
+                .is_none());
+            assert_eq!(cache.cursor_reserved(), 0);
+        });
+        with_test_state_budget(budget, || {
+            let mut input = OpenedInput::funded(File::open(&archive.0).unwrap(), &cache)
+                .unwrap()
+                .unwrap();
+            input.read_exact(&mut [0; 1]).unwrap();
+            primary.append(SESSION, &token_line(41));
+            index.traversal = None;
+            let (_, scan, modes) =
+                page_in(&primary, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            assert_eq!(
+                modes,
+                (0, 1),
+                "a real primary Tail progresses during the decode"
+            );
+            assert_eq!(scan.snapshots.len(), 1);
+            assert!(
+                cache.retained_checkpoint(&peer_key).is_some(),
+                "decoder causes no extra eviction"
+            );
+            assert!(cache.retained_checkpoint(&key).is_some());
+            assert_eq!(cache.cursor_reserved(), credit);
+            input.close();
+        });
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_release_and_unwind_follow_the_production_stores_guard() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::DECODER_TEST_LOCK
+        .lock()
+        .unwrap();
+    for unwind in [false, true] {
+        let cache = Arc::new(SharedCache::default());
+        let f = Temp::new(
+            "stores-owner",
+            &zstd::stream::encode_all(&b"synthetic"[..], 1).unwrap(),
+        );
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            let mut input = OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+                .unwrap()
+                .unwrap();
+            input.read_exact(&mut [0; 1]).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let stores = cache.durable().unwrap();
+                assert!(super::super::durable_tail::stores_held());
+                if unwind {
+                    panic!("synthetic durable operation failure");
+                }
+                drop(stores);
+            }));
+            assert_eq!(result.is_err(), unwind);
+            assert!(!super::super::durable_tail::stores_held());
+            input.close();
+        });
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_owner"));
+    }
+    #[cfg(debug_assertions)]
+    {
+        let cache = Arc::new(SharedCache::default());
+        let guard = cache.durable().unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| DecoderOwner::acquire(
+                &cache, 1
+            )))
+            .is_err()
+        );
+        drop(guard);
+        DecoderOwner::acquire(&cache, 1).unwrap().release();
+    }
+}
