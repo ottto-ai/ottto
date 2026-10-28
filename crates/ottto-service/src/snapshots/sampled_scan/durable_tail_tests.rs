@@ -1355,8 +1355,7 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
 ///
 /// This is a same-binary round trip: no record bytes written by the
 /// previous binary are replayed. Its cross-version claim rests on the
-/// pinned literal interpretation below, on `durable_tail.rs`, its store and
-/// codec being unchanged from the permit-era base (7997fe740), and on the
+/// pinned literal interpretation below and on the
 /// sampled-scope goldens (`the_always_on_sampled_scope_keeps_the_permit_era_bytes`).
 /// A restore reads only its bounded certificate and re-derivation bytes,
 /// never the transcript in Full; an unsupported heap layout cannot restore
@@ -1419,7 +1418,10 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
     .unwrap()
     .binding;
     let (reduction, _) = native_record(&path, &scope);
-    let mut store = DurableTailStore::new(store::store_dir_for_index(&index_path), DurableSource::ClaudeCode);
+    let mut store = DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        DurableSource::ClaudeCode,
+    );
     store
         .write_after_save(
             lock,
@@ -1435,15 +1437,17 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
         .unwrap();
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, capture);
-    let restored = cache.durable_restore(
-        source,
-        &key,
-        &path,
-        &scope,
-        &mut File::open(&path).unwrap(),
-        &index,
-        &after,
-    ).into_test_option();
+    let restored = cache
+        .durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &index,
+            &after,
+        )
+        .into_test_option();
     let supported = crate::heap_layout_bound::layout_supported();
     assert_eq!(restored.is_some(), supported);
     let (counts, disk) = cache.durable_counters(source).unwrap();
