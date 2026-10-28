@@ -348,6 +348,44 @@ impl HeaderInventory {
             return false;
         };
         let key = local_index_key(&path);
+        let empty = BTreeSet::new();
+        let paths = index
+            .traversal
+            .as_ref()
+            .map(|t| &t.codex_rollout_paths)
+            .unwrap_or(&empty);
+        if let Some(owner) = metadata.identity_from_path_evidence(&path.with_extension(
+            if is_compressed_codex_rollout(Some(&path), None) {
+                ""
+            } else {
+                "jsonl"
+            },
+        )) {
+            if metadata.spawn_parents.get(&owner).is_some_and(|parent| {
+                super::codex_compressed_holds::parent_unbound(
+                    parent,
+                    CodexParentCensus::new(&self.roots, paths),
+                    metadata,
+                )
+            }) {
+                index.hold_compressed(
+                    &path,
+                    BTreeSet::from([owner]),
+                    CodexZstCause::ParentLedgerUnbound,
+                );
+            }
+        }
+        if index
+            .files
+            .get(&key)
+            .is_some_and(|entry| entry.codex_compressed_hold.is_some())
+        {
+            if let Some(owners) = index.codex_state_only_blocked_by_file.get(&key) {
+                self.held_owners.extend(owners.iter().cloned());
+            }
+            self.held_archives.insert(key);
+            return false;
+        }
         let compressed = is_compressed_codex_rollout(Some(&path), None);
         let mut excluded = false;
         let result = (|| -> Result<HeaderWitness> {

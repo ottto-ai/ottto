@@ -54,6 +54,8 @@ pub(crate) enum CodexZstCause {
     ParserStateRequired,
     #[serde(rename = "CompressedHeaderInvalid")]
     HeaderInvalid,
+    #[serde(rename = "CompressedFamilyUnproven")]
+    FamilyUnproven,
     #[doc(hidden)]
     #[serde(skip)]
     __Count,
@@ -80,6 +82,19 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
             "codex_zst_refused",
             BTreeMap::from([(cause, previous.saturating_add(1))]),
         )]),
+    );
+}
+
+static CODEX_ZST_HELD: [AtomicU64; CODEX_ZST_CAUSES] =
+    [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
+pub(crate) fn codex_zst_held(cause: CodexZstCause) {
+    let total = CODEX_ZST_HELD[cause as usize]
+        .fetch_add(1, Relaxed)
+        .saturating_add(1);
+    traversal_point(
+        "codex_zst_held",
+        "codex",
+        &BTreeMap::from([("codex_zst_held", BTreeMap::from([(cause, total)]))]),
     );
 }
 
@@ -1202,6 +1217,7 @@ mod tests {
             DecodedOverLimit,
             ParserStateRequired,
             HeaderInvalid,
+            FamilyUnproven,
         ];
         assert_eq!(ALL.len(), super::CODEX_ZST_CAUSES);
         for (index, cause) in ALL.iter().enumerate() {

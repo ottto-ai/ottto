@@ -66,6 +66,9 @@ mod oversized_discovery;
 pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
 pub(crate) use tests::output as claude_request_account_output;
+#[cfg(test)]
+mod codex_compressed_hold_tests;
+mod codex_compressed_holds;
 mod codex_compressed_input;
 #[cfg(test)]
 mod codex_zst_refusal_tests;
@@ -4365,6 +4368,9 @@ pub struct ScanIndexEntry {
     /// stored ctime belongs to. Zero (unavailable) never adopts the ctime.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub(crate) opened_birth_nanos: u64,
+    /// Sticky non-red custody; only 11c may release it. Never an ACK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_compressed_hold: Option<CodexZstCause>,
 }
 impl ScanIndexEntry {
     fn codex_recovery_is_pending(&self) -> bool {
@@ -21584,7 +21590,7 @@ fn codex_parent_candidate_match(
         CodexCensusMatch::One(key) => PathBuf::from(key),
     };
     if refuse_compressed_codex(Some(&path), None, CodexZstCause::ParentLedgerUnbound).is_err() {
-        return Err(Absent);
+        return Err(NoLedger);
     }
     let scan_root = census
         .scan_roots
@@ -21676,7 +21682,7 @@ fn retained_codex_parent(
         )
         .is_err()
         {
-            return Err(CodexParentUnresolvable::Absent);
+            return Err(CodexParentUnresolvable::NoLedger);
         }
         cache
             .retained_open(Path::new(&key), &file)
@@ -21727,6 +21733,8 @@ fn codex_parent_locate(
         CodexCensusMatch::One(key) => key,
     };
     let path = PathBuf::from(key);
+    refuse_compressed_codex(Some(&path), None, CodexZstCause::ParentLedgerUnbound)
+        .map_err(|_| NoLedger)?;
     let scan_root = census
         .scan_roots
         .iter()
@@ -26795,6 +26803,7 @@ impl OwnedSourceScan {
                     if !done {
                         pending!();
                     }
+                    inventory.hold_compressed_families(index);
                     let unresolved = &inventory.held_owners;
                     residue_blocked_session_ids.extend(unresolved.iter().cloned());
                     codex_state_only_blocked_session_ids.extend(unresolved.iter().cloned());
@@ -26806,8 +26815,14 @@ impl OwnedSourceScan {
                         {
                             return true;
                         }
-                        census.record_unreadable(UnreadableCause::Reduction, 1);
-                        residue_index_keys.insert(key);
+                        if !index
+                            .files
+                            .get(&key)
+                            .is_some_and(|e| e.codex_compressed_hold.is_some())
+                        {
+                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                            residue_index_keys.insert(key);
+                        }
                         codex_state_only_blocked_session_ids.extend(
                             codex_session_id_candidates_from_path(
                                 &candidate.path.with_extension(""),
@@ -28907,6 +28922,34 @@ impl OwnedSourceScan {
                         pending!();
                     }
                 };
+                if source == SnapshotSource::Codex
+                    && parsed_file
+                        .codex_parent_session_ref
+                        .as_deref()
+                        .is_some_and(|parent| {
+                            codex_compressed_holds::parent_unbound(
+                                parent,
+                                codex_parent_identities.census(index),
+                                &codex_title_metadata,
+                            )
+                        })
+                {
+                    let owners = parsed_file.state_only_blocked_session_ids.clone();
+                    index.hold_compressed(
+                        &candidate.path,
+                        owners.clone(),
+                        CodexZstCause::ParentLedgerUnbound,
+                    );
+                    for alias in &aliases {
+                        index.hold_compressed(
+                            &alias.path,
+                            owners.clone(),
+                            CodexZstCause::ParentLedgerUnbound,
+                        );
+                    }
+                    codex_state_only_blocked_session_ids.extend(owners);
+                    pending!();
+                }
                 if let Some(evidence) = index
                     .files
                     .get_mut(&local_index_key(&candidate.path))
@@ -42331,6 +42374,14 @@ fn open_and_identify_scan_candidate_with_rescue(
     verification_rescue: bool,
     cache: Option<&sampled_scan::SharedCache>,
 ) -> Option<(CandidateFile, File)> {
+    if source == SnapshotSource::Codex
+        && files
+            .get(&local_index_key(&candidate.path))
+            .and_then(|entry| entry.codex_compressed_hold)
+            .is_some()
+    {
+        return None;
+    }
     let (mut opened_file, live) =
         match open_candidate_file_stat_retained(source, &mut candidate, cache) {
             Ok(opened) => opened,
@@ -42383,9 +42434,10 @@ fn open_and_identify_scan_candidate_with_rescue(
     {
         if matches!(
             archive.disposition,
-            ArchiveDisposition::Held { .. } | ArchiveDisposition::Refused { .. }
-        ) || (matches!(archive.disposition, ArchiveDisposition::Pending { .. })
-            && entry.last_snapshot_fingerprint.is_none())
+            ArchiveDisposition::Held { cause } if !matches!(cause, CodexZstCause::ParentLedgerUnbound | CodexZstCause::FamilyUnproven)
+        ) || matches!(archive.disposition, ArchiveDisposition::Refused { .. })
+            || (matches!(archive.disposition, ArchiveDisposition::Pending { .. })
+                && entry.last_snapshot_fingerprint.is_none())
         {
             census.record_unreadable(UnreadableCause::Reduction, 1);
         }
@@ -47636,6 +47688,12 @@ impl ScanIndex {
                     });
             }
         }
+        for (key, entry) in &self.files {
+            if entry.codex_compressed_hold.is_some() {
+                files.entry(key.clone()).or_default().codex_compressed_hold =
+                    entry.codex_compressed_hold;
+            }
+        }
         // A complete census may prune vanished/aged paths from `self`, but a
         // partial upload must never make that deletion durable. Only the final
         // all-accepted save may publish pruning.
@@ -48738,6 +48796,10 @@ impl ScanIndex {
                     .get(&key)
                     .and_then(|entry| entry.codex_counting_owner.clone()),
                 archive: self.files.get(&key).and_then(|entry| entry.archive.clone()),
+                codex_compressed_hold: self
+                    .files
+                    .get(&key)
+                    .and_then(|entry| entry.codex_compressed_hold),
                 opened_changed_nanos: candidate.fingerprint_changed_nanos,
                 opened_birth_nanos: candidate.fingerprint_birth_nanos,
             },
@@ -48795,6 +48857,10 @@ impl ScanIndex {
                     .get(&key)
                     .and_then(|entry| entry.codex_counting_owner.clone()),
                 archive: self.files.get(&key).and_then(|entry| entry.archive.clone()),
+                codex_compressed_hold: self
+                    .files
+                    .get(&key)
+                    .and_then(|entry| entry.codex_compressed_hold),
                 opened_changed_nanos: candidate.fingerprint_changed_nanos,
                 opened_birth_nanos: candidate.fingerprint_birth_nanos,
             },
@@ -51961,6 +52027,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     archive: None,
+                    codex_compressed_hold: None,
                     opened_changed_nanos: 0,
                     opened_birth_nanos: 0,
                 },
@@ -53349,6 +53416,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     archive: None,
+                    codex_compressed_hold: None,
                     opened_changed_nanos: 0,
                     opened_birth_nanos: 0,
                 },
@@ -53802,6 +53870,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     archive: None,
+                    codex_compressed_hold: None,
                     opened_changed_nanos: 0,
                     opened_birth_nanos: 0,
                 },
@@ -53900,6 +53969,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     archive: None,
+                    codex_compressed_hold: None,
                     opened_changed_nanos: 0,
                     opened_birth_nanos: 0,
                 },
@@ -53968,6 +54038,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     archive: None,
+                    codex_compressed_hold: None,
                     opened_changed_nanos: 0,
                     opened_birth_nanos: 0,
                 },
@@ -54023,6 +54094,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     archive: None,
+                    codex_compressed_hold: None,
                     opened_changed_nanos: 0,
                     opened_birth_nanos: 0,
                 },
@@ -54075,6 +54147,7 @@ mod tests {
                     codex_counting_v2: false,
                     codex_counting_owner: None,
                     archive: None,
+                    codex_compressed_hold: None,
                     opened_changed_nanos: 0,
                     opened_birth_nanos: 0,
                 },
@@ -59858,6 +59931,7 @@ mod tests {
             codex_counting_v2: false,
             codex_counting_owner: None,
             archive: None,
+            codex_compressed_hold: None,
             opened_changed_nanos: 0,
             opened_birth_nanos: 0,
         };
@@ -83997,6 +84071,7 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 archive: None,
+                codex_compressed_hold: None,
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
             },
@@ -85620,6 +85695,7 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 archive: None,
+                codex_compressed_hold: None,
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
             },
@@ -87199,6 +87275,7 @@ mod tests {
             codex_counting_v2: false,
             codex_counting_owner: None,
             archive: None,
+            codex_compressed_hold: None,
             opened_changed_nanos: 0,
             opened_birth_nanos: 0,
         }
@@ -88290,6 +88367,7 @@ mod tests {
                 codex_counting_v2: false,
                 codex_counting_owner: None,
                 archive: None,
+                codex_compressed_hold: None,
                 opened_changed_nanos: 0,
                 opened_birth_nanos: 0,
             },
@@ -89353,7 +89431,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
 });
 crate::heap_layout_bound::fields!(ScanCensus; oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store);
-crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, archive, opened_changed_nanos, opened_birth_nanos);
+crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, archive, opened_changed_nanos, opened_birth_nanos, codex_compressed_hold);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; retired_unchanged_reread_admitted, retired_reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
