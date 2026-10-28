@@ -35,7 +35,6 @@ struct Cache {
     entries: Vec<Entry>,
     refreshed: i64,
     capability: bool,
-    #[serde(skip)]
     rejected: bool,
     #[serde(skip)]
     persisted_at: i64,
@@ -456,6 +455,13 @@ fn reject(generation: &Generation) {
     if let Ok(mut state) = CACHE.lock() {
         if let Some(cache) = state.as_mut() {
             cache.rejected = true;
+            cache.capability = false;
+            // An ordinary restart cannot restore edit authority. If atomic
+            // persistence fails, discard the older capability-bearing cache.
+            let support = default_support_dir();
+            if persist(cache, &support).is_err() {
+                let _ = fs::remove_file(support.join(CACHE_NAME));
+            }
         }
     }
 }
@@ -572,6 +578,17 @@ mod tests {
         assert!(read().entries.unwrap()[0].nickname.is_none());
         reject(&next);
         assert_eq!(read().connected, Some(false));
+        *CACHE.lock().unwrap() = None; // fresh process, same device/org binding
+        assert_eq!(read().connected, Some(false));
+        apply_upload(Some(&next), Some(&[]));
+        assert_eq!(read().connected, Some(false));
+        {
+            let _lock = crate::control::lock_setup_run_binding();
+            invalidate_locked();
+        }
+        let reclaimed = generation().unwrap();
+        apply_upload(Some(&reclaimed), Some(&[]));
+        assert_eq!(read().connected, Some(true));
         std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
     }
 }

@@ -99,8 +99,9 @@ files and policy helpers that cannot be evaluated statically refuse as
 
 Codex checks its selected `config.toml` and active profile. Non-OpenAI providers,
 redefined OpenAI providers, endpoint overrides, API login, a different forced
-workspace, or a credential store other than file are refused. Project config
-and managed policy that this evaluator cannot evaluate are presence-refused.
+workspace, or a credential store other than file are refused. System
+`/etc/codex/config.toml`, cwd `config.toml`, project `.codex/config.toml` and
+managed policy that this evaluator cannot evaluate are presence-refused.
 Reasons identify a typed settings layer, never a settings value or path.
 This conservative evaluator can reject a configuration the provider would
 accept. It does not fetch remote organization policy.
@@ -153,7 +154,8 @@ no email-shaped text or controls, formatting characters (except emoji ZWJ),
 private-use, unassigned or line/paragraph separators (Unicode 15.1 baseline).
 401/403 makes editing not connected; no retry, offline queue or registration
 is attempted. An older backend's absent upload field is a no-op.
-Successful ordinary uploads do not clear a nickname authorization rejection;
+Authorization rejection is persisted for the device/org generation and survives
+daemon restart. Successful ordinary uploads do not clear that rejection;
 reconnecting or reclaiming establishes new authority. Repeated unchanged
 uploads update in-memory freshness and persist it at most every fifteen minutes;
 changed revisions persist immediately.

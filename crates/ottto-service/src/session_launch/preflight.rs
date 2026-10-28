@@ -105,7 +105,7 @@ fn ancestors(cwd: &Path) -> impl Iterator<Item = &Path> {
 pub(super) fn evaluate(binding: &Binding, cwd: &Path) -> Result<(), Block> {
     match binding.provider {
         Provider::ClaudeCode => claude(binding, cwd),
-        Provider::Codex => codex(binding, cwd),
+        Provider::Codex => codex(binding, cwd, Path::new("/etc/codex")),
         Provider::Unknown => Err(block(Reason::Unknown)),
     }
 }
@@ -296,19 +296,21 @@ fn refuse_present(path: &Path, layer: Layer) -> Result<(), Block> {
     }
 }
 
-fn codex(binding: &Binding, cwd: &Path) -> Result<(), Block> {
+pub(super) fn codex(binding: &Binding, cwd: &Path, system_dir: &Path) -> Result<(), Block> {
     // Codex 0.x project and MDM requirements/config cannot be evaluated by
     // this local-only evaluator. Presence is a typed refusal, never ignored.
     for ancestor in ancestors(cwd).filter(|ancestor| *ancestor != binding.user.home) {
         refuse_present(&ancestor.join(".codex/config.toml"), Layer::Project)?;
     }
-    for path in [
-        "/etc/codex/managed_config.toml",
-        "/etc/codex/requirements.toml",
-        "/Library/Managed Preferences/com.openai.codex.plist",
-    ] {
-        refuse_present(Path::new(path), Layer::Managed)?;
+    // Codex 0.150 also loads cwd/config.toml and the system config layer.
+    refuse_present(&cwd.join("config.toml"), Layer::Project)?;
+    for name in ["config.toml", "managed_config.toml", "requirements.toml"] {
+        refuse_present(&system_dir.join(name), Layer::Managed)?;
     }
+    refuse_present(
+        Path::new("/Library/Managed Preferences/com.openai.codex.plist"),
+        Layer::Managed,
+    )?;
     refuse_present(&binding.root.join("managed_config.toml"), Layer::Managed)?;
     for path in [
         binding

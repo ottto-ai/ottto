@@ -726,3 +726,36 @@ fn version_probe_finds_the_selected_installs_shebang_interpreter() {
         "2.1.310"
     );
 }
+
+#[test]
+fn codex_system_and_cwd_configuration_are_presence_refused() {
+    let scratch = crate::test_scratch::ScratchDir::new("codex-config-layers");
+    let home = scratch.as_ref().join("home");
+    let cwd = scratch.as_ref().join("project");
+    let system = scratch.as_ref().join("system-codex");
+    for path in [&home, &cwd, &system] {
+        fs::create_dir(path).unwrap();
+    }
+    let mut binding = fixture_binding(&home);
+    binding.provider = Provider::Codex;
+    binding.claude_slot = None;
+    binding.root = home.join(".codex");
+    assert!(preflight::codex(&binding, &cwd, &system).is_ok());
+    for (path, layer) in [
+        (
+            system.join("config.toml"),
+            ottto_protocol::SessionLaunchSettingLayerV1::Managed,
+        ),
+        (
+            cwd.join("config.toml"),
+            ottto_protocol::SessionLaunchSettingLayerV1::Project,
+        ),
+    ] {
+        fs::write(&path, "model_provider = 'custom'\n").unwrap();
+        let error = preflight::codex(&binding, &cwd, &system).unwrap_err();
+        assert_eq!(error.reason, Reason::ConfigUnsupported);
+        assert_eq!(error.setting_layer, Some(layer));
+        fs::remove_file(path).unwrap();
+        assert!(preflight::codex(&binding, &cwd, &system).is_ok());
+    }
+}
