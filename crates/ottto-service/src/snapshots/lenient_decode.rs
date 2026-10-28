@@ -327,6 +327,7 @@ impl Serialize for ScanIndex {
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
         );
+        field!(compressed_admission_yields, BTreeMap::is_empty);
         map.end()
     }
 }
@@ -418,6 +419,7 @@ pub(super) const FIELDS: &[&str] = &[
     "upload_ack_retirement_handoff",
     "held_audit_progress",
     "claude_money_birth_store",
+    "compressed_admission_yields",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1912,6 +1914,10 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "accepted_rebuild_last_alarm_unix_seconds" => {
                             index.accepted_rebuild_last_alarm_unix_seconds =
                                 self.diagnostic_timestamp(value)?;
+                        }
+                        "compressed_admission_yields" => {
+                            index.compressed_admission_yields =
+                                self.records("compressed_admission_yields", value, false)?;
                         }
                         "claude_money_birth_store" => {
                             // Optional money hints cannot rebuild or pause an otherwise valid index.

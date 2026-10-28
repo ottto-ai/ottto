@@ -144,8 +144,11 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
         .is_err());
     });
     assert_refused(CodexZstCause::ParentLedgerUnbound, || {
-        let (parent, retained) =
-            retained_codex_parent(census, "synthetic", &sampled_scan::SharedCache::default());
+        let (parent, retained) = retained_codex_parent(
+            census,
+            "synthetic.jsonl",
+            &sampled_scan::SharedCache::default(),
+        );
         assert!(parent.is_err());
         assert!(retained.is_none());
     });
