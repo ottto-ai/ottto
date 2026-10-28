@@ -42,7 +42,9 @@ static PROCESS: OnceLock<LockedStateDir> = OnceLock::new();
 /// Keeps `locked` for the rest of the process. A daemon takes the lock once,
 /// first; a later call keeps the first holder.
 pub fn hold_for_process(locked: LockedStateDir) -> &'static LockedStateDir {
-    PROCESS.get_or_init(|| locked)
+    let locked = PROCESS.get_or_init(|| locked);
+    crate::claude_sole_login::start(locked.dir());
+    locked
 }
 
 /// The lock this process holds on the state directory containing `path`,

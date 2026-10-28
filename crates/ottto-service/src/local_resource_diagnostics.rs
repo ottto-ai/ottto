@@ -278,6 +278,8 @@ impl Probe {
     ) {
         #[derive(Serialize)]
         struct Counts {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sole_login: Option<crate::claude_sole_login::Counts>,
             #[serde(flatten)]
             collection: CollectionCounts,
             #[serde(flatten)]
@@ -297,6 +299,7 @@ impl Probe {
         }
         let claude = source == "claude_code";
         let counts = Counts {
+            sole_login: claude.then(crate::claude_sole_login::counts).flatten(),
             line_delivery: self
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())

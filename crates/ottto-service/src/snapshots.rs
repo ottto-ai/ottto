@@ -20402,6 +20402,9 @@ impl SnapshotAccumulator {
             _ => None,
         }
         .map(Box::new);
+        if self.source == SnapshotSource::ClaudeCode {
+            crate::claude_sole_login::seen(&source_session_id, path);
+        }
         let mut item = SnapshotItem {
             request_evidence: Vec::new(),
             request_identity_refusals: 0,

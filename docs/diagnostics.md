@@ -600,3 +600,11 @@ counts as `hint_failed`, before any contract observation. While a placeholder
 is stored, permit flaps remain visible in permit outcomes but cannot be
 classified into `from_empty`, `to_empty` or `collector_e2_grouping` from that
 unknown prior contract.
+
+
+The Claude `native_collection_page` carrier includes `sole_login` counts for
+`folders_tracked`, `folders_ineligible`, and `health_gaps` (`daemon_down` and
+`watcher_error`). These count local hash-only history; they label no requests.
+Watcher qualification is deferred: every interval without that proof is a gap,
+including every restart. No overflow/drop coverage is claimed by these counts.
+The history and write-intent files stay local and are not diagnostic payloads.

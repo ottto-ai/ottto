@@ -17456,9 +17456,12 @@ fn require_claude_auth_identity_agreement(
 }
 
 fn read_claude_cli_oauth_account(path: &Path) -> Option<ClaudeCliOauthAccount> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    parse_claude_cli_oauth_account(&value)
+    let value = crate::claude_sole_login::account_read(path, || {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    });
+    parse_claude_cli_oauth_account(value.as_ref()?)
 }
 
 fn parse_claude_cli_oauth_account(value: &Value) -> Option<ClaudeCliOauthAccount> {

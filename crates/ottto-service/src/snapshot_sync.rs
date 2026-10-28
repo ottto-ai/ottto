@@ -3782,6 +3782,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                         watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).ok();
                     }
                 }
+                crate::claude_sole_login::cadence();
                 match sync_once_with_retry(&home, &support_dir, &daemon, &mut retry) {
                     Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                     Err(error) => {

@@ -61,6 +61,8 @@ credit-balance labels, diagnostics, logs and support receipts retain their
 existing redaction rules; email is permitted only in the named status display
 fields. Tokens and credentials stay local.
 
+Ottto may label a session's account with the single Claude login on your Mac for that organization
+
 Local usage snapshots use derived and redacted fields such as session ids,
 timestamps, usage totals, model usage, hashed workspace identity, and
 display-safe account or plan evidence.

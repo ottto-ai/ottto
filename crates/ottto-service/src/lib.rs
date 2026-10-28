@@ -10,6 +10,7 @@ pub mod claude_browser_auth;
 pub mod claude_local_otel;
 pub(crate) mod claude_refresher;
 mod claude_session_registrations;
+pub(crate) mod claude_sole_login;
 pub(crate) mod claude_spawn_gate;
 pub(crate) mod claude_status_coverage;
 pub mod claude_upkeep;
