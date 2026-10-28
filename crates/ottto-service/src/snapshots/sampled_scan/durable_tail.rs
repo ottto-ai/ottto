@@ -43,18 +43,18 @@ use sampled_jsonl::CachedJsonlReduction;
 /// retained lock stays bounded. Entries past it are deferred to a later save.
 pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 
-/// Upper bound of both stores' resident digest maps (two sources).
-pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 128;
+/// One slot per source, three sources: resident digest maps outside RAM cache.
+pub(crate) const STORES_RESIDENT_BOUND: usize = 3 * store::MAX_RECORDS * 128;
 
 /// Head re-parse bytes of restores, per source, for the process lifetime.
 /// The re-parse bypasses the reread guard (bounded at `HEAD_BOUND`, on a RAM
 /// miss only), so the census pass line reports it beside the guard's own
 /// counters (SOURCE N1).
-static REDERIVE_HEAD_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static REDERIVE_HEAD_BYTES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
     durable_source(source).map_or(0, |source| {
-        REDERIVE_HEAD_BYTES[source as usize].load(Ordering::Relaxed)
+        REDERIVE_HEAD_BYTES[source.slot()].load(Ordering::Relaxed)
     })
 }
 
@@ -81,6 +81,7 @@ pub(crate) struct Counters {
     /// state-directory lock (not the daemon).
     pub(crate) write_unlocked: u64,
     pub(crate) peak_body_bytes: u64,
+    pub(crate) retained_refused_pi_ledger_cap: u64,
     /// GC's largest keep map: index keys with a record on disk, at most the
     /// store's `INVENTORY_BOUND`, whatever the index size.
     pub(crate) gc_keep_peak: u64,
@@ -105,7 +106,7 @@ impl Counters {
              refused_record={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
-             write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
+             write_deferred={} write_unlocked={} peak_body_bytes={} retained_refused_pi_ledger_cap={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} refused{{corrupt:{},newer:{},older:{},allowlist:{},unusable:{}}} \
              unusable{{errno:{},mode:{},shape:{}}} \
@@ -128,6 +129,7 @@ impl Counters {
             self.write_deferred,
             self.write_unlocked,
             self.peak_body_bytes,
+            self.retained_refused_pi_ledger_cap,
             store.disk_records,
             store.disk_bytes,
             store.bytes_written,
@@ -169,6 +171,7 @@ struct Slot {
 pub(crate) struct Stores {
     claude: Option<Slot>,
     codex: Option<Slot>,
+    pi: Option<Slot>,
     /// Keys admitted to the RAM cache since their source's last write.
     touched: BTreeSet<String>,
     /// Selection provenance: the source-file fingerprint each admitted
@@ -184,6 +187,7 @@ impl Stores {
         match source {
             DurableSource::ClaudeCode => &mut self.claude,
             DurableSource::Codex => &mut self.codex,
+            DurableSource::Pi => &mut self.pi,
         }
     }
 }
@@ -203,7 +207,7 @@ pub(crate) fn durable_source(source: SnapshotSource) -> Option<DurableSource> {
     match source {
         SnapshotSource::ClaudeCode => Some(DurableSource::ClaudeCode),
         SnapshotSource::Codex => Some(DurableSource::Codex),
-        SnapshotSource::Pi => None,
+        SnapshotSource::Pi => Some(DurableSource::Pi),
     }
 }
 
@@ -461,7 +465,7 @@ impl SharedCache {
             }
         };
         stores.counters.rederive_head_bytes += receipt.head_bytes;
-        REDERIVE_HEAD_BYTES[source as usize].fetch_add(receipt.head_bytes, Ordering::Relaxed);
+        REDERIVE_HEAD_BYTES[source.slot()].fetch_add(receipt.head_bytes, Ordering::Relaxed);
         stores.counters.rederive_named_lines += receipt.named_lines;
         stores.counters.rederive_line_bytes += receipt.line_bytes;
         drop(stores);
@@ -681,6 +685,11 @@ impl SharedCache {
         counters.write_deferred += deferred;
         counters.peak_body_bytes = counters.peak_body_bytes.max(peak);
         for class in not_persisted {
+            if snapshot_source == SnapshotSource::Pi
+                && matches!(class, "pi_ledger_cap" | "record_bytes")
+            {
+                counters.retained_refused_pi_ledger_cap += 1;
+            }
             Counters::bump(&mut counters.not_persisted, class);
         }
         let slot = stores.slot(source).as_mut()?;

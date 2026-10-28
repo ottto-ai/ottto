@@ -94,23 +94,33 @@ pub(crate) trait SingleWriter {
     fn state_dir(&self) -> &Path;
 }
 
-/// The sources M1 keeps. Pi is never stored.
+/// The sources kept by the durable warm cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DurableSource {
     ClaudeCode,
     Codex,
+    Pi,
 }
 impl DurableSource {
+    pub(crate) fn slot(self) -> usize {
+        match self {
+            Self::ClaudeCode => 0,
+            Self::Codex => 1,
+            Self::Pi => 2,
+        }
+    }
     fn tag(self) -> u8 {
         match self {
             Self::ClaudeCode => 1,
             Self::Codex => 2,
+            Self::Pi => 3,
         }
     }
     fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             1 => Some(Self::ClaudeCode),
             2 => Some(Self::Codex),
+            3 => Some(Self::Pi),
             _ => None,
         }
     }
