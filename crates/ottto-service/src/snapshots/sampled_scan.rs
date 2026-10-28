@@ -1973,10 +1973,66 @@ pub(super) fn new_source_parser(
     artifacts: bool,
     curve: bool,
     identity_capture: bool,
-    index: &ScanIndex,
+    index: &mut ScanIndex,
+    cache: Option<&Arc<SharedCache>>,
 ) -> Result<OwnedJsonlParser> {
-    let mut parser = OwnedJsonlParser::new(
-        file,
+    let input =
+        if source == SnapshotSource::Codex
+            && is_compressed_codex_rollout(Some(&candidate.path), None)
+        {
+            let key = local_index_key(&candidate.path);
+            anyhow::ensure!(
+                !index
+                    .files
+                    .get(&key)
+                    .and_then(|entry| entry.archive.as_ref())
+                    .is_some_and(|archive| archive.quiet(&file)),
+                "compressed rollout already attempted"
+            );
+            if let Some(archive) = index.files.get_mut(&key).and_then(|e| e.archive.as_mut()) {
+                if matches!(
+                    archive.disposition,
+                    ArchiveDisposition::Pending { attempts: 3.., .. }
+                ) && archive.matches(&file)
+                {
+                    archive.settle(false);
+                    anyhow::bail!("compressed settlement exhausted");
+                }
+            }
+            index.codex_state_only_blocked_session_ids.extend(
+                codex_session_id_candidates_from_path(&candidate.path.with_extension("")),
+            );
+            let input = match cache {
+                Some(cache) => OpenedInput::funded(file, cache)?,
+                None => {
+                    crate::local_resource_diagnostics::codex_zst_refused(
+                        CodexZstCause::AdmissionRefused,
+                    );
+                    None
+                }
+            };
+            let Some(input) = input else {
+                anyhow::bail!("compressed rollout admission yielded");
+            };
+            let evidence = codex_compressed_input::ArchiveEvidence::begin(
+                input.get_ref(),
+                &candidate.path,
+                index.files.get(&key).and_then(|e| e.archive.as_deref()),
+            );
+            let evidence = match evidence {
+                Ok(e) => e,
+                Err(e) => {
+                    input.close();
+                    return Err(e.into());
+                }
+            };
+            index.files.entry(key).or_default().archive = Some(Box::new(evidence));
+            input
+        } else {
+            OpenedInput::plain(file)
+        };
+    let mut parser = OwnedJsonlParser::new_opened(
+        input,
         &candidate.path,
         source,
         match source {
