@@ -279,16 +279,21 @@ fn held_literal_body_is_retryable_reoffered_and_never_poison() {
     .unwrap();
     assert_eq!(outcome, ResumableUploadResult::Completed);
 
-    // A newer body is offered at once; the backend judges it afresh.
+    // A newer body (new usage, so a new fingerprint) is offered at once;
+    // the backend judges it afresh.
     let mut newer = items.clone();
     newer[0].request_count += 1;
+    newer[0].snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &newer[0]);
+    let newer_fingerprint = newer[0].snapshot_fingerprint.clone();
+    assert_ne!(newer_fingerprint, held);
     let mut sent = Vec::new();
     upload(&newer, scope, &mut ledger, &mut accepted, |batch| {
-        sent.extend(batch.iter().map(snapshot_upload_body_witness));
-        ack(batch, &[(at(batch, &held), HELD, false)])
+        sent.extend(batch.iter().map(|i| i.snapshot_fingerprint.clone()));
+        ack(batch, &[(at(batch, &newer_fingerprint), HELD, false)])
     })
     .unwrap();
-    assert_eq!(sent, vec![snapshot_upload_body_witness(&newer[0])]);
+    assert_eq!(sent, vec![newer_fingerprint.clone()]);
 
     // Once due, the same body is re-offered and settles on acceptance.
     let mut ledger = progress();
