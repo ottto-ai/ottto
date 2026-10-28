@@ -2251,8 +2251,9 @@ struct PendingComparison {
 
 // Only this pass's one unambiguous, loss-free native completion is evidence.
 fn completed_reduction(candidate: &CandidateFile, pending: &[PendingIndexFinalization]) -> bool {
-    let key = local_index_key(&candidate.path);
-    let mut reads = pending.iter().filter(|read| read.index_key == key);
+    // Same canonical key as local_index_key, borrowed for UTF-8 paths.
+    let key = candidate.path.to_string_lossy();
+    let mut reads = pending.iter().filter(|read| read.index_key == key.as_ref());
     let Some(read) = reads.next() else {
         return false;
     };
@@ -2485,10 +2486,19 @@ impl Qualification {
         native: &[SnapshotItem],
         remaining_files: usize,
     ) -> (Vec<CandidateFile>, TargetSelection) {
-        self.take_target_candidates_after(native, 0, remaining_files, &[], usize::MAX, None)
-            .expect("logical target selection adapter")
+        self.take_target_candidates_after(
+            native,
+            0,
+            remaining_files,
+            &[],
+            usize::MAX,
+            &ScanIndex::default(),
+            None,
+        )
+        .expect("logical target selection adapter")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn take_target_candidates_after(
         &mut self,
         native: &[SnapshotItem],
@@ -2496,6 +2506,7 @@ impl Qualification {
         remaining_files: usize,
         pending: &[PendingIndexFinalization],
         file_limit: usize,
+        index: &ScanIndex,
         mut recovery: Option<&mut RecoveryBudget<'_>>,
     ) -> Result<(Vec<CandidateFile>, TargetSelection), crate::source_rotation::LocalRefusal> {
         use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
@@ -2525,7 +2536,8 @@ impl Qualification {
             prepay_selection(
                 &mut recovery,
                 &mut charged,
-                self.matching_workspace(&native[frontier..]),
+                self.matching_workspace(&native[frontier..])
+                    .and_then(|bytes| bytes.checked_add(192)), // one root digest, old/new hex buffers
             )?;
         }
         let mut sources_by_root = BTreeMap::<String, BTreeSet<String>>::new();
@@ -2562,6 +2574,23 @@ impl Qualification {
                     result.requires_base = true;
                 }
             }
+        }
+        // D-COMPARISON: decline the optional native route BEFORE any plan,
+        // latch or target attempt if this page could overflow the held scope.
+        // All page and target families count: even a restored target or an
+        // unrelated body may be held at the authoritative fold.
+        // BASE keeps the actual bodies and stamps; this grants no extra read.
+        if !sources_by_root.is_empty()
+            && !comparison_hold_scope_fits(
+                index,
+                pending,
+                native,
+                sources_by_root.keys().map(String::as_str),
+            )
+        {
+            result.requires_base = true;
+            sources_by_root.clear();
+            self.pending.clear();
         }
         // No hit, no repeated whole-page grouping. Only actual target roots
         // need current native siblings to establish acquisition completeness.
@@ -2856,6 +2885,57 @@ impl Qualification {
             })
             .sum()
     }
+}
+
+/// Conservative admission for the EXISTING bounded scope, including earlier
+/// holds in this sweep. Only borrowed page roots live in the fixed stack array;
+/// one digest at a time uses the matching workspace prepaid by selection.
+fn comparison_hold_scope_fits<'a>(
+    index: &ScanIndex,
+    pending: &'a [PendingIndexFinalization],
+    native: &'a [SnapshotItem],
+    target_roots: impl Iterator<Item = &'a str>,
+) -> bool {
+    let prior = if index.bounded_sweep_had_unsettled_upload {
+        if index.bounded_sweep_unsettled_causes
+            != UnsettledUploadCause::CompletedBlockingHolds.bit()
+        {
+            return false;
+        }
+        let Some(scope) = index
+            .claude_full_rearm_progress
+            .held_family_roots
+            .as_ref()
+            .filter(|scope| held_family_scope_has_writer_shape(scope))
+        else {
+            return false;
+        };
+        Some(scope)
+    } else {
+        None
+    };
+    let mut roots = [None; MAX_SCOPED_HELD_FAMILY_ROOTS];
+    let mut count = 0;
+    for root in pending
+        .iter()
+        .filter_map(|read| {
+            claude_index_path_member_ref(Path::new(&read.index_key)).map(|member| member.root)
+        })
+        .chain(native.iter().map(claude_snapshot_family_root_ref))
+        .chain(target_roots)
+    {
+        if roots[..count].contains(&Some(root))
+            || prior.is_some_and(|scope| scope.contains(&claude_full_rearm_root_digest(root)))
+        {
+            continue;
+        }
+        if count + prior.map_or(0, BTreeSet::len) == MAX_SCOPED_HELD_FAMILY_ROOTS {
+            return false; // never truncate or widen the scope
+        }
+        roots[count] = Some(root);
+        count += 1;
+    }
+    true
 }
 
 impl TargetAcquisition {

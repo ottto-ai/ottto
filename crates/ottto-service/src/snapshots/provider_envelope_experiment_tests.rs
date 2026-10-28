@@ -4657,6 +4657,294 @@ fn native_comparison_paid_hit_unrestorable_target_holds_copy_this_pass_only() {
     }
 }
 
+/// R2-F2: a plan can be uncovered even though one of its targets restored.
+/// Keep the hold, but count only the target with no validated completion.
+#[test]
+fn native_comparison_refused_targets_excludes_successful_restores_in_mixed_plan() {
+    if !native_positive_layout_for_test(
+        "native_comparison_refused_targets_excludes_successful_restores_in_mixed_plan",
+    ) {
+        return;
+    }
+    let (fixture, state, qualification) = native_comparison_positive_hit_fixture_with(|fixture| {
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.warm_target_reductions(cache.clone());
+        let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
+        assert!(
+            cache.take(&key).is_some(),
+            "evict exactly the parent's reduction"
+        );
+    });
+    let hit = native_comparison_paid_hit(&fixture, state, qualification);
+    assert_eq!(hit.queued, 2);
+    assert!(!hit.healthy);
+    assert_eq!(
+        hit.reads,
+        TargetReads {
+            unchanged: 1,
+            refused: 1,
+            ..TargetReads::default()
+        }
+    );
+    let (receipt, _) = hit.controller.receipt_for_test();
+    assert_eq!(receipt.completed_target_files, 1);
+    assert_eq!(
+        receipt.known_rearm_candidates.len(),
+        2,
+        "both candidates belong to the same uncovered plan"
+    );
+    let (mut index, mut scan, terminal) = complete_native_with_terminal_owner(hit.state);
+    let completion = hit.controller.complete(&scan, terminal, true).unwrap();
+    let mut fallback = completion
+        .fallback
+        .expect("one unavailable target still holds COPY");
+    let ((), rows) = crate::local_resource_diagnostics::capture(|| fallback.withhold(&mut scan));
+    let counts = &rows
+        .iter()
+        .find(|row| row["stage"] == "native_comparison_restore_unavailable")
+        .unwrap()["counts"];
+    // DoD 20: a9931824c reports 2 (plan candidates), despite the successful restore.
+    assert_eq!(counts["native_comparison_refused_targets"], 1);
+    assert_eq!(counts["native_comparison_pending_debt"], 1);
+    assert_eq!(counts["native_comparison_disclosed_restore_unavailable"], 1);
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id != PAID_HIT_COPY));
+    assert_eq!(
+        scan.snapshots.len(),
+        1,
+        "the successfully restored target body remains available"
+    );
+    fallback.after_native_fold(&mut scan, &mut index);
+    assert!(!scan.census_complete);
+    fallback
+        .restore_selected(&mut index, &fixture.index)
+        .unwrap();
+    let copy = local_index_key(&fixture.dir.join(format!("{PAID_HIT_COPY}.jsonl")));
+    assert!(!index.files.contains_key(&copy) && !index.confirmed_empty_files.contains(&copy));
+    assert_eq!(
+        index.accepted_snapshot_fingerprints,
+        fixture.index.accepted_snapshot_fingerprints
+    );
+    for (key, entry) in &fixture.index.files {
+        assert_eq!(
+            index.files[key].source_file_fingerprint,
+            entry.source_file_fingerprint
+        );
+    }
+}
+
+/// Extend the existing production-scanner fixture with real COPY files, an
+/// independent healthy family, and an earlier scope in the SAME sweep.
+fn native_comparison_scope_fixture(
+    copies: usize,
+    earlier_holds: usize,
+) -> (
+    NativePreparationFixture,
+    OwnedSourceScan,
+    claude_native_comparison::Qualification,
+    BTreeSet<String>,
+) {
+    let mut fixture = NativePreparationFixture::new();
+    fixture.cache = Some(Arc::new(sampled_scan::SharedCache::default()));
+    for n in 0..copies {
+        let session = format!("c3333333-3333-4333-8333-{n:012}");
+        fs::write(fixture.dir.join(format!("{session}.jsonl")), format!("{{\"timestamp\":\"2026-08-02T07:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"req_1\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")).unwrap();
+    }
+    fs::write(fixture.dir.join(format!("{FALLBACK_HEALTHY}.jsonl")), format!("{{\"timestamp\":\"2026-08-02T07:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{FALLBACK_HEALTHY}\",\"requestId\":\"req_healthy\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")).unwrap();
+    let mut state = fixture.paused_with_limit(copies + 8);
+    assert_eq!(state.scanned_file_count, copies + 1);
+    assert_eq!(state.snapshots.len(), copies + 1);
+    assert_eq!(state.pending_finalization.len(), copies + 1);
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    assert_eq!(qualification.certified_member_count(), 2);
+    for item in &state.snapshots {
+        assert_eq!(
+            qualification.possible_targets(item).unwrap(),
+            if item.source_session_id == FALLBACK_HEALTHY {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([fixture.parent.clone()])
+            }
+        );
+    }
+    // Install after the pause: these are earlier-page holds in THIS sweep,
+    // not a fresh traversal's prior-generation debt/rearm input.
+    let earlier = (0..earlier_holds)
+        .map(|n| format!("a1111111-1111-4111-8111-{n:012}"))
+        .collect::<BTreeSet<_>>();
+    if !earlier.is_empty() {
+        state
+            .index
+            .mark_bounded_sweep_held_by_families(Some(&earlier));
+    }
+    let scope = earlier
+        .iter()
+        .map(|root| claude_full_rearm_root_digest(root))
+        .collect();
+    assert_eq!(
+        state.index.unchanged_proof_unsettled_families(),
+        Some(scope)
+    );
+    (fixture, state, qualification, earlier)
+}
+
+/// R2-F1: >64 potential held roots uses the authoritative BASE fold without
+/// clearing a stamp or injecting a target read. Compare emitted bytes AND ACK
+/// settlement to an independently scanned BASE page with the same prior scope.
+#[test]
+fn native_comparison_scope_overflow_uses_base_without_vetoing_healthy_family() {
+    if !native_positive_layout_for_test(
+        "native_comparison_scope_overflow_uses_base_without_vetoing_healthy_family",
+    ) {
+        return;
+    }
+    for (copies, earlier_holds) in [(65, 0), (2, 63)] {
+        let (fixture, state, qualification, earlier) =
+            native_comparison_scope_fixture(copies, earlier_holds);
+        let before = native_bodies(&state.snapshots);
+        let prior_scope = state.index.unchanged_proof_unsettled_families();
+        let mut base = fixture.paused_with_limit(copies + 8);
+        if !earlier.is_empty() {
+            base.index
+                .mark_bounded_sweep_held_by_families(Some(&earlier));
+        }
+        assert_eq!(base.index.unchanged_proof_unsettled_families(), prior_scope);
+        assert_eq!(native_bodies(&base.snapshots), before);
+        let base_reads = TargetReads::of(&base);
+        base.disable_native_comparison();
+        let (base_index, base_scan) = SelectionFixture::run(base);
+        let hit = native_comparison_paid_hit(&fixture, state, qualification);
+        // DoD 20: a9931824c queues two targets and later drops the scope.
+        assert_eq!(
+            hit.queued, 0,
+            "BASE before any target attempt, never truncated holds"
+        );
+        assert!(!hit.healthy);
+        assert_eq!(
+            hit.reads,
+            TargetReads::default(),
+            "no target Full, Tail, restore or refusal on the BASE exit"
+        );
+        assert_eq!(
+            native_bodies(&hit.state.snapshots),
+            before,
+            "all actual native bodies enter BASE"
+        );
+        let (receipt, _) = hit.controller.receipt_for_test();
+        assert!(receipt.unresolved_sources.is_empty());
+        let (index, scan, terminal) = complete_native_with_terminal_owner(hit.state);
+        let mut completion = hit.controller.complete(&scan, terminal, true).unwrap();
+        assert!(
+            completion.window.is_none(),
+            "BASE cannot lend optional native negatives"
+        );
+        assert!(
+            completion.fallback.is_none(),
+            "BASE exit creates no native hold"
+        );
+        completion.prepare_native_corrections(&scan, &fixture.index, &Default::default());
+        assert_eq!(completion.pending_native_correction_count_for_test(), 0);
+        assert!(scan.census_complete, "no native census veto");
+        assert_eq!(index.unchanged_proof_unsettled_families(), prior_scope);
+        let scope = index
+            .unchanged_proof_unsettled_families()
+            .expect("scope stays representable");
+        assert!(!scope.contains(&claude_full_rearm_root_digest(FALLBACK_HEALTHY)));
+        for (key, entry) in &fixture.index.files {
+            assert_eq!(
+                index.files[key].source_file_fingerprint, entry.source_file_fingerprint,
+                "BASE exit clears no target stamp"
+            );
+        }
+        assert_eq!(
+            base_reads.full,
+            copies + 1,
+            "only the new COPY files and healthy file, A1 FirstRead"
+        );
+        assert_eq!(
+            base_reads.tail + base_reads.unchanged + base_reads.refused,
+            0
+        );
+        let (base_wire, base_settlement) = comparison_money_body(&fixture, base_index, base_scan);
+        let (wire, settlement) = comparison_money_body(&fixture, index, scan);
+        let body: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        assert!(body["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["source_session_id"] == FALLBACK_HEALTHY));
+        assert_eq!(
+            wire, base_wire,
+            "BASE emitted bodies include the independent healthy family"
+        );
+        assert_eq!(
+            settlement, base_settlement,
+            "exact entity-ACK and accepted bodies equal BASE"
+        );
+    }
+}
+
+/// Capacity is admission, not a blanket disable: exactly 64 potential roots
+/// (61 earlier + COPY + healthy + target) still holds COPY with the signed scope.
+#[test]
+fn native_comparison_scope_at_capacity_keeps_hold_and_healthy_family_separate() {
+    if !native_positive_layout_for_test(
+        "native_comparison_scope_at_capacity_keeps_hold_and_healthy_family_separate",
+    ) {
+        return;
+    }
+    let (fixture, state, qualification, earlier) = native_comparison_scope_fixture(1, 61);
+    let hit = native_comparison_paid_hit(&fixture, state, qualification);
+    assert_eq!(hit.queued, 2);
+    assert!(!hit.healthy);
+    assert_eq!(
+        hit.reads,
+        TargetReads {
+            refused: 2,
+            ..TargetReads::default()
+        }
+    );
+    let (mut index, mut scan, terminal) = complete_native_with_terminal_owner(hit.state);
+    let completion = hit.controller.complete(&scan, terminal, true).unwrap();
+    let mut fallback = completion
+        .fallback
+        .expect("representable comparison hold remains native");
+    fallback.withhold(&mut scan);
+    fallback.after_native_fold(&mut scan, &mut index);
+    let copy = "c3333333-3333-4333-8333-000000000000";
+    let mut expected = earlier
+        .iter()
+        .map(|root| claude_full_rearm_root_digest(root))
+        .collect::<BTreeSet<_>>();
+    expected.insert(claude_full_rearm_root_digest(copy));
+    assert_eq!(expected.len(), 62);
+    assert_eq!(
+        index.unchanged_proof_unsettled_families(),
+        Some(expected.clone())
+    );
+    assert!(!expected.contains(&claude_full_rearm_root_digest(FALLBACK_HEALTHY)));
+    assert_eq!(scan.snapshots.len(), 1);
+    assert_eq!(scan.snapshots[0].source_session_id, FALLBACK_HEALTHY);
+    assert!(!scan.census_complete);
+    fallback
+        .restore_selected(&mut index, &fixture.index)
+        .unwrap();
+    assert_eq!(index.unchanged_proof_unsettled_families(), Some(expected));
+    let key = local_index_key(&fixture.dir.join(format!("{copy}.jsonl")));
+    assert!(!index.files.contains_key(&key) && !index.confirmed_empty_files.contains(&key));
+    assert_eq!(
+        index.accepted_snapshot_fingerprints,
+        fixture.index.accepted_snapshot_fingerprints
+    );
+}
+
 /// Condition 1, restart, B2 and B3: nothing about the held comparison
 /// survives. A fresh process with no permit and empty RAM re-derives it on
 /// the next walk from the unchanged plain Skips and holds the dependent
@@ -5140,6 +5428,7 @@ fn native_comparison_deferred_policy_unknown_native_is_base_without_new_debt() {
             0,
             &[],
             8,
+            &state.index,
             Some(&mut claude_native_comparison::RecoveryBudget {
                 previous: &fixture.index,
                 credit: &mut credit,
@@ -5222,6 +5511,7 @@ fn native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation()
                 0,
                 &[],
                 8,
+                &state.index,
                 Some(&mut claude_native_comparison::RecoveryBudget {
                     previous: &fixture.index,
                     credit: &mut paid,

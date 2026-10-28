@@ -1213,7 +1213,12 @@ impl SelectedFallback {
         crate::local_resource_diagnostics::native_comparison_restore_unavailable(
             before - scan.snapshots.len(),
             self.withheld_sources.len(),
-            self.targets.len(),
+            // Count target-level unavailable outcomes, not every candidate
+            // of an uncovered plan. Completed restorations grant no refusal.
+            self.targets
+                .iter()
+                .filter(|target| !completed_reduction(target, &scan.pending_finalization))
+                .count(),
         );
     }
 

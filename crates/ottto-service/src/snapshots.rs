@@ -25647,6 +25647,7 @@ impl OwnedSourceScan {
             self.file_limit.saturating_sub(self.scanned_file_count),
             &self.pending_finalization,
             self.file_limit,
+            &self.index,
             recovery.as_mut(),
         )?;
         if selection.matched_roots > 0 || !selection.unresolved_sources.is_empty() {
