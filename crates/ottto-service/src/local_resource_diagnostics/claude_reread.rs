@@ -59,6 +59,8 @@ impl Rearm {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {
+    #[serde(flatten)]
+    pub(crate) absence: super::claude_absence::Counts,
     #[serde(skip_serializing_if = "Rearm::is_empty")]
     pub(crate) claude_reread: Rearm,
     #[serde(skip_serializing_if = "CachePage::is_empty")]
@@ -113,6 +115,8 @@ pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
         self.claude_reread.merge(other.claude_reread);
+        self.absence.0 =
+            std::array::from_fn(|i| self.absence.0[i].saturating_add(other.absence.0[i]));
         self.retained_cache_page_events
             .merge(other.retained_cache_page_events);
     }
@@ -199,7 +203,7 @@ pub(crate) fn retry_offered() {
 pub(crate) fn active() -> bool {
     CURRENT.with(|current| current.get().is_some())
 }
-fn update(f: impl FnOnce(&mut Counts)) {
+pub(super) fn update(f: impl FnOnce(&mut Counts)) {
     CURRENT.with(|current| {
         if let Some(mut counts) = current.get() {
             f(&mut counts);

@@ -82,6 +82,22 @@ record `pending_audits`, `overdue_audits` and `oldest_due_age_seconds` using the
 existing index calculations. These are state, not events; overdue work remains
 owed until full verification. Both objects are absent when sampling is null.
 
+Additive version 2 Claude counts on the existing page/check-in carrier classify
+refused census-member NotFounds by the **existing immediate-parent metadata
+probe**: `claude_absence_parent_missing`, `claude_absence_parent_symlink`,
+`claude_absence_parent_not_directory`, `claude_absence_parent_metadata_error`.
+Missing includes a NotFound parent or no parent component; metadata_error means
+any other probe error. The same four suffixes under
+`claude_absence_parent_subagent_` count the subset whose path has an exact
+`subagents` component. Fields are omitted at zero, saturate on overflow, and
+count refusals, not distinct files. CandidateWalk, CandidateForcedIndex and Open
+share these totals; there is no site split. Counts follow the existing scoped
+page/check-in accumulation, including cooperative steps, and reset with that
+scope. A live non-symlink parent still authorizes removal and adds no refusal
+count. Codex/Pi, watcher hints and nonmember candidate losses add none. No new
+filesystem probe, event stream, path/key/name output or authority decision is
+introduced; diagnostics only, no behaviour change.
+
 A `source_finish` record wraps rotation finish, including its validation,
 post-policy finalization and upload work. It exists exactly when finish was
 called and returned normally, including an error return. It has `counts: {}`

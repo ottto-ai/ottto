@@ -63,7 +63,7 @@ impl Family {
         }
         Self {
             dir,
-            state_dir: temp_dir("claude-usage-proof-rearm-state"),
+            state_dir: crate::test_scratch::private_dir("claude-usage-proof-rearm-state"),
             root_session_id,
             parent_path,
             child_path,
@@ -325,7 +325,26 @@ impl Family {
     /// restart control proves that disk state cannot restore a native receipt.
     fn reload(&mut self) {
         let path = self.state_dir.join("scan-index.json");
+        assert!(
+            self.index.files.contains_key(&self.parent_key),
+            "the fixture retains its parent before save"
+        );
         self.index.save(&path).expect("save scan index");
+        assert!(
+            self.index.files.contains_key(&self.parent_key),
+            "the fixture retains its parent after save"
+        );
+        let decoded = lenient_decode::read_file(
+            File::open(&path).expect("open saved fixture"),
+            "load",
+            "unattributed",
+        )
+        .expect("the saved fixture decodes without quarantine");
+        assert!(
+            decoded.files.contains_key(&self.parent_key),
+            "the saved fixture decodes its parent at {path:?}; decoded keys: {:?}",
+            decoded.files.keys().collect::<Vec<_>>()
+        );
         self.index = ScanIndex::load(&path).expect("load scan index");
         assert!(
             self.index.files.contains_key(&self.parent_key),
