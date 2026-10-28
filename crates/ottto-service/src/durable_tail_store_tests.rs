@@ -1717,3 +1717,129 @@ pub(crate) fn pinned_v1_bytes(record: &PendingRecord, generation: u64) -> Vec<u8
     bytes.extend_from_slice(&trailer);
     bytes
 }
+
+#[test]
+fn claude_mutations_require_exact_strict_proof_and_a_current_stamp() {
+    for seam in ["overwrite", "delete", "gc"] {
+        for arm in [
+            "unproved",
+            "wrong_entry",
+            "ahead",
+            "stamp_changed",
+            "eligible",
+        ] {
+            let scratch = Scratch::new();
+            let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+            let path = scratch.transcript("t.jsonl", b"{}\n");
+            let b = binding("acct", "scope", ("fp", None));
+            let record = pending(b.clone(), certificate(&path), 1);
+            let mut writer = scratch.store();
+            assert_eq!(
+                writer
+                    .write_after_save(&lock, 1, vec![record.clone()])
+                    .unwrap()
+                    .written,
+                1
+            );
+            let disk = record_file(&writer, &b.key);
+            let before = fs::read(&disk).unwrap();
+            let mut cold = scratch.store();
+            let decoded = found(cold.read(&b.key, &placeholder_allowlist()));
+            let mut expected = Expected {
+                binding: b.clone(),
+                committed_generation: 1,
+            };
+            match arm {
+                "wrong_entry" => expected.binding.entry = entry_digest("other", None),
+                "ahead" => expected.committed_generation = 0,
+                _ => {}
+            }
+            if arm != "unproved" {
+                cold.authorize(&decoded, &expected);
+            }
+            if arm == "stamp_changed" {
+                let alternate = disk.with_extension("replacement");
+                put_record(&alternate, &before);
+                fs::rename(alternate, &disk).unwrap();
+            }
+            match seam {
+                "overwrite" => {
+                    let receipt = cold
+                        .write_after_save(&lock, 2, vec![pending(b.clone(), certificate(&path), 2)])
+                        .unwrap();
+                    assert_eq!(
+                        receipt.written,
+                        usize::from(arm == "eligible"),
+                        "{seam} {arm}"
+                    );
+                }
+                "delete" => {
+                    assert_eq!(
+                        cold.remove_keys(&lock, &BTreeSet::from([b.key])).unwrap(),
+                        usize::from(arm == "eligible"),
+                        "{seam} {arm}"
+                    );
+                }
+                _ => cold
+                    .gc(
+                        &lock,
+                        &b.context,
+                        &placeholder_allowlist(),
+                        &BTreeMap::new(),
+                    )
+                    .unwrap(),
+            }
+            if arm == "eligible" {
+                if seam == "overwrite" {
+                    assert_ne!(fs::read(&disk).unwrap(), before);
+                } else {
+                    assert!(!disk.exists(), "{seam} {arm}");
+                }
+            } else {
+                assert_eq!(fs::read(&disk).unwrap(), before, "{seam} {arm}");
+            }
+        }
+    }
+}
+
+#[test]
+fn claude_mutation_proof_expires_at_pass_boundary_and_unmemoized_records_survive() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let path = scratch.transcript("t.jsonl", b"{}\n");
+    let b = binding("acct", "scope", ("fp", None));
+    let mut store = scratch.store();
+    store
+        .write_after_save(&lock, 1, vec![pending(b.clone(), certificate(&path), 1)])
+        .unwrap();
+    let disk = record_file(&store, &b.key);
+    let before = fs::read(&disk).unwrap();
+    store.begin_pass();
+    store
+        .gc(
+            &lock,
+            &b.context,
+            &placeholder_allowlist(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read(&disk).unwrap(),
+        before,
+        "pass reset grants no deletion"
+    );
+    let record = found(store.read(&b.key, &placeholder_allowlist()));
+    store.authorize(
+        &record,
+        &Expected {
+            binding: b.clone(),
+            committed_generation: 1,
+        },
+    );
+    store.durable.clear(); // deterministic memo eviction, no invented disk authority
+    assert_eq!(
+        store.remove_keys(&lock, &BTreeSet::from([b.key])).unwrap(),
+        0
+    );
+    assert_eq!(fs::read(&disk).unwrap(), before);
+}
