@@ -617,11 +617,11 @@ fn census_residue_reparse_never_keeps_the_old_record() {
     );
 }
 
-/// TD1e: the shadow reports that the record census would converge on a
+/// TD1e: the record census covers a
 /// corpus whose BASE census cannot (identity-invalid pending, and separately
 /// a cap-exceeding occurrence total), while the real fence stays BASE.
 #[test]
-fn census_shadow_would_open_where_the_base_fence_closes() {
+fn census_records_cover_the_terminal_where_the_base_fence_closes() {
     let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
         evidence: BTreeMap::new(),
         health: Default::default(),
@@ -671,15 +671,6 @@ fn census_shadow_would_open_where_the_base_fence_closes() {
         let mut index = ScanIndex::default();
         let mut scan = census_scan(&root, &mut index, FIRST_WINDOW);
         assert!(scan.census_complete, "{case}");
-        let shadow = scan.claude_request_census_shadow.expect("terminal shadow");
-        assert!(shadow.would_open, "{case}: {shadow:?}");
-        assert_eq!(shadow.family_keys, 2, "{case}");
-        assert_eq!(shadow.covered_by_fingerprint, 2, "{case}");
-        assert_eq!(
-            shadow.shape_identity_incomplete,
-            usize::from(id_less),
-            "{case}"
-        );
         assert!(claude_census_disjointness_complete(
             &index,
             &scan.census_window_end,
@@ -702,7 +693,6 @@ fn census_shadow_would_open_where_the_base_fence_closes() {
             "{case}: the BASE fence closes"
         );
         assert!(disposition.duplicate_census.fence_after, "{case}");
-        assert_eq!(disposition.duplicate_census.request_census, None);
     }
 }
 
@@ -774,10 +764,6 @@ fn census_records_follow_the_working_index_through_committable_subset() {
     assert_eq!(census.get(&key), Some(&new_record));
     assert_eq!(census.get(&new_key), Some(&unseen_record));
     assert_eq!(census.hash_total_for_test(), 3);
-    assert_eq!(
-        committed.claude_request_census_shadow_for_test(),
-        current.claude_request_census_shadow_for_test()
-    );
 }
 
 /// Prune at the complete terminal: before any join, keep only keys that are
@@ -807,10 +793,9 @@ fn census_terminal_prune_keeps_indexed_and_walked_keys_only() {
             ),
         );
     }
-    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+    crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
         &mut index,
         &BTreeSet::from([walked.clone()]),
-        &BTreeSet::new(),
         FIRST_WINDOW,
     );
     assert_eq!(
@@ -820,18 +805,6 @@ fn census_terminal_prune_keeps_indexed_and_walked_keys_only() {
     assert_eq!(
         index.claude_request_census_for_test().hash_total_for_test(),
         2
-    );
-    // The retired record's copy of hash 2 no longer makes a duplicate.
-    assert_eq!(counts.duplicate_hashes, 0);
-    assert_eq!(counts.records, 2);
-    assert_eq!(counts.family_keys, 1);
-    assert_eq!(counts.covered_by_fingerprint, 1);
-    assert!(counts.would_open);
-    assert_eq!(
-        index
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        Some(true)
     );
 }
 
@@ -951,212 +924,15 @@ fn census_member_status_names_disjoint_shared_unknown_and_unobserved() {
     assert_eq!(status("unverified"), ClaudeCensusMemberStatus::Unverified);
     assert_eq!(status("migrate"), ClaudeCensusMemberStatus::Disjoint);
 
-    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+    crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
         &mut index,
         &BTreeSet::new(),
-        &BTreeSet::new(),
         FIRST_WINDOW,
-    );
-    assert!(counts.would_open);
-    assert_eq!(counts.family_keys, 7);
-    assert_eq!(counts.covered_by_fingerprint, 6);
-    assert_eq!(counts.covered_by_window, 1);
-    assert_eq!(counts.shape_exact, 5);
-    assert_eq!(counts.shape_empty, 1);
-    assert_eq!(counts.shape_identity_incomplete, 1);
-    assert_eq!(counts.unverified, 1);
-    assert_eq!(counts.duplicate_hashes, 1);
-    assert_eq!(counts.duplicate_owner_entries, 2);
-    assert_eq!(counts.shared_keys, 2);
-    assert_eq!(counts.family_unknown_roots, 1);
-    assert_eq!(counts.hashes, 8);
-    assert!(counts.json_bytes > 0);
-}
-
-/// S2(d), S8 and the review's cause list: every uncovered key is counted
-/// once, under the first matching cause, and quarantine keys without a
-/// record are counted on their own.
-#[test]
-fn census_shadow_counts_each_missing_record_by_cause() {
-    let key = |name: &str| format!("/census/projects/{name}.jsonl");
-    let mut index = ScanIndex::default();
-    let mut add = |name: &str, seed: char, snapshot: bool| {
-        let mut entry = manifest_index_entry(snapshot.then_some(name));
-        entry.source_file_fingerprint = if seed == ' ' {
-            String::new()
-        } else {
-            hex_fingerprint(seed)
-        };
-        index.files.insert(key(name), entry);
-        if snapshot {
-            index
-                .file_snapshot_fingerprints
-                .insert(key(name), BTreeSet::from([name.to_string()]));
-        }
-    };
-    add("over-budget", 'a', true);
-    add("account-hold", 'b', true);
-    add("residue", 'c', true);
-    add("placeholder", 'd', false);
-    add("empty-fp", ' ', true);
-    add("fp-mismatch", 'e', true);
-    add("migrate", 'f', true);
-    add("quarantined", '1', true);
-    index.claude_request_census_mut_for_test().insert_for_test(
-        &key("over-budget"),
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &hex_fingerprint('a'),
-            1,
-            ClaudeRequestCensusShape::OverBudget,
-            vec![],
-        ),
-    );
-    index.claude_request_census_mut_for_test().insert_for_test(
-        &key("fp-mismatch"),
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &hex_fingerprint('9'),
-            1,
-            ClaudeRequestCensusShape::Exact,
-            vec![1],
-        ),
-    );
-    index
-        .claude_account_deferred_holds
-        .insert(key("account-hold"), "held-body".to_string());
-    index.insert_retry_pending_claude_authority_for_test("quarantined");
-    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-        &mut index,
-        &BTreeSet::new(),
-        &BTreeSet::from([key("residue")]),
-        FIRST_WINDOW,
-    );
-    assert!(!counts.would_open);
-    assert_eq!(counts.family_keys, 8);
-    assert_eq!(counts.missing_over_budget, 1);
-    assert_eq!(counts.missing_account_hold, 1);
-    assert_eq!(counts.missing_residue, 1);
-    assert_eq!(counts.missing_placeholder, 1);
-    assert_eq!(counts.missing_empty_fingerprint, 1);
-    assert_eq!(counts.missing_fingerprint_mismatch, 1);
-    assert_eq!(counts.missing_migrate, 2);
-    assert_eq!(counts.quarantine_without_record, 1);
-    assert_eq!(counts.covered_by_fingerprint + counts.covered_by_window, 0);
-}
-
-/// S3(d) tripwire: a verified complete re-parse at an unchanged fingerprint
-/// and derivation that yields different ids is counted; the same ids are not.
-#[test]
-fn census_derivation_drift_tripwire_counts_changed_ids_at_one_revision() {
-    let scratch = crate::test_scratch::ScratchDir::new("census-derivation-drift");
-    let root = scratch.join("projects");
-    census_write(
-        &root,
-        "census-drift.jsonl",
-        &[census_response(
-            "census-drift",
-            Some("req_drift_1"),
-            "msg_drift_1",
-            1,
-            10,
-        )],
-    );
-    let mut index = ScanIndex::default();
-    census_scan(&root, &mut index, FIRST_WINDOW);
-    let key = census_key(&index, &root, "census-drift.jsonl");
-    let record = index
-        .claude_request_census_for_test()
-        .get(&key)
-        .expect("record")
-        .clone();
-    assert!(!record.unverified_for_test(), "a full loss-free read");
-    assert_eq!(
-        index
-            .claude_request_census_shadow_for_test()
-            .derivation_drift_for_test(),
-        0
-    );
-    // As if an older parser had recorded other ids at this exact revision.
-    index.claude_request_census_mut_for_test().insert_for_test(
-        &key,
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &record.fingerprint_hex_for_test(),
-            record.window_for_test(),
-            ClaudeRequestCensusShape::Exact,
-            vec![claude_request_hash("req_other")],
-        ),
-    );
-    index
-        .files
-        .get_mut(&key)
-        .expect("entry")
-        .source_file_fingerprint
-        .clear();
-    census_scan(&root, &mut index, SECOND_WINDOW);
-    let reparsed = index
-        .claude_request_census_for_test()
-        .get(&key)
-        .expect("reparsed record");
-    assert_eq!(
-        reparsed.fingerprint_hex_for_test(),
-        record.fingerprint_hex_for_test()
-    );
-    assert_eq!(
-        index
-            .claude_request_census_shadow_for_test()
-            .derivation_drift_for_test(),
-        1
-    );
-    // The same ids at the same revision are no drift.
-    index
-        .files
-        .get_mut(&key)
-        .expect("entry")
-        .source_file_fingerprint
-        .clear();
-    census_scan(&root, &mut index, "2026-08-04T09:00:00Z");
-    assert_eq!(
-        index
-            .claude_request_census_shadow_for_test()
-            .derivation_drift_for_test(),
-        1
-    );
-    // A budget tombstone at the same revision is no drift either: the budget,
-    // not extraction, replaced its shape and hashes.
-    index.claude_request_census_mut_for_test().insert_for_test(
-        &key,
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &record.fingerprint_hex_for_test(),
-            record.window_for_test(),
-            ClaudeRequestCensusShape::OverBudget,
-            vec![],
-        ),
-    );
-    index
-        .files
-        .get_mut(&key)
-        .expect("entry")
-        .source_file_fingerprint
-        .clear();
-    census_scan(&root, &mut index, "2026-08-05T09:00:00Z");
-    assert_eq!(
-        index
-            .claude_request_census_for_test()
-            .get(&key)
-            .expect("reparsed record")
-            .shape_for_test(),
-        ClaudeRequestCensusShape::Exact
-    );
-    assert_eq!(
-        index
-            .claude_request_census_shadow_for_test()
-            .derivation_drift_for_test(),
-        1
     );
 }
 
 /// StateMissing M1: an unchanged re-parse of a record retired at 35 days
-/// (a backfill re-reading every file, a resume miss) is no derivation drift
-/// and leaves the record retired: neither the hashes nor the index bytes
+/// (a backfill re-reading every file, a resume miss) leaves the record retired: neither the hashes nor the index bytes
 /// bounce back.
 #[test]
 fn census_retired_record_survives_an_unchanged_reparse() {
@@ -1205,12 +981,6 @@ fn census_retired_record_survives_an_unchanged_reparse() {
     );
     assert_eq!(reparsed.retired_for_test(), Some(1), "still retired");
     assert!(reparsed.request_hashes_for_test().is_empty());
-    assert_eq!(
-        index
-            .claude_request_census_shadow_for_test()
-            .derivation_drift_for_test(),
-        0
-    );
     assert_eq!(
         index.claude_request_census_for_test().totals_for_test().0,
         hashes
@@ -1296,16 +1066,16 @@ fn census_unindexed_lossy_member_leaves_its_family_unknown() {
         claude_census_member_status(&index, &root_key, FIRST_WINDOW, true),
         ClaudeCensusMemberStatus::FamilyUnknown
     );
-    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+    crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
         &mut index,
-        &BTreeSet::from([member_key.clone()]),
         &BTreeSet::from([member_key.clone()]),
         FIRST_WINDOW,
     );
-    assert!(counts.would_open);
-    assert_eq!(counts.family_keys, 1);
-    assert_eq!(counts.family_unknown_roots, 1);
-    assert_eq!(counts.records, 2);
+    assert_eq!(index.claude_request_census_for_test().len_for_test(), 2);
+    assert_eq!(
+        claude_census_member_status(&index, &root_key, FIRST_WINDOW, true),
+        ClaudeCensusMemberStatus::FamilyUnknown
+    );
 }
 
 fn census_index_json(records: serde_json::Value) -> serde_json::Value {
@@ -1494,30 +1264,21 @@ fn census_decoder_drops_bad_entries_and_never_quarantines_the_index() {
         "shadow-state",
         &serde_json::to_string(&value).expect("json"),
     );
-    assert_eq!(
-        loaded
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        Some(true)
-    );
-    assert_eq!(
-        loaded
-            .claude_request_census_shadow_for_test()
-            .derivation_drift_for_test(),
-        0
-    );
+    assert!(serde_json::to_value(&loaded)
+        .unwrap()
+        .get("claude_request_census_shadow")
+        .is_none());
     value["claude_request_census_shadow"] = serde_json::json!(["bad"]);
     let loaded = census_load(
         &scratch,
         "shadow-state-wrong-type",
         &serde_json::to_string(&value).expect("json"),
     );
-    assert_eq!(
-        loaded
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        None
-    );
+    assert!(loaded.claude_request_census_for_test().is_empty());
+    assert!(serde_json::to_value(&loaded)
+        .unwrap()
+        .get("claude_request_census_shadow")
+        .is_none());
 
     // An old decoder ignores fields it does not know: a later field never
     // quarantines this one either.
@@ -1628,76 +1389,6 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
     assert!(after >= before + 8_000, "{before} -> {after}");
 }
 
-/// The shadow counters ride the duplicate-census counters, bounded.
-#[test]
-fn census_shadow_counts_encoding_is_bounded() {
-    let shadow = ClaudeRequestCensusShadowCounts {
-        would_open: false,
-        would_open_flips: u64::MAX,
-        family_keys: usize::MAX,
-        covered_by_fingerprint: usize::MAX,
-        covered_by_window: usize::MAX,
-        missing_residue: usize::MAX,
-        missing_account_hold: usize::MAX,
-        missing_placeholder: usize::MAX,
-        missing_empty_fingerprint: usize::MAX,
-        missing_fingerprint_mismatch: usize::MAX,
-        missing_migrate: usize::MAX,
-        missing_over_budget: usize::MAX,
-        quarantine_without_record: usize::MAX,
-        shape_exact: usize::MAX,
-        shape_empty: usize::MAX,
-        shape_identity_incomplete: usize::MAX,
-        shape_lossy: usize::MAX,
-        unverified: usize::MAX,
-        twin: usize::MAX,
-        family_unknown_roots: usize::MAX,
-        records: usize::MAX,
-        hashes: usize::MAX,
-        hash_budget_usage_percent: usize::MAX,
-        hash_budget_warning: false,
-        transient_limited: false,
-        transient_peak_bytes: usize::MAX,
-        duplicate_hashes: usize::MAX,
-        duplicate_owner_entries: usize::MAX,
-        shared_keys: usize::MAX,
-        derivation_drift: u64::MAX,
-        json_bytes: usize::MAX,
-        heap_bytes: usize::MAX,
-    };
-    let encoded = serde_json::to_string(&shadow).expect("encode shadow");
-    assert!(
-        encoded.len() <= CENSUS_SHADOW_MAX_BYTES,
-        "{} bytes",
-        encoded.len()
-    );
-    assert_eq!(
-        encoded.len(),
-        CENSUS_SHADOW_MAX_BYTES,
-        "longest scalar spellings"
-    );
-    let without = ClaudeDuplicateCensusCounts::default();
-    let with = ClaudeDuplicateCensusCounts {
-        request_census: Some(shadow),
-        ..without
-    };
-    let grown = serde_json::to_string(&with).expect("encode counts").len()
-        - serde_json::to_string(&without)
-            .expect("encode counts")
-            .len();
-    assert!(
-        grown <= CENSUS_SHADOW_MAX_BYTES + r#","request_census":"#.len(),
-        "{grown} bytes"
-    );
-    // Absent (every non-terminal page and every other source), nothing is
-    // added to the existing line.
-    assert!(!serde_json::to_string(&without)
-        .expect("encode counts")
-        .contains("request_census"));
-}
-
-const CENSUS_SHADOW_MAX_BYTES: usize = 1_238;
-
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.
 #[test]
@@ -1787,35 +1478,6 @@ fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
     loaded
         .save(&path)
         .expect("CAS also drains oversized evidence");
-}
-
-#[test]
-fn census_hash_budget_warning_starts_at_eighty_percent() {
-    // 80% of the hash cap, rounded up: the first count that warns.
-    let threshold = (MAX_CLAUDE_REQUEST_CENSUS_HASHES * 4).div_ceil(5) as u64;
-    for hashes in [threshold - 1, threshold] {
-        let mut index = ScanIndex::default();
-        index.claude_request_census_mut_for_test().insert_for_test(
-            "key",
-            ClaudeRequestCensusRecord::synthetic_for_test(
-                &hex_fingerprint('a'),
-                1,
-                ClaudeRequestCensusShape::Lossy,
-                (0..hashes).collect(),
-            ),
-        );
-        let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-            &mut index,
-            &BTreeSet::from(["key".to_owned()]),
-            &BTreeSet::new(),
-            FIRST_WINDOW,
-        );
-        assert_eq!(counts.hash_budget_warning, hashes == threshold);
-        assert_eq!(
-            counts.hash_budget_usage_percent,
-            if hashes == threshold { 80 } else { 79 }
-        );
-    }
 }
 
 /// A pre-D1 shape has no census fields: IgnoredAny consumes their tokens,
@@ -2020,28 +1682,6 @@ fn census_failed_reduction_invalidates_old_record() {
 }
 
 #[test]
-fn census_shadow_bounds_workspace_without_changing_the_index() {
-    let mut index = ScanIndex::default();
-    let key = format!("/census/projects/{}.jsonl", "x".repeat(5000));
-    index.files.insert(key, manifest_index_entry(Some("body")));
-    let before = serde_json::to_value(&index).unwrap();
-    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-        &mut index,
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        FIRST_WINDOW,
-    );
-    assert!(counts.transient_limited);
-    assert!(!counts.would_open);
-    let mut after = serde_json::to_value(&index).unwrap();
-    after
-        .as_object_mut()
-        .unwrap()
-        .remove("claude_request_census_shadow");
-    assert_eq!(after, before);
-}
-
-#[test]
 fn census_decoder_stops_after_attempted_entries_even_when_all_are_rejected() {
     let scratch = crate::test_scratch::ScratchDir::new("census-attempt-budget");
     let mut records = String::from("{");
@@ -2180,21 +1820,14 @@ fn census_escaped_shadow_field_name_cannot_bypass_the_reader_bound() {
     drop(file);
     let mut loaded = ScanIndex::load(&path).expect("escaped field has the same bounded reader");
     assert_eq!(loaded.files.len(), 1);
-    assert_eq!(
-        loaded
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        None
-    );
     loaded
         .save(&path)
         .expect("CAS also bounds escaped field names");
 }
 
-/// The valid shadow state must survive load, CAS and reload byte-for-value,
-/// independently of whether its previous predicate was open or closed.
+/// Legacy shadow state is decode-only: load/CAS drop it and preserve the census.
 #[test]
-fn census_valid_shadow_state_round_trips_exactly() {
+fn census_retired_shadow_disappears_without_changing_census() {
     let scratch = crate::test_scratch::ScratchDir::new("census-shadow-roundtrip");
     for open in [false, true] {
         for escaped in [false, true] {
@@ -2213,9 +1846,19 @@ fn census_valid_shadow_state_round_trips_exactly() {
             }
             let name = format!("shadow-{open}-{escaped}");
             let mut loaded = census_load(&scratch, &name, &json);
+            assert!(serde_json::to_value(&loaded)
+                .unwrap()
+                .get("claude_request_census_shadow")
+                .is_none());
             assert_eq!(
-                serde_json::to_value(&loaded).unwrap()["claude_request_census_shadow"],
-                expected
+                serde_json::to_vec(loaded.claude_request_census_for_test()).unwrap(),
+                serde_json::to_vec(
+                    &serde_json::from_value::<
+                        crate::snapshots::claude_request_census::ClaudeRequestCensus,
+                    >(value["claude_request_census"].clone())
+                    .unwrap()
+                )
+                .unwrap()
             );
             assert_eq!(
                 loaded
@@ -2224,11 +1867,15 @@ fn census_valid_shadow_state_round_trips_exactly() {
                 2
             );
             let path = scratch.join(format!("{name}.json"));
-            loaded.save(&path).expect("CAS preserves shadow state");
+            loaded.save(&path).expect("CAS drops retired shadow state");
             let reloaded = ScanIndex::load(&path).unwrap();
+            assert!(serde_json::to_value(&reloaded)
+                .unwrap()
+                .get("claude_request_census_shadow")
+                .is_none());
             assert_eq!(
-                serde_json::to_value(&reloaded).unwrap()["claude_request_census_shadow"],
-                expected
+                reloaded.claude_request_census_for_test(),
+                loaded.claude_request_census_for_test()
             );
         }
     }
@@ -2247,22 +1894,10 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
         let mut loaded = census_load(&scratch, field, &json);
         if field == "claude_request_census" {
             assert!(loaded.claude_request_census_for_test().is_empty());
-            assert_eq!(
-                loaded
-                    .claude_request_census_shadow_for_test()
-                    .would_open_for_test(),
-                Some(true)
-            );
         } else {
             assert_eq!(
                 loaded.claude_request_census_for_test().keys_for_test(),
                 vec!["good"]
-            );
-            assert_eq!(
-                loaded
-                    .claude_request_census_shadow_for_test()
-                    .would_open_for_test(),
-                None
             );
         }
         loaded

@@ -1247,6 +1247,102 @@ mod durable_restart {
         });
     }
 
+    /// SOURCE: dropping diagnostics preserves #806's durable binding and
+    /// restores an unchanged native read range, without a historical replay.
+    #[test]
+    fn retired_shadow_upgrade_restores_with_zero_native_read_range() {
+        for array in [false, true] {
+            let f = Fixture::new(2);
+            let state = State::new(&f);
+            let first = Arc::new(SharedCache::default());
+            state.begin(&first);
+            let mut prior = seed_predecessor(&f, &first);
+            prior.save(&state.index_path).unwrap();
+            first.durable_write_after_save(state.lock, SOURCE, &prior);
+            assert_eq!(
+                state.store_records(),
+                usize::from(crate::heap_layout_bound::layout_supported())
+            );
+            drop(first);
+            // The durable record predates the upgrade, at the same entry and
+            // scope. A later index generation must continue to admit it.
+            let census = serde_json::to_vec(&prior.claude_request_census).unwrap();
+            let expected = serde_json::to_vec(&prior).unwrap();
+            let mut old = serde_json::to_value(&prior).unwrap();
+            old["claude_request_census_shadow"] = json!({"o":true,"f":7,"d":9});
+            if array {
+                old = crate::snapshots::lenient_decode_tests::old_census_shadow_array(&prior);
+            }
+            let bytes = serde_json::to_vec(&old).unwrap();
+            let native: ScanIndex = serde_json::from_slice(&bytes)
+                .expect("legacy map/array has every slot's native type");
+            let strict = lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed")
+                .expect("old shadow loads through strict field decoding");
+            for decoded in [native, strict] {
+                assert!(decoded.decode_holds.is_empty());
+                assert_eq!(serde_json::to_vec(&decoded).unwrap(), expected);
+            }
+            fs::write(&state.index_path, bytes).unwrap();
+            let mut upgraded = ScanIndex::load(&state.index_path).unwrap();
+            assert!(upgraded.decode_holds.is_empty());
+            assert_eq!(serde_json::to_vec(&upgraded).unwrap(), expected);
+            upgraded.save(&state.index_path).unwrap();
+            let written: Value =
+                serde_json::from_slice(&fs::read(&state.index_path).unwrap()).unwrap();
+            for retired in ["claude_request_census_shadow", "derivation_drift", "d"] {
+                assert!(written.get(retired).is_none());
+            }
+            let upgraded = ScanIndex::load(&state.index_path).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&upgraded.claude_request_census).unwrap(),
+                census
+            );
+            // Late evidence selects the existing output-refresh path while
+            // transcript bytes stay unchanged, so this must exercise restore
+            // rather than vacuously skip a quiet, already accepted file.
+            f.evidence(2);
+            let restarted = Arc::new(SharedCache::default());
+            state.begin(&restarted);
+            let mut read_range = None;
+            let warm = enriched(
+                &f,
+                raw_scan(&f, upgraded.clone(), Some(restarted.clone()), |scan| {
+                    let active = scan.active_file.as_ref().expect("native file selected");
+                    let plan = active
+                        .parser
+                        .reader
+                        .acquisition
+                        .as_ref()
+                        .expect("read plan");
+                    read_range = Some(plan.start_offset()..plan.frozen_length());
+                }),
+            );
+            assert_layout_mode(warm.modes, (0, 0, 1));
+            assert_eq!(
+                restored(&restarted),
+                u64::from(crate::heap_layout_bound::layout_supported())
+            );
+            let range = read_range.expect("the real scanner prepared an acquisition");
+            if crate::heap_layout_bound::layout_supported() {
+                assert_eq!(range.end - range.start, 0, "upgrade native read-range is 0");
+                assert_eq!(
+                    warm.native_bytes, 0,
+                    "upgrade reads 0 native transcript bytes"
+                );
+            } else {
+                assert_eq!(range.start, 0);
+                assert_eq!(range.end, fs::metadata(&f.path).unwrap().len());
+            }
+            let cold = enriched(&f, raw_scan(&f, upgraded.clone(), None, |_| {}));
+            assert_eq!(
+                serde_json::to_vec(&warm.index.claude_request_census).unwrap(),
+                serde_json::to_vec(&cold.index.claude_request_census).unwrap(),
+                "late evidence updates the source fingerprint identically to Full"
+            );
+            assert_oracle(&f, &warm, upgraded);
+        }
+    }
+
     #[test]
     fn restart_after_a_metadata_only_touch_restores_unchanged() {
         let f = Fixture::new(2);

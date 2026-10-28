@@ -160,7 +160,7 @@ use claude_history_upgrade::{
     HistoryDecision, HistoryEmission, HistoryHold, HistoryPage, NoListPolicy,
 };
 use claude_reemission_exclusions::{ListState, MemberDirStamp, ReemissionExclusions};
-use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
+use claude_request_census::ClaudeRequestCensus;
 use claude_response_records::{
     ClaudeResponseBook, ClaudeSelectorTable, CompactClaudeResponseRecord, CompactClaudeSelector,
 };
@@ -3500,12 +3500,9 @@ pub struct ScanIndex {
     /// never the index.
     #[serde(default, skip_serializing_if = "ClaudeRequestCensus::is_empty")]
     claude_request_census: ClaudeRequestCensus,
-    /// Slice D1: count-only shadow memory between complete terminals.
-    #[serde(
-        default,
-        skip_serializing_if = "ClaudeRequestCensusShadowState::is_empty"
-    )]
-    claude_request_census_shadow: ClaudeRequestCensusShadowState,
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    #[serde(rename = "claude_request_census_shadow", default, skip_serializing)]
+    retired_claude_request_census_shadow: serde::de::IgnoredAny,
     /// Families whose current transcript revision could not reconstruct a
     /// previously proven session-exclusive usage witness. Unlike backend
     /// poison quarantine, these revisions are not settled and never enter the
@@ -4078,7 +4075,7 @@ impl Default for ScanIndex {
             claude_usage_family_witnesses: BTreeMap::new(),
             claude_usage_family_pending: BTreeMap::new(),
             claude_request_census: ClaudeRequestCensus::default(),
-            claude_request_census_shadow: ClaudeRequestCensusShadowState::default(),
+            retired_claude_request_census_shadow: serde::de::IgnoredAny,
             claude_usage_authority_quarantine: BTreeMap::new(),
             claude_retired_family_tombstones: ClaudeRetiredFamilyTombstones::default(),
             claude_retired_family_tombstones_initialized: false,
@@ -7063,9 +7060,6 @@ pub struct ClaudeDuplicateCensusCounts {
     pub full_rearm: bool,
     pub rearm_attempt: u8,
     pub full_rearm_deferred_until: Option<u64>,
-    /// Slice D1 shadow, present only on a complete Claude terminal scan.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_census: Option<ClaudeRequestCensusShadowCounts>,
 }
 
 /// Fix 1 disclosure for one complete Claude terminal, logged beside the
@@ -7094,17 +7088,10 @@ impl ClaudeFullRearmSuppressionCounts {
     }
 }
 
-/// Slice D1: the request-census shadow, measured by the scan on a complete
-/// Claude terminal before any fold and reported beside the duplicate-census
-/// counters. Content-free counts; nothing reads them into a decision.
-/// `would_open` is whether every indexed Claude family-member key (not
-/// confirmed empty) has a record covering it, by fingerprint or by this
-/// census window, within the hash budget and the duplicate-owner bound.
-/// `missing_*` name, first match wins, why the other keys are not covered.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+/// Test oracle workspace for live census, copy-holder and retirement behavior.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClaudeRequestCensusShadowCounts {
-    pub would_open: bool,
-    pub would_open_flips: u64,
     pub family_keys: usize,
     pub covered_by_fingerprint: usize,
     pub covered_by_window: usize,
@@ -7131,10 +7118,6 @@ pub struct ClaudeRequestCensusShadowCounts {
     pub transient_peak_bytes: usize,
     pub duplicate_hashes: usize,
     pub duplicate_owner_entries: usize,
-    pub shared_keys: usize,
-    pub derivation_drift: u64,
-    pub json_bytes: usize,
-    pub heap_bytes: usize,
 }
 
 /// Content-free first-proof hold counters for one Claude fold, never a
@@ -7321,9 +7304,6 @@ pub struct SourceScanResult {
     pub(crate) codex_counting_v2: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
     codex_join_validation: Option<codex_file_join::Validation>,
     codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
-    /// Slice D1 shadow, measured by a complete Claude terminal scan before
-    /// any fold. Count-only; the usage fold copies it into its counters.
-    pub(crate) claude_request_census_shadow: Option<ClaudeRequestCensusShadowCounts>,
     /// Stage 1 hunk A: the paused cursor job's continuation ticket, minted
     /// at this page's pause (`PauseEnd::Paused` only). None on every other
     /// end, and on an unaccelerated attempt.
@@ -8597,7 +8577,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
             .map(|pending| pending.index_key.clone())
             .collect()
     };
-    let mut disposition = apply_claude_reported_usage_with_index_limits_and_current_files(
+    apply_claude_reported_usage_with_index_limits_and_current_files(
         &mut scan.snapshots,
         api_report,
         trace_report,
@@ -8611,11 +8591,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         observations,
         comparison,
         veto_api_rows,
-    );
-    // Slice D1: report only. The shadow was measured by the scan; no fold
-    // input above read it.
-    disposition.duplicate_census.request_census = scan.claude_request_census_shadow;
-    disposition
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30315,16 +30291,14 @@ impl OwnedSourceScan {
                 let census_complete = raw_census_complete
                     && !needs_clean_followup
                     && !authority_debt_withholds_census;
-                // Slice D1: prune and measure only, before any fold.
-                let claude_request_census_shadow =
-                    (source == SnapshotSource::ClaudeCode && census_complete).then(|| {
-                        claude_request_census::settle_claude_request_census_terminal(
-                            index,
-                            &traversal_snapshot.observed_index_keys,
-                            &traversal_snapshot.residue.index_keys,
-                            &census_window_end,
-                        )
-                    });
+                // Census maintenance stays before any fold.
+                if source == SnapshotSource::ClaudeCode && census_complete {
+                    claude_request_census::settle_claude_request_census_terminal(
+                        index,
+                        &traversal_snapshot.observed_index_keys,
+                        &census_window_end,
+                    );
+                }
                 let reconciliation_pending = traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation
@@ -30583,7 +30557,6 @@ impl OwnedSourceScan {
                     snapshots,
                     pending_finalization,
                     codex_legacy_join_baselines,
-                    claude_request_census_shadow,
                     continuation_ticket,
                     continuation_committed: codex_page.continuation_committed(),
                     codex_join_validation: codex_join_inventory
@@ -47575,7 +47548,7 @@ impl ScanIndex {
             claude_usage_family_witnesses: self.claude_usage_family_witnesses.clone(),
             claude_usage_family_pending: self.claude_usage_family_pending.clone(),
             claude_request_census: self.claude_request_census.clone(),
-            claude_request_census_shadow: self.claude_request_census_shadow.clone(),
+            retired_claude_request_census_shadow: serde::de::IgnoredAny,
             claude_usage_authority_quarantine: self.claude_usage_authority_quarantine.clone(),
             claude_retired_family_tombstones: self.claude_retired_family_tombstones.clone(),
             claude_retired_family_tombstones_initialized: self
@@ -64624,7 +64597,6 @@ mod tests {
             full_rearm: true,
             rearm_attempt: u8::MAX,
             full_rearm_deferred_until: Some(u64::MAX),
-            request_census: None,
         };
         let encoded = serde_json::to_string(&max).expect("encode counters");
         assert!(encoded.len() <= 589, "{} bytes", encoded.len());
@@ -89079,7 +89051,7 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store);
+crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, retired_claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, retired_reread_guard, held_audit_progress, claude_money_birth_store);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
@@ -89713,9 +89685,10 @@ mod census_unreadable_tests {
 crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_member);
 
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
-crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
+crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until);
 crate::heap_layout_bound::fields!(ClaudeFullRearmSuppressionCounts; full_rearm_suppressed, full_rearm_skipped_invalid_unchanged, full_rearm_post_rebuild_skipped, structural_invalid_family_count, suppressed_since_unix_seconds);
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
+#[cfg(test)]
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries);
 
 #[path = "snapshots/composition_compactions.rs"]
 mod composition_compactions;

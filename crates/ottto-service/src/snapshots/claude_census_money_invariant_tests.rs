@@ -242,15 +242,18 @@ fn money_ledger_records_are_invisible_to_d1() {
         ),
         before
     );
-    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+    crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
         &mut loaded,
         &BTreeSet::from([key.clone()]),
-        &BTreeSet::new(),
         MONEY_WINDOW,
     );
-    assert_eq!(counts.records, 1);
-    assert_eq!(counts.hashes, 2);
-    assert_eq!(counts.duplicate_hashes, 0);
+    assert_eq!(loaded.claude_request_census_for_test().len_for_test(), 1);
+    assert_eq!(
+        loaded
+            .claude_request_census_for_test()
+            .hash_total_for_test(),
+        2
+    );
     assert!(
         loaded
             .claude_request_census_for_test()
@@ -262,7 +265,6 @@ fn money_ledger_records_are_invisible_to_d1() {
     crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
         &mut index,
         &BTreeSet::from([key.clone()]),
-        &BTreeSet::new(),
         MONEY_WINDOW,
     );
     assert!(index
@@ -302,7 +304,6 @@ fn money_transcript_records_retire_after_35_days() {
     crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
         &mut index,
         &keys,
-        &BTreeSet::new(),
         MONEY_WINDOW,
     );
     let (aged_after, _) = crate::snapshots::claude_request_census::transcript_retirements();
