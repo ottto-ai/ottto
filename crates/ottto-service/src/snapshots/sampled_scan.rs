@@ -2006,7 +2006,7 @@ pub(super) fn new_source_parser(
         };
         let Some(input) = input else {
             if codex_compressed_input::admission_streak(&key, true) == 12 {
-                let counts = serde_json::json!({"consecutive_yields": 12, "admission_starved_count": codex_compressed_input::admission_starved_count()});
+                let counts = serde_json::json!({"consecutive_yields": 12, "admission_starved_count": codex_compressed_input::admission_starved_count(None)});
                 traversal_point("codex_zst_admission_alarm", "codex", &counts);
             }
             anyhow::bail!("compressed rollout admission yielded");

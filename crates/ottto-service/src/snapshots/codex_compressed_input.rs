@@ -100,22 +100,16 @@ pub(super) fn admission_streak(key: &str, yielded: bool) -> u8 {
     slots.insert(hash, count);
     count
 }
-pub(super) fn admission_starved_count() -> usize {
-    STREAKS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .values()
-        .filter(|n| **n >= 12)
-        .count()
-}
-pub(super) fn admission_starved(key: &str) -> bool {
+/// Count starved tracked keys, optionally scoped to one physical archive.
+pub(super) fn admission_starved_count(key: Option<&str>) -> usize {
     use sha2::Digest;
-    let hash: [u8; 32] = sha2::Sha256::digest(key.as_bytes()).into();
+    let hash: Option<[u8; 32]> = key.map(|key| sha2::Sha256::digest(key.as_bytes()).into());
     STREAKS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get(&hash)
-        .is_some_and(|n| *n >= 12)
+        .iter()
+        .filter(|(k, n)| **n >= 12 && hash.as_ref().map_or(true, |h| h == *k))
+        .count()
 }
 impl super::OwnedSourceScan {
     pub(crate) fn persist_archive_reservation(
@@ -690,10 +684,9 @@ impl super::ScanCensus {
     ) {
         let key = super::local_index_key(path);
         let archive = index.files.get(&key).and_then(|e| e.archive.as_deref());
-        if let Some(cause) = archive
-            .and_then(|a| a.terminal_cause())
-            .or_else(|| admission_starved(&key).then_some(CodexZstCause::AdmissionStarved))
-        {
+        if let Some(cause) = archive.and_then(|a| a.terminal_cause()).or_else(|| {
+            (admission_starved_count(Some(&key)) > 0).then_some(CodexZstCause::AdmissionStarved)
+        }) {
             self.archive_residue(path, archive, cause);
         } else {
             self.record_unreadable(normal, 1);
@@ -753,16 +746,7 @@ impl super::ScanIndex {
                 .as_ref()
                 .is_some_and(|old| old != &context);
             archive.user_context = Some(context.clone());
-            if changed
-                && matches!(
-                    archive.disposition,
-                    ArchiveDisposition::Acquired
-                        | ArchiveDisposition::Pending { .. }
-                        | ArchiveDisposition::Held {
-                            cause: CodexZstCause::CorrectionUnapplied
-                        }
-                )
-            {
+            if changed && archive.body_witness.is_some() {
                 archive.user_change = true;
                 archive.body_witness = None;
                 archive.disposition = ArchiveDisposition::Pending {

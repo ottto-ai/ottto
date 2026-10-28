@@ -45650,9 +45650,13 @@ impl ScanIndex {
         self.traversal = None;
         self.scan_residue_witness = None;
         self.confirmed_empty_files.clear();
-        self.file_snapshot_fingerprints.clear();
-        self.snapshot_activity_at.clear();
-        self.accepted_snapshot_fingerprints.clear();
+        self.file_snapshot_fingerprints
+            .retain(|key, _| self.files.get(key).is_some_and(|e| e.archive.is_some()));
+        let archive_facts = &self.file_snapshot_fingerprints;
+        self.accepted_snapshot_fingerprints
+            .retain(|fp| archive_facts.values().any(|facts| facts.contains(fp)));
+        self.snapshot_activity_at
+            .retain(|fp, _| self.accepted_snapshot_fingerprints.contains(fp));
         self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
         self.accepted_incidence_pending_census = false;
         self.accepted_rebuild_incidence.clear();
