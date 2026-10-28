@@ -2980,7 +2980,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
             _ => panic!("plain group boots"),
         }
     }
-    boot.admit_for_test(&index);
     let mut active = boot
         .into_job(JobInputs {
             metadata: &metadata,
@@ -3006,7 +3005,6 @@ fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
         .unwrap();
     let no_scope = |_: &CandidateFile| None;
     let inputs = StepInputs {
-        index: &index,
         metadata: &metadata,
         attribution: None,
         artifacts: false,
