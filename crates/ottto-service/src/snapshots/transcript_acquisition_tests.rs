@@ -1669,6 +1669,10 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         for (arm, pending) in [
             ("old_append", 0),
+            ("old_append_50h", 0),
+            ("due_quiet_50h", 0),
+            ("restore_miss_debt", 0),
+            ("cleared_selection_debt", 0),
             ("due_append", 0),
             ("due_quiet", 0),
             ("slots_256", 256),
@@ -1676,6 +1680,10 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             ("clock_append", 0),
             ("real_edit", 0),
         ] {
+            let quiet = arm.starts_with("due_quiet");
+            let missing = matches!(arm, "restore_miss_debt" | "cleared_selection_debt");
+            let full = arm == "real_edit" || missing;
+            let owes = arm.starts_with("due_") || arm == "real_edit" || missing;
             sampled_scan::set_test_now(Some(START));
             let fixture = ScanFixture::new(source);
             fixture.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -1701,7 +1709,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             assert_eq!(modes, (1, 0, 0), "{source:?}/{arm}");
             assert!(!initial.snapshots.is_empty());
             let key = local_index_key(&fixture.file.0);
-            if arm.starts_with("due_") || arm == "real_edit" {
+            if owes {
                 let fingerprint = index.files[&key].source_file_fingerprint.clone();
                 assert!(index.stage_sampled_audit(
                     &key,
@@ -1726,7 +1734,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                     .values()
                     .filter(|e| e.has_unverified_source())
                     .count(),
-                pending + usize::from(arm.starts_with("due_") || arm == "real_edit")
+                pending + usize::from(owes)
             );
             index.save(&index_path).unwrap();
             assert_eq!(
@@ -1758,16 +1766,30 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                     .unwrap()
                     .set_modified(modified + std::time::Duration::from_secs(1))
                     .unwrap();
-            } else if arm != "due_quiet" {
+            } else if !quiet {
                 fixture.file.append(&usage(source, 130, 1, "fixture-model"));
             }
             let suffix_bytes = fs::metadata(&fixture.file.0).unwrap().len() - before;
             sampled_scan::set_test_now(Some(if arm == "clock_append" {
                 START - 1
+            } else if arm.ends_with("50h") {
+                START + 50 * 3_600
             } else {
                 START + 7_200
             }));
-            let loaded = ScanIndex::load(&index_path).unwrap();
+            let mut loaded = ScanIndex::load(&index_path).unwrap();
+            if missing {
+                assert_eq!(loaded.files[&key].unverified_deadline(), Some(START + 1));
+            }
+            if arm == "cleared_selection_debt" {
+                loaded
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .source_file_fingerprint
+                    .clear();
+                assert!(loaded.files[&key].source_file_fingerprint.is_empty());
+            }
             let second = Arc::new(sampled_scan::SharedCache::default());
             second.durable_begin_pass(
                 source,
@@ -1776,42 +1798,104 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 claude_request_identity::capture_by_default(),
             );
             assert!(second.take(&key).is_none(), "restore must start cold");
-            let (warm, result, modes, bytes) = production_scan_at_with_setup(
-                &fixture,
-                source,
-                loaded.clone(),
-                Some(second.clone()),
-                &namespace.0,
-                NOW,
-                |scan| {
-                    let context = scan.sampling.as_ref().unwrap();
-                    if pending > 0 {
-                        assert_eq!(context.audit_slots, 0);
-                        assert_eq!(context.audit_metadata_supported, pending <= 256);
-                        let (budget, _) =
-                            sampled_scan::copy_budget_step(scan.sampling.as_ref(), None, false);
-                        assert!(
-                            budget > 0,
-                            "audit population cannot zero the bounded copy budget"
-                        );
-                    }
-                },
-            );
-            let counts = second.durable_counters(source).unwrap().0;
-            assert_eq!(counts.restore_attempts, 1, "{source:?}/{arm}");
+            if arm == "restore_miss_debt" {
+                // The real record passes binding/certificate/decode but RAM
+                // admission refuses it: exercise DT's budget-refused Miss.
+                *second.retained().unwrap() = TranscriptCache::with_byte_limit(0);
+            }
+            let (((warm, result, modes, bytes), diagnostics), sample_reads) =
+                crate::transcript_acquisition::capture_sample_reads(|| {
+                    crate::local_resource_diagnostics::capture(|| {
+                        production_scan_at_with_setup(
+                            &fixture,
+                            source,
+                            loaded.clone(),
+                            Some(second.clone()),
+                            &namespace.0,
+                            NOW,
+                            |scan| {
+                                let context = scan.sampling.as_ref().unwrap();
+                                if pending > 0 {
+                                    assert_eq!(context.audit_slots, 0);
+                                    assert_eq!(context.audit_metadata_supported, pending <= 256);
+                                    let (budget, _) = sampled_scan::copy_budget_step(
+                                        scan.sampling.as_ref(),
+                                        None,
+                                        false,
+                                    );
+                                    assert!(
+                                        budget > 0,
+                                        "audit population cannot zero the bounded copy budget"
+                                    );
+                                }
+                            },
+                        )
+                    })
+                });
+            let pages = diagnostics
+                .iter()
+                .filter(|record| record["stage"] == "native_collection_page")
+                .collect::<Vec<_>>();
+            assert_eq!(pages.len(), 1);
+            let reasons = &pages[0]["counts"]["sampled_acquisition"]["page_events"]["full_reasons"];
             assert_eq!(
-                counts.restored,
-                u64::from(arm != "real_edit"),
+                *reasons,
+                if full {
+                    json!({"state_missing": 1})
+                } else {
+                    json!({})
+                },
                 "{source:?}/{arm}"
             );
+            assert!(reasons.get("audit_due").is_none());
+            assert!(reasons.get("clock_changed").is_none());
+            let counts = second.durable_counters(source).unwrap().0;
+            assert_eq!(counts.restore_attempts, 1, "{source:?}/{arm}");
+            assert_eq!(counts.restored, u64::from(!full), "{source:?}/{arm}");
             if arm == "real_edit" {
                 assert_eq!(counts.certificate_refused.get("same_size_edit"), Some(&1));
+            } else if arm == "restore_miss_debt" {
+                assert_eq!(counts.budget_refused, 1);
+                assert!(counts.ineligible.is_empty());
+                assert!(counts.certificate_refused.is_empty());
+            } else if arm == "cleared_selection_debt" {
+                assert_eq!(counts.ineligible.get("selection_cleared"), Some(&1));
+                assert_eq!(counts.budget_refused, 0);
+            }
+            // Actual File::read returns, including the certificate restore's
+            // two windows before prepare. Neither totals nor ranges come
+            // from the completed context metrics below.
+            let window = before.min(crate::transcript_acquisition::SAMPLE_BYTES as u64) as usize;
+            let pairs = if !full {
+                if quiet {
+                    1
+                } else {
+                    2
+                }
+            } else {
+                usize::from(arm == "restore_miss_debt")
+            };
+            assert_eq!(sample_reads.len(), 2 * pairs, "{source:?}/{arm}");
+            for pair in sample_reads.chunks_exact(2) {
+                assert_eq!(pair[0].offset, Ok(0));
+                assert_eq!(pair[1].offset, Ok(before - window as u64));
+                for read in pair {
+                    assert_eq!(read.requested, window);
+                    assert_eq!(read.result, Ok(window));
+                }
             }
             assert_eq!(
+                sample_reads
+                    .iter()
+                    .map(|r| r.result.unwrap())
+                    .sum::<usize>(),
+                2 * pairs * window
+            );
+            assert_eq!(
                 modes,
-                if arm == "real_edit" {
+                if full {
                     (1, 0, 0)
-                } else if arm == "due_quiet" {
+                } else if quiet {
                     (0, 0, 1)
                 } else {
                     (0, 1, 0)
@@ -1820,15 +1904,15 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             );
             assert_eq!(
                 bytes.0,
-                if arm == "real_edit" {
-                    before
+                if full {
+                    before + suffix_bytes
                 } else {
                     suffix_bytes
                 },
                 "actual native extent: {source:?}/{arm}"
             );
             assert!(bytes.1 <= (2 * crate::transcript_acquisition::SAMPLE_BYTES) as u64);
-            if arm != "due_quiet" {
+            if !quiet {
                 assert!(!result.snapshots.is_empty());
             }
             let (_, cold, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
@@ -1839,8 +1923,8 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
             );
             assert_eq!(
                 warm.files[&key].has_unverified_source(),
-                arm != "real_edit",
-                "only the actual edit Full verifies the source"
+                !full,
+                "only an actual native Full verifies the source"
             );
         }
     }
