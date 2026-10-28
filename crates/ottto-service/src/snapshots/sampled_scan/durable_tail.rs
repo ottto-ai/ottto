@@ -453,11 +453,10 @@ impl SharedCache {
         source: SnapshotSource,
         candidate: &CandidateFile,
         index: &mut ScanIndex,
-        consume: bool,
     ) -> Option<store::Refusal> {
         self.durable_hold(source, &local_index_key(&candidate.path))
             .or_else(|| {
-                self.durable_upgrade_missing(source, candidate, index, consume)
+                self.durable_upgrade_missing(source, candidate, index)
                     .then_some(store::Refusal::UpgradeMissing)
             })
     }
@@ -467,7 +466,6 @@ impl SharedCache {
         source: SnapshotSource,
         candidate: &CandidateFile,
         index: &mut ScanIndex,
-        consume: bool,
     ) -> bool {
         if !crate::heap_layout_bound::layout_supported() {
             return false;
@@ -506,13 +504,9 @@ impl SharedCache {
         if !slot.store.absent(&store::key_digest(ds, &key)) {
             return false;
         }
-        if reread_guard::byte_unchanged(entry, candidate)
-            || !index.reread_guard.upgrade_missing(&key, consume)
-        {
-            return true;
-        }
-        stores.counters.upgrade_state_missing += u64::from(consume);
-        false
+        // GD retired the old reservation ledger. Missing state is never a
+        // replay grant: hold until the approved cause gate can durably bind A5.
+        true
     }
 
     pub(in crate::snapshots) fn durable_hold_exit(
@@ -554,6 +548,12 @@ impl SharedCache {
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
     ) -> RestoreOutcome {
+        if snapshot_source == SnapshotSource::Codex
+            && refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
+                .is_err()
+        {
+            return RestoreOutcome::Miss;
+        }
         // The common guard held U/T14 before acquisition; this sees class changes since.
         match self.restore_known(
             snapshot_source,
@@ -697,6 +697,10 @@ impl SharedCache {
         held: &mut File,
         interpretation: &Interpretation<'_>,
     ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
+        if source == SnapshotSource::Codex {
+            refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
+                .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
+        }
         record.eligible(expected).map_err(Failure::Ineligible)?;
         let (checkpoint, _) = record
             .record

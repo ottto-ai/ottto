@@ -3600,7 +3600,7 @@ fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
 /// expected/scope/restore/write seams. Every upgraded restart has zero Fulls.
 #[cfg(unix)]
 #[test]
-fn pinned_v1_upgrade_rewrites_v2_then_second_restart_tails_without_a_full() {
+fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() {
     use crate::durable_tail_store as store;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -3719,6 +3719,141 @@ fn pinned_v1_upgrade_rewrites_v2_then_second_restart_tails_without_a_full() {
             let (_, full, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
             assert_eq!(modes, (0, 1, 0), "second restart {source:?} {pin}");
             assert_eq!(production_body(source, scan), production_body(source, full));
+        }
+    }
+}
+
+fn codex_cache_break_lines(index: usize) -> [Value; 2] {
+    let timestamp = format!("2026-10-07T10:{:02}:{:02}Z", index / 60, index % 60);
+    let read = if index % 2 == 0 { 90_000 } else { 0 };
+    let warm = (index / 2 + 1) as u64 * 90_000;
+    let requests = index as u64 + 1;
+    [
+        json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_{index}"),
+            "usage":{"input_tokens":100_000,"cached_input_tokens":read,"cache_write_input_tokens":0,"output_tokens":1}}}),
+        json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{
+            "total_token_usage":{"input_tokens":100_000 * requests,"cached_input_tokens":warm,"output_tokens":requests},
+            "last_token_usage":{"input_tokens":100_000,"cached_input_tokens":read,"output_tokens":1}}}}),
+    ]
+}
+
+fn uploaded_cache_breaks(body: &Value) -> (Vec<String>, &Value) {
+    let wire = &body[0]["cache_observations"];
+    assert_eq!(wire["coverage"], json!("partial"));
+    let refs = wire["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operation| {
+            assert_eq!(operation["op"], json!("upsert"));
+            operation["observation"]["affected_request_ref"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    (refs, &wire["omitted_observation_count"])
+}
+
+/// A Codex session past the cache-observation cap keeps tailing with full-read
+/// parity, and every pass uploads the same first breaks with an exact count of the rest.
+#[test]
+fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = Fixture::new(source);
+    fixture.append(&json!({"type":"turn_context","payload":{"model":"gpt-test","effort":"high","current_date":"2026-10-07"}}));
+    for index in 0..130 {
+        for line in codex_cache_break_lines(index) {
+            fixture.append(&line);
+        }
+    }
+    let first = (0..64)
+        .map(|n| format!("resp_{}", 2 * n + 1))
+        .collect::<Vec<_>>();
+    let (retained, mode, _, body) = acquire(&fixture, source, None, 100);
+    assert_eq!(
+        mode,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing)
+    );
+    assert_eq!(body, oracle(&fixture, source));
+    assert_eq!(uploaded_cache_breaks(&body), (first.clone(), &json!(1)));
+    assert!(retained.is_some(), "the over-cap session is retained");
+    for index in 130..140 {
+        for line in codex_cache_break_lines(index) {
+            fixture.append(&line);
+        }
+    }
+    let (_, mode, _, body) = acquire(&fixture, source, retained, 101);
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(body, oracle(&fixture, source));
+    assert_eq!(uploaded_cache_breaks(&body), (first, &json!(6)));
+}
+
+/// Missing state cannot borrow GD's retired replay authority, even after growth.
+#[cfg(unix)]
+#[test]
+fn missing_upgrade_state_stays_held_across_idle_passes_restart_and_growth() {
+    use crate::durable_tail_store as store;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let index_path = fixture.dir.join("state/index.json");
+        let namespace = Scope("missing-upgrade".into());
+        let first = Arc::new(sampled_scan::SharedCache::default());
+        first.durable_begin_pass(
+            source,
+            &index_path,
+            &namespace,
+            claude_request_identity::capture_by_default(),
+        );
+        let (index, scan, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(first),
+            &namespace.0,
+        );
+        assert_eq!(modes.0, 1);
+        assert!(!scan.snapshots.is_empty());
+        let key = local_index_key(&fixture.file.0);
+        assert!(!index.files[&key].source_file_fingerprint.is_empty());
+        assert!(!store::store_dir_for_index(&index_path).exists());
+        for pass in 0..6 {
+            if pass == 5 {
+                fixture.file.append(&usage(source, 160, 2, "fixture-model"));
+            }
+            let restart = Arc::new(sampled_scan::SharedCache::default());
+            restart.durable_begin_pass(
+                source,
+                &index_path,
+                &namespace,
+                claude_request_identity::capture_by_default(),
+            );
+            let (next, scan, modes) = production_scan(
+                &fixture,
+                source,
+                index.clone(),
+                Some(restart.clone()),
+                &namespace.0,
+            );
+            assert_eq!(modes, (0, 0, 0), "{source:?}/{pass}: no acquisition");
+            assert!(scan.snapshots.is_empty());
+            assert_eq!(
+                next.files[&key].last_snapshot_fingerprint,
+                index.files[&key].last_snapshot_fingerprint
+            );
+            let (counts, _) = restart.durable_counters(source).unwrap();
+            assert_eq!(
+                counts.durable_held[store::Refusal::UpgradeMissing as usize],
+                1
+            );
+            assert_eq!(counts.upgrade_state_missing, 0, "no A5 was admitted");
         }
     }
 }

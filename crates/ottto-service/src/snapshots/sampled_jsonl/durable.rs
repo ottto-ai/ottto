@@ -360,6 +360,9 @@ pub(crate) fn rederive_parser(
     path: &Path,
     decoded: &Decoded,
 ) -> Result<OwnedJsonlParser> {
+    if decoded.reduction.accumulator.source == SnapshotSource::Codex {
+        refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)?;
+    }
     // A duplicated descriptor shares the held one's offset: start at 0.
     file.seek(SeekFrom::Start(0))?;
     let acc = &decoded.reduction.accumulator;

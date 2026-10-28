@@ -1373,6 +1373,7 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
     for kind in [
         "unknown",
         "newer",
+        "r2_v3",
         "reserved_v2",
         "spent_v2",
         "bad_trailer",
@@ -1407,8 +1408,15 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                     bytes[10] ^= 1;
                     Refusal::Unknown
                 }
-                "newer" | "reserved_v2" | "spent_v2" | "oversized_newer" => {
-                    set_version(&mut bytes, FORMAT_VERSION + 1);
+                "newer" | "reserved_v2" | "spent_v2" | "oversized_newer" | "r2_v3" => {
+                    set_version(
+                        &mut bytes,
+                        if kind == "r2_v3" {
+                            3
+                        } else {
+                            FORMAT_VERSION + 1
+                        },
+                    );
                     // Future fields are opaque here; 5a1 must not interpret a mark.
                     if kind == "oversized_newer" {
                         bytes.resize(RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES + 1, 0);

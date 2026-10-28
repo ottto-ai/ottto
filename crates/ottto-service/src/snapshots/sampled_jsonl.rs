@@ -133,6 +133,11 @@ impl OwnedJsonlParser {
     ) -> Result<ReadMode> {
         // Checkpoints, samples and resume offsets are physical-file bytes. A
         // compressed stream has none, so it is never sampled or resumed.
+        refuse_compressed_codex(
+            None,
+            Some(&self.reader.reader),
+            CodexZstCause::PhysicalOffsetUnsupported,
+        )?;
         anyhow::ensure!(
             !self.reader.reader.is_compressed(),
             "compressed input has no physical acquisition offsets"
@@ -179,10 +184,6 @@ impl OwnedJsonlParser {
             now,
         )?;
         let mode = plan.mode();
-        if matches!(mode, ReadMode::Full(_)) {
-            self.assert_reread_ticket();
-            anyhow::ensure!(self.reread_read_allowed(), "reread ticket expired");
-        }
         if matches!(mode, ReadMode::Full(_)) && self.source == SnapshotSource::Codex {
             self.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
         }

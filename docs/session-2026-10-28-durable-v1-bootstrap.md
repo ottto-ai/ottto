@@ -1,21 +1,21 @@
-# Durable v1 bootstrap and missing-state admission
+# Durable v1 bootstrap
 
-The first format-v2 preparation slice keeps writing format v1. Restore and GC
-bind each known record using its stored format and source allowlist, preserving
-the original scope formula. Decoded Codex counting state must agree with the
-configured cutover; its interpretation/evidence remain the reduction's decision.
-V1 audit-debt bytes are checked and dropped on decode. Ordinary replacement
-failure or budget refusal retains the valid v1 authority.
+Restore and GC bind each known record using its stored format and source
+allowlist, preserving the original scope formula. The writer remains format 1.
+Formats 2 and 3 remain newer-format holds: this change allocates no new tag.
+Decoded Codex counting state must agree with the configured cutover; its
+interpretation and evidence remain the reduction's decision. V1 audit-debt
+bytes are checked and dropped on decode without changing their wire offsets.
+Ordinary replacement failure or budget refusal retains valid v1 authority.
 
-Indexed cold misses hold while idle. Changed content uses an existing saved,
-once-per-file/per-release reread reservation before acquisition. A counter and
-alarm expose `upgrade_state_missing`. Group preflight waits for every sibling's
-saved reservation before consuming any, so requeues cannot strand a member.
-Completed joined Codex members intentionally have no per-file reduction and
-use their existing group admission, while durable-record holds still apply.
-The existing replay ledger keeps one hash per indexed file and release, avoiding
-a fixed file grant cap. Release history survives rollback/re-upgrade, preserving
-the once-per-release limit.
+GD removed the old reread reservation ledger. This change does not restore it
+or use its retired positional fields. Indexed cold misses hold conservatively,
+including changed content, until the approved cause gate can durably bind the
+one permitted A5 recovery. Held misses are observable as `durable_held` class
+`upgrade_missing`; `upgrade_state_missing` counts admitted A5 reads and remains
+zero while that admission is unavailable. Completed joined Codex jobs retain no
+per-file reduction by design and use their existing group admission. Durable
+record holds still precede this exemption.
 
-The next slice enables v2 layout, metadata and recovery-marker preservation.
-No feature flags or new source tags are introduced here.
+No feature flags, new source tags or representation reinterpretation. Broader
+restart admission and R2 format 3 remain separate changes.

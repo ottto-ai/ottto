@@ -5125,6 +5125,15 @@ impl SharedCache {
         // length `PageBudget::plan` compares with B. Refuse it explicitly
         // (never a cursor job); the activation names the compressed > B plan
         // and sizes it by decoded bytes.
+        if refuse_compressed_codex(
+            Some(&job.candidate.path),
+            Some(&job.parser.reader.reader),
+            CodexZstCause::PhysicalOffsetUnsupported,
+        )
+        .is_err()
+        {
+            return Err(refuse(StartRefusal::Unstartable));
+        }
         if job.parser.reader.reader.is_compressed() {
             return Err(refuse(StartRefusal::Unstartable));
         }
@@ -6143,7 +6152,8 @@ pub(in crate::snapshots) struct LiveWitness {
 crate::heap_layout_bound::fields!(LiveWitness; dev, ino, offset, head, boundary);
 
 impl LiveWitness {
-    pub(in crate::snapshots) fn read(file: &File, offset: u64) -> Option<Self> {
+    pub(in crate::snapshots) fn read(path: &Path, file: &File, offset: u64) -> Option<Self> {
+        refuse_compressed_codex(Some(path), None, CodexZstCause::PhysicalOffsetUnsupported).ok()?;
         let stamp = OpenStamp::capture(file).ok()?;
         if offset == 0 || stamp.extent < offset {
             return None;
@@ -6386,6 +6396,7 @@ impl MemoEntry {
     /// Every wake dependency except the stamp holds.
     fn dependencies_hold(
         &self,
+        path: &Path,
         digest: &str,
         file: &File,
         parent_now: Option<&ParentNow>,
@@ -6404,7 +6415,7 @@ impl MemoEntry {
                 .as_deref()
                 .map_or(true, |sidecar| sidecar == sidecar_now)
             && self.live.as_ref().map_or(true, |live| {
-                LiveWitness::read(file, live.offset).as_ref() == Some(live)
+                LiveWitness::read(path, file, live.offset).as_ref() == Some(live)
             })
     }
 
@@ -6414,17 +6425,19 @@ impl MemoEntry {
     #[cfg(test)]
     pub(in crate::snapshots) fn matches(
         &self,
+        path: &Path,
         digest: &str,
         file: &File,
         parent_now: Option<&ParentNow>,
         sidecar_now: &str,
     ) -> Option<OpenStamp> {
         let now = OpenStamp::capture(file).ok()?;
-        self.matches_stamp(digest, file, parent_now, sidecar_now, now)
+        self.matches_stamp(path, digest, file, parent_now, sidecar_now, now)
     }
 
     pub(in crate::snapshots) fn matches_stamp(
         &self,
+        path: &Path,
         digest: &str,
         file: &File,
         parent_now: Option<&ParentNow>,
@@ -6436,7 +6449,7 @@ impl MemoEntry {
         } else {
             self.stamp.wake_compatible(&now)
         };
-        (stamp_holds && self.dependencies_hold(digest, file, parent_now, sidecar_now))
+        (stamp_holds && self.dependencies_hold(path, digest, file, parent_now, sidecar_now))
             .then_some(now)
     }
 
@@ -6444,6 +6457,7 @@ impl MemoEntry {
     /// held (the re-read a counted tail would save): the current extent.
     pub(in crate::snapshots) fn grew_past_exact(
         &self,
+        path: &Path,
         digest: &str,
         file: &File,
         parent_now: Option<&ParentNow>,
@@ -6453,7 +6467,7 @@ impl MemoEntry {
         (self.exact_stamp
             && now.extent > self.stamp.extent
             && self.stamp.wake_compatible(&now)
-            && self.dependencies_hold(digest, file, parent_now, sidecar_now))
+            && self.dependencies_hold(path, digest, file, parent_now, sidecar_now))
         .then(|| now.extent())
     }
 }

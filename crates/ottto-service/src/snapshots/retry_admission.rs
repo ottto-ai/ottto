@@ -514,27 +514,7 @@ fn claude_retry_note_offered(
     }
     let oversized = state.oversized_root.clone();
     let previous = state.oversized_after_path.clone();
-    let context = index
-        .traversal
-        .as_ref()
-        .expect("active traversal")
-        .context_fingerprint
-        .clone();
-    let held = oversized_after.is_some()
-        && index.reread_plan_for_rearms(
-            SnapshotSource::ClaudeCode,
-            collected_at,
-            &context,
-            false,
-            |key| {
-                oversized.as_deref().is_some_and(|root| {
-                    claude_index_path_member_ref(Path::new(key)).is_some_and(|m| m.root == root)
-                }) && previous.as_deref().map_or(true, |after| key > after)
-                    && oversized_after.as_deref().is_some_and(|after| key <= after)
-                    && offered(key)
-            },
-        );
-    if !held && oversized_after.is_some() {
+    if oversized_after.is_some() {
         for path in paths {
             let key = local_index_key(&path.path);
             if claude_index_path_member_ref(&path.path)
@@ -562,11 +542,11 @@ fn claude_retry_note_offered(
         .as_mut()
         .and_then(|origin| origin.admission.as_mut())
         .expect("retained admission");
-    state.progressed |= due_after.is_some() || (!held && oversized_after.is_some());
+    state.progressed |= due_after.is_some() || oversized_after.is_some();
     if due_after.is_some() {
         state.due_after_path = due_after;
     }
-    if !held && oversized_after.is_some() {
+    if oversized_after.is_some() {
         state.oversized_after_path = oversized_after;
     }
 }

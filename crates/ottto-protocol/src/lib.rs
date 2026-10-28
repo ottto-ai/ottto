@@ -8007,16 +8007,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "Phase 1+ reducer work: fixtures are present, runtime reducer is not implemented yet"]
-    fn local_health_reducer_replays_contract_matrix() {
-        let fixtures = local_health_contract_fixtures();
-        assert!(
-            !fixtures.is_empty(),
-            "future reducer should replay each fixture into its expected health state"
-        );
-    }
-
     fn local_health_contract_fixtures() -> Vec<LocalHealthContractFixture> {
         serde_json::from_str(include_str!(
             "../../../fixtures/local-health/contract-matrix.v1.json"

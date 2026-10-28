@@ -677,17 +677,20 @@ fn commit_completed_with_local_holds(
     progress_blocking: bool,
     held_family_roots: Option<&BTreeSet<String>>,
 ) -> ScanIndex {
-    if !progress_blocking
-        && index.locally_held_keys_restorable(
+    if !progress_blocking {
+        if index.locally_held_keys_restorable(
             committed_index,
             locally_held_fingerprints,
             account_deferred_held_fingerprints,
-        )
-    {
-        return index.into_locally_held_keys_reverted(
-            committed_index,
-            locally_held_fingerprints,
-            account_deferred_held_fingerprints,
+        ) {
+            return index.into_locally_held_keys_reverted(
+                committed_index,
+                locally_held_fingerprints,
+                account_deferred_held_fingerprints,
+            );
+        }
+        crate::local_resource_diagnostics::claude_reread::held_reason(
+            crate::local_resource_diagnostics::claude_reread::HeldReason::NotRestorable,
         );
     }
     let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
@@ -5462,17 +5465,7 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
-                if next
-                    .persist_reread_reservations(&mut self.committed_index, &self.index_path)
-                    .is_err()
-                {
-                    self.scan = Some(next);
-                    return SourcePreparationStep::Refused(
-                        self,
-                        crate::source_rotation::LocalRefusal("reread reservation save refused"),
-                    );
-                }
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -6315,7 +6308,6 @@ fn prepare_sync_source_inner(
         context_curve_enabled,
         request_identity_capture,
     )
-    .with_reread_persistence()
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_codex_side_pass(codex_side_pass);
     if source == SnapshotSource::ClaudeCode {
@@ -6685,7 +6677,6 @@ fn prepare_continuation_source(
         ordinary_equivalent,
     )
     .with_continuation_deadline(deadline)
-    .with_reread_persistence()
     .with_sampled_acquisition(
         std::sync::Arc::clone(cache),
         // K5: the ordinary Codex page's scope; Codex never captures.
@@ -14348,6 +14339,63 @@ mod tests {
     }
 
     #[test]
+    fn cache_overcap_byte_trim_witness_network_and_ack_use_identical_completion() {
+        let (patch, prior) =
+            crate::snapshots::cache_overcap_tests::large_prior_and_replacement_fixture();
+        let mut raw = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        raw.context_curve = None;
+        raw.cache_observations = Some(patch);
+        raw.cache_observations_state = None;
+        let key = cache_session_key(&raw.source_session_id);
+        let mut progress = test_upload_progress();
+        progress
+            .accepted_cache_states
+            .insert(key.clone(), prior.clone());
+        progress
+            .accepted_cache_heads
+            .insert(key.clone(), "e".repeat(64));
+        let witness = effective_snapshot_upload_body_witness(
+            &raw,
+            &progress,
+            true,
+            true,
+            &BTreeSet::new(),
+            &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+        );
+        let mut network = raw.clone();
+        prepare_snapshot_cache_for_upload(&mut network, &progress, true, true, &BTreeSet::new());
+        assert_eq!(witness, snapshot_upload_body_witness(&network));
+        assert_eq!(
+            progress.accepted_cache_states[&key], prior,
+            "projection does not advance accepted state"
+        );
+        let wire = network.cache_observations.as_ref().unwrap();
+        assert!(wire.validate());
+        let expected = crate::snapshots::cache_state_from_patch(Some(&prior), wire);
+        assert_eq!(network.cache_observations_state.as_ref(), Some(&expected));
+        assert!(
+            crate::canonical_json::canonicalize(&expected)
+                .unwrap()
+                .len()
+                <= crate::snapshots::cache_observations::MAX_WIRE_BYTES
+        );
+        progress.record_cache_state(&network, false).unwrap();
+        assert_eq!(
+            progress.accepted_cache_states[&key], expected,
+            "ACK completion applies the actual uploaded patch"
+        );
+        progress.record_cache_state(&network, false).unwrap();
+        assert_eq!(
+            progress.accepted_cache_states[&key], expected,
+            "ACK retry is idempotent"
+        );
+        assert!(
+            raw.cache_observations_state.is_none(),
+            "local evidence is retained"
+        );
+    }
+
+    #[test]
     fn cache_event_ack_restart_correction_and_missing_proof() {
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         item.context_curve = None;
@@ -19892,6 +19940,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completed_hold_reason_names_only_the_actual_failed_restore_branch() {
+        use crate::local_resource_diagnostics::claude_reread::Scope;
+        let key = "/opaque/projects/family-root.jsonl";
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {key: {
+                "size_bytes": 1, "modified_unix_seconds": 2,
+                "source_file_fingerprint": "new-source",
+                "last_snapshot_fingerprint": "held",
+                "scan_identity_version": "semantic_sync:v2"
+            }},
+            "file_snapshot_fingerprints": {key: ["held"]},
+            "claude_usage_family_witnesses": {"family-root": {
+                "evidence_fingerprint": "e".repeat(64),
+                "member_request_id_fingerprints": {},
+                "member_occurrence_fingerprints": {},
+                "assigned_request_id_fingerprints": {}
+            }}
+        }));
+        let held = BTreeSet::from(["held".to_owned()]);
+        for (previous, blocking, expected) in [
+            (
+                ScanIndex::default(),
+                false,
+                serde_json::json!({"not_restorable": 1}),
+            ),
+            (ScanIndex::default(), true, serde_json::json!(null)),
+            (scanned.clone(), false, serde_json::json!(null)),
+        ] {
+            let scope = Scope::begin(true);
+            let committed = commit_completed_with_local_holds(
+                scanned.clone(),
+                &previous,
+                &test_upload_progress(),
+                &held,
+                &BTreeSet::new(),
+                blocking,
+                None,
+            );
+            assert_eq!(
+                committed.bounded_sweep_had_unsettled_upload(),
+                previous.files.is_empty()
+            );
+            assert_eq!(
+                serde_json::to_value(scope.finish()).unwrap()["claude_reread"]["held_reason"],
+                expected
+            );
+        }
+    }
+
     /// A completed upload whose holds can still change in this traversal keeps
     /// the conservative partial commit and owes a clean follow-up; one whose
     /// holds cannot progress reverts only the held key and may settle.
@@ -22517,9 +22615,6 @@ mod tests {
                 }
                 mod oversized_discovery_pipeline_tests {
                     include!("snapshot_sync/oversized_discovery_pipeline_tests.rs");
-                }
-                mod structural_reread_guard_tests {
-                    include!("snapshot_sync/structural_reread_guard_tests.rs");
                 }
             }
         }

@@ -350,7 +350,6 @@ impl PipelineFixture {
         // Keep all existing field/ACK/debt/restart assertions below, and compare
         // the full state at that boundary with the borrowed reference surface.
         // Both whole-index arms may remember replay witnesses during restore.
-        let _reread_clock = crate::snapshots::reread_guard::TestClock::freeze();
         let borrowed_reference = (matches!(
             &upload,
             PipelineUpload::Accept

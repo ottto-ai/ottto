@@ -1539,7 +1539,6 @@ fn group_with_legacy_tee_is_byte_charged() {
         }
     }
     let metadata = CodexTitleMetadata::default();
-    boot.admit_for_test(&previous);
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
@@ -1553,7 +1552,6 @@ fn group_with_legacy_tee_is_byte_charged() {
     assert!(job.group.as_ref().unwrap().tee.is_some());
     let no_scope = |_: &CandidateFile| None;
     let inputs = StepInputs {
-        index: &previous,
         metadata: &metadata,
         attribution: None,
         artifacts: false,
@@ -1691,7 +1689,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         }
     }
     let metadata = CodexTitleMetadata::default();
-    boot.admit_for_test(&previous);
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
@@ -1704,7 +1701,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         .unwrap();
     let no_scope = |_: &CandidateFile| None;
     let inputs = StepInputs {
-        index: &previous,
         metadata: &metadata,
         attribution: None,
         artifacts: false,
@@ -2937,63 +2933,6 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn two_missing_group_members_keep_both_tickets_until_the_group_can_acquire() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let (root, _) = fixture();
-    fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-    let _lock = crate::locked_state_dir::test_locks::hold(&root);
-    let index_path = root.join("index.json");
-    let source = SnapshotSource::Codex;
-    let mut committed = ScanIndex::default();
-    for name in ["a", "b"] {
-        committed.files.insert(local_index_key(&root.join(format!("sessions/{name}.jsonl"))),serde_json::from_value(json!({"size_bytes":0,"modified_unix_seconds":0,"source_file_fingerprint":"prior-native","last_snapshot_fingerprint":"prior-accepted"})).unwrap());
-    }
-    committed.save(&index_path).unwrap();
-    let cache = Arc::new(SharedCache::default());
-    let namespace = Scope("group-missing-upgrade".into());
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
-    let mut owned = OwnedSourceScan::new(
-        source,
-        &[root.join("sessions")],
-        committed.clone(),
-        "2026-10-06T23:00:00Z",
-        7,
-        10,
-        false,
-        None,
-        &[],
-        false,
-        false,
-    )
-    .with_sampled_acquisition(cache.clone(), namespace);
-    let mut saves = 0;
-    let result = loop {
-        match owned.step(None) {
-            OwnedSourceScanStep::Pending(mut next) => {
-                if next.index.reread_guard.needs_save() {
-                    saves += 1;
-                }
-                next.persist_reread_reservations(&mut committed, &index_path)
-                    .unwrap();
-                assert!(saves <= 2, "no additional per-release grant");
-                owned = next;
-            }
-            OwnedSourceScanStep::Complete { scan, .. } => break scan,
-        }
-    };
-    assert_eq!(saves, 2, "one receipt for each member");
-    assert!(result.scanned_file_count >= 2);
-    assert!(!result.snapshots.is_empty());
-    let (counts, _) = cache.durable_counters(source).unwrap();
-    assert_eq!(counts.upgrade_state_missing, 2);
-    assert_eq!(counts.durable_held.iter().sum::<u64>(), 0);
-    fs::remove_dir_all(root).unwrap();
-}
-
 /// A successful joined scan has no per-file durable reductions by design.
 /// Appending only the live member must still admit its unchanged sealed peer.
 #[cfg(unix)]
@@ -3047,12 +2986,116 @@ fn completed_joined_members_are_not_missing_upgrade_state() {
         );
         assert!(scan.scanned_file_count >= 2, "joined updates must progress");
         assert!(!scan.snapshots.is_empty());
-        assert!(!next.reread_guard.needs_save());
         index = next;
     }
     assert_eq!(fs::read(sealed).unwrap(), before);
     let (counts, _) = cold.durable_counters(source).unwrap();
     assert_eq!(counts.upgrade_state_missing, 0);
     assert_eq!(counts.durable_held.iter().sum::<u64>(), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
+    use codex_zst_refusal_tests::assert_refused;
+    let (root, inventory) = fixture();
+    let index = ScanIndex::default();
+    let group = inventory.groups().into_values().next().unwrap();
+    let mut boot = GroupBoot::new(group.clone(), &index);
+    let plain = group.members[0].clone();
+    let mut compressed = plain.clone();
+    compressed.path.set_extension("jsonl.zst");
+    fs::copy(&plain.path, &compressed.path).unwrap();
+    boot.group.members[0] = compressed.clone();
+    assert_refused(CodexZstCause::GroupProbeUnsupported, || {
+        assert!(matches!(boot.probe(0), Boot::Strict));
+        assert_eq!(boot.charge, 0);
+    });
+    let metadata = CodexTitleMetadata::default();
+    assert_refused(CodexZstCause::GroupReadUnsupported, || {
+        assert!(open_member_file(&mut compressed).is_err());
+        assert!(new_group_parser(
+            File::open(&compressed.path).unwrap(),
+            &compressed,
+            &metadata,
+            None,
+            None,
+            false,
+            false,
+            codex_counting_version::AckEvidence::None
+        )
+        .is_err());
+        let expected =
+            BTreeMap::from([(local_index_key(&compressed.path), "accepted-body".into())]);
+        assert!(legacy_tee(
+            &expected,
+            &compressed,
+            &File::open(&compressed.path).unwrap(),
+            &metadata,
+            None,
+            None,
+            false,
+            false
+        )
+        .is_err());
+    });
+    let mut boot = GroupBoot::new(group, &index);
+    loop {
+        match boot.step(None, &index) {
+            Boot::Pending => {}
+            Boot::Ready => break,
+            _ => panic!("plain group boots"),
+        }
+    }
+    let mut active = boot
+        .into_job(JobInputs {
+            metadata: &metadata,
+            traces: None,
+            ledgers: None,
+            artifacts: false,
+            context_curve: false,
+            index: &index,
+        })
+        .unwrap();
+    let before = active.parser.reader.consumed_bytes();
+    let group = active.group.as_deref_mut().unwrap();
+    group.current = 1;
+    group.members[1] = compressed;
+    let join = active
+        .parser
+        .accumulator
+        .codex_tier_replay
+        .as_mut()
+        .unwrap()
+        .join
+        .take()
+        .unwrap();
+    let no_scope = |_: &CandidateFile| None;
+    let inputs = StepInputs {
+        metadata: &metadata,
+        attribution: None,
+        artifacts: false,
+        context_curve: false,
+        live_scope: &no_scope,
+    };
+    assert_refused(CodexZstCause::GroupReadUnsupported, || {
+        assert!(matches!(
+            open_member(&mut active, join, &inputs),
+            Err(GroupEnd::Strict)
+        ));
+        assert_eq!(
+            active.parser.reader.consumed_bytes(),
+            before,
+            "swap never reset the reader"
+        );
+    });
+    active.candidate.path.set_extension("jsonl.zst");
+    let cache = Arc::new(SharedCache::default());
+    assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
+        assert!(matches!(
+            cache.cursor_start(&mut active, &Scope("zst".into()), None, None, true, &index),
+            Err(cursor::StartRefusal::Unstartable)
+        ));
+    });
     fs::remove_dir_all(root).unwrap();
 }
