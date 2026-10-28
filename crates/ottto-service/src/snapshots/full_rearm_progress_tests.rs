@@ -1224,10 +1224,11 @@ fn always_on_veto_state(rearm: &Rearm, index: &ScanIndex, items: &[SnapshotItem]
 /// Contract-5 cutover (E1 seam, Lead B condition D): on a permitted Mac
 /// (contract recorded, latch clear) every terminal builds contract-5
 /// evidence and emits contract-5 bodies. With the family's sidecars absent,
-/// matched, or matched with request identity, the first due terminal records
-/// the structural baseline and every later due terminal with no contract
-/// change skips: no fingerprint is cleared, so nothing reads Full. Under the
-/// released E2 contract (gate on) and the gate-off collector.
+/// matched, or matched with request identity but no account check, the
+/// first due terminal records the structural baseline and every later due
+/// terminal with no contract change skips: no fingerprint is cleared, so
+/// nothing reads Full. Under the released E2 contract (gate on) and the
+/// gate-off collector.
 #[test]
 fn always_on_terminals_keep_the_structural_suppression() {
     for (contract, gate) in [
@@ -1267,9 +1268,9 @@ fn always_on_terminals_keep_the_structural_suppression() {
                     );
                     assert_eq!(parent.provenance.collector, contract, "{arm}: {body}");
                     assert_eq!(parent.request_identity_refusals, 0, "{arm}: {body}");
-                    if cause == "matched-identity" {
-                        assert!(tagged_rows > 0, "{arm}: tagged rows: {body}");
-                    }
+                    // Request identity without D1's account-checked login never
+                    // tags (`valid_login`); a tagged body is the control below.
+                    assert_eq!(tagged_rows, 0, "{arm}: {body}");
                     assert_eq!(
                         index.claude_request_identity_contract.as_deref(),
                         Some(contract),
@@ -1306,13 +1307,14 @@ fn always_on_terminals_keep_the_structural_suppression() {
     }
 }
 
-/// Control for the structural suppression (Lead B condition D): a family
-/// whose one telemetry row is account-checked, covering one of the parent's
-/// four requests, withholds the session account for incomplete request
-/// evidence (legacy account path). That non-structural veto keeps every due
-/// terminal re-arming. It does not depend on the contract: the always-on
-/// build (tagged contract-5 body) and a pre-cutover build without evidence
-/// re-arm the same terminals.
+/// Control for the structural suppression (Lead B condition D): contract 5
+/// tags only from D1's account-checked login, and a family whose one
+/// checked row covers one of the parent's four requests also withholds the
+/// session account for incomplete request evidence (legacy account path,
+/// `apply_claude_account_evidence`). `observe_page` counts that withheld
+/// member as non-structural, so every due terminal re-arms. The veto does
+/// not depend on the contract: the always-on build (tagged contract-5 body)
+/// and a pre-cutover build without evidence re-arm the same terminals.
 #[test]
 fn a_withheld_account_rearms_the_same_before_and_after_the_cutover() {
     claude_request_identity::with_cycle_contract_for_test(
@@ -1334,6 +1336,26 @@ fn a_withheld_account_rearms_the_same_before_and_after_the_cutover() {
                             parent.claude_account_withheld_reason.is_some(),
                             "always_on={always_on}: {state}"
                         );
+                        assert_eq!(parent.request_identity_refusals, 0, "{state}");
+                        if always_on {
+                            let tagged = parent
+                                .model_usage
+                                .iter()
+                                .chain(
+                                    parent
+                                        .usage_buckets
+                                        .iter()
+                                        .flat_map(|bucket| &bucket.model_usage),
+                                )
+                                .any(|row| {
+                                    row.evidence_ref.is_some() || row.identity_parts.is_some()
+                                });
+                            assert!(tagged, "a tagged contract-5 body: {state}");
+                            assert_eq!(
+                                parent.provenance.collector,
+                                claude_request_identity::E2_GROUPING
+                            );
+                        }
                         (
                             run.counts.full_rearm,
                             run.suppression.full_rearm_suppressed,
