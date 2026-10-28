@@ -116,7 +116,7 @@ enum Command {
     /// daemon state is touched.
     #[command(hide = true)]
     H527Produce {
-        /// `h527_producer_input:v1` JSON bundle.
+        /// `h527_producer_input:v2` JSON bundle.
         #[arg(long)]
         input: PathBuf,
         /// New directory for the artifact, held packet and summary.
