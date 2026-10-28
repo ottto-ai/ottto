@@ -18,9 +18,20 @@ def output(args):
     return subprocess.check_output(args, text=True).strip()
 
 
-# Disk-only lifecycle fixtures (#806): a VERIFIED line each, no receipt file.
+# Pi writes cross-build receipts even when the base has no durable Pi store.
+PI_FIXTURES = (
+    "pi_plain_session", "pi_tool_turn", "pi_compaction", "pi_branch_summary",
+    "pi_usage_entry_kinds", "pi_ledger_count_above_one", "pi_ledger_paired_digest",
+    "pi_ledger_reused_id", "pi_ledger_reverse_pair", "pi_conflict", "pi_conflict_after_pair",
+    "pi_no_response_id", "pi_selector_across_seal", "pi_provider_hour_and_late_time",
+    "pi_invalid_cost", "pi_invalid_time", "pi_usage_overflow", "pi_error_zero_requests",
+    "pi_cli_fork_preserves_double_count", "pi_version_rewrite_after_tail",
+    "pi_restart_between_pages", "pi_upgrade_without_semantic_revision",
+    "pi_downgrade_then_reupgrade", "pi_acquisition_metadata_changes",
+)
+# Existing disk-only lifecycle fixtures keep their strict VERIFIED contract.
 DISK_FIXTURES = ("restart_between_pages", "upgrade_without_semantic_revision",
-                 "downgrade_then_reupgrade")
+                 "downgrade_then_reupgrade") + PI_FIXTURES
 
 
 def main():
@@ -52,7 +63,7 @@ def main():
     head_sha = output(["git", "rev-parse", "HEAD"])
     manifest = {"base": base_sha, "head": head_sha, "base_ref": ref,
                 "arms": ["retained_ram_tail_or_unchanged", "cold_full", "disk_restore"],
-                "disk_restore": "EXECUTED: " + ", ".join(DISK_FIXTURES)}
+                "disk_restore": {}}
     (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     base = root / "base"
     command(["git", "worktree", "add", "--detach", str(base), base_sha])
@@ -92,18 +103,29 @@ def main():
                 "quiet_sidecar_growth", "side_owner", "side_without_owner",
                 "side_owner_directory_unlisted", "failed_then_healthy_telemetry",
                 "codex_v2_sticky", "codex_legacy_acked_sticky",
-            }
+            } | set(PI_FIXTURES)
             if len(verified) != len(expected) or set(verified) != expected or "UNEXECUTED" in result.stdout:
                 raise RuntimeError(f"incomplete native coverage: {verified}")
-            # Every disk line must be VERIFIED, once per fixture: 10 + 3 receipts.
             disk = re.findall(r"\bMONEY_EQUIVALENCE_DISK (\w+) (\w+)", result.stdout, re.M)
-            if sorted(disk) != sorted((name, "VERIFIED") for name in DISK_FIXTURES):
+            if len(disk) != len(DISK_FIXTURES) or {name for name, _ in disk} != set(DISK_FIXTURES):
                 raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
+            pi_states = {status for name, status in disk if name in PI_FIXTURES}
+            # A base without the Pi store reports UNSUPPORTED uniformly, from
+            # the runtime capability probe; never excuse a partial/broken store.
+            allowed_pi = ({"VERIFIED"}, {"UNSUPPORTED"}) if arm == "base" else ({"VERIFIED"},)
+            if pi_states not in allowed_pi or any(
+                status != "VERIFIED" for name, status in disk if name not in PI_FIXTURES
+            ):
+                raise RuntimeError(f"invalid {arm} disk-restore coverage: {disk}")
+            manifest["disk_restore"][arm] = dict(disk)
+            (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
             if len(verified) + len(disk) != len(expected) + len(DISK_FIXTURES):
                 raise RuntimeError(f"expected {len(expected)} + {len(DISK_FIXTURES)} receipts")
         left, right = receipts / "base", receipts / "head"
         names = sorted(p.name for p in left.glob("*.json") if not p.name.endswith(".cross-build.json"))
-        if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")):
+        if names != sorted(name + ".json" for name in expected) or names != sorted(
+            p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")
+        ):
             raise RuntimeError("missing or extra fixture receipts")
         for name in names:
             inputs = Path(name).with_suffix(".inputs")
@@ -124,11 +146,15 @@ def main():
         manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        unsupported = [name for name, status in manifest["disk_restore"]["base"].items()
+                       if status == "UNSUPPORTED"]
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
         with summary.open("a") as f:
             f.write(f"Money equivalence VERIFIED: {len(names)} + {len(DISK_FIXTURES)} disk-restore fixtures, "
                     f"base `{base_sha}`, head `{head_sha}`. "
-                    f"{manifest['runtime_seconds']:.1f}s. Family vector/Pi remain ignored.\n")
+                    f"{manifest['runtime_seconds']:.1f}s. "
+                    f"Base Pi disk UNSUPPORTED: {', '.join(sorted(unsupported)) or 'none'}; "
+                    f"head Pi disk VERIFIED: {len(PI_FIXTURES)}. Family vector remains ignored.\n")
     finally:
         command(["git", "worktree", "remove", "--force", str(base)])
 

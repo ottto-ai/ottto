@@ -131,7 +131,10 @@ impl ReceiptBody {
             }
             canonical(&wire)
         };
-        if self.source == SnapshotSource::ClaudeCode {
+        if self.source == SnapshotSource::Pi && self.items.is_empty() {
+            assert_eq!(self.raw, b"[]", "quarantine emits no envelope");
+            self.raw.clone()
+        } else if self.source == SnapshotSource::ClaudeCode {
             // Claude's real uploader returns a sequence of encoded envelopes.
             let batches: Vec<Vec<u8>> = serde_json::from_slice(&self.raw).unwrap();
             canonical(
@@ -1048,7 +1051,40 @@ fn pi_seed() -> String {
         ))
 }
 
-fn pi_disk_corpus(name: &str, initial: &str) -> (Corpus, Disk, PathBuf, E2ScanFixture, ScanIndex) {
+struct PiProof {
+    durable: bool,
+    bodies: Vec<ReceiptBody>,
+}
+
+impl PiProof {
+    fn capture(&mut self, scan: &SourceScanResult) {
+        self.bodies.push(ReceiptBody {
+            raw: if scan.snapshots.is_empty() {
+                b"[]".to_vec()
+            } else {
+                other_wire(SnapshotSource::Pi, scan)
+            },
+            source: SnapshotSource::Pi,
+            items: scan.snapshots.clone(),
+        });
+    }
+
+    fn finish(self, c: &Corpus) {
+        let name = c.base.file_name().unwrap().to_str().unwrap();
+        receipt(name, &self.bodies);
+        let status = if self.durable {
+            "VERIFIED"
+        } else {
+            "UNSUPPORTED"
+        };
+        println!("MONEY_EQUIVALENCE_DISK {name} {status}");
+    }
+}
+
+fn pi_disk_corpus(
+    name: &str,
+    initial: &str,
+) -> (Corpus, Disk, PathBuf, E2ScanFixture, ScanIndex, PiProof) {
     let c = corpus(name);
     let path = c.root.join("session.jsonl");
     std::fs::write(&path, initial).unwrap();
@@ -1057,11 +1093,20 @@ fn pi_disk_corpus(name: &str, initial: &str) -> (Corpus, Disk, PathBuf, E2ScanFi
     let scanner = disk.owner(SnapshotSource::Pi);
     let (mut index, scan, modes) =
         other_page(&c, &scanner, SnapshotSource::Pi, ScanIndex::default());
-    assert_eq!(modes, (1, 0, 0));
+    // This API exists on main too: an unsupported source has no store slot.
+    // A supported build must actually persist its warm record, never silently
+    // downgrade a failed write to UNSUPPORTED.
+    let durable = scanner.cache.durable_counters(SnapshotSource::Pi).is_some();
+    assert_eq!(modes, if durable { (1, 0, 0) } else { (0, 0, 0) });
     assert!(!scan.snapshots.is_empty());
     let prior = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut index);
-    assert_eq!(disk.records(), 1, "warm Pi reduction must be durable");
-    (c, disk, path, scanner, prior)
+    assert_eq!(disk.records(), usize::from(durable), "Pi store capability");
+    let mut proof = PiProof {
+        durable,
+        bodies: Vec::new(),
+    };
+    proof.capture(&scan);
+    (c, disk, path, scanner, prior, proof)
 }
 
 fn pi_grow(path: &Path, value: Value) {
@@ -1072,7 +1117,9 @@ fn pi_grow(path: &Path, value: Value) {
 // Return each arm's own finished index, so a later page cannot borrow another
 // arm's settlement. Quarantined files have no emitted body; compare their
 // disposition and retryability instead of inventing a successful upload.
+#[allow(clippy::too_many_arguments)]
 fn pi_pages(
+    proof: &mut PiProof,
     c: &Corpus,
     retained: &E2ScanFixture,
     restart: &E2ScanFixture,
@@ -1084,16 +1131,28 @@ fn pi_pages(
     save_inputs(c);
     let [tail_prior, full_prior, disk_prior] = priors;
     let (tail_index, tail, mode) = other_page(c, retained, SnapshotSource::Pi, tail_prior);
-    assert_eq!(mode, ram_mode, "Pi retained acquisition");
+    assert_eq!(
+        mode,
+        if proof.durable { ram_mode } else { (0, 0, 0) },
+        "Pi retained acquisition"
+    );
     let (full_index, full, mode) =
         other_page(c, &E2ScanFixture::default(), SnapshotSource::Pi, full_prior);
     assert_eq!(mode.1 + mode.2, 0, "cold Pi cannot reuse a reduction");
     let (disk_index, restored, mode) = other_page(c, restart, SnapshotSource::Pi, disk_prior);
-    assert_eq!(mode, disk_mode, "Pi disk acquisition");
     assert_eq!(
-        durable_restores(&restart.cache, SnapshotSource::Pi).1,
-        restores
+        mode,
+        if proof.durable { disk_mode } else { (0, 0, 0) },
+        "Pi disk acquisition"
     );
+    if proof.durable {
+        assert_eq!(
+            durable_restores(&restart.cache, SnapshotSource::Pi).1,
+            restores
+        );
+    } else {
+        assert!(restart.cache.durable_counters(SnapshotSource::Pi).is_none());
+    }
     for scan in [&tail, &restored] {
         assert_eq!(
             scan.dropped_usage_record_count,
@@ -1124,18 +1183,27 @@ fn pi_pages(
         assert_eq!(tail_index.files.len(), full_index.files.len());
         assert_eq!(disk_index.files.len(), full_index.files.len());
     }
+    proof.capture(&full);
     ([tail_index, full_index, disk_index], full)
 }
 
 fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> SourceScanResult {
-    let (c, disk, path, scanner, prior) = pi_disk_corpus(name, prefix);
+    let (c, disk, path, scanner, prior, mut proof) = pi_disk_corpus(name, prefix);
     let mut priors = [prior.clone(), prior.clone(), prior];
     let mut last = None;
     for value in suffix {
         pi_grow(&path, value);
         let restart = disk.owner(SnapshotSource::Pi);
-        let ([tail, full, mut restored], scan) =
-            pi_pages(&c, &scanner, &restart, priors, (0, 1, 0), (0, 1, 0), 1);
+        let ([tail, full, mut restored], scan) = pi_pages(
+            &mut proof,
+            &c,
+            &scanner,
+            &restart,
+            priors,
+            (0, 1, 0),
+            (0, 1, 0),
+            1,
+        );
         let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
         priors = [tail, full, next];
         last = Some(scan);
@@ -1146,7 +1214,7 @@ fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> Sou
         requests,
         "{name}"
     );
-    println!("MONEY_EQUIVALENCE_PI {name} VERIFIED");
+    proof.finish(&c);
     scan
 }
 
@@ -1161,7 +1229,12 @@ fn pi() {
         .lines()
         .map(|s| serde_json::from_str(s).unwrap())
         .collect();
-    let scan = pi_splits("pi", &pi_seed(), lines.into_iter().skip(1).collect(), 2);
+    let scan = pi_splits(
+        "pi_plain_session",
+        &pi_seed(),
+        lines.into_iter().skip(1).collect(),
+        2,
+    );
     assert_eq!(scan.snapshots[0].input_tokens, 20);
 }
 
@@ -1457,7 +1530,7 @@ fn pi_cli_fork_preserves_double_count() {
     if !supported("pi_cli_fork_preserves_double_count") {
         return;
     }
-    let (c, disk, path, scanner, prior) =
+    let (c, disk, path, scanner, prior, mut proof) =
         pi_disk_corpus("pi_cli_fork_preserves_double_count", &pi_seed());
     let fork = c.root.join("fork.jsonl");
     let copied = pi_seed()
@@ -1480,6 +1553,7 @@ fn pi_cli_fork_preserves_double_count() {
     );
     let restart = disk.owner(SnapshotSource::Pi);
     let (_, scan) = pi_pages(
+        &mut proof,
         &c,
         &scanner,
         &restart,
@@ -1497,6 +1571,7 @@ fn pi_cli_fork_preserves_double_count() {
         scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(),
         40
     );
+    proof.finish(&c);
 }
 
 #[test]
@@ -1505,7 +1580,8 @@ fn pi_version_rewrite_after_tail() {
         return;
     }
     let initial = pi_seed().replacen("\"version\":3", "\"version\":1", 1);
-    let (c, disk, path, scanner, prior) = pi_disk_corpus("pi_version_rewrite_after_tail", &initial);
+    let (c, disk, path, scanner, prior, mut proof) =
+        pi_disk_corpus("pi_version_rewrite_after_tail", &initial);
     pi_grow(
         &path,
         pi_turn(
@@ -1517,6 +1593,7 @@ fn pi_version_rewrite_after_tail() {
     );
     let restart = disk.owner(SnapshotSource::Pi);
     let ([tail, full, mut restored], _) = pi_pages(
+        &mut proof,
         &c,
         &scanner,
         &restart,
@@ -1547,6 +1624,7 @@ fn pi_version_rewrite_after_tail() {
     assert!(std::fs::metadata(&path).unwrap().len() > before.len());
     let restart = disk.owner(SnapshotSource::Pi);
     let (_, scan) = pi_pages(
+        &mut proof,
         &c,
         &scanner,
         &restart,
@@ -1556,6 +1634,7 @@ fn pi_version_rewrite_after_tail() {
         0,
     );
     assert_eq!(scan.snapshots[0].request_count, 3);
+    proof.finish(&c);
 }
 
 #[test]
@@ -1579,19 +1658,21 @@ fn pi_upgrade_without_semantic_revision() {
     if !supported("pi_upgrade_without_semantic_revision") {
         return;
     }
-    let (c, disk, path, scanner, prior) =
+    let (c, disk, path, scanner, prior, mut proof) =
         pi_disk_corpus("pi_upgrade_without_semantic_revision", &pi_seed());
-    let written = disk.record_bytes();
+    let written = proof.durable.then(|| disk.record_bytes());
     disk.begin(&scanner, SnapshotSource::Pi);
     let (mut quiet, _, mode) = other_page(&c, &scanner, SnapshotSource::Pi, prior.clone());
     assert_eq!(mode.0 + mode.1, 0);
     let committed = disk.commit(&scanner.cache, SnapshotSource::Pi, &mut quiet);
     assert!(committed.generation > prior.generation);
-    assert_eq!(
-        disk.record_bytes(),
-        written,
-        "quiet commit preserves older record generation"
-    );
+    if let Some(written) = written {
+        assert_eq!(
+            disk.record_bytes(),
+            written,
+            "quiet commit preserves older record generation"
+        );
+    }
     pi_grow(
         &path,
         pi_turn(
@@ -1603,6 +1684,7 @@ fn pi_upgrade_without_semantic_revision() {
     );
     let upgraded = disk.owner(SnapshotSource::Pi);
     pi_pages(
+        &mut proof,
         &c,
         &scanner,
         &upgraded,
@@ -1611,6 +1693,7 @@ fn pi_upgrade_without_semantic_revision() {
         (0, 1, 0),
         1,
     );
+    proof.finish(&c);
 }
 
 #[test]
@@ -1618,7 +1701,8 @@ fn pi_downgrade_then_reupgrade() {
     if !supported("pi_downgrade_then_reupgrade") {
         return;
     }
-    let (c, disk, path, _, prior) = pi_disk_corpus("pi_downgrade_then_reupgrade", &pi_seed());
+    let (c, disk, path, _, prior, mut proof) =
+        pi_disk_corpus("pi_downgrade_then_reupgrade", &pi_seed());
     let downgraded = E2ScanFixture::default();
     pi_grow(
         &path,
@@ -1629,11 +1713,12 @@ fn pi_downgrade_then_reupgrade() {
             "2026-10-27T06:01:00Z",
         ),
     );
-    let (mut down, _, mode) = other_page(&c, &downgraded, SnapshotSource::Pi, prior);
-    assert_eq!(mode, (1, 0, 0));
+    let (mut down, scan, mode) = other_page(&c, &downgraded, SnapshotSource::Pi, prior);
+    assert_eq!(mode, if proof.durable { (1, 0, 0) } else { (0, 0, 0) });
+    proof.capture(&scan);
     down.save(&disk.index).unwrap();
     let committed = ScanIndex::load(&disk.index).unwrap();
-    assert_eq!(disk.records(), 1);
+    assert_eq!(disk.records(), usize::from(proof.durable));
     pi_grow(
         &path,
         pi_turn(
@@ -1645,6 +1730,7 @@ fn pi_downgrade_then_reupgrade() {
     );
     let reupgraded = disk.owner(SnapshotSource::Pi);
     let ([tail, full, mut restored], _) = pi_pages(
+        &mut proof,
         &c,
         &downgraded,
         &reupgraded,
@@ -1653,10 +1739,12 @@ fn pi_downgrade_then_reupgrade() {
         (1, 0, 0),
         0,
     );
-    assert_eq!(
-        durable_restores(&reupgraded.cache, SnapshotSource::Pi).2,
-        BTreeMap::from([("entry_changed", 1)])
-    );
+    if proof.durable {
+        assert_eq!(
+            durable_restores(&reupgraded.cache, SnapshotSource::Pi).2,
+            BTreeMap::from([("entry_changed", 1)])
+        );
+    }
     let next = disk.commit(&reupgraded.cache, SnapshotSource::Pi, &mut restored);
     pi_grow(
         &path,
@@ -1664,6 +1752,7 @@ fn pi_downgrade_then_reupgrade() {
     );
     let restart = disk.owner(SnapshotSource::Pi);
     pi_pages(
+        &mut proof,
         &c,
         &downgraded,
         &restart,
@@ -1672,6 +1761,7 @@ fn pi_downgrade_then_reupgrade() {
         (0, 1, 0),
         1,
     );
+    proof.finish(&c);
 }
 
 #[cfg(unix)]
@@ -1681,7 +1771,7 @@ fn pi_acquisition_metadata_changes() {
         return;
     }
     use std::os::unix::fs::PermissionsExt;
-    let (c, disk, path, scanner, prior) =
+    let (c, disk, path, scanner, prior, mut proof) =
         pi_disk_corpus("pi_acquisition_metadata_changes", &pi_seed());
     let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
     let permissions = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -1692,6 +1782,7 @@ fn pi_acquisition_metadata_changes() {
     );
     let restart = disk.owner(SnapshotSource::Pi);
     let ([tail, full, mut restored], _) = pi_pages(
+        &mut proof,
         &c,
         &scanner,
         &restart,
@@ -1708,7 +1799,8 @@ fn pi_acquisition_metadata_changes() {
         .set_modified(modified + std::time::Duration::from_secs(2))
         .unwrap();
     let restart = disk.owner(SnapshotSource::Pi);
-    pi_pages(
+    let ([tail, full, mut restored], _) = pi_pages(
+        &mut proof,
         &c,
         &scanner,
         &restart,
@@ -1717,4 +1809,26 @@ fn pi_acquisition_metadata_changes() {
         (1, 0, 0),
         0,
     );
+    let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
+    pi_grow(
+        &path,
+        pi_turn(
+            "message",
+            Some("metadata-growth"),
+            20,
+            "2026-10-27T06:01:00Z",
+        ),
+    );
+    let restart = disk.owner(SnapshotSource::Pi);
+    pi_pages(
+        &mut proof,
+        &c,
+        &scanner,
+        &restart,
+        [tail, full, next],
+        (0, 1, 0),
+        (0, 1, 0),
+        1,
+    );
+    proof.finish(&c);
 }
