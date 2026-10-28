@@ -524,7 +524,7 @@ fn native_fixture(path: &Path) {
 
 /// Money rules re-owe marked paths. Seed a usable record first, prove it
 /// restores, then prove revision/money debt refuses before record I/O and
-/// invalidates the existing record on the real post-save write path.
+/// preserves the unadjudicable predecessor on the real post-save write path.
 #[test]
 fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
     let _gate = claude_request_money::e2::GateForTest::set(true);
@@ -675,8 +675,11 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
                 counts.summary(source, &disk)
             );
             assert_eq!(counts.not_persisted.get("history_owed"), Some(&1));
-            assert_eq!(disk.records_invalidated, 1);
-            assert_eq!(records(), 0);
+            assert_eq!(
+                disk.records_invalidated, 0,
+                "owed veto grants no mutation proof"
+            );
+            assert_eq!(records(), 1, "unproved predecessor is retained");
         }
     }
     let _ = std::fs::remove_dir_all(root);
@@ -1481,7 +1484,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
 /// Lead B (#829): a production post-save that skipped the per-pass setup
 /// never wipes valid records, even for keys the index does not hold. With
 /// the setup, ordinary GC keeps an indexed but undecided key and collects
-/// only the absent key's record (the control proving GC ran).
+/// unadjudicable absent records; the GC counters prove the walk ran.
 #[test]
 fn save_without_per_pass_setup_keeps_valid_records() {
     let root = crate::test_scratch::private_dir("ottto-dt-no-setup-save");
@@ -1547,9 +1550,10 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     cache.durable_begin_pass(source, &index_path, &namespace, false);
     crate::snapshots::durable_after_save(&cache, &root, source, &index);
     assert_eq!(std::fs::read(path(indexed)).unwrap(), before[0]);
-    assert!(!path(absent).exists());
+    assert_eq!(std::fs::read(path(absent)).unwrap(), before[1]);
     let (_, disk_counters) = cache.durable_counters(source).unwrap();
-    assert_eq!(disk_counters.gc_records_deleted, 1);
+    assert_eq!(disk_counters.gc_records_deleted, 0);
+    assert_eq!(disk_counters.gc_records_read, 2);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1682,6 +1686,20 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                     .unwrap()
                     .binding;
                 let mut disk_store = DurableTailStore::new(dir.clone(), ds);
+                let predecessor =
+                    store::tests::found(disk_store.read(&pending.binding.key, &pending.allowlist));
+                let proof = expected(
+                    ds,
+                    source,
+                    &key,
+                    &scope,
+                    &index,
+                    &interp,
+                    Some((predecessor.format, predecessor.record.allowlist)),
+                )
+                .unwrap();
+                assert_eq!(predecessor.eligible(&proof), Ok(()));
+                disk_store.authorize(&predecessor, &proof);
                 let receipt = disk_store
                     .write_after_save(lock, index.generation, 0, vec![v2])
                     .unwrap();
@@ -1701,6 +1719,9 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                     .unwrap()
                     .binding;
                 over_budget.body.resize(store::RECORD_BYTES, 0);
+                let predecessor =
+                    store::tests::found(disk_store.read(&pending.binding.key, &pending.allowlist));
+                disk_store.authorize(&predecessor, &proof);
                 let receipt = disk_store
                     .write_after_save(lock, index.generation, 0, vec![over_budget])
                     .unwrap();
@@ -2031,4 +2052,344 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
     );
     assert_eq!(std::fs::read(record_path).unwrap(), before_bytes);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+// Q11 rows are self-contained so they can move into transition_fixture.rs,
+// which is absent at the pinned 5a2a base. Observe successful raw reads, not consumes.
+thread_local! {
+    static RETAIL_READS: std::cell::RefCell<Vec<(u64, usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+pub(super) fn observe_retail(at: u64, n: usize, old: u64) {
+    RETAIL_READS.with(|reads| reads.borrow_mut().push((at, n, old)));
+}
+fn retail_reads() -> Vec<(u64, usize, u64)> {
+    RETAIL_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
+}
+
+#[test]
+fn q11_custody_counts_prefetch_short_reads_and_failure_without_renewal() {
+    use std::io::{BufRead, Seek, SeekFrom, Write};
+    let root = crate::test_scratch::private_dir("ottto-q11-raw");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let scope = Scope("q11".into());
+    let cert = certificate(&path, &scope);
+    let (checkpoint, _) = cert
+        .restore(&mut File::open(&path).unwrap(), scope.clone())
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{}\n{}\n")
+        .unwrap();
+    let cache = SharedCache::default();
+    let source = SnapshotSource::ClaudeCode;
+    let mut file = File::open(&path).unwrap();
+    let now = std::time::Instant::now();
+    let attempt = cache
+        .begin_retail(source, "key", &checkpoint, &file, 6, now)
+        .unwrap();
+    let mut owner = DurableCustody::default();
+    owner.put_retail(attempt);
+    let mut attempt = owner.take_retail().unwrap();
+    assert!(owner.take_retail().is_none());
+    retail_reads();
+    file.seek(SeekFrom::Start(3)).unwrap();
+    {
+        // Buffer pulls all six bytes even though its caller consumes only one.
+        let mut reader = std::io::BufReader::with_capacity(8192, attempt.accounted(&mut file));
+        assert_eq!(reader.fill_buf().unwrap(), b"{}\n{}\n");
+        reader.consume(1);
+        assert_eq!(reader.fill_buf().unwrap().len(), 5);
+    }
+    assert_eq!(retail_reads(), vec![(3, 6, 3)]);
+    assert!(
+        attempt.read_at(&file, &mut [0; 8], 3).is_err(),
+        "no backward reread"
+    );
+    assert_eq!(attempt.read_at(&file, &mut [0; 8], 9).unwrap(), 0);
+    assert!(attempt.read_at(&file, &mut [0; 8], 10).is_err());
+    let other = root.join("replacement.jsonl");
+    std::fs::write(&other, b"{}\n{}\n{}\n").unwrap();
+    assert!(attempt
+        .read_at(&File::open(&other).unwrap(), &mut [0; 8], 9)
+        .is_err());
+    attempt.finish();
+    for pass in 0..5 {
+        cache.clear();
+        cache.durable_begin_pass(
+            source,
+            &root.join("index.json"),
+            &Scope(format!("scope-{pass}")),
+            false,
+        );
+        assert!(matches!(
+            cache.begin_retail(source, "key", &checkpoint, &file, 6, now),
+            Err(RetailHold::Exhausted)
+        ));
+    }
+    let (_, progressed) = native_record(&path, &scope);
+    // New compatible progress at the high water permits only zero old bytes.
+    let fresh = cache
+        .begin_retail(source, "key", &progressed, &file, 9, now)
+        .unwrap();
+    fresh.finish();
+    assert!(matches!(
+        cache.begin_retail(
+            source,
+            "key",
+            &progressed,
+            &file,
+            9,
+            now - std::time::Duration::from_secs(1)
+        ),
+        Err(RetailHold::AccountingLost)
+    ));
+    let stores = cache.durable().unwrap();
+    assert_eq!(stores.retail_spent.len(), 1);
+    assert_eq!(
+        (stores.counters.retail_keys, stores.counters.retail_attempts),
+        (1, 2)
+    );
+    drop(stores);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn q11_overflow_never_forgets_a_spent_key_and_pread_charges_actual_bytes() {
+    use std::io::{Seek, SeekFrom, Write};
+    let root = crate::test_scratch::private_dir("ottto-q11-overflow");
+    let path = root.join("t.jsonl");
+    std::fs::write(&path, b"{}\n").unwrap();
+    let scope = Scope("q11".into());
+    let cert = certificate(&path, &scope);
+    let (checkpoint, _) = cert
+        .restore(&mut File::open(&path).unwrap(), scope)
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{}\n")
+        .unwrap();
+    let cache = SharedCache::default();
+    let mut file = File::open(&path).unwrap();
+    let now = std::time::Instant::now();
+    let mut attempt = cache
+        .begin_retail(SnapshotSource::ClaudeCode, "0", &checkpoint, &file, 6, now)
+        .unwrap();
+    retail_reads();
+    assert_eq!(attempt.read_at(&file, &mut [0; 128], 3).unwrap(), 3);
+    assert_eq!(retail_reads(), vec![(3, 3, 3)]);
+    attempt.finish();
+    for n in 1..store::MAX_RECORDS * 2 {
+        cache
+            .begin_retail(
+                SnapshotSource::ClaudeCode,
+                &n.to_string(),
+                &checkpoint,
+                &file,
+                6,
+                now,
+            )
+            .unwrap()
+            .finish();
+    }
+    assert!(matches!(
+        cache.begin_retail(
+            SnapshotSource::ClaudeCode,
+            "overflow",
+            &checkpoint,
+            &file,
+            6,
+            now
+        ),
+        Err(RetailHold::AccountingLost)
+    ));
+    assert!(matches!(
+        cache.begin_retail(SnapshotSource::ClaudeCode, "0", &checkpoint, &file, 6, now),
+        Err(RetailHold::Exhausted)
+    ));
+    assert_eq!(
+        cache.durable().unwrap().retail_spent.len(),
+        store::MAX_RECORDS * 2
+    );
+    let mut failed = SharedCache::default()
+        .begin_retail(
+            SnapshotSource::ClaudeCode,
+            "fail",
+            &checkpoint,
+            &file,
+            6,
+            now,
+        )
+        .unwrap();
+    // The OS rejects reads from this same object opened write-only; zero bytes counted.
+    let mut write_only = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    write_only.seek(SeekFrom::Start(3)).unwrap();
+    retail_reads();
+    assert!(failed.read(&mut write_only, &mut [0; 128]).is_err());
+    assert!(retail_reads().is_empty());
+    file.seek(SeekFrom::Start(3)).unwrap();
+    assert_eq!(failed.read(&mut file, &mut [0; 128]).unwrap(), 3);
+    assert_eq!(retail_reads(), vec![(3, 3, 3)]);
+    let mut summary = Counters::default();
+    summary.retail_keys = 1;
+    let line = summary.summary(SnapshotSource::ClaudeCode, &store::StoreCounters::default());
+    assert!(line.contains("retail_keys=1"));
+    assert!(line.contains("budget_refused_retail_old_bytes="));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
+fn q11_strict_restore_real_plain_reader_tail_then_retry_holds() {
+    use std::io::Write;
+    let root = crate::test_scratch::private_dir("ottto-q11-strict-native");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let ds = durable_source(source).unwrap();
+    let namespace = Scope("q11-account".into());
+    let scope = Scope("q11-file".into());
+    let index_path = root.join("index.json");
+    let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let (reduction, checkpoint) = native_record(&path, &scope);
+    let mut index = ScanIndex::default();
+    let accepted_end = std::fs::metadata(&path).unwrap().len();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":accepted_end,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    index.save(&index_path).unwrap();
+    let interp = Interpretation::of(source, &key, &index, false, &namespace);
+    let expected = expected(ds, source, &key, &scope, &index, &interp, None).unwrap();
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    assert_eq!(
+        disk.write_after_save(
+            lock,
+            index.generation,
+            vec![PendingRecord {
+                binding: expected.binding,
+                certificate: certificate(&path, &scope),
+                body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
+                    .unwrap(),
+                allowlist: codec::allowlist_digest(source)
+            }]
+        )
+        .unwrap()
+        .written,
+        1
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{}\n")
+        .unwrap();
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let mut parser = OwnedJsonlParser::new(
+        File::open(&path).unwrap(),
+        &path,
+        source,
+        apply_claude_code_line,
+        None,
+        None,
+        None,
+        false,
+        true,
+    )
+    .unwrap();
+    let taken = cache
+        .durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            parser.reader.reader.get_mut(),
+            &index,
+            &interp,
+        )
+        .into_test_option()
+        .expect("strict record restores");
+    let attempt = cache
+        .begin_retail(
+            source,
+            &key,
+            &taken.retained.checkpoint,
+            parser.reader.reader.get_ref(),
+            accepted_end,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        parser
+            .prepare_acquisition(Some(taken.retained), &scope, None, 1_800_000_001)
+            .unwrap(),
+        crate::transcript_acquisition::ReadMode::Tail
+    );
+    parser.reader.reader.put_retail(attempt);
+    retail_reads();
+    while !parser.step().unwrap() {}
+    assert_eq!(retail_reads(), vec![(accepted_end, 3, 0)]);
+    let native = codec::encode(
+        &parser.durable_test_reduction_copy(),
+        store::RECORD_BYTES,
+        jsonl_line_cap() as u64,
+    )
+    .unwrap();
+    let cold = codec::encode(
+        &native_record(&path, &scope).0,
+        store::RECORD_BYTES,
+        jsonl_line_cap() as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        native, cold,
+        "native reduction, distinct from the emitted-money oracle"
+    );
+    cache.clear();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    assert!(matches!(
+        cache.begin_retail(
+            source,
+            &key,
+            &checkpoint,
+            parser.reader.reader.get_ref(),
+            accepted_end,
+            std::time::Instant::now()
+        ),
+        Err(RetailHold::Exhausted)
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn q11_complete_map_is_paid_before_the_first_key() {
+    let nodes =
+        crate::heap_layout_bound::tree_node_bytes::<store::Digest32, (u64, std::time::Instant)>()
+            .unwrap();
+    let reserve = super::super::RETAIL_RESERVE_BYTES;
+    assert!((2 * store::MAX_RECORDS + 1) * nodes <= reserve);
+    assert_eq!(
+        STORES_RESIDENT_BOUND,
+        2 * store::MAX_RECORDS * 128 + reserve
+    );
+    assert_eq!(
+        super::super::STATE_BYTES
+            + reserve
+            + crate::source_rotation::OVERLAP_BUDGET
+            + super::super::AUDIT_AND_SCRATCH_BYTES,
+        crate::transcript_cache::CACHE_BYTES
+    );
+    assert_eq!(
+        SharedCache::default().durable().unwrap().retail_spent.len(),
+        0
+    );
 }

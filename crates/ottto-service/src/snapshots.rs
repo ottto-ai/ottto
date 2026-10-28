@@ -31763,6 +31763,8 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
+                        let mut retail_attempt = None;
+                        #[cfg(unix)]
                         let (retained, taken_admission) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
                                 let interpretation = sampled_scan::durable_tail::Interpretation::of(
@@ -31782,6 +31784,26 @@ impl OwnedSourceScan {
                                     &interpretation,
                                 ) {
                                     sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => {
+                                        if source == SnapshotSource::ClaudeCode {
+                                            let accepted_end =
+                                                index.files.get(&key).map_or(0, |e| e.size_bytes);
+                                            match context.cache.begin_retail(
+                                                source,
+                                                &key,
+                                                &taken.retained.checkpoint,
+                                                parser.reader.reader.get_ref(),
+                                                accepted_end,
+                                                std::time::Instant::now(),
+                                            ) {
+                                                Ok(attempt) => retail_attempt = Some(attempt),
+                                                Err(reason) => {
+                                                    context.cache.durable_retail_hold(
+                                                        source, reason, index, &candidate,
+                                                    );
+                                                    pending!();
+                                                }
+                                            }
+                                        }
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
                                         let admission = (
@@ -31831,6 +31853,14 @@ impl OwnedSourceScan {
                                 pending!();
                             }
                         };
+                        #[cfg(unix)]
+                        if let Some(attempt) = retail_attempt {
+                            if mode == crate::transcript_acquisition::ReadMode::Tail {
+                                parser.reader.reader.put_retail(attempt);
+                            } else {
+                                attempt.finish();
+                            }
+                        }
                         // H1c: the plan uses absolute offsets; the reader's
                         // extent is relative to its Full/Tail start.
                         if source == SnapshotSource::ClaudeCode

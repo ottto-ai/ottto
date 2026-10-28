@@ -45,7 +45,7 @@ pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper bound of both stores' resident digest maps (two sources).
 pub(crate) const STORES_RESIDENT_BOUND: usize =
-    2 * store::MAX_RECORDS * 256 + 2 * (store::MAX_BATCH + 1) * 4096;
+    2 * store::MAX_RECORDS * 256 + 2 * (store::MAX_BATCH + 1) * 4096 + super::RETAIL_RESERVE_BYTES;
 
 /// Head re-parse bytes of restores, per source, for the process lifetime.
 /// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
@@ -65,6 +65,8 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
 pub(crate) struct Counters {
     pub(crate) restore_attempts: u64,
     pub(crate) restored: u64,
+    pub(crate) retail_attempts: u64,
+    pub(crate) retail_keys: u64,
     pub(crate) missing: u64,
     pub(crate) upgrade_state_missing: u64,
     pub(crate) refused_record: u64,
@@ -106,7 +108,7 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} restore_attempts={} restored={} missing={} \
-             refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
+             retail_attempts={} retail_keys={} tail_read_bytes={} budget_refused_retail_old_bytes={} repeated_physical_old_bytes={} refused_record={} upgrade_state_missing={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
@@ -115,11 +117,16 @@ impl Counters {
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
-             records_invalidated={} peak_codec_bytes={}",
+             records_invalidated={} mutation_unproved={} peak_codec_bytes={}",
             source.api_slug(),
             self.restore_attempts,
             self.restored,
             self.missing,
+            self.retail_attempts,
+            self.retail_keys,
+            retail_bytes(source, 0),
+            retail_bytes(source, 1),
+            retail_bytes(source, 1),
             self.refused_record,
             self.upgrade_state_missing,
             classes(&self.ineligible),
@@ -155,6 +162,7 @@ impl Counters {
             store.gc_bytes_read,
             self.gc_keep_peak,
             store.records_invalidated,
+            store.mutation_unproved,
             store.peak_codec_bytes,
         )
     }
@@ -189,6 +197,8 @@ pub(crate) struct Stores {
     /// reverts or clears the entry makes it refuse (F2).
     selected: BTreeMap<String, String>,
     counters: Counters,
+    // Source+key only: never clear on passes, scope changes or cache eviction.
+    retail_spent: BTreeMap<store::Digest32, (u64, std::time::Instant)>,
 }
 
 impl Stores {
@@ -398,7 +408,228 @@ fn refuse_class(refuse: Refuse) -> &'static str {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RetailHold {
+    Exhausted,
+    AccountingLost,
+    Ineligible,
+}
+pub(crate) struct RetailAttempt {
+    source: DurableSource,
+    object: (u64, u64, u64),
+    next: u64,
+    end: u64,
+    old_end: u64,
+}
+// Process totals by source: native physical Tail bytes and old-suffix overlap.
+static RETAIL_BYTES: [[AtomicU64; 2]; 2] = [
+    [AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0)],
+];
+fn retail_bytes(source: SnapshotSource, metric: usize) -> u64 {
+    durable_source(source).map_or(0, |s| {
+        RETAIL_BYTES[s as usize][metric].load(Ordering::Relaxed)
+    })
+}
+
+/// Inline ownership; later active custody extends this same owner.
+#[derive(Default)]
+pub(crate) struct DurableCustody {
+    retail: Option<RetailAttempt>,
+}
+impl DurableCustody {
+    pub(crate) fn take_retail(&mut self) -> Option<RetailAttempt> {
+        self.retail.take()
+    }
+    pub(crate) fn put_retail(&mut self, attempt: RetailAttempt) {
+        assert!(self.retail.is_none(), "retail already attached");
+        self.retail = Some(attempt);
+    }
+    pub(crate) fn retail_mut(&mut self) -> Option<&mut RetailAttempt> {
+        self.retail.as_mut()
+    }
+}
+
+/// Below BufReader: count successful OS reads including prefetch, even on later failure.
+pub(crate) struct AccountedReader<'a, R> {
+    attempt: &'a mut RetailAttempt,
+    inner: R,
+}
+impl<R: std::io::Read + std::io::Seek> std::io::Read for AccountedReader<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let at = self.inner.stream_position()?;
+        let limit = self.attempt.limit(at)?.min(bytes.len());
+        let n = self.inner.read(&mut bytes[..limit])?;
+        self.attempt.count(at, n);
+        Ok(n)
+    }
+}
+impl<R: std::io::Read + std::io::Seek> std::io::Seek for AccountedReader<'_, R> {
+    fn seek(&mut self, at: std::io::SeekFrom) -> std::io::Result<u64> {
+        let pos = self.inner.seek(at)?;
+        self.attempt.limit(pos)?;
+        Ok(pos)
+    }
+}
+impl RetailAttempt {
+    fn range(&self, file: &File, offset: u64) -> std::io::Result<usize> {
+        let m = file.metadata()?;
+        if (m.dev(), m.ino(), birth_unix_nanos(&m)) != self.object {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "retail object",
+            ));
+        }
+        self.limit(offset)
+    }
+    fn limit(&self, offset: u64) -> std::io::Result<usize> {
+        if offset < self.next || offset > self.end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "retail fence",
+            ));
+        }
+        Ok((self.end - offset).min(usize::MAX as u64) as usize)
+    }
+    fn count(&mut self, offset: u64, n: usize) {
+        RETAIL_BYTES[self.source as usize][0].fetch_add(n as u64, Ordering::Relaxed);
+        RETAIL_BYTES[self.source as usize][1].fetch_add(
+            self.old_end.saturating_sub(offset).min(n as u64),
+            Ordering::Relaxed,
+        );
+        #[cfg(test)]
+        tests::observe_retail(offset, n, self.old_end.saturating_sub(offset).min(n as u64));
+        self.next = offset + n as u64;
+    }
+    /// The owner must supply its same held reader; File entry points additionally check O.
+    pub(crate) fn accounted<R: std::io::Read + std::io::Seek>(
+        &mut self,
+        inner: R,
+    ) -> AccountedReader<'_, R> {
+        AccountedReader {
+            attempt: self,
+            inner,
+        }
+    }
+    pub(crate) fn read(&mut self, file: &mut File, bytes: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{Read, Seek};
+        let at = file.stream_position()?;
+        self.range(file, at)?;
+        self.accounted(file).read(bytes)
+    }
+    pub(crate) fn read_at(
+        &mut self,
+        file: &File,
+        bytes: &mut [u8],
+        offset: u64,
+    ) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        let limit = self.range(file, offset)?.min(bytes.len());
+        let n = file.read_at(&mut bytes[..limit], offset)?;
+        self.count(offset, n);
+        Ok(n)
+    }
+    pub(crate) fn finish(self) {}
+}
+
+fn authorize_strict(
+    slot: &mut Slot,
+    snapshot_source: SnapshotSource,
+    key: &str,
+    index: &ScanIndex,
+) {
+    let Some(scope) = slot.decided.get(key) else {
+        return;
+    };
+    let source = durable_source(snapshot_source).expect("durable source");
+    let digest = store::key_digest(source, key);
+    let ReadOutcome::Found(record) = slot
+        .store
+        .read(&digest, &codec::allowlist_digest(snapshot_source))
+    else {
+        return;
+    };
+    let interpretation = Interpretation::of(
+        snapshot_source,
+        key,
+        index,
+        slot.identity_capture,
+        &slot.namespace,
+    );
+    if let Some(expected) = expected(
+        source,
+        snapshot_source,
+        key,
+        scope,
+        index,
+        &interpretation,
+        Some((record.format, record.record.allowlist)),
+    ) {
+        slot.store.authorize(&record, &expected);
+    }
+}
+
 impl SharedCache {
+    /// Caller already proved strict eligibility/certificate and absence of compatible RAM.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_retail(
+        &self,
+        source: SnapshotSource,
+        key: &str,
+        checkpoint: &Checkpoint,
+        file: &File,
+        accepted_end: u64,
+        now: std::time::Instant,
+    ) -> Result<RetailAttempt, RetailHold> {
+        if crate::heap_layout_bound::tree_node_bytes::<store::Digest32, (u64, std::time::Instant)>()
+            .is_none_or(|n| n > 1024)
+        {
+            return Err(RetailHold::AccountingLost);
+        }
+        let c = checkpoint
+            .durable_certificate(birth_unix_nanos(
+                &file.metadata().map_err(|_| RetailHold::Ineligible)?,
+            ))
+            .ok_or(RetailHold::Ineligible)?;
+        let end = file.metadata().map_err(|_| RetailHold::Ineligible)?.len();
+        let source = durable_source(source).ok_or(RetailHold::Ineligible)?;
+        let key = store::key_digest(source, key);
+        let mut stores = self.durable().ok_or(RetailHold::AccountingLost)?;
+        if let Some((high, spent)) = stores.retail_spent.get(&key) {
+            if now < *spent {
+                Counters::bump(&mut stores.counters.ineligible, "retail_clock_rollback");
+                return Err(RetailHold::AccountingLost);
+            }
+            if c.length < *high || accepted_end > c.length {
+                Counters::bump(
+                    &mut stores.counters.ineligible,
+                    "retail_exhausted.budget_refused",
+                );
+                return Err(RetailHold::Exhausted);
+            }
+        } else if stores.retail_spent.len() >= store::MAX_RECORDS * 2 {
+            Counters::bump(
+                &mut stores.counters.ineligible,
+                "retail_accounting_overflow",
+            );
+            return Err(RetailHold::AccountingLost);
+        }
+        if c.length > end || end < accepted_end {
+            Counters::bump(&mut stores.counters.ineligible, "retail_range_ineligible");
+            return Err(RetailHold::Ineligible);
+        }
+        let first = !stores.retail_spent.contains_key(&key);
+        stores.counters.retail_keys += u64::from(first);
+        stores.counters.retail_attempts += 1;
+        stores.retail_spent.insert(key, (end, now));
+        Ok(RetailAttempt {
+            source,
+            object: (c.device, c.inode, c.birth_nanos),
+            next: c.length,
+            end,
+            old_end: accepted_end,
+        })
+    }
     fn durable(&self) -> Option<std::sync::MutexGuard<'_, Stores>> {
         self.durable.lock().ok()
     }
@@ -552,6 +783,34 @@ impl SharedCache {
         // GD retired the old reservation ledger. Missing state is never a
         // replay grant: hold until the approved cause gate can durably bind A5.
         true
+    }
+
+    /// Q11 capacity/exhaustion is disclosed stale custody, never an integrity failure.
+    pub(in crate::snapshots) fn durable_retail_hold(
+        &self,
+        source: SnapshotSource,
+        reason: RetailHold,
+        index: &mut ScanIndex,
+        candidate: &CandidateFile,
+    ) {
+        let kept = source == SnapshotSource::ClaudeCode
+            && claude_request_census::retain_held(index, candidate);
+        if let Some(mut stores) = self.durable() {
+            Counters::bump(
+                &mut stores.counters.ineligible,
+                match reason {
+                    RetailHold::Exhausted => "retail_hold.exhausted",
+                    RetailHold::AccountingLost => "retail_hold.accounting_lost",
+                    RetailHold::Ineligible => "retail_hold.ineligible",
+                },
+            );
+            stores.counters.held_census[usize::from(!kept)] += 1;
+            if let Some(ds) = durable_source(source) {
+                if let Some(slot) = stores.slot(ds).as_mut() {
+                    slot.held += 1;
+                }
+            }
+        }
     }
 
     pub(in crate::snapshots) fn durable_hold_exit(
@@ -709,6 +968,9 @@ impl SharedCache {
                 return None;
             }
         };
+        if let Some(slot) = stores.slot(source).as_mut() {
+            slot.store.authorize(&record, &expected);
+        }
         stores.counters.rederive_head_bytes += receipt.head_bytes;
         REDERIVE_HEAD_BYTES[source as usize].fetch_add(receipt.head_bytes, Ordering::Relaxed);
         stores.counters.rederive_named_lines += receipt.named_lines;
@@ -997,6 +1259,11 @@ impl SharedCache {
             Counters::bump(&mut counters.not_persisted, class);
         }
         let slot = stores.slot(source).as_mut()?;
+        if source == DurableSource::ClaudeCode {
+            for key in offered.values() {
+                authorize_strict(slot, snapshot_source, key, index);
+            }
+        }
         if !invalidate.is_empty() {
             let _ = slot.store.remove_keys(writer, &invalidate);
         }
@@ -1076,7 +1343,15 @@ impl SharedCache {
                         &interpretation,
                         Some((format, allowlist)),
                     )
-                    .map(|e| e.binding.scope)
+                    .map(|e| {
+                        if source == DurableSource::ClaudeCode {
+                            if let ReadOutcome::Found(record) = slot.store.read(&digest, &allowlist)
+                            {
+                                slot.store.authorize(&record, &e);
+                            }
+                        }
+                        e.binding.scope
+                    })
                 });
                 keep.insert(digest, scope);
             }

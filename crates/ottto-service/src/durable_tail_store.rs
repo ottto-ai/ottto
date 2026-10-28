@@ -387,6 +387,7 @@ pub(crate) struct StoreCounters {
     /// Per-pass read I/O.
     pub(crate) bytes_read: u64,
     pub(crate) records_read: u64,
+    pub(crate) mutation_unproved: u64,
     pub(crate) missing: u64,
     pub(crate) format_hold: [u64; 7],
     /// Writes skipped: predecessor unknown, or a new key while record files
@@ -431,7 +432,7 @@ pub(crate) struct BatchReceipt {
 pub(crate) struct DurableTailStore {
     dir: PathBuf,
     source: DurableSource,
-    durable: BTreeMap<Digest32, (Option<Digest32>, Stamp)>,
+    durable: BTreeMap<Digest32, (Option<Digest32>, Stamp, bool)>,
     counters: StoreCounters,
     /// The store-level fault that made this store memory-only for the process.
     disabled: Option<&'static str>,
@@ -453,7 +454,7 @@ pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
 pub(crate) const T14_BREAKER: u64 = 20;
 const REBUILT_BOUND: usize = 64;
 // A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
-const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp))>() <= 128);
+const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp, bool))>() <= 128);
 
 impl DurableTailStore {
     pub(crate) fn new(dir: PathBuf, source: DurableSource) -> Self {
@@ -474,6 +475,9 @@ impl DurableTailStore {
     /// A new pass: the directory is checked again and the T14 breaker resets.
     pub(crate) fn begin_pass(&mut self) {
         self.checked = false;
+        for (_, _, allowed) in self.durable.values_mut() {
+            *allowed = false;
+        }
         self.pass = [0; 2];
         self.rebuilt.clear();
         self.usable(None);
@@ -640,7 +644,7 @@ impl DurableTailStore {
             {
                 return Err(Refusal::Corrupt);
             }
-            if let Some((content, old)) = self.durable.get(key) {
+            if let Some((content, old, _)) = self.durable.get(key) {
                 if *old == stamp && (work != "overwrite" || content.is_some()) {
                     binding.content = *content;
                     return Ok(Some(binding));
@@ -664,7 +668,7 @@ impl DurableTailStore {
                 ));
             }
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(key) {
-                self.durable.insert(*key, (None, stamp));
+                self.durable.insert(*key, (None, stamp, false));
             }
             Ok(Some(binding))
         })();
@@ -731,7 +735,7 @@ impl DurableTailStore {
         self.note_codec(bytes.capacity() + bytes.len().saturating_sub(HEADER_BYTES));
         match decode(&bytes, allowlist) {
             Ok(record) => {
-                if let Some((content, _)) = self.durable.get_mut(key) {
+                if let Some((content, _, _)) = self.durable.get_mut(key) {
                     *content = Some(content_digest(&record.record));
                 }
                 ReadOutcome::Found(Box::new(record))
@@ -806,6 +810,29 @@ impl DurableTailStore {
         Ok(receipted)
     }
 
+    /// Only a fully verified original binding may authorize a Claude mutation.
+    pub(crate) fn authorize(&mut self, record: &DurableRecord, expected: &Expected) {
+        if record.eligible(expected).is_err() {
+            return;
+        }
+        let key = record.record.binding.key;
+        let digest = content_digest(&record.record);
+        let path = self.record_path(&key);
+        if let Some((Some(content), stamp, allowed)) = self.durable.get_mut(&key) {
+            *allowed = *content == digest
+                && fs::symlink_metadata(path).is_ok_and(|m| Stamp::of(&m) == *stamp);
+        }
+    }
+    fn authorized(&mut self, key: &Digest32) -> bool {
+        let allowed = self.source != DurableSource::ClaudeCode
+            || self.durable.get(key).is_some_and(|(_, stamp, yes)| {
+                *yes && fs::symlink_metadata(self.record_path(key))
+                    .is_ok_and(|m| Stamp::of(&m) == *stamp)
+            });
+        self.counters.mutation_unproved += u64::from(!allowed);
+        allowed
+    }
+
     /// The post-save write. Call only after `ScanIndex::save` succeeded, with
     /// that save's committed generation and only entries that save kept.
     /// Clean records (same content as the last durable write) are skipped;
@@ -864,6 +891,7 @@ impl DurableTailStore {
                         continue;
                     }
                     // Carry the exact verified predecessor into conditional retirement.
+                    Ok(Some(_)) if !self.authorized(&record.binding.key) => continue,
                     Ok(Some(old)) => (old.stamp, old.content),
                     Ok(None) => (None, None),
                 };
@@ -968,7 +996,7 @@ impl DurableTailStore {
             on_disk.insert(key, bytes.len() as u64);
             let stamp = Stamp::of(&fs::symlink_metadata(&path)?);
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
-                self.durable.insert(key, (Some(content), stamp));
+                self.durable.insert(key, (Some(content), stamp, true));
             }
             receipt.written += 1;
             receipt.bytes_written += bytes.len() as u64;
@@ -1046,6 +1074,7 @@ impl DurableTailStore {
                 continue;
             }
             let verdict = match self.classify(&key, "delete", Some(writer)) {
+                Ok(Some(_)) if !self.authorized(&key) => Some(len),
                 Ok(Some(binding)) => {
                     let binding = binding.record.binding;
                     let live = binding.context == *live_context
@@ -1126,6 +1155,7 @@ impl DurableTailStore {
             let path = self.record_path(key);
             if !self.pending.contains_key(key)
                 && matches!(self.classify(key, "delete", Some(writer)), Ok(Some(_)))
+                && self.authorized(key)
             {
                 remove_if_present(&path)?;
                 removed += 1;

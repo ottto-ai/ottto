@@ -1287,7 +1287,7 @@ fn budget_bounds_hold() {
     // Beside the cache, outside its state budget: both stores' digest maps.
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        128 * 1024 + 2 * (MAX_BATCH + 1) * 4096
+        128 * 1024 + 2 * (MAX_BATCH + 1) * 4096 + 513 * 1024
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
