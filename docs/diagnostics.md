@@ -463,3 +463,53 @@ refusal. This describes carry admission, not unique families over multiple
 starts, proof completeness, actual rereads, or permission to change checkpoints.
 Capped roots retain their earlier carry rejection and cannot be counted again
 if the final combined cancellation funding refuses them.
+
+### Claude Contract Debt Counters (schema 2 additive)
+
+The existing `native_collection_page` / `native_comparison_decision` carrier
+also includes sparse, counts-only `request_identity_permit` (`permitted`,
+`denied`, `fetch_failed`, `hint_failed`), `identity_contract_transition`
+(`from_empty`, `to_empty`, `collector_e2_grouping`, `mid_traversal_placeholder`)
+and `identity_contract_latch` (`set`, `cleared`). The existing synchronous
+preparation, collection and finish scopes own these deltas: merge disjoint
+scopes, never sum a repeated scope twice. Permits are counted once at the first
+Claude prepare observation, not again by scanning or emission. Null and unknown
+tokens remain denials. Relay-token and activity-hint errors retain the last
+contract and reach the existing early decision/unwind carrier, including when
+no page is collected. There is no new event stream or wire check-in payload.
+
+Transitions count observed state changes, not repeated observations of the same
+placeholder. `mid_traversal_placeholder` counts entry into and exit from a
+placeholder, including recording the actual contract at a genuine start.
+`set` / `cleared` count in-memory false-to-true / true-to-false observations;
+a partial save can retain the durable latch through its existing OR rule.
+Decode containment setting the latch is outside these observation counters.
+`deferred_by_contract_debt` counts finally funded families once per traversal
+start, summed only when multiple starts occur in one page. Deferral keeps
+correction debt and the old census window; it grants no current projection,
+identity, ownership or duplicate-fence proof. Unknown or sweep-wide settlement
+debt refuses deferral. The upload-context mismatch veto remains unchanged.
+
+`traversal_context_change` counts comparisons with the process-observed retained
+traversal's start: `backfill_changed`, `active_upload_context_changed`,
+`policy_changed`, `attribution_available_changed`, `attribution_epoch_changed`,
+`cache_capability_changed`, `replay_changed`, `roots_changed`. Each comparison
+may increment multiple components. The first observation in a process, an
+unobserved retained traversal and an unavailable component are unknown and
+increment no change counter. Epoch differences require both epochs available;
+availability has its own counter. Ordered roots are compared through a
+domain-separated SHA-256 digest with length-prefixed normalized path bytes, so a same-count
+replacement or reorder counts. Diagnostics retain no root paths.
+`root_count` is the most recent comparison's gauge, including zero. These process-local observations do not
+persist or affect decisions; no roots, paths, keys, namespaces, hashes, token
+values or body contents are emitted.
+
+The deferral count includes newly classified storage-only singleton deferrals;
+those retain custody without granting carry or proof. Under contract debt the
+existing stale-carry `contract` rejection bucket also includes member-evidence
+refusals. With no comparison lease, per-cycle permit counts use the existing
+prepare decision line once per attempted Claude cycle. A malformed hint window
+counts as `hint_failed`, before any contract observation. While a placeholder
+is stored, permit flaps remain visible in permit outcomes but cannot be
+classified into `from_empty`, `to_empty` or `collector_e2_grouping` from that
+unknown prior contract.
