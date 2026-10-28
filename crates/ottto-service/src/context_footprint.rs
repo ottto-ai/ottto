@@ -359,9 +359,14 @@ fn harvest_recent_workspaces(
     inventory_paths: Option<InventoryPaths>,
 ) -> Result<ContextHarvestOutcome> {
     let now = SystemTime::now();
-    let mut workspaces = discover_recent_claude_workspaces(home, now);
+    let mut counts = DiscoveryCounts::default();
+    let mut workspaces = discover_recent_claude_workspaces(home, now, &mut counts);
     workspaces.truncate(MAX_WORKSPACES_PER_CYCLE);
     if workspaces.is_empty() {
+        eprintln!(
+            "context_footprint_harvest_metrics discovered=0 uploaded=0 skipped=0 failed=0 discovery_files_total={} discovery_files_read={} discovery_bytes_selected={} discovery_path_scopes={}",
+            counts.files_total, counts.files_read, counts.bytes_selected, counts.path_scopes
+        );
         return Ok(ContextHarvestOutcome::default());
     }
 
@@ -416,11 +421,15 @@ fn harvest_recent_workspaces(
         }
     }
     eprintln!(
-        "context_footprint_harvest_metrics discovered={} uploaded={} skipped={} failed={}",
+        "context_footprint_harvest_metrics discovered={} uploaded={} skipped={} failed={} discovery_files_total={} discovery_files_read={} discovery_bytes_selected={} discovery_path_scopes={}",
         uploaded + skipped + failed,
         uploaded,
         skipped,
-        failed
+        failed,
+        counts.files_total,
+        counts.files_read,
+        counts.bytes_selected,
+        counts.path_scopes
     );
     if failed > 0 && uploaded == 0 && skipped == 0 {
         return Err(anyhow!(
@@ -1234,18 +1243,69 @@ pub(crate) fn safe_text(raw: &str, max_len: usize) -> Option<String> {
     Some(normalized.chars().take(max_len).collect())
 }
 
-fn discover_recent_claude_workspaces(home: &Path, now: SystemTime) -> Vec<WorkspaceCandidate> {
+/// Transcripts handed to the cwd parser by one discovery pass, for the cycle
+/// metrics line. `bytes_selected` is those files' sizes, not bytes actually
+/// parsed. `path_scopes` counts workspaces scoped by their own path: real
+/// non-git directories and git probes that failed cannot be told apart.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DiscoveryCounts {
+    files_total: usize,
+    files_read: usize,
+    bytes_selected: u64,
+    path_scopes: usize,
+}
+
+fn discover_recent_claude_workspaces(
+    home: &Path,
+    now: SystemTime,
+    counts: &mut DiscoveryCounts,
+) -> Vec<WorkspaceCandidate> {
     let mut files = Vec::new();
     collect_recent_jsonl_files(&home.join(".claude").join("projects"), now, &mut files);
+    discover_workspaces_in_files(files, counts, repository_scope)
+}
+
+/// `scope_of` answers a workspace's repository scope and whether it fell
+/// back to the path itself.
+fn discover_workspaces_in_files(
+    mut files: Vec<(PathBuf, SystemTime)>,
+    counts: &mut DiscoveryCounts,
+    mut scope_of: impl FnMut(&Path) -> (String, bool),
+) -> Vec<WorkspaceCandidate> {
     files.sort_by_key(|item| std::cmp::Reverse(item.1));
+    counts.files_total = files.len();
     let mut by_path: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
+    let mut scope_by_path: BTreeMap<String, String> = BTreeMap::new();
+    let mut scopes: BTreeSet<String> = BTreeSet::new();
+    let mut previous_mtime = None;
     for (file, mtime) in files {
+        // Files are newest-first, so a path's and a scope's last_seen are fixed
+        // by the first file naming them. Once a full cycle of scopes is known
+        // and every unread file is strictly older, no unread file can enter,
+        // reorder or re-represent the truncated list. Equal mtimes are read to
+        // the end so boundary ties keep today's order. This holds for the
+        // captured mtimes and stable is_dir/repository answers; a scope probe
+        // that fails before git succeeds can still split one repository.
+        if scopes.len() >= MAX_WORKSPACES_PER_CYCLE
+            && previous_mtime.is_some_and(|previous| mtime < previous)
+        {
+            break;
+        }
+        previous_mtime = Some(mtime);
+        counts.files_read += 1;
+        counts.bytes_selected += fs::metadata(&file).map_or(0, |metadata| metadata.len());
         for cwd in cwd_values_from_jsonl(&file) {
             let path = PathBuf::from(&cwd);
             if !path.is_dir() {
                 continue;
             }
             let key = path.to_string_lossy().to_string();
+            if !scope_by_path.contains_key(&key) {
+                let (scope, path_scope) = scope_of(&path);
+                counts.path_scopes += usize::from(path_scope);
+                scopes.insert(scope.clone());
+                scope_by_path.insert(key.clone(), scope);
+            }
             by_path
                 .entry(key)
                 .and_modify(|candidate| {
@@ -1261,21 +1321,32 @@ fn discover_recent_claude_workspaces(home: &Path, now: SystemTime) -> Vec<Worksp
     }
     let mut candidates: Vec<_> = by_path.into_values().collect();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_seen));
-    dedupe_workspace_candidates_by_repository(candidates)
+    // Every candidate was scoped when the scan admitted it.
+    dedupe_workspace_candidates_by_repository(candidates, |candidate| {
+        scope_by_path
+            .get(candidate.path.to_string_lossy().as_ref())
+            .cloned()
+            .unwrap_or_default()
+    })
+}
+
+/// Workspaces of one repository share a scope; a workspace without a
+/// repository hash is its own scope (`true`).
+fn repository_scope(path: &Path) -> (String, bool) {
+    match resolve_repository_identity(path, false).repository_hash {
+        Some(hash) => (hash, false),
+        None => (sha256_hex(&[path.to_string_lossy().as_ref()]), true),
+    }
 }
 
 fn dedupe_workspace_candidates_by_repository(
     candidates: Vec<WorkspaceCandidate>,
+    scope_of: impl Fn(&WorkspaceCandidate) -> String,
 ) -> Vec<WorkspaceCandidate> {
     let mut by_scope: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
     for candidate in candidates {
-        let repository_identity = resolve_repository_identity(&candidate.path, false);
-        let fallback_text = candidate.path.to_string_lossy();
-        let scope = repository_identity
-            .repository_hash
-            .unwrap_or_else(|| sha256_hex(&[fallback_text.as_ref()]));
         by_scope
-            .entry(scope)
+            .entry(scope_of(&candidate))
             .and_modify(|existing| {
                 if existing.last_seen < candidate.last_seen {
                     *existing = candidate.clone();
@@ -2372,9 +2443,11 @@ mod tests {
         )
         .unwrap();
 
-        let discovered = discover_recent_claude_workspaces(&home, SystemTime::now());
+        let mut counts = DiscoveryCounts::default();
+        let discovered = discover_recent_claude_workspaces(&home, SystemTime::now(), &mut counts);
 
         assert_eq!(discovered.len(), 1);
+        assert_eq!((counts.files_total, counts.files_read), (1, 1));
         assert_eq!(discovered[0].path, workspace);
         let _ = fs::remove_dir_all(&home);
     }
@@ -2571,20 +2644,446 @@ mod tests {
         let older = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
         let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
 
-        let out = dedupe_workspace_candidates_by_repository(vec![
-            WorkspaceCandidate {
-                path: repo.clone(),
-                last_seen: older,
-            },
-            WorkspaceCandidate {
-                path: subdir.clone(),
-                last_seen: newer,
-            },
-        ]);
+        let out = dedupe_workspace_candidates_by_repository(
+            vec![
+                WorkspaceCandidate {
+                    path: repo.clone(),
+                    last_seen: older,
+                },
+                WorkspaceCandidate {
+                    path: subdir.clone(),
+                    last_seen: newer,
+                },
+            ],
+            |candidate| repository_scope(&candidate.path).0,
+        );
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, subdir);
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Today's discovery before the early stop: every recent file is parsed,
+    /// then deduplicated by repository and truncated to one cycle.
+    fn discover_all_files_oracle(home: &Path, now: SystemTime) -> Vec<WorkspaceCandidate> {
+        let mut files = Vec::new();
+        collect_recent_jsonl_files(&home.join(".claude").join("projects"), now, &mut files);
+        files.sort_by_key(|item| std::cmp::Reverse(item.1));
+        let mut by_path: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
+        for (file, mtime) in files {
+            for cwd in cwd_values_from_jsonl(&file) {
+                let path = PathBuf::from(&cwd);
+                if !path.is_dir() {
+                    continue;
+                }
+                by_path
+                    .entry(path.to_string_lossy().to_string())
+                    .and_modify(|candidate| {
+                        if candidate.last_seen < mtime {
+                            candidate.last_seen = mtime;
+                        }
+                    })
+                    .or_insert(WorkspaceCandidate {
+                        path,
+                        last_seen: mtime,
+                    });
+            }
+        }
+        let mut candidates: Vec<_> = by_path.into_values().collect();
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_seen));
+        let mut by_scope: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
+        for candidate in candidates {
+            let scope = resolve_repository_identity(&candidate.path, false)
+                .repository_hash
+                .unwrap_or_else(|| frozen_path_scope(&candidate.path));
+            by_scope
+                .entry(scope)
+                .and_modify(|existing| {
+                    if existing.last_seen < candidate.last_seen {
+                        *existing = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+        let mut out: Vec<_> = by_scope.into_values().collect();
+        out.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_seen));
+        out.truncate(MAX_WORKSPACES_PER_CYCLE);
+        out
+    }
+
+    /// The path scope bytes as shipped before the early stop: SHA-256 of the
+    /// lossy path text followed by one NUL byte, lowercase hex.
+    fn frozen_path_scope(path: &Path) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update([0u8]);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Writes one transcript per entry, naming its cwds, with the given age.
+    fn write_discovery_transcripts(home: &Path, now: SystemTime, files: &[(u64, Vec<&Path>)]) {
+        let project = home.join(".claude").join("projects").join("-early-stop");
+        fs::create_dir_all(&project).unwrap();
+        for (index, (age_secs, cwds)) in files.iter().enumerate() {
+            let path = project.join(format!("session-{index:03}.jsonl"));
+            let text: String = cwds
+                .iter()
+                .map(|cwd| format!("{}\n", json!({"type": "user", "cwd": cwd})))
+                .collect();
+            fs::write(&path, text).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(*age_secs))
+                .unwrap();
+        }
+    }
+
+    fn discover_with_counts(
+        home: &Path,
+        now: SystemTime,
+    ) -> (Vec<WorkspaceCandidate>, DiscoveryCounts) {
+        let mut counts = DiscoveryCounts::default();
+        let mut found = discover_recent_claude_workspaces(home, now, &mut counts);
+        found.truncate(MAX_WORKSPACES_PER_CYCLE);
+        (found, counts)
+    }
+
+    #[test]
+    fn discovery_stops_after_a_full_cycle_of_scopes_with_unchanged_result() {
+        let home = temp_dir("early-stop");
+        let now = SystemTime::now();
+        let dirs: Vec<PathBuf> = (0..15)
+            .map(|index| {
+                let dir = home.join("work").join(format!("dir-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let missing = home.join("work").join("missing");
+        let mut files: Vec<(u64, Vec<&Path>)> = dirs
+            .iter()
+            .enumerate()
+            .map(|(index, dir)| (60 * (index as u64 + 1), vec![dir.as_path()]))
+            .collect();
+        // A cwd that no longer exists is not a scope and never ends discovery.
+        files[0].1.insert(0, missing.as_path());
+        // The oldest file also names a newer workspace; it cannot move it.
+        files[14].1.push(dirs[0].as_path());
+        write_discovery_transcripts(&home, now, &files);
+
+        let (found, counts) = discover_with_counts(&home, now);
+
+        assert_eq!(found, discover_all_files_oracle(&home, now));
+        assert_eq!(
+            found.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+            dirs[..MAX_WORKSPACES_PER_CYCLE].to_vec()
+        );
+        assert_eq!(counts.files_total, 15);
+        assert_eq!(counts.files_read, MAX_WORKSPACES_PER_CYCLE);
+        assert!(counts.bytes_selected > 0);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn discovery_finishes_the_boundary_mtime_tie_before_stopping() {
+        let home = temp_dir("early-stop-tie");
+        let now = SystemTime::now();
+        let dirs: Vec<PathBuf> = (0..16)
+            .map(|index| {
+                let dir = home.join("work").join(format!("tie-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        // Files 10..=13 share one mtime across the twelfth-scope boundary;
+        // the scope-hash order among them decides which survive truncation.
+        let files: Vec<(u64, Vec<&Path>)> = dirs
+            .iter()
+            .enumerate()
+            .map(|(index, dir)| {
+                let age = match index {
+                    0..=9 => 60 * (index as u64 + 1),
+                    10..=13 => 6_000,
+                    _ => 60_000 + index as u64,
+                };
+                (age, vec![dir.as_path()])
+            })
+            .collect();
+        write_discovery_transcripts(&home, now, &files);
+
+        let (found, counts) = discover_with_counts(&home, now);
+
+        assert_eq!(found, discover_all_files_oracle(&home, now));
+        assert_eq!(found.len(), MAX_WORKSPACES_PER_CYCLE);
+        assert_eq!(counts.files_read, 14);
+        assert_eq!(counts.files_total, 16);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn discovery_counts_repository_scopes_not_directories() {
+        let repo = init_git_repo("early-stop-scopes");
+        let now = SystemTime::now();
+        let mut subdirs: Vec<PathBuf> = (0..11)
+            .map(|index| {
+                let dir = repo.join(format!("pkg-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        // A linked worktree is the same repository scope as its main checkout.
+        let worktree = temp_dir("early-stop-scopes-worktree");
+        fs::remove_dir_all(&worktree).unwrap();
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "early-stop",
+                worktree.to_string_lossy().as_ref(),
+            ],
+        );
+        subdirs.push(worktree.clone());
+        let others: Vec<PathBuf> = (0..13)
+            .map(|index| {
+                let dir = repo.join("..").join(format!(
+                    "{}-plain-{index:02}",
+                    repo.file_name().unwrap().to_string_lossy()
+                ));
+                fs::create_dir_all(&dir).unwrap();
+                fs::canonicalize(dir).unwrap()
+            })
+            .collect();
+        let home = temp_dir("early-stop-scopes-home");
+        // Twelve newest files name twelve directories of one repository: one
+        // scope, so discovery must continue into the plain directories.
+        let mut files: Vec<(u64, Vec<&Path>)> = subdirs
+            .iter()
+            .enumerate()
+            .map(|(index, dir)| (60 * (index as u64 + 1), vec![dir.as_path()]))
+            .collect();
+        for (index, dir) in others.iter().enumerate() {
+            files.push((6_000 + 60 * index as u64, vec![dir.as_path()]));
+        }
+        // An unread old file names the repository root: the newest subdirectory
+        // still represents the repository.
+        files.push((90_000, vec![repo.as_path()]));
+        write_discovery_transcripts(&home, now, &files);
+
+        let (found, counts) = discover_with_counts(&home, now);
+
+        assert_eq!(found, discover_all_files_oracle(&home, now));
+        assert_eq!(found[0].path, subdirs[0]);
+        assert_eq!(found.len(), MAX_WORKSPACES_PER_CYCLE);
+        assert_eq!(counts.files_read, 12 + 11);
+        assert_eq!(counts.files_total, 12 + 13 + 1);
+        assert_eq!(counts.path_scopes, 11);
+        for dir in others {
+            let _ = fs::remove_dir_all(dir);
+        }
+        let _ = fs::remove_dir_all(&worktree);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// One transcript per entry naming `cwd`, returned as a captured
+    /// (path, mtime) tuple; the file's real mtime is left as written.
+    fn captured_transcripts(
+        root: &Path,
+        entries: &[(&Path, SystemTime)],
+    ) -> Vec<(PathBuf, SystemTime)> {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(index, (cwd, mtime))| {
+                let path = root.join(format!("captured-{index:03}.jsonl"));
+                fs::write(&path, format!("{}\n", json!({"cwd": cwd}))).unwrap();
+                (path, *mtime)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn discovery_ranks_by_captured_mtimes_and_orders_ties_by_scope() {
+        let root = temp_dir("early-stop-captured");
+        let dirs: Vec<PathBuf> = (0..16)
+            .map(|index| {
+                let dir = root.join(format!("ws-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let epoch = SystemTime::UNIX_EPOCH;
+        let at = |secs: u64| epoch + Duration::from_secs(secs);
+        // Captured times, not the files' real ones: ten distinct newest, a
+        // four-way tie across the twelfth scope, then an epoch fallback.
+        let mut entries: Vec<(&Path, SystemTime)> = (0..10)
+            .map(|index| (dirs[index].as_path(), at(2_000 - index as u64)))
+            .collect();
+        for dir in &dirs[10..14] {
+            entries.push((dir.as_path(), at(1_000)));
+        }
+        entries.push((dirs[14].as_path(), at(500)));
+        entries.push((dirs[15].as_path(), epoch));
+        let files = captured_transcripts(&root, &entries);
+        // Injected scopes make the tie order explicit: z-scopes sort last.
+        let scope_names = ["z1", "a1", "z0", "a0"];
+        let scope_of = |path: &Path| {
+            let index = dirs.iter().position(|dir| dir == path).unwrap();
+            match index {
+                10..=13 => (scope_names[index - 10].to_string(), false),
+                _ => (format!("m{index:02}"), true),
+            }
+        };
+        let mut counts = DiscoveryCounts::default();
+
+        let mut found = discover_workspaces_in_files(files, &mut counts, scope_of);
+        found.truncate(MAX_WORKSPACES_PER_CYCLE);
+
+        let mut expected: Vec<(PathBuf, SystemTime)> = (0..10)
+            .map(|index| (dirs[index].clone(), at(2_000 - index as u64)))
+            .collect();
+        // Scope order inside the tie: a0 (dir 13), a1 (dir 11).
+        expected.push((dirs[13].clone(), at(1_000)));
+        expected.push((dirs[11].clone(), at(1_000)));
+        assert_eq!(
+            found
+                .iter()
+                .map(|candidate| (candidate.path.clone(), candidate.last_seen))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!((counts.files_read, counts.files_total), (14, 16));
+        assert_eq!(counts.path_scopes, 10);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_counts_path_scopes_when_repository_probes_fail() {
+        let root = temp_dir("early-stop-probe-fails");
+        let dirs: Vec<PathBuf> = (0..14)
+            .map(|index| {
+                let dir = root.join(format!("pkg-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let entries: Vec<(&Path, SystemTime)> = dirs
+            .iter()
+            .enumerate()
+            .map(|(index, dir)| {
+                (
+                    dir.as_path(),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(100 - index as u64),
+                )
+            })
+            .collect();
+        // Documented limit: if every probe fails, twelve directories of one
+        // repository look like twelve scopes, so discovery stops early; the
+        // path-scope counter makes that visible.
+        let failing = |path: &Path| (frozen_path_scope(path), true);
+        let mut counts = DiscoveryCounts::default();
+        let found = discover_workspaces_in_files(
+            captured_transcripts(&root, &entries),
+            &mut counts,
+            failing,
+        );
+        assert_eq!(found.len(), MAX_WORKSPACES_PER_CYCLE);
+        assert_eq!((counts.files_read, counts.path_scopes), (12, 12));
+
+        // With the probe answering, they are one repository and every file
+        // is read.
+        let answering = |_: &Path| ("repository".to_string(), false);
+        let mut counts = DiscoveryCounts::default();
+        let found = discover_workspaces_in_files(
+            captured_transcripts(&root, &entries),
+            &mut counts,
+            answering,
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, dirs[0]);
+        assert_eq!((counts.files_read, counts.path_scopes), (14, 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_reads_everything_when_fewer_than_a_cycle_of_scopes_exist() {
+        let home = temp_dir("early-stop-few");
+        let now = SystemTime::now();
+        let dirs: Vec<PathBuf> = (0..5)
+            .map(|index| {
+                let dir = home.join("work").join(format!("few-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let files: Vec<(u64, Vec<&Path>)> = (0..9)
+            .map(|index| (60 * (index as u64 + 1), vec![dirs[index % 5].as_path()]))
+            .collect();
+        write_discovery_transcripts(&home, now, &files);
+
+        let (found, counts) = discover_with_counts(&home, now);
+
+        assert_eq!(found, discover_all_files_oracle(&home, now));
+        assert_eq!(found.len(), 5);
+        assert_eq!((counts.files_read, counts.files_total), (9, 9));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn discovery_keeps_tied_representatives_and_future_mtimes_in_order() {
+        let repo = init_git_repo("early-stop-representative");
+        let now = SystemTime::now();
+        let alpha = repo.join("alpha");
+        let beta = repo.join("beta");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+        let home = temp_dir("early-stop-representative-home");
+        let plain: Vec<PathBuf> = (0..12)
+            .map(|index| {
+                let dir = home.join("work").join(format!("plain-{index:02}"));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let future = home.join("work").join("future");
+        fs::create_dir_all(&future).unwrap();
+        // Two tied files of one repository name its directories in opposite
+        // line orders; the path-ordered representative must win either way.
+        let mut files: Vec<(u64, Vec<&Path>)> = vec![
+            (300, vec![beta.as_path(), alpha.as_path()]),
+            (300, vec![alpha.as_path(), beta.as_path()]),
+        ];
+        for (index, dir) in plain.iter().enumerate() {
+            files.push((600 + 60 * index as u64, vec![dir.as_path()]));
+        }
+        write_discovery_transcripts(&home, now, &files);
+        // A clock-skewed future mtime is still inside the window and newest.
+        let future_file = home
+            .join(".claude")
+            .join("projects")
+            .join("-early-stop")
+            .join("session-future.jsonl");
+        fs::write(&future_file, format!("{}\n", json!({"cwd": future}))).unwrap();
+        File::options()
+            .write(true)
+            .open(&future_file)
+            .unwrap()
+            .set_modified(now + Duration::from_secs(3_600))
+            .unwrap();
+
+        let (found, counts) = discover_with_counts(&home, now);
+
+        assert_eq!(found, discover_all_files_oracle(&home, now));
+        assert_eq!(found[0].path, future);
+        assert_eq!(found[1].path, alpha);
+        assert_eq!(counts.files_read, 1 + 2 + 10);
+        assert_eq!(counts.files_total, 1 + 2 + 12);
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

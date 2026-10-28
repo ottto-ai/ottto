@@ -6929,6 +6929,7 @@ fn finish_sync_source(
             prepared_claude_evidence,
             comparison_completion.as_mut(),
             native_comparison_lease.as_ref(),
+            Some((&daemon.transcript_cache, &committed_index)),
         );
         let (disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
@@ -8825,6 +8826,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         prepared,
         comparison,
         lease,
+        None,
     )
     .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
@@ -8837,6 +8839,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[allow(clippy::too_many_arguments)] // Optional process owner beside existing fold inputs.
 fn try_apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -8845,6 +8848,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     mut prepared: Option<PreparedClaudeLocalEvidence>,
     mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+    retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -9161,6 +9165,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
         },
     );
+    if let Some((cache, committed)) = retained {
+        cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
+    }
     disposition.hold_request_owned(withheld);
     if request_owned_enabled {
         for item in &mut scan_result.snapshots {
@@ -9219,19 +9226,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         ),
     };
     drop(identity_evidence);
-    // E2 grains have served their last consumer: contract 5 and account
-    // qualification now own the final rows. Do not retain or clone the fold
-    // alongside upload entities. A withheld entity still needs its original
-    // fold for the hold; it has no request-owned emitted body.
-    #[cfg(test)]
-    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
-        &scan_result.snapshots,
-    );
-    for item in &mut scan_result.snapshots {
-        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
-            crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
-        }
-    }
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -9311,6 +9305,19 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             authority_retry: index.claude_usage_authority_pending_count() > 0,
         },
     );
+    // All local consumers (comparison/fallback, finalizer, identity, account
+    // qualification and the optional shadow) have finished. Release native
+    // inputs only for emitted E2 bodies before upload clones/checkpoints.
+    // Held and legacy bodies retain their inputs for their existing owners.
+    #[cfg(test)]
+    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
+        &scan_result.snapshots,
+    );
+    for item in &mut scan_result.snapshots {
+        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
+            crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
+        }
+    }
     Ok((disposition, census_withheld, stats))
 }
 
@@ -11642,6 +11649,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let owner = std::sync::Arc::new(lifecycle::Lifecycle::default());
@@ -11659,6 +11667,7 @@ mod tests {
                 None,
                 completion.as_mut(),
                 Some(&lease),
+                None,
             )
             .unwrap()
         });
