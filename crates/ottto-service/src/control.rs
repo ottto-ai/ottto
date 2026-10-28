@@ -17462,48 +17462,74 @@ mod tests {
     #[test]
     fn session_exec_commands_require_cli_kind_and_authorized_token() {
         let daemon = daemon();
-        let command = || LocalControlCommand::SessionLaunchConsume {
-            schema_version: 1,
-            launch_id: "synthetic".into(),
-            secret: SecretString::new("synthetic"),
-        };
-        for (kind, token) in [
-            (Some(LocalClientKind::CompanionApp), Some("token")),
-            (None, Some("token")),
-            (Some(LocalClientKind::Cli), None),
-        ] {
+        for report in [false, true] {
+            let command = || {
+                if report {
+                    LocalControlCommand::SessionLaunchReport {
+                        schema_version: 1,
+                        launch_id: "synthetic".into(),
+                        attempt_id: SecretString::new("synthetic"),
+                        reason: ottto_protocol::SessionLaunchBlockReasonV1::ExecFailed,
+                    }
+                } else {
+                    LocalControlCommand::SessionLaunchConsume {
+                        schema_version: 1,
+                        launch_id: "synthetic".into(),
+                        secret: SecretString::new("synthetic"),
+                    }
+                }
+            };
+            for (kind, token, expected) in [
+                (
+                    Some(LocalClientKind::CompanionApp),
+                    Some("token"),
+                    CliErrorCode::LocalAuthFailed,
+                ),
+                (None, Some("token"), CliErrorCode::LocalAuthFailed),
+                // Without a token or trusted peer, the common authorization
+                // boundary refuses before the CLI-only command check.
+                (
+                    Some(LocalClientKind::Cli),
+                    None,
+                    CliErrorCode::LocalClientNotTrusted,
+                ),
+                (
+                    Some(LocalClientKind::Cli),
+                    Some("wrong-token"),
+                    CliErrorCode::LocalAuthFailed,
+                ),
+            ] {
+                let response = handle_request(
+                    &daemon,
+                    LocalControlRequest {
+                        request_id: "launch-auth".into(),
+                        protocol_version: 28,
+                        token: token.map(str::to_owned),
+                        client_kind: kind,
+                        client_install_owner: None,
+                        command: command(),
+                    },
+                );
+                assert!(!response.ok);
+                assert_eq!(response.error.unwrap().code, expected);
+            }
             let response = handle_request(
                 &daemon,
                 LocalControlRequest {
                     request_id: "launch-auth".into(),
                     protocol_version: 28,
-                    token: token.map(str::to_owned),
-                    client_kind: kind,
+                    token: Some("token".into()),
+                    client_kind: Some(LocalClientKind::Cli),
                     client_install_owner: None,
                     command: command(),
                 },
             );
-            assert!(!response.ok);
-            assert_eq!(response.error.unwrap().code, CliErrorCode::LocalAuthFailed);
+            assert!(response.ok);
+            assert_eq!(
+                response.payload.unwrap()["block"]["reason"],
+                "launch_unknown"
+            );
         }
-        let response = handle_request(
-            &daemon,
-            LocalControlRequest {
-                request_id: "launch-auth".into(),
-                protocol_version: 28,
-                token: Some("token".into()),
-                client_kind: Some(LocalClientKind::Cli),
-                client_install_owner: None,
-                command: command(),
-            },
-        );
-        assert!(response.ok);
-        let result: ottto_protocol::SessionLaunchConsumeResultV1 =
-            serde_json::from_value(response.payload.unwrap()).unwrap();
-        assert_eq!(
-            result.block.unwrap().reason,
-            ottto_protocol::SessionLaunchBlockReasonV1::LaunchUnknown
-        );
     }
 
     #[test]
