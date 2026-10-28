@@ -55,6 +55,7 @@ pub(crate) struct Corrupt;
 
 enum Sink {
     Bytes { out: Vec<u8>, limit: usize },
+    Count { len: usize, limit: usize },
     Hash(Box<Sha256>),
 }
 
@@ -68,9 +69,20 @@ impl Enc {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
             sink: Sink::Bytes {
-                out: Vec::new(),
+                out: Vec::with_capacity(limit),
                 limit,
             },
+        }
+    }
+    pub(crate) fn count(limit: usize) -> Self {
+        Self {
+            sink: Sink::Count { len: 0, limit },
+        }
+    }
+    pub(crate) fn counted(&self) -> usize {
+        match &self.sink {
+            Sink::Count { len, .. } => *len,
+            _ => unreachable!("only a count sink has a counted length"),
         }
     }
     pub(crate) fn hash(domain: &str) -> Self {
@@ -84,12 +96,12 @@ impl Enc {
     pub(crate) fn hashing(&self) -> bool {
         matches!(self.sink, Sink::Hash(_))
     }
-    /// Bytes written so far; `None` in hash mode. Tests only.
+    /// Byte-output position; counting and hashing never record `L` spans.
     #[cfg(test)]
     pub(crate) fn position(&self) -> Option<usize> {
         match &self.sink {
             Sink::Bytes { out, .. } => Some(out.len()),
-            Sink::Hash(_) => None,
+            Sink::Hash(_) | Sink::Count { .. } => None,
         }
     }
     pub(crate) fn raw(&mut self, bytes: &[u8]) -> Result<(), Refuse> {
@@ -101,6 +113,12 @@ impl Enc {
                 out.extend_from_slice(bytes);
             }
             Sink::Hash(hasher) => hasher.update(bytes),
+            Sink::Count { len, limit } => {
+                *len = len.checked_add(bytes.len()).ok_or(Refuse::TooLarge)?;
+                if *len > *limit {
+                    return Err(Refuse::TooLarge);
+                }
+            }
         }
         Ok(())
     }
@@ -128,7 +146,7 @@ impl Enc {
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         match self.sink {
             Sink::Bytes { out, .. } => out,
-            Sink::Hash(_) => Vec::new(),
+            Sink::Hash(_) | Sink::Count { .. } => Vec::new(),
         }
     }
     /// Hash mode: the digest.
@@ -136,6 +154,7 @@ impl Enc {
         match self.sink {
             Sink::Hash(hasher) => hasher.finalize().into(),
             Sink::Bytes { out, .. } => Sha256::digest(out).into(),
+            Sink::Count { .. } => unreachable!("counting is not hashing"),
         }
     }
 }

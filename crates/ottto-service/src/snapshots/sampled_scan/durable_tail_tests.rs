@@ -6,6 +6,118 @@ use std::io::Read;
 
 const INDEX_KEYS: usize = 20_000;
 
+#[test]
+fn oversized_active_request_refuses_without_waiting_or_opening_a_store() {
+    let cache = SharedCache::default();
+    let (result, events) = crate::local_resource_diagnostics::capture(|| {
+        cache.acquire_active(SnapshotSource::Codex, store::ACTIVE_BYTES + 1)
+    });
+    assert!(matches!(result, store::LeaseWait::Busy));
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["counts"]["active_budget_refused"], 1);
+    assert!(cache.durable_counters(SnapshotSource::Codex).is_none());
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs native cache admission layout"
+)]
+fn existing_m1_writer_uses_and_releases_active_credit_on_success_and_io_error() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        Arc,
+    };
+    assert!(crate::heap_layout_bound::layout_supported());
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = crate::test_scratch::private_dir("ottto-writer-active-credit");
+        let lock = test_locks::hold(&root);
+        let index_path = root.join("index.json");
+        let scope = Scope("writer-active-file".into());
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &Scope("writer-active".into()), false);
+        let mut index = ScanIndex::default();
+        for fail in [false, true] {
+            let path = root.join(if fail { "fault.jsonl" } else { "success.jsonl" });
+            if source == SnapshotSource::Codex {
+                codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+            } else {
+                std::fs::write(&path, serde_json::json!({"type":"assistant", "sessionId":"active-credit",
+                    "message":{"id":"msg-active", "model":"claude-opus-4-1", "role":"assistant", "content":[],
+                        "usage":{"input_tokens":5,"output_tokens":2}}}).to_string()+"\n").unwrap();
+            }
+            let key = local_index_key(&path);
+            let (reduction, checkpoint) = native_record_of(&path, &scope, source);
+            let body =
+                codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
+            assert!(cache.insert_admitted(
+                key.clone(),
+                sampled_jsonl::CompletedNativeAcquisition {
+                    checkpoint,
+                    reduction: Some(reduction),
+                    released: None,
+                    unsealed: false,
+                },
+                0
+            ));
+            cache.durable_note_selection(&key, "fp");
+            index.files.insert(
+                key.clone(),
+                serde_json::from_value(serde_json::json!({
+                    "size_bytes":std::fs::metadata(&path).unwrap().len(),
+                    "modified_unix_seconds":1,"source_file_fingerprint":"fp"
+                }))
+                .unwrap(),
+            );
+            index.save(&index_path).unwrap();
+            let reached = Arc::new(AtomicBool::new(false));
+            if fail {
+                let reached = reached.clone();
+                store::test_hooks::set_before_rename(Some(Box::new(move |_, _| {
+                    reached.store(true, AtomicOrdering::SeqCst);
+                    Err(std::io::Error::other("synthetic rename failure"))
+                })));
+            }
+            let (receipt, events) = crate::local_resource_diagnostics::capture(|| {
+                cache.durable_write_after_save(lock, source, &index)
+            });
+            store::test_hooks::set_before_rename(None);
+            assert_eq!(reached.load(AtomicOrdering::SeqCst), fail);
+            assert_eq!(receipt.is_none(), fail);
+            if !fail {
+                assert_eq!(receipt.unwrap().written, 1);
+                let ds = durable_source(source).unwrap();
+                let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+                let ReadOutcome::Found(record) = disk.read(
+                    &store::key_digest(ds, &key),
+                    &codec::allowlist_digest(source),
+                ) else {
+                    panic!("real M1 write produced no readable record");
+                };
+                assert_eq!(record.record.body, body);
+            }
+            let reserved = (4 * store::RECORD_BYTES + WRITE_PASS_BYTES) as u64;
+            assert!(events
+                .iter()
+                .any(|e| e["counts"]["active_current_bytes"] == reserved));
+            assert!(events
+                .iter()
+                .any(|e| e["counts"]["active_peak_bytes"] == reserved));
+            assert!(events
+                .iter()
+                .any(|e| e["counts"]["active_current_bytes"] == 0));
+            assert!(!events
+                .iter()
+                .any(|e| e["counts"]["active_drop_release"] == 1));
+            let store::LeaseWait::Granted(lease) = cache.acquire_active(source, 0) else {
+                panic!("writer exit leaked active ownership");
+            };
+            lease.release();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn indexed_key(n: usize) -> String {
     format!("/synthetic/sessions/rollout-{n:05}.jsonl")
 }

@@ -141,7 +141,34 @@ pub(crate) fn encode(
     limit: usize,
     line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
-    let acc = &reduction.accumulator;
+    let CachedJsonlReduction {
+        accumulator: acc,
+        report,
+        recognized_usage_drop_count,
+        positive_recognized_usage_count,
+        positive_usage_evidence,
+    } = reduction;
+    encode_parts(
+        acc,
+        report,
+        (
+            *recognized_usage_drop_count,
+            *positive_recognized_usage_count,
+            *positive_usage_evidence,
+        ),
+        limit,
+        line_cap,
+    )
+}
+
+// Same field order as CachedJsonlReduction::put, borrowing native fields.
+pub(in crate::snapshots) fn encode_parts(
+    acc: &SnapshotAccumulator,
+    report: &JsonlReadReport,
+    scalars: (usize, usize, bool),
+    limit: usize,
+    line_cap: u64,
+) -> Result<Vec<u8>, Refuse> {
     if !matches!(
         acc.source,
         SnapshotSource::ClaudeCode | SnapshotSource::Codex
@@ -149,9 +176,18 @@ pub(crate) fn encode(
         return Err(Refuse::NotRederivable("SnapshotAccumulator.source"));
     }
     let rederive = rederive_digests(acc, line_cap)?;
-    let mut e = Enc::bytes(limit);
-    reduction.put(&mut e)?;
-    rederive.put(&mut e)?;
+    let put = |e: &mut Enc| {
+        acc.put(e)?;
+        report.put(e)?;
+        scalars.0.put(e)?;
+        scalars.1.put(e)?;
+        scalars.2.put(e)?;
+        rederive.put(e)
+    };
+    let mut count = Enc::count(limit);
+    put(&mut count)?;
+    let mut e = Enc::bytes(count.counted());
+    put(&mut e)?;
     Ok(e.into_bytes())
 }
 

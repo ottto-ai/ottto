@@ -766,12 +766,52 @@ impl SharedCache {
         }
     }
 
+    pub(crate) fn acquire_active(
+        &self,
+        source: SnapshotSource,
+        need_bytes: u64,
+    ) -> store::LeaseWait {
+        if need_bytes > store::ACTIVE_BYTES {
+            crate::local_resource_diagnostics::durable_tail_alarm(
+                source.api_slug(),
+                &serde_json::json!({"active_budget_refused":1}),
+            );
+            return store::LeaseWait::Busy;
+        }
+        if let store::LeaseWait::Granted(mut lease) = store::ActiveLease::acquire(source.api_slug())
+        {
+            match lease.charge(need_bytes) {
+                Ok(()) => return store::LeaseWait::Granted(lease),
+                Err(store::ActiveOverBudget) => lease.release(),
+            }
+        }
+        store::LeaseWait::Busy
+    }
+
     /// After a successful save of `index` (the committed generation), writes
     /// the records of this source's entries admitted since its last write
     /// that are still resident and kept by the save, then collects records
     /// the save no longer keeps. `writer` proves the single state-directory
     /// writer (#801).
     pub(crate) fn durable_write_after_save<W: SingleWriter>(
+        &self,
+        writer: &W,
+        snapshot_source: SnapshotSource,
+        index: &ScanIndex,
+    ) -> Option<store::BatchReceipt> {
+        durable_source(snapshot_source)?;
+        let store::LeaseWait::Granted(lease) = self.acquire_active(
+            snapshot_source,
+            (4 * store::RECORD_BYTES + WRITE_PASS_BYTES) as u64,
+        ) else {
+            return None;
+        };
+        let result = self.write_after_save_active(writer, snapshot_source, index);
+        lease.release();
+        result
+    }
+
+    fn write_after_save_active<W: SingleWriter>(
         &self,
         writer: &W,
         snapshot_source: SnapshotSource,

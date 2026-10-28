@@ -1486,6 +1486,86 @@ fn structural_verifier_large_body_still_allocates_nothing() {
     );
 }
 
+fn assert_borrowed_count_identity(reduction: &CachedJsonlReduction) {
+    take_l_spans();
+    let rederive = rederive_digests(&reduction.accumulator, line_cap()).unwrap();
+    let mut old = Enc::bytes(crate::durable_tail_store::RECORD_BYTES);
+    reduction.put(&mut old).unwrap();
+    rederive.put(&mut old).unwrap();
+    let expected = old.into_bytes();
+    take_l_spans();
+    let (count, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut count = Enc::count(expected.len());
+        reduction.put(&mut count).unwrap();
+        rederive.put(&mut count).unwrap();
+        count.counted()
+    });
+    assert_eq!(stats.allocations, 0, "count must not allocate: {stats:?}");
+    assert_eq!(count, expected.len());
+    let (refused, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut count = Enc::count(expected.len() - 1);
+        reduction
+            .put(&mut count)
+            .and_then(|()| rederive.put(&mut count))
+    });
+    assert_eq!(refused, Err(Refuse::TooLarge));
+    assert_eq!(stats.allocations, 0, "refusal precedes any body allocation");
+    assert!(
+        take_l_spans().is_empty(),
+        "count is not a second L-span output"
+    );
+    let actual = encode(reduction, expected.len(), line_cap()).unwrap();
+    assert_eq!(
+        actual, expected,
+        "borrowed parts preserve the original codec bytes"
+    );
+    assert_eq!(actual.capacity(), actual.len());
+    assert_eq!(
+        encode(reduction, expected.len() - 1, line_cap()),
+        Err(Refuse::TooLarge)
+    );
+    let (_, options) = crate::durable_tail_codec::trace_verify(|| verify(&actual).unwrap());
+    assert!(options >= 5, "fixture must populate nested optional state");
+    take_l_spans();
+}
+
+#[test]
+fn borrowed_count_exact_encoding_matches_populated_both_source_canaries() {
+    let scratch = Scratch::new("borrowed-count-canaries");
+    let mut covered = BTreeSet::new();
+    for case in cases() {
+        let path = scratch.write("nested.jsonl", &case.lines);
+        let (reduction, _) = full_read(&path, case.source);
+        covered.insert(case.source.api_slug());
+        assert_borrowed_count_identity(&reduction);
+    }
+    assert_eq!(covered, BTreeSet::from(["claude_code", "codex"]));
+}
+
+#[test]
+fn borrowed_count_identity_covers_codex_absent_legacy_and_v2_state() {
+    use codex_counting_version::AckEvidence;
+    let scratch = Scratch::new("borrowed-count-contract");
+    let path = scratch.write("codex.jsonl", &codex_lines());
+    for (evidence, version) in [
+        (None, 0),
+        (Some(AckEvidence::LegacyAcked), 1),
+        (Some(AckEvidence::None), 2),
+    ] {
+        let mut parser = parser(&path, SnapshotSource::Codex);
+        if let Some(evidence) = evidence {
+            codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));
+        }
+        parser
+            .prepare_acquisition(None, &scope(), None, NOW)
+            .unwrap();
+        while !parser.step().unwrap() {}
+        let reduction = parser.durable_test_reduction_copy();
+        assert_eq!(reduction.durable_counting().map_or(0, |c| c.1), version);
+        assert_borrowed_count_identity(&reduction);
+    }
+}
+
 #[test]
 fn compressed_rederive_refuses_before_seek_or_jsonl_parse() {
     let scratch = Scratch::new("zst-refusal");

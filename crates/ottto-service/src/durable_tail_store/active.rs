@@ -1,0 +1,229 @@
+//! Process-wide ownership of transient durable-record allocations.
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+pub(crate) const ACTIVE_BYTES: u64 = 64 * 1024 * 1024;
+const WAIT: Duration = Duration::from_secs(20);
+// Fixed FIFO slots: waiting never allocates or holds another scan lock.
+static OWNER: Mutex<Owner> = Mutex::new(Owner {
+    busy: false,
+    next: 0,
+    queue: [0; 64],
+    len: 0,
+});
+static WAKE: Condvar = Condvar::new();
+struct Owner {
+    busy: bool,
+    next: u64,
+    queue: [u64; 64],
+    len: usize,
+}
+pub(crate) struct ActiveLease {
+    source: &'static str,
+    bytes: u64,
+    released: bool,
+}
+impl ActiveLease {
+    pub(crate) fn acquire(source: &'static str) -> LeaseWait {
+        Self::acquire_for(source, WAIT)
+    }
+    fn acquire_for(source: &'static str, timeout: Duration) -> LeaseWait {
+        let start = Instant::now();
+        let outcome = Self::wait(source, timeout);
+        event(
+            source,
+            "active_wait_us",
+            start.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        );
+        event(source, "active_wait_busy", u64::from(outcome.is_none()));
+        outcome.map_or(LeaseWait::Busy, LeaseWait::Granted)
+    }
+    fn wait(source: &'static str, timeout: Duration) -> Option<Self> {
+        let deadline = Instant::now().checked_add(timeout)?;
+        let mut owner = OWNER.lock().ok()?;
+        if owner.len == owner.queue.len() {
+            return None;
+        }
+        let ticket = owner.next.checked_add(1)?;
+        owner.next = ticket;
+        let at = owner.len;
+        owner.queue[at] = ticket;
+        owner.len += 1;
+        #[cfg(test)]
+        tests::registered(ticket);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let at = owner.queue[..owner.len].iter().position(|t| *t == ticket)?;
+                owner.queue[at..].rotate_left(1);
+                owner.len -= 1;
+                WAKE.notify_all();
+                return None;
+            }
+            if !owner.busy && owner.queue[0] == ticket {
+                owner.queue.rotate_left(1);
+                owner.len -= 1;
+                owner.busy = true;
+                return Some(Self {
+                    source,
+                    bytes: 0,
+                    released: false,
+                });
+            }
+            owner = WAKE.wait_timeout(owner, remaining).ok()?.0;
+        }
+    }
+    pub(crate) fn charge(&mut self, bytes: u64) -> Result<(), ActiveOverBudget> {
+        let total = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|n| *n <= ACTIVE_BYTES)
+            .ok_or(ActiveOverBudget)?;
+        self.bytes = total;
+        event(self.source, "active_current_bytes", total);
+        Ok(())
+    }
+    pub(crate) fn release(mut self) {
+        self.finish(false);
+    }
+    fn finish(&mut self, leaked: bool) {
+        if !self.released {
+            event(self.source, "active_peak_bytes", self.bytes);
+            event(self.source, "active_current_bytes", 0);
+            event(self.source, "active_drop_release", u64::from(leaked));
+            self.bytes = 0;
+            self.released = true;
+            if let Ok(mut owner) = OWNER.lock() {
+                owner.busy = false;
+                WAKE.notify_all();
+            }
+        }
+    }
+}
+impl Drop for ActiveLease {
+    fn drop(&mut self) {
+        self.finish(true);
+    }
+}
+
+pub(crate) enum LeaseWait {
+    Granted(ActiveLease),
+    Busy,
+}
+#[derive(Debug)]
+pub(crate) struct ActiveOverBudget;
+fn event(source: &str, name: &'static str, value: u64) {
+    crate::local_resource_diagnostics::durable_tail_alarm(
+        source,
+        &serde_json::json!({(name): value}),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::local_resource_diagnostics::capture;
+    use std::sync::mpsc;
+
+    thread_local! {
+        static QUEUED: std::cell::RefCell<Option<mpsc::Sender<u64>>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn registered(ticket: u64) {
+        QUEUED.with(|sender| {
+            if let Some(sender) = sender.borrow().as_ref() {
+                sender.send(ticket).unwrap();
+            }
+        });
+    }
+
+    fn granted() -> ActiveLease {
+        match ActiveLease::acquire("claude_code") {
+            LeaseWait::Granted(lease) => lease,
+            LeaseWait::Busy => panic!("test owner unavailable"),
+        }
+    }
+
+    #[test]
+    fn checked_credit_explicit_release_and_counted_drop() {
+        let (_, events) = capture(|| {
+            let mut lease = granted();
+            lease.charge(ACTIVE_BYTES).unwrap();
+            assert!(matches!(lease.charge(1), Err(ActiveOverBudget)));
+            assert!(matches!(lease.charge(u64::MAX), Err(ActiveOverBudget)));
+            assert_eq!(lease.bytes, ACTIVE_BYTES);
+            lease.release();
+            drop(granted());
+            granted().release();
+        });
+        let counters = events
+            .iter()
+            .map(|event| &event["counts"])
+            .collect::<Vec<_>>();
+        assert!(counters
+            .iter()
+            .any(|c| c["active_peak_bytes"] == ACTIVE_BYTES));
+        assert_eq!(
+            counters
+                .iter()
+                .filter(|c| c["active_drop_release"] == 1)
+                .count(),
+            1
+        );
+        assert!(
+            counters
+                .iter()
+                .filter(|c| c["active_current_bytes"] == 0)
+                .count()
+                >= 3
+        );
+    }
+
+    #[test]
+    fn timeout_removes_ticket_and_live_waiters_progress_in_fifo_order() {
+        let first = granted();
+        assert_eq!(WAIT, Duration::from_secs(20));
+        let (expired, expire_events) = capture(|| {
+            matches!(
+                ActiveLease::acquire_for("codex", Duration::from_millis(5)),
+                LeaseWait::Busy
+            )
+        });
+        assert!(expired);
+        assert!(expire_events
+            .iter()
+            .any(|e| e["counts"]["active_wait_busy"] == 1));
+        assert!(!expire_events
+            .iter()
+            .any(|e| e["counts"].get("active_current_bytes").is_some()));
+        let (ready, receive) = mpsc::channel();
+        let (queued, registrations) = mpsc::channel();
+        let a_queued = queued.clone();
+        let a_ready = ready.clone();
+        let a = std::thread::spawn(move || {
+            QUEUED.with(|sender| *sender.borrow_mut() = Some(a_queued));
+            let lease = ActiveLease::wait("claude_code", WAIT).expect("first queued");
+            a_ready.send("a").unwrap();
+            lease.release();
+        });
+        let first_ticket = registrations.recv_timeout(Duration::from_secs(5)).unwrap();
+        let b = std::thread::spawn(move || {
+            QUEUED.with(|sender| *sender.borrow_mut() = Some(queued));
+            let lease = ActiveLease::wait("codex", WAIT).expect("second queued");
+            ready.send("b").unwrap();
+            lease.release();
+        });
+        assert!(registrations.recv_timeout(Duration::from_secs(5)).unwrap() > first_ticket);
+        first.release();
+        assert_eq!(
+            receive.recv_timeout(WAIT + Duration::from_secs(1)).unwrap(),
+            "a"
+        );
+        assert_eq!(
+            receive.recv_timeout(WAIT + Duration::from_secs(1)).unwrap(),
+            "b"
+        );
+        a.join().unwrap();
+        b.join().unwrap();
+        granted().release();
+    }
+}

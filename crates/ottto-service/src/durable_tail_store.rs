@@ -39,6 +39,9 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+mod active;
+pub(crate) use active::{ActiveLease, ActiveOverBudget, LeaseWait, ACTIVE_BYTES};
+
 /// Envelope format. Bump on any envelope or certificate layout change.
 pub(crate) const FORMAT_VERSION: u16 = 1;
 const MAGIC: [u8; 8] = *b"ottto-dt";
