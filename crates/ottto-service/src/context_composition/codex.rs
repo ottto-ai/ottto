@@ -10,9 +10,7 @@ use super::report::{Weight, WorkspaceReport};
 #[cfg(test)]
 use super::IMAGE_NOMINAL_TOKENS;
 #[cfg(test)]
-use crate::composition_kinds::{
-    self as kinds, Agent, CallClass, ContentLabel, Kind, LineCtx, Verdict,
-};
+use crate::composition_kinds::{self as kinds, CallClass, ContentLabel, Kind, LineCtx, Verdict};
 use serde_json::Value;
 #[cfg(test)]
 use std::borrow::Cow;
@@ -61,7 +59,7 @@ pub(crate) fn parse_codex_session(
         report.copied_history_sessions += 1;
     }
 
-    let ctx = LineCtx::v1(Agent::Codex);
+    let ctx = LineCtx::v1();
 
     // Pass 1: call_id -> call class; residency markers.
     let mut callmap: BTreeMap<String, CallClass> = BTreeMap::new();
