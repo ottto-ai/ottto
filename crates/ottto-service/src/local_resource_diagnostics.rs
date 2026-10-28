@@ -69,7 +69,7 @@ pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
     )
 }
 
-/// K10 (LD): one line observer's counts for a page; inline, nonzero keys only.
+/// K10 (LD): one line observer's counts for a page; nonzero keys only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct LineDeliveryCounts {
     #[serde(skip_serializing_if = "is_zero")]
@@ -77,27 +77,10 @@ pub(crate) struct LineDeliveryCounts {
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) bytes: u64,
     #[serde(skip_serializing_if = "is_zero")]
-    pub(crate) observer_us: u64,
-    #[serde(skip_serializing_if = "LineDeliveryIncomplete::is_empty")]
-    pub(crate) incomplete: LineDeliveryIncomplete,
-}
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct LineDeliveryIncomplete {
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(crate) held: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(crate) read_failure: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub(crate) yielded: u64,
-}
-impl LineDeliveryIncomplete {
-    fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
+    pub(crate) incomplete: u64,
 }
 
 /// K10 (LD): why a discovery gate left a file unselected.
-#[derive(Clone, Copy)]
 pub(crate) enum UnselectedReason {
     Age,
     Size,
@@ -110,10 +93,8 @@ thread_local! {
     static LINE_UNSELECTED: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
 }
 fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
-    let Some(slot) = ["claude_code", "codex", "pi"]
-        .iter()
-        .position(|s| *s == source)
-    else {
+    let sources = ["claude_code", "codex", "pi"];
+    let Some(slot) = sources.iter().position(|s| *s == source) else {
         return 0;
     };
     #[cfg(test)]
@@ -265,7 +246,6 @@ pub(crate) struct Probe {
     started: Instant,
     process: Option<ProcessSample>,
     pub(crate) page_events: claude_reread::Counts,
-    /// LD: the pass's observer name and counts, set before the page line.
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
 }
 impl Probe {

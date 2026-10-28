@@ -31935,10 +31935,8 @@ impl OwnedSourceScan {
             active_file = Some(active);
             pending!();
         }
-        if active_file.is_none() {
-            if let Some(delivery) = line_delivery.as_mut() {
-                delivery.left_active();
-            }
+        if let (None, Some(delivery)) = (&active_file, line_delivery.as_mut()) {
+            delivery.left_active();
         }
         Ok(OwnedSourceScanStep::Pending(Self {
             native_comparison,
@@ -32844,7 +32842,6 @@ impl OwnedJsonlParser {
     fn step(&mut self) -> Result<bool> {
         self.step_delivering(None)
     }
-    /// `step`, lending each newline-complete physical line to `on_line` (LD).
     fn step_delivering(&mut self, on_line: Option<line_delivery::LineTap<'_>>) -> Result<bool> {
         #[cfg(test)]
         if let Some(path) = self.source_read_probe.take() {
@@ -33859,8 +33856,6 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         self.step_lines(on_value, None)
     }
 
-    /// `step`, also lending a newline-complete physical line to `on_line`
-    /// (LD; offsets relative to this reader's start).
     fn step_lines(
         &mut self,
         on_value: impl FnMut(&Value),
@@ -33905,8 +33900,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         mut on_value: impl FnMut(&Value),
         on_line: Option<line_delivery::LineTap<'_>>,
     ) -> std::io::Result<JsonlReaderStep> {
-        // A line starts where the previous newline ended, even when its
-        // overlong skip paused across steps.
+        // Where this line started, even when its overlong skip paused.
         let line_start = self.last_line_end;
         let reader = &mut self.reader;
         let buf = &mut self.buf;
@@ -34030,7 +34024,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             // An unterminated trailing line reaches money only, never LD.
             on_line
                 .filter(|_| line_complete)
-                .map(|tap| (line_start, self.consumed, tap)),
+                .map(|tap| (self.consumed - line_start, tap)),
             &mut on_value,
         );
         self.finished = reached_eof;
@@ -34039,8 +34033,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
 }
 
 /// Count and apply one physical line held in `buf` (newline-terminated, or a
-/// trailing line at EOF). Shared by every read path. `deliver` (LD) borrows a
-/// newline-complete line `(start, end)` and its one parse before money's sink.
+/// trailing line at EOF). Shared by every read path; `deliver` is LD's tap.
 #[allow(clippy::too_many_arguments)]
 fn apply_physical_line(
     buf: &mut Vec<u8>,
@@ -34049,21 +34042,15 @@ fn apply_physical_line(
     early: Option<EarlySalvage>,
     max_line_bytes: usize,
     salvage_codex_envelope: bool,
-    deliver: Option<(u64, u64, line_delivery::LineTap<'_>)>,
+    deliver: Option<(u64, line_delivery::LineTap<'_>)>,
     on_value: &mut impl FnMut(&Value),
 ) {
     report.physical_line_count += 1;
     if overflowed {
         report.over_line_cap_count += 1;
-        if let Some((start, end, tap)) = deliver {
-            // Never the capped prefix or a salvaged envelope.
-            tap(&line_delivery::PhysicalLine {
-                start,
-                end,
-                bytes: &[],
-                value: None,
-                overlong: true,
-            });
+        if let Some((length, tap)) = deliver {
+            // Never a salvaged envelope.
+            tap(length, &line_delivery::PhysicalLine { value: None });
         }
         // Codex created-thread ownership requires a gap-free ordinal and
         // timestamp stream. Image-bearing response/compaction rows carry
@@ -34107,14 +34094,9 @@ fn apply_physical_line(
             None
         }
     };
-    if let Some((start, end, tap)) = deliver {
-        tap(&line_delivery::PhysicalLine {
-            start,
-            end,
-            bytes: buf.as_slice(),
-            value: value.as_ref(),
-            overlong: false,
-        });
+    if let Some((length, tap)) = deliver {
+        let value = value.as_ref();
+        tap(length, &line_delivery::PhysicalLine { value });
     }
     if let Some(value) = value {
         on_value(&value);

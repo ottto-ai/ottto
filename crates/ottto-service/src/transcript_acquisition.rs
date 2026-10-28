@@ -77,37 +77,28 @@ impl FileStamp {
     }
 }
 
-/// LD: an opened object's identity while its descriptor is held, from one
-/// fstat of that descriptor. RAM only: never a path, persisted field or proof
-/// authority. An inode reused after deletion can alias an old entry.
+/// LD: an opened object's RAM-only identity, never a path, persisted field or
+/// proof authority. A reused inode can alias an old entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct FileObject {
-    pub(crate) dev: u64,
-    pub(crate) ino: u64,
-    /// Creation time in Unix seconds when the file system reports one.
-    pub(crate) birth: Option<u64>,
+    dev: u64,
+    ino: u64,
+    birth: Option<u64>,
 }
 
 impl FileObject {
-    /// `None` off unix, where there is no stable object identity.
-    pub(crate) fn of(metadata: &Metadata) -> Option<Self> {
-        #[cfg(unix)]
-        {
-            Some(Self {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-                birth: metadata
-                    .created()
-                    .ok()
-                    .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|created| created.as_secs()),
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = metadata;
-            None
-        }
+    /// One fstat of the held descriptor; `None` off unix.
+    #[cfg(unix)]
+    pub(crate) fn of(file: &File) -> Option<(Self, Metadata)> {
+        let metadata = file.metadata().ok()?;
+        let created = metadata.created().ok();
+        let birth = created.and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok());
+        let (dev, ino, birth) = (metadata.dev(), metadata.ino(), birth.map(|b| b.as_secs()));
+        Some((Self { dev, ino, birth }, metadata))
+    }
+    #[cfg(not(unix))]
+    pub(crate) fn of(_: &File) -> Option<(Self, Metadata)> {
+        None
     }
 }
 

@@ -146,12 +146,10 @@ page events, not gauges, and are never summed across observers:
   not a line until its newline arrives in a later read.
 - `bytes`: physical bytes of those lines, newline and skipped overlong bytes
   included. These are bytes the read already consumed, never extra reads.
-- `observer_us`: synchronous time inside the observer's calls, including files
-  it skipped.
-- `incomplete`: files whose delivery ended early, by cause: `held` (removed
-  unfinished by a hold or refusal), `read_failure`, or `yielded` (a paged job
-  paused, or the page ended or was dropped mid-file). A file the observer
-  skipped is not counted. A later page can count the same file again.
+- `incomplete`: files whose delivery ended before their read completed: removed
+  unfinished by a hold or refusal, a read failure, a paged job pausing, or the
+  page ending or being dropped mid-file. A file the observer skipped is not
+  counted. A later page can count the same file again.
 
 `counts.line_delivery_unselected` counts discovery skip decisions for the
 page's source: `age` (outside the backfill window and not held for

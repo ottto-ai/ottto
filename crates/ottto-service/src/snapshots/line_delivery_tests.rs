@@ -1,8 +1,6 @@
 //! LD: the physical-line hook at the one reader, the per-pass lifecycle,
 //! excluded reads, K10 counters and E3's selection-identity conditions.
-use super::line_delivery::{
-    DeliveryEnd, DeliveryMode, FileView, Gap, GapCause, LineObserver, PhysicalLine, Want,
-};
+use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want};
 use super::*;
 use crate::local_resource_diagnostics::{capture, CollectionCounts, Probe};
 use crate::transcript_acquisition::FileObject;
@@ -15,13 +13,7 @@ const SESSION: &str = "5e551011-0000-4000-8000-00000000d1d1";
 #[derive(Clone, Debug, PartialEq)]
 enum Event {
     Begin(FileView),
-    Line {
-        start: u64,
-        end: u64,
-        bytes: Vec<u8>,
-        value: Option<Value>,
-        overlong: bool,
-    },
+    Line(Option<Value>),
     End(DeliveryEnd),
 }
 
@@ -41,7 +33,7 @@ impl Recorder {
     fn lines(&self) -> Vec<Event> {
         self.events()
             .into_iter()
-            .filter(|event| matches!(event, Event::Line { .. }))
+            .filter(|event| matches!(event, Event::Line(_)))
             .collect()
     }
     fn ends(&self) -> Vec<DeliveryEnd> {
@@ -55,9 +47,6 @@ impl Recorder {
     }
 }
 impl LineObserver for Recorder {
-    fn name(&self) -> &'static str {
-        "test"
-    }
     fn begin(&mut self, file: &FileView) -> Want {
         self.push(Event::Begin(*file));
         if self.skip {
@@ -67,19 +56,10 @@ impl LineObserver for Recorder {
         }
     }
     fn line(&mut self, _: &FileView, line: &PhysicalLine<'_>) {
-        self.push(Event::Line {
-            start: line.start,
-            end: line.end,
-            bytes: line.bytes.to_vec(),
-            value: line.value.cloned(),
-            overlong: line.overlong,
-        });
+        self.push(Event::Line(line.value.cloned()));
     }
     fn end(&mut self, _: &FileView, end: &DeliveryEnd) {
-        self.push(Event::End(end.clone()));
-    }
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
+        self.push(Event::End(*end));
     }
 }
 
@@ -203,7 +183,7 @@ fn claude_page(
             );
         }
         if let Some(observer) = observer {
-            scan = scan.with_line_observer(Box::new(observer.clone()));
+            scan = scan.with_line_observer("test", Box::new(observer.clone()));
         }
         finish(scan)
     });
@@ -217,29 +197,19 @@ fn page_counts(rows: &[Value]) -> Value {
         .clone()
 }
 
-fn expected_line(start: u64, physical: &[u8], value: Option<Value>) -> Event {
-    let bytes = physical.strip_suffix(b"\n").unwrap();
-    Event::Line {
-        start,
-        end: start + physical.len() as u64,
-        bytes: bytes.to_vec(),
-        value,
-        overlong: false,
-    }
-}
-
 // ---- The reader hook ----
 
 #[derive(Debug, PartialEq)]
 enum Seen {
-    Tap {
-        start: u64,
-        end: u64,
-        bytes: Vec<u8>,
-        value: Option<Value>,
-        overlong: bool,
-    },
+    Tap { length: u64, value: Option<Value> },
     Money(Value),
+}
+
+fn tap(seen: &RefCell<Vec<Seen>>) -> impl FnMut(u64, &PhysicalLine<'_>) + '_ {
+    move |length: u64, line: &PhysicalLine<'_>| {
+        let value = line.value.cloned();
+        seen.borrow_mut().push(Seen::Tap { length, value })
+    }
 }
 
 fn drive(
@@ -250,15 +220,7 @@ fn drive(
         let step = reader
             .step_lines(
                 |value| seen.borrow_mut().push(Seen::Money(value.clone())),
-                Some(&mut |line: &PhysicalLine<'_>| {
-                    seen.borrow_mut().push(Seen::Tap {
-                        start: line.start,
-                        end: line.end,
-                        bytes: line.bytes.to_vec(),
-                        value: line.value.cloned(),
-                        overlong: line.overlong,
-                    })
-                }),
+                Some(&mut tap(seen)),
             )
             .unwrap();
         if let JsonlReaderStep::Complete(report) = step {
@@ -267,8 +229,8 @@ fn drive(
     }
 }
 
-/// D1/D2: every newline-complete physical line reaches the tap, blank,
-/// malformed and invalid-UTF-8 lines with no value, CRLF with its `\r`. The
+/// D1/D2: every newline-complete physical line reaches the tap with its
+/// physical length, blank, malformed and invalid-UTF-8 lines with no value. The
 /// tap borrows the one parse that money then receives; the report and money
 /// stream are those of the untapped reader. An unterminated EOF line goes to
 /// money only.
@@ -302,18 +264,15 @@ fn reader_lends_every_complete_line_its_one_parse_before_money() {
         Some(crlf.clone()),
     ];
     for (line, value) in physical.drain(..).zip(values) {
-        let end = start + line.len() as u64;
+        let length = line.len() as u64;
         expected.push(Seen::Tap {
-            start,
-            end,
-            bytes: line[..line.len() - 1].to_vec(),
+            length,
             value: value.clone(),
-            overlong: false,
         });
         if let Some(value) = value {
             expected.push(Seen::Money(value));
         }
-        start = end;
+        start += length;
     }
     expected.push(Seen::Money(last.clone()));
     assert_eq!(*seen.borrow(), expected);
@@ -334,8 +293,8 @@ fn reader_lends_every_complete_line_its_one_parse_before_money() {
 }
 
 /// D2/D3: an overlong line skipped across paused steps is delivered once,
-/// at its newline, with empty bytes and no value from its true physical
-/// start; money still receives the salvaged Codex envelope.
+/// at its newline, with no value and its whole physical length; money still
+/// receives the salvaged Codex envelope.
 #[test]
 fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
     let short = json!({"timestamp": "2026-10-01T00:00:00Z", "ordinal": 6});
@@ -361,15 +320,7 @@ fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
         let step = reader
             .step_lines(
                 |value| seen.borrow_mut().push(Seen::Money(value.clone())),
-                Some(&mut |line: &PhysicalLine<'_>| {
-                    seen.borrow_mut().push(Seen::Tap {
-                        start: line.start,
-                        end: line.end,
-                        bytes: line.bytes.to_vec(),
-                        value: line.value.cloned(),
-                        overlong: line.overlong,
-                    })
-                }),
+                Some(&mut tap(&seen)),
             )
             .unwrap();
         match step {
@@ -384,19 +335,19 @@ fn overlong_line_is_empty_and_valueless_while_money_keeps_salvage() {
         .iter()
         .filter(|seen| matches!(seen, Seen::Tap { .. }))
         .collect::<Vec<_>>();
-    let a = lines[0].len() as u64;
-    let b = a + lines[1].len() as u64;
     assert_eq!(
         *taps[1],
         Seen::Tap {
-            start: a,
-            end: b,
-            bytes: Vec::new(),
+            length: lines[1].len() as u64,
             value: None,
-            overlong: true,
         }
     );
     assert_eq!(taps.len(), 3);
+    let lengths = taps.iter().map(|seen| match seen {
+        Seen::Tap { length, .. } => *length,
+        Seen::Money(_) => 0,
+    });
+    assert_eq!(lengths.sum::<u64>(), lines.concat().len() as u64);
     let money = seen
         .iter()
         .filter_map(|seen| match seen {
@@ -446,24 +397,21 @@ fn sealed_fragment_is_delivered_only_after_its_newline() {
         next.into_inner(),
         vec![
             Seen::Tap {
-                start: 0,
-                end: tail.len() as u64,
-                bytes: raw(&pending),
+                length: tail.len() as u64,
                 value: Some(pending.clone()),
-                overlong: false,
             },
             Seen::Money(pending),
         ],
-        "reader-relative; the scan adds the Tail's sealed start"
+        "exactly once, newline included"
     );
 }
 
 // ---- The scan lifecycle ----
 
-/// A read without a ReadPlan: `Full(None)` from 0 on the held object, every
-/// physical line including an inherited CRLF row, `Complete` with the
-/// unterminated tail as its fragment, and the K10 page counts. With the
-/// newline written, the next read delivers that line exactly once.
+/// A read without a ReadPlan: `Full` on the held object, every physical line
+/// including an inherited CRLF row, `Complete` without the unterminated tail,
+/// and the K10 page counts. With the newline written, the next read delivers
+/// that line exactly once.
 #[test]
 fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
     let root = Root::new("ld-unplanned");
@@ -493,49 +441,33 @@ fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
     let held = fs::metadata(&path).unwrap();
     let mut expected = vec![Event::Begin(FileView {
         source: SnapshotSource::ClaudeCode,
-        object: FileObject::of(&held).unwrap(),
+        object: FileObject::of(&fs::File::open(&path).unwrap()).unwrap().0,
         mtime: held.modified().ok(),
-        start: 0,
-        mode: DeliveryMode::Full(None),
+        mode: DeliveryMode::Full,
     })];
     let values = [Some(first), None, None, None, Some(inherited)];
-    let mut start = 0;
-    for (line, value) in physical.iter().zip(values) {
-        expected.push(expected_line(start, line, value));
-        start += line.len() as u64;
-    }
-    expected.push(Event::End(DeliveryEnd::Complete {
-        sealed_x: start,
-        fragment: Some((start, raw(&late).len() as u64)),
-    }));
+    expected.extend(values.into_iter().map(Event::Line));
+    expected.push(Event::End(DeliveryEnd::Complete));
     assert_eq!(recorder.events(), expected);
-    let Event::Line { bytes, .. } = &expected[5] else {
-        unreachable!()
-    };
-    assert_eq!(bytes.last(), Some(&b'\r'), "CR kept");
 
+    let sealed = physical.concat().len() as u64;
     let counts = &page_counts(&rows)["line_delivery"]["test"];
     assert_eq!(counts["lines"], 5);
-    assert_eq!(counts["bytes"], start);
+    assert_eq!(counts["bytes"], sealed, "physical bytes, no fragment");
     assert!(counts.get("incomplete").is_none());
 
     append(&path, b"\n");
     let after = Recorder::default();
-    claude_page(&root.projects(), ScanIndex::default(), Some(&after), None);
+    let (_, _, _, rows) = claude_page(&root.projects(), ScanIndex::default(), Some(&after), None);
     let delivered_late = after
         .lines()
         .into_iter()
-        .filter(|line| matches!(line, Event::Line { value: Some(value), .. } if *value == late))
+        .filter(|line| *line == Event::Line(Some(late.clone())))
         .count();
     assert_eq!(delivered_late, 1);
     let total = fs::metadata(&path).unwrap().len();
-    assert_eq!(
-        after.ends(),
-        vec![DeliveryEnd::Complete {
-            sealed_x: total,
-            fragment: None,
-        }]
-    );
+    assert_eq!(after.ends(), vec![DeliveryEnd::Complete]);
+    assert_eq!(page_counts(&rows)["line_delivery"]["test"]["bytes"], total);
 }
 
 /// E3 condition 2: registering an observer changes neither which files a
@@ -609,10 +541,7 @@ fn skip_delivers_no_lines_and_ends_once() {
     let events = recorder.events();
     assert_eq!(events.len(), 2);
     assert!(matches!(events[0], Event::Begin(_)));
-    assert!(matches!(
-        events[1],
-        Event::End(DeliveryEnd::Complete { .. })
-    ));
+    assert!(matches!(events[1], Event::End(DeliveryEnd::Complete)));
     let counts = &page_counts(&rows)["line_delivery"]["test"];
     assert!(counts.get("lines").is_none() && counts.get("bytes").is_none());
 }
@@ -629,7 +558,7 @@ fn comparison_target_read_calls_no_observer() {
     let recorder = Recorder::default();
     let mut scan = step_until(
         new_scan(&root.projects(), ScanIndex::default())
-            .with_line_observer(Box::new(recorder.clone())),
+            .with_line_observer("test", Box::new(recorder.clone())),
         |scan| scan.active_file.is_some(),
     );
     scan.active_file.as_deref_mut().unwrap().comparison_target = true;
@@ -649,7 +578,7 @@ fn side_read_calls_no_observer() {
     let recorder = Recorder::default();
     let mut scan = step_until(
         new_scan(&root.projects(), ScanIndex::default())
-            .with_line_observer(Box::new(recorder.clone())),
+            .with_line_observer("test", Box::new(recorder.clone())),
         |scan| scan.active_file.is_some(),
     );
     let active = scan.active_file.as_deref_mut().unwrap();
@@ -686,7 +615,7 @@ fn codex_group_member_reads_call_no_observer() {
         false,
         false,
     )
-    .with_line_observer(Box::new(recorder.clone()));
+    .with_line_observer("test", Box::new(recorder.clone()));
     let result = loop {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
@@ -699,58 +628,45 @@ fn codex_group_member_reads_call_no_observer() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn three_line_file(root: &Root) -> (PathBuf, Vec<u64>) {
-    let path = root.file(SESSION);
-    let mut ends = Vec::new();
+fn three_line_file(root: &Root) {
     for n in 0..3 {
         append(
-            &path,
+            &root.file(SESSION),
             &[raw(&row("/w/one", &format!("u{n}"))), b"\n".to_vec()].concat(),
         );
-        ends.push(fs::metadata(&path).unwrap().len());
     }
-    (path, ends)
 }
 
 fn two_lines_delivered(recorder: &Recorder) -> impl Fn(&OwnedSourceScan) -> bool + '_ {
     move |_| recorder.lines().len() >= 2
 }
 
-/// D6: an open file removed between steps ends once as `Held` from its last
-/// delivered line, also when the page completes in that same step.
+/// D6: an open file removed between steps ends once `Incomplete`, also when
+/// the page completes in that same step.
 #[test]
-fn file_removed_mid_read_ends_incomplete_held() {
+fn file_removed_mid_read_ends_incomplete() {
     let root = Root::new("ld-held");
-    let (_, ends) = three_line_file(&root);
+    three_line_file(&root);
     let recorder = Recorder::default();
     let mut scan = step_until(
         new_scan(&root.projects(), ScanIndex::default())
-            .with_line_observer(Box::new(recorder.clone())),
+            .with_line_observer("test", Box::new(recorder.clone())),
         two_lines_delivered(&recorder),
     );
     drop(scan.active_file.take());
     finish(scan);
-    assert_eq!(
-        recorder.ends(),
-        vec![DeliveryEnd::Incomplete {
-            gaps: vec![Gap {
-                from: ends[1],
-                to: ends[2],
-                cause: GapCause::Held,
-            }],
-        }]
-    );
+    assert_eq!(recorder.ends(), vec![DeliveryEnd::Incomplete]);
 }
 
-/// D6: a failed read ends once as `ReadFailed`.
+/// D6: a failed read ends once `Incomplete` and is counted.
 #[test]
-fn failed_read_ends_incomplete_read_failed() {
+fn failed_read_ends_incomplete_and_is_counted() {
     let root = Root::new("ld-failed");
-    let (_, ends) = three_line_file(&root);
+    three_line_file(&root);
     let recorder = Recorder::default();
     let mut scan = step_until(
         new_scan(&root.projects(), ScanIndex::default())
-            .with_line_observer(Box::new(recorder.clone())),
+            .with_line_observer("test", Box::new(recorder.clone())),
         two_lines_delivered(&recorder),
     );
     scan.active_file
@@ -760,44 +676,23 @@ fn failed_read_ends_incomplete_read_failed() {
         .reader
         .failure = Some(std::io::ErrorKind::Other);
     let ((_, _, _), rows) = capture(|| finish(scan));
-    assert_eq!(
-        recorder.ends(),
-        vec![DeliveryEnd::Incomplete {
-            gaps: vec![Gap {
-                from: ends[1],
-                to: ends[2],
-                cause: GapCause::ReadFailed,
-            }],
-        }]
-    );
-    assert_eq!(
-        page_counts(&rows)["line_delivery"]["test"]["incomplete"],
-        json!({"read_failure": 1})
-    );
+    assert_eq!(recorder.ends(), vec![DeliveryEnd::Incomplete]);
+    assert_eq!(page_counts(&rows)["line_delivery"]["test"]["incomplete"], 1);
 }
 
-/// D6: a pass dropped mid-file still ends its open file once, as `Yielded`.
+/// D6: a pass dropped mid-file still ends its open file once `Incomplete`.
 #[test]
-fn dropped_pass_ends_open_file_once_as_yielded() {
+fn dropped_pass_ends_open_file_once_incomplete() {
     let root = Root::new("ld-dropped");
-    let (_, ends) = three_line_file(&root);
+    three_line_file(&root);
     let recorder = Recorder::default();
     let scan = step_until(
         new_scan(&root.projects(), ScanIndex::default())
-            .with_line_observer(Box::new(recorder.clone())),
+            .with_line_observer("test", Box::new(recorder.clone())),
         two_lines_delivered(&recorder),
     );
     drop(scan);
-    assert_eq!(
-        recorder.ends(),
-        vec![DeliveryEnd::Incomplete {
-            gaps: vec![Gap {
-                from: ends[1],
-                to: ends[2],
-                cause: GapCause::Yielded,
-            }],
-        }]
-    );
+    assert_eq!(recorder.ends(), vec![DeliveryEnd::Incomplete]);
 }
 
 /// Sampled acquisition (layout-supported builds): a Full starts at 0; after
@@ -818,11 +713,13 @@ fn sampled_full_tail_unchanged_and_reset_deliver_by_mode() {
             &[raw(&row("/w/one", &format!("u{n}"))), b"\n".to_vec()].concat(),
         );
     }
+    let sealed = fs::metadata(&path).unwrap().len();
     append(&path, &raw(&late));
     let cache = Arc::new(sampled_scan::SharedCache::default());
+    let delivered = |rows: &[Value]| page_counts(rows)["line_delivery"]["test"]["bytes"].clone();
 
     let first = Recorder::default();
-    let (index, _, _, _) = claude_page(
+    let (index, _, _, rows) = claude_page(
         &root.projects(),
         ScanIndex::default(),
         Some(&first),
@@ -831,56 +728,47 @@ fn sampled_full_tail_unchanged_and_reset_deliver_by_mode() {
     let Some(Event::Begin(view)) = first.events().first().cloned() else {
         panic!("no begin: {:?}", first.events());
     };
-    assert_eq!(view.start, 0);
-    assert!(matches!(view.mode, DeliveryMode::Full(_)));
-    let ends = first.ends();
-    let [DeliveryEnd::Complete {
-        sealed_x,
-        fragment: Some(_),
-    }] = ends[..]
-    else {
-        panic!("{ends:?}");
-    };
+    assert_eq!(view.mode, DeliveryMode::Full);
+    assert_eq!(first.ends(), vec![DeliveryEnd::Complete]);
+    assert_eq!(delivered(&rows), sealed, "from 0, fragment withheld");
 
     append(&path, b"\n");
     append(
         &path,
         &[raw(&row("/w/two", "u10")), b"\n".to_vec()].concat(),
     );
+    let total = fs::metadata(&path).unwrap().len();
     let grown = Recorder::default();
-    let (index, _, _, _) = claude_page(&root.projects(), index, Some(&grown), Some(&cache));
+    let (index, _, _, rows) = claude_page(&root.projects(), index, Some(&grown), Some(&cache));
     let Some(Event::Begin(view)) = grown.events().first().cloned() else {
         panic!("no begin: {:?}", grown.events());
     };
     match view.mode {
-        DeliveryMode::Tail => assert_eq!(view.start, sealed_x),
-        DeliveryMode::Full(_) => assert_eq!(view.start, 0),
+        DeliveryMode::Tail => assert_eq!(delivered(&rows), total - sealed, "from sealed"),
+        DeliveryMode::Full => assert_eq!(delivered(&rows), total),
         DeliveryMode::Unchanged => panic!("grown file"),
     }
     let late_lines = grown
         .lines()
         .into_iter()
-        .filter(|line| matches!(line, Event::Line { value: Some(value), .. } if *value == late))
-        .collect::<Vec<_>>();
-    assert_eq!(late_lines.len(), 1, "delivered once after its newline");
-    let Event::Line { start, .. } = late_lines[0] else {
-        unreachable!()
-    };
-    assert_eq!(start, sealed_x, "absolute physical offset");
+        .filter(|line| *line == Event::Line(Some(late.clone())))
+        .count();
+    assert_eq!(late_lines, 1, "delivered once after its newline");
 
     let unchanged = Recorder::default();
     let (index, _, _, _) = claude_page(&root.projects(), index, Some(&unchanged), Some(&cache));
     assert_eq!(unchanged.lines(), Vec::new());
 
-    fs::write(&path, [raw(&row("/w/new", "n1")), b"\n".to_vec()].concat()).unwrap();
+    let rewrite = [raw(&row("/w/new", "n1")), b"\n".to_vec()].concat();
+    fs::write(&path, &rewrite).unwrap();
     let rewritten = Recorder::default();
-    claude_page(&root.projects(), index, Some(&rewritten), Some(&cache));
+    let (_, _, _, rows) = claude_page(&root.projects(), index, Some(&rewritten), Some(&cache));
     let Some(Event::Begin(view)) = rewritten.events().first().cloned() else {
         panic!("no begin: {:?}", rewritten.events());
     };
-    assert_eq!(view.start, 0);
-    assert!(matches!(view.mode, DeliveryMode::Full(_)));
+    assert_eq!(view.mode, DeliveryMode::Full);
     assert_eq!(rewritten.lines().len(), 1);
+    assert_eq!(delivered(&rows), rewrite.len() as u64, "from 0");
 }
 
 // ---- E3 condition 1: unselected counters after unchanged gate decisions ----
