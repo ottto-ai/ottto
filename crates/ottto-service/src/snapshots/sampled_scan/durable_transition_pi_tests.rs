@@ -522,7 +522,7 @@ fn pi_corrupt_or_missing_section_rebuilds_once_then_replaces_the_record() {
 }
 
 // P-U: a Pi record this reader cannot interpret is held byte-identical
-// through repeated passes, GC and a restart: no Full, no POST.
+// through five passes with GC, then a restart: no Full, no POST.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -542,7 +542,7 @@ fn pi_unknown_record_holds_without_full_or_post_and_survives_gc() {
     let cold = f.emit_bodies(Mode::ColdFull);
     let before = stored_bodies(&f.prior);
     let (path, _, unknown) = unknown_record(&f.disk);
-    for _ in 0..3 {
+    for _ in 0..5 {
         let held = f.emit_bodies(Mode::DiskRestore);
         assert_eq!((held.modes, held.restored), ((0, 0, 0), 0));
         money_oracle::assert_held(&f.entity, &cold, &held, &cold);
