@@ -575,6 +575,14 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     }
     std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
     std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin);
+    let ambient_keys = [
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+        "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+    ];
+    for key in ambient_keys {
+        std::env::set_var(key, "synthetic-override");
+    }
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let claims = serde_json::json!({"iss":"https://auth.openai.com","aud":"synthetic","exp":now+3600,
         "https://api.openai.com/auth":{"chatgpt_user_id":"user-one","chatgpt_account_id":"workspace-one"}});
@@ -605,7 +613,7 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     let quoted = quote_launch_executable(witness.to_str().unwrap()).unwrap();
     let cli = bin.join("codex");
     let write_cli = |version: &str| {
-        fs::write(&cli, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted}\n[ \"$1\" = --version ] || exit 99\nprintf 'codex-cli {version}\\n'\n")).unwrap();
+        fs::write(&cli, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted}\n[ \"$1\" = --version ] || exit 99\ntest -z \"${{CODEX_ACCESS_TOKEN+x}}${{CODEX_REFRESH_TOKEN_URL_OVERRIDE+x}}${{CODEX_APP_SERVER_LOGIN_CLIENT_ID+x}}\" || exit 97\nprintf 'codex-cli {version}\\n'\n")).unwrap();
         fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
     };
     write_cli("0.170.0");
@@ -643,10 +651,12 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
         .last()
         .unwrap()
         .to_owned();
-    assert_eq!(
-        registry.consume(&result.launch_id.unwrap(), &secret).state,
-        Some(State::Starting)
-    );
+    let consumed = registry.consume(&result.launch_id.unwrap(), &secret);
+    assert_eq!(consumed.state, Some(State::Starting));
+    let unset = consumed.plan.unwrap().env_unset.unwrap();
+    for key in ambient_keys {
+        assert!(unset.iter().any(|name| name == key));
+    }
     assert_eq!(fs::read_to_string(&witness).unwrap(), "--version\n");
     write_cli("1.0.0");
     assert_eq!(
@@ -686,6 +696,9 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     );
     std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
     std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH");
+    for key in ambient_keys {
+        std::env::remove_var(key);
+    }
 }
 
 #[test]

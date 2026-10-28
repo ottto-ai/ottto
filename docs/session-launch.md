@@ -82,8 +82,9 @@ sets both `CODEX_HOME` and `CODEX_SQLITE_HOME` to its absolute selected home.
 The Claude scrub list includes account/config selectors, API/auth/OAuth tokens,
 gateway URL/header overrides, Bedrock/Vertex/Foundry/Anthropic-AWS route selectors
 and credentials, and inherited Claude session entrypoint variables. The Codex
-list includes home selectors, API keys, OpenAI/Azure endpoint and organization
-overrides, and inherited profile selection. The source constants are the
+list includes home selectors, API keys, ambient access tokens, OAuth refresh URL
+and client overrides, OpenAI/Azure endpoint and organization overrides, and
+inherited profile selection. The source constants are the
 authoritative complete lists; the CLI applies the returned lists unchanged.
 
 The evaluators support Claude Code **2.x** and Codex **0.x**. Claude checks the
