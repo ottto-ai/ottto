@@ -46,21 +46,16 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-/// Decoder heap credit: the compressed input buffer plus twice zstd's own
-/// streaming bound for this window, covering old and new buffers that may
-/// coexist while a frame resizes them.
+// Bundled zstd 1.5.7, WindowLogMax(23), 514 MiB synthetic concatenated
+// archive: CI run 40774588149 measured 8,894,448 bytes peak (native heap +
+// buffers + box, including resize overlap). Add 10%, round up to 64 KiB.
+// Paid inside STATE_BYTES; the fixed primary Tail floor remains unchanged.
+const COMPRESSED_INPUT_CREDIT: usize = 9_830_400;
+
+/// Decoder portion of the measured whole-input credit, including input buffer.
 fn decoder_reservation() -> io::Result<usize> {
-    // SAFETY: pure size query, no pointers or external state. Bound is for the
-    // same bundled zstd version and window limit used by this decoder.
-    let estimate =
-        unsafe { zstd::zstd_safe::zstd_sys::ZSTD_estimateDStreamSize(1usize << WINDOW_LOG) };
-    // SAFETY: zstd error classification is a pure integer query.
-    if unsafe { zstd::zstd_safe::zstd_sys::ZSTD_isError(estimate) } != 0 {
-        return Err(invalid("cannot bound compressed rollout decoder"));
-    }
-    estimate
-        .checked_mul(2)
-        .and_then(|n| n.checked_add(BUFFER_BYTES))
+    COMPRESSED_INPUT_CREDIT
+        .checked_sub(BUFFER_BYTES + size_of::<BufReader<BoundedDecoder<File>>>())
         .ok_or_else(|| invalid("compressed rollout reservation overflow"))
 }
 
@@ -433,7 +428,10 @@ pub(in crate::snapshots) mod tests {
             peak >= 8 * 1024 * 1024,
             "native zstd allocations must be counted"
         );
-        assert!(peak <= credit, "measured peak must fit prepaid credit");
+        assert!(
+            peak + peak.div_ceil(10) <= credit,
+            "measured peak plus 10% must fit prepaid credit"
+        );
         assert_eq!(
             allocation.requested_live, 0,
             "all decoder allocations released"
