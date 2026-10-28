@@ -13,10 +13,8 @@ fn item(i: usize, literal: bool) -> SnapshotItem {
     item.cache_observations_state = None;
     item.usage_accounting_contract =
         literal.then(|| crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT.into());
-    // The Claude fingerprint does not separate these synthetic sessions; the Codex one
-    // keeps each synthetic entity distinct, as in the h357 fixtures.
     item.snapshot_fingerprint =
-        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &item);
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
     item
 }
 
@@ -74,6 +72,15 @@ fn ack(items: &[SnapshotItem], rejected: &[(usize, &str, bool)]) -> SnapshotBatc
             })
             .collect(),
     }
+}
+
+/// The batch position of `fingerprint`: the uploader packs by fingerprint,
+/// not by input order.
+fn at(batch: &[SnapshotItem], fingerprint: &str) -> usize {
+    batch
+        .iter()
+        .position(|item| item.snapshot_fingerprint == fingerprint)
+        .unwrap()
 }
 
 fn progress() -> SnapshotUploadProgress {
@@ -237,7 +244,7 @@ fn held_literal_body_is_retryable_reoffered_and_never_poison() {
     let mut ledger = progress();
     let mut accepted = 0;
     let outcome = upload(&items, scope, &mut ledger, &mut accepted, |batch| {
-        ack(batch, &[(0, HELD, false)])
+        ack(batch, &[(at(batch, &held), HELD, false)])
     })
     .unwrap();
     assert_eq!(outcome, ResumableUploadResult::Deferred { count: 1 });
@@ -278,7 +285,7 @@ fn held_literal_body_is_retryable_reoffered_and_never_poison() {
     let mut sent = Vec::new();
     upload(&newer, scope, &mut ledger, &mut accepted, |batch| {
         sent.extend(batch.iter().map(snapshot_upload_body_witness));
-        ack(batch, &[(0, HELD, false)])
+        ack(batch, &[(at(batch, &held), HELD, false)])
     })
     .unwrap();
     assert_eq!(sent, vec![snapshot_upload_body_witness(&newer[0])]);
@@ -287,7 +294,7 @@ fn held_literal_body_is_retryable_reoffered_and_never_poison() {
     let mut ledger = progress();
     let mut accepted = 0;
     upload(&items, scope, &mut ledger, &mut accepted, |batch| {
-        ack(batch, &[(0, HELD, false)])
+        ack(batch, &[(at(batch, &held), HELD, false)])
     })
     .unwrap();
     ledger
@@ -322,7 +329,7 @@ fn refused_after_review_permanent_takes_the_permanent_path() {
     let mut ledger = progress();
     let mut accepted = 0;
     let outcome = upload(&items, scope, &mut ledger, &mut accepted, |batch| {
-        ack(batch, &[(0, REFUSED, true)])
+        ack(batch, &[(at(batch, &refused), REFUSED, true)])
     })
     .unwrap();
     assert_eq!(outcome, ResumableUploadResult::Rejected { count: 1 });
