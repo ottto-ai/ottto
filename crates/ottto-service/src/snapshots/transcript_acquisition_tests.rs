@@ -3618,7 +3618,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
             source,
             &index_path,
             &namespace,
-            claude_request_identity::capture_by_default(),
+            source == SnapshotSource::ClaudeCode,
         );
         let (mut index, _, modes) = production_scan(
             &fixture,
@@ -3652,7 +3652,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
             source,
             &index_path,
             &namespace,
-            claude_request_identity::capture_by_default(),
+            source == SnapshotSource::ClaudeCode,
         );
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (mut warm, scan, modes) = production_scan(
@@ -3704,7 +3704,7 @@ fn pinned_v1_bootstrap_ordinary_save_then_second_restart_tails_without_a_full() 
             source,
             &index_path,
             &namespace,
-            claude_request_identity::capture_by_default(),
+            source == SnapshotSource::ClaudeCode,
         );
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (_, scan, modes) =
@@ -3809,7 +3809,7 @@ fn no_record_keys_keep_existing_full_admission_after_restart() {
             source,
             &index_path,
             &namespace,
-            claude_request_identity::capture_by_default(),
+            source == SnapshotSource::ClaudeCode,
         );
         let loaded = ScanIndex::load(&index_path).unwrap();
         let (_, scan, modes) = production_scan(
