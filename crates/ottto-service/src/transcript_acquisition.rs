@@ -108,6 +108,19 @@ pub(crate) struct FileObject {
 }
 
 impl FileObject {
+    /// Reuse the primary open's stat, with the same birth granularity as LD.
+    pub(crate) fn from_opened_identity(
+        identity: Option<[u64; 2]>,
+        birth_nanos: u64,
+    ) -> Option<Self> {
+        let [dev, ino] = identity?;
+        Some(Self {
+            dev,
+            ino,
+            birth: (birth_nanos != 0).then_some(birth_nanos / 1_000_000_000),
+        })
+    }
+
     /// One fstat of the held descriptor; `None` off unix.
     #[cfg(unix)]
     pub(crate) fn of(file: &File) -> Option<(Self, Metadata)> {
