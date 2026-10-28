@@ -16885,49 +16885,6 @@ impl CodexTurnTraceMap {
     }
 }
 
-/// Local opt-out for the experimental Codex fast-mode trace read. Defaults on;
-/// set `OTTTO_CODEX_FAST_MODE_TRACE=off` (also accepts `0`/`false`/`no`/
-/// `disabled`) to skip new `logs_2.sqlite` reads. Protected old decisions remain
-/// subject to exact file-owned receipt replay. The master local-usage switch
-/// (`local_usage_reconciliation_enabled`) already gates all collection; this is
-/// a finer opt-out specific to reading the undocumented debug DB.
-fn codex_fast_mode_trace_enabled() -> bool {
-    codex_fast_mode_trace_enabled_from(std::env::var("OTTTO_CODEX_FAST_MODE_TRACE").ok().as_deref())
-}
-
-fn codex_fast_mode_trace_enabled_from(value: Option<&str>) -> bool {
-    match value {
-        Some(raw) => !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "off" | "0" | "false" | "no" | "disabled"
-        ),
-        None => true,
-    }
-}
-
-/// Finer opt-out (mirrors `codex_fast_mode_trace_enabled`) for the per-session
-/// Claude Code `workflows/` directory stat that detects dynamic workflow
-/// orchestration. `OTTTO_CLAUDE_WORKFLOW_DETECT=off` (or 0/false/no/disabled)
-/// skips the filesystem probe entirely, after which every Claude session
-/// reports no workflow-orchestration signal.
-fn claude_workflow_detect_enabled() -> bool {
-    claude_workflow_detect_enabled_from(
-        std::env::var("OTTTO_CLAUDE_WORKFLOW_DETECT")
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn claude_workflow_detect_enabled_from(value: Option<&str>) -> bool {
-    match value {
-        Some(raw) => !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "off" | "0" | "false" | "no" | "disabled"
-        ),
-        None => true,
-    }
-}
-
 /// Local opt-IN for capturing Claude Code per-turn work-attribution
 /// (`attributionAgent`/`Skill`/`Plugin`/`McpServer`/`McpTool`) off each
 /// assistant+usage line into the per-turn `SelectorCapture`. Subagent
@@ -20114,7 +20071,7 @@ impl SnapshotAccumulator {
         // of the `<sessionId>.jsonl` we just parsed. Stat it so the backend can
         // surface a per-session "workflow orchestration ran" signal. Best-effort
         // only: absence/errors -> false, never load-bearing for collection.
-        if self.source == SnapshotSource::ClaudeCode && claude_workflow_detect_enabled() {
+        if self.source == SnapshotSource::ClaudeCode {
             let workflows_dir = path.with_extension("").join("workflows");
             self.origin.used_workflow_orchestration =
                 Some(claude_workflows_dir_has_manifest(&workflows_dir));
@@ -25932,15 +25889,13 @@ impl OwnedSourceScan {
             index.traversal = None;
         }
         // Read the per-turn fast-mode signal once per cycle (logs_2 is large); share
-        // it read-only across every session file via Arc. Skipped when the local
-        // opt-out is set.
-        let codex_turn_traces =
-            (source == SnapshotSource::Codex && codex_fast_mode_trace_enabled()).then(|| {
-                Arc::new(CodexTurnTraceMap::load_from_roots(
-                    roots,
-                    backfill_window_days,
-                ))
-            });
+        // it read-only across every session file via Arc.
+        let codex_turn_traces = (source == SnapshotSource::Codex).then(|| {
+            Arc::new(CodexTurnTraceMap::load_from_roots(
+                roots,
+                backfill_window_days,
+            ))
+        });
         if source == SnapshotSource::ClaudeCode {
             index.observe_claude_request_identity_contract(claude_request_identity_capture);
         }
@@ -60691,20 +60646,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_fast_mode_trace_opt_out_defaults_on() {
-        assert!(codex_fast_mode_trace_enabled_from(None));
-        assert!(codex_fast_mode_trace_enabled_from(Some("on")));
-        assert!(codex_fast_mode_trace_enabled_from(Some("1")));
-        assert!(codex_fast_mode_trace_enabled_from(Some("")));
-        for off in ["off", "0", "false", "no", "disabled", "OFF", " Off "] {
-            assert!(
-                !codex_fast_mode_trace_enabled_from(Some(off)),
-                "expected {off:?} to disable the trace"
-            );
-        }
-    }
-
-    #[test]
     fn claude_attribution_capture_opt_in_defaults_off() {
         // Default OFF: absent env, and any unrecognized/explicit-off value.
         assert!(!claude_attribution_capture_enabled_from(None));
@@ -68883,15 +68824,6 @@ mod tests {
         assert_eq!(origin.used_workflow_orchestration, Some(true));
 
         let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn claude_workflow_detect_env_opt_out_parses() {
-        assert!(claude_workflow_detect_enabled_from(None));
-        assert!(claude_workflow_detect_enabled_from(Some("on")));
-        assert!(!claude_workflow_detect_enabled_from(Some("off")));
-        assert!(!claude_workflow_detect_enabled_from(Some("0")));
-        assert!(!claude_workflow_detect_enabled_from(Some(" Disabled ")));
     }
 
     #[test]

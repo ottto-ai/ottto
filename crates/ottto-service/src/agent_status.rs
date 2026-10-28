@@ -89,8 +89,7 @@ const CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 /// (identify honestly, poll sparsely, circuit-break instead of adapting). The
 /// activity-based slot in `claude_credit_pools` shortens this to 5 min while
 /// the binding is in use on this Mac, and a fresh local statusLine reading
-/// stands in for those reads; `CLAUDE_ACTIVITY_CADENCE_ENABLED` turns the
-/// in-use slot off.
+/// stands in for those reads.
 const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 40 * 60;
 /// Half-width of the deterministic spread applied to the base cadence, giving
 /// an effective gate in the 38-42 minute range.
@@ -153,13 +152,6 @@ const CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX: usize = 64;
 const CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX: usize = 20;
 /// The backend accepts at most this many status snapshots in one upload.
 const AGENT_STATUS_UPLOAD_SNAPSHOT_MAX: usize = 10;
-/// Whether the account-less Desktop pair status uploads. The backend keeps a
-/// login's metered current row when this status arrives: an account-less,
-/// meterless status no longer takes the profile of its newest linked
-/// observation, so the current-row cleanup cannot delete this Mac's metered
-/// row for that profile. Pair connect targets are local and do not depend on
-/// this.
-const CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED: bool = true;
 // Reuse the daemon's existing detected-use/session retention contract. This
 // warning is a view of the same local activity evidence, not a new lifetime.
 const CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS: i64 =
@@ -8209,8 +8201,6 @@ fn blocked_claude_upkeep_status(
 /// No new wire values: the quiet default is collection `refresh_due` with
 /// upkeep `upkeep_disabled` (quota access `paused`), never
 /// `stale_access_token`, which tells the app the provider ended the session.
-/// `PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN` (open decision Q-A) switches to
-/// `credential_unavailable`, which the app presents as "Sign in again".
 fn paused_claude_refresh_status(
     slot_id: &str,
     observed_at: &str,
@@ -8242,22 +8232,10 @@ fn paused_claude_refresh_status(
             "Claude Code has not refreshed this sign-in since it expired at {expired_at}. \"Keep my Claude accounts signed in\" is off, so Ottto does not refresh it. The last reading is shown with its age. Sign in again, or turn the setting on, to resume now."
         )
     };
-    let (state, code) = if refreshing {
-        (
-            ClaudeConfigSlotCollectionStateV1::RefreshDue,
-            ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
-        )
-    } else if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
-        (
-            ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
-            ClaudeConfigSlotDiagnosticCodeV1::CredentialUnavailable,
-        )
-    } else {
-        (
-            ClaudeConfigSlotCollectionStateV1::RefreshDue,
-            ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
-        )
-    };
+    let (state, code) = (
+        ClaudeConfigSlotCollectionStateV1::RefreshDue,
+        ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
+    );
     status.state = state;
     status.quota_snapshot = status
         .quota_snapshot
@@ -10392,15 +10370,18 @@ fn claude_desktop_pairs_snapshot(
 /// Append this pass's Desktop pair status to the Claude uploads, after every
 /// login and degraded snapshot so coverage is computed from what actually
 /// uploads. The uploads already present are never changed.
+///
+/// The backend keeps a login's metered current row when this status arrives:
+/// an account-less, meterless status no longer takes the profile of its newest
+/// linked observation, so the current-row cleanup cannot delete this Mac's
+/// metered row for that profile. Pair connect targets are local and do not
+/// depend on this.
 fn append_claude_desktop_pairs_snapshot(
     snapshots: &mut Vec<AgentStatusSnapshot>,
     desktop: &ClaudeDesktopPairs,
     captured_at: &str,
     expires_at: &str,
 ) {
-    if !CLAUDE_DESKTOP_PAIRS_UPLOAD_ENABLED {
-        return;
-    }
     let Some(snapshot) = claude_desktop_pairs_snapshot(desktop, snapshots, captured_at, expires_at)
     else {
         return;
@@ -11213,9 +11194,7 @@ fn collect_claude_oauth_usage_unstamped(
     // displaces a saved-reset slot.
     let usage_read =
         claude_credit_pools::claude_usage_read_kind(&read_schedule, &previous_credit_balances, now);
-    let passive_config = if claude_credit_pools::CLAUDE_PASSIVE_READING_ENABLED
-        && usage_read == claude_credit_pools::ClaudeUsageRead::Plain
-    {
+    let passive_config = if usage_read == claude_credit_pools::ClaudeUsageRead::Plain {
         claude_oauth_passive_config(
             caller,
             account_identifier_hash,
@@ -12276,7 +12255,6 @@ fn claude_oauth_usage_slot_seconds(
         latest_activity_at,
         feed_fresh_at,
         claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash),
-        claude_credit_pools::CLAUDE_ACTIVITY_CADENCE_ENABLED,
         now,
     )
 }
@@ -39048,12 +39026,7 @@ exit 44
             for index in 0..3 {
                 let collection = fixture.slot_collection(index);
                 if expired {
-                    let expected_state =
-                        if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
-                            ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
-                        } else {
-                            ClaudeConfigSlotCollectionStateV1::RefreshDue
-                        };
+                    let expected_state = ClaudeConfigSlotCollectionStateV1::RefreshDue;
                     assert_eq!(collection.state, expected_state, "{label}");
                     assert_ne!(
                         collection.state,
@@ -39614,17 +39587,6 @@ exit 44
         fixture.set_all_expiries(-TimeDuration::hours(1));
         fixture.collect();
         let paused = fixture.slot_collection(0);
-        if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
-            assert_eq!(
-                paused.state,
-                ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
-            );
-            assert_eq!(
-                projected_claude_quota_access_state(&paused),
-                Some(ClaudeQuotaAccessState::AttentionRequired)
-            );
-            return;
-        }
         assert_eq!(paused.state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
         assert_eq!(
             paused.upkeep.as_ref().map(|upkeep| upkeep.result),
