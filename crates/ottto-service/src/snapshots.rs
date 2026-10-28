@@ -30705,6 +30705,9 @@ impl OwnedSourceScan {
                         codex_cursor: context.cache.cursor_diagnostics(&codex_page),
                     }
                 });
+                if source == SnapshotSource::ClaudeCode {
+                    index.note_claude_permit_gauge();
+                }
                 if sampled_acquisition.is_some() {
                     crate::local_resource_diagnostics::cache_lifecycle_totals();
                     crate::local_resource_diagnostics::codex_memo_lifecycle_totals(
@@ -43924,6 +43927,16 @@ impl ScanIndex {
         })
     }
 
+    /// E3 gauge (#799 page carrier, SOURCE C2): Claude files carrying
+    /// `STAMPED_WITHOUT_PERMIT`, read from the store at every collection page
+    /// end and at finalization.
+    fn note_claude_permit_gauge(&self) {
+        crate::local_resource_diagnostics::claude_reread::stamped_without_permit(
+            self.claude_money_birth_store
+                .money_mark_count(claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT),
+        );
+    }
+
     /// E3 counts only (#799 page carrier): the permit-bit gauge, and each
     /// upgrade the gate permitted this page that finalized below the active
     /// revision, by its hold.
@@ -43932,10 +43945,7 @@ impl ScanIndex {
         if !claude_reread::active() {
             return;
         }
-        claude_reread::stamped_without_permit(
-            self.claude_money_birth_store
-                .money_mark_count(claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT),
-        );
+        self.note_claude_permit_gauge();
         let active = self.active_effective_upload_body_witness_revision;
         for gated in self.claude_history_emission.files.values() {
             if !gated.permitted

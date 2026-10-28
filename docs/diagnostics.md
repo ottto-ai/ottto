@@ -383,12 +383,17 @@ preparation/save events after work, without creating a comparison permit.
 - `authority_normalization_cleared`: nonempty-to-empty transitions while dropping
   unbound authority records on working load/save. Discarded CAS probes are
   excluded, matching the existing authority-drop totals.
-- `stamped_without_permit`: the one **gauge** in this object, set at Claude
+- `stamped_without_permit`: the one **gauge** in this object, read from the
+  local mark count at every Claude collection page end
+  (`native_collection_page`, whether or not finalization follows) and at Claude
   finalization: indexed Claude files whose revision-3 body was stamped in a
   cycle without the identity permit (local money mark `STAMPED_WITHOUT_PERMIT`,
   seeded once by money-rule version 2 unless the loaded contract record was the
-  adopted E2 one). Merging two observations keeps the larger value.
-  A late identity permit re-reads none of these files; this gauge discloses them.
+  adopted E2 one). The key is sparse like the others: absent = 0 on a Claude
+  page. Merging two observations keeps the larger value. A late identity
+  permit re-reads none of these files, and an identity-contract latch clear
+  keeps their marks; only a permitted restamp clears one. User effect:
+  sessions read while the identity permission was off may show no subscription until re-read.
 - `history_permitted_not_stamped_not_accepted`, `_telemetry_unread`, `_held`,
   `_other`: upgrades the history gate permitted on this page that did not stamp
   the active revision. `not_accepted` stamped but a partial save kept the

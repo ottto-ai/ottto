@@ -3254,6 +3254,121 @@ fn e2_late_identity_permit_reowes_nothing_and_discloses_unpermitted_stamps() {
     });
 }
 
+/// SOURCE C1 (#825 interim (b)): a real e2 identity-contract latch clear
+/// (`""` → `E2_GROUPING`, cleared at a census terminal) keeps every
+/// `STAMPED_WITHOUT_PERMIT` bit and the gauge. Only a permitted restamp
+/// clears a bit afterwards (under option (a), only its own re-owe would).
+#[test]
+fn e2_latch_clear_keeps_permit_marks_and_the_gauge() {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
+    use crate::snapshots::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
+    let fixture = HistoryFixture::new("e2-latch-clear-marks");
+    fixture.baseline();
+    fixture.install_list(&[]);
+    let marks = |index: &ScanIndex| {
+        HISTORY_SESSIONS
+            .iter()
+            .map(|session| {
+                let key = HistoryFixture::key(index, session);
+                index
+                    .claude_money_birth_store
+                    .money_marks(location_key(&key))
+            })
+            .collect::<Vec<_>>()
+    };
+    with_e2_history(&fixture, || {
+        let before = fixture.cycle("2026-08-02T08:30:00Z", E2_HISTORY_UPGRADE);
+        let stamped = marks(&before.index);
+        assert!(stamped.iter().all(|m| m & STAMPED_WITHOUT_PERMIT != 0));
+        assert_eq!(
+            before.index.claude_request_identity_contract_for_test().0,
+            Some("")
+        );
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+        saved["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
+        saved["claude_duplicate_fence_next_full_rearm_unix_seconds"] =
+            serde_json::json!(1785711600u64);
+        std::fs::write(&fixture.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let on = HistoryCycle {
+            request_identity: true,
+            ..E2_HISTORY_UPGRADE
+        };
+        with_cycle_contract_for_test(E2_GROUPING, || {
+            crate::snapshots::with_body_witness_adoption_page_budget(1, || {
+                let mut latch = Vec::new();
+                for hour in 9..15 {
+                    let scope =
+                        crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                    let page = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), on);
+                    let gauge = scope.finish().claude_reread.stamped_without_permit;
+                    latch.push(page.index.claude_request_identity_contract_for_test());
+                    assert_eq!(marks(&page.index), stamped, "hour={hour}: bits kept");
+                    assert_eq!(gauge, HISTORY_SESSIONS.len() as u64, "hour={hour}");
+                }
+                // Observed "" → E2 sets the latch at hour 9's prepare; only
+                // the census terminal clears it.
+                assert_eq!(latch.last(), Some(&(Some(E2_GROUPING), false)));
+                let first = HISTORY_SESSIONS[0];
+                fixture.append(first, "req_0_2");
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                let restamped = fixture.cycle("2026-08-02T15:00:00Z", on);
+                assert_eq!(
+                    scope.finish().claude_reread.stamped_without_permit,
+                    HISTORY_SESSIONS.len() as u64 - 1
+                );
+                let after = marks(&restamped.index);
+                assert_eq!(after[0] & STAMPED_WITHOUT_PERMIT, 0, "a permitted restamp");
+                assert_eq!(after[1..], stamped[1..]);
+            })
+        });
+    });
+}
+
+/// SOURCE C2: the gauge rides every Claude collection page from the store's
+/// mark count, also a page no finalization follows; with no marks its sparse
+/// key is absent (absent = 0).
+#[test]
+fn e2_permit_gauge_rides_a_collection_page_without_finalization() {
+    use crate::snapshots::claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
+    let fixture = HistoryFixture::new("e2-permit-gauge-page");
+    fixture.baseline();
+    with_e2_history(&fixture, || {
+        let mut index = fixture
+            .cycle("2026-08-02T08:30:00Z", E2_HISTORY_UPGRADE)
+            .index;
+        // The scan alone: no finalization runs after this page.
+        let page = |index: &mut ScanIndex| {
+            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                crate::snapshots::scan_source_roots_with_artifacts(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&fixture.root),
+                    index,
+                    "2026-08-02T09:00:00Z",
+                    crate::snapshots::BACKFILL_WINDOW_DAYS,
+                    true,
+                )
+                .unwrap()
+            });
+            rows.iter()
+                .filter(|row| {
+                    row["stage"] == "native_collection_page" && row["source"] == "claude_code"
+                })
+                .map(|row| row["counts"]["claude_reread"]["stamped_without_permit"].as_u64())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(page(&mut index), [Some(HISTORY_SESSIONS.len() as u64)]);
+        for session in HISTORY_SESSIONS {
+            let key = HistoryFixture::key(&index, session);
+            index
+                .claude_money_birth_store
+                .set_money_mark(&key, STAMPED_WITHOUT_PERMIT, false);
+        }
+        assert_eq!(page(&mut index), [None]);
+    });
+}
+
 /// E3: off/on/off/on. Each permitted restamp clears its file's bit and each
 /// unpermitted one sets it, in the same save as its stamp; no flip re-owes
 /// or re-sends anything, also with the duplicate prepare/start observation.
