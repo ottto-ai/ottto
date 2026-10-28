@@ -4142,18 +4142,31 @@ fn pi_recordless_restart_and_eviction_full_only_on_change() {
         assert!(reads.is_empty(), "restart and eviction cannot read idle Pi");
         assert_eq!((modes, bytes), ((0, 0, 0), (0, 0)));
         fixture.file.append(&usage(source, 200, 1, "fixture-model"));
-        let ((index, _, modes, _), counts) = observe(|| {
-            production_scan_at(
-                &fixture,
-                source,
-                quiet,
-                Some(cache.clone()),
-                "pi-recordless",
-                NOW,
-            )
+        let (((index, _, modes, _), diagnostics), counts) = observe(|| {
+            crate::local_resource_diagnostics::capture(|| {
+                production_scan_at(
+                    &fixture,
+                    source,
+                    quiet,
+                    Some(cache.clone()),
+                    "pi-recordless",
+                    NOW,
+                )
+            })
         });
         assert_eq!(modes, (1, 0, 0));
         assert_eq!(counts.pi, 1, "one counted transitional pi Full");
+        let pages = diagnostics
+            .iter()
+            .filter(|record| record["stage"] == "native_collection_page")
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0]["source"], "pi");
+        assert_eq!(
+            pages[0]["counts"]["sampled_acquisition"]["page_events"]["full_reasons"],
+            json!({"state_missing": 1}),
+            "a recordless Pi read keeps the shared planner reason"
+        );
         let ((_, _, modes, _), counts) = observe(|| {
             production_scan_at(
                 &fixture,
