@@ -31715,6 +31715,9 @@ impl OwnedSourceScan {
                             && codex_session_id_candidates_from_path(&candidate.path)
                                 .iter()
                                 .any(|id| index.codex_parent_ownership_refs.contains(id));
+                        // A comparison target reuses its reduction under the
+                        // same certificate, binding and stamp rules (O1: its
+                        // read is restore-only; the refusal below).
                         let allow_sample = context.audit_metadata_supported
                         // A same-process E2-held native read may reuse its own
                         // certificate. It grants no persisted/index authority;
@@ -31722,7 +31725,6 @@ impl OwnedSourceScan {
                         && (index.files.contains_key(&key) || e2_held_new_file)
                         && !protected
                         && !forced_family
-                        && !comparison_target
                         && !parent_proof_required
                         && (debt.is_some() || context.audit_slots > 0);
                         context
@@ -31968,6 +31970,29 @@ impl OwnedSourceScan {
                         });
                     }
                 }
+            }
+            // O1: a comparison target is never a Full cause. Only a validated
+            // reuse of its retained or durably restored reduction serves it
+            // (Unchanged, or a Tail that completes the reduction to the
+            // current revision); any other plan is refused before the parser
+            // reads past the guards, and the controller's fallback keeps the
+            // dependent debt.
+            if comparison_target
+                && !file_sampling.as_ref().is_some_and(|active| {
+                    matches!(
+                        active.mode,
+                        crate::transcript_acquisition::ReadMode::Tail
+                            | crate::transcript_acquisition::ReadMode::Unchanged
+                    )
+                })
+            {
+                if let Some(context) = sampling.as_mut() {
+                    context.admission.full_refused_native_comparison_target = context
+                        .admission
+                        .full_refused_native_comparison_target
+                        .saturating_add(1);
+                }
+                pending!();
             }
             let mut active = Box::new(OwnedActiveFile {
                 comparison_target,
