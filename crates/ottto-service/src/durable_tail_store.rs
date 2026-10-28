@@ -774,7 +774,7 @@ impl DurableTailStore {
             .sum::<usize>();
         for mut record in pending {
             // A T14 predecessor is the rebuild's to replace.
-            let corrupt = match self.classify(&record.binding.key, "overwrite") {
+            let keep_prior = match self.classify(&record.binding.key, "overwrite") {
                 Err(Refusal::Corrupt) => true,
                 Err(reason) => {
                     self.counters.store_write_skipped[if matches!(
@@ -807,7 +807,7 @@ impl DurableTailStore {
                             record.metadata.protocol = old.record.metadata.protocol;
                         }
                     }
-                    false
+                    old.format == 1
                 }
                 Ok(None) => false,
             };
@@ -819,7 +819,7 @@ impl DurableTailStore {
             {
                 receipt.clean += 1;
             } else {
-                dirty.push((record, content, corrupt));
+                dirty.push((record, content, keep_prior));
             }
         }
         if !self.usable() {
@@ -832,7 +832,7 @@ impl DurableTailStore {
         ensure_private_dir(&self.dir)?;
         let (mut on_disk, mut unlisted) = self.scan_disk()?;
         let mut changed = false;
-        for (record, content, corrupt) in dirty {
+        for (record, content, keep_prior) in dirty {
             if receipt.written + receipt.budget_refused >= MAX_BATCH {
                 receipt.deferred += 1;
                 receipt.deferred_keys.push(record.binding.key);
@@ -879,8 +879,8 @@ impl DurableTailStore {
             {
                 // A stale record for this key would bind to an older entry
                 // only; drop it so the refusal costs no disk. A T14 record
-                // stays until a rebuild replaces it.
-                if previous != 0 && !corrupt && stored.record.metadata.mark == 0 {
+                // and a bootstrappable v1 record stay until replacement.
+                if previous != 0 && !keep_prior && stored.record.metadata.mark == 0 {
                     remove_if_present(&path)?;
                     on_disk.remove(&key);
                     changed = true;

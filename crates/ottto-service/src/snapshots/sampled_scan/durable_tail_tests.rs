@@ -1439,6 +1439,34 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                 cache.durable_note_scope(source, &key, &scope);
                 cache.durable_gc(lock, source, &index).unwrap();
                 assert_eq!(std::fs::read(&disk).unwrap(), bytes);
+                // V2's larger envelope may exceed an unchanged record/store
+                // budget. It must not delete the still-authoritative v1 image.
+                let mut over_budget = pending.clone();
+                over_budget.binding = expected(ds, source, &key, &scope, &index, &interp, None)
+                    .unwrap()
+                    .binding;
+                over_budget.body.resize(store::RECORD_BYTES, 0);
+                let receipt = disk_store
+                    .write_after_save(lock, index.generation, vec![over_budget])
+                    .unwrap();
+                assert_eq!(receipt.budget_refused, 1);
+                assert_eq!(receipt.written, 0);
+                cache.durable_gc(lock, source, &index).unwrap();
+                assert_eq!(std::fs::read(&disk).unwrap(), bytes);
+                let restart = SharedCache::default();
+                restart.durable_begin_pass(source, &index_path, &namespace, false);
+                assert!(restart
+                    .durable_restore(
+                        source,
+                        &key,
+                        &path,
+                        &scope,
+                        &mut File::open(&path).unwrap(),
+                        &index,
+                        &interp
+                    )
+                    .into_test_option()
+                    .is_some());
             } else {
                 let (counts, _) = cache.durable_counters(source).unwrap();
                 assert_eq!(
