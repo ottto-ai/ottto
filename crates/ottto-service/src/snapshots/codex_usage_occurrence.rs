@@ -1,5 +1,8 @@
 //! Codex usage counting V2: one billed request is counted once at its native
-//! usage. Local only; Legacy sessions never construct this state.
+//! usage. Local only: never uploaded except where the upload contract
+//! already carries it; persisted only in the local durable-tail store (raw
+//! response and turn ids are class `L`). Legacy sessions never construct this
+//! state.
 //!
 //! Native `token_usage_record`s are the authority for their turn. Coverage on
 //! the native thread counter (`[before, after)`, six dimensions) decides what
@@ -323,6 +326,7 @@ enum Closed {
 
 #[derive(Clone)]
 struct ClosedTurnFilter(Box<[u64; CLOSED_TURN_FILTER_WORDS]>);
+crate::durable_tail_codec::durable_struct!(ClosedTurnFilter(L x0: Box<[u64; CLOSED_TURN_FILTER_WORDS]>));
 
 impl ClosedTurnFilter {
     fn new() -> Self {
@@ -1132,10 +1136,92 @@ pub(super) const fn max_pending_heap_bytes() -> usize {
 }
 
 crate::heap_layout_bound::fields!(CodexCounting; evidence, cutover_unix_ms, version, reducer);
+crate::durable_tail_codec::durable_struct!(CodexCounting {
+    N evidence: AckEvidence,
+    N cutover_unix_ms: Option<i64>,
+    N version: Option<CountingVersion>,
+    D reducer: Option<Box<OccurrenceReducer>>,
+});
 crate::heap_layout_bound::fields!(OccurrenceReducer; epoch, last_native, prev_ui, native_since_prev_ui, line_ui, turn, closed_turns, closed_filter, counters);
+crate::durable_tail_codec::durable_struct!(OccurrenceReducer {
+    D epoch: Option<Epoch>,
+    D last_native: Option<LastNative>,
+    N prev_ui: Option<UiTuple>,
+    N native_since_prev_ui: bool,
+    N line_ui: Option<(T6, T6)>,
+    D turn: Option<BoundTurn>,
+    L closed_turns: VecDeque<String>,
+    // A membership filter over closed turn ids: a nested type whose one
+    // field is L (provider ids; it carries strictly less than the ids, so
+    // it is L, not H (F1)).
+    D closed_filter: Option<ClosedTurnFilter>,
+    N counters: OccurrenceCounters,
+});
 crate::heap_layout_bound::fields!(Epoch; base, hwm, first_id, contiguous);
+crate::durable_tail_codec::durable_struct!(Epoch {
+    N base: T6,
+    N hwm: T6,
+    L first_id: String,
+    N contiguous: bool,
+});
 crate::heap_layout_bound::fields!(LastNative; id, usage, after);
+crate::durable_tail_codec::durable_struct!(LastNative {
+    L id: String,
+    N usage: T6,
+    N after: T6,
+});
 crate::heap_layout_bound::fields!(UiTuple; last, total, last_t6, total_t6);
+crate::durable_tail_codec::durable_struct!(UiTuple {
+    N last: UsageTotals,
+    N total: UsageTotals,
+    N last_t6: T6,
+    N total_t6: T6,
+});
 crate::heap_layout_bound::fields!(BoundTurn; id, native, ui_published, staged_events, pending);
+crate::durable_tail_codec::durable_struct!(BoundTurn {
+    L id: String,
+    N native: bool,
+    N ui_published: bool,
+    N staged_events: u64,
+    D pending: OwnedMap<(String, RowKey), PendingRow>,
+});
 crate::heap_layout_bound::fields!(PendingRow; selector_context, selector_sources, usage, events, first_activity_at, last_activity_at);
+crate::durable_tail_codec::durable_struct!(PendingRow {
+    U selector_context: BTreeMap<String, String>,
+    U selector_sources: BTreeMap<String, String>,
+    N usage: UsageTotals,
+    N events: u64,
+    N first_activity_at: String,
+    N last_activity_at: String,
+});
 crate::heap_layout_bound::fields!(OccurrenceCounters; native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes);
+crate::durable_tail_codec::durable_struct!(OccurrenceCounters {
+    N native_counted: u64,
+    N native_not_authority: u64,
+    N native_restated: u64,
+    N native_inside_holed_coverage: u64,
+    N native_inside_holed_coverage_usage: T6,
+    N native_chain_gap: u64,
+    N native_chain_overlap: u64,
+    N native_chain_overlap_covered: T6,
+    N native_epoch_reset: u64,
+    N native_conflict: u64,
+    N native_outside_open_turn: u64,
+    N native_outside_open_turn_usage: T6,
+    N native_after_turn_closed: u64,
+    N native_after_turn_closed_usage: T6,
+    N native_after_ui_flush: u64,
+    N native_after_ui_flush_usage: T6,
+    N ui_equal_total_repeat: u64,
+    N ui_equal_total_repeat_usage: T6,
+    N ui_in_native_turn_not_counted: u64,
+    N ui_in_native_turn_not_counted_usage: T6,
+    N ui_in_unbound_span: u64,
+    N v2_cumulative_base_uncounted: u64,
+    N v2_cumulative_base_uncounted_usage: T6,
+    N turn_closure_mismatch: u64,
+    N turn_reopened: u64,
+    N closed_filter_hit_unconfirmed: u64,
+    N closed_filter_hit_unconfirmed_native_usage: T6,
+    N pending_overflow_flushes: u64,
+});

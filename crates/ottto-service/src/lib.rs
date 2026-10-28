@@ -29,6 +29,9 @@ pub mod control;
 pub mod control_plane_health;
 mod desktop_recent;
 pub mod detected_uses;
+mod durable_tail_codec;
+#[cfg(unix)]
+mod durable_tail_store;
 mod external_scheduler_attribution;
 #[cfg(unix)]
 pub(crate) mod fd_guard;
@@ -39,6 +42,8 @@ pub mod legacy_service;
 mod local_resource_diagnostics;
 #[cfg(unix)]
 mod local_state_sweep;
+#[cfg(unix)]
+pub mod locked_state_dir;
 pub mod macos_service;
 pub mod mcp_inventory;
 pub(crate) mod net_resilience;

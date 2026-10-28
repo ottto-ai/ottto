@@ -1289,6 +1289,224 @@ impl crate::heap_layout_bound::HeapLayoutBound for ReadMode {
     }
 }
 
+/// A `Checkpoint`'s certificate for the local durable warm-cache store: the
+/// `PrefixSeal` shape, but with the unnormalized length kept beside the
+/// sealed offset, both samples kept only as their domain-separated SHA-256
+/// (`DURABLE_SAMPLE_DOMAIN`), and the file birth.
+/// ctime is deliberately absent: a metadata-only change (mode, xattr) is not
+/// a refusal input. mtime stays one: at an unchanged length a moved mtime is
+/// a same-size edit, exactly as `select_mode` decides for a RAM checkpoint.
+///
+/// `admits` is structural only (object, length, mtime, birth, samples). The
+/// audit clock and staged debt are carried here unchanged and decided again
+/// by `select_mode` on the checkpoint a restore rebuilds from this one.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DurableCertificate {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    /// The checkpoint's unnormalized stamp length (>= `sealed_offset`).
+    pub(crate) length: u64,
+    pub(crate) modified: (i64, i64),
+    /// Unix nanos of the opened object's birth; 0 when unavailable.
+    pub(crate) birth_nanos: u64,
+    pub(crate) sealed_offset: u64,
+    /// `min(sealed_offset, SAMPLE_BYTES)`, the length of both windows.
+    pub(crate) sample_len: u32,
+    pub(crate) head_sha256: [u8; 32],
+    pub(crate) boundary_sha256: [u8; 32],
+    pub(crate) verified_unix_seconds: u64,
+    pub(crate) audit_debt_unix_seconds: Option<u64>,
+}
+
+/// What `DurableCertificate::admits` found on the held FD.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DurableAdmission {
+    /// The object still has exactly the certified length and mtime.
+    pub(crate) unchanged: bool,
+    /// Sample bytes re-read from the held FD (at most `2 * SAMPLE_BYTES`).
+    pub(crate) sample_bytes_read: usize,
+}
+
+/// The certificate samples' digest domain (M1, SOURCE P2-5): a sample digest
+/// is never the plain SHA-256 of its window, so a file shorter than one
+/// window never yields the plain hash of the whole file.
+#[cfg(unix)]
+pub(crate) const DURABLE_SAMPLE_DOMAIN: &[u8] = b"ottto-dt-sample:v1\0";
+
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
+pub(crate) fn durable_sample_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(DURABLE_SAMPLE_DOMAIN)
+        .chain_update(bytes)
+        .finalize()
+        .into()
+}
+
+/// The opened object's birth in unix nanos, or 0 when the file system cannot
+/// report it. Never a default such as mtime or now.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
+pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
+    metadata
+        .created()
+        .ok()
+        .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|since| u64::try_from(since.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
+impl Checkpoint {
+    /// This checkpoint as a content-free durable certificate. `None` when its
+    /// samples are not valid for its stamp (such a checkpoint never admits).
+    /// The interpretation scope this checkpoint was made under.
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    pub(crate) fn durable_certificate(&self, birth_nanos: u64) -> Option<DurableCertificate> {
+        if !self.samples.valid_for(self.stamp.length)
+            || self.samples.head.len() != self.samples.boundary.len()
+        {
+            return None;
+        }
+        Some(DurableCertificate {
+            device: self.stamp.device,
+            inode: self.stamp.inode,
+            length: self.stamp.length,
+            modified: self.stamp.modified,
+            birth_nanos,
+            sealed_offset: self.samples.sealed_offset,
+            sample_len: u32::try_from(self.samples.head.len()).ok()?,
+            head_sha256: durable_sample_digest(&self.samples.head),
+            boundary_sha256: durable_sample_digest(&self.samples.boundary),
+            verified_unix_seconds: self.last_full_verified_unix_seconds,
+            audit_debt_unix_seconds: self.audit_debt.map(|debt| debt.due_unix_seconds),
+        })
+    }
+}
+
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
+impl DurableCertificate {
+    /// Whether the held FD is still this certificate's object with `[0, s)`
+    /// unchanged as far as samples can tell: the same device, inode and (when
+    /// both are known) birth; not shorter; at an equal length, the same mtime;
+    /// both windows hash to the certified digests; and no stamp change while
+    /// the windows were read. ctime is never compared. A refusal is the reason
+    /// the read must be Full; no partial state exists to undo. It seeks the
+    /// FD; the caller's read plan positions it again before any native read.
+    pub(crate) fn admits(&self, file: &mut File) -> Result<DurableAdmission, FullReason> {
+        self.admit_samples(file).map(|(admission, ..)| admission)
+    }
+
+    /// `admits`, then the RAM checkpoint a restore continues from: this
+    /// certificate's stamp (with the current ctime, which is never a refusal
+    /// input), `scope`, the sample windows just re-read and verified from the
+    /// held FD, and the certified audit clock and debt. `select_mode` then
+    /// decides Unchanged, Tail or Full exactly as for a RAM checkpoint.
+    pub(crate) fn restore(
+        &self,
+        file: &mut File,
+        scope: Scope,
+    ) -> Result<(Checkpoint, DurableAdmission), FullReason> {
+        let (admission, head, boundary, current) = self.admit_samples(file)?;
+        let checkpoint = Checkpoint {
+            stamp: FileStamp {
+                length: self.length,
+                device: self.device,
+                inode: self.inode,
+                modified: self.modified,
+                changed: current.changed,
+            },
+            scope,
+            samples: Samples {
+                sealed_offset: self.sealed_offset,
+                head,
+                boundary,
+            },
+            last_full_verified_unix_seconds: self.verified_unix_seconds,
+            audit_debt: self
+                .audit_debt_unix_seconds
+                .map(|due_unix_seconds| AuditDebt { due_unix_seconds }),
+        };
+        if !checkpoint.samples.valid_for(checkpoint.stamp.length) {
+            return Err(FullReason::InvalidCheckpoint);
+        }
+        Ok((checkpoint, admission))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn admit_samples(
+        &self,
+        file: &mut File,
+    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), FullReason> {
+        let metadata = file.metadata().map_err(|_| FullReason::Replaced)?;
+        let stamp = FileStamp::capture(metadata.clone()).map_err(|_| FullReason::Replaced)?;
+        if u64::from(self.sample_len) != self.sealed_offset.min(SAMPLE_BYTES as u64)
+            || self.sealed_offset > self.length
+        {
+            return Err(FullReason::InvalidCheckpoint);
+        }
+        let birth = birth_unix_nanos(&metadata);
+        if stamp.device != self.device
+            || stamp.inode != self.inode
+            || (self.birth_nanos != 0 && birth != 0 && birth != self.birth_nanos)
+        {
+            return Err(FullReason::Replaced);
+        }
+        if stamp.length < self.length {
+            return Err(FullReason::Shrunk);
+        }
+        let unchanged = stamp.length == self.length;
+        if unchanged && stamp.modified != self.modified {
+            return Err(FullReason::SameSizeEdit);
+        }
+        let len = self.sample_len as usize;
+        let mut read = 0;
+        let head = read_sample(file, 0, len, &mut read).map_err(|_| FullReason::HeadChanged)?;
+        if durable_sample_digest(&head) != self.head_sha256 {
+            return Err(FullReason::HeadChanged);
+        }
+        let boundary = read_sample(
+            file,
+            self.sealed_offset - u64::from(self.sample_len),
+            len,
+            &mut read,
+        )
+        .map_err(|_| FullReason::BoundaryChanged)?;
+        if durable_sample_digest(&boundary) != self.boundary_sha256 {
+            return Err(FullReason::BoundaryChanged);
+        }
+        let after = file
+            .metadata()
+            .and_then(FileStamp::capture)
+            .map_err(|_| FullReason::Replaced)?;
+        if after.device != stamp.device
+            || after.inode != stamp.inode
+            || after.length != stamp.length
+            || after.modified != stamp.modified
+        {
+            return Err(FullReason::Replaced);
+        }
+        Ok((
+            DurableAdmission {
+                unchanged,
+                sample_bytes_read: read,
+            },
+            head,
+            boundary,
+            after,
+        ))
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static SAMPLES_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };

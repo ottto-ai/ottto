@@ -259,8 +259,64 @@ fn call_bytes(id: &str, call: &OpeningCall) -> usize {
         + call.files.iter().map(String::capacity).sum::<usize>()
 }
 
-fn blob_bytes(hash: &str) -> usize {
-    node_bytes::<ClaudeBlob>() + hash.len()
+/// A blob entry: its node plus its inline key, charged in full (the node
+/// estimate already holds a `String`-sized key slot).
+fn blob_bytes() -> usize {
+    node_bytes::<ClaudeBlob>() + std::mem::size_of::<ClaudeRequestKey>()
+}
+
+/// A Claude `api-request-shape` or `api-request-blob` key (`shapeHash`, blob
+/// `hash`): a client-minted content hash of instruction or system text, not a
+/// provider id. Held only as its domain-separated SHA-256 (M1, SOURCE P2-5:
+/// `H`, never `L`); every incoming key is hashed before any lookup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct ClaudeRequestKey([u8; 32]);
+
+impl ClaudeRequestKey {
+    const SHAPE_DOMAIN: &'static [u8] = b"ottto-dt-claude-shape-key:v1\0";
+    const BLOB_DOMAIN: &'static [u8] = b"ottto-dt-claude-blob-key:v1\0";
+
+    fn shape(raw: &str) -> Self {
+        Self::of(Self::SHAPE_DOMAIN, raw)
+    }
+
+    fn blob(raw: &str) -> Self {
+        Self::of(Self::BLOB_DOMAIN, raw)
+    }
+
+    fn of(domain: &[u8], raw: &str) -> Self {
+        use sha2::Digest as _;
+        Self(
+            sha2::Sha256::new()
+                .chain_update(domain)
+                .chain_update(raw.as_bytes())
+                .finalize()
+                .into(),
+        )
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestKey {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    // 32 inline bytes: no heap, one walker visit like the key it replaced.
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// An opening call's provider call or tool-use id, apart from the tool name
+/// its `OpeningCall` holds, so a record's `L` span is the id alone (M1,
+/// SOURCE P2-5).
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct OpeningCallId {
+    id: String,
+}
+
+impl std::borrow::Borrow<str> for OpeningCallId {
+    fn borrow(&self) -> &str {
+        &self.id
+    }
 }
 
 fn is_client_version(value: &str) -> bool {
@@ -435,8 +491,8 @@ pub(super) struct SessionStartState {
     parts_unmeasurable: bool,
     codex_tools_logged: bool,
     config_digest: Option<ConfigDigest>,
-    claude_shape: Option<(String, u64, u64)>,
-    claude_blobs: BTreeMap<String, ClaudeBlob>,
+    claude_shape: Option<(ClaudeRequestKey, u64, u64)>,
+    claude_blobs: BTreeMap<ClaudeRequestKey, ClaudeBlob>,
     memory_units: Option<u64>,
     instruction_load_cut: Option<bool>,
     /// Claude's request-1 instruction text, held for path matching.
@@ -447,7 +503,7 @@ pub(super) struct SessionStartState {
     /// Codex: the one prelude parser, which also holds the AGENTS.md text
     /// for path matching.
     codex_prelude: Option<Box<CodexPreludeParser>>,
-    calls: BTreeMap<String, OpeningCall>,
+    calls: BTreeMap<OpeningCallId, OpeningCall>,
     last_codex_call: Option<String>,
     files: BTreeMap<String, OpeningFileState>,
     /// Files refused by the memory budget, by the request they arrive in.
@@ -459,14 +515,93 @@ pub(super) struct SessionStartState {
     shell_moved: bool,
     /// An opening Claude response spanned several requests.
     collapsed_requests: bool,
+    /// End offset of the last line applied while the window was open (the
+    /// line that froze it, once frozen), when the reader knew it. The opening
+    /// content (M1 durable warm-cache) equals a re-parse of the file through
+    /// it; `None` after any line at an unknown position.
+    content_end: Option<u64>,
 }
 
 crate::heap_layout_bound::fields!(OpeningRequest; context_tokens, uncached_input_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, parts_reconcile, output_tokens);
+crate::durable_tail_codec::durable_struct!(OpeningRequest {
+    N context_tokens: u64,
+    N uncached_input_tokens: u64,
+    N cache_read_tokens: u64,
+    N cache_write_5m_tokens: Option<u64>,
+    N cache_write_1h_tokens: Option<u64>,
+    N parts_reconcile: bool,
+    N output_tokens: u64,
+});
 crate::heap_layout_bound::fields!(ClaudeBlob; parts, unmeasurable, config_digest);
+crate::durable_tail_codec::durable_struct!(ClaudeBlob {
+    N parts: [u64; PARTS],
+    N unmeasurable: bool,
+    // A reversible rolling digest of instruction text (F1): content, never
+    // stored; re-derived with the opening content and hash-verified.
+    X config_digest: Option<ConfigDigest>,
+});
 crate::heap_layout_bound::fields!(ConfigDigest; a, b, len);
+// Not a cryptographic digest: its state reverses to short instruction text,
+// so it is content (X) everywhere and cannot be classed H (no `HDigest`).
+crate::durable_tail_codec::durable_struct!(ConfigDigest {
+    X a: u64,
+    X b: u64,
+    X len: u64,
+});
+crate::durable_tail_codec::durable_struct!(ClaudeRequestKey(H digest: [u8; 32]));
+crate::heap_layout_bound::fields!(OpeningCallId; id);
+crate::durable_tail_codec::durable_struct!(OpeningCallId { L id: String });
 crate::heap_layout_bound::fields!(OpeningCall; response, tool, candidates, files, answered, truncated);
+crate::durable_tail_codec::durable_struct!(OpeningCall {
+    N response: u8,
+    U tool: String,
+    N candidates: u64,
+    E files: Vec<String>,
+    N answered: bool,
+    N truncated: bool,
+});
 crate::heap_layout_bound::fields!(OpeningFileState; ordinal, tool, repo_path, instruction_segments, reads, chars, client_loaded, truncated);
-crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests);
+crate::durable_tail_codec::durable_struct!(OpeningFileState {
+    N ordinal: u64,
+    U tool: String,
+    X repo_path: Option<String>,
+    N instruction_segments: u8,
+    N reads: [u64; 2],
+    N chars: [u64; 2],
+    N client_loaded: [bool; 2],
+    N truncated: [bool; 2],
+});
+crate::heap_layout_bound::fields!(SessionStartState; client_version, user_turns, inherited_prefix, frozen, requests, codex_requests, response_tool_calls, truncated_outputs, parts, parts_closed, parts_unmeasurable, codex_tools_logged, config_digest, claude_shape, claude_blobs, memory_units, instruction_load_cut, instructions, instructions_capped, codex_prelude, calls, last_codex_call, files, files_untracked, held_bytes, shell_moved, collapsed_requests, content_end);
+crate::durable_tail_codec::durable_struct!(SessionStartState {
+    U client_version: Option<String>,
+    N user_turns: u8,
+    N inherited_prefix: bool,
+    N frozen: bool,
+    N requests: [Option<OpeningRequest>; WINDOW_REQUESTS],
+    N codex_requests: u8,
+    N response_tool_calls: [u64; 2],
+    N truncated_outputs: [u64; 2],
+    N parts: [u64; PARTS],
+    N parts_closed: bool,
+    N parts_unmeasurable: bool,
+    N codex_tools_logged: bool,
+    X config_digest: Option<ConfigDigest>,
+    D claude_shape: Option<(ClaudeRequestKey, u64, u64)>,
+    D claude_blobs: BTreeMap<ClaudeRequestKey, ClaudeBlob>,
+    N memory_units: Option<u64>,
+    N instruction_load_cut: Option<bool>,
+    X instructions: Option<String>,
+    N instructions_capped: bool,
+    X codex_prelude: Option<Box<CodexPreludeParser>>,
+    D calls: BTreeMap<OpeningCallId, OpeningCall>,
+    L last_codex_call: Option<String>,
+    X files: BTreeMap<String, OpeningFileState>,
+    N files_untracked: [u64; 2],
+    N held_bytes: usize,
+    N shell_moved: bool,
+    N collapsed_requests: bool,
+    N content_end: Option<u64>,
+});
 
 impl SessionStartState {
     pub(super) fn note_user_turn(&mut self) {
@@ -485,6 +620,7 @@ impl SessionStartState {
     }
 
     fn freeze(&mut self) {
+        self.note_line_applied();
         self.frozen = true;
         if !self.parts_closed {
             self.parts_closed = true;
@@ -499,6 +635,81 @@ impl SessionStartState {
         self.claude_shape = None;
         self.last_codex_call = None;
         self.recount_held();
+    }
+
+    /// M1: after each applied line, while the window is open, the end of
+    /// that line: the opening content is final through it.
+    pub(super) fn note_line_applied(&mut self) {
+        if !self.frozen {
+            self.content_end = crate::durable_tail_codec::current_line()
+                .map(|(offset, len)| offset.saturating_add(len));
+        }
+    }
+
+    /// M1 durable warm-cache reuse: the digest of the opening content a
+    /// record never carries (instruction text, the Codex prelude with its cwd
+    /// and AGENTS.md, opening file paths), or `None` when there is none. It
+    /// is re-derived by re-parsing the file head through `content_end`, which
+    /// must be known and within `bound`.
+    pub(super) fn durable_content_digest(
+        &self,
+        bound: u64,
+    ) -> Result<Option<([u8; 32], u64)>, crate::durable_tail_codec::Refuse> {
+        use crate::durable_tail_codec::Refuse;
+        if self.instructions.is_none()
+            && self.codex_prelude.is_none()
+            && self.files.is_empty()
+            && self.config_digest.is_none()
+            && self
+                .claude_blobs
+                .values()
+                .all(|blob| blob.config_digest.is_none())
+        {
+            return Ok(None);
+        }
+        let end = self
+            .content_end
+            .filter(|end| *end <= bound)
+            .ok_or(Refuse::NotRederivable("SessionStartState.content_end"))?;
+        Ok(Some((self.durable_content_hash()?, end)))
+    }
+
+    /// The opening content's digest alone, for a head re-parse (which has no
+    /// line positions) to compare with the recorded one.
+    pub(super) fn durable_content_hash(
+        &self,
+    ) -> Result<[u8; 32], crate::durable_tail_codec::Refuse> {
+        use crate::durable_tail_codec::{Durable, Enc};
+        let mut e = Enc::hash("ottto-dt-rederive:session_start:v2");
+        self.instructions.put(&mut e)?;
+        self.codex_prelude.put(&mut e)?;
+        self.files.put(&mut e)?;
+        self.config_digest.put(&mut e)?;
+        // The blobs' own digests, by key (their keys and parts are stored).
+        e.varint(self.claude_blobs.len() as u64)?;
+        for blob in self.claude_blobs.values() {
+            blob.config_digest.put(&mut e)?;
+        }
+        Ok(e.finish_hash())
+    }
+
+    /// Moves the re-derived opening content from a head re-parse.
+    pub(super) fn adopt_durable_content(&mut self, from: &mut Self) {
+        self.instructions = from.instructions.take();
+        self.codex_prelude = from.codex_prelude.take();
+        self.files = std::mem::take(&mut from.files);
+        self.config_digest = from.config_digest.take();
+        for (key, blob) in &mut self.claude_blobs {
+            blob.config_digest = from
+                .claude_blobs
+                .get_mut(key)
+                .and_then(|from| from.config_digest.take());
+        }
+    }
+
+    /// Where the opening content is final (`content_end`), when known.
+    pub(super) fn durable_content_end(&self) -> Option<u64> {
+        self.content_end
     }
 
     fn charge(&mut self, bytes: usize) -> bool {
@@ -519,17 +730,13 @@ impl SessionStartState {
             + self
                 .calls
                 .iter()
-                .map(|(id, call)| call_bytes(id, call))
+                .map(|(id, call)| call_bytes(&id.id, call))
                 .sum::<usize>()
-            + self
-                .claude_blobs
-                .keys()
-                .map(|hash| blob_bytes(hash))
-                .sum::<usize>()
+            + self.claude_blobs.len().saturating_mul(blob_bytes())
             + self
                 .claude_shape
                 .as_ref()
-                .map_or(0, |(hash, _, _)| hash.capacity());
+                .map_or(0, |_| std::mem::size_of::<ClaudeRequestKey>());
     }
 
     // ---- Claude Code ----------------------------------------------------
@@ -664,19 +871,20 @@ impl SessionStartState {
             .flatten()
             .map(json_units)
             .sum();
-        let hash = str_at(value, "shapeHash").unwrap_or("").to_string();
-        if !self.charge(hash.capacity()) {
+        let key = ClaudeRequestKey::shape(str_at(value, "shapeHash").unwrap_or(""));
+        if !self.charge(std::mem::size_of::<ClaudeRequestKey>()) {
             self.parts_unmeasurable = true;
             return;
         }
-        self.claude_shape = Some((hash, system, tools));
+        self.claude_shape = Some((key, system, tools));
     }
 
     fn claude_blob(&mut self, value: &Value) {
         let (Some(hash), Some(message)) = (str_at(value, "hash"), value.get("message")) else {
             return;
         };
-        if !self.claude_blobs.contains_key(hash) && !self.charge(blob_bytes(hash)) {
+        let key = ClaudeRequestKey::blob(hash);
+        if !self.claude_blobs.contains_key(&key) && !self.charge(blob_bytes()) {
             self.parts_unmeasurable = true;
             return;
         }
@@ -714,7 +922,7 @@ impl SessionStartState {
                 _ => blob.parts[Part::Other as usize] += json_units(item),
             }
         }
-        self.claude_blobs.insert(hash.to_string(), blob);
+        self.claude_blobs.insert(key, blob);
     }
 
     /// The first `api-request`: request 1's tail of measured blobs.
@@ -724,19 +932,24 @@ impl SessionStartState {
         let blobs = std::mem::take(&mut self.claude_blobs);
         self.recount_held();
         let tail = value.get("tail").and_then(Value::as_array);
-        let (Some((shape_hash, system, tools)), Some(tail)) = (shape, tail) else {
+        let (Some((shape_key, system, tools)), Some(tail)) = (shape, tail) else {
             self.parts_unmeasurable = true;
             return;
         };
         // A `base` continues an earlier request: history was copied in.
-        if value.get("base").is_some() || str_at(value, "shapeHash") != Some(shape_hash.as_str()) {
+        if value.get("base").is_some()
+            || str_at(value, "shapeHash").map(ClaudeRequestKey::shape) != Some(shape_key)
+        {
             self.parts_unmeasurable = true;
             return;
         }
         self.parts[Part::System as usize] += system;
         self.parts[Part::Tools as usize] += tools;
         for hash in tail {
-            match hash.as_str().and_then(|hash| blobs.get(hash)) {
+            match hash
+                .as_str()
+                .and_then(|hash| blobs.get(&ClaudeRequestKey::blob(hash)))
+            {
                 Some(blob) if !blob.unmeasurable => {
                     for (total, part) in self.parts.iter_mut().zip(blob.parts) {
                         *total += part;
@@ -1040,7 +1253,8 @@ impl SessionStartState {
             ..OpeningCall::default()
         };
         if self.charge(call_bytes(id, &call)) {
-            self.calls.insert(id.to_string(), call);
+            self.calls
+                .insert(OpeningCallId { id: id.to_string() }, call);
         }
     }
 
@@ -3087,6 +3301,137 @@ mod tests {
                 quantile(&mut total.wire, 0.5),
                 quantile(&mut total.wire, 1.0),
             );
+        }
+    }
+
+    /// M1, SOURCE P2-5: an opening call's `L` span is its id alone, apart
+    /// from the tool name its `OpeningCall` holds (`U`); request-shape and
+    /// blob keys are held only as their domain-separated digests, and an
+    /// incoming raw key still finds its entry.
+    #[test]
+    fn opening_call_ids_are_the_only_l_span_and_request_keys_are_digests() {
+        use crate::durable_tail_codec::{take_l_spans, Durable, Enc};
+        let mut state = SessionStartState::default();
+        state.open_call("call_CANARYSPLITcx", 1, "call_NAMEHALFcx");
+        assert!(state.calls.contains_key("call_CANARYSPLITcx"));
+        state.claude_blob(&json!({"hash": "blob-RAWKEY", "message": {"role": "user",
+            "content": [{"type": "text", "text": "hello"}]}}));
+        state.claude_shape(
+            &json!({"shapeHash": "shape-RAWKEY", "shape": {"system": [], "tools": []}}),
+        );
+        assert!(state
+            .claude_blobs
+            .contains_key(&ClaudeRequestKey::blob("blob-RAWKEY")));
+        assert_eq!(
+            state.claude_shape.map(|(key, ..)| key),
+            Some(ClaudeRequestKey::shape("shape-RAWKEY"))
+        );
+        take_l_spans();
+        let mut e = Enc::bytes(1 << 20);
+        state.put(&mut e).unwrap();
+        let body = e.into_bytes();
+        let spans = take_l_spans();
+        let at = |needle: &str| {
+            body.windows(needle.len())
+                .position(|window| window == needle.as_bytes())
+        };
+        assert!(at("RAWKEY").is_none(), "a raw request key reached the body");
+        let id = at("call_CANARYSPLITcx").unwrap();
+        let leaf = spans
+            .iter()
+            .filter(|(start, end, _)| *start <= id && id + 18 <= *end)
+            .min_by_key(|(start, end, _)| end - start)
+            .map(|(_, _, path)| *path);
+        assert_eq!(leaf, Some("OpeningCallId.id"));
+        let label = tool_label("call_NAMEHALFcx");
+        let name = at(&label).unwrap();
+        assert!(
+            spans
+                .iter()
+                .all(|(start, end, _)| name >= *end || name + label.len() <= *start),
+            "the tool name sits inside an L span"
+        );
+        // The request then measures through the hashed keys.
+        state.claude_request(&json!({"shapeHash": "shape-RAWKEY", "tail": ["blob-RAWKEY"]}));
+        assert!(!state.parts_unmeasurable);
+    }
+
+    /// F1: `ConfigDigest` is a reversible rolling digest of instruction text,
+    /// so it is content (`X`) on both sources: an encoded record carries none
+    /// of its state (the body equals the body of the same state with every
+    /// config digest cleared), a decoded record has none, and the head
+    /// re-parse brings it back so the content hash verifies.
+    #[test]
+    fn config_digest_is_content_and_never_reaches_a_record_body() {
+        use crate::durable_tail_codec::{Dec, Durable, Enc};
+        let claude = || {
+            let mut state = SessionStartState::default();
+            for line in claude_fixture_lines().iter().take(6) {
+                state.observe_claude_line(line, 0, Some(Path::new("/w/repo")));
+            }
+            state
+        };
+        let codex = || {
+            let mut state = SessionStartState::default();
+            state.observe_codex_line(
+                &codex_message(
+                    "user",
+                    &[(
+                        codex_prelude_footprint::AGENTS_MD_KIND,
+                        "# AGENTS.md instructions for /w/repo\n\n<INSTRUCTIONS>\nSECRET_RULES\n</INSTRUCTIONS>",
+                    )],
+                ),
+                None,
+            );
+            state
+        };
+        let body = |state: &SessionStartState| {
+            let mut e = Enc::bytes(1 << 20);
+            state.put(&mut e).unwrap();
+            e.into_bytes()
+        };
+        let build: [(&str, &dyn Fn() -> SessionStartState); 2] =
+            [("claude", &claude), ("codex", &codex)];
+        for (name, build) in build {
+            let state = build();
+            let digest = state
+                .config_digest
+                .unwrap_or_else(|| panic!("{name}: instruction text folds a config digest"));
+            let recorded = state.durable_content_hash().unwrap();
+            let encoded = body(&state);
+            for word in [digest.a, digest.b] {
+                assert!(
+                    !encoded.windows(8).any(|w| w == word.to_le_bytes()),
+                    "{name}: a config digest word reached the body"
+                );
+            }
+            assert!(
+                !encoded.windows(12).any(|w| w == b"SECRET_RULES")
+                    && !encoded.windows(10).any(|w| w == b"guide.md f"),
+                "{name}: instruction text reached the body"
+            );
+            let mut cleared = state.clone();
+            cleared.config_digest = None;
+            for blob in cleared.claude_blobs.values_mut() {
+                blob.config_digest = None;
+            }
+            assert_eq!(body(&cleared), encoded, "{name}");
+            let mut decoded = SessionStartState::take(&mut Dec::new(&encoded)).unwrap();
+            assert!(decoded.config_digest.is_none(), "{name}");
+            assert!(
+                decoded
+                    .claude_blobs
+                    .values()
+                    .all(|blob| blob.config_digest.is_none()),
+                "{name}"
+            );
+            decoded.adopt_durable_content(&mut build());
+            assert_eq!(
+                decoded.config_digest.map(ConfigDigest::to_bytes),
+                Some(digest.to_bytes()),
+                "{name}"
+            );
+            assert_eq!(decoded.durable_content_hash().unwrap(), recorded, "{name}");
         }
     }
 }

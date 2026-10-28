@@ -66,14 +66,20 @@ pub(crate) fn bounded_compaction_events(
 const CLAUDE_IDLE_COMPACTION_GAP_SECONDS: i64 = 50 * 60;
 
 /// `compactMetadata.trigger` of a Claude Code `compact_boundary`, read on the
-/// boundary line only. Unknown values stay `None`. Local, never serialized;
-/// the upload carries the closed string from `wire`.
+/// boundary line only. Unknown values stay `None`. Local: never uploaded
+/// except where the upload contract already carries it (the closed string
+/// from `wire`); persisted only in the local durable-tail store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClaudeCompactionTrigger {
     Auto,
     Manual,
     Idle,
 }
+crate::durable_tail_codec::durable_enum!(ClaudeCompactionTrigger {
+    0 => Auto,
+    1 => Manual,
+    2 => Idle,
+});
 
 impl ClaudeCompactionTrigger {
     pub(super) fn from_marker(value: Option<&str>) -> Option<Self> {
@@ -288,6 +294,10 @@ struct CodexCompactionSize {
     before: Option<NonZeroU64>,
     after: Option<NonZeroU64>,
 }
+crate::durable_tail_codec::durable_struct!(CodexCompactionSize {
+    N before: Option<NonZeroU64>,
+    N after: Option<NonZeroU64>,
+});
 
 /// Sizes for the newest distinct Codex marker timestamps, sorted by the same
 /// string order as `bounded_compaction_timestamps`. Pruned during parsing:
@@ -298,6 +308,10 @@ pub(super) struct CodexCompactionSizes {
     entries: Vec<(String, CodexCompactionSize)>,
     pending_after: bool,
 }
+crate::durable_tail_codec::durable_struct!(CodexCompactionSizes {
+    N entries: Vec<(String, CodexCompactionSize)>,
+    N pending_after: bool,
+});
 
 impl CodexCompactionSizes {
     /// Keep the first marker at each timestamp. Once a timestamp falls below

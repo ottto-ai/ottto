@@ -1408,7 +1408,14 @@ pub(crate) fn note_marker_line(
                 .and_then(Value::as_str)
                 .map(|text| text.trim().to_ascii_lowercase())
                 .unwrap_or_default();
-            let digest = format!("{:x}", sha2::Sha256::digest(text.as_bytes()));
+            // Domain-separated SHA-256 (an H value in the durable store).
+            let digest = format!(
+                "{:x}",
+                sha2::Sha256::new()
+                    .chain_update(b"ottto-claude-org-marker-context:v1\0")
+                    .chain_update(text.as_bytes())
+                    .finalize()
+            );
             let state = markers.get_or_insert_with(Box::default);
             if state.context_digest.as_deref() != Some(digest.as_str()) {
                 if state.context_digest.is_some() && state.context_flip_position.is_none() {
@@ -3897,7 +3904,22 @@ fn tag_item(
 }
 
 crate::heap_layout_bound::fields!(OrgMarkers; entries, starting_marker, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
+crate::durable_tail_codec::durable_struct!(OrgMarkers {
+    D entries: Vec<OrgMarker>,
+    D starting_marker: Option<OrgMarker>,
+    N overflowed: bool,
+    H context_digest: Option<String>,
+    N context_changed: bool,
+    N context_position: Option<u64>,
+    N context_flip_position: Option<u64>,
+    E home: Option<crate::claude_status_coverage::HomeKey>,
+});
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
+crate::durable_tail_codec::durable_struct!(OrgMarker {
+    N position: u64,
+    U org: Option<String>,
+    N terminal_trusted: bool,
+});
 crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_seconds, process_id, inventory);
 crate::heap_layout_bound::fields!(AccountDisplay; current, history);
 crate::heap_layout_bound::fields!(ActiveSessionCurrentAccount; status, account_identifier_hash, organization_identifier_hash, subscription_product, latest_request_at, unknown_reason);
