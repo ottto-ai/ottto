@@ -2007,15 +2007,13 @@ pub(super) fn new_source_parser(
                 }
             };
             let Some(input) = input else {
-                let yields = index.compressed_admission_yields.entry(key).or_default();
-                *yields = yields.saturating_add(1).min(13);
-                if *yields == 12 {
+                if codex_compressed_input::admission_streak(&key, true) == 12 {
                     let counts = serde_json::json!({"consecutive_yields": 12});
                     traversal_point("codex_zst_admission_alarm", "codex", &counts);
                 }
                 anyhow::bail!("compressed rollout admission yielded");
             };
-            index.compressed_admission_yields.remove(&key);
+            codex_compressed_input::admission_streak(&key, false);
             let evidence = match codex_compressed_input::ArchiveEvidence::begin(
                 input.get_ref(),
                 &candidate.path,
