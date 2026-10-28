@@ -13,8 +13,10 @@ fn item(i: usize, literal: bool) -> SnapshotItem {
     item.cache_observations_state = None;
     item.usage_accounting_contract =
         literal.then(|| crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT.into());
+    // The Claude fingerprint does not separate these synthetic sessions; the Codex one
+    // keeps each synthetic entity distinct, as in the h357 fixtures.
     item.snapshot_fingerprint =
-        crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::Codex, &item);
     item
 }
 
@@ -231,6 +233,7 @@ fn held_literal_body_is_retryable_reoffered_and_never_poison() {
     let scope = "claude_code-usage-decrease-held";
     let items = (0..3).map(|i| item(i, true)).collect::<Vec<_>>();
     let held = items[0].snapshot_fingerprint.clone();
+    assert!(items[1..].iter().all(|i| i.snapshot_fingerprint != held));
     let mut ledger = progress();
     let mut accepted = 0;
     let outcome = upload(&items, scope, &mut ledger, &mut accepted, |batch| {
