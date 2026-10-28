@@ -16,15 +16,12 @@ adapters.
 
 ## Local Checks
 
-Run the smallest relevant checks first. For broad changes, run:
-
-```bash
-cargo fmt --check
-cargo test
-cargo test --manifest-path crates/Cargo.toml -p ottto-connector-testkit --test first_party_sources
-jq empty connectors/registry.generated.json schemas/*.schema.json
-bash scripts/public_repo_export_check.sh
-```
+Run the smallest relevant checks first: `cargo fmt --check`, checks or tests of
+the one crate you changed (`cargo test -p <crate>`), `jq empty` on changed JSON.
+Full-workspace builds and tests run in GitHub CI, not locally: push a branch and
+run the free Linux lane (`gh workflow run linux-tests.yml --ref <branch>`), or
+open the pull request. A local full-workspace build takes several GB of memory
+and every core for minutes, on a machine other agents may share.
 
 Release, installer, and supply-chain changes must also run their targeted
 script tests and dry-run gates before review.
@@ -37,6 +34,29 @@ it is not scheduled or enforced by GitHub. The default is one discovery review
 and, after accepted fixes, one focused verification within 24 hours. Existing
 Cargo, native and public-surface checks remain required; review does not replace
 them. Small prose, cosmetic or purely mechanical changes may skip with a reason.
+
+## Merging
+
+Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
+ready, waits until the Public CI (`ci.yml`) checks of the pull-request run on the
+PR's head commit passed (Linux `Public surface checks`, `Rust advisory audit` and
+`Dependency review`; the macOS `Rust contracts` job is skipped on pull requests
+and runs in the merge queue), and then enqueues exactly that head; other checks
+are informational. `main`'s ruleset requires `Rust contracts`, `Public surface
+checks` and `Rust advisory audit` in the merge queue. For macOS evidence before
+enqueueing, run `gh workflow run ci.yml --ref <branch>` once. The script refuses a PR with
+merge conflicts: rebase onto `main` and push first. `gh pr checks` exit 0 is not
+evidence, no Linux job stands in for the macOS `Rust contracts` job, and a
+manually started (`workflow_dispatch`) run tests the branch head, not the merge
+with `main`.
+
+`main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it, including the macOS `Rust contracts` job; a PR that fails there is removed (exit 4, with the failing run): fix it, push and rerun the guard.
+
+Authors with write access merge their own pull request once its review is
+complete, its pull-request checks passed on the final head and it is mergeable. No
+separate merge window, merge slot or extra approval is required. Wait only for a
+real dependency or conflict with other open work, an explicit dated hold, or an
+announced release freeze.
 
 ## Credential Store Tests
 

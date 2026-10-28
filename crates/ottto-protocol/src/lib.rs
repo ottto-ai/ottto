@@ -43,6 +43,11 @@ pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 24;
 /// keep their meaning; clients send v26 only when the status carries
 /// `daemon_sign_in_supported`.
 pub const CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION: u16 = 26;
+/// Command-scoped version for the Codex background limit refresh switch
+/// (`codex_account_set_quota_refresh_consent`). An older daemon rejects it
+/// instead of accepting a switch it would not honor; clients send v27 only
+/// when the status carries `background_quota_refresh`.
+pub const CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION: u16 = 27;
 /// Destructive installation reset is command-scoped so an older daemon cannot
 /// accept the request while silently ignoring `forget_installation`.
 pub const INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION: u16 = 25;
@@ -683,6 +688,11 @@ pub struct AuthResetResponse {
     pub setup_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disconnected_at: Option<Rfc3339Timestamp>,
+    /// Whether Ottto released this Mac's server registration during a cloud
+    /// reset. Absent for local-only resets and from older daemons; `false`
+    /// means the registration may still be active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_released: Option<bool>,
     pub message: StableMessage,
 }
 
@@ -772,6 +782,10 @@ pub struct SourceHealth {
 /// only the sessions whose activity advanced in the latest scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSessionReconciliation {
+    /// Start of the completed Claude activity scan. Absent for other sources,
+    /// cleared lists, and older caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_started_at: Option<Rfc3339Timestamp>,
     pub reconciled_at: Rfc3339Timestamp,
     pub changed_session_count: u64,
     #[serde(default)]
@@ -801,6 +815,30 @@ pub struct ActiveSession {
     pub compaction_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_timestamps: Vec<Rfc3339Timestamp>,
+    /// Context sizes around each compaction: the same newest-64 list as
+    /// `compaction_timestamps`, `at` byte-identical to an entry of it. Sizes
+    /// use the measure of the first/latest context fields below. Empty when
+    /// the source states no sizes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_events: Vec<ActiveSessionCompaction>,
+    /// Prompt size of the session's first counted request (session start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_turn_context_tokens: Option<u64>,
+    /// Prompt size of the session's latest counted request ("now").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_context_tokens: Option<u64>,
+    /// Recorded context points for the Sessions graph, oldest first, unique
+    /// by time: the first request, the latest timed request, the last request
+    /// of each 15-minute slot, and big changes in between; at most 64,
+    /// thinned evenly so the whole session
+    /// span stays visible. Not every request. Local only, never uploaded;
+    /// present only while the session was active within the last 75 minutes
+    /// when it was read. Each point is a `[unix_seconds, tokens]` pair (whole
+    /// seconds, UTC). A request without a usable timestamp adds no point;
+    /// while only the pinned first point exists, another request in that
+    /// same second also adds no point, so the last point can differ from Last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_points: Vec<ActiveSessionContextPoint>,
     /// Cumulative observed session counters. Optional keeps older daemons and
     /// sources that cannot prove a counter honest in the Companion UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -845,6 +883,15 @@ pub struct ActiveSession {
     pub subscription_product: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_attribution_source: Option<String>,
+    /// Content-free reason the daemon withheld this session's account, so an
+    /// app can say why instead of a bare "unknown". Closed values:
+    /// `multiple_accounts` (the session's own request evidence names more than
+    /// one account) and `incomplete_request_evidence` (one account, but not
+    /// every billed request has a request witness). Only ever set while
+    /// `account_identifier_hash` is absent, and never names an account. Apps
+    /// must treat an unknown value as no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_withheld_reason: Option<String>,
     /// Model the session was MOST RECENTLY seen running, not its lifetime
     /// primary. An active session's card answers "what is it running right
     /// now", so a long session that switched models must not keep showing the
@@ -856,7 +903,98 @@ pub struct ActiveSession {
     /// configured default standing in for observed evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_reasoning_effort: Option<String>,
+    /// The account handling this session NOW: the identity of the session's
+    /// newest own request, never the current login or a lifetime payer.
+    /// Absent when the daemon could not compute it (older daemon, source
+    /// without per-request identity); apps must not substitute the cumulative
+    /// account fields above for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_account: Option<ActiveSessionCurrentAccount>,
+    /// The session's usage per distinct (account, workspace, subscription),
+    /// compared on the full triple. Empty when not computed. When present the
+    /// entries' counters sum to the session's counted usage; an entry without
+    /// an account is usage no request evidence names. Local display only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_history: Vec<ActiveSessionAccountUse>,
 }
+
+/// The account of an active session's newest own request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionCurrentAccount {
+    /// `known` or `unknown`. Apps must treat any other value as `unknown`.
+    pub status: String,
+    /// Present exactly when `status` is `known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    /// The workspace that request's own evidence names; absent when it names
+    /// none. Never borrowed from the login or another request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    /// When the newest own request ran, known or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_request_at: Option<Rfc3339Timestamp>,
+    /// Content-free reason, only while `unknown`: `latest_request_unidentified`,
+    /// `conflicting_latest_requests`, `request_order_unavailable` or
+    /// `identity_withheld`. Apps must treat an unknown value as no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_reason: Option<String>,
+}
+
+/// One (account, workspace, subscription) an active session used, with its
+/// exact counted usage. No money: local display only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionAccountUse {
+    /// Absent: usage no request evidence names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    #[serde(default)]
+    pub request_count: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_5m_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_1h_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Newest own transcript request of this triple, when provable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<Rfc3339Timestamp>,
+    /// This triple is exactly `current_account`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub current: bool,
+}
+
+/// One compaction of an active session. Sizes are prompt sizes, never billed
+/// tokens: `before_tokens` is the last owned request before the compaction,
+/// `after_tokens` the first owned request after it (absent until seen).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionCompaction {
+    pub at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_tokens: Option<u64>,
+    /// Closed values `auto`, `manual` or `idle` when the source states them
+    /// (Claude Code). Codex states none. Apps must hide an unknown value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+}
+
+/// One recorded prompt size of an active session at the request's own time,
+/// on the wire as a compact `[unix_seconds, tokens]` pair: whole seconds since
+/// the Unix epoch (UTC), then the prompt size in tokens. A plain tuple alias,
+/// not a tuple struct, so source-derived decode guards keep reading the
+/// protocol's named-field structs unchanged.
+pub type ActiveSessionContextPoint = (i64, u64);
 
 /// One detected billing destination for a source, as observed from local
 /// session telemetry. The Companion keys rows on
@@ -1496,6 +1634,11 @@ pub struct AgentAccountStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStatusPlanObservation {
+    /// Local-only recent Desktop request activity for this exact account + org.
+    /// Expires 15 minutes after event time, evaluated when serving the response.
+    /// Never uploaded or exported in diagnostics; does not imply current login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_recent_at: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2247,6 +2390,9 @@ pub struct SourceVerificationResult {
     pub message: StableMessage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_results: Vec<SourceRouteVerificationResult>,
+    /// What kind of check ran and what it established. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<SourceVerificationCheck>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2284,6 +2430,53 @@ pub struct SourceRouteVerificationResult {
     pub error_code: Option<String>,
     pub local_session_observed: Option<bool>,
     pub message: StableMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<SourceVerificationCheck>,
+}
+
+/// The kind of check a Verify used and what it established. `scope` never
+/// names an account: no verification result binds accepted usage to one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceVerificationCheck {
+    /// Absent when no route was evaluated, so the kind is not determined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<SourceVerificationMethod>,
+    pub scope: SourceVerificationScope,
+}
+
+/// The kind of check. It does not say the check sent a prompt or finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVerificationMethod {
+    /// Local configuration, source registration and CLI presence only.
+    ConfigurationCheck,
+    /// A small provider prompt, then a check for fresh usage.
+    LivePrompt,
+    /// No prompt: recent usage and local route evidence.
+    PassiveRecentUsage,
+    /// Routes used different methods; each route carries its own.
+    Mixed,
+    /// A value from a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a completed check established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceVerificationScope {
+    NotEstablished,
+    /// Local configuration is ready; upload was not checked.
+    Configuration,
+    /// Local session or route evidence only; upload was not confirmed.
+    LocalEvidence,
+    /// Ottto received fresh matching usage.
+    UsageReceived,
+    /// Some routes established something and others did not, or they differ.
+    Partial,
+    /// A value from a newer daemon; never success.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2859,6 +3052,9 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         LocalControlCommand::CodexAccountStartSignIn { .. } => {
             CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION
         }
+        LocalControlCommand::CodexAccountSetQuotaRefreshConsent { .. } => {
+            CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION
+        }
         LocalControlCommand::AuthReset {
             forget_installation: true,
             ..
@@ -2888,12 +3084,27 @@ pub enum LocalClientKind {
     WebUi,
 }
 
-/// Whether the machine-local Claude config-slot registry may be maintained by
-/// the daemon in the background. Consent applies to the whole registry; a slot
-/// never acquires a separate hidden or inferred grant.
+/// Whether the daemon may keep Claude logins current in the background: renew
+/// their sign-in and, where the status carries `consent_covers_limit_reads`,
+/// read their usage limits on its own schedule, for every Claude login on this
+/// Mac (the default login and each registered slot). Consent applies to the
+/// whole registry; a slot never acquires a separate hidden or inferred grant.
+/// A person's Refresh and setup checks read regardless.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeAccountUpkeepConsentState {
+    ConsentRequired,
+    Granted,
+}
+
+/// Whether the daemon may read Codex usage limits in the background (its
+/// scheduled `codex app-server` reads, which also renew each home's sign-in),
+/// for every Codex home on this Mac. On until the owner chooses. A person's
+/// Refresh and setup checks read regardless. Same wire values as
+/// [`ClaudeAccountUpkeepConsentState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexQuotaRefreshConsentState {
     ConsentRequired,
     Granted,
 }
@@ -3290,6 +3501,17 @@ pub struct ClaudeUnresolvedAccountDescriptorV1 {
     pub unresolved_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
+    /// Present only for one exact Claude Desktop account/organization session
+    /// folder pair; such a row is a daemon-selectable connect target. Absent
+    /// for account-only evidence, which never names an organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    /// Display only, on an exact pair row: the labels that folder pair's own
+    /// Desktop metadata states. Never identity or authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<Rfc3339Timestamp>,
     #[serde(default)]
@@ -3392,6 +3614,13 @@ pub struct ClaudeAccountsStatusV1 {
     /// root aliases, paths, or destructive account actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_provisional_login_count: Option<u16>,
+    /// Presence: `consent` also covers background usage-limit reads. With it
+    /// off this daemon reads no Claude limits on its own schedule for any
+    /// login, the default login included; a person's Refresh and setup checks
+    /// still read. Older daemons omit it (their consent covers sign-in
+    /// renewal and expired saved slots only); older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_covers_limit_reads: Option<bool>,
 }
 
 /// Provider-owned Codex sign-in observation for one daemon-created home. The
@@ -3703,6 +3932,12 @@ pub struct CodexAccountsStatusV1 {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_sign_in_supported: Option<bool>,
+    /// The background limit refresh switch for every Codex home on this Mac.
+    /// Presence is the capability bit for the v27
+    /// `codex_account_set_quota_refresh_consent`. Older daemons omit it (they
+    /// always read in the background); older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_quota_refresh: Option<CodexQuotaRefreshConsentState>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3753,6 +3988,13 @@ pub struct AgentCostsQuery {
     pub mode: Option<String>,
     #[serde(default)]
     pub all_machines: bool,
+    /// Comma-separated grouped families for `mode=full`; Ottto owns the list
+    /// and its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<String>,
+    /// Include the selected families' daily/hourly series (`mode=full`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub daily: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3828,6 +4070,9 @@ pub enum LocalControlCommand {
     Status {
         #[serde(default)]
         refresh_agent_status: bool,
+        /// Explicit doctor recovery; ordinary status reads do not reset backoff.
+        #[serde(default, skip_serializing_if = "is_false")]
+        retry_relay_authorization: bool,
     },
     /// Read the daemon's bounded, privacy-safe snapshot upload receipt ring.
     Receipts {
@@ -3849,6 +4094,12 @@ pub enum LocalControlCommand {
         /// still apply.
         #[serde(default, skip_serializing_if = "is_false")]
         quota_refresh: bool,
+    },
+    /// Read only the status owner's process memory. Never refresh, load a disk
+    /// cache, or hydrate general status. An empty array means no saved reading.
+    /// A distinct verb makes older daemons reject rather than refresh.
+    AgentStatusCached {
+        source: Option<SourceKind>,
     },
     PersonalMeterLocalSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4073,6 +4324,13 @@ pub enum LocalControlCommand {
     CodexAccountRemove {
         schema_version: u16,
         slot_id: String,
+    },
+    /// v27: turn background Codex limit reads on or off for every Codex home
+    /// on this Mac. Off stops the daemon's scheduled reads (and the sign-in
+    /// renewal they do); a person's Refresh and setup checks still read.
+    CodexAccountSetQuotaRefreshConsent {
+        schema_version: u16,
+        consent: bool,
     },
     Detect {
         source: SourceKind,
@@ -4802,6 +5060,7 @@ fn is_format_char(ch: char) -> bool {
 fn redact_plan_observation_for_backend(
     mut observation: AgentStatusPlanObservation,
 ) -> AgentStatusPlanObservation {
+    observation.desktop_recent_at = None;
     observation.evidence_method = safe_optional_text(observation.evidence_method.take());
     observation.source_session_id = safe_optional_text(observation.source_session_id.take());
     observation.provider = safe_optional_text(observation.provider.take());
@@ -4862,6 +5121,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn status_retry_relay_authorization_is_additive_and_explicit() {
+        let legacy = serde_json::json!({"command":"status", "refresh_agent_status":false});
+        let command: LocalControlCommand = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            command,
+            LocalControlCommand::Status {
+                refresh_agent_status: false,
+                retry_relay_authorization: false,
+            }
+        );
+        assert_eq!(serde_json::to_value(command).unwrap(), legacy);
+        let doctor = LocalControlCommand::Status {
+            refresh_agent_status: false,
+            retry_relay_authorization: true,
+        };
+        assert_eq!(
+            serde_json::to_value(doctor).unwrap()["retry_relay_authorization"],
+            true
+        );
+    }
+
+    #[test]
     fn cli_exit_codes_are_stable() {
         assert_eq!(CliErrorCode::InvalidRequest.exit_code(), 2);
         assert_eq!(CliErrorCode::DaemonUnavailable.exit_code(), 10);
@@ -4872,6 +5153,43 @@ mod tests {
         assert_eq!(CliErrorCode::NeedsUserAction.exit_code(), 60);
         assert_eq!(CliErrorCode::TimedOut.exit_code(), 61);
         assert_eq!(CliErrorCode::Internal.exit_code(), 70);
+    }
+
+    #[test]
+    fn desktop_recent_is_optional_and_redacted_for_backend() {
+        let mut snapshot: AgentStatusSnapshot = serde_json::from_str(include_str!(
+            "../../../fixtures/agent-status/display-carrier.json"
+        ))
+        .unwrap();
+        assert!(snapshot
+            .plan_observations
+            .iter()
+            .all(|r| r.desktop_recent_at.is_none()));
+        assert!(!serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("desktop_recent_at"));
+        snapshot.plan_observations[0].desktop_recent_at = Some("2026-10-25T10:00:00Z".into());
+        let local = serde_json::to_string(&snapshot).unwrap();
+        assert!(local.contains("desktop_recent_at"));
+        assert!(!serde_json::to_string(&snapshot.redacted_for_backend())
+            .unwrap()
+            .contains("desktop_recent_at"));
+    }
+
+    #[test]
+    fn agent_status_cached_is_a_distinct_wire_command() {
+        let command = LocalControlCommand::AgentStatusCached {
+            source: Some(SourceKind::ClaudeCode),
+        };
+        let wire = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"command": "agent_status_cached", "source": "claude_code"})
+        );
+        assert_eq!(
+            serde_json::from_value::<LocalControlCommand>(wire).unwrap(),
+            command
+        );
     }
 
     #[test]
@@ -5134,6 +5452,7 @@ mod tests {
                 remaining_slots: 9,
             },
             daemon_sign_in_supported: None,
+            background_quota_refresh: None,
         };
 
         let wire = serde_json::to_value(&status).expect("serialize");
@@ -5178,6 +5497,110 @@ mod tests {
             assert!(error.to_string().contains("expected 26"));
         }
         assert_eq!(CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION, 26);
+    }
+
+    #[test]
+    fn codex_quota_refresh_consent_is_v27_only() {
+        let wire = serde_json::json!({
+            "request_id": "req_codex_quota_refresh",
+            "protocol_version": CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "codex_account_set_quota_refresh_consent",
+            "schema_version": 1,
+            "consent": false
+        });
+        let request =
+            serde_json::from_value::<LocalControlRequest>(wire.clone()).expect("v27 consent");
+        assert_eq!(
+            request.command,
+            LocalControlCommand::CodexAccountSetQuotaRefreshConsent {
+                schema_version: 1,
+                consent: false,
+            }
+        );
+        let round_trip = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            round_trip["command"],
+            "codex_account_set_quota_refresh_consent"
+        );
+        assert_eq!(round_trip["consent"], false);
+        // An older client's version, or any other command family's, is
+        // rejected: the switch never lands on a daemon that would ignore it.
+        for wrong in [
+            LOCAL_CONTROL_PROTOCOL_VERSION,
+            CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION,
+        ] {
+            let mut stale = wire.clone();
+            stale["protocol_version"] = serde_json::json!(wrong);
+            let error = serde_json::from_value::<LocalControlRequest>(stale)
+                .expect_err("the switch rejects every other protocol");
+            assert!(error.to_string().contains("expected 27"), "{error}");
+        }
+        assert_eq!(CODEX_QUOTA_REFRESH_CONSENT_CONTROL_PROTOCOL_VERSION, 27);
+
+        // A daemon that predates the command cannot decode it at all.
+        let error = serde_json::from_value::<LocalControlCommand>(serde_json::json!({
+            "command": "codex_account_set_quota_refresh_consents",
+            "schema_version": 1,
+            "consent": true
+        }))
+        .expect_err("unknown commands are rejected, never ignored");
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn background_quota_refresh_status_fields_are_additive() {
+        // An older daemon's statuses carry neither field.
+        let legacy: CodexAccountsStatusV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "setup_operation": {"state": "idle"},
+            "default_slot": {"slot_id": "default", "ownership": "default"},
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        }))
+        .expect("v26 status decodes");
+        assert_eq!(legacy.background_quota_refresh, None);
+        let mut status = legacy.clone();
+        let wire = serde_json::to_value(&status).expect("serialize");
+        assert!(wire.get("background_quota_refresh").is_none(), "{wire}");
+
+        for (state, value) in [
+            (CodexQuotaRefreshConsentState::Granted, "granted"),
+            (
+                CodexQuotaRefreshConsentState::ConsentRequired,
+                "consent_required",
+            ),
+        ] {
+            status.background_quota_refresh = Some(state);
+            let wire = serde_json::to_value(&status).expect("serialize");
+            assert_eq!(wire["background_quota_refresh"], value);
+            let decoded: CodexAccountsStatusV1 = serde_json::from_value(wire).expect("decode");
+            assert_eq!(decoded.background_quota_refresh, Some(state));
+        }
+
+        let claude = serde_json::json!({
+            "schema_version": 1,
+            "consent": "granted",
+            "setup_operation": {"state": "idle"},
+            "default_slot": {
+                "slot_id": "default",
+                "ownership": "external",
+                "service_name": "Claude Code-credentials"
+            },
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        });
+        let legacy: ClaudeAccountsStatusV1 =
+            serde_json::from_value(claude.clone()).expect("older Claude status decodes");
+        assert_eq!(legacy.consent_covers_limit_reads, None);
+        let mut covered = claude;
+        covered["consent_covers_limit_reads"] = serde_json::json!(true);
+        let covered: ClaudeAccountsStatusV1 =
+            serde_json::from_value(covered).expect("newer Claude status decodes");
+        assert_eq!(covered.consent_covers_limit_reads, Some(true));
+        assert_eq!(
+            serde_json::to_value(&covered).expect("serialize")["consent_covers_limit_reads"],
+            true
+        );
     }
 
     #[test]
@@ -5275,7 +5698,7 @@ mod tests {
                 account_identifier_hash: Some("a".repeat(64)),
                 workspace_identifier_hash: Some("b".repeat(64)),
                 account_label: "Codex account".to_string(),
-                workspace_label: Some("Singular".to_string()),
+                workspace_label: Some("Acme".to_string()),
                 subscription_product: None,
                 durability: CodexAccountTargetDurabilityV1::ObservedOnly,
                 is_current: false,
@@ -5291,7 +5714,7 @@ mod tests {
             blocked_targets: 0,
         };
         let wire = serde_json::to_value(coverage).expect("serialize target coverage");
-        assert_eq!(wire["targets"][0]["workspace_label"], "Singular");
+        assert_eq!(wire["targets"][0]["workspace_label"], "Acme");
         assert_eq!(wire["targets"][0]["connectable"], true);
         let encoded = wire.to_string();
         for forbidden in [
@@ -6186,6 +6609,9 @@ mod tests {
         let descriptor = ClaudeUnresolvedAccountDescriptorV1 {
             unresolved_id: "claude_unresolved_0123456789abcdef".to_string(),
             account_identifier_hash: Some("display-safe-hash".to_string()),
+            organization_identifier_hash: None,
+            account_label: None,
+            organization_label: None,
             observed_at: Some("2026-08-04T12:00:00Z".to_string()),
             evidence: vec![
                 ClaudeUnresolvedAccountEvidenceKind::CliIdentity,
@@ -6283,6 +6709,8 @@ mod tests {
                     bucket: Some("day".to_string()),
                     mode: Some("full".to_string()),
                     all_machines: false,
+                    dimensions: None,
+                    daily: false,
                 }
             }
         );
@@ -6719,6 +7147,7 @@ mod tests {
             context: None,
             capabilities: Vec::new(),
             plan_observations: vec![AgentStatusPlanObservation {
+                desktop_recent_at: None,
                 observed_at: Some("2026-05-07T00:00:00Z".to_string()),
                 evidence_method: Some("cli_text".to_string()),
                 source_session_id: Some("session-safe".to_string()),
@@ -7967,8 +8396,62 @@ mod tests {
     }
 
     #[test]
+    fn active_session_accounts_are_optional_and_round_trip() {
+        let old: ActiveSession = serde_json::from_value(serde_json::json!({
+            "source_session_id": "s",
+            "source_last_activity_at": "2026-07-19T18:00:00Z"
+        }))
+        .expect("older session");
+        assert_eq!(old.current_account, None);
+        assert!(old.account_history.is_empty());
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("current_account").is_none());
+        assert!(value.get("account_history").is_none());
+
+        let session: ActiveSession = serde_json::from_value(serde_json::json!({
+            "source_session_id": "s",
+            "source_last_activity_at": "2026-07-19T18:00:00Z",
+            "current_account": {"status": "unknown", "unknown_reason": "future_reason"},
+            "account_history": [
+                {"account_identifier_hash": "a", "subscription_product": "max",
+                 "request_count": 2, "input_tokens": 5, "current": true},
+                {"request_count": 1}
+            ]
+        }))
+        .expect("new session");
+        let current = session.current_account.as_ref().unwrap();
+        assert_eq!(current.status, "unknown");
+        assert_eq!(current.account_identifier_hash, None);
+        assert_eq!(session.account_history[1].account_identifier_hash, None);
+        assert_eq!(session.account_history[1].output_tokens, 0);
+        assert!(!session.account_history[1].current);
+        let value = serde_json::to_value(&session).unwrap();
+        assert_eq!(value["account_history"][0]["current"], true);
+        assert!(value["account_history"][1].get("current").is_none());
+        assert!(value["account_history"][1].get("last_used_at").is_none());
+        assert!(value["current_account"]
+            .get("account_identifier_hash")
+            .is_none());
+    }
+
+    #[test]
+    fn old_active_session_reconciliation_without_scan_start_still_parses() {
+        let reconciliation: ActiveSessionReconciliation =
+            serde_json::from_value(serde_json::json!({
+                "reconciled_at": "2026-07-19T18:00:00Z",
+                "changed_session_count": 0,
+                "sessions": []
+            }))
+            .expect("older reconciliation");
+        assert_eq!(reconciliation.scan_started_at, None);
+        let value = serde_json::to_value(reconciliation).unwrap();
+        assert!(value.get("scan_started_at").is_none());
+    }
+
+    #[test]
     fn active_session_reconciliation_serializes_to_swift_contract_keys() {
         let reconciliation = ActiveSessionReconciliation {
+            scan_started_at: Some("2026-07-19T17:55:00Z".to_string()),
             reconciled_at: "2026-07-19T18:00:00Z".to_string(),
             changed_session_count: 1,
             sessions: vec![ActiveSession {
@@ -7984,6 +8467,24 @@ mod tests {
                     "2026-07-19T17:30:00Z".to_string(),
                     "2026-07-19T17:50:00Z".to_string(),
                 ],
+                compaction_events: vec![
+                    ActiveSessionCompaction {
+                        at: "2026-07-19T17:30:00Z".to_string(),
+                        before_tokens: Some(186_000),
+                        after_tokens: Some(41_000),
+                        trigger: Some("auto".to_string()),
+                    },
+                    ActiveSessionCompaction {
+                        at: "2026-07-19T17:50:00Z".to_string(),
+                        before_tokens: Some(120_000),
+                        after_tokens: None,
+                        trigger: None,
+                    },
+                ],
+                first_turn_context_tokens: Some(24_000),
+                last_turn_context_tokens: Some(120_000),
+                // 2026-07-19T17:00:00Z and 17:59:00Z.
+                context_points: vec![(1_784_480_400, 24_000), (1_784_483_940, 120_000)],
                 input_tokens: Some(1_000),
                 cache_read_tokens: Some(800),
                 cache_creation_5m_tokens: Some(50),
@@ -7998,12 +8499,16 @@ mod tests {
                 organization_identifier_hash: Some("org-hash".to_string()),
                 subscription_product: Some("chatgpt_pro".to_string()),
                 account_attribution_source: Some("current_login_at_reconciliation".to_string()),
+                account_withheld_reason: None,
                 latest_model: Some("claude-opus-5".to_string()),
                 latest_reasoning_effort: Some("high".to_string()),
+                current_account: None,
+                account_history: Vec::new(),
             }],
         };
 
         let value = serde_json::to_value(&reconciliation).expect("serialize reconciliation");
+        assert_eq!(value["scan_started_at"], "2026-07-19T17:55:00Z");
         assert_eq!(value["changed_session_count"], 1);
         assert_eq!(value["sessions"][0]["source_session_id"], "session-a");
         assert_eq!(value["sessions"][0]["compaction_count"], 2);
@@ -8019,11 +8524,64 @@ mod tests {
             "2026-07-19T17:50:00Z"
         );
         // Snake-case keys the Swift Companion decodes for the session card.
+        assert_eq!(
+            value["sessions"][0]["compaction_events"],
+            serde_json::json!([
+                {"at": "2026-07-19T17:30:00Z", "before_tokens": 186_000, "after_tokens": 41_000, "trigger": "auto"},
+                {"at": "2026-07-19T17:50:00Z", "before_tokens": 120_000}
+            ])
+        );
+        assert_eq!(value["sessions"][0]["first_turn_context_tokens"], 24_000);
+        assert_eq!(value["sessions"][0]["last_turn_context_tokens"], 120_000);
+        assert_eq!(
+            value["sessions"][0]["context_points"],
+            serde_json::json!([[1_784_480_400, 24_000], [1_784_483_940, 120_000]])
+        );
         assert_eq!(value["sessions"][0]["latest_model"], "claude-opus-5");
         assert_eq!(value["sessions"][0]["latest_reasoning_effort"], "high");
+        // Absent, not null, when the daemon has no withheld reason.
+        assert!(value["sessions"][0]
+            .as_object()
+            .is_some_and(|session| !session.contains_key("account_withheld_reason")));
         let round_tripped: ActiveSessionReconciliation =
             serde_json::from_value(value).expect("deserialize reconciliation");
         assert_eq!(round_tripped, reconciliation);
+
+        let mut withheld = reconciliation.clone();
+        withheld.sessions[0].account_identifier_hash = None;
+        withheld.sessions[0].organization_identifier_hash = None;
+        withheld.sessions[0].subscription_product = None;
+        withheld.sessions[0].account_attribution_source = None;
+        withheld.sessions[0].account_withheld_reason = Some("multiple_accounts".to_string());
+        let value = serde_json::to_value(&withheld).expect("serialize withheld reconciliation");
+        assert_eq!(
+            value["sessions"][0]["account_withheld_reason"],
+            "multiple_accounts"
+        );
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize withheld reconciliation");
+        assert_eq!(round_tripped, withheld);
+
+        // Empty lists and unknown sizes are absent, never `[]` or null, and an
+        // older daemon's row without the keys decodes to empty.
+        let mut bare = reconciliation.clone();
+        bare.sessions[0].compaction_events.clear();
+        bare.sessions[0].context_points.clear();
+        bare.sessions[0].first_turn_context_tokens = None;
+        bare.sessions[0].last_turn_context_tokens = None;
+        let value = serde_json::to_value(&bare).expect("serialize bare reconciliation");
+        let session = value["sessions"][0].as_object().expect("session object");
+        for key in [
+            "compaction_events",
+            "context_points",
+            "first_turn_context_tokens",
+            "last_turn_context_tokens",
+        ] {
+            assert!(!session.contains_key(key), "{key}");
+        }
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize bare reconciliation");
+        assert_eq!(round_tripped, bare);
     }
 
     #[test]
@@ -8518,5 +9076,43 @@ mod tests {
         assert!(!is_credit_reason_code("Tenure"));
         assert!(!is_credit_reason_code(&"a".repeat(65)));
         assert!(!is_credit_reason_code("five hour"));
+    }
+
+    #[test]
+    fn verification_check_is_optional_and_unknown_values_stay_unknown() {
+        let old = serde_json::json!({
+            "source": "codex",
+            "config": {"discovered": true, "path_hint": null, "fingerprint": null, "drift": []},
+            "status": "warning",
+            "verified": false,
+            "records_seen": 0,
+            "last_record_id": null,
+            "last_received_at": null,
+            "smoke_after": null,
+            "message": {"code": "codex_local_import", "text": "checked"},
+        });
+        let decoded: SourceVerificationResult = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(decoded.check, None);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
+
+        let mut future = old;
+        future["check"] = serde_json::json!({"method": "quantum_probe", "scope": "future_scope"});
+        let decoded: SourceVerificationResult = serde_json::from_value(future).unwrap();
+        assert_eq!(
+            decoded.check,
+            Some(SourceVerificationCheck {
+                method: Some(SourceVerificationMethod::Unknown),
+                scope: SourceVerificationScope::Unknown,
+            })
+        );
+
+        let check = SourceVerificationCheck {
+            method: None,
+            scope: SourceVerificationScope::NotEstablished,
+        };
+        assert_eq!(
+            serde_json::to_value(&check).unwrap(),
+            serde_json::json!({"scope": "not_established"})
+        );
     }
 }

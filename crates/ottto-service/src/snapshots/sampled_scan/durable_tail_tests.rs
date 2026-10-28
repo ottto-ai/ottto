@@ -1,0 +1,751 @@
+//! GC against a committed index much larger than the store (F3, F5).
+use super::*;
+use crate::locked_state_dir::test_locks;
+use crate::transcript_acquisition::ReadPlan;
+use std::io::Read;
+
+const INDEX_KEYS: usize = 20_000;
+
+fn indexed_key(n: usize) -> String {
+    format!("/synthetic/sessions/rollout-{n:05}.jsonl")
+}
+
+/// A real committed checkpoint's certificate for `path`.
+fn certificate(path: &Path, scope: &Scope) -> DurableCertificate {
+    let mut file = File::open(path).unwrap();
+    let mut plan = ReadPlan::prepare(&mut file, None, scope, None, 1_800_000_000).unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    plan.observe_complete_records(&bytes).unwrap();
+    let checkpoint = plan
+        .commit_after_native_completion(&file, scope, 1_800_000_000)
+        .unwrap();
+    checkpoint
+        .durable_certificate(birth_unix_nanos(&std::fs::metadata(path).unwrap()))
+        .unwrap()
+}
+
+/// F3/F5 receipt: GC after a save of a 20 000-entry index over a 4-record
+/// store looks up only the store's inventory (its keep map holds the 3
+/// indexed records, never the index), reads one header per record and no
+/// body, and drops the record whose key the index no longer holds.
+#[test]
+fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
+    let root = crate::test_scratch::private_dir("ottto-dt-gc-large-index");
+    let lock = test_locks::hold(&root);
+    let index_path = root.join("index.json");
+    let transcript = root.join("t.jsonl");
+    std::fs::write(&transcript, b"{\"n\":1}\n").unwrap();
+    let certificate = certificate(&transcript, &Scope("dt-gc-file".into()));
+    let source = SnapshotSource::Codex;
+    let namespace = Scope("dt-gc".into());
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+
+    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!(
+        {"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"}
+    ))
+    .unwrap();
+    let mut index = ScanIndex::default();
+    for n in 0..INDEX_KEYS {
+        index.files.insert(indexed_key(n), entry.clone());
+    }
+    let mut store = DurableTailStore::new(store::store_dir_for_index(&index_path));
+    let allowlist = codec::allowlist_digest(source);
+    let context = store::context_digest(&namespace.0, None);
+    let keys = [
+        indexed_key(7),
+        indexed_key(12_345),
+        indexed_key(INDEX_KEYS - 1),
+        "/synthetic/sessions/rollout-dropped.jsonl".to_string(),
+    ];
+    let pending = keys
+        .iter()
+        .map(|key| PendingRecord {
+            binding: Binding {
+                source: DurableSource::Codex,
+                key: store::key_digest(DurableSource::Codex, key),
+                context,
+                scope: [0; 32],
+                entry: store::entry_digest("fp", None),
+            },
+            certificate: certificate.clone(),
+            body: vec![0; 64],
+            allowlist,
+        })
+        .collect();
+    store.write_after_save(lock, 1, pending).unwrap();
+
+    cache.durable_gc(lock, source, &index).unwrap();
+    let (counters, stats) = cache.durable_counters(source).unwrap();
+    // The old keep map held one (digest, scope) pair per index key.
+    let pair = std::mem::size_of::<(store::Digest32, Option<store::Digest32>)>();
+    println!(
+        "dt_gc_receipt: index_keys={INDEX_KEYS} store_records={} inventory_bound={} \
+         gc_keep_peak={} keep_pair_bytes={pair} keep_bytes={} unbounded_keep_bytes={} \
+         gc_records_read={} gc_bytes_read={} gc_records_deleted={} disk_records={}",
+        keys.len(),
+        store::INVENTORY_BOUND,
+        counters.gc_keep_peak,
+        counters.gc_keep_peak as usize * pair,
+        INDEX_KEYS * pair,
+        stats.gc_records_read,
+        stats.gc_bytes_read,
+        stats.gc_records_deleted,
+        stats.disk_records,
+    );
+    assert_eq!(counters.gc_keep_peak, 3);
+    assert!(counters.gc_keep_peak as usize <= store::INVENTORY_BOUND);
+    assert_eq!(stats.gc_records_read, keys.len() as u64);
+    assert_eq!(
+        stats.gc_bytes_read,
+        (keys.len() * store::HEADER_BYTES) as u64
+    );
+    assert_eq!(stats.gc_records_deleted, 1);
+    assert_eq!(stats.disk_records, 3);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Replay bindings are independent of the field codec. A revision, rule or
+/// per-file marker change refuses even with unchanged scope, bytes and body.
+#[test]
+fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
+    let source = SnapshotSource::ClaudeCode;
+    let key = "/synthetic/claude/fixture.jsonl";
+    let scope = Scope("same-file-scope".into());
+    let namespace = Scope("same-account".into());
+    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({
+        "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp",
+        "effective_upload_body_witness_revision":3
+    }))
+    .unwrap();
+    let mut index = ScanIndex::default();
+    index.files.insert(key.into(), entry);
+    index.activate_effective_upload_body_witness_revision(3);
+    index.adopt_effective_upload_body_witness_revision_monotonically();
+    index.claude_money_birth_store.set_money_rule_version(1);
+    let binding = |index: &ScanIndex| {
+        let interpretation = Interpretation::of(source, key, index, false, &namespace);
+        expected(
+            DurableSource::ClaudeCode,
+            source,
+            key,
+            &scope,
+            index,
+            &interpretation,
+        )
+        .unwrap()
+        .binding
+    };
+    let prior = binding(&index);
+    assert!(!index.effective_upload_body_witness_revision_requires_adoption(key));
+    for arm in ["revision", "rule", "applied", "marks", "gate"] {
+        let mut changed = index.clone();
+        match arm {
+            "revision" => changed.activate_effective_upload_body_witness_revision(2),
+            "rule" => changed.claude_money_birth_store.set_money_rule_version(2),
+            "applied" => {
+                changed
+                    .files
+                    .get_mut(key)
+                    .unwrap()
+                    .effective_upload_body_witness_revision = 2
+            }
+            "marks" => changed
+                .claude_money_birth_store
+                .set_money_marks(key, claude_request_money::e2::money_mark::ESTIMATED),
+            "gate" => {}
+            _ => unreachable!(),
+        }
+        let after = if arm == "gate" {
+            claude_request_money::e2::with_disabled(|| binding(&changed))
+        } else {
+            binding(&changed)
+        };
+        assert_ne!(prior, after, "{arm}");
+        assert_eq!(prior.key, after.key, "{arm}");
+        assert_eq!(prior.context, after.context, "{arm}");
+        if matches!(arm, "applied" | "marks") {
+            assert_ne!(prior.entry, after.entry, "{arm}");
+        } else {
+            assert_ne!(prior.scope, after.scope, "{arm}");
+        }
+    }
+}
+
+/// A real native reduction and certificate, encoded even on layouts where
+/// RAM admission is unavailable. Positive restore/write controls still must
+/// run on the supported macOS layout.
+fn native_record(path: &Path, scope: &Scope) -> (CachedJsonlReduction, Checkpoint) {
+    native_record_of(path, scope, SnapshotSource::ClaudeCode)
+}
+
+fn native_record_of(
+    path: &Path,
+    scope: &Scope,
+    source: SnapshotSource,
+) -> (CachedJsonlReduction, Checkpoint) {
+    let apply = match source {
+        SnapshotSource::Codex => apply_codex_line,
+        _ => apply_claude_code_line,
+    };
+    let mut parser = OwnedJsonlParser::new(
+        File::open(path).unwrap(),
+        path,
+        source,
+        apply,
+        None,
+        None,
+        None,
+        false,
+        true,
+    )
+    .unwrap();
+    parser
+        .prepare_acquisition(None, scope, None, 1_800_000_000)
+        .unwrap();
+    while !parser.step().unwrap() {}
+    let reduction = parser.durable_test_reduction_copy();
+    let checkpoint = match parser
+        .certify_without_retention(scope, 1_800_000_000)
+        .unwrap()
+    {
+        sampled_jsonl::SideCertificate::Certified { completed, .. } => completed.checkpoint,
+        _ => panic!("a clean native fixture is certified"),
+    };
+    (reduction, checkpoint)
+}
+
+fn native_fixture(path: &Path) {
+    std::fs::write(
+        path,
+        concat!(
+            "{\"type\":\"assistant\",\"sessionId\":\"11111111-2222-4333-8444-555555555555\",",
+            "\"timestamp\":\"2026-10-07T10:00:00Z\",\"requestId\":\"req-dt-owed\",",
+            "\"message\":{\"id\":\"msg-dt-owed\",\"model\":\"fixture-model\",",
+            "\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Money rules re-owe marked paths. Seed a usable record first, prove it
+/// restores, then prove revision/money debt refuses before record I/O and
+/// invalidates the existing record on the real post-save write path.
+#[test]
+fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    let root = crate::test_scratch::private_dir("ottto-dt-owed");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("owed-test".into());
+    let scope = Scope("owed-file".into());
+    let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    for money in [false, true] {
+        // Independent committed generations; both arms exercise real CAS.
+        let index_path = root.join(if money {
+            "money-index.json"
+        } else {
+            "revision-index.json"
+        });
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":std::fs::metadata(&path).unwrap().len(),
+                "modified_unix_seconds":1,"source_file_fingerprint":"fp",
+                "effective_upload_body_witness_revision":if money {3} else {2}
+            }))
+            .unwrap(),
+        );
+        index.activate_effective_upload_body_witness_revision(if money { 3 } else { 2 });
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        if money {
+            index.claude_money_birth_store.set_money_rule_version(1);
+            index
+                .claude_money_birth_store
+                .set_money_marks(&key, claude_request_money::e2::money_mark::ESTIMATED);
+        }
+        assert!(!index.effective_upload_body_witness_revision_requires_adoption(&key));
+        index.save(&index_path).unwrap();
+        let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+        let binding = expected(
+            DurableSource::ClaudeCode,
+            source,
+            &key,
+            &scope,
+            &index,
+            &interpretation,
+        )
+        .unwrap()
+        .binding;
+        let (reduction, checkpoint) = native_record(&path, &scope);
+        let body = codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
+        let mut store = DurableTailStore::new(store::store_dir_for_index(&index_path));
+        store
+            .write_after_save(
+                lock,
+                index.generation,
+                vec![PendingRecord {
+                    binding,
+                    certificate: certificate(&path, &scope),
+                    body,
+                    allowlist: codec::allowlist_digest(source),
+                }],
+            )
+            .unwrap();
+        let records = || {
+            std::fs::read_dir(store::store_dir_for_index(&index_path))
+                .unwrap()
+                .count()
+        };
+        assert_eq!(records(), 1, "a real usable record exists");
+        let positive = SharedCache::default();
+        positive.durable_begin_pass(source, &index_path, &namespace, false);
+        let restored = positive.durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &index,
+            &interpretation,
+        );
+        let supported = crate::heap_layout_bound::layout_supported();
+        assert_eq!(restored.is_some(), supported);
+        assert_eq!(
+            positive.durable_counters(source).unwrap().0.restored,
+            u64::from(supported)
+        );
+        assert_eq!(positive.durable_counters(source).unwrap().1.records_read, 1);
+        drop(restored);
+        if money {
+            claude_request_money::e2::with_money_rules(
+                &[(1, 0), (2, claude_request_money::e2::money_mark::ESTIMATED)],
+                || {
+                    claude_request_money::e2::apply_money_rules(&mut index);
+                },
+            );
+            assert_eq!(index.claude_money_birth_store.money_rule_version(), 2);
+        } else {
+            // Use the supported revision ceiling; do not loosen activation.
+            index.activate_effective_upload_body_witness_revision(3);
+        }
+        assert!(index.effective_upload_body_witness_revision_requires_adoption(&key));
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+        assert!(cache
+            .durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &interpretation,
+            )
+            .is_none());
+        let (counts, disk) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.ineligible.get("history_owed"), Some(&1));
+        assert_eq!(
+            (counts.restored, counts.missing, disk.records_read),
+            (0, 0, 0)
+        );
+        if supported {
+            assert!(cache.insert_admitted(
+                key.clone(),
+                sampled_jsonl::CompletedNativeAcquisition {
+                    checkpoint,
+                    reduction: Some(reduction),
+                    released: None,
+                    unsealed: false,
+                },
+                0
+            ));
+            cache.durable_note_selection(&key, "fp");
+            index.save(&index_path).unwrap();
+            cache.durable_write_after_save(lock, source, &index);
+            let (counts, disk) = cache.durable_counters(source).unwrap();
+            println!(
+                "owed_write money={money}: {}",
+                counts.summary(source, &disk)
+            );
+            assert_eq!(counts.not_persisted.get("history_owed"), Some(&1));
+            assert_eq!(disk.records_invalidated, 1);
+            assert_eq!(records(), 0);
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Capture is process-local in RAM, but a durable checkpoint crosses a
+/// restart. Both toggle directions must change Claude's binding (Codex is
+/// unaffected) and refuse the old record under the actual env setting.
+#[test]
+fn attribution_capture_toggle_refuses_the_previous_claude_record() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let root = crate::test_scratch::private_dir("ottto-dt-attribution");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("attribution-test".into());
+    let scope = Scope("attribution-file".into());
+    let index_path = root.join("index.json");
+    let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    index.save(&index_path).unwrap();
+    for before in [false, true] {
+        // Isolated child process: no concurrent test can observe the env.
+        std::env::set_var(
+            "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
+            if before { "1" } else { "0" },
+        );
+        let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+        let codex_before =
+            Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace);
+        let binding = expected(
+            DurableSource::ClaudeCode,
+            source,
+            &key,
+            &scope,
+            &index,
+            &interpretation,
+        )
+        .unwrap()
+        .binding;
+        let (reduction, _) = native_record(&path, &scope);
+        let mut store = DurableTailStore::new(store::store_dir_for_index(&index_path));
+        store
+            .write_after_save(
+                lock,
+                index.generation,
+                vec![PendingRecord {
+                    binding: binding.clone(),
+                    certificate: certificate(&path, &scope),
+                    body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
+                        .unwrap(),
+                    allowlist: codec::allowlist_digest(source),
+                }],
+            )
+            .unwrap();
+        std::env::set_var(
+            "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
+            if before { "0" } else { "1" },
+        );
+        let after = Interpretation::of(source, &key, &index, false, &namespace);
+        let changed = expected(
+            DurableSource::ClaudeCode,
+            source,
+            &key,
+            &scope,
+            &index,
+            &after,
+        )
+        .unwrap()
+        .binding;
+        assert_ne!(binding.scope, changed.scope);
+        assert_eq!(binding.entry, changed.entry);
+        assert_eq!(binding.key, changed.key);
+        assert_eq!(binding.context, changed.context);
+        assert_eq!(
+            codex_before.identity_contract,
+            Interpretation::of(SnapshotSource::Codex, &key, &index, false, &namespace)
+                .identity_contract
+        );
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        assert!(cache
+            .durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &after
+            )
+            .is_none());
+        let (counts, disk) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.ineligible.get("scope"), Some(&1));
+        assert_eq!(counts.restored, 0);
+        assert_eq!(disk.records_read, 1);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A Codex transcript whose open call's id is `call_id_bytes` long: the id
+/// is kept verbatim in the record body, so it sizes the body. Three counted
+/// requests close the session-start window first, so its re-derived opening
+/// content ends inside the 1 MiB head.
+fn codex_budget_fixture(path: &Path, session: &str, call_id_bytes: Option<usize>) {
+    let at = "2026-10-07T10:00:00Z";
+    let usage = |input: u64, output: u64| {
+        serde_json::json!({"input_tokens":input,"cached_input_tokens":0,
+            "output_tokens":output,"reasoning_output_tokens":0})
+    };
+    let mut lines = vec![
+        serde_json::json!({"type":"session_meta","timestamp":at,"payload":{"id":session,
+            "timestamp":at,"cwd":"/tmp/dt-budget","originator":"codex_cli_rs",
+            "cli_version":"0.50.0","source":"cli"}}),
+        serde_json::json!({"type":"turn_context","timestamp":at,
+            "payload":{"turn_id":"turn-1","cwd":"/tmp/dt-budget","model":"gpt-5.2"}}),
+    ];
+    for n in 1..=crate::snapshots::session_start::WINDOW_REQUESTS as u64 {
+        lines.push(serde_json::json!({"type":"event_msg","timestamp":at,
+            "payload":{"type":"token_count","info":{
+                "total_token_usage":usage(100 * n, 10 * n),
+                "last_token_usage":usage(100, 10),"model":"gpt-5.2"}}}));
+    }
+    if let Some(bytes) = call_id_bytes {
+        lines.push(open_call(bytes));
+    }
+    let text = lines
+        .iter()
+        .map(|line| line.to_string() + "\n")
+        .collect::<String>();
+    std::fs::write(path, text).unwrap();
+}
+
+fn open_call(call_id_bytes: usize) -> serde_json::Value {
+    serde_json::json!({"type":"response_item","timestamp":"2026-10-07T10:00:01Z",
+        "payload":{"type":"function_call","name":"shell",
+            "arguments":"{\"command\":[\"true\"]}",
+            "call_id":format!("call_{}", "x".repeat(call_id_bytes))}})
+}
+
+/// P2-1 (review r10): a resident deferred by the per-save byte budget
+/// (`WRITE_PASS_BYTES`) keeps its acquired selection provenance. Its next
+/// save, with no rescan or admission of the key in between, writes its
+/// record: no selection refusal, no invalidation of the key's existing
+/// record (intact while its replacement waits), and a restart restores the
+/// replacement. Arm `spent`: the first two bodies use the allowance exactly
+/// (`budget == 0`); arm `too_large`: the third body exceeds the remainder.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
+    let source = SnapshotSource::Codex;
+    let namespace = Scope("dt-budget".into());
+    let scope = Scope("dt-budget-file".into());
+    let cap = jsonl_line_cap() as u64;
+    let body_of = |path: &Path| {
+        let (reduction, checkpoint) = native_record_of(path, &scope, source);
+        let body = codec::encode(&reduction, store::RECORD_BYTES, cap).unwrap();
+        (reduction, checkpoint, body)
+    };
+    let entry = |path: &Path, fingerprint: &str| -> ScanIndexEntry {
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":std::fs::metadata(path).unwrap().len(),
+            "modified_unix_seconds":1,"source_file_fingerprint":fingerprint
+        }))
+        .unwrap()
+    };
+    let admit = |cache: &SharedCache,
+                 path: &Path,
+                 fingerprint: &str,
+                 (reduction, checkpoint): (CachedJsonlReduction, Checkpoint)| {
+        let key = local_index_key(path);
+        assert!(cache.insert_admitted(
+            key.clone(),
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint,
+                reduction: Some(reduction),
+                released: None,
+                unsealed: false,
+            },
+            0
+        ));
+        cache.durable_note_selection(&key, fingerprint);
+    };
+    for arm in ["spent", "too_large"] {
+        let root = crate::test_scratch::private_dir(&format!("ottto-dt-budget-{arm}"));
+        let lock = test_locks::hold(&root);
+        let index_path = root.join("index.json");
+        let store_dir = store::store_dir_for_index(&index_path);
+        let record_files = || {
+            std::fs::read_dir(store_dir.as_path())
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        // Keys write in key order: a, b, then c.
+        let [a, b, c] = ["a", "b", "c"].map(|name| root.join(format!("{name}.jsonl")));
+        let [session_a, session_b, session_c] = [
+            "019fa111-2222-7333-8444-00000000000a",
+            "019fa111-2222-7333-8444-00000000000b",
+            "019fa111-2222-7333-8444-00000000000c",
+        ];
+        let mut index = ScanIndex::default();
+
+        // Process 0: c's existing valid record.
+        codex_budget_fixture(&c, session_c, None);
+        let prior = SharedCache::default();
+        prior.durable_begin_pass(source, &index_path, &namespace, false);
+        let (reduction, checkpoint, _) = body_of(&c);
+        admit(&prior, &c, "fp-c0", (reduction, checkpoint));
+        index.files.insert(local_index_key(&c), entry(&c, "fp-c0"));
+        index.save(&index_path).unwrap();
+        prior.durable_write_after_save(lock, source, &index);
+        let existing = record_files();
+        assert_eq!(existing.len(), 1, "{arm}: c's prior record");
+        drop(prior);
+
+        // Process 1: a and b, then c's replacement, all resident.
+        let id_bytes = 3 * 1024 * 1024;
+        codex_budget_fixture(&a, session_a, Some(id_bytes));
+        let (reduction_a, checkpoint_a, body_a) = body_of(&a);
+        let b_body = |bytes: usize| {
+            codex_budget_fixture(&b, session_b, Some(bytes));
+            body_of(&b)
+        };
+        let mut b_bytes = id_bytes;
+        let mut found = b_body(b_bytes);
+        if arm == "spent" {
+            // Size b so a and b use the allowance exactly; the body grows
+            // with the id byte for byte (no varint boundary nearby).
+            let target = WRITE_PASS_BYTES - body_a.len();
+            for _ in 0..4 {
+                if found.2.len() == target {
+                    break;
+                }
+                b_bytes = (b_bytes + target).checked_sub(found.2.len()).unwrap();
+                found = b_body(b_bytes);
+            }
+            assert_eq!(
+                body_a.len() + found.2.len(),
+                WRITE_PASS_BYTES,
+                "{arm}: a={} b={} id={b_bytes}",
+                body_a.len(),
+                found.2.len()
+            );
+        }
+        let (reduction_b, checkpoint_b, body_b) = found;
+        let mut appended = std::fs::OpenOptions::new().append(true).open(&c).unwrap();
+        std::io::Write::write_all(
+            &mut appended,
+            (open_call(id_bytes).to_string() + "\n").as_bytes(),
+        )
+        .unwrap();
+        drop(appended);
+        let (reduction_c, checkpoint_c, body_c) = body_of(&c);
+        if arm == "too_large" {
+            let remainder = WRITE_PASS_BYTES - body_a.len() - body_b.len();
+            assert!(remainder > 0 && body_c.len() > remainder, "{arm}");
+        }
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        admit(&cache, &a, "fp-a", (reduction_a, checkpoint_a));
+        admit(&cache, &b, "fp-b", (reduction_b, checkpoint_b));
+        admit(&cache, &c, "fp-c1", (reduction_c, checkpoint_c));
+        index.files.insert(local_index_key(&a), entry(&a, "fp-a"));
+        index.files.insert(local_index_key(&b), entry(&b, "fp-b"));
+        index.files.insert(local_index_key(&c), entry(&c, "fp-c1"));
+        index.save(&index_path).unwrap();
+        cache.durable_write_after_save(lock, source, &index);
+        let (counts, disk) = cache.durable_counters(source).unwrap();
+        println!(
+            "dt_budget {arm} first save: {}",
+            counts.summary(source, &disk)
+        );
+        assert_eq!(counts.write_deferred, 1, "{arm}: c deferred by bytes");
+        assert_eq!(disk.records_written, 2, "{arm}: a and b");
+        assert_eq!(disk.disk_records, 3, "{arm}: c's prior, a, b");
+        assert!(counts.not_persisted.is_empty(), "{arm}");
+        assert_eq!(disk.records_invalidated, 0, "{arm}");
+        let after_first = record_files();
+        assert_eq!(after_first.len(), 3, "{arm}");
+        for (path, bytes) in &existing {
+            assert_eq!(
+                after_first.get(path),
+                Some(bytes),
+                "{arm}: c's record intact"
+            );
+        }
+        {
+            let stores = cache.durable().unwrap();
+            let key_c = local_index_key(&c);
+            assert!(stores.touched.contains(&key_c), "{arm}: c offered again");
+            assert_eq!(
+                stores.selected.get(&key_c).map(String::as_str),
+                Some("fp-c1"),
+                "{arm}: c keeps its acquired provenance"
+            );
+        }
+
+        // The next save: no rescan or admission of c in between.
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        index.save(&index_path).unwrap();
+        cache.durable_write_after_save(lock, source, &index);
+        let (counts, disk) = cache.durable_counters(source).unwrap();
+        println!(
+            "dt_budget {arm} second save: {}",
+            counts.summary(source, &disk)
+        );
+        assert_eq!(counts.write_deferred, 1, "{arm}");
+        assert_eq!(disk.records_written, 3, "{arm}: c's replacement written");
+        assert_eq!(disk.disk_records, 3, "{arm}");
+        assert!(
+            counts.not_persisted.is_empty(),
+            "{arm}: no selection refusal"
+        );
+        assert_eq!(disk.records_invalidated, 0, "{arm}");
+        let after_second = record_files();
+        assert_eq!(after_second.len(), 3, "{arm}");
+        for path in existing.keys() {
+            assert_ne!(
+                after_second.get(path),
+                existing.get(path),
+                "{arm}: replaced"
+            );
+        }
+        drop(cache);
+
+        // Restart: all three restore from the committed index.
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        let restart = SharedCache::default();
+        restart.durable_begin_pass(source, &index_path, &namespace, false);
+        for (path, body) in [(&a, &body_a), (&b, &body_b), (&c, &body_c)] {
+            let key = local_index_key(path);
+            let interpretation = Interpretation::of(source, &key, &loaded, false, &namespace);
+            let taken = restart
+                .durable_restore(
+                    source,
+                    &key,
+                    path,
+                    &scope,
+                    &mut File::open(path).unwrap(),
+                    &loaded,
+                    &interpretation,
+                )
+                .unwrap_or_else(|| {
+                    let (counts, disk) = restart.durable_counters(source).unwrap();
+                    panic!("{arm}: restore: {}", counts.summary(source, &disk))
+                });
+            assert_eq!(
+                codec::encode(&taken.retained.state, store::RECORD_BYTES, cap).unwrap(),
+                *body,
+                "{arm}"
+            );
+        }
+        let (counts, disk) = restart.durable_counters(source).unwrap();
+        println!("dt_budget {arm} restart: {}", counts.summary(source, &disk));
+        assert_eq!(counts.restored, 3, "{arm}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

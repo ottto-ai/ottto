@@ -9,7 +9,6 @@ Cargo.lock	1685	inventory only	inventory only	not reviewed in this pass
 Cargo.toml	41	targeted reading	fully read (text only)	not reviewed in this pass
 LICENSE	201	inventory only	inventory only	not reviewed in this pass
 NOTICE	7	inventory only	inventory only	not reviewed in this pass
-PUBLIC_EXPORT_MANIFEST.json	3158	inventory only	inventory only	not reviewed in this pass
 README.md	858	inventory only	inventory only	not reviewed in this pass
 SECURITY.md	46	inventory only	inventory only	not reviewed in this pass
 SUPPORT.md	38	inventory only	inventory only	not reviewed in this pass
@@ -105,7 +104,7 @@ crates/ottto-service/src/client_report.rs	361	targeted reading	structural scan	n
 crates/ottto-service/src/cloud_sessions.rs	8980	structural scan	partially read: 67-240,4310-4365	partially read: 1590-1718,2208-2315,2530-2657,4310-4365
 crates/ottto-service/src/codex_process_homes.rs	110	structural scan	structural scan	not reviewed in this pass
 crates/ottto-service/src/command_env.rs	694	targeted reading	structural scan	not reviewed in this pass
-crates/ottto-service/src/context_composition.rs	1911	targeted reading	partially read: 1606-1640	not reviewed in this pass
+crates/ottto-service/src/context_composition/	1911	targeted reading	partially read: 1606-1640 (of the former single file context_composition.rs, since split into this directory)	not reviewed in this pass
 crates/ottto-service/src/context_composition/tests.rs	1265	structural scan	structural scan	not reviewed in this pass
 crates/ottto-service/src/context_footprint.rs	2104	structural scan	partially read: 1-240	partially read: 203-223,380-511,572-608
 crates/ottto-service/src/context_posture.rs	861	structural scan	structural scan	not reviewed in this pass

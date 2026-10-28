@@ -12,6 +12,8 @@ fn p12_experimental_base_exit_account_deferred_hold_lets_a_bounded_claude_traver
 
 #[test]
 fn p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let scope = crate::snapshots::envelope_selection_experiment::Scope::restart();
     terminal_family_member_controls_keep_blocking_pruning_and_rebinding();
     assert_eq!(scope.counts().rearm_suppressed, 0);
@@ -20,6 +22,8 @@ fn p12_experimental_base_exit_terminal_family_member_controls_keep_blocking_prun
 
 #[test]
 fn p12_experimental_base_exit_terminal_family_never_committed_members_let_the_claude_census_complete() {
+    // Terminal-authority hold/rearm policy; E2 literal bodies bypass legacy demotion.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let scope = crate::snapshots::envelope_selection_experiment::Scope::restart();
     terminal_family_never_committed_members_let_the_claude_census_complete();
     assert_eq!(scope.counts().rearm_suppressed, 0);

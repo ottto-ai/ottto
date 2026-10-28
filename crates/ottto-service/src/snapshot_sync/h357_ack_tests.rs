@@ -62,10 +62,19 @@ fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
         body_witness_digest: version.map(|_| snapshot_upload_body_witness(item)),
         head_etag: None,
         head_challenge: None,
+        unchanged_basis: None,
     }
 }
 
 fn response(items: &[SnapshotItem], rejected: usize) -> SnapshotBatchResponse {
+    response_with_reason(items, rejected, "usage_accounting_authority_downgrade")
+}
+
+fn response_with_reason(
+    items: &[SnapshotItem],
+    rejected: usize,
+    reason: &str,
+) -> SnapshotBatchResponse {
     let mut refs = items[..items.len() - rejected]
         .iter()
         .map(reference)
@@ -91,7 +100,7 @@ fn response(items: &[SnapshotItem], rejected: usize) -> SnapshotBatchResponse {
             .map(|item| SnapshotEntityRejection {
                 source_session_id: item.source_session_id.clone(),
                 snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                reason: "usage_accounting_authority_downgrade".into(),
+                reason: reason.into(),
                 detail: "not logged".into(),
                 permanent: true,
                 occurrence_count: 1,
@@ -440,13 +449,8 @@ fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_tim
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-#[test]
-#[serial_test::serial(client_report)]
-fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success_clock() {
-    let _guard = SNAPSHOT_SYNC_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+/// Refuse every body of a two-item page with `reason` through the real upload.
+fn h359_all_rejected(reason: &str) -> (SnapshotUploadProgress, ResumableUploadResult, u64) {
     let items = items(2);
     let mut ledger = progress();
     let mut accepted = 0;
@@ -458,7 +462,7 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
         |i| i.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let ack = response(&batch, 2);
+            let ack = response_with_reason(&batch, 2, reason);
             ack.validate_entity_ack(&request(batch))?;
             Ok(ack)
         },
@@ -468,6 +472,19 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
     assert_eq!(outcome, ResumableUploadResult::Rejected { count: 2 });
     assert_eq!(accepted, 0);
     assert!(ledger.accepted_fingerprints.is_empty());
+    (ledger, outcome, accepted)
+}
+
+/// A non-dominated refusal pins the error path through the production
+/// chooser; the dominated twin is below.
+#[test]
+#[serial_test::serial(client_report)]
+fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success_clock() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (ledger, outcome, accepted) = h359_all_rejected("invalid");
     let now = Instant::now();
     let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
     for _ in 0..8 {
@@ -487,7 +504,7 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
             machine_id: "synthetic",
             scan_started_at: "2026-10-12T00:00:00Z",
             counts: SyncCounts::default(),
-            state: deferred_entity_state(true),
+            state: refused_entity_state(true, PermanentRefusalCounts::of(&ledger), true),
         },
         true,
     )
@@ -497,6 +514,35 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
     assert_eq!(
         status.last_error_code.as_deref(),
         Some("backend_validation_error")
+    );
+}
+
+/// Twin of the test above: the same all-refused page with a dominated reason
+/// goes through the settled-residue chooser instead of the error path.
+#[test]
+#[serial_test::serial(client_report)]
+fn h359_all_dominated_rejected_reports_the_settled_residue_state() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (ledger, _, _) = h359_all_rejected(DOMINATED_DOWNGRADE);
+    let refusals = PermanentRefusalCounts::of(&ledger);
+    assert_eq!(
+        refusals,
+        PermanentRefusalCounts {
+            total: 2,
+            dominated: 2
+        }
+    );
+    assert_eq!(
+        reported_code(refused_entity_state(true, refusals, true)),
+        None
+    );
+    assert_eq!(
+        reported_code(refused_entity_state(true, refusals, false)),
+        Some("backend_validation_error"),
+        "an unsettled cycle keeps the error path"
     );
 }
 
@@ -631,7 +677,11 @@ fn h359_refused_cache_probe_settles_without_head_and_healthy_sibling_continues()
                 .iter()
                 .filter(|i| i.snapshot_fingerprint == rejected_fp)
                 .count();
-            let mut ack = response(&batch, rejected);
+            // `response` rejects the batch tail; batch order follows the
+            // fingerprints, so put the refused probe last explicitly.
+            let mut ordered = batch.clone();
+            ordered.sort_by_key(|i| i.snapshot_fingerprint == rejected_fp);
+            let mut ack = response(&ordered, rejected);
             if cas {
                 for reference in ack
                     .accepted_entities
@@ -737,7 +787,11 @@ fn index_entry(source_file_fingerprint: &str) -> crate::snapshots::ScanIndexEntr
         codex_captured_tier_receipt: None,
         codex_captured_tier_receipt_required: false,
         codex_captured_uncommitted: false,
+        codex_counting_v2: false,
+        codex_counting_owner: None,
         effective_upload_body_witness_revision: 0,
+        opened_changed_nanos: 0,
+        opened_birth_nanos: 0,
     }
 }
 
@@ -1297,6 +1351,7 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
                 "shed" => Err(anyhow::Error::new(UploadShed {
                     status: 429,
                     retry_after: None,
+                    code: None,
                 })),
                 _ => Ok(SnapshotBatchResponse {
                     accepted: 0,
@@ -1758,4 +1813,340 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
     assert!(snapshots[0].cache_observations.is_some());
     assert_eq!(snapshots[0].cache_base_head_etag, Some("e".repeat(64)));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+const DOMINATED_DOWNGRADE: &str = "usage_accounting_authority_downgrade";
+const DOMINATED_STALE: &str = "accepted_log_stale_older_upload";
+
+/// Refuse `count` synthetic bodies with `reason` through the real ledger path.
+fn refuse(ledger: &mut SnapshotUploadProgress, reason: &str, count: usize) {
+    let start = ledger.permanent_rejections.len();
+    for i in start..start + count {
+        ledger.quarantine_permanent_body(&format!("{i:064x}"), &format!("body-{i}"), reason);
+    }
+}
+
+fn reported_code(state: CollectorState<'static>) -> Option<&'static str> {
+    match state {
+        CollectorState::Success => None,
+        CollectorState::Error { code, .. } => Some(code),
+        other => panic!("unexpected refused-entity state {other:?}"),
+    }
+}
+
+/// T1: a retained list of 286 authority downgrades and 23 stale older
+/// uploads, no holds. Every refusal is dominated, so the cycle is not a
+/// validation error.
+#[test]
+fn dominated_permanent_refusals_are_not_a_backend_validation_error() {
+    let mut ledger = progress();
+    refuse(&mut ledger, DOMINATED_DOWNGRADE, 286);
+    refuse(&mut ledger, DOMINATED_STALE, 23);
+    let refusals = PermanentRefusalCounts::of(&ledger);
+    assert_eq!(
+        refusals,
+        PermanentRefusalCounts {
+            total: 309,
+            dominated: 309
+        }
+    );
+    assert_eq!(
+        reported_code(refused_entity_state(true, refusals, true)),
+        None,
+        "dominated refusals report the settled-success state"
+    );
+    assert!(ledger.accepted_fingerprints.is_empty(), "never an ACK");
+}
+
+/// T2: one dominated plus one other permanent reason keeps today's code.
+#[test]
+fn a_non_dominated_permanent_refusal_keeps_backend_validation_error() {
+    for other in [
+        "divergent_duplicate_logical_session",
+        "body_exceeds_max_bytes",
+        "occurred_at_beyond_journal_retention",
+        "invalid",
+    ] {
+        let mut ledger = progress();
+        refuse(&mut ledger, DOMINATED_DOWNGRADE, 1);
+        refuse(&mut ledger, other, 1);
+        let refusals = PermanentRefusalCounts::of(&ledger);
+        assert_eq!(
+            refusals,
+            PermanentRefusalCounts {
+                total: 2,
+                dominated: 1
+            },
+            "{other}"
+        );
+        assert_eq!(
+            reported_code(refused_entity_state(true, refusals, true)),
+            Some("backend_validation_error"),
+            "{other}"
+        );
+    }
+    assert_eq!(
+        reported_code(refused_entity_state(
+            true,
+            PermanentRefusalCounts::default(),
+            true
+        )),
+        Some("backend_validation_error"),
+        "no retained refusal is no evidence of domination"
+    );
+}
+
+/// T3: dominated refusals plus a local hold stay unsettled, and the reported
+/// code is unchanged.
+#[test]
+#[serial_test::serial(source_manifests)]
+fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
+    let mut ledger = progress();
+    refuse(&mut ledger, DOMINATED_DOWNGRADE, 2);
+    let holds = LocalHoldSettlement {
+        held_entity_count: 1,
+        retry_pending_family_count: 0,
+        held_fingerprints: BTreeSet::from(["f".repeat(64)]),
+        account_deferred_fingerprints: BTreeSet::new(),
+        progress_blocking: false,
+        held_family_roots: None,
+    };
+    let settlement = settle_checkpointed_upload(
+        ScanIndex::default(),
+        &ScanIndex::default(),
+        &ledger,
+        &holds,
+        true,
+    );
+    assert!(!settlement.fully_settled);
+    let refusals = PermanentRefusalCounts::of(&ledger);
+    assert_eq!(
+        reported_code(refused_entity_state(
+            true,
+            refusals,
+            settlement.fully_settled
+        )),
+        Some("backend_validation_error")
+    );
+}
+
+/// T5: a retryable deferral stays `server_error`, whatever the ledger holds.
+#[test]
+fn retryable_deferrals_stay_server_error_beside_dominated_refusals() {
+    let mut ledger = progress();
+    refuse(&mut ledger, DOMINATED_STALE, 3);
+    let refusals = PermanentRefusalCounts::of(&ledger);
+    for settled in [true, false] {
+        assert_eq!(
+            reported_code(refused_entity_state(false, refusals, settled)),
+            Some("server_error")
+        );
+    }
+}
+
+/// F1: a newer body of a refused entity with a retryable conflict owes its own
+/// outcome. The older dominated refusal is no longer the entity's terminal
+/// record, so it cannot make the cycle a settled success.
+#[test]
+fn a_pending_newer_body_unbinds_its_dominated_refusal() {
+    let mut ledger = progress();
+    refuse(&mut ledger, DOMINATED_DOWNGRADE, 2);
+    ledger.quarantine_retryable_body(&format!("{:064x}", 0), "newer-body-0");
+    let refusals = PermanentRefusalCounts::of(&ledger);
+    assert_eq!(
+        refusals,
+        PermanentRefusalCounts {
+            total: 2,
+            dominated: 1
+        }
+    );
+    assert_eq!(
+        reported_code(refused_entity_state(true, refusals, true)),
+        Some("backend_validation_error")
+    );
+    assert!(ledger.accepted_fingerprints.is_empty(), "never an ACK");
+
+    // A refused body whose entity left the census keeps a terminal record for
+    // that same body, so it still counts as dominated.
+    let mut ledger = progress();
+    refuse(&mut ledger, DOMINATED_DOWNGRADE, 2);
+    ledger.retain_current_quarantines(&BTreeSet::new());
+    assert_eq!(
+        PermanentRefusalCounts::of(&ledger),
+        PermanentRefusalCounts {
+            total: 2,
+            dominated: 2
+        }
+    );
+}
+
+// --- In-place resend budget across the cache-head bootstrap stages ---
+
+fn short_shed() -> anyhow::Error {
+    anyhow::Error::new(UploadShed {
+        status: 503,
+        retry_after: Some(Duration::from_secs(1)),
+        code: None,
+    })
+}
+
+/// An exact ACK for one bootstrap or delivery batch; under head CAS every
+/// settled entity carries its held-head etag.
+fn stage_ack(batch: Vec<SnapshotItem>, enforce_head_cas: bool) -> Result<SnapshotBatchResponse> {
+    let mut ack = response(&batch, 0);
+    if enforce_head_cas {
+        for reference in ack
+            .accepted_entities
+            .iter_mut()
+            .chain(&mut ack.unchanged_entities)
+        {
+            reference.head_etag = Some("e".repeat(64));
+        }
+    }
+    ack.validate_entity_ack_with_head_cas(&request(batch), enforce_head_cas)?;
+    Ok(ack)
+}
+
+/// One source page gets two in-place resends and 10 s of waiting in total,
+/// not per bootstrap stage: two short sheds on the ordinary probe spend the
+/// budget, so a shed on the CAS repeat stands and the bootstrap keeps its
+/// existing unsettled-probe error.
+#[test]
+#[serial_test::serial(client_report)]
+fn inplace_retry_budget_spans_both_bootstrap_stages() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let probes = items(2);
+    let mut ledger = progress();
+    let mut calls = Vec::new();
+    let (result, waits) = with_inplace_retry_test_clock(None, || {
+        bootstrap_cache_heads(
+            &probes,
+            "inplace-bootstrap-budget",
+            &mut ledger,
+            true,
+            |batch, enforce_head_cas| {
+                calls.push(enforce_head_cas);
+                let stage_attempt = calls.iter().filter(|cas| **cas == enforce_head_cas).count();
+                let shed_attempts = if enforce_head_cas { 1 } else { 2 };
+                if stage_attempt <= shed_attempts {
+                    return Err(short_shed());
+                }
+                stage_ack(batch, enforce_head_cas)
+            },
+            |_| Ok(()),
+        )
+    });
+    assert!(
+        result.is_err(),
+        "the CAS shed stands once the page budget is spent"
+    );
+    assert_eq!(calls, [false, false, false, true]);
+    assert_eq!(waits.len(), 2);
+    assert!(waits.iter().sum::<Duration>() <= Duration::from_secs(10));
+    assert!(ledger.accepted_cache_heads.is_empty(), "no head is minted");
+}
+
+/// The source page's three stages as `finish_sync_source` runs them: ordinary
+/// bootstrap, its CAS repeat and the cache-bearing delivery, all drawing on
+/// one in-place budget. `sheds` gives the short sheds each stage meets before
+/// it succeeds. Returns the calls per stage (0, 1, 2), the waits, the
+/// delivery outcome and the ledger.
+fn shared_budget_source_page(
+    sheds: [usize; 3],
+) -> (
+    Vec<usize>,
+    Vec<Duration>,
+    Result<ResumableUploadResult>,
+    SnapshotUploadProgress,
+) {
+    let probes = items(2);
+    let mut snapshots = probes.clone();
+    for item in &mut snapshots {
+        item.cache_observations = Some(crate::snapshots::cache_observations::CacheObservations {
+            schema_version: 1,
+            operations: Vec::new(),
+            coverage: "complete".into(),
+            omitted_observation_count: None,
+        });
+    }
+    let mut ledger = progress();
+    let mut calls = Vec::new();
+    let (delivery, waits) = with_inplace_retry_test_clock(None, || {
+        let mut inplace_retry = InplaceRetryBudget::default();
+        bootstrap_cache_heads_with_budget(
+            &probes,
+            "inplace-source-page",
+            &mut ledger,
+            true,
+            &mut inplace_retry,
+            |batch, enforce_head_cas| {
+                let stage = usize::from(enforce_head_cas);
+                calls.push(stage);
+                if calls.iter().filter(|seen| **seen == stage).count() <= sheds[stage] {
+                    return Err(short_shed());
+                }
+                stage_ack(batch, enforce_head_cas)
+            },
+            |_| Ok(()),
+        )?;
+        apply_bootstrapped_cache_heads(&mut snapshots, &ledger)?;
+        let mut accepted = 0;
+        upload_resumable_batches_with_body_witness_partitioned(
+            &snapshots,
+            "inplace-source-page",
+            &mut ledger,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |item| Some(item.source_session_id.as_str()),
+            |_| false,
+            &mut inplace_retry,
+            |batch| {
+                calls.push(2);
+                if calls.iter().filter(|seen| **seen == 2).count() <= sheds[2] {
+                    return Err(short_shed());
+                }
+                stage_ack(batch, true)
+            },
+            |_| Ok(()),
+        )
+    });
+    (calls, waits, delivery, ledger)
+}
+
+/// Ordinary bootstrap, CAS repeat and cache-bearing delivery of one source
+/// page share two resends and 10 s of waiting. With one short shed in each
+/// stage, the first two are resent and the delivery's shed stands, so the
+/// page waits twice, never three or six times.
+#[test]
+#[serial_test::serial(client_report)]
+fn inplace_retry_budget_spans_bootstrap_and_cache_bearing_delivery() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (calls, waits, delivery, ledger) = shared_budget_source_page([1, 1, 1]);
+    assert_eq!(calls, [0, 0, 1, 1, 2]);
+    assert_eq!(waits.len(), 2, "two resends for the whole source page");
+    assert!(waits.iter().sum::<Duration>() <= Duration::from_secs(10));
+    assert_eq!(
+        delivery.unwrap(),
+        ResumableUploadResult::Shed {
+            retry_after: Some(Duration::from_secs(1))
+        },
+        "the delivery shed keeps today's backoff"
+    );
+    assert_eq!(ledger.accepted_cache_heads.len(), 2, "bootstrap settled");
+
+    // Within the budget, sheds spread over the bootstrap and the delivery are
+    // all recovered and the page settles as a first-try success would.
+    let (calls, waits, delivery, ledger) = shared_budget_source_page([1, 0, 1]);
+    assert_eq!(calls, [0, 0, 1, 2, 2]);
+    assert_eq!(waits.len(), 2);
+    assert!(waits.iter().sum::<Duration>() <= Duration::from_secs(10));
+    assert_eq!(delivery.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(ledger.accepted_cache_heads.len(), 2);
 }

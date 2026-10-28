@@ -20,6 +20,10 @@ pub const OTTTO_RELAY_DEVICE_SECRET_ACCOUNT: &str = "relay-device-secret";
 pub const OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT: &str = "prior-relay-device-secret";
 pub const OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT: &str = "pending-relay-device-secret";
 pub const OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT: &str = "pending-setup-run-token";
+pub const OTTTO_REVOCATION_RECEIPT_ACCOUNT: &str = "revocation-receipt";
+pub const OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT: &str = "local-release-marker";
+pub const OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT: &str = "local-release-device-proof";
+pub const OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT: &str = "history-browser-claim";
 pub const CONTROL_TOKEN_FILE_NAME: &str = "control-token";
 
 #[derive(Debug, Error)]
@@ -30,6 +34,9 @@ pub enum TokenStoreError {
     Store(String),
     #[error("control token is not valid UTF-8")]
     InvalidUtf8,
+    /// A daemon owns local state but has not saved its control token yet.
+    #[error("ottto-service is starting and has not created its control token yet")]
+    DaemonNotReady,
 }
 
 pub trait ControlTokenStore {
@@ -82,6 +89,7 @@ pub struct KeychainTokenStore;
 #[derive(Debug, Clone)]
 pub struct KeychainSecretStore {
     account: &'static str,
+    keychain_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +156,20 @@ impl ControlTokenStore for FileControlTokenStore {
 
 impl KeychainSecretStore {
     pub const fn new(account: &'static str) -> Self {
-        Self { account }
+        Self {
+            account,
+            keychain_only: false,
+        }
+    }
+
+    /// Use the existing Keychain service without a file mirror or fallback.
+    /// Explicit file-store isolation disables this store rather than touching
+    /// the real Keychain or writing the secret to disk.
+    pub const fn keychain_only(account: &'static str) -> Self {
+        Self {
+            account,
+            keychain_only: true,
+        }
     }
 }
 
@@ -170,6 +191,13 @@ impl ControlTokenStore for KeychainTokenStore {
 #[cfg(target_os = "macos")]
 impl ControlTokenStore for KeychainSecretStore {
     fn load(&self) -> Result<String, TokenStoreError> {
+        if self.keychain_only {
+            return if explicit_file_secret_store() {
+                Err(TokenStoreError::Missing)
+            } else {
+                run_keychain_with_timeout(self.account, "load", keychain_load)
+            };
+        }
         // An explicit file-store directory is an isolation boundary, not just
         // a different mirror location. Tests and support tools use it with a
         // temporary HOME and must never fall through to the user's Keychain.
@@ -193,6 +221,17 @@ impl ControlTokenStore for KeychainSecretStore {
     }
 
     fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+        if self.keychain_only {
+            if explicit_file_secret_store() {
+                return Err(TokenStoreError::Store(
+                    "Keychain-only storage is unavailable".to_string(),
+                ));
+            }
+            let token = token.to_string();
+            return run_keychain_with_timeout(self.account, "save", move |account| {
+                keychain_save(account, &token)
+            });
+        }
         if explicit_file_secret_store() {
             return save_file_secret(self.account, token);
         }
@@ -219,6 +258,13 @@ impl ControlTokenStore for KeychainSecretStore {
     }
 
     fn delete(&self) -> Result<(), TokenStoreError> {
+        if self.keychain_only {
+            return if explicit_file_secret_store() {
+                Ok(())
+            } else {
+                run_keychain_with_timeout(self.account, "delete", keychain_delete)
+            };
+        }
         if explicit_file_secret_store() {
             return delete_file_secret(self.account);
         }
@@ -461,14 +507,25 @@ impl ControlTokenStore for KeychainTokenStore {
 #[cfg(not(target_os = "macos"))]
 impl ControlTokenStore for KeychainSecretStore {
     fn load(&self) -> Result<String, TokenStoreError> {
+        if self.keychain_only {
+            return Err(TokenStoreError::Missing);
+        }
         load_file_secret(self.account)
     }
 
     fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+        if self.keychain_only {
+            return Err(TokenStoreError::Store(
+                "Keychain-only storage is unavailable".to_string(),
+            ));
+        }
         save_file_secret(self.account, token)
     }
 
     fn delete(&self) -> Result<(), TokenStoreError> {
+        if self.keychain_only {
+            return Ok(());
+        }
         delete_file_secret(self.account)
     }
 }
@@ -493,6 +550,52 @@ pub fn load_or_create_control_token() -> Result<String, TokenStoreError> {
     }
 
     let store = FileControlTokenStore::default();
+    match store.load() {
+        Ok(token) => Ok(token),
+        Err(TokenStoreError::Missing) => {
+            let token = generate_control_token().map_err(TokenStoreError::Store)?;
+            store.save(&token)?;
+            Ok(token)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Client-side fallback when the control token cannot be read. A missing
+/// token is created only while this process holds the daemon's
+/// state-directory lock, so a client and a starting daemon can never each
+/// save a different token. When a daemon holds the lock it creates the token
+/// itself: the existing token is used, or `DaemonNotReady` is returned and
+/// nothing is written.
+#[cfg(unix)]
+pub fn load_or_create_control_token_unless_daemon_owns() -> Result<String, TokenStoreError> {
+    if let Ok(token) = std::env::var(OTTTO_CONTROL_TOKEN_ENV) {
+        return Ok(token);
+    }
+    load_or_create_control_token_unless_owned_in(&default_support_dir())
+}
+
+#[cfg(not(unix))]
+pub fn load_or_create_control_token_unless_daemon_owns() -> Result<String, TokenStoreError> {
+    load_or_create_control_token()
+}
+
+#[cfg(unix)]
+fn load_or_create_control_token_unless_owned_in(
+    support_dir: &Path,
+) -> Result<String, TokenStoreError> {
+    use crate::state_dir_lock::{StateDirLock, StateDirLockError};
+    let store = FileControlTokenStore::new(support_dir.join(CONTROL_TOKEN_FILE_NAME));
+    let _lock = match StateDirLock::acquire(support_dir) {
+        Ok(lock) => lock,
+        Err(StateDirLockError::Held { .. }) => {
+            return match store.load() {
+                Err(TokenStoreError::Missing) => Err(TokenStoreError::DaemonNotReady),
+                other => other,
+            };
+        }
+        Err(error) => return Err(TokenStoreError::Store(error.to_string())),
+    };
     match store.load() {
         Ok(token) => Ok(token),
         Err(TokenStoreError::Missing) => {
@@ -734,6 +837,32 @@ fn secret_file_name(account: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that resolve the env-driven secret fallback dir:
+    /// one of them points `OTTTO_SECRET_FALLBACK_DIR_ENV` at its own directory
+    /// and removes it, which would pull files from under the other.
+    static SECRET_FALLBACK_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_secret_fallback_dir_env() -> std::sync::MutexGuard<'static, ()> {
+        SECRET_FALLBACK_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn revocation_receipt_keychain_only_never_uses_file_store() {
+        let _env = lock_secret_fallback_dir_env();
+        // cfg(test) isolates all Keychain access. Even an existing fallback
+        // must not be read, replaced, or removed by the Keychain-only store.
+        let mirrored = KeychainSecretStore::new(OTTTO_REVOCATION_RECEIPT_ACCOUNT);
+        mirrored.save("synthetic-file-value").unwrap();
+        let isolated = KeychainSecretStore::keychain_only(OTTTO_REVOCATION_RECEIPT_ACCOUNT);
+        assert!(matches!(isolated.load(), Err(TokenStoreError::Missing)));
+        assert!(isolated.save("synthetic-keychain-only-value").is_err());
+        isolated.delete().unwrap();
+        assert_eq!(mirrored.load().unwrap(), "synthetic-file-value");
+        mirrored.delete().unwrap();
+    }
+
     #[test]
     #[cfg(unix)]
     fn diagnostic_cache_writer_is_private_atomic_and_does_not_follow_target() {
@@ -812,6 +941,7 @@ mod tests {
 
     #[test]
     fn file_secret_store_round_trips_with_sanitized_names_and_user_only_permissions() {
+        let _env = lock_secret_fallback_dir_env();
         let dir =
             std::env::temp_dir().join(format!("ottto-secret-fallback-test-{}", std::process::id()));
         let previous = std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV);
@@ -1109,5 +1239,115 @@ mod tests {
         assert_eq!(result, Err(ERR_SEC_NO_SUCH_KEYCHAIN));
         assert_eq!(attempts.get(), 2);
         assert_eq!(reresolves.get(), 1);
+    }
+
+    /// A daemon holding local state and still creating its token: the CLI
+    /// fallback reports not-ready and writes nothing, then uses the token
+    /// the daemon saves.
+    #[cfg(unix)]
+    #[test]
+    fn cli_token_fallback_never_creates_while_a_daemon_owns_state() {
+        use crate::state_dir_lock::{scratch, StateDirLock, STATE_DIR_LOCK_FILE_NAME};
+        let root = scratch("cli-token-held");
+        let support = root.join("Ottto");
+        let daemon = StateDirLock::acquire(&support).expect("daemon owns state");
+        let lock_bytes = fs::read(support.join(STATE_DIR_LOCK_FILE_NAME)).expect("lock");
+
+        let result = load_or_create_control_token_unless_owned_in(&support);
+        assert!(
+            matches!(result, Err(TokenStoreError::DaemonNotReady)),
+            "{result:?}"
+        );
+        let names: Vec<_> = fs::read_dir(&support)
+            .expect("support dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from(STATE_DIR_LOCK_FILE_NAME)]
+        );
+        assert_eq!(
+            fs::read(support.join(STATE_DIR_LOCK_FILE_NAME)).expect("lock"),
+            lock_bytes
+        );
+
+        let store = FileControlTokenStore::new(support.join(CONTROL_TOKEN_FILE_NAME));
+        store.save("daemon-token").expect("daemon saves its token");
+        assert_eq!(
+            load_or_create_control_token_unless_owned_in(&support).expect("existing token"),
+            "daemon-token"
+        );
+        assert_eq!(store.load().expect("token kept"), "daemon-token");
+        drop(daemon);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Daemons and CLI fallbacks starting together on a fresh directory end
+    /// with exactly one saved token, and every caller that got one got it.
+    #[cfg(unix)]
+    #[test]
+    fn simultaneous_first_start_saves_one_token() {
+        use crate::state_dir_lock::{scratch, StateDirLock};
+        const STARTERS: usize = 8;
+        for round in 0..16 {
+            let root = scratch(&format!("token-first-start-{round}"));
+            let support = root.join("Ottto");
+            let barrier = Arc::new(std::sync::Barrier::new(STARTERS));
+            let threads: Vec<_> = (0..STARTERS)
+                .map(|starter| {
+                    let support = support.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if starter % 2 == 0 {
+                            // serve: lock for life, then load or create.
+                            let Ok(lock) = StateDirLock::acquire(&support) else {
+                                return (None, None);
+                            };
+                            let store =
+                                FileControlTokenStore::new(support.join(CONTROL_TOKEN_FILE_NAME));
+                            let token = match store.load() {
+                                Ok(token) => token,
+                                Err(TokenStoreError::Missing) => {
+                                    let token = generate_control_token().expect("token");
+                                    store.save(&token).expect("save token");
+                                    token
+                                }
+                                Err(error) => panic!("{error}"),
+                            };
+                            (Some(token), Some(lock))
+                        } else {
+                            match load_or_create_control_token_unless_owned_in(&support) {
+                                Ok(token) => (Some(token), None),
+                                Err(TokenStoreError::DaemonNotReady) => (None, None),
+                                Err(error) => panic!("{error}"),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let results: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().expect("starter"))
+                .collect();
+            let saved = FileControlTokenStore::new(support.join(CONTROL_TOKEN_FILE_NAME))
+                .load()
+                .expect("one token saved");
+            let tokens: Vec<_> = results
+                .iter()
+                .filter_map(|(token, _)| token.clone())
+                .collect();
+            assert!(!tokens.is_empty(), "round {round}");
+            assert!(
+                tokens.iter().all(|token| *token == saved),
+                "round {round}: {tokens:?} vs {saved}"
+            );
+            assert!(
+                results.iter().filter(|(_, lock)| lock.is_some()).count() <= 1,
+                "round {round}: two daemons owned state"
+            );
+            drop(results);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }

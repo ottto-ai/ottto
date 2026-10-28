@@ -145,6 +145,25 @@ impl<T: HeapLayoutBound> HeapLayoutBound for Option<T> {
         Some(())
     }
 }
+impl<T: HeapLayoutBound> HeapLayoutBound for std::cell::OnceCell<T> {
+    fn stable_heap(&self) -> bool {
+        self.get().map_or(true, HeapLayoutBound::stable_heap)
+    }
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(0)?;
+        if let Some(x) = self.get() {
+            x.heap_bound(c)?;
+        }
+        Some(())
+    }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(0)?;
+        if let Some(x) = self.get() {
+            x.completed_heap_bound(c)?;
+        }
+        Some(())
+    }
+}
 impl<T: HeapLayoutBound> HeapLayoutBound for Vec<T> {
     fn stable_heap(&self) -> bool {
         self.iter().all(HeapLayoutBound::stable_heap)
@@ -194,13 +213,17 @@ impl<T: HeapLayoutBound> HeapLayoutBound for VecDeque<T> {
         Some(())
     }
 }
+/// The bytes `tree_nodes` charges per entry: one full node (see there).
+pub(crate) fn tree_node_bytes<K, V>() -> Option<usize> {
+    256usize
+        .checked_add(12 * size_of::<usize>())?
+        .checked_add(11usize.checked_mul(size_of::<K>().checked_add(size_of::<V>())?)?)
+}
 pub(crate) fn tree_nodes<K, V>(len: usize, c: &mut Counter) -> Option<()> {
     // Rust1.88/1.95 B=6:11 key/value slots and12 edges. Charging one full node per
     // entry plus one root overcounts unused slots and internal/leaf grouping.
     // A zero-length map may retain its empty allocated root after removal.
-    let node = 256usize
-        .checked_add(12 * size_of::<usize>())?
-        .checked_add(11usize.checked_mul(size_of::<K>().checked_add(size_of::<V>())?)?)?;
+    let node = tree_node_bytes::<K, V>()?;
     c.add(len.checked_add(1)?.checked_mul(node)?)
 }
 impl<K: HeapLayoutBound, V: HeapLayoutBound> HeapLayoutBound for BTreeMap<K, V> {
@@ -387,7 +410,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentDiagnost
     }
 }
 
-crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusPlanObservation; observed_at, evidence_method, source_session_id, provider, billing_provider, model_provider, billing_channel, auth_mode, gateway_provider, subscription_product, plan_type, account_label, account_id, organization_label, organization_id, account_identifier_hash, organization_identifier_hash, superseded_account_identifier_hash, superseded_organization_identifier_hash, credential_fingerprint_hash, billing_identity_evidence, billing_identity_confidence, confidence, is_current);
+crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusPlanObservation; desktop_recent_at, observed_at, evidence_method, source_session_id, provider, billing_provider, model_provider, billing_channel, auth_mode, gateway_provider, subscription_product, plan_type, account_label, account_id, organization_label, organization_id, account_identifier_hash, organization_identifier_hash, superseded_account_identifier_hash, superseded_organization_identifier_hash, credential_fingerprint_hash, billing_identity_evidence, billing_identity_confidence, confidence, is_current);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentStatusConfidence {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

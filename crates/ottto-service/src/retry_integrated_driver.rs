@@ -241,6 +241,7 @@ fn integrated_send(
                             return Err(anyhow::Error::new(crate::snapshot_client::UploadShed {
                                 status: 503,
                                 retry_after: Some(Duration::from_secs(60)),
+                                code: None,
                             }));
                         }
                         IntegratedScript::AuthReplay => {
@@ -377,15 +378,25 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
     baseline.save(&index_path).unwrap();
     let mut working = baseline.clone();
     working.activate_upload_context("integration-policy".into());
-    working.activate_effective_upload_body_witness_revision(1);
-    let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
-        SnapshotSource::ClaudeCode,
-        std::slice::from_ref(&root),
-        &mut working,
-        "2026-10-05T00:00:00Z",
-        crate::snapshots::BACKFILL_WINDOW_DAYS,
-        100,
-        true,
+    // The daemon's current Claude revision: gate on, the literal guard
+    // denies a request-owned body below revision 3.
+    working.activate_effective_upload_body_witness_revision(
+        crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
+    );
+    // Ordinary transcripts: each file exists before its records (E2).
+    let mut scan = crate::snapshots::claude_request_money::e2::with_fixture_birth(
+        start.unix_timestamp_nanos() as u64,
+        || {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut working,
+                "2026-10-05T00:00:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                100,
+                true,
+            )
+        },
     )
     .unwrap();
     for item in &mut scan.snapshots {
@@ -393,6 +404,14 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
         item.cache_observations_state = None;
         item.session_account_evidence = None;
     }
+    // Production order: the local-evidence stage finishes the E2 bodies
+    // (gate on, they carry the hours) before policy finalization.
+    let withheld = crate::snapshots::claude_request_money::e2::finish_page(
+        &mut scan.snapshots,
+        &working,
+        crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded,
+    );
+    assert!(withheld.is_empty(), "{withheld:?}");
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut working);
     assert_eq!(scan.snapshots.len(), sessions);
     assert!(scan

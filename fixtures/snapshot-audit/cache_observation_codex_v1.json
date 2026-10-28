@@ -1,5 +1,5 @@
 {
-  "body_witness_digest": "783c6eec9f21352990e06315765b265c7dee9ff82cd136aef995a53baf51ba7e",
+  "body_witness_digest": "8e5f2ffcdce04a1ce5bd5c0faa83dd0845ee13507ad325993be7a62a06ea60c6",
   "body_witness_version": 20,
   "cache_observations_state": {
     "coverage": "complete",
@@ -58,7 +58,7 @@
   },
   "snapshot": {
     "activity_summary": {
-      "capability_collection_version": "agent_capability_usage:v1",
+      "capability_collection_version": "agent_capability_usage:v2",
       "changed_files": 0,
       "lines_added": 0,
       "lines_deleted": 0,
@@ -146,7 +146,7 @@
         }
       ],
       "ownership_revision": "codex_owned_rollout_occurrences:v1",
-      "parser_revision": "codex_jsonl:v38",
+      "parser_revision": "codex_jsonl:v40",
       "points": [
         {
           "compaction_after_request_boundary_index": null,
@@ -200,8 +200,12 @@
         "reasoning_effort": "high",
         "reasoning_output_tokens": 0,
         "request_count": 3,
-        "selector_context": {},
-        "selector_sources": {}
+        "selector_context": {
+          "context_bucket": "short"
+        },
+        "selector_sources": {
+          "context_bucket": "derived_from_last_token_usage"
+        }
       }
     ],
     "output_tokens": 3,
@@ -216,24 +220,24 @@
     "semantic_envelope": {
       "component_contract_version": "snapshot_semantic:v1",
       "component_hashes": {
-        "activity_summary": "348307e04856d6c750d45c50ceda5974e7f256ad6111c437f459b1a3345ef97f",
+        "activity_summary": "74fe5c3284ea3cc561063577aea6bc6ec055c3d4aafc7d18da04bff647f9db3e",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "1b2a8916ff336a10f9102221472500fd0ea1874ca7a56957faf50285384a4b7c",
         "context_posture": "09bf0e9a129e80ccea506b9f7b8e3d982d76cb62950192e6c99f69f1acd72cc5",
         "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
         "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
         "lifecycle_activity": "95c24d9640f43a112ba680558c8b0af3a27cf9f6f5fdca388076356bb305f341",
-        "usage_accounting": "b13e1ddc2c6f47ffb4754cde2debc4e6ef2680083cb487e846fe40437fb92f5a"
+        "usage_accounting": "ae0628ecb13e610dcf19728c72785c15322758135891179e590f713d5981033a"
       },
-      "content_hash": "7d3bbac2652260a3ae9147f7bb5b0b9a55bd0160e758adb6e80df874e5c48fae",
+      "content_hash": "19fd8fb2e372459f7ac670cad4cfd15accdb70668f82174622d82adb007a046b",
       "hash_epoch": 1,
       "revision_contract_version": "snapshot_revision:v1",
-      "revision_hash": "1528e31f6b5cfeb71e01cb828f0051c00414c5b07d4672ac0fced2aa22a2bcf6",
+      "revision_hash": "5b5798d0b8445224846d47dd57a851d809e8008744a04722ae14d40f98fea210",
       "revision_v2_canonicalization": "rfc8785:integers-only:v1",
       "revision_v2_contract_version": "snapshot_revision:v2",
-      "revision_v2_hash": "88cad3c1e13a5715415e5e4e6fd3b01c9c12029574eda454dc64a72725345c12",
-      "revision_v2_parser_version": "codex_jsonl:v38",
-      "revision_v2_scan_identity_version": "codex_jsonl:v33",
+      "revision_v2_hash": "3fe0d6bdcf00651e6875705762d75e2082307bc674258af5d6d860f605eb668f",
+      "revision_v2_parser_version": "codex_jsonl:v40",
+      "revision_v2_scan_identity_version": "codex_jsonl:v34",
       "upload_policy": {
         "session_artifacts_enabled": false,
         "session_attribution_enabled": false,
@@ -244,7 +248,7 @@
     },
     "session_display_name": null,
     "session_display_name_source": null,
-    "snapshot_fingerprint": "83d1f920175d4759ea1c4165bdd04597f4c8657b0b979b7c102d17668f2d8d36",
+    "snapshot_fingerprint": "e3221306a30b49b47dd52a6afbad3313072a82c78dd6378efb51a775256a9a11",
     "source_ended_at": null,
     "source_file_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     "source_last_activity_at": "2026-09-30T10:00:02Z",
@@ -270,8 +274,12 @@
             "reasoning_effort": "high",
             "reasoning_output_tokens": 0,
             "request_count": 3,
-            "selector_context": {},
-            "selector_sources": {}
+            "selector_context": {
+              "context_bucket": "short"
+            },
+            "selector_sources": {
+              "context_bucket": "derived_from_last_token_usage"
+            }
           }
         ]
       }

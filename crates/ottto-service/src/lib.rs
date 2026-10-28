@@ -15,23 +15,35 @@ pub(crate) mod claude_status_coverage;
 pub mod claude_upkeep;
 pub mod client_report;
 pub mod cloud_sessions;
+pub mod codex_prelude_footprint;
 mod codex_process_homes;
 mod codex_scan_diagnostics;
 pub mod codex_sign_in;
 pub(crate) mod command_env;
+mod composition_kinds;
 pub mod context_composition;
+mod context_file_counts;
 pub mod context_footprint;
 pub mod context_posture;
 pub mod control;
 pub mod control_plane_health;
+mod desktop_recent;
 pub mod detected_uses;
+mod durable_tail_codec;
+#[cfg(unix)]
+mod durable_tail_store;
 mod external_scheduler_attribution;
 #[cfg(unix)]
 pub(crate) mod fd_guard;
+mod instruction_inventory;
 pub mod keychain;
 mod launch_events;
 pub mod legacy_service;
 mod local_resource_diagnostics;
+#[cfg(unix)]
+mod local_state_sweep;
+#[cfg(unix)]
+pub mod locked_state_dir;
 pub mod macos_service;
 pub mod mcp_inventory;
 pub(crate) mod net_resilience;
@@ -40,6 +52,7 @@ pub mod otlp_relay;
 pub(crate) mod provider_calls;
 pub mod provider_daily_reference;
 pub(crate) mod quota_credit_model;
+mod relay_auth;
 mod retry_tls;
 pub mod session_attribution;
 pub mod snapshot_audit;
@@ -50,6 +63,9 @@ pub mod snapshot_sync;
 pub mod snapshot_watcher;
 pub mod snapshots;
 mod source_rotation;
+pub mod telemetry_attach;
+#[cfg(test)]
+mod test_isolation;
 #[cfg(test)]
 mod test_scratch;
 mod transcript_acquisition;
@@ -59,6 +75,12 @@ pub mod unix_socket;
 pub mod upload_receipts;
 pub mod xpc_mach;
 
+#[cfg(unix)]
+pub use local_state_sweep::{run_local_state_sweep_command, sweep_local_state_at_startup};
+#[cfg(unix)]
+pub use ottto_core::state_dir_lock;
+
+use crate::control::TerminalRefreshRejection;
 use crate::detected_uses::{prune_stale_detected_uses, DETECTED_USE_RETENTION_DAYS};
 use ottto_core::{
     compiled_release_version, default_connection_api_base_url, default_support_dir, empty_status,
@@ -137,6 +159,8 @@ pub struct BackendErrorDetails {
     pub endpoint: String,
     pub status: Option<u16>,
     pub body_excerpt: Option<String>,
+    /// Stable machine code the error body named, when it named one.
+    pub reason_code: Option<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -225,6 +249,7 @@ impl ControlToken {
 #[derive(Debug, Clone)]
 pub struct LocalDaemon {
     transcript_cache: Arc<snapshots::sampled_scan::SharedCache>,
+    footprint_cwds: Arc<context_footprint::CwdProjection>,
     native_comparison: Arc<snapshots::claude_native_comparison::lifecycle::Lifecycle>,
     inner: Arc<Mutex<DaemonState>>,
     control_token: ControlToken,
@@ -318,6 +343,12 @@ impl DaemonState {
                 eprintln!("failed to persist source state for {slug}: {error}");
             }
         }
+    }
+
+    fn binds_setup_run(&self, binding: &LocalConnectionBinding) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|current| setup_run_binding_matches(current, binding))
     }
 
     /// Clear the in-memory first-seen + reconciliation maps and delete the
@@ -434,6 +465,7 @@ impl LocalDaemon {
         let now = now.into();
         Self {
             transcript_cache: Arc::new(snapshots::sampled_scan::SharedCache::default()),
+            footprint_cwds: Arc::default(),
             native_comparison: Arc::new(
                 snapshots::claude_native_comparison::lifecycle::Lifecycle::default(),
             ),
@@ -723,6 +755,7 @@ impl LocalDaemon {
             claim_code: Some(claim_code.to_string()),
             api_base_url: default_connection_api_base_url(),
         });
+        clear_setup_run_read_rejection(&mut state);
         state.account = account.clone();
         Ok(AuthCompleteResponse {
             account,
@@ -865,6 +898,7 @@ impl LocalDaemon {
             claim_code: Some(claim_code.to_string()),
             api_base_url: default_connection_api_base_url(),
         });
+        clear_setup_run_read_rejection(&mut state);
         state.account = account.clone();
         Ok(AuthCompleteResponse {
             account,
@@ -893,6 +927,19 @@ impl LocalDaemon {
             code: ACCOUNT_NOT_FOUND_MESSAGE_CODE.to_string(),
             text: "The Ottto account this Mac was connected to no longer exists. Sign in to connect it to an account.".to_string(),
         });
+        Ok(())
+    }
+
+    /// Registration requested browser consent. Preserve the bound account and
+    /// candidate; expose the existing sign-in action instead of a failed setup.
+    pub(crate) fn mark_history_choice_required(&self) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        state.account.state = LocalAccountState::ReattachRequired;
+        state.account.message = Some(StableMessage {
+            code: "history_choice_required".to_string(),
+            text: "Waiting for browser sign-in to finish.".to_string(),
+        });
+        state.account.can_reconnect = Some(true);
         Ok(())
     }
 
@@ -969,6 +1016,7 @@ impl LocalDaemon {
         };
         state.account = LocalAccountBinding::not_connected();
         state.connection = None;
+        clear_setup_run_read_rejection(&mut state);
         state.pending_auth = None;
         state.pending_switch = None;
         state.sources.clear();
@@ -980,6 +1028,7 @@ impl LocalDaemon {
             cloud_disconnected: false,
             setup_run_id: None,
             disconnected_at: None,
+            device_released: None,
             message: StableMessage {
                 code: "disconnected".to_string(),
                 text: "This Mac is disconnected from Ottto.".to_string(),
@@ -1010,11 +1059,7 @@ impl LocalDaemon {
     pub fn connection_for_authorized_client(
         &self,
     ) -> Result<Option<LocalConnectionBinding>, LocalApiError> {
-        self.connection_for_authorized_client_with(|| {
-            FileConnectionStore::default()
-                .load()
-                .map_err(|_| LocalApiError::StatePoisoned)
-        })
+        self.connection_for_authorized_client_with(load_persisted_connection)
     }
 
     fn connection_for_authorized_client_with<F>(
@@ -1025,12 +1070,22 @@ impl LocalDaemon {
         F: FnOnce() -> Result<Option<LocalConnectionBinding>, LocalApiError>,
     {
         let mut state = self.state()?;
-        if state.connection.is_none() {
-            if let Some(connection) = load_connection()? {
-                state.connection = Some(connection);
-            }
-        }
-        Ok(state.connection.clone())
+        load_connection_into(&mut state, load_connection)
+    }
+
+    /// The setup-run binding an agent read starts with, together with the
+    /// read-rejection revision it starts from. Both are captured under one
+    /// state lock, so the revision describes exactly what this binding's
+    /// reads had recorded when this read began.
+    pub(crate) fn setup_run_read_start(&self) -> Result<Option<SetupRunReadStart>, LocalApiError> {
+        let mut state = self.state()?;
+        let Some(binding) = load_connection_into(&mut state, load_persisted_connection)? else {
+            return Ok(None);
+        };
+        Ok(Some(SetupRunReadStart {
+            binding,
+            revision: setup_run_read_revision(&state.local_health_events),
+        }))
     }
 
     pub fn bind_setup_run_for_authorized_client(
@@ -1038,7 +1093,14 @@ impl LocalDaemon {
         connection: LocalConnectionBinding,
     ) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
+        let replaces_binding = !state
+            .connection
+            .as_ref()
+            .is_some_and(|current| setup_run_binding_matches(current, &connection));
         state.connection = Some(connection);
+        if replaces_binding {
+            clear_setup_run_read_rejection(&mut state);
+        }
         Ok(())
     }
 
@@ -1055,6 +1117,7 @@ impl LocalDaemon {
             return Ok(false);
         }
         state.connection = None;
+        clear_setup_run_read_rejection(&mut state);
         Ok(true)
     }
 
@@ -1274,7 +1337,15 @@ impl LocalDaemon {
             .collect::<Result<Vec<_>, _>>()?;
         let snapshots = collections
             .iter()
-            .flat_map(|collection| collection.snapshots.iter().cloned())
+            .flat_map(|collection| {
+                let mut snapshots = collection.snapshots.clone();
+                desktop_recent::overlay(
+                    &mut snapshots,
+                    &collection.source_health_snapshot,
+                    time::OffsetDateTime::now_utc(),
+                );
+                snapshots
+            })
             .collect::<Vec<_>>();
         let mut state = self.state()?;
         for collection in collections {
@@ -1442,6 +1513,107 @@ impl LocalDaemon {
             serde_json::json!({
                 "kind": "snapshot_sync_recovered",
                 "message": "local snapshot sync recovered",
+                "current": true
+            }),
+        );
+        Ok(())
+    }
+
+    /// Record that an agent read (`ottto costs`, `sessions`, `context`, ...)
+    /// ended in an authoritative terminal answer from the device-secret
+    /// refresh: Ottto ended the setup run, or no longer accepts this Mac's
+    /// device credential. An ended run only makes the setup-run and token
+    /// states honest and adds a Warning: uploads use the device credential
+    /// and keep working. A refused device credential marks the device
+    /// inactive, which untrusts sources the way a rejected upload does.
+    /// Recorded on transition only, so repeated failing reads stay bounded.
+    /// `binding` is the setup-run binding the read started with; an outcome
+    /// that arrives after the binding was replaced describes the old run and
+    /// is dropped.
+    pub(crate) fn record_setup_run_read_rejected(
+        &self,
+        binding: &LocalConnectionBinding,
+        rejection: TerminalRefreshRejection,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        if !state.binds_setup_run(binding)
+            || latest_setup_run_read_rejection(&state.local_health_events)
+                .is_some_and(|current| current.rejection == rejection)
+        {
+            return Ok(());
+        }
+        let (code, message) = match rejection {
+            TerminalRefreshRejection::SetupRunEnded => (
+                SETUP_RUN_ENDED_READ_REJECTION,
+                "Ottto ended this Mac's setup run; agent reads stop until it reconnects",
+            ),
+            TerminalRefreshRejection::DeviceRejected => (
+                DEVICE_REJECTED_READ_REJECTION,
+                "Ottto refused this Mac's device credential for agent reads",
+            ),
+        };
+        push_local_health_event(
+            &mut state,
+            "SetupRunReadRejected",
+            "setup_run_read_rejected",
+            LocalHealthAuthority::Backend,
+            serde_json::json!({
+                "kind": "setup_run_read_rejected",
+                "rejection": code,
+                "message": message,
+                "current": true
+            }),
+        );
+        Ok(())
+    }
+
+    /// True when this Mac is bound to an account but has no usable setup run:
+    /// no setup-run binding is left, Ottto's latest authoritative answer
+    /// for the binding was terminal (an ended run or a refused device
+    /// credential), or Ottto rejected this Mac's credentials on the latest
+    /// local-health upload (the status then answers `reconnect_required`).
+    /// Sign-in may then start a fresh claim over the bound account;
+    /// completing it for the same user replaces the binding.
+    pub(crate) fn connected_setup_run_needs_reconnect(&self) -> Result<bool, LocalApiError> {
+        if self.connection_for_authorized_client()?.is_none() {
+            return Ok(true);
+        }
+        let state = self.state()?;
+        Ok(
+            latest_setup_run_read_rejection(&state.local_health_events).is_some()
+                || matches!(
+                    latest_local_health_upload_in(&state.local_health_events),
+                    Some(LatestLocalHealthUpload::AuthRejected { .. })
+                ),
+        )
+    }
+
+    /// Clear a recorded setup-run read rejection after a successful read
+    /// that started with the current binding. Only the rejection that was
+    /// already current when the read started is cleared: reads of one
+    /// binding run concurrently, so a slow read that succeeded before the
+    /// run ended can finish after a later read recorded the rejection, and
+    /// its success says nothing about that newer answer.
+    pub(crate) fn record_setup_run_read_accepted(
+        &self,
+        start: &SetupRunReadStart,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        if !state.binds_setup_run(&start.binding)
+            || latest_setup_run_read_rejection(&state.local_health_events)
+                .map(|current| current.sequence)
+                != Some(start.revision)
+        {
+            return Ok(());
+        }
+        push_local_health_event(
+            &mut state,
+            "SetupRunReadRecovered",
+            "setup_run_read_recovered",
+            LocalHealthAuthority::Backend,
+            serde_json::json!({
+                "kind": "setup_run_read_recovered",
+                "message": "Ottto accepted this Mac's setup run for agent reads",
                 "current": true
             }),
         );
@@ -2023,6 +2195,32 @@ fn status_from_state(state: &DaemonState) -> DaemonStatus {
     status
 }
 
+pub(crate) const ACCOUNT_RECONNECT_REQUIRED_MESSAGE_CODE: &str = "reconnect_required";
+
+/// The account answer a client should show for `status`: a copy of the saved
+/// binding that stops claiming `connected` while canonical health says Ottto
+/// rejected this Mac's credentials. Identity stays. The saved binding is never
+/// changed and nothing here is persisted, so internal account gates keep
+/// reading the saved state and a status without the rejection shows the saved
+/// answer again. Other binding states (a pending claim, reattach, reset) are
+/// already not connected and are returned unchanged.
+pub fn effective_account_binding(status: &DaemonStatus) -> LocalAccountBinding {
+    let mut account = status.account.clone();
+    let canonical_reconnect = status
+        .canonical_health
+        .as_ref()
+        .is_some_and(|health| health.account.state == LocalHealthAccountState::ReconnectRequired);
+    if account.state == LocalAccountState::Connected && canonical_reconnect {
+        account.state = LocalAccountState::Error;
+        account.message = Some(StableMessage {
+            code: ACCOUNT_RECONNECT_REQUIRED_MESSAGE_CODE.to_string(),
+            text: "Ottto no longer accepts this Mac's sign-in. Sign in to Ottto again to reconnect it."
+                .to_string(),
+        });
+    }
+    account
+}
+
 fn push_local_health_upload_event(
     state: &mut DaemonState,
     event_type: &str,
@@ -2316,8 +2514,11 @@ enum LatestLocalHealthUpload {
 }
 
 fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealthUpload> {
-    status
-        .local_health_events
+    latest_local_health_upload_in(&status.local_health_events)
+}
+
+fn latest_local_health_upload_in(events: &[LocalHealthEventV1]) -> Option<LatestLocalHealthUpload> {
+    events
         .iter()
         .filter(|event| {
             event.event_type == "LocalHealthUploadFailed"
@@ -2361,6 +2562,106 @@ fn latest_snapshot_sync_stall(status: &DaemonStatus) -> Option<String> {
         .map(|event| event.observed_at.clone())
 }
 
+fn load_persisted_connection() -> Result<Option<LocalConnectionBinding>, LocalApiError> {
+    FileConnectionStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)
+}
+
+fn load_connection_into<F>(
+    state: &mut DaemonState,
+    load_connection: F,
+) -> Result<Option<LocalConnectionBinding>, LocalApiError>
+where
+    F: FnOnce() -> Result<Option<LocalConnectionBinding>, LocalApiError>,
+{
+    if state.connection.is_none() {
+        if let Some(connection) = load_connection()? {
+            state.connection = Some(connection);
+        }
+    }
+    Ok(state.connection.clone())
+}
+
+fn setup_run_binding_matches(
+    current: &LocalConnectionBinding,
+    replacement: &LocalConnectionBinding,
+) -> bool {
+    current.setup_run_id == replacement.setup_run_id
+        && current.api_base_url == replacement.api_base_url
+}
+
+/// A setup-run read rejection describes the binding that was rejected. When
+/// that binding is replaced or removed, the rejection no longer describes the
+/// current setup run, so close it rather than report a new run as rejected.
+fn clear_setup_run_read_rejection(state: &mut DaemonState) {
+    if latest_setup_run_read_rejection(&state.local_health_events).is_none() {
+        return;
+    }
+    push_local_health_event(
+        state,
+        "SetupRunReadRecovered",
+        "setup_run_read_recovered",
+        LocalHealthAuthority::Setup,
+        serde_json::json!({
+            "kind": "setup_run_binding_replaced",
+            "message": "the rejected setup-run binding was replaced or removed",
+            "current": true
+        }),
+    );
+}
+
+const SETUP_RUN_ENDED_READ_REJECTION: &str = "setup_run_ended";
+const DEVICE_REJECTED_READ_REJECTION: &str = "device_rejected";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetupRunReadRejection {
+    sequence: u64,
+    observed_at: String,
+    rejection: TerminalRefreshRejection,
+}
+
+/// What an agent read started from: the binding it reads with and the
+/// sequence of the latest setup-run read rejection/recovery event at that
+/// moment (0 when none). Event sequences are unique and only grow while the
+/// daemon runs, so an equal revision names the same recorded observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetupRunReadStart {
+    pub(crate) binding: LocalConnectionBinding,
+    revision: u64,
+}
+
+fn latest_setup_run_read_event(events: &[LocalHealthEventV1]) -> Option<&LocalHealthEventV1> {
+    events
+        .iter()
+        .filter(|event| {
+            event.event_type == "SetupRunReadRejected"
+                || event.event_type == "SetupRunReadRecovered"
+        })
+        .max_by_key(|event| event.sequence)
+}
+
+fn setup_run_read_revision(events: &[LocalHealthEventV1]) -> u64 {
+    latest_setup_run_read_event(events).map_or(0, |event| event.sequence)
+}
+
+/// The latest setup-run read rejection, if the most recent
+/// rejection/recovery event says it is still current.
+fn latest_setup_run_read_rejection(events: &[LocalHealthEventV1]) -> Option<SetupRunReadRejection> {
+    let event = latest_setup_run_read_event(events)
+        .filter(|event| event.event_type == "SetupRunReadRejected")?;
+    let rejection = match event.payload.get("rejection")?.as_str()? {
+        SETUP_RUN_ENDED_READ_REJECTION => TerminalRefreshRejection::SetupRunEnded,
+        DEVICE_REJECTED_READ_REJECTION => TerminalRefreshRejection::DeviceRejected,
+        _ => return None,
+    };
+    Some(SetupRunReadRejection {
+        sequence: event.sequence,
+        observed_at: event.observed_at.clone(),
+        rejection,
+    })
+}
+
 fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV1 {
     let (mut state, mut setup_run_state, mut setup_token_state) = match status.account.state {
         LocalAccountState::Connected => (
@@ -2396,6 +2697,25 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
         setup_run_state = LocalSetupRunState::RebindRequired;
         setup_token_state = LocalSetupTokenState::RefreshRequired;
     }
+    // The connected flag alone says nothing about whether Ottto still accepts
+    // the setup run. After a read ended in a terminal device-secret refresh
+    // answer, report what Ottto said instead of `complete`/`valid`. A refused
+    // device credential does not say the run ended, so it is never `expired`.
+    let read_rejection = matches!(state, LocalHealthAccountState::Connected)
+        .then(|| latest_setup_run_read_rejection(&status.local_health_events))
+        .flatten()
+        .map(|current| current.rejection);
+    match read_rejection {
+        Some(TerminalRefreshRejection::SetupRunEnded) => {
+            setup_run_state = LocalSetupRunState::Rejected;
+            setup_token_state = LocalSetupTokenState::Expired;
+        }
+        Some(TerminalRefreshRejection::DeviceRejected) => {
+            setup_run_state = LocalSetupRunState::Unknown;
+            setup_token_state = LocalSetupTokenState::RefreshRequired;
+        }
+        None => {}
+    }
     let device_state = match latest_upload.as_ref() {
         Some(LatestLocalHealthUpload::AuthRejected { .. }) => LocalDeviceState::Inactive,
         Some(LatestLocalHealthUpload::BackendUnreachable { .. }) => LocalDeviceState::Unknown,
@@ -2406,6 +2726,11 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
             LocalDeviceState::StaleHeartbeat
         }
         _ => LocalDeviceState::Active,
+    };
+    let device_state = if read_rejection == Some(TerminalRefreshRejection::DeviceRejected) {
+        LocalDeviceState::Inactive
+    } else {
+        device_state
     };
     LocalHealthAccountV1 {
         state,
@@ -2426,6 +2751,36 @@ fn local_health_source_for_status(
     source: &SourceHealth,
     projection_revision: u64,
 ) -> LocalHealthSourceV1 {
+    let snapshot_source = match source.source {
+        SourceKind::ClaudeCode => snapshots::SnapshotSource::ClaudeCode,
+        SourceKind::Codex => snapshots::SnapshotSource::Codex,
+        SourceKind::Pi => snapshots::SnapshotSource::Pi,
+    };
+    if snapshots::scan_index_rebuild_paused(snapshot_source) {
+        return LocalHealthSourceV1 {
+            source_id: format!("src_{}", source_slug(&source.source)),
+            app: source.source.clone(),
+            state: LocalHealthSourceState::RepairRequired,
+            authority: LocalHealthAuthority::Runtime,
+            authority_at: current_rfc3339_timestamp(),
+            projection_revision: projection_revision.saturating_sub(1),
+            blocking_reason: Some(snapshots::SCAN_INDEX_REBUILD_LOOP_CODE.to_string()),
+            next_action: Some("review_scan_index_repair".to_string()),
+            // The automatic retry time is the guard's own witness stamp plus
+            // seven days; a user Repair may run one gated rebuild sooner.
+            // A refused override (SI-718-O1) names its code; the source and
+            // its index stay as they were.
+            clear_condition: Some(format!(
+                "successful compatible scan-index load after a user Repair (one gated rebuild per 24 h) or the automatic retry{}{}; preserve the index and quarantine witnesses, never delete the index",
+                snapshots::scan_index_rebuild_auto_retry_at(snapshot_source)
+                    .map(|at| format!(" (auto_retry_at={at})"))
+                    .unwrap_or_default(),
+                snapshots::scan_index_rebuild_override_refusal(snapshot_source)
+                    .map(|code| format!(" (override_refused={code})"))
+                    .unwrap_or_default()
+            )),
+        };
+    }
     let has_verify_attention =
         source.last_verified_at.is_some() && has_verification_failure_problem(source);
     let authority = if source.last_verified_at.is_some() {
@@ -2671,6 +3026,28 @@ fn local_health_blockers_for_status(
             &observed_at,
             "restart ottto-service (or restore its DNS resolution); usage snapshot sync is stalled while other uploads succeed",
         ));
+    }
+    if account.state == LocalHealthAccountState::Connected {
+        if let Some(current) = latest_setup_run_read_rejection(&status.local_health_events) {
+            let (code, clear_condition) = match current.rejection {
+                TerminalRefreshRejection::SetupRunEnded => (
+                    "setup_run_rejected",
+                    "run `ottto login` to reconnect this Mac and restore agent reads",
+                ),
+                TerminalRefreshRejection::DeviceRejected => (
+                    "device_credential_rejected",
+                    "Ottto refused this Mac's device credential; run `ottto login` to reconnect this Mac",
+                ),
+            };
+            blockers.push(blocker(
+                code,
+                LocalHealthSeverity::Warning,
+                "setup",
+                LocalHealthAuthority::Backend,
+                &current.observed_at,
+                clear_condition,
+            ));
+        }
     }
     if matches!(
         account.state,
@@ -4859,9 +5236,12 @@ mod tests {
             (OTTTO_KEYCHAIN_ACCOUNT, synthetic_control_token),
             (OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, synthetic_relay_secret),
         ] {
-            ottto_core::token_store::FileControlTokenStore::new(secrets.join(account))
-                .save(value)
-                .expect("save synthetic diagnostic secret");
+            // Fully qualified: the trait import above is macOS-only.
+            ottto_core::ControlTokenStore::save(
+                &ottto_core::token_store::FileControlTokenStore::new(secrets.join(account)),
+                value,
+            )
+            .expect("save synthetic diagnostic secret");
         }
         let daemon = daemon();
         let bundle = daemon
@@ -5128,6 +5508,128 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_loop_pause_is_a_server_visible_canonical_source_blocker() {
+        use snapshots::{ScanIndex, SnapshotSource};
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut sibling = codex_health();
+        sibling.source = SourceKind::Pi;
+        sibling.descriptor = source_descriptor(&SourceKind::Pi);
+        daemon
+            .update_sources(TOKEN, vec![codex_health(), sibling])
+            .unwrap();
+        let scratch = crate::test_scratch::ScratchDir::new("rebuild-loop-source-health");
+        let path = scratch.as_ref().join("index.json");
+        std::fs::write(&path, b"{").unwrap();
+        let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::Codex,
+            scratch.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(origin, snapshots::ScanIndexLoadOrigin::Quarantined);
+        let original = b"{ ";
+        std::fs::write(&path, original).unwrap();
+        let error = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::Codex,
+            scratch.as_ref(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("scan_index_rebuild_loop"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let status = daemon.status(TOKEN).unwrap();
+        let health = status.canonical_health.unwrap();
+        let source = health
+            .sources
+            .iter()
+            .find(|s| s.app == SourceKind::Codex)
+            .unwrap();
+        assert_eq!(source.state, LocalHealthSourceState::RepairRequired);
+        assert_eq!(
+            source.blocking_reason.as_deref(),
+            Some("scan_index_rebuild_loop")
+        );
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
+        assert!(source
+            .clear_condition
+            .as_deref()
+            .unwrap()
+            .contains("never delete the index"));
+        // The automatic retry time rides in the existing clear_condition:
+        // seven days after the quarantine witness this pause read.
+        let retry_at = source
+            .clear_condition
+            .as_deref()
+            .unwrap()
+            .split_once("auto_retry_at=")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(at, _)| at)
+            .expect("clear_condition names auto_retry_at");
+        let retry_at =
+            time::OffsetDateTime::parse(retry_at, &time::format_description::well_known::Rfc3339)
+                .unwrap();
+        let week_out = time::OffsetDateTime::now_utc() + time::Duration::days(7);
+        assert!((retry_at - week_out).abs() < time::Duration::minutes(5));
+        assert!(health
+            .blockers
+            .iter()
+            .any(|b| b.code == "scan_index_rebuild_loop"
+                && b.clear_condition.contains("auto_retry_at=")));
+        assert_eq!(
+            health
+                .sources
+                .iter()
+                .find(|s| s.app == SourceKind::Pi)
+                .unwrap()
+                .state,
+            LocalHealthSourceState::Healthy
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|b| b.code == "scan_index_rebuild_loop"
+                && b.severity == LocalHealthSeverity::Blocking));
+        assert_ne!(health.overall.state, LocalHealthOverallState::Healthy);
+        // This is the same typed payload upload_local_health_projection posts.
+        let wire = serde_json::to_value(&health).unwrap();
+        assert!(wire["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["blocking_reason"] == "scan_index_rebuild_loop"));
+        assert!(wire["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["code"] == "scan_index_rebuild_loop"));
+
+        // Reviewed repair restores a compatible index; the next actual load
+        // clears only this source's runtime pause without a daemon restart.
+        std::fs::write(&path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+        let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::Codex,
+            scratch.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(origin, snapshots::ScanIndexLoadOrigin::Loaded);
+        let health = daemon.status(TOKEN).unwrap().canonical_health.unwrap();
+        assert!(!health
+            .blockers
+            .iter()
+            .any(|b| b.code == "scan_index_rebuild_loop"));
+        assert_eq!(
+            health
+                .sources
+                .iter()
+                .find(|s| s.app == SourceKind::Codex)
+                .unwrap()
+                .state,
+            LocalHealthSourceState::Healthy
+        );
+    }
+
+    #[test]
     fn verification_result_updates_source_health() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
@@ -5149,6 +5651,7 @@ mod tests {
                 text: "Codex verification passed.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -5254,6 +5757,7 @@ mod tests {
                 text: "Codex telemetry config does not match the active Ottto relay.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -5328,6 +5832,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -5399,6 +5904,7 @@ mod tests {
                     text: "Verification passed.".to_string(),
                 },
                 route_results: Vec::new(),
+                check: None,
             };
             daemon
                 .record_verification_result(&verified)
@@ -5425,6 +5931,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
         daemon
             .record_verification_result(&not_installed)
@@ -5485,6 +5992,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
         daemon
             .record_verification_result(&cli_unavailable)
@@ -5691,6 +6199,61 @@ mod tests {
     }
 
     #[test]
+    fn auth_rejected_status_shows_effective_reconnect_without_changing_saved_binding() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let saved = daemon.status(TOKEN).expect("status").account;
+        assert_eq!(saved.state, LocalAccountState::Connected);
+        assert_eq!(
+            effective_account_binding(&daemon.status(TOKEN).expect("status")),
+            saved
+        );
+
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        let status = daemon.status(TOKEN).expect("status");
+        // Internal account gates still read the saved binding.
+        assert_eq!(status.account, saved);
+
+        let effective = effective_account_binding(&status);
+        assert_eq!(effective.state, LocalAccountState::Error);
+        let message = effective.message.as_ref().expect("reconnect message");
+        assert_eq!(message.code, ACCOUNT_RECONNECT_REQUIRED_MESSAGE_CODE);
+        assert!(message.text.contains("Sign in to Ottto again"));
+        assert_eq!(effective.user, saved.user);
+        assert_eq!(effective.organization, saved.organization);
+        assert_eq!(effective.connected_at, saved.connected_at);
+        assert_eq!(effective.can_reconnect, saved.can_reconnect);
+        // Nothing was written back to the saved binding.
+        assert_eq!(daemon.account_for_trusted_client().expect("account"), saved);
+
+        // A later accepted upload clears it; the old rejection does not latch.
+        daemon
+            .record_local_health_upload_succeeded()
+            .expect("record upload success");
+        assert_eq!(
+            effective_account_binding(&daemon.status(TOKEN).expect("status")),
+            saved
+        );
+    }
+
+    #[test]
+    fn fresh_claim_is_not_rewritten_by_an_older_auth_rejection() {
+        let daemon = daemon();
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+
+        let status = daemon.status(TOKEN).expect("status");
+        let effective = effective_account_binding(&status);
+        assert_eq!(effective.state, LocalAccountState::ClaimPending);
+        assert_eq!(effective, status.account);
+    }
+
+    #[test]
     fn auth_rejected_upload_prevents_healthy_source_projection() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         daemon
@@ -5718,6 +6281,312 @@ mod tests {
             Some("auth_missing")
         );
         assert_eq!(health.sources[0].next_action.as_deref(), Some("sign_in"));
+    }
+
+    fn read_start(daemon: &LocalDaemon) -> SetupRunReadStart {
+        daemon
+            .setup_run_read_start()
+            .expect("read start")
+            .expect("bound setup run")
+    }
+
+    fn read_binding(setup_run_id: &str) -> LocalConnectionBinding {
+        LocalConnectionBinding {
+            setup_run_id: setup_run_id.to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: None,
+            claim_code: None,
+            api_base_url: "https://api.ottto.net".to_string(),
+        }
+    }
+
+    #[test]
+    fn rejected_setup_run_read_reports_run_honestly_without_blocking_uploads() {
+        let run = read_binding("run_1");
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(run.clone()));
+        daemon
+            .record_verification_result(&verified_codex("2026-05-05T10:20:00Z"))
+            .expect("record successful verification");
+        daemon
+            .record_setup_run_read_accepted(&read_start(&daemon))
+            .expect("accepted read without a prior rejection");
+        assert!(latest_setup_run_read_rejection(
+            &daemon.status(TOKEN).expect("status").local_health_events
+        )
+        .is_none());
+
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("record rejected read");
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("record repeated rejected read");
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(
+            status
+                .local_health_events
+                .iter()
+                .filter(|event| event.event_type.starts_with("SetupRunRead"))
+                .count(),
+            1,
+            "repeated rejected reads must not grow the event log"
+        );
+        let health = status.canonical_health.expect("canonical health");
+        assert_eq!(health.account.state, LocalHealthAccountState::Connected);
+        assert_eq!(health.account.setup_run_state, LocalSetupRunState::Rejected);
+        assert_eq!(
+            health.account.setup_token_state,
+            LocalSetupTokenState::Expired
+        );
+        assert_eq!(health.account.device_state, LocalDeviceState::Active);
+        let blocker = health
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == "setup_run_rejected")
+            .expect("setup run rejection is surfaced");
+        assert_eq!(blocker.severity, LocalHealthSeverity::Warning);
+        assert_eq!(
+            health.sources[0].state,
+            LocalHealthSourceState::Healthy,
+            "uploads use the device credential, so a rejected read must not untrust sources"
+        );
+
+        daemon
+            .record_setup_run_read_accepted(&read_start(&daemon))
+            .expect("record recovered read");
+        let recovered = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            recovered.account.setup_run_state,
+            LocalSetupRunState::Complete
+        );
+        assert_eq!(
+            recovered.account.setup_token_state,
+            LocalSetupTokenState::Valid
+        );
+        assert!(!recovered
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "setup_run_rejected"));
+
+        // A refused device credential does not say the run ended: never
+        // `expired`, the device is inactive, and the blocker says so.
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::DeviceRejected)
+            .expect("record device rejection");
+        let device_rejected = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            device_rejected.account.state,
+            LocalHealthAccountState::Connected
+        );
+        assert_eq!(
+            device_rejected.account.setup_run_state,
+            LocalSetupRunState::Unknown
+        );
+        assert_eq!(
+            device_rejected.account.setup_token_state,
+            LocalSetupTokenState::RefreshRequired
+        );
+        assert_eq!(
+            device_rejected.account.device_state,
+            LocalDeviceState::Inactive
+        );
+        assert!(device_rejected
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "device_credential_rejected"));
+        assert!(!device_rejected
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "setup_run_rejected"));
+        let reported =
+            serde_json::to_string(&(&device_rejected.account, &device_rejected.blockers))
+                .expect("serialize health");
+        assert!(
+            !reported.to_ascii_lowercase().contains("expired"),
+            "{reported}"
+        );
+
+        // A later ended-run answer for the same binding is a new transition.
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("record ended run");
+        let ended = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(ended.account.setup_run_state, LocalSetupRunState::Rejected);
+        assert_eq!(
+            ended.account.setup_token_state,
+            LocalSetupTokenState::Expired
+        );
+        assert!(!ended
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "device_credential_rejected"));
+    }
+
+    #[test]
+    fn older_successful_read_cannot_clear_a_newer_same_run_rejection() {
+        let run = read_binding("run_1");
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(run.clone()));
+        let setup_run_state = |daemon: &LocalDaemon| {
+            daemon
+                .status(TOKEN)
+                .expect("status")
+                .canonical_health
+                .expect("canonical health")
+                .account
+                .setup_run_state
+        };
+        let recoveries = |daemon: &LocalDaemon| {
+            daemon
+                .status(TOKEN)
+                .expect("status")
+                .local_health_events
+                .iter()
+                .filter(|event| event.event_type == "SetupRunReadRecovered")
+                .count()
+        };
+
+        // A slow read starts while Ottto still accepts the run. A later read
+        // of the same binding is told the run ended, then the slow read's
+        // success arrives: it predates that answer and must not clear it.
+        let slow_read = read_start(&daemon);
+        let rejected_read = read_start(&daemon);
+        daemon
+            .record_setup_run_read_rejected(
+                &rejected_read.binding,
+                TerminalRefreshRejection::SetupRunEnded,
+            )
+            .expect("record rejected read");
+        daemon
+            .record_setup_run_read_accepted(&slow_read)
+            .expect("late success of the older read");
+        assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Rejected);
+        assert_eq!(recoveries(&daemon), 0);
+
+        // A read that started after the rejection and succeeds recovers it.
+        let started_while_rejected = read_start(&daemon);
+        let recovering_read = read_start(&daemon);
+        daemon
+            .record_setup_run_read_accepted(&recovering_read)
+            .expect("subsequent successful read");
+        assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Complete);
+        assert_eq!(recoveries(&daemon), 1);
+
+        // The run is rejected again with the same kind. A read that started
+        // during the earlier rejection describes that one, not this one.
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("record second rejection");
+        daemon
+            .record_setup_run_read_accepted(&started_while_rejected)
+            .expect("late success from the earlier rejection");
+        assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Rejected);
+        assert_eq!(recoveries(&daemon), 1);
+
+        // A different terminal answer recorded after a read started is also
+        // newer than that read.
+        let before_device_rejection = read_start(&daemon);
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::DeviceRejected)
+            .expect("record device rejection");
+        daemon
+            .record_setup_run_read_accepted(&before_device_rejection)
+            .expect("late success before the device rejection");
+        assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Unknown);
+        assert_eq!(recoveries(&daemon), 1);
+
+        daemon
+            .record_setup_run_read_accepted(&read_start(&daemon))
+            .expect("subsequent successful read");
+        let recovered = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            recovered.account.setup_run_state,
+            LocalSetupRunState::Complete
+        );
+        assert_eq!(recovered.account.device_state, LocalDeviceState::Active);
+        assert!(!recovered.blockers.iter().any(|blocker| {
+            blocker.code == "setup_run_rejected" || blocker.code == "device_credential_rejected"
+        }));
+        assert_eq!(recoveries(&daemon), 2);
+    }
+
+    #[test]
+    fn setup_run_read_rejection_follows_the_binding_that_was_rejected() {
+        let rejected = |daemon: &LocalDaemon| {
+            latest_setup_run_read_rejection(
+                &daemon.status(TOKEN).expect("status").local_health_events,
+            )
+            .is_some()
+        };
+        let old_run = read_binding("run_old");
+        let new_run = read_binding("run_new");
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(old_run.clone()));
+
+        daemon
+            .record_setup_run_read_rejected(&old_run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("record rejected read");
+        daemon
+            .bind_setup_run_for_authorized_client(old_run.clone())
+            .expect("rebind same run");
+        assert!(
+            rejected(&daemon),
+            "the same binding is still the rejected run"
+        );
+        daemon
+            .bind_setup_run_for_authorized_client(new_run.clone())
+            .expect("bind replacement run");
+        assert!(
+            !rejected(&daemon),
+            "a replacement run is not the rejected run"
+        );
+        daemon
+            .record_setup_run_read_rejected(&old_run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("late outcome from a read of the old run");
+        assert!(
+            !rejected(&daemon),
+            "an in-flight read of the replaced run must not reject the new run"
+        );
+
+        daemon
+            .record_setup_run_read_rejected(&new_run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("record rejected read");
+        assert!(rejected(&daemon));
+        assert!(daemon
+            .clear_setup_run_for_authorized_client_if_matches("run_new", "https://api.ottto.net")
+            .expect("clear binding"));
+        assert!(!rejected(&daemon), "a cleared binding closes its rejection");
+
+        daemon
+            .bind_setup_run_for_authorized_client(new_run.clone())
+            .expect("bind run again");
+        daemon
+            .record_setup_run_read_rejected(&new_run, TerminalRefreshRejection::SetupRunEnded)
+            .expect("record rejected read");
+        daemon
+            .reset_account_for_authorized_client()
+            .expect("reset account");
+        assert!(!rejected(&daemon), "logout closes the rejection");
     }
 
     #[test]
@@ -5798,7 +6667,7 @@ mod tests {
     fn snapshot_sync_stall_never_masks_a_blocking_failure() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         daemon
-            .record_snapshot_sync_stalled(45, Some("otlp_relay"))
+            .record_snapshot_sync_stalled(45, Some("agent_status"))
             .expect("record sync stall");
         daemon
             .record_local_health_upload_failed(LocalHealthUploadFailureKind::BackendUnreachable)
@@ -5910,6 +6779,7 @@ mod tests {
                 text: "Codex smoke session failed before verification could complete.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -5956,6 +6826,7 @@ mod tests {
                 text: "No Pi model routes passed smoke verification.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
         daemon
             .record_verification_result(&result)
@@ -6045,6 +6916,7 @@ mod tests {
                 text: "Ottto did not receive a fresh Codex verification signal after the smoke prompt.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6111,6 +6983,7 @@ mod tests {
                 text: "Pi telemetry is turned off in this workspace. Turn telemetry on in Ottto, then retry Verify.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6218,6 +7091,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6284,6 +7158,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6417,6 +7292,7 @@ mod tests {
                 text: "Claude Code smoke session failed before verification could complete: You've hit your org's monthly spend limit · run [path] to raise it, or visit claude.ai/admin-settings/usage".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6603,6 +7479,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6667,6 +7544,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6728,6 +7606,7 @@ mod tests {
                     .to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6785,6 +7664,7 @@ mod tests {
                 text: detail.to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6848,6 +7728,7 @@ mod tests {
                 text: "Use Sign in in the Ottto app to refresh it.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6896,6 +7777,7 @@ mod tests {
                 text: "Claude Code sign-in expired. Ottto itself is still connected.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -6940,6 +7822,7 @@ mod tests {
                 text: "Use Sign in in the Ottto app, then try verifying again.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         };
 
         daemon
@@ -8516,6 +9399,7 @@ mod tests {
             },
         ];
         snapshot.plan_observations = vec![ottto_protocol::AgentStatusPlanObservation {
+            desktop_recent_at: None,
             observed_at: Some("2026-05-05T10:20:00Z".to_string()),
             evidence_method: Some("local_status".to_string()),
             source_session_id: None,
@@ -8712,6 +9596,7 @@ mod tests {
                 text: "Codex verification passed.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         }
     }
 
@@ -8735,6 +9620,7 @@ mod tests {
                 text: "Use Sign in in the Ottto app to refresh it.".to_string(),
             },
             route_results: Vec::new(),
+            check: None,
         }
     }
 

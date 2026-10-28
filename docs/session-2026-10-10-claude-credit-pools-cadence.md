@@ -216,3 +216,22 @@ loop and the single-slot path, and prove a body fetched during that pass is
 never adopted. Another proves a passive body never displaces a saved-reset
 slot, and another that the variant diagnostic reaches the upload, with and
 without windows.
+
+## October 18: idle freshness at the scheduled-read boundary
+
+Idle accounts are now read every 38–42 minutes, with active accounts using
+five-minute slots. The previous display deadline matched the idle read gate
+exactly. A foreground status read after that deadline but before the next
+scheduled collection could briefly mark a healthy account's limits stale.
+
+The shared cache and retained-slot display deadline now allows one additional
+five-minute collection interval. Provider reads still become due at the original
+gate. Observation timestamps, values, account binding, Retry-After and breaker
+holds keep their original semantics. The allowance is bounded: readings become
+stale after the display deadline even if no further collection succeeds.
+
+Regression coverage checks the start and end of the scheduling gap, retained-slot
+agreement, original observation and values, continued read eligibility, and stale
+windows and credits beyond the allowance. Formatting and diff checks pass;
+compiled tests are delegated to CI because local machine load exceeds the build
+limit. This change requires a runtime release before installed clients use it.

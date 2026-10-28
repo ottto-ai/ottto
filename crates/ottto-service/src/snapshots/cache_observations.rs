@@ -339,7 +339,26 @@ pub(crate) fn codex_slot(
 // Closed owned-field inventory for optional scan overlap admission.
 crate::heap_layout_bound::fields!(CacheObservations; schema_version, operations, coverage, omitted_observation_count);
 crate::heap_layout_bound::fields!(OwnedRequest; slot, ordering, compaction_before, configuration_changed, configuration_witness, idle_seconds);
+crate::durable_tail_codec::durable_struct!(OwnedRequest {
+    D slot: RequestSlot,
+    N ordering: String,
+    N compaction_before: bool,
+    N configuration_changed: bool,
+    H configuration_witness: Option<String>,
+    N idle_seconds: Option<u64>,
+});
 crate::heap_layout_bound::fields!(RequestSlot; request_ref, occurred_at, model, effort, prompt_tokens, cache_read_tokens, cache_creation_tokens, uncached_tokens, output_tokens);
+crate::durable_tail_codec::durable_struct!(RequestSlot {
+    L request_ref: String,
+    N occurred_at: String,
+    U model: Option<String>,
+    U effort: Option<String>,
+    N prompt_tokens: Option<u64>,
+    N cache_read_tokens: Option<u64>,
+    N cache_creation_tokens: Option<u64>,
+    N uncached_tokens: Option<u64>,
+    N output_tokens: Option<u64>,
+});
 
 crate::heap_layout_bound::fields!(Observation; event_id, affected_request_ref, episode_anchor_request_ref, baseline_request_ref, occurred_at, observation_kind, status, previous, affected, immediate_next, ordering_confidence, explanation_code, supporting_conditions, idle_seconds, report_gap_seconds, detector_version);
 

@@ -190,6 +190,42 @@ pub(crate) struct UnreadableBreakdown {
 }
 crate::heap_layout_bound::fields!(UnreadableCauses; counts);
 
+/// PR-P: number of `CodexParentUnresolvable` causes (asserted in `snapshots`).
+pub(crate) const PARENT_UNRESOLVABLE_CAUSES: usize = 12;
+/// Held fork children per parent cause; counts only. Persisted inside
+/// `ScanTraversalCounts`, so old traversals default to zero, and an older
+/// binary ignores the unknown field (as `UnreadableCauses`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ParentUnresolvableCauses {
+    counts: [u64; PARENT_UNRESOLVABLE_CAUSES],
+}
+impl ParentUnresolvableCauses {
+    /// `cause` is `CodexParentUnresolvable::index()` (this module cannot name
+    /// the enum); saturating, like `UnreadableCauses::record`.
+    pub(crate) fn record(&mut self, cause: usize, count: u64) {
+        if let Some(slot) = self.counts.get_mut(cause) {
+            *slot = slot.saturating_add(count);
+        }
+    }
+    pub(crate) fn merge(&mut self, other: Self) {
+        for (slot, incoming) in self.counts.iter_mut().zip(other.counts) {
+            *slot = slot.saturating_add(incoming);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> [u64; PARENT_UNRESOLVABLE_CAUSES] {
+        self.counts
+    }
+    #[cfg(test)]
+    pub(crate) fn saturated() -> Self {
+        Self {
+            counts: [u64::MAX; PARENT_UNRESOLVABLE_CAUSES],
+        }
+    }
+}
+crate::heap_layout_bound::fields!(ParentUnresolvableCauses; counts);
+
 #[derive(Default, Serialize)]
 struct CensusLossCounts {
     discovered: u64,
@@ -594,6 +630,67 @@ impl LoaderEvidence {
     }
 }
 
+/// Content-free counts of Codex sidecar identity-conflict keys, taken from the
+/// loaders' existing comparisons. New `state_threads` conflict keys split
+/// exactly into alias, intra-root row and cross-root row keys. A cross-root
+/// key is progress-only when `created_at`, `model` and `rollout_path` agree;
+/// that classifies fields only and does not prove the copies harmless.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct IdentityConflictTaxonomy {
+    pub state_alias_keys: u32,
+    pub state_intra_root_row_keys: u32,
+    pub state_cross_root_keys: u32,
+    pub state_cross_root_progress_only_keys: u32,
+    pub state_cross_root_identity_field_keys: u32,
+    pub state_cross_root_field_differs: StateRowFieldDiffs,
+    /// All loaders' conflict keys after every home, and the subsets the merged
+    /// created classification and the prior scan's durable state-only
+    /// entities still name. Spawn edges whose parent is a conflict key count
+    /// once per child.
+    pub conflict_keys_total: u32,
+    pub conflict_keys_state_created: u32,
+    pub conflict_keys_prior_state_only: u32,
+    pub conflict_parent_child_edges: u32,
+}
+impl IdentityConflictTaxonomy {
+    pub fn observe_state_cross_root(&mut self, differs: StateRowFieldDiffs) {
+        self.state_cross_root_keys = self.state_cross_root_keys.saturating_add(1);
+        let identity_field_differs =
+            differs.created_at != 0 || differs.model != 0 || differs.rollout_path != 0;
+        let class = if identity_field_differs {
+            &mut self.state_cross_root_identity_field_keys
+        } else {
+            &mut self.state_cross_root_progress_only_keys
+        };
+        *class = class.saturating_add(1);
+        let total = &mut self.state_cross_root_field_differs;
+        for (slot, add) in [
+            (&mut total.title, differs.title),
+            (&mut total.tokens_used, differs.tokens_used),
+            (&mut total.archived, differs.archived),
+            (&mut total.created_at, differs.created_at),
+            (&mut total.updated_at, differs.updated_at),
+            (&mut total.model, differs.model),
+            (&mut total.rollout_path, differs.rollout_path),
+        ] {
+            *slot = slot.saturating_add(add);
+        }
+    }
+}
+
+/// Per-field counts of differing `state_threads` rows; one key counts once in
+/// every field it differs on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct StateRowFieldDiffs {
+    pub title: u32,
+    pub tokens_used: u32,
+    pub archived: u32,
+    pub created_at: u32,
+    pub updated_at: u32,
+    pub model: u32,
+    pub rollout_path: u32,
+}
+
 #[derive(Debug)]
 pub(crate) struct IncompleteShape;
 impl std::fmt::Display for IncompleteShape {
@@ -688,19 +785,95 @@ pub(crate) struct CodexScanDiagnostics {
     pub spawn_edges: LoaderEvidence,
     pub rollout_extents: LoaderEvidence,
     pub session_index: LoaderEvidence,
+    pub identity_conflict_taxonomy: IdentityConflictTaxonomy,
     pub gates: CensusGates,
     pub unreadable_causes: UnreadableCauses,
+    /// PR-P: held fork children per parent cause. Traversal-cumulative, as
+    /// `unreadable_causes`: every page reports the running traversal total.
+    pub parent_unresolvable: ParentUnresolvableCauses,
+    /// PR-P: the scope's parent-resolution restart budget consumed, only when
+    /// this page established it (its step-start pass or a restart ran).
+    /// Omitted, never a fabricated 0, on discovery pages or without a shared
+    /// cache, and omitted when the cursor is poisoned (N1: the scan still
+    /// treats the budget as spent, but the count is unknown). A budget
+    /// counter, not a count of actual restarts: an evicted slot re-enters
+    /// spent, so it may read 2 (or exceed it after re-entry) with fewer
+    /// restarts run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_restarts_in_scope: Option<u64>,
     pub quarantine_count: u64,
     pub sample_offset: u64,
     pub lineage: [Option<RecoveryLineage>; LINEAGE_SAMPLES],
 }
 
+/// Content-free, fixed-size Codex usage-counting V2 receipts of one scan's
+/// finished parses (a singleton, or a joined group's single replay parse,
+/// each folded once), summed with saturation. Owned by the scan result and
+/// borrowed into the local terminal journal as `local_codex_counting_v2`;
+/// also present for active-cutover scans or tombstone bookkeeping. Usage vectors are
+/// `input, cached_input, cache_write_input, output, reasoning_output, total`.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct CountingV2Receipts {
+    pub v2_sessions: u64,
+    /// Cap evictions this scan, by the deterministic safety class.
+    pub tombstone_evictions_v2_only: u64,
+    pub tombstone_evictions_pre_cutover_legacy: u64,
+    pub tombstone_evictions_not_provably_pre_cutover_legacy: u64,
+    /// Finished V2 parses correlated with a retained evicted last Legacy
+    /// carrier. Observations can repeat before a committed ACK absorbs it;
+    /// the bounded diagnostic history can age out, so this is not exhaustive.
+    pub legacy_to_v2_after_tombstone_eviction: u64,
+    pub tombstone_count: u64,
+    pub tombstone_cap: u64,
+    pub native_counted: u64,
+    pub native_not_authority: u64,
+    pub native_restated: u64,
+    pub native_inside_holed_coverage: u64,
+    pub native_inside_holed_coverage_usage: [u64; 6],
+    pub native_chain_gap: u64,
+    pub native_chain_overlap: u64,
+    pub native_chain_overlap_covered: [u64; 6],
+    pub native_epoch_reset: u64,
+    pub native_conflict: u64,
+    pub native_outside_open_turn: u64,
+    pub native_outside_open_turn_usage: [u64; 6],
+    pub native_after_turn_closed: u64,
+    pub native_after_turn_closed_usage: [u64; 6],
+    pub native_after_ui_flush: u64,
+    pub native_after_ui_flush_usage: [u64; 6],
+    pub ui_equal_total_repeat: u64,
+    pub ui_equal_total_repeat_usage: [u64; 6],
+    pub ui_in_native_turn_not_counted: u64,
+    pub ui_in_native_turn_not_counted_usage: [u64; 6],
+    pub ui_in_unbound_span: u64,
+    pub v2_cumulative_base_uncounted: u64,
+    pub v2_cumulative_base_uncounted_usage: [u64; 6],
+    pub turn_closure_mismatch: u64,
+    pub turn_reopened: u64,
+    /// Closed-turn filter hits outside the exact recent ring: an older
+    /// closure or a false positive. Natives there count 0 (usage below).
+    pub closed_filter_hit_unconfirmed: u64,
+    pub closed_filter_hit_unconfirmed_native_usage: [u64; 6],
+    pub pending_overflow_flushes: u64,
+    /// Visible local debt, only for the scan that parsed it: sessions ending
+    /// this parse inside a still-open UI-only turn, their staged UI events and
+    /// staged usage. Not carried to later scans.
+    pub open_turn_ui_pending_sessions_this_scan: u64,
+    pub open_turn_ui_pending_events_this_scan: u64,
+    pub open_turn_ui_pending_usage_this_scan: [u64; 6],
+    /// Open turns whose staged usage sum overflowed; never folded as zero.
+    pub open_turn_ui_pending_unsummable_this_scan: u64,
+}
+
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, gates, unreadable_causes, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, identity_conflict_taxonomy, gates, unreadable_causes, parent_unresolvable, parent_restarts_in_scope, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CountingV2Receipts; v2_sessions, tombstone_evictions_v2_only, tombstone_evictions_pre_cutover_legacy, tombstone_evictions_not_provably_pre_cutover_legacy, legacy_to_v2_after_tombstone_eviction, tombstone_count, tombstone_cap, native_counted, native_not_authority, native_restated, native_inside_holed_coverage, native_inside_holed_coverage_usage, native_chain_gap, native_chain_overlap, native_chain_overlap_covered, native_epoch_reset, native_conflict, native_outside_open_turn, native_outside_open_turn_usage, native_after_turn_closed, native_after_turn_closed_usage, native_after_ui_flush, native_after_ui_flush_usage, ui_equal_total_repeat, ui_equal_total_repeat_usage, ui_in_native_turn_not_counted, ui_in_native_turn_not_counted_usage, ui_in_unbound_span, v2_cumulative_base_uncounted, v2_cumulative_base_uncounted_usage, turn_closure_mismatch, turn_reopened, closed_filter_hit_unconfirmed, closed_filter_hit_unconfirmed_native_usage, pending_overflow_flushes, open_turn_ui_pending_sessions_this_scan, open_turn_ui_pending_events_this_scan, open_turn_ui_pending_usage_this_scan, open_turn_ui_pending_unsummable_this_scan);
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
+crate::heap_layout_bound::fields!(IdentityConflictTaxonomy; state_alias_keys, state_intra_root_row_keys, state_cross_root_keys, state_cross_root_progress_only_keys, state_cross_root_identity_field_keys, state_cross_root_field_differs, conflict_keys_total, conflict_keys_state_created, conflict_keys_prior_state_only, conflict_parent_child_edges);
+crate::heap_layout_bound::fields!(StateRowFieldDiffs; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 impl crate::heap_layout_bound::HeapLayoutBound for LoaderReason {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
@@ -783,6 +956,39 @@ mod tests {
         assert_eq!(evidence.completed_roots, 1);
         assert!(!serde_json::to_string(&evidence).unwrap().contains("secret"));
     }
+    /// PR-P: both parent fields are additive. `parent_restarts_in_scope` is
+    /// omitted when unknown (never a fabricated 0) and present when
+    /// established, 0 included; cause counts saturate, ignore an
+    /// out-of-range cause, and a pre-PR-P value loads as zero.
+    #[test]
+    fn parent_fields_are_additive_and_unknown_restarts_are_omitted() {
+        let mut diagnostics = CodexScanDiagnostics::default();
+        let value = serde_json::to_value(diagnostics).unwrap();
+        assert!(value.get("parent_restarts_in_scope").is_none());
+        assert_eq!(
+            value["parent_unresolvable"]["counts"],
+            serde_json::to_value([0_u64; PARENT_UNRESOLVABLE_CAUSES]).unwrap()
+        );
+        diagnostics.parent_restarts_in_scope = Some(0);
+        diagnostics.parent_unresolvable.record(3, 2);
+        diagnostics
+            .parent_unresolvable
+            .record(PARENT_UNRESOLVABLE_CAUSES, 1);
+        let value = serde_json::to_value(diagnostics).unwrap();
+        assert_eq!(value["parent_restarts_in_scope"], 0);
+        let mut expected = [0_u64; PARENT_UNRESOLVABLE_CAUSES];
+        expected[3] = 2;
+        assert_eq!(diagnostics.parent_unresolvable.counts(), expected);
+        let old: ParentUnresolvableCauses = serde_json::from_str("{}").unwrap();
+        assert_eq!(old, ParentUnresolvableCauses::default());
+        let back: ParentUnresolvableCauses =
+            serde_json::from_value(serde_json::to_value(diagnostics.parent_unresolvable).unwrap())
+                .unwrap();
+        assert_eq!(back, diagnostics.parent_unresolvable);
+        let mut merged = ParentUnresolvableCauses::saturated();
+        merged.merge(diagnostics.parent_unresolvable);
+        assert_eq!(merged, ParentUnresolvableCauses::saturated());
+    }
     #[test]
     fn fully_populated_schema_stays_bounded_and_content_free() {
         let mut diagnostics = CodexScanDiagnostics {
@@ -800,11 +1006,45 @@ mod tests {
             sqlite_extended_code: Some(i32::MAX),
             ..Default::default()
         };
+        // PR-P: the two parent fields at their maxima.
+        diagnostics.parent_unresolvable = ParentUnresolvableCauses::saturated();
+        diagnostics.parent_restarts_in_scope = Some(u64::MAX);
         diagnostics.state_titles = evidence;
         diagnostics.state_threads = evidence;
         diagnostics.spawn_edges = evidence;
         diagnostics.rollout_extents = evidence;
         diagnostics.session_index = evidence;
+        let field_differs = StateRowFieldDiffs {
+            title: u32::MAX,
+            tokens_used: u32::MAX,
+            archived: u32::MAX,
+            created_at: u32::MAX,
+            updated_at: u32::MAX,
+            model: u32::MAX,
+            rollout_path: u32::MAX,
+        };
+        diagnostics.identity_conflict_taxonomy = IdentityConflictTaxonomy {
+            state_alias_keys: u32::MAX,
+            state_intra_root_row_keys: u32::MAX,
+            state_cross_root_keys: u32::MAX,
+            state_cross_root_progress_only_keys: u32::MAX,
+            state_cross_root_identity_field_keys: u32::MAX,
+            state_cross_root_field_differs: field_differs,
+            conflict_keys_total: u32::MAX,
+            conflict_keys_state_created: u32::MAX,
+            conflict_keys_prior_state_only: u32::MAX,
+            conflict_parent_child_edges: u32::MAX,
+        };
+        // Counters saturate instead of wrapping.
+        diagnostics
+            .identity_conflict_taxonomy
+            .observe_state_cross_root(field_differs);
+        assert_eq!(
+            diagnostics
+                .identity_conflict_taxonomy
+                .state_cross_root_field_differs,
+            field_differs
+        );
         let mut lineage = RecoveryLineage::new(
             "raw session id /Users/private credential",
             SnapshotQuarantineDisposition::RetryPending,
@@ -818,7 +1058,51 @@ mod tests {
         lineage.associated_file_count = u64::MAX;
         lineage.final_body_revision = u64::MAX;
         diagnostics.lineage = [Some(lineage); LINEAGE_SAMPLES];
-        let bytes = serde_json::to_vec_pretty(&diagnostics).unwrap();
+        let max = [u64::MAX; 6];
+        let receipts = CountingV2Receipts {
+            v2_sessions: u64::MAX,
+            tombstone_evictions_v2_only: u64::MAX,
+            tombstone_evictions_pre_cutover_legacy: u64::MAX,
+            tombstone_evictions_not_provably_pre_cutover_legacy: u64::MAX,
+            legacy_to_v2_after_tombstone_eviction: u64::MAX,
+            tombstone_count: u64::MAX,
+            tombstone_cap: u64::MAX,
+            native_counted: u64::MAX,
+            native_not_authority: u64::MAX,
+            native_restated: u64::MAX,
+            native_inside_holed_coverage: u64::MAX,
+            native_inside_holed_coverage_usage: max,
+            native_chain_gap: u64::MAX,
+            native_chain_overlap: u64::MAX,
+            native_chain_overlap_covered: max,
+            native_epoch_reset: u64::MAX,
+            native_conflict: u64::MAX,
+            native_outside_open_turn: u64::MAX,
+            native_outside_open_turn_usage: max,
+            native_after_turn_closed: u64::MAX,
+            native_after_turn_closed_usage: max,
+            native_after_ui_flush: u64::MAX,
+            native_after_ui_flush_usage: max,
+            ui_equal_total_repeat: u64::MAX,
+            ui_equal_total_repeat_usage: max,
+            ui_in_native_turn_not_counted: u64::MAX,
+            ui_in_native_turn_not_counted_usage: max,
+            ui_in_unbound_span: u64::MAX,
+            v2_cumulative_base_uncounted: u64::MAX,
+            v2_cumulative_base_uncounted_usage: max,
+            turn_closure_mismatch: u64::MAX,
+            turn_reopened: u64::MAX,
+            closed_filter_hit_unconfirmed: u64::MAX,
+            closed_filter_hit_unconfirmed_native_usage: max,
+            pending_overflow_flushes: u64::MAX,
+            open_turn_ui_pending_sessions_this_scan: u64::MAX,
+            open_turn_ui_pending_events_this_scan: u64::MAX,
+            open_turn_ui_pending_usage_this_scan: max,
+            open_turn_ui_pending_unsummable_this_scan: u64::MAX,
+        };
+        // The journal carries both blocks; together they keep the old cap.
+        let mut bytes = serde_json::to_vec_pretty(&diagnostics).unwrap();
+        bytes.extend(serde_json::to_vec_pretty(&receipts).unwrap());
         assert!(bytes.len() < MAX_LOCAL_DIAGNOSTIC_BYTES);
         let text = String::from_utf8(bytes).unwrap();
         for forbidden in ["/Users", "credential", "raw session id"] {

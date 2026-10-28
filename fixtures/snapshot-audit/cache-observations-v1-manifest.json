@@ -14,22 +14,22 @@
     "claude": {
       "body_witness_digest": "0f94a7ae8d064c5135fee319f27e494685a00d8ce5e11e3f7493c7f4e29f12d2",
       "body_witness_version": 15,
-      "fixture_canonical_sha256": "89dd163e9c4ec6a985766fb05549c73bc522bcc228e86cfc1b6b52b0ead0bb0c",
+      "fixture_canonical_sha256": "dc52e78a0c57590e5fd871168058df570e981763dafc435e2db6580a1fad018a",
       "fixture_file": "cache_observation_claude_v1.json",
       "fixture_wire_bytes": 6442,
       "normalized_public_body_witness_version": 13,
-      "parser_revision": "claude_code_jsonl:v38",
-      "scan_identity_revision": "claude_code_jsonl:v29"
+      "parser_revision": "claude_code_jsonl:v40",
+      "scan_identity_revision": "claude_code_jsonl:v30"
     },
     "codex": {
-      "body_witness_digest": "783c6eec9f21352990e06315765b265c7dee9ff82cd136aef995a53baf51ba7e",
+      "body_witness_digest": "8e5f2ffcdce04a1ce5bd5c0faa83dd0845ee13507ad325993be7a62a06ea60c6",
       "body_witness_version": 20,
-      "fixture_canonical_sha256": "d7233b6de6dfc00a151c354ffe43434e49cfcf28c32490854946dff81b8618fc",
+      "fixture_canonical_sha256": "551d92d9d10df4b56ea3da07341cf9c103851db964df917da25c677a7a1d0cf5",
       "fixture_file": "cache_observation_codex_v1.json",
-      "fixture_wire_bytes": 7613,
+      "fixture_wire_bytes": 7757,
       "normalized_public_body_witness_version": 18,
-      "parser_revision": "codex_jsonl:v38",
-      "scan_identity_revision": "codex_jsonl:v33"
+      "parser_revision": "codex_jsonl:v40",
+      "scan_identity_revision": "codex_jsonl:v34"
     }
   },
   "head_cas_contract": "snapshot_head_etag:v1",

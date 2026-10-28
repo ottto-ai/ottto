@@ -48,6 +48,42 @@ impl ClaudeProofCorrectionCandidate {
     }
 }
 
+/// Content-free counts of unbound Claude authority records dropped on load or
+/// save, of the indexed family members re-armed with them, and of demotions
+/// that found no current witness and so formed no record (SOURCE U3).
+static CLAUDE_AUTHORITY_DROPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CLAUDE_AUTHORITY_DROP_REARMED_FILES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const CLAUDE_AUTHORITY_DROP_LOGGED_REFS: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_AUTHORITY_DROPS_FOR_TEST: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    static CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// This thread's dropped records and re-armed files.
+#[cfg(test)]
+pub(crate) fn claude_authority_drops_for_test() -> (usize, usize) {
+    CLAUDE_AUTHORITY_DROPS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn claude_authority_unwitnessed_demotions_for_test() -> usize {
+    CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+fn count_claude_authority_unwitnessed_demotion() {
+    CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    CLAUDE_AUTHORITY_UNWITNESSED_DEMOTIONS_FOR_TEST.with(|cell| cell.set(cell.get() + 1));
+}
+
 fn claude_authority_record_contract_is_valid(
     record: &ClaudeUsageAuthorityQuarantineRecord,
 ) -> bool {
@@ -104,6 +140,93 @@ impl ScanIndex {
                 .cloned()
                 .collect(),
         });
+    }
+
+    // RetryPending members were held, never uploaded under the old proof.
+    // Reproof changes only their binding; no correction grant or retry reset.
+    fn rebind_retry_pending_claude_authority(&mut self, root: &str) {
+        let Some(witness) = self.claude_usage_family_witnesses.get(root) else {
+            return;
+        };
+        let Some(record) = self.claude_usage_authority_quarantine.get_mut(root) else {
+            return;
+        };
+        if record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+            && claude_usage_authority_deadline_is_bounded(record)
+        {
+            record.proven_witness_fingerprint = claude_usage_family_witness_fingerprint(witness);
+        }
+    }
+
+    // SOURCE ruling: an unbound or ill-formed record fails closed alone, on
+    // load and on save, with its pending proof state. Terminal refusals and
+    // the upload ledger stay. Its indexed members are re-armed, bounded by
+    // family size, so the next pass re-reads the family and re-forms the
+    // record against the current witness, or leaves unproven residue.
+    fn drop_unbound_claude_authority_records(&mut self, stage: &str) {
+        let witnesses = &self.claude_usage_family_witnesses;
+        let unbound = self
+            .claude_usage_authority_quarantine
+            .iter()
+            .filter(|(root, record)| {
+                !self.decode_holds_family(root)
+                    && !witnesses.get(*root).is_some_and(|witness| {
+                        claude_usage_authority_preserves_pending(record, witness)
+                    })
+            })
+            .map(|(root, _)| root.clone())
+            .collect::<BTreeSet<_>>();
+        if unbound.is_empty() {
+            return;
+        }
+        for root in &unbound {
+            self.claude_usage_authority_quarantine.remove(root);
+            self.claude_usage_family_pending.remove(root);
+        }
+        let mut rearmed = 0_usize;
+        for (index_key, entry) in &mut self.files {
+            if claude_index_path_member_ref(Path::new(index_key))
+                .is_some_and(|member| unbound.contains(member.root))
+                && !entry.source_file_fingerprint.is_empty()
+            {
+                entry.source_file_fingerprint.clear();
+                rearmed += 1;
+            }
+        }
+        // A pure CAS reread discards this normalized graph. Only the load or
+        // working save applies a rearm, so do not count that same action twice.
+        if stage == "cas" {
+            return;
+        }
+        crate::local_resource_diagnostics::claude_reread::authority_normalization(rearmed as u64);
+        CLAUDE_AUTHORITY_DROPS.fetch_add(unbound.len(), std::sync::atomic::Ordering::Relaxed);
+        CLAUDE_AUTHORITY_DROP_REARMED_FILES
+            .fetch_add(rearmed, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        CLAUDE_AUTHORITY_DROPS_FOR_TEST.with(|cell| {
+            let (drops, files) = cell.get();
+            cell.set((drops + unbound.len(), files + rearmed));
+        });
+        let family_refs = unbound
+            .iter()
+            .take(CLAUDE_AUTHORITY_DROP_LOGGED_REFS)
+            .map(|root| {
+                sha256_hex(&["claude_authority_drop_family_ref:v1", root.as_str()])[..12]
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "local snapshot scan index {stage} dropped {} unbound Claude usage authority record(s) \
+             [family_ref_sha256 {family_refs}{}]; authority_drop_rearmed_files={rearmed}; those \
+             families re-prove or stay unproven residue on the next pass",
+            unbound.len(),
+            if unbound.len() > CLAUDE_AUTHORITY_DROP_LOGGED_REFS {
+                ",..."
+            } else {
+                ""
+            }
+        );
     }
 
     // M1: only the existing complete healthy census can retire absent grants.
@@ -266,9 +389,24 @@ impl ScanIndex {
                         .insert(advance.member, previous);
                 }
                 None => {
-                    record
-                        .member_source_file_fingerprints
-                        .remove(&advance.member);
+                    if record.proof_correction.as_ref().is_some_and(|correction| {
+                        correction.owed_member_ids.contains(&advance.member)
+                    }) {
+                        // No prior pair exists to restore. Preserve the debt
+                        // with a domain-separated nonmatching revision: the
+                        // reverted empty facts cannot certify completion.
+                        record.member_source_file_fingerprints.insert(
+                            advance.member,
+                            sha256_hex(&[
+                                "claude_empty_map_restore_missing_previous:v1",
+                                &advance.revision,
+                            ]),
+                        );
+                    } else {
+                        record
+                            .member_source_file_fingerprints
+                            .remove(&advance.member);
+                    }
                 }
             }
         }
@@ -432,8 +570,12 @@ impl ScanIndex {
             .collect::<BTreeMap<_, _>>();
         let mut candidates = Vec::new();
         for snapshot in &mut result.snapshots {
-            if snapshot.usage_accounting_contract.as_deref()
-                != Some("session_exclusive_reported_usage:v1")
+            // E2 (gate on): an owed member's request-owned literal settles
+            // its correction on the same exact ACK as a reported body.
+            let settles = snapshot.usage_accounting_contract.as_deref()
+                == Some("session_exclusive_reported_usage:v1")
+                || claude_history_upgrade::is_request_owned_literal(snapshot);
+            if !settles
                 || disposition
                     .quarantined_source_session_ids
                     .contains(&snapshot.source_session_id)
@@ -677,12 +819,7 @@ impl ScanIndex {
                 .iter()
                 .map(|item| item.body_witness.as_str())
                 .collect::<BTreeSet<_>>();
-            let mut digest = Sha256::new();
-            update_length_prefixed(&mut digest, b"snapshot_file_upload_body_set:v1");
-            for body in &bodies {
-                update_length_prefixed(&mut digest, body.as_bytes());
-            }
-            let body_set = format!("{:x}", digest.finalize());
+            let body_set = snapshot_file_upload_body_set_hex(bodies);
             if self
                 .files
                 .get(key)

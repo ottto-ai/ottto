@@ -303,8 +303,10 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
     let mut bytes = record(&damaged);
     bytes.extend_from_slice(b"\n\xff\n");
     fs::write(&bad_file, bytes).unwrap();
-    // Discovery resolves the valid first cwd; the newest report then fails.
-    set_mtime(&bad_file, SystemTime::now() + Duration::from_secs(1));
+    // Both are settled. Discovery resolves the valid first cwd; the newest
+    // report then fails.
+    set_mtime(&good_file, SystemTime::now() - 2 * SETTLE_WINDOW);
+    set_mtime(&bad_file, SystemTime::now() - SETTLE_WINDOW);
     let source = SnapshotSource::ClaudeCode;
     let source_label = agent_source_label(source);
     let bad_cache_file = cache_path(
@@ -394,7 +396,7 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
             "synthetic-secret",
             "synthetic-machine",
             &api,
-            &home,
+            std::slice::from_ref(&transcripts),
             &support,
             source,
         )
@@ -430,6 +432,149 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
             upload["workspace_hash"],
             sha256_hex(&[healthy.to_string_lossy().as_ref()])
         );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// One harvest against a synthetic backend whose activity hint answers with
+/// `hint_labels` (`None` fails the fetch). Returns the uploaded payload.
+fn harvest_upload_with_hint(root: &Path, workspace: &Path, hint_labels: Option<bool>) -> Value {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let label = match hint_labels {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "unknown",
+    };
+    let transcripts = root.join(label).join("home/.claude/projects");
+    let support = root.join(label).join("support");
+    for dir in [&transcripts, &support] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let now = OffsetDateTime::now_utc();
+    let file = transcripts.join("session.jsonl");
+    let record = json!({"type":"attachment","cwd":workspace,
+        "timestamp":iso_utc(now),"attachment":{"content":"label policy evidence"}});
+    fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    set_mtime(&file, SystemTime::now() - 2 * SETTLE_WINDOW);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let end = Instant::now() + Duration::from_secs(10);
+        let mut uploads = Vec::new();
+        while uploads.is_empty() && Instant::now() < end {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("synthetic fixture accept: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                assert!(header.len() <= 16 * 1024);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let length = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let (status, response) = if header.contains("/relay-token ") {
+                ("200 OK", json!({"token":"synthetic-relay"}))
+            } else if header.contains("/activity-hints ") {
+                match hint_labels {
+                    Some(labels) => (
+                        "200 OK",
+                        json!({"source":"claude-code",
+                        "server_time":iso_utc(now),"record_count_15m":0,"record_count_24h":0,
+                        "local_usage_reconciliation_enabled":false,"backfill_window_days":14,
+                        "workspace_labels_enabled":labels,"recommended_scan_after":iso_utc(now)}),
+                    ),
+                    None => ("500 Internal Server Error", json!({"detail":"unavailable"})),
+                }
+            } else {
+                assert!(header.contains("/context-composition/snapshot "));
+                uploads.push(serde_json::from_slice::<Value>(&body).unwrap());
+                ("200 OK", json!({"accepted":true}))
+            };
+            let response = response.to_string();
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        }
+        uploads
+    });
+    let source = SnapshotSource::ClaudeCode;
+    let device = LocalDeviceBinding {
+        device_id: "synthetic-device".into(),
+        machine_id: Some("synthetic-machine".into()),
+        sources: vec![agent_source_label(source).into()],
+    };
+    harvest_source(
+        &SnapshotApiClient::new(&api),
+        &device,
+        "synthetic-secret",
+        "synthetic-machine",
+        &api,
+        std::slice::from_ref(&transcripts),
+        &support,
+        source,
+    )
+    .unwrap();
+    let mut uploads = server.join().unwrap();
+    assert_eq!(uploads.len(), 1, "{label}: exactly one upload");
+    uploads.pop().unwrap()
+}
+
+#[test]
+fn harvest_withholds_labels_unless_a_fetched_hint_allows_them() {
+    let root = crate::test_scratch::private_dir("composition-label-policy");
+    let workspace = root.join("label-policy-repo");
+    fs::create_dir_all(&workspace).unwrap();
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let on = harvest_upload_with_hint(&root, &workspace, Some(true));
+    assert_eq!(on["workspace_label"], "label-policy-repo");
+    assert_eq!(on["workspace_label_source"], "repository");
+    assert_eq!(on["repository_label"], "label-policy-repo");
+    assert_eq!(on["repository_label_source"], "git_root");
+    // Policy OFF and a failed hint fetch upload the same withheld payload.
+    for hint_labels in [Some(false), None] {
+        let withheld = harvest_upload_with_hint(&root, &workspace, hint_labels);
+        for field in [
+            "workspace_label",
+            "workspace_label_source",
+            "repository_label",
+            "repository_label_source",
+        ] {
+            assert!(
+                withheld[field].is_null(),
+                "{hint_labels:?}: {field} withheld"
+            );
+        }
+        assert_eq!(withheld["workspace_hash"], on["workspace_hash"]);
+        assert_eq!(withheld["repository_hash"], on["repository_hash"]);
     }
     fs::remove_dir_all(root).unwrap();
 }
@@ -532,7 +677,7 @@ fn measure_synthetic_workspace() {
     };
     let start = Instant::now();
     let scans = discover_workspaces(
-        &root.join("transcripts"),
+        &[root.join("transcripts")],
         SystemTime::now(),
         Instant::now() + Duration::from_secs(300),
     )
@@ -627,7 +772,7 @@ fn measure_synthetic_workspace() {
 //   b1 Bash -> "file1\nfile2"(11=3) shell_output @ord4 res{5,7}=2
 //   br1 browser -> "shot"(4=1)+1 image(1300) browser_and_images @ord6 res{7}=1
 // -------------------------------------------------------------------------
-fn sess_a() -> Vec<Value> {
+pub(super) fn sess_a() -> Vec<Value> {
     vec![
         json!({"type":"user","sessionId":"sessA","message":{"role":"user","content":"hi"}}),
         json!({"type":"assistant","sessionId":"sessA","message":{"role":"assistant","content":[
@@ -657,7 +802,7 @@ fn sess_a() -> Vec<Value> {
 //   w1 result "OK"(2=1) other_tools @ord5 res(5,6){}=0
 //   g1 Grep -> "match1"(6=2) other_tools @ord8 res(8,inf){9}=1
 // -------------------------------------------------------------------------
-fn sess_b() -> Vec<Value> {
+pub(super) fn sess_b() -> Vec<Value> {
     vec![
         json!({"type":"user","sessionId":"sessB","message":{"role":"user","content":"go"}}),
         json!({"type":"attachment","sessionId":"sessB","attachment":{"type":"task_reminder","content":"REMEMBER","itemCount":1}}),
@@ -687,7 +832,7 @@ fn sess_b() -> Vec<Value> {
 //   h1 Read /proj/efforts.html -> "HTMLDATA"(8=2) doc_reads_html @ord6 res{8}=1
 //   orphan result (unknown id) "ORPHAN12"(8=2) other_tools @ord7 res{8}=1
 // -------------------------------------------------------------------------
-fn sess_c() -> Vec<Value> {
+pub(super) fn sess_c() -> Vec<Value> {
     vec![
         json!({"type":"user","sessionId":"sessC","message":{"role":"user","content":"c"}}),
         json!({"type":"attachment","sessionId":"sessC","attachment":{"type":"edited_text_file","filename":"/x/memory/recall.md","snippet":"MEMSNIP12"}}),
@@ -829,7 +974,7 @@ fn subagent_transcripts_stay_distinct() {
 //   c2 web output "WEBRESULT"(9=3) web_fetch_search @ord5 res(5,6){}=0
 //   c3 exec "AFTER123"(8=2) shell_output @ord8 res(8,inf){9}=1
 // -------------------------------------------------------------------------
-fn codex_sess() -> Vec<Value> {
+pub(super) fn codex_sess() -> Vec<Value> {
     vec![
         json!({"type":"session_meta","payload":{"id":"codexS"}}),
         json!({"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"DEVINSTRUCT"}]}}),
@@ -1279,18 +1424,143 @@ fn discovery_incomplete_transcript_refuses_partial_workspace_set() {
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
-    let scans = discover_workspaces(&transcripts, SystemTime::now(), deadline).unwrap();
+    let roots = [transcripts.clone()];
+    let scans = discover_workspaces(&roots, SystemTime::now(), deadline).unwrap();
     assert_eq!(scans.len(), 1);
     assert_eq!(scans[0].workspace, workspace);
     fs::write(transcripts.join("unresolved.jsonl"), b"\xff\n").unwrap();
-    assert!(discover_workspaces(&transcripts, SystemTime::now(), deadline).is_err());
+    assert!(discover_workspaces(&roots, SystemTime::now(), deadline).is_err());
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn discovery_expired_budget_is_not_complete_empty_coverage() {
     let root = crate::test_scratch::private_dir("composition-discovery-expired");
-    assert!(discover_workspaces(&root, SystemTime::now(), Instant::now()).is_err());
+    assert!(discover_workspaces(
+        std::slice::from_ref(&root),
+        SystemTime::now(),
+        Instant::now()
+    )
+    .is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn discovery_spans_registered_roots_and_counts_each_transcript_once() {
+    let root = crate::test_scratch::private_dir("composition-discovery-roots");
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let default_root = root.join("default/projects");
+    let slot_root = root.join("slot/projects");
+    for dir in [&default_root, &slot_root] {
+        fs::create_dir_all(dir.join("-workspace")).unwrap();
+    }
+    let record = json!({"cwd": workspace}).to_string();
+    fs::write(default_root.join("-workspace/default-only.jsonl"), &record).unwrap();
+    fs::write(slot_root.join("-workspace/slot-only.jsonl"), &record).unwrap();
+    // The same session copied into both folders counts once: the newest copy.
+    let older = default_root.join("-workspace/copied.jsonl");
+    let newer = slot_root.join("-workspace/copied.jsonl");
+    fs::write(&older, &record).unwrap();
+    fs::write(&newer, &record).unwrap();
+    set_mtime(&older, SystemTime::now() - Duration::from_secs(60));
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let scans = discover_workspaces(
+        &[default_root.clone(), slot_root.clone()],
+        SystemTime::now(),
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(scans.len(), 1);
+    let mut files = scans[0]
+        .files
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            default_root.join("-workspace/default-only.jsonl"),
+            newer,
+            slot_root.join("-workspace/slot-only.jsonl"),
+        ]
+    );
+    // Subagent ids repeat across parent sessions; those are distinct files.
+    for session in ["session-a", "session-b"] {
+        let dir = slot_root.join("-workspace").join(session).join("subagents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("agent-1.jsonl"), &record).unwrap();
+    }
+    let scans = discover_workspaces(
+        &[default_root.clone(), slot_root.clone()],
+        SystemTime::now(),
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(scans[0].files.len(), 5);
+    // The default folder alone is the pre-registration view.
+    let default_only = discover_workspaces(&[default_root], SystemTime::now(), deadline).unwrap();
+    assert_eq!(default_only[0].files.len(), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn live_transcript_does_not_fence_the_settled_files_of_its_workspace() {
+    let root = crate::test_scratch::private_dir("composition-settle-window");
+    let workspace = root.join("workspace");
+    let transcripts = root.join("transcripts");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&transcripts).unwrap();
+    let record = json!({"type":"attachment","cwd":workspace,
+        "timestamp":iso_utc(OffsetDateTime::now_utc()),"attachment":{"content":"evidence"}})
+    .to_string();
+    let settled = transcripts.join("settled.jsonl");
+    let live = transcripts.join("live.jsonl");
+    fs::write(&settled, &record).unwrap();
+    fs::write(&live, &record).unwrap();
+    set_mtime(&settled, SystemTime::now() - 2 * SETTLE_WINDOW);
+
+    let now = SystemTime::now();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut scans = discover_workspaces(std::slice::from_ref(&transcripts), now, deadline).unwrap();
+    let mut scan = scans.remove(0);
+    assert_eq!(scan.files.len(), 2);
+    // The live session appends between discovery and the signature check.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&live)
+        .unwrap()
+        .write_all(format!("\n{record}").as_bytes())
+        .unwrap();
+    set_mtime(&live, now + Duration::from_secs(1));
+    assert!(workspace_files_signature(&scan.files, deadline).is_err());
+
+    // A live transcript the last upload included stays, keeping its history.
+    let uploaded = BTreeMap::from([(
+        live.to_string_lossy().to_string(),
+        transcript_file_metadata(&fs::metadata(&live).unwrap()).unwrap(),
+    )]);
+    let mut kept = scan.files.clone();
+    retain_settled_files(&mut kept, now, Some(&uploaded));
+    assert_eq!(kept, scan.files);
+    // A new live transcript waits for a later cycle.
+    retain_settled_files(&mut scan.files, now, None);
+    assert_eq!(
+        scan.files.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+        [&settled]
+    );
+    let signature = workspace_files_signature(&scan.files, deadline).unwrap();
+    let report = build_report_for_scan(
+        &scan,
+        &signature,
+        SnapshotSource::ClaudeCode,
+        wide_window(),
+        deadline,
+    )
+    .unwrap();
+    assert!(build_request(&report, &workspace, "machine", "claude-code", false).is_some());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1326,4 +1596,221 @@ fn report_expired_budget_does_not_return_empty_or_partial_replacement() {
     )
     .is_none());
     fs::remove_file(path).unwrap();
+}
+
+// -------------------------------------------------------------------------
+// Copied history: fork/resume records count once as entered context, and
+// only stay resident for the copying session's own requests.
+// -------------------------------------------------------------------------
+
+fn codex_dev(ordinal: u64, text: &str) -> Value {
+    json!({"type":"response_item","ordinal":ordinal,"payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":text}]}})
+}
+
+fn codex_turn(ordinal: u64) -> Value {
+    json!({"type":"response_item","ordinal":ordinal,"payload":{"type":"agent_message","content":[{"type":"output_text","text":"ok"}]}})
+}
+
+fn parse_codex_records(name: &str, records: &[Value]) -> WorkspaceReport {
+    let mut report = WorkspaceReport::new(wide_window());
+    let fallback = Date::from_calendar_date(2026, Month::October, 18).unwrap();
+    let path = write_jsonl(name, records);
+    parse_codex_session(&path, &mut report, fallback).unwrap();
+    fs::remove_file(path).unwrap();
+    report
+}
+
+#[test]
+fn codex_ordinal_fork_counts_copied_history_once() {
+    // Ordinals 0-3 are the copied parent: its header, instructions and turn.
+    let report = parse_codex_records(
+        "codex-ordinal-fork",
+        &[
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":"child","forked_from_id":"parent","thread_source":"subagent","subagent_history_start_ordinal":4}}),
+            json!({"type":"session_meta","ordinal":1,"payload":{"id":"parent"}}),
+            codex_dev(2, "COPIEDDV"),
+            codex_turn(3),
+            codex_dev(4, "OWNDEVXX"),
+            json!({"type":"response_item","ordinal":5,"payload":{"type":"function_call","name":"exec","call_id":"c1","arguments":"{}"}}),
+            json!({"type":"response_item","ordinal":6,"payload":{"type":"function_call_output","call_id":"c1","output":"SHELL123"}}),
+            codex_turn(7),
+        ],
+    );
+    // Entered once (own block, 2 tokens). Residency: own block and the copied
+    // block each stay for the child's two own requests; the parent's turn
+    // is not one of them.
+    assert_eq!(
+        report.category_totals(Category::HarnessAttachments),
+        (1, 2, 8, 0)
+    );
+    assert_eq!(report.copied_history_sessions, 1);
+    assert_eq!(report.excluded_not_fresh, 0);
+    assert_eq!(report.sessions["child"].total, 4);
+}
+
+#[test]
+fn codex_legacy_subagent_fork_starts_at_trigger_turn() {
+    let header = json!({"type":"session_meta","payload":{"id":"child","forked_from_id":"parent","thread_source":"subagent"}});
+    let trigger =
+        json!({"type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}});
+    let report = parse_codex_records(
+        "codex-legacy-subagent",
+        &[
+            header.clone(),
+            codex_dev(1, "COPIEDDV"),
+            codex_turn(2),
+            trigger,
+            codex_dev(4, "OWNDEVXX"),
+            codex_turn(5),
+        ],
+    );
+    assert_eq!(
+        report.category_totals(Category::HarnessAttachments),
+        (1, 2, 4, 0)
+    );
+    assert_eq!(report.copied_history_sessions, 1);
+
+    // Without the trigger the copied part has no boundary: skip the session.
+    let report = parse_codex_records(
+        "codex-legacy-subagent-no-trigger",
+        &[header, codex_dev(1, "COPIEDDV"), codex_turn(2)],
+    );
+    assert!(report.daily.is_empty() && report.sessions.is_empty());
+    assert_eq!(report.excluded_not_fresh, 1);
+}
+
+#[test]
+fn codex_fork_without_boundary_is_excluded_and_paginated_fork_is_local() {
+    let records = |header: Value| vec![header, codex_dev(1, "OWNDEVXX"), codex_turn(2)];
+    let legacy = parse_codex_records(
+        "codex-legacy-user-fork",
+        &records(
+            json!({"type":"session_meta","payload":{"id":"child","forked_from_id":"parent","thread_source":"user"}}),
+        ),
+    );
+    assert!(legacy.daily.is_empty() && legacy.sessions.is_empty());
+    assert_eq!(legacy.excluded_not_fresh, 1);
+
+    for header in [
+        json!({"type":"session_meta","payload":{"id":"child","forked_from_id":"parent","history_base":{"cursor":"x"},"thread_source":"user"}}),
+        json!({"type":"session_meta","payload":{"id":"child","thread_source":"agent_created_thread","history_base":{"cursor":"x"}}}),
+        json!({"type":"session_meta","payload":{"id":"child","thread_source":"user"}}),
+    ] {
+        let report = parse_codex_records("codex-local-history", &records(header));
+        assert_eq!(
+            report.category_totals(Category::HarnessAttachments),
+            (1, 2, 2, 0)
+        );
+        assert_eq!(report.copied_history_sessions, 0);
+        assert_eq!(report.excluded_not_fresh, 0);
+    }
+}
+
+#[test]
+fn claude_resumed_transcript_counts_copied_records_once_in_any_order() {
+    let attachment = |uuid: &str, session: &str| json!({"type":"attachment","uuid":uuid,"sessionId":session,"attachment":{"content":"same harness text"}});
+    let turn = |uuid: &str, session: &str, id: &str| json!({"type":"assistant","uuid":uuid,"sessionId":session,"message":{"id":id,"content":[]}});
+    let original = write_jsonl(
+        "claude-original",
+        &[attachment("u1", "A"), turn("u2", "A", "m1")],
+    );
+    // The resumed transcript repeats u1/u2 under its own session id.
+    let resumed = write_jsonl(
+        "claude-resumed",
+        &[
+            attachment("u1", "B"),
+            turn("u2", "B", "m1"),
+            attachment("u3", "B"),
+            turn("u4", "B", "m2"),
+        ],
+    );
+    let fallback = Date::from_calendar_date(2026, Month::October, 18).unwrap();
+    let parse = |order: [&PathBuf; 2]| {
+        let mut report = WorkspaceReport::new(wide_window());
+        for path in order {
+            parse_claude_session(path, &mut report, fallback, true).unwrap();
+        }
+        report
+    };
+    let forward = parse([&original, &resumed]);
+    let reverse = parse([&resumed, &original]);
+    let (events, tokens, residency, _) = forward.category_totals(Category::HarnessAttachments);
+    // Two distinct records entered; u1 stays for both sessions' requests
+    // (2 turns), u3 for one.
+    assert_eq!(events, 2);
+    assert_eq!(residency, tokens / 2 * 3);
+    assert_eq!(
+        reverse.category_totals(Category::HarnessAttachments),
+        forward.category_totals(Category::HarnessAttachments)
+    );
+    assert_eq!(
+        (forward.copied_history_sessions, forward.excluded_not_fresh),
+        (1, 0)
+    );
+    // Parsed second, the original holds only already-counted records.
+    assert_eq!(
+        (reverse.copied_history_sessions, reverse.excluded_not_fresh),
+        (0, 1)
+    );
+    fs::remove_file(original).unwrap();
+    fs::remove_file(resumed).unwrap();
+}
+
+#[test]
+fn claude_copied_records_stay_with_the_transcript_created_first() {
+    let root = crate::test_scratch::private_dir("composition-copied-owner");
+    let attachment = |uuid: &str, session: &str| json!({"type":"attachment","uuid":uuid,"sessionId":session,"attachment":{"content":"same harness text"}});
+    let turn = |uuid: &str, session: &str| json!({"type":"assistant","uuid":uuid,"sessionId":session,"message":{"id":uuid,"content":[]}});
+    let write = |name: &str, records: &[Value]| {
+        let path = root.join(name);
+        let body = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+        path
+    };
+    let original = write("original.jsonl", &[attachment("u1", "A"), turn("u2", "A")]);
+    std::thread::sleep(Duration::from_millis(20));
+    let fork = write(
+        "fork.jsonl",
+        &[attachment("u1", "B"), turn("u2", "B"), turn("u3", "B")],
+    );
+    let created_order_known = fs::metadata(&original)
+        .and_then(|metadata| metadata.created())
+        .is_ok();
+    // The original keeps working after the fork, so it is modified last.
+    let later = SystemTime::now() + Duration::from_secs(60);
+    set_mtime(&original, later);
+    let scan = WorkspaceScan {
+        workspace: root.clone(),
+        files: vec![
+            (
+                original.clone(),
+                fs::metadata(&original).unwrap().modified().unwrap(),
+            ),
+            (
+                fork.clone(),
+                fs::metadata(&fork).unwrap().modified().unwrap(),
+            ),
+        ],
+        last_seen: later,
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let signature = workspace_files_signature(&scan.files, deadline).unwrap();
+    let report = build_report_for_scan(
+        &scan,
+        &signature,
+        SnapshotSource::ClaudeCode,
+        wide_window(),
+        deadline,
+    )
+    .unwrap();
+    assert_eq!(report.category_totals(Category::HarnessAttachments).0, 1);
+    if created_order_known {
+        assert!(report.sessions["A"].total > 0);
+        assert!(!report.sessions.contains_key("B"));
+        assert_eq!(report.copied_history_sessions, 1);
+    }
+    fs::remove_dir_all(root).unwrap();
 }

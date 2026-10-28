@@ -169,6 +169,49 @@ directly and does not promise that a provider-revoked login will remain valid.
 When Codex reports that a durable home needs login, the app should offer the
 same provider-owned reconnect flow for that exact home.
 
+## Background limit refresh
+
+The daemon reads each Codex home's limits on its own schedule (every 5 minutes
+for a home in use on this Mac, every 15 minutes otherwise, and once a day for a
+second home signed into the same login) and every status read serves the saved
+reading. Each scheduled read is one `codex app-server` run, which also lets
+Codex renew that home's sign-in. The scheduler sleeps until the next home is
+due, and at most a minute, whether or not any app is in front, so a login
+switched outside the daemon is read within a minute (and at least a minute
+after that home's previous read). Between wakes it reuses what it derived from
+the settings, credential and saved files while they are unchanged.
+
+"Background limit refresh" turns these scheduled reads off for every Codex home
+on this Mac at once, the default home included. It is on until the owner
+chooses; nothing changes for anyone who never touches it. The setting is stored
+in the Codex account settings (`background_quota_refresh_consent` and
+`background_quota_refresh_consent_chosen`); an older daemon ignores both, and a
+downgrade that rewrites the file returns the setting to on. A settings file the
+daemon cannot read counts as off.
+
+While it is off:
+
+- the scheduler reads no home: no `codex app-server` run, no running-process
+  scan, and no once-a-day same-login read. The setting is read on every
+  scheduler wake and checked again under the settings lock right before each
+  read; switching it back on wakes the scheduler at once;
+- a person's **Refresh limits**, setup and sign-in checks still read;
+- saved readings are still served and age as usual: shown stale after 30
+  minutes, and not shown past the last-known cap;
+- a home with no usable saved reading reports
+  `codex_quota_background_refresh_off` instead of `codex_quota_not_read_yet`;
+- an older companion app's status refresh, which cannot be told from its timer,
+  reads nothing;
+- an idle home is not renewed, so after a long idle period its next read may
+  ask to sign in again.
+
+Nothing new is read, stored or uploaded; the switch only removes reads. The
+accounts status carries the setting as `background_quota_refresh`
+(`granted` or `consent_required`); its presence means the daemon supports the
+switch. A client sets it with `codex_account_set_quota_refresh_consent`
+(`schema_version`, `consent`) at protocol version 27; older daemons reject that
+command.
+
 ## Product language
 
 The shared Claude Code and Codex action should be phrased as **Keep limits

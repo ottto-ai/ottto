@@ -66,6 +66,13 @@ fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> Value {
 }
 
 fn native_parser(fixture: &Fixture, source: SnapshotSource) -> (OwnedJsonlParser, String, Scope) {
+    native_parser_with(fixture, source, &CodexTitleMetadata::default())
+}
+fn native_parser_with(
+    fixture: &Fixture,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+) -> (OwnedJsonlParser, String, Scope) {
     let mut file = File::open(&fixture.0).unwrap();
     let expected = opened_object_identity(source, &mut file).unwrap();
     let scope = Scope(format!("synthetic-native-{source:?}"));
@@ -78,7 +85,7 @@ fn native_parser(fixture: &Fixture, source: SnapshotSource) -> (OwnedJsonlParser
             SnapshotSource::ClaudeCode => apply_claude_code_line,
             _ => unreachable!(),
         },
-        Some(&CodexTitleMetadata::default()),
+        Some(metadata),
         None,
         None,
         false,
@@ -98,9 +105,58 @@ fn acquire(
     usize,
     Value,
 ) {
-    let (mut parser, expected, scope) = native_parser(fixture, source);
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    acquire_with(
+        fixture,
+        source,
+        &CodexTitleMetadata::default(),
+        &scope,
+        old,
+        now,
+        true,
+    )
+}
+/// `acquire` under explicit Codex sidecar metadata and reduction scope;
+/// `complete` is the expected `ParsedJsonlFile::complete()`.
+#[allow(clippy::too_many_arguments)]
+fn acquire_with(
+    fixture: &Fixture,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+    scope: &Scope,
+    old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    now: u64,
+    complete: bool,
+) -> (
+    Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    ReadMode,
+    usize,
+    Value,
+) {
+    let (retained, mode, guards, items) =
+        acquire_items_with(fixture, source, metadata, scope, old, now, complete);
+    (retained, mode, guards, serde_json::to_value(items).unwrap())
+}
+/// `acquire_with`, returning the items themselves so local-only (`serde(skip)`)
+/// fields can be compared too.
+#[allow(clippy::too_many_arguments)]
+fn acquire_items_with(
+    fixture: &Fixture,
+    source: SnapshotSource,
+    metadata: &CodexTitleMetadata,
+    scope: &Scope,
+    old: Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    now: u64,
+    complete: bool,
+) -> (
+    Option<Retained<sampled_jsonl::CachedJsonlReduction>>,
+    ReadMode,
+    usize,
+    Vec<SnapshotItem>,
+) {
+    let (mut parser, expected, _) = native_parser_with(fixture, source, metadata);
     let debt = old.as_ref().and_then(|old| old.checkpoint.audit_debt());
-    let mode = parser.prepare_acquisition(old, &scope, debt, now).unwrap();
+    let mode = parser.prepare_acquisition(old, scope, debt, now).unwrap();
     let guards = parser
         .reader
         .acquisition
@@ -120,7 +176,11 @@ fn acquire(
         );
     }
     let acquisition = parser
-        .retain_reduction(&scope, now, budget)
+        .retain_reduction(
+            scope,
+            now,
+            sampled_scan::RetainBudget::granted_unclassified(budget),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(acquisition.reduction.is_some(), predicted.is_some());
@@ -134,15 +194,15 @@ fn acquire(
             &fixture.0,
             NOW,
             "native-fixture".into(),
-            Some(&CodexTitleMetadata::default()),
+            Some(metadata),
             Some(&ClaudeTitleMetadata::default()),
             None,
         )
         .unwrap();
-    assert!(parsed.complete());
+    assert_eq!(parsed.complete(), complete);
     let mut items = parsed.snapshots;
     apply_upload_policy(source, &mut items, SnapshotUploadPolicy::default());
-    (retained, mode, guards, serde_json::to_value(items).unwrap())
+    (retained, mode, guards, items)
 }
 fn oracle(fixture: &Fixture, source: SnapshotSource) -> Value {
     let mut items = match source {
@@ -238,6 +298,168 @@ fn sampled_native_progressive_claude_response_and_codex_cumulative_reset() {
     }
 }
 #[test]
+fn sampled_native_claude_compaction_pairs_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let fixture = Fixture::new(source);
+    fixture.append(&usage(source, 100, 0, "claude-opus-4-8"));
+    fixture.append(&json!({"type":"system", "subtype":"compact_boundary",
+        "sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:30:05Z",
+        "uuid":"tail-boundary", "parentUuid":null,
+        "compactMetadata":{"trigger":"auto","preTokens":900000}}));
+    let (retained, _, _, _) = acquire(&fixture, source, None, 100);
+    assert!(retained.is_some());
+    // The summary arrives in a later pass, 5 s from its boundary, so only the
+    // parent chain carried in the cached accumulator can pair it.
+    fixture.append(
+        &json!({"type":"attachment", "sessionId":"native-tail-fixture",
+        "timestamp":"2026-10-07T10:30:05.001Z", "uuid":"tail-attachment",
+        "parentUuid":"tail-boundary"}),
+    );
+    fixture.append(&json!({"type":"user", "isCompactSummary":true,
+        "isVisibleInTranscriptOnly":true, "sessionId":"native-tail-fixture",
+        "timestamp":"2026-10-07T10:30:00Z", "uuid":"tail-summary",
+        "parentUuid":"tail-attachment",
+        "message":{"role":"user","content":"Synthetic summary"}}));
+    let (_, mode, _, body) = acquire(&fixture, source, retained, 101);
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(body[0]["compaction_count"], json!(1));
+    assert_eq!(body, oracle(&fixture, source));
+}
+/// D1: the Codex context windows ride the retained accumulator, so every
+/// real incremental Tail pass (one record per pass, so each window rule meets
+/// a record boundary: change, equal-peak tie, missing window, fill) renders
+/// what a full re-read renders.
+#[test]
+fn sampled_native_codex_context_windows_match_full_read_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = Fixture::new(source);
+    // (last-turn context, window) per record; cumulative input grows.
+    let records: [(u64, Option<u64>); 7] = [
+        (100, Some(1_000)),
+        (200, Some(1_000)),
+        (200, Some(2_000)),
+        (150, None),
+        (300, None),
+        (300, Some(3_000)),
+        (120, Some(2_000)),
+    ];
+    let expected = [
+        // (first, peak, last) windows after each record.
+        (Some(1_000), Some(1_000), Some(1_000)),
+        (Some(1_000), Some(1_000), Some(1_000)),
+        (Some(1_000), Some(1_000), Some(2_000)),
+        (Some(1_000), Some(1_000), None),
+        (Some(1_000), None, None),
+        (Some(1_000), Some(3_000), Some(3_000)),
+        (Some(1_000), Some(3_000), Some(2_000)),
+    ];
+    let mut total = 0;
+    let mut retained = None;
+    for (step, ((context, window), want)) in records.into_iter().zip(expected).enumerate() {
+        total += context;
+        let mut record = json!({"type":"event_msg", "timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"type":"token_count", "info":{"model":"gpt-6",
+            "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":step},
+            "last_token_usage":{"input_tokens":context,"cached_input_tokens":context/2,"output_tokens":1}}}});
+        if let Some(window) = window {
+            record["payload"]["info"]["model_context_window"] = json!(window);
+        }
+        fixture.append(&record);
+        let (next, mode, _, body) = acquire(&fixture, source, retained, 100 + step as u64);
+        // The first pass builds the retained state; every later pass is a
+        // real incremental Tail from it.
+        if step > 0 {
+            assert_eq!(mode, ReadMode::Tail, "step {step}");
+        }
+        assert!(next.is_some(), "step {step}: the reduction is retained");
+        assert_eq!(body, oracle(&fixture, source), "step {step}");
+        let window = |key: &str| body[0].get(key).and_then(Value::as_u64);
+        assert_eq!(
+            (
+                window("first_turn_context_window_tokens"),
+                window("peak_context_fill_window_tokens"),
+                window("last_turn_context_window_tokens"),
+            ),
+            want,
+            "step {step}"
+        );
+        retained = next;
+    }
+}
+/// The fold builds Claude sizes from the retained boundaries and owned
+/// requests, so a Tail pass that sees the next request gives the full read's
+/// sizes. Rebuilt here with every request owned, as for an exclusive root.
+#[test]
+fn sampled_native_claude_compaction_sizes_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let metadata = CodexTitleMetadata::default();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    let rebuilt = |mut items: Vec<SnapshotItem>| {
+        let mut item = items.remove(0);
+        let mut owned = item
+            .claude_usage_occurrences
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        owned.sort_by_key(|occurrence| occurrence.sequence);
+        rebuild_claude_context_posture(&mut item, &owned, None);
+        item
+    };
+    let fixture = Fixture::new(source);
+    fixture.append(&usage(source, 100, 0, "claude-opus-4-8"));
+    fixture.append(&json!({"type":"system", "subtype":"compact_boundary",
+        "sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:30:05Z",
+        "compactMetadata":{"trigger":"manual","preTokens":900000}}));
+    let (retained, _, _, items) =
+        acquire_items_with(&fixture, source, &metadata, &scope, None, 100, true);
+    assert!(retained.is_some());
+    let first = rebuilt(items);
+    assert_eq!(
+        first.compaction_events,
+        vec![SnapshotCompactionEvent {
+            at: "2026-10-07T10:30:05Z".to_string(),
+            before: first.first_turn_context_tokens,
+            after: None,
+            trigger: Some("manual".to_string()),
+        }]
+    );
+
+    fixture.append(&usage(source, 40, 1, "claude-opus-4-8"));
+    let (_, mode, _, items) =
+        acquire_items_with(&fixture, source, &metadata, &scope, retained, 101, true);
+    assert_eq!(mode, ReadMode::Tail);
+    let tail = rebuilt(items);
+    let mut full = parse_claude_code_jsonl_file_with_artifacts(
+        &fixture.0,
+        NOW,
+        "native-fixture".into(),
+        false,
+    )
+    .unwrap();
+    apply_upload_policy(source, &mut full, SnapshotUploadPolicy::default());
+    let full = rebuilt(full);
+    assert_eq!(
+        tail.compaction_events[0].before,
+        first.first_turn_context_tokens
+    );
+    assert_eq!(
+        tail.compaction_events[0].after,
+        tail.last_turn_context_tokens
+    );
+    assert!(tail.compaction_events[0].after.is_some());
+    assert_eq!(tail.compaction_events, full.compaction_events);
+    assert_eq!(tail.local_context_points, full.local_context_points);
+}
+#[test]
 fn sampled_native_cache_eviction_and_active_state_accounting() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -263,7 +485,7 @@ fn sampled_native_cache_eviction_and_active_state_accounting() {
         assert_eq!(cache.insert("fixture".into(), retained), supported);
         if supported {
             assert!(cache.resident_bound().unwrap() >= measured.unwrap());
-            let retained = cache.take("fixture").unwrap();
+            let retained = cache.take("fixture").unwrap().retained;
             let native_copy = retained.state.clone();
             let clone_bound = cache.bound_with(&native_copy).unwrap();
             let combined_bound = cache.bound_with(&(retained, native_copy)).unwrap();
@@ -321,6 +543,82 @@ fn sampled_native_hidden_middle_edit_is_corrected_by_due_full_audit() {
     }
 }
 #[test]
+fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = Fixture::new(SnapshotSource::ClaudeCode);
+    fixture.append(&usage(
+        SnapshotSource::ClaudeCode,
+        100,
+        0,
+        "claude-opus-4-8",
+    ));
+    let ((old, mode, _, body), full) =
+        observe(|| acquire(&fixture, SnapshotSource::ClaudeCode, None, 100));
+    assert!(matches!(mode, ReadMode::Full(_)));
+    assert_eq!(body, oracle(&fixture, SnapshotSource::ClaudeCode));
+    assert_eq!(full.retention_produced, 1);
+    assert_eq!(full.retention_bound_refused, 0);
+    fixture.append(&usage(
+        SnapshotSource::ClaudeCode,
+        140,
+        1,
+        "claude-opus-4-8",
+    ));
+    let (mut parser, expected, scope) = native_parser(&fixture, SnapshotSource::ClaudeCode);
+    assert_eq!(
+        parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
+        ReadMode::Tail
+    );
+    while !parser.step().unwrap() {}
+    let (certificate, refused) = observe(|| {
+        parser
+            .retain_reduction(
+                &scope,
+                101,
+                sampled_scan::RetainBudget::granted_unclassified(0),
+            )
+            .unwrap()
+            .unwrap()
+    });
+    assert!(certificate.reduction.is_none());
+    assert_eq!(
+        certificate
+            .checkpoint
+            .audit_debt()
+            .unwrap()
+            .due_unix_seconds,
+        3700
+    );
+    assert_eq!(refused.retention_bound_refused, 1);
+    assert_eq!(refused.retention_produced, 0);
+    let parsed = parser
+        .finish(
+            &expected,
+            &fixture.0,
+            NOW,
+            "native-fixture".into(),
+            Some(&CodexTitleMetadata::default()),
+            Some(&ClaudeTitleMetadata::default()),
+            None,
+        )
+        .unwrap();
+    assert!(parsed.complete());
+    let mut items = parsed.snapshots;
+    apply_upload_policy(
+        SnapshotSource::ClaudeCode,
+        &mut items,
+        SnapshotUploadPolicy::default(),
+    );
+    assert_eq!(
+        serde_json::to_value(items).unwrap(),
+        oracle(&fixture, SnapshotSource::ClaudeCode)
+    );
+}
+
+#[test]
 fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -364,11 +662,11 @@ fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
                 .retain_reduction(
                     &scope,
                     101,
-                    if partial {
+                    sampled_scan::RetainBudget::granted_unclassified(if partial {
                         crate::transcript_cache::ENTRY_BYTES
                     } else {
                         0
-                    },
+                    }),
                 )
                 .unwrap()
                 .unwrap();
@@ -416,6 +714,302 @@ fn sampled_native_wrong_provider_cache_refuses_reuse() {
         parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
         ReadMode::Full(_)
     ));
+}
+
+// P1-RETAIN-3: Codex forks whose ownership boundary is decided from in-file
+// header fields alone continue from a retained native reduction.
+fn lineage_fixture(values: &[Value]) -> Fixture {
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    fs::write(
+        &fixture.0,
+        values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    fixture
+}
+/// Codex token totals: input, cached input, output, reasoning output.
+type LineageUsage = (u64, u64, u64, u64);
+fn lineage_tokens(
+    second: u64,
+    ordinal: Option<u64>,
+    total: LineageUsage,
+    last: LineageUsage,
+) -> Value {
+    let mut value = json!({"timestamp":format!("2026-10-07T10:00:{second:02}Z"), "type":"event_msg",
+        "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
+        "total_token_usage":{"input_tokens":total.0,"cached_input_tokens":total.1,"output_tokens":total.2,"reasoning_output_tokens":total.3},
+        "last_token_usage":{"input_tokens":last.0,"cached_input_tokens":last.1,"output_tokens":last.2,"reasoning_output_tokens":last.3}}}});
+    if let Some(ordinal) = ordinal {
+        value["ordinal"] = json!(ordinal);
+    }
+    value
+}
+/// Appended owned usage after a fixture whose last total is (140, 110, 18, 3).
+const LINEAGE_APPENDS: [(LineageUsage, LineageUsage); 2] = [
+    ((200, 150, 30, 5), (60, 40, 12, 2)),
+    ((230, 170, 35, 6), (30, 20, 5, 1)),
+];
+/// The reduction a sampled full read retains, before `retain_reduction`.
+fn lineage_state(fixture: &Fixture, metadata: &CodexTitleMetadata) -> SnapshotAccumulator {
+    let (mut parser, _, scope) = native_parser_with(fixture, SnapshotSource::Codex, metadata);
+    parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+    while !parser.step().unwrap() {}
+    parser.accumulator.clone()
+}
+fn lineage_oracle(fixture: &Fixture, metadata: &CodexTitleMetadata) -> Value {
+    let mut items = parse_codex_jsonl_file_with_title_metadata(
+        &fixture.0,
+        NOW,
+        "native-fixture".into(),
+        metadata,
+        None,
+    )
+    .unwrap();
+    apply_upload_policy(
+        SnapshotSource::Codex,
+        &mut items,
+        SnapshotUploadPolicy::default(),
+    );
+    serde_json::to_value(items).unwrap()
+}
+#[test]
+fn sampled_native_in_file_codex_forks_continue_tail_with_full_parse_parity() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let parent = "019fa111-2222-7333-8444-0000000000b1";
+    let spawn = json!({"subagent":{"thread_spawn":{"parent_thread_id":parent}}});
+    let cases = [
+        (
+            "ordinal-with-forked-from-id",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal","forked_from_id":parent,"thread_source":"subagent","source":spawn,"subagent_history_start_ordinal":2}}),
+                lineage_tokens(1, Some(1), (100, 80, 10, 2), (100, 80, 10, 2)),
+                lineage_tokens(2, Some(2), (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            true,
+        ),
+        (
+            "ordinal-without-forked-from-id",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal-headless","thread_source":"subagent","subagent_history_start_ordinal":2}}),
+                lineage_tokens(1, Some(1), (100, 80, 10, 2), (100, 80, 10, 2)),
+                lineage_tokens(2, Some(2), (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            true,
+        ),
+        (
+            "history-base",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","type":"session_meta","payload":{"id":"lineage-history-base","forked_from_id":parent,"thread_source":"user","history_mode":"paginated","history_base":{"cursor":"provider"},"source":"cli"}}),
+                lineage_tokens(1, None, (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            false,
+        ),
+        (
+            "legacy-trigger-subagent",
+            vec![
+                json!({"timestamp":"2026-10-07T10:00:00Z","type":"session_meta","payload":{"id":"lineage-legacy","forked_from_id":parent,"thread_source":"subagent","source":spawn}}),
+                lineage_tokens(1, None, (100, 80, 10, 2), (100, 80, 10, 2)),
+                json!({"timestamp":"2026-10-07T10:00:02Z","type":"event_msg","payload":{"type":"task_started"}}),
+                json!({"timestamp":"2026-10-07T10:00:03Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+                lineage_tokens(4, None, (140, 110, 18, 3), (40, 30, 8, 1)),
+            ],
+            false,
+        ),
+    ];
+    for (case, values, ordinals) in cases {
+        let fixture = lineage_fixture(&values);
+        let (mut retained, mode, _, body) = acquire(&fixture, source, None, 100);
+        assert_eq!(
+            mode,
+            ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing),
+            "{case}"
+        );
+        assert_eq!(body, oracle(&fixture, source), "{case}: first read");
+        assert!(retained.is_some(), "{case}: an in-file fork is retained");
+        {
+            let accumulator = lineage_state(&fixture, &CodexTitleMetadata::default());
+            assert!(sampled_scan::compatible_reduction(&accumulator), "{case}");
+            assert!(accumulator.codex_is_fork, "{case}");
+            assert!(
+                matches!(
+                    accumulator.codex_ownership_boundary,
+                    CodexOwnershipBoundary::Ordinal { .. } | CodexOwnershipBoundary::AllLocal
+                ),
+                "{case}: {:?}",
+                accumulator.codex_ownership_boundary
+            );
+            assert!(!accumulator.codex_created_thread_native_only, "{case}");
+            assert!(!accumulator.codex_parent_ledger_consulted, "{case}");
+        }
+        for (step, (total, last)) in LINEAGE_APPENDS.into_iter().enumerate() {
+            let next_ordinal = (values.len() + step) as u64;
+            fixture.append(&lineage_tokens(
+                10 + step as u64,
+                ordinals.then_some(next_ordinal),
+                total,
+                last,
+            ));
+            let (next, mode, _, body) = acquire(&fixture, source, retained, 101 + step as u64);
+            assert_eq!(mode, ReadMode::Tail, "{case}: append {step}");
+            assert_eq!(body, oracle(&fixture, source), "{case}: append {step}");
+            assert!(next.is_some(), "{case}: append {step} stays retained");
+            retained = next;
+        }
+        assert_eq!(
+            acquire(&fixture, source, retained, 200).3,
+            oracle(&fixture, source),
+            "{case}"
+        );
+    }
+}
+#[test]
+fn sampled_native_retained_ordinal_fork_with_an_ordinal_break_is_held_not_retained() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let metadata = CodexTitleMetadata::default();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    // After a retained `Ordinal` copy, a gap or a backward step breaks the
+    // ordinal stream: the tail is held exactly as a full parse holds it, no
+    // copy is retained, and the next change is a full read.
+    for (case, broken) in [("gap", 4), ("backward", 1)] {
+        let fixture = lineage_fixture(&[
+            json!({"timestamp":"2026-10-07T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"lineage-ordinal-break","forked_from_id":"019fa111-2222-7333-8444-0000000000b1","thread_source":"subagent","subagent_history_start_ordinal":2}}),
+            lineage_tokens(1, Some(1), (100, 80, 10, 2), (100, 80, 10, 2)),
+            lineage_tokens(2, Some(2), (140, 110, 18, 3), (40, 30, 8, 1)),
+        ]);
+        let (retained, _, _, _) = acquire(&fixture, source, None, 100);
+        assert!(retained.is_some(), "{case}: the fork is retained first");
+        let (total, last) = LINEAGE_APPENDS[0];
+        fixture.append(&lineage_tokens(10, Some(broken), total, last));
+        let (next, mode, _, body) =
+            acquire_with(&fixture, source, &metadata, &scope, retained, 101, false);
+        assert_eq!(mode, ReadMode::Tail, "{case}");
+        assert_eq!(body, oracle(&fixture, source), "{case}: tail parity");
+        assert_eq!(body, json!([]), "{case}: held, never partial");
+        assert!(next.is_none(), "{case}: no copy after the break");
+        let (total, last) = LINEAGE_APPENDS[1];
+        fixture.append(&lineage_tokens(11, Some(broken + 1), total, last));
+        let (next, mode, _, body) =
+            acquire_with(&fixture, source, &metadata, &scope, next, 102, false);
+        assert_eq!(
+            mode,
+            ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing),
+            "{case}"
+        );
+        assert_eq!(body, oracle(&fixture, source), "{case}: full parity");
+        assert!(next.is_none(), "{case}");
+    }
+}
+#[test]
+fn sampled_native_legacy_subagent_with_sidecar_parent_retains_until_family_changes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let child = format!(
+        "019fa111-2222-7333-8444-{:012x}",
+        (u64::from(std::process::id()) << 16) | NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+    );
+    let parent = "019fa111-2222-7333-8444-0000000000c1";
+    let grandparent = "019fa111-2222-7333-8444-0000000000c2";
+    // The sidecar parent binds only through a rollout path that names the child.
+    let fixture = Fixture(std::env::temp_dir().join(format!("rollout-{child}.jsonl")));
+    let _ = fs::remove_file(&fixture.0);
+    for value in [
+        json!({"timestamp":"2026-10-07T10:00:00Z","type":"session_meta","payload":{"id":child,"forked_from_id":parent,"thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":parent}}}}}),
+        lineage_tokens(1, None, (100, 80, 10, 2), (100, 80, 10, 2)),
+        json!({"timestamp":"2026-10-07T10:00:02Z","type":"event_msg","payload":{"type":"task_started"}}),
+        json!({"timestamp":"2026-10-07T10:00:03Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+        lineage_tokens(4, None, (140, 110, 18, 3), (40, 30, 8, 1)),
+    ] {
+        fixture.append(&value);
+    }
+    let mut family = CodexTitleMetadata::default();
+    family
+        .spawn_parents
+        .insert(child.clone(), parent.to_string());
+    // The production reduction scope folds in this fingerprint, which carries
+    // the family position (`reduction_dependencies`, `file_scope`).
+    let scope =
+        |metadata: &CodexTitleMetadata| Scope(metadata.path_reduction_fingerprint(&fixture.0));
+
+    let (retained, mode, _, body) =
+        acquire_with(&fixture, source, &family, &scope(&family), None, 100, true);
+    assert_eq!(
+        mode,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing)
+    );
+    assert_eq!(body, lineage_oracle(&fixture, &family));
+    assert!(
+        retained.is_some(),
+        "a legacy-trigger subagent with a sidecar parent is retained"
+    );
+    {
+        let accumulator = lineage_state(&fixture, &family);
+        assert!(sampled_scan::compatible_reduction(&accumulator));
+        assert_eq!(
+            accumulator
+                .codex_sidecar_parent
+                .as_ref()
+                .map(|(_, parent)| parent.as_str()),
+            Some(parent)
+        );
+        assert_eq!(
+            accumulator.codex_ownership_boundary,
+            CodexOwnershipBoundary::AllLocal
+        );
+        assert!(accumulator.codex_legacy_trigger_seen);
+    }
+
+    let (total, last) = LINEAGE_APPENDS[0];
+    fixture.append(&lineage_tokens(10, None, total, last));
+    let (retained, mode, _, body) = acquire_with(
+        &fixture,
+        source,
+        &family,
+        &scope(&family),
+        retained,
+        101,
+        true,
+    );
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(body, lineage_oracle(&fixture, &family));
+    assert!(retained.is_some());
+
+    // A family change (a newly recorded grandparent) changes the reduction
+    // scope, so the retained copy is not continued.
+    let mut changed = family.clone();
+    changed
+        .spawn_parents
+        .insert(parent.to_string(), grandparent.to_string());
+    assert_ne!(scope(&changed), scope(&family));
+    let (total, last) = LINEAGE_APPENDS[1];
+    fixture.append(&lineage_tokens(11, None, total, last));
+    let (retained, mode, _, body) = acquire_with(
+        &fixture,
+        source,
+        &changed,
+        &scope(&changed),
+        retained,
+        102,
+        true,
+    );
+    assert_eq!(
+        mode,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::ScopeChanged)
+    );
+    assert_eq!(body, lineage_oracle(&fixture, &changed));
+    assert!(retained.is_some());
 }
 
 struct ScanFixture {
@@ -606,7 +1200,11 @@ fn sampled_native_live_inputs_restored_after_charge_and_copy() {
         ));
     }
     let completed = parser
-        .retain_reduction(&scope, 100, crate::transcript_cache::ENTRY_BYTES)
+        .retain_reduction(
+            &scope,
+            100,
+            sampled_scan::RetainBudget::granted_unclassified(crate::transcript_cache::ENTRY_BYTES),
+        )
         .unwrap()
         .unwrap();
     assert!(
@@ -648,6 +1246,7 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
             if inputs != "parents" {
                 let traces = Arc::new(CodexTurnTraceMap {
                     priority_turns: (0..5000).map(|n| format!("unrelated-turn-{n}")).collect(),
+                    incomplete: false,
                 });
                 assert!(crate::heap_layout_bound::bound(&traces, 31 * 1024 * 1024).is_none());
                 scan.codex_turn_traces = Some(traces);
@@ -662,6 +1261,10 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
                                     signatures: Vec::new(),
                                     scan_complete: true,
                                     opened_object_identity: "synthetic-unrelated".into(),
+                                    unresolvable: None,
+                                    opened_changed_nanos: 0,
+                                    opened_modified_nanos: 0,
+                                    opened_birth_nanos: 0,
                                 },
                             )
                         })
@@ -709,6 +1312,342 @@ fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
             production_body(SnapshotSource::Codex, full)
         );
         eprintln!("SAMPLED_LIVE_INPUTS inputs={inputs} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
+    }
+}
+/// SOURCE B2: a Codex restart through the real scanner. A first process
+/// reads the rollout Full under an active counting cutover (the V2 view)
+/// with live turn traces and parent ledgers, saves, and writes its record
+/// under #801's lock. A restarted process (fresh RAM cache, same live inputs
+/// re-injected by the scan) restores the record, re-checks its observed
+/// priority turns against the traces, Tails the appended rows and publishes
+/// the cold Full's body. Refusal arms, each read Full to the cold Full's
+/// body: the counting view changes between write and restore (the record's
+/// scope no longer binds), and the traces now mark the observed turn
+/// priority (the restored copy's priority re-check refuses reuse), or the key
+/// becomes a referenced parent (no record I/O). Nonempty #660 maps are unchanged
+/// by restore + Tail and byte-equal to the cold Full maps. Legacy-ACK
+/// stickiness (Lead B r8 condition 2): a dated root header that a fresh read
+/// would count as V2, seeded with a prior Legacy ACK, writes a Legacy record;
+/// restore + Tail keeps Legacy and equals the cold Full's body, census and
+/// counting state. The restore itself is proven where the layout is
+/// supported (macOS); elsewhere the arm reads Full to the same oracle.
+#[cfg(unix)]
+#[test]
+fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
+    let source = SnapshotSource::Codex;
+    let supported = crate::heap_layout_bound::layout_supported();
+    let _cutover = codex_counting_version::TestCutover::set(0);
+    let capture = claude_request_identity::capture_by_default();
+    let namespace = Scope("durable-codex".into());
+    let arms = [
+        "restore",
+        "view_changed",
+        "priority_changed",
+        "parent_ref",
+        "legacy_ack_restore",
+    ];
+    for (v2, arm) in [false, true]
+        .into_iter()
+        .flat_map(|v2| arms.map(|arm| (v2, arm)))
+        .filter(|&(v2, arm)| !v2 || arm != "legacy_ack_restore")
+    {
+        let legacy_ack = arm == "legacy_ack_restore";
+        let fixture = ScanFixture::new(source);
+        // A dated origin can select V2; an undated origin stays Legacy.
+        // The Legacy -> V2 view-change control needs a dated header with
+        // prior Legacy ACK evidence, so either injected view is valid. The
+        // Legacy-ACK stickiness arm needs the same dated header and ACK.
+        if v2 || arm == "view_changed" || legacy_ack {
+            let text = fs::read_to_string(&fixture.file.0).unwrap();
+            let mut meta: Value = serde_json::from_str(text.trim()).unwrap();
+            meta["payload"]["timestamp"] = json!("2026-10-07T10:00:00Z");
+            fs::write(&fixture.file.0, meta.to_string() + "\n").unwrap();
+        }
+        fixture.file.append(
+            &json!({"type":"turn_context","timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"turn_id":"turn-b2-1","model":"fixture-model"}}),
+        );
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let live = |priority: bool| {
+            move |scan: &mut OwnedSourceScan| {
+                let mut turns = (0..64)
+                    .map(|n| format!("unrelated-turn-{n}"))
+                    .collect::<BTreeSet<_>>();
+                if priority {
+                    turns.insert("turn-b2-1".into());
+                }
+                scan.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
+                    priority_turns: turns,
+                    incomplete: false,
+                }));
+                scan.codex_parent_ownership_ledgers =
+                    Some(Arc::new(Mutex::new(BTreeMap::from([(
+                        "unrelated-parent".to_string(),
+                        CodexParentOwnershipLedger {
+                            signatures: Vec::new(),
+                            scan_complete: true,
+                            opened_object_identity: "synthetic-unrelated".into(),
+                            unresolvable: None,
+                            opened_changed_nanos: 0,
+                            opened_modified_nanos: 0,
+                            opened_birth_nanos: 0,
+                        },
+                    )]))));
+            }
+        };
+        let state = fixture.dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let index_path = state.join("index.json");
+        let lock = crate::locked_state_dir::test_locks::hold(&state);
+        let first = Arc::new(sampled_scan::SharedCache::default());
+        first.durable_begin_pass(source, &index_path, &namespace, capture);
+        let mut initial = ScanIndex::default();
+        if !v2 && (arm == "view_changed" || legacy_ack) {
+            initial.files.insert(
+                local_index_key(&fixture.file.0),
+                serde_json::from_value(json!({
+                    "size_bytes":0, "modified_unix_seconds":0,
+                    "source_file_fingerprint":"prior-legacy-source",
+                    "last_snapshot_fingerprint":"prior-legacy-ack"
+                }))
+                .unwrap(),
+            );
+        }
+        let (mut index, _, modes, _) = production_scan_at_with_setup(
+            &fixture,
+            source,
+            initial,
+            Some(first.clone()),
+            &namespace.0,
+            NOW,
+            live(false),
+        );
+        assert_eq!(modes, (1, 0, 0), "{arm}");
+        let key = local_index_key(&fixture.file.0);
+        assert_eq!(
+            index.files[&key].codex_counting_v2, v2,
+            "seed decision: {arm}"
+        );
+        index.save(&index_path).unwrap();
+        first.durable_write_after_save(lock, source, &index);
+        let records = fs::read_dir(crate::durable_tail_store::store_dir_for_index(&index_path))
+            .map_or(0, |entries| entries.count());
+        assert_eq!(
+            records,
+            usize::from(supported),
+            "{arm}: written after the save"
+        );
+
+        fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+        let mut loaded = ScanIndex::load(&index_path).unwrap();
+        let key = local_index_key(&fixture.file.0);
+        if arm == "view_changed" {
+            let entry = loaded.files.get_mut(&key).unwrap();
+            entry.codex_counting_v2 = !entry.codex_counting_v2;
+        }
+        if arm == "parent_ref" {
+            loaded
+                .codex_parent_ownership_refs
+                .insert("019fa111-2222-7333-8444-555555555555".into());
+        }
+        // Nonempty #660 records for an unrelated parent/child must survive
+        // the main retained-copy path byte-for-byte, including its real seal.
+        let (mut proof_parser, _, proof_scope) = native_parser(&fixture.file, source);
+        proof_parser
+            .prepare_acquisition(None, &proof_scope, None, 1_791_374_400)
+            .unwrap();
+        while !proof_parser.step().unwrap() {}
+        let seal = match proof_parser
+            .certify_without_retention(&proof_scope, 1_791_374_400)
+            .unwrap()
+        {
+            sampled_jsonl::SideCertificate::Certified { completed, .. } => completed
+                .checkpoint
+                .seal_as(1_791_374_400, &codex_parent_side_scope()),
+            _ => panic!("fixture proof checkpoint"),
+        };
+        let stamp =
+            sampled_scan::codex_cursor::OpenStamp::capture(&File::open(&fixture.file.0).unwrap())
+                .unwrap();
+        loaded.codex_parent_side.insert(
+            "unrelated-parent-key".into(),
+            CodexParentSide {
+                verdict: SideVerdict::Settled,
+                seal: seal.clone(),
+                parsed: stamp,
+                pace: None,
+                generation: 1,
+                referenced_epoch: 1,
+            },
+        );
+        loaded.codex_parent_side_requests.insert(
+            "unrelated-parent-key".into(),
+            SideRequest {
+                dev_ino: (0, 0),
+                needed_extent: 1,
+                state: SideRequestState::Live,
+                state_extent: 1,
+                state_ctime: (0, 0),
+                attempt_extent: 1,
+                attempt_ctime: (0, 0),
+                attempts: 1,
+                not_before_unix_seconds: u64::MAX,
+                needed_charge: None,
+                referenced_epoch: 1,
+            },
+        );
+        loaded.codex_parent_prefix_proofs.insert(
+            "unrelated-child-key".into(),
+            CodexParentProofState::Proven(CodexParentPrefixProof {
+                parent: "unrelated-parent".into(),
+                parent_seal: seal,
+                matched: 0,
+                child_digest: sha256_hex(&["unrelated-child-prefix"]),
+                owned: false,
+                published: false,
+            }),
+        );
+        // These are retained historical records outside this scan root.
+        // Census reconciliation must keep them; this control has no new
+        // disappearance or proof work to perform on the sentinel records.
+        for record_key in ["unrelated-parent-key", "unrelated-child-key"] {
+            let mut historical = loaded.files[&key].clone();
+            historical.codex_protected_owner = Some(sha256_hex(&["unrelated-history-owner"]));
+            assert!(historical.retain_history_evidence());
+            loaded.files.insert(record_key.into(), historical);
+        }
+        let parent_records = |index: &ScanIndex| {
+            (
+                serde_json::to_vec(&index.codex_parent_side).unwrap(),
+                serde_json::to_vec(&index.codex_parent_side_requests).unwrap(),
+                serde_json::to_vec(&index.codex_parent_prefix_proofs).unwrap(),
+            )
+        };
+        let before_parents = parent_records(&loaded);
+        let second = Arc::new(sampled_scan::SharedCache::default());
+        second.durable_begin_pass(source, &index_path, &namespace, capture);
+        let (warm_index, scan, modes, _) = production_scan_at_with_setup(
+            &fixture,
+            source,
+            loaded.clone(),
+            Some(second.clone()),
+            &namespace.0,
+            NOW,
+            live(arm == "priority_changed"),
+        );
+        let (counters, store) = second.durable_counters(source).unwrap();
+        eprintln!("{arm}: {}", counters.summary(source, &store));
+        let restored =
+            matches!(arm, "restore" | "priority_changed" | "legacy_ack_restore") && supported;
+        if arm == "parent_ref" {
+            assert_eq!(
+                counters.restore_attempts, 0,
+                "parent never attempts restore"
+            );
+            assert_eq!(store.records_read, 0, "parent never reads its record");
+        }
+        assert_eq!(counters.restored, u64::from(restored), "{arm}");
+        if supported && arm == "view_changed" {
+            assert_eq!(counters.ineligible.get("scope"), Some(&1), "{arm}");
+        }
+        let expected = if supported && matches!(arm, "restore" | "legacy_ack_restore") {
+            (0, 1, 0)
+        } else {
+            (1, 0, 0)
+        };
+        assert_eq!(modes, expected, "{arm}");
+        let (cold_index, full, _, _) = production_scan_at_with_setup(
+            &fixture,
+            source,
+            loaded,
+            None,
+            &namespace.0,
+            NOW,
+            live(arm == "priority_changed"),
+        );
+        assert_eq!(
+            warm_index.files[&key].codex_counting_v2, cold_index.files[&key].codex_counting_v2,
+            "restored counting decision: {arm}"
+        );
+        assert_eq!(
+            warm_index.files[&key].codex_counting_v2,
+            if arm == "view_changed" { !v2 } else { v2 },
+            "never flip the loaded decision: {arm}",
+        );
+        if matches!(arm, "restore" | "legacy_ack_restore") {
+            assert_eq!(parent_records(&warm_index), before_parents);
+            assert_eq!(parent_records(&warm_index), parent_records(&cold_index));
+        }
+        if legacy_ack {
+            assert!(!warm_index.files[&key].codex_counting_v2, "stays Legacy");
+            // Census and counting state of the restored generation equal the
+            // cold Full's; neither runs a V2 counting parse.
+            let census = |index: &ScanIndex, scan: &SourceScanResult| {
+                (
+                    [
+                        scan.scanned_session_count as u64,
+                        scan.over_line_cap_count as u64,
+                        scan.recognized_usage_drop_count as u64,
+                        scan.dropped_usage_record_count,
+                        scan.ownership_incomplete_file_count as u64,
+                        scan.zero_snapshot_usage_evidence_count as u64,
+                        scan.terminal_ownership_incomplete_file_count as u64,
+                        scan.terminal_zero_snapshot_usage_evidence_count as u64,
+                        scan.terminal_recognized_usage_drop_count as u64,
+                        scan.terminal_dropped_usage_record_count,
+                        scan.terminal_over_line_cap_count as u64,
+                        scan.census_residue_index_key_count as u64,
+                        scan.census_residue_archived_rollout_count as u64,
+                        scan.census_residue_blocked_session_count as u64,
+                    ],
+                    index.codex_state_only_blocked_session_ids.clone(),
+                    scan.codex_counting_v2
+                        .as_ref()
+                        .map_or(0, |receipts| receipts.v2_sessions),
+                )
+            };
+            let (warm_census, cold_census) =
+                (census(&warm_index, &scan), census(&cold_index, &full));
+            assert_eq!(warm_census, cold_census, "census: {arm}");
+            assert_eq!(warm_census.2, 0, "no V2 counting parse: {arm}");
+            let counting = |entry: &ScanIndexEntry| {
+                (
+                    entry.codex_counting_v2,
+                    entry.codex_counting_owner.clone(),
+                    entry.last_snapshot_fingerprint.clone(),
+                    entry.last_upload_body_witness.clone(),
+                    entry.effective_upload_body_witness_revision,
+                    entry.codex_applied_tier_receipt.clone(),
+                    entry.codex_applied_tier_receipt_required,
+                )
+            };
+            assert_eq!(
+                counting(&warm_index.files[&key]),
+                counting(&cold_index.files[&key]),
+                "counting state: {arm}"
+            );
+            // Premise: without the Legacy ACK the same dated file is V2, so
+            // the restored decision is stickiness, not the header's default.
+            let (fresh, _, _, _) = production_scan_at_with_setup(
+                &fixture,
+                source,
+                ScanIndex::default(),
+                None,
+                &namespace.0,
+                NOW,
+                live(false),
+            );
+            assert!(
+                fresh.files[&key].codex_counting_v2,
+                "a fresh read of the dated header chooses V2"
+            );
+        }
+        assert!(!scan.snapshots.is_empty(), "compare an emitted Codex body");
+        assert_eq!(
+            production_body(source, scan),
+            production_body(source, full),
+            "{arm}"
+        );
     }
 }
 fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value {
@@ -1022,6 +1961,7 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     parser.accumulator.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
         priority_turns: BTreeSet::from(["unrelated-turn".into()]),
+        incomplete: false,
     }));
     assert_eq!(
         parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
@@ -1031,6 +1971,7 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
     let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
     parser.accumulator.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
         priority_turns: BTreeSet::from(["this-turn".into()]),
+        incomplete: false,
     }));
     assert!(matches!(
         parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
@@ -1093,6 +2034,424 @@ fn sampled_production_unretainable_full_file_preserves_other_native_tails() {
         assert_eq!(production_body(source, tail), production_body(source, full));
     }
 }
+
+/// L-A1: the `sampled_production_unretainable_full_file_preserves_other_native_tails`
+/// rows, read with the sidecar census incomplete, so the large file is an
+/// unsampled synchronous native read rather than a sampled `Full` one.
+fn append_unretainable_rows(large: &ScanFixture, source: SnapshotSource) {
+    for n in 0..150 {
+        let mut row = usage(source, 100 + n as u64, n, &format!("model-{n}"));
+        if source == SnapshotSource::ClaudeCode && n == 0 {
+            row["message"]["id"] =
+                Value::String("x".repeat(crate::transcript_cache::ENTRY_BYTES + 1));
+        }
+        large.file.append(&row);
+    }
+}
+fn incomplete_sidecar_census(scan: &mut OwnedSourceScan) {
+    scan.sidecar_census_complete = false;
+}
+
+/// L-A1: an unsampled native read (Claude, or Codex under the 64MiB singleton
+/// limit, with the sidecar census incomplete) owns no optimization state. Its
+/// copy refusal must not wipe an unrelated, independently bounded resident
+/// reduction, and must not insert one of its own.
+#[test]
+fn sampled_production_unsampled_full_file_preserves_other_native_tails() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let small = ScanFixture::new(source);
+        let large = ScanFixture::new(source);
+        let small_key = local_index_key(&small.file.0);
+        let large_key = local_index_key(&large.file.0);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        small.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (index, _, _) = production_scan(
+            &small,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        assert!(
+            cache.retained_checkpoint(&small_key).is_some(),
+            "precondition: the unrelated reduction is resident {source:?}"
+        );
+        append_unretainable_rows(&large, source);
+        let (mut parser, _, _) = native_parser(&large.file, source);
+        while !parser.step().unwrap() {}
+        assert!(
+            crate::heap_layout_bound::bound(&parser, 31 * 1024 * 1024).is_none(),
+            "precondition: the fixture refuses optional copies {source:?}"
+        );
+        let ((_, large_scan, large_modes, _), lifecycle) =
+            crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+                production_scan_at_with_setup(
+                    &large,
+                    source,
+                    ScanIndex::default(),
+                    Some(cache.clone()),
+                    "mixed-files",
+                    NOW,
+                    incomplete_sidecar_census,
+                )
+            });
+        assert_eq!(
+            large_modes,
+            (0, 0, 0),
+            "precondition: the large file is read unsampled {source:?}"
+        );
+        let (_, large_full, _, _) = production_scan_at_with_setup(
+            &large,
+            source,
+            ScanIndex::default(),
+            None,
+            "mixed-files",
+            NOW,
+            incomplete_sidecar_census,
+        );
+        assert_eq!(
+            production_body(source, large_scan),
+            production_body(source, large_full),
+            "precondition: native output {source:?}"
+        );
+        assert_eq!(
+            lifecycle.clear_other_active, 0,
+            "unsampled native copy refusal wiped the cache {source:?}"
+        );
+        assert_eq!(lifecycle.clear_entries_released, 0, "{source:?}");
+        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0, "{source:?}");
+        assert_eq!(lifecycle.clear_metadata_unsupported, 0, "{source:?}");
+        assert_eq!(lifecycle.clear_no_active, 0, "{source:?}");
+        assert!(
+            cache.retained_checkpoint(&small_key).is_some(),
+            "the unrelated reduction survives {source:?}"
+        );
+        assert!(
+            cache.retained_checkpoint(&large_key).is_none(),
+            "the unsampled file inserted nothing {source:?}"
+        );
+        small.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes) = production_scan(&small, source, index, Some(cache), "mixed-files");
+        assert_eq!(modes, (0, 1, 0), "unrelated unsampled refusal {source:?}");
+        let (_, full, _) =
+            production_scan(&small, source, ScanIndex::default(), None, "mixed-files");
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
+
+/// A cached production scan object, stepped by the caller.
+fn cached_scan(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: &Arc<sampled_scan::SharedCache>,
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> OwnedSourceScan {
+    let mut scan = OwnedSourceScan::new(
+        source,
+        std::slice::from_ref(&fixture.root),
+        index,
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        true,
+    )
+    .with_sampled_acquisition(Arc::clone(cache), Scope("mixed-files".into()));
+    setup(&mut scan);
+    scan
+}
+/// Steps `scan` until `stop` holds between two steps.
+fn step_until(
+    mut scan: OwnedSourceScan,
+    mut stop: impl FnMut(&mut OwnedSourceScan) -> bool,
+) -> OwnedSourceScan {
+    for _ in 0..10_000 {
+        if stop(&mut scan) {
+            return scan;
+        }
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete { .. } => panic!("the scan completed first"),
+        }
+    }
+    panic!("the scan did not reach the expected step");
+}
+
+/// L-A1 guard matrix: the copy-refusal release called directly on the real
+/// step-start shape of an unsampled native read, and on a borrowed Tail
+/// (P1-RETAIN R0: no release unless it borrows more than its reduction).
+#[test]
+fn sampled_unsampled_native_refusal_guard_matrix() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let release = |scan: &OwnedSourceScan, measured: Option<usize>| {
+        observe(|| {
+            sampled_scan::release_cache_for_copy_refusal(
+                scan.sampling.as_ref(),
+                scan.active_file.as_deref(),
+                measured,
+            )
+        })
+        .1
+    };
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let small = ScanFixture::new(source);
+        let large = ScanFixture::new(source);
+        let small_key = local_index_key(&small.file.0);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        small.file.append(&usage(source, 100, 0, "fixture-model"));
+        production_scan(
+            &small,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        assert!(
+            cache.retained_checkpoint(&small_key).is_some(),
+            "precondition: the unrelated reduction is resident {source:?}"
+        );
+        append_unretainable_rows(&large, source);
+        let mut measured = None;
+        let mut scan = step_until(
+            cached_scan(
+                &large,
+                source,
+                ScanIndex::default(),
+                &cache,
+                incomplete_sidecar_census,
+            ),
+            |scan| {
+                if scan.active_file.is_none() {
+                    return false;
+                }
+                let (budget, resident) = scan.sampled_copy_parts();
+                measured = resident;
+                budget == 0
+            },
+        );
+        let active = scan.active_file.as_deref().unwrap();
+        assert!(
+            active.sampling.is_none()
+                && active.cursor.is_none()
+                && active.group.is_none()
+                && active.aliases.is_empty()
+                && active.applied_receipts.is_empty()
+                && active.parser.reader.acquisition.is_none(),
+            "precondition: an unsampled native read {source:?}"
+        );
+        assert!(
+            measured.is_some(),
+            "precondition: this step measured the residents {source:?}"
+        );
+        let reserved = cache.cursor_reserved();
+
+        // Exempt and measured: no clear, no new copy budget.
+        let counts = release(&scan, measured);
+        assert_eq!(
+            (
+                counts.clear_other_active,
+                counts.clear_full_resident_bound_unknown,
+                counts.clear_metadata_unsupported,
+                counts.clear_no_active,
+                counts.clear_entries_released,
+            ),
+            (0, 0, 0, 0, 0),
+            "{source:?}"
+        );
+        assert!(
+            cache.retained_checkpoint(&small_key).is_some(),
+            "{source:?}"
+        );
+        assert_eq!(
+            scan.sampled_copy_parts(),
+            (0, measured),
+            "residents stay bounded and the copy budget stays zero {source:?}"
+        );
+        assert_eq!(cache.cursor_reserved(), reserved, "{source:?}");
+
+        // Any structural miss keeps ClearOtherActive, even when measured.
+        let candidate = scan.active_file.as_deref().unwrap().candidate.clone();
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.aliases.push(candidate);
+        let counts = release(&scan, measured);
+        assert_eq!(counts.clear_other_active, 1, "alias {source:?}");
+        assert_eq!(counts.clear_entries_released, 1, "{source:?}");
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.aliases.clear();
+        active.applied_receipts.insert(String::new(), None);
+        assert_eq!(
+            release(&scan, measured).clear_other_active,
+            1,
+            "receipt {source:?}"
+        );
+        scan.active_file
+            .as_deref_mut()
+            .unwrap()
+            .applied_receipts
+            .clear();
+        let no_join = |active: &OwnedActiveFile| {
+            active
+                .parser
+                .accumulator
+                .codex_tier_replay
+                .as_ref()
+                .map_or(true, |replay| replay.join.is_none())
+        };
+        let others_absent = |active: &OwnedActiveFile| {
+            active.sampling.is_none()
+                && active.cursor.is_none()
+                && active.group.is_none()
+                && active.aliases.is_empty()
+                && active.applied_receipts.is_empty()
+        };
+        // An acquisition alone, which `sampling` implies today, still clears.
+        let active = scan.active_file.as_deref_mut().unwrap();
+        assert!(
+            others_absent(&*active)
+                && no_join(&*active)
+                && active.parser.reader.acquisition.is_none(),
+            "precondition: only the acquisition conjunct changes {source:?}"
+        );
+        let mut file = OpenOptions::new().read(true).open(&large.file.0).unwrap();
+        let plan = crate::transcript_acquisition::ReadPlan::prepare(
+            &mut file,
+            None,
+            &Scope("guard-matrix".into()),
+            None,
+            100,
+        )
+        .unwrap();
+        active.parser.reader.acquisition = Some(plan);
+        assert_eq!(
+            release(&scan, measured).clear_other_active,
+            1,
+            "acquisition {source:?}"
+        );
+        scan.active_file
+            .as_deref_mut()
+            .unwrap()
+            .parser
+            .reader
+            .acquisition = None;
+        // A Codex group join alone, which `group` implies today, still clears.
+        if source == SnapshotSource::Codex {
+            let active = scan.active_file.as_deref_mut().unwrap();
+            assert!(
+                others_absent(&*active)
+                    && active.parser.reader.acquisition.is_none()
+                    && no_join(&*active),
+                "precondition: only the join conjunct changes"
+            );
+            let replay = active.parser.accumulator.codex_tier_replay.take();
+            let mut joined = replay
+                .clone()
+                .unwrap_or_else(|| codex_file_join::TierReplay::new(None, false, String::new()));
+            joined.join = Some(Box::new(codex_file_join::StreamProof::new(
+                String::new(),
+                false,
+                vec![codex_file_join::MemberPlan::default()],
+            )));
+            active.parser.accumulator.codex_tier_replay = Some(joined);
+            assert_eq!(release(&scan, measured).clear_other_active, 1, "join");
+            scan.active_file
+                .as_deref_mut()
+                .unwrap()
+                .parser
+                .accumulator
+                .codex_tier_replay = replay;
+        }
+
+        // An unknown resident bound keeps the clear, recorded as such.
+        let counts = release(&scan, None);
+        assert_eq!(counts.clear_full_resident_bound_unknown, 1, "{source:?}");
+        assert_eq!(counts.clear_other_active, 0, "{source:?}");
+        // The no-argument wrapper supplies no measurement: conservative.
+        let (_, counts) = observe(|| scan.release_sampled_cache_for_copy_refusal());
+        assert_eq!(counts.clear_full_resident_bound_unknown, 1, "{source:?}");
+        assert_eq!(counts.clear_other_active, 0, "{source:?}");
+        // Unsupported audit metadata keeps its clear.
+        scan.sampling.as_mut().unwrap().audit_metadata_supported = false;
+        let counts = release(&scan, measured);
+        assert_eq!(counts.clear_metadata_unsupported, 1, "{source:?}");
+        assert_eq!(counts.clear_other_active, 0, "{source:?}");
+        drop(scan);
+
+        // P1-RETAIN R0: a sampled Tail singleton borrows only its taken
+        // reduction, so its step-start refusal releases nothing, measured or
+        // not; its release is decided at completion. Any other borrowed
+        // state keeps ClearOtherActive.
+        let tail = ScanFixture::new(source);
+        let tail_cache = Arc::new(sampled_scan::SharedCache::default());
+        tail.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (tail_index, _, _) = production_scan(
+            &tail,
+            source,
+            ScanIndex::default(),
+            Some(tail_cache.clone()),
+            "mixed-files",
+        );
+        tail.file.append(&usage(source, 140, 1, "fixture-model"));
+        let mut scan = step_until(
+            cached_scan(&tail, source, tail_index, &tail_cache, |_| {}),
+            |scan| scan.active_file.is_some(),
+        );
+        assert!(
+            matches!(
+                scan.active_file
+                    .as_deref()
+                    .and_then(|active| active.sampling.as_ref())
+                    .map(|sampling| sampling.mode),
+                Some(ReadMode::Tail)
+            ),
+            "precondition: a Tail active {source:?}"
+        );
+        assert!(
+            sampled_scan::borrows_only_retained_reduction(scan.active_file.as_deref().unwrap()),
+            "precondition: shape F {source:?}"
+        );
+        let (_, measured) = scan.sampled_copy_parts();
+        assert!(measured.is_some(), "{source:?}");
+        for resident in [measured, None] {
+            assert_eq!(
+                release(&scan, resident),
+                crate::local_resource_diagnostics::cache_lifecycle::Counts::default(),
+                "Tail {source:?} measured {}",
+                resident.is_some()
+            );
+        }
+        let candidate = scan.active_file.as_deref().unwrap().candidate.clone();
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.aliases.push(candidate);
+        assert!(!sampled_scan::borrows_only_retained_reduction(active));
+        assert_eq!(
+            release(&scan, measured).clear_other_active,
+            1,
+            "Tail alias {source:?}"
+        );
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.aliases.clear();
+        active.applied_receipts.insert(String::new(), None);
+        assert!(!sampled_scan::borrows_only_retained_reduction(active));
+        assert_eq!(
+            release(&scan, measured).clear_other_active,
+            1,
+            "Tail receipt {source:?}"
+        );
+    }
+}
+
+#[path = "retain_release_tests.rs"]
+mod retain_release_tests;
 
 #[test]
 fn sampled_production_large_baseline_index_does_not_disable_small_active_tail() {
@@ -1558,7 +2917,13 @@ fn sampled_native_priority_witness_refusal_keeps_native_output_and_certificate()
             .retention_bound(crate::transcript_cache::ENTRY_BYTES)
             .is_none());
         let completed = sampled
-            .retain_reduction(&scope, 100, crate::transcript_cache::ENTRY_BYTES)
+            .retain_reduction(
+                &scope,
+                100,
+                sampled_scan::RetainBudget::granted_unclassified(
+                    crate::transcript_cache::ENTRY_BYTES,
+                ),
+            )
             .unwrap()
             .unwrap();
         assert!(completed.reduction.is_none());
@@ -1583,6 +2948,67 @@ fn sampled_native_priority_witness_refusal_keeps_native_output_and_certificate()
             serde_json::to_value(items).unwrap(),
             oracle(&fixture, source)
         );
+    }
+}
+
+#[test]
+fn resource_diagnostics_acquisition_absence_preserves_unknown_and_short_circuit() {
+    for blocked in [false, true] {
+        let f = ScanFixture::new(SnapshotSource::ClaudeCode);
+        f.file
+            .append(&usage(SnapshotSource::ClaudeCode, 100, 0, "fixture-model"));
+        let ((_, scan, _, _), rows) = crate::local_resource_diagnostics::capture(|| {
+            production_scan_at_with_setup(
+                &f,
+                SnapshotSource::ClaudeCode,
+                ScanIndex::default(),
+                Some(Arc::new(sampled_scan::SharedCache::default())),
+                "absence-fixture",
+                NOW,
+                |scan| scan.state_census_complete = !blocked,
+            )
+        });
+        let pages = rows
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 1);
+        let counts = &pages[0]["counts"]["sampled_acquisition"]["acquisition_admission"];
+        assert_eq!(counts["attempts"], 1);
+        assert_eq!(counts["retained_entry"], json!({"assessed":1,"matched":0}));
+        assert_eq!(counts["cache_lookup_miss_unknown_origin"], 1);
+        assert_eq!(
+            counts["state_census_complete"],
+            json!({"assessed":1,"matched":usize::from(!blocked)})
+        );
+        for field in [
+            "reduction_dependencies_available",
+            "index_entry_present",
+            "sampling_allowed",
+        ] {
+            assert_eq!(counts[field]["assessed"], usize::from(!blocked));
+        }
+        assert_eq!(counts["index_entry_present"]["matched"], 0);
+        assert_eq!(counts["sampling_allowed"]["matched"], 0);
+        assert_eq!(counts["prepare_started"], usize::from(!blocked));
+        assert_eq!(counts["prepare_failed"], 0);
+        let (_, control, _, _) = production_scan_at_with_setup(
+            &f,
+            SnapshotSource::ClaudeCode,
+            ScanIndex::default(),
+            None,
+            "absence-fixture",
+            NOW,
+            |scan| scan.state_census_complete = !blocked,
+        );
+        assert_eq!(
+            production_body(SnapshotSource::ClaudeCode, scan),
+            production_body(SnapshotSource::ClaudeCode, control)
+        );
+        let encoded = serde_json::to_string(pages[0]).unwrap();
+        assert!(!encoded.contains(f.dir.to_str().unwrap()));
+        assert!(!encoded.contains("expired"));
+        assert!(!encoded.contains("evicted"));
     }
 }
 
@@ -1614,6 +3040,10 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
                         "resource-fixture",
                     )
                 });
+            let records = records
+                .into_iter()
+                .filter(|record| record["stage"] == "native_collection_page")
+                .collect::<Vec<_>>();
             assert_eq!(records.len(), 1, "one completed collection page");
             let record = &records[0];
             assert_eq!(record["stage"], "native_collection_page");
@@ -1698,6 +3128,11 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
             production_scan(&f, source, ScanIndex::default(), None, "resource-fixture")
         });
+        let records = records
+            .into_iter()
+            .filter(|record| record["stage"] == "native_collection_page")
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "one completed collection page");
         assert!(
             records[0]["counts"]["sampled_acquisition"].is_null(),
             "uncovered read counts are unknown"
@@ -1770,5 +3205,232 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
         let (_, full, _) =
             production_scan(&live, source, ScanIndex::default(), None, "scan-pressure");
         assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
+
+/// U1a-2a: `unsealed` is set on both `retain_reduction` returns, and a side
+/// certificate carries the same bit without a retained copy or any
+/// `cache_lifecycle` event (U-T64(d)).
+#[test]
+fn side_certificate_reports_unsealed_without_cache_events() {
+    use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    fixture.append(&usage(SnapshotSource::Codex, 100, 0, "gpt-5.5"));
+    let certify = |fixture: &Fixture| {
+        let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
+        assert!(matches!(
+            parser.prepare_acquisition(None, &scope, None, 100).unwrap(),
+            ReadMode::Full(_)
+        ));
+        while !parser.step().unwrap() {}
+        observe(|| parser.certify_without_retention(&scope, 100).unwrap())
+    };
+    let retain = |fixture: &Fixture| {
+        let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
+        parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+        while !parser.step().unwrap() {}
+        observe(|| {
+            parser
+                .retain_reduction(
+                    &scope,
+                    100,
+                    sampled_scan::RetainBudget::granted_unclassified(
+                        crate::transcript_cache::ENTRY_BYTES,
+                    ),
+                )
+                .unwrap()
+                .unwrap()
+        })
+    };
+    let len = fixture.0.metadata().unwrap().len();
+    let (sealed, sealed_events) = retain(&fixture);
+    assert!(!sealed.unsealed);
+    assert_eq!(sealed_events.retention_unsealed_eof, 0);
+    let (certificate, events) = certify(&fixture);
+    assert_eq!(events, Counts::default());
+    let sampled_jsonl::SideCertificate::Certified {
+        completed,
+        len: held,
+    } = certificate
+    else {
+        panic!("a complete loss-free read is certified");
+    };
+    assert_eq!(held, len);
+    assert!(!completed.unsealed);
+    assert!(completed.reduction.is_none());
+    assert_eq!(completed.checkpoint.sealed_offset(), len);
+
+    // A valid final row without its newline is applied at native EOF.
+    let mut file = OpenOptions::new().append(true).open(&fixture.0).unwrap();
+    serde_json::to_writer(&mut file, &usage(SnapshotSource::Codex, 140, 1, "gpt-5.5")).unwrap();
+    drop(file);
+    let grown = fixture.0.metadata().unwrap().len();
+    let (unsealed, unsealed_events) = retain(&fixture);
+    assert!(unsealed.unsealed);
+    assert!(unsealed.reduction.is_none());
+    assert_eq!(unsealed_events.retention_unsealed_eof, 1);
+    let (certificate, events) = certify(&fixture);
+    assert_eq!(events, Counts::default());
+    let sampled_jsonl::SideCertificate::Certified {
+        completed,
+        len: held,
+    } = certificate
+    else {
+        panic!("an unsealed read is still certified through its sealed prefix");
+    };
+    assert_eq!(held, grown);
+    assert!(completed.unsealed);
+    assert_eq!(completed.checkpoint.sealed_offset(), len);
+}
+
+mod stage2pre_in_page_tail_tests;
+
+/// Codex rollout with two compaction shapes: a marker followed by an exact
+/// repeat of the last record (not counted) and a zero-size record (skipped)
+/// before the next counted request, then two markers with no request between.
+fn codex_compaction_lines() -> Vec<Value> {
+    let token = |at: &str, total: u64, last: u64| {
+        json!({"type":"event_msg", "timestamp":at,
+        "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
+        "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":total/10},
+        "last_token_usage":{"input_tokens":last,"cached_input_tokens":last/2,"output_tokens":last/10}}}})
+    };
+    let compacted =
+        |at: &str| json!({"timestamp":at,"type":"compacted","payload":{"replacement_history":[]}});
+    let before = token("2026-10-07T11:05:00Z", 490_000, 250_000);
+    vec![
+        token("2026-10-07T11:00:00Z", 240_000, 240_000),
+        before.clone(),
+        compacted("2026-10-07T11:10:00Z"),
+        before,
+        token("2026-10-07T11:11:00Z", 490_000, 0),
+        token("2026-10-07T11:20:00Z", 549_000, 59_000),
+        token("2026-10-07T11:40:00Z", 619_000, 70_000),
+        compacted("2026-10-07T11:45:00Z"),
+        compacted("2026-10-07T11:46:00Z"),
+        token("2026-10-07T11:50:00Z", 649_000, 30_000),
+    ]
+}
+fn local_points(item: &SnapshotItem) -> Vec<(String, u32)> {
+    item.local_context_points
+        .iter()
+        .map(|point| {
+            let at = OffsetDateTime::from_unix_timestamp(i64::from(point.at_unix_seconds))
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap();
+            (at, point.prompt_tokens)
+        })
+        .collect()
+}
+#[test]
+fn codex_compaction_events_take_last_before_and_first_counted_after() {
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    for line in codex_compaction_lines() {
+        fixture.append(&line);
+    }
+    let items = parse_codex_jsonl_file(&fixture.0, NOW, "native-fixture".into()).unwrap();
+    let item = &items[0];
+    let event = |at: &str, before: u64, after: u64| SnapshotCompactionEvent {
+        at: at.to_string(),
+        before: Some(before),
+        after: Some(after),
+        trigger: None,
+    };
+    assert_eq!(
+        item.compaction_events,
+        [
+            event("2026-10-07T11:10:00Z", 250_000, 59_000),
+            event("2026-10-07T11:45:00Z", 70_000, 30_000),
+            event("2026-10-07T11:46:00Z", 70_000, 30_000),
+        ]
+    );
+    assert_eq!(
+        item.compaction_events
+            .iter()
+            .map(|event| event.at.clone())
+            .collect::<Vec<_>>(),
+        item.compaction_timestamps
+    );
+    // Points come from the first/peak/last block: first == First,
+    // last == Last, none above Peak; one per 15-minute slot.
+    assert_eq!(
+        local_points(item),
+        [
+            ("2026-10-07T11:00:00Z".to_string(), 240_000),
+            ("2026-10-07T11:05:00Z".to_string(), 250_000),
+            ("2026-10-07T11:20:00Z".to_string(), 59_000),
+            ("2026-10-07T11:40:00Z".to_string(), 70_000),
+            ("2026-10-07T11:50:00Z".to_string(), 30_000),
+        ]
+    );
+    assert_eq!(item.first_turn_context_tokens, Some(240_000));
+    assert_eq!(item.last_turn_context_tokens, Some(30_000));
+    assert_eq!(item.peak_context_fill_tokens, Some(250_000));
+    let wire = serde_json::to_value(item).unwrap();
+    assert!(wire.get("local_context_points").is_none());
+    assert_eq!(wire["compaction_events"][0]["before"], json!(250_000));
+
+    // Output gate: two hours after the last activity the item carries no
+    // points; compaction sizes are unaffected.
+    let late = parse_codex_jsonl_file(&fixture.0, "2026-10-07T13:50:00Z", "native-fixture".into())
+        .unwrap();
+    assert!(late[0].local_context_points.is_empty());
+    assert_eq!(late[0].compaction_events, item.compaction_events);
+}
+#[test]
+fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let lines = codex_compaction_lines();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    let metadata = CodexTitleMetadata::default();
+    let whole = Fixture::new(source);
+    for line in &lines {
+        whole.append(line);
+    }
+    let expected = parse_codex_jsonl_file(&whole.0, NOW, "native-fixture".into()).unwrap();
+    for split in 0..lines.len() {
+        let fixture = Fixture::new(source);
+        for line in &lines[..split] {
+            fixture.append(line);
+        }
+        let (mut retained, _, _, _) =
+            acquire_items_with(&fixture, source, &metadata, &scope, None, 100, true);
+        let mut items = Vec::new();
+        for (step, line) in lines[split..].iter().enumerate() {
+            fixture.append(line);
+            let reusable = retained.is_some();
+            let (next, mode, _, next_items) = acquire_items_with(
+                &fixture,
+                source,
+                &metadata,
+                &scope,
+                retained,
+                101 + step as u64,
+                true,
+            );
+            if reusable {
+                assert_eq!(mode, ReadMode::Tail, "split {split}, step {step}");
+            }
+            retained = next;
+            items = next_items;
+        }
+        assert_eq!(
+            serde_json::to_value(&items).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "split {split}"
+        );
+        assert_eq!(
+            items[0].compaction_events, expected[0].compaction_events,
+            "split {split}"
+        );
+        assert_eq!(
+            local_points(&items[0]),
+            local_points(&expected[0]),
+            "split {split}"
+        );
     }
 }

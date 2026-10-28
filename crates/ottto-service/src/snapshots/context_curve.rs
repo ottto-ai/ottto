@@ -490,6 +490,7 @@ pub(super) fn validate_context_curve(
         if !matches!(
             curve.coverage.as_str(),
             "ownership_unresolved"
+                | "scalars_file_birth_only"
                 | "parser_unsupported"
                 | "pre_capture"
                 | "payload_budget_exceeded"
@@ -685,7 +686,17 @@ mod tests;
 
 // Closed owned-field inventory for optional scan overlap admission.
 crate::heap_layout_bound::fields!(ContextCurveCandidateBoundary; observed_at, point_count_before);
+crate::durable_tail_codec::durable_struct!(ContextCurveCandidateBoundary {
+    N observed_at: Option<String>,
+    N point_count_before: u64,
+});
 crate::heap_layout_bound::fields!(ContextCurveCandidatePoint; observed_at, effective_input_tokens, model, context_window_tokens);
+crate::durable_tail_codec::durable_struct!(ContextCurveCandidatePoint {
+    N observed_at: Option<String>,
+    N effective_input_tokens: u64,
+    U model: Option<String>,
+    N context_window_tokens: Option<u64>,
+});
 crate::heap_layout_bound::fields!(SnapshotContextCurve; contract_version, parser_revision, ownership_revision, sampling_revision, coverage, total_owned_request_count, retained_point_count, total_compaction_boundary_count, retained_boundary_count, points, boundaries, model_windows);
 crate::heap_layout_bound::fields!(SnapshotContextCurveBoundary; boundary_index, observed_at, before_owned_request_ordinal, after_owned_request_ordinal, segment_before_ordinal, segment_after_ordinal);
 crate::heap_layout_bound::fields!(SnapshotContextCurveModelWindow; model_window_index, model, context_window_tokens, evidence_kind, evidence_revision);

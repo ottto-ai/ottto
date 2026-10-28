@@ -29,7 +29,7 @@ pub(crate) mod support_health;
 
 mod bounded_read;
 
-const STORE_DIR: &str = "local-otel/claude-code-effort";
+pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
 const MAX_EVIDENCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -96,6 +96,64 @@ pub struct ClaudeLocalOtelEvidence {
     /// Legacy rows have no evaluation; absence never fills an organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_identity: Option<ClaudeRequestIdentityEvidence>,
+    /// The row's one fingerprint check, kept in memory only.
+    #[serde(skip)]
+    pub(crate) fingerprint_check: FingerprintCheck,
+}
+
+/// Result of a row's fingerprint check, filled by whichever step asks first
+/// (`snapshots::claude_api_evidence_fingerprint_is_valid`) so later steps on
+/// the same page do not hash it again. Never serialized, ignored by `==`, and
+/// cleared on `Clone`: a copy may be edited, so it is checked anew. Rows are
+/// not edited after decode. One byte, inside the row's existing padding.
+#[derive(Default)]
+pub(crate) struct FingerprintCheck(std::sync::atomic::AtomicU8);
+
+impl FingerprintCheck {
+    const VALID: u8 = 1;
+    const INVALID: u8 = 2;
+
+    pub(crate) fn get_or_check(&self, check: impl FnOnce() -> bool) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.0.load(Relaxed) {
+            Self::VALID => true,
+            Self::INVALID => false,
+            _ => {
+                let valid = check();
+                self.0
+                    .store(if valid { Self::VALID } else { Self::INVALID }, Relaxed);
+                valid
+            }
+        }
+    }
+}
+
+impl Clone for FingerprintCheck {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for FingerprintCheck {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for FingerprintCheck {}
+
+impl std::fmt::Debug for FingerprintCheck {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("_")
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for FingerprintCheck {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +270,16 @@ fn identity_attribute_evidence(
     }
 }
 
+impl crate::telemetry_attach::ReportedRequest for ClaudeLocalOtelEvidence {
+    fn request_key(&self) -> &str {
+        &self.request_id
+    }
+
+    fn reported_cost_micros(&self) -> Option<u64> {
+        self.cost_usd_micros
+    }
+}
+
 /// Health diagnostics for a strict sidecar read. The legacy loader intentionally
 /// retains its skip-and-continue behavior; completeness-sensitive reconciliation
 /// must use this report and fail closed when `is_complete()` is false.
@@ -287,6 +355,23 @@ impl ClaudeTraceOwnershipLoadReport {
     }
 }
 
+/// Context attached when a Claude OTLP body cannot be decoded, so the relay
+/// can tell a malformed request apart from a local storage failure.
+#[derive(Debug, Clone, Copy)]
+struct UndecodableClaudeOtlpBody;
+
+impl std::fmt::Display for UndecodableClaudeOtlpBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Claude OTLP body could not be decoded")
+    }
+}
+
+/// True when a capture error came from decoding the request body rather than
+/// from storing the reduced evidence.
+pub fn is_undecodable_body(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<UndecodableClaudeOtlpBody>().is_some()
+}
+
 pub fn capture_claude_api_request_logs(
     support_dir: &Path,
     body: &[u8],
@@ -294,9 +379,9 @@ pub fn capture_claude_api_request_logs(
 ) -> Result<usize> {
     let content_type = content_type.to_ascii_lowercase();
     let evidence = if content_type.contains("json") {
-        api_evidence_from_json(body)?
+        api_evidence_from_json(body).context(UndecodableClaudeOtlpBody)?
     } else if content_type.contains("protobuf") || content_type.contains("octet-stream") {
-        api_evidence_from_protobuf(body)?
+        api_evidence_from_protobuf(body).context(UndecodableClaudeOtlpBody)?
     } else {
         return Ok(0);
     };
@@ -407,8 +492,8 @@ fn persist_api_evidence(
 }
 
 /// Reduce Claude Code's enhanced `claude_code.llm_request` spans to a bounded,
-/// content-free request owner record. The caller continues forwarding `body`
-/// unchanged; this function only decodes a borrowed byte slice.
+/// content-free request owner record. This function only decodes a borrowed
+/// byte slice; the raw body is never stored or sent anywhere.
 pub fn capture_claude_llm_request_traces(
     support_dir: &Path,
     body: &[u8],
@@ -416,9 +501,9 @@ pub fn capture_claude_llm_request_traces(
 ) -> Result<usize> {
     let content_type = content_type.to_ascii_lowercase();
     let evidence = if content_type.contains("json") {
-        trace_evidence_from_json(body)?
+        trace_evidence_from_json(body).context(UndecodableClaudeOtlpBody)?
     } else if content_type.contains("protobuf") || content_type.contains("octet-stream") {
-        trace_evidence_from_protobuf(body)?
+        trace_evidence_from_protobuf(body).context(UndecodableClaudeOtlpBody)?
     } else {
         return Ok(0);
     };
@@ -636,6 +721,22 @@ fn api_file_generation(metadata: &fs::Metadata) -> Option<ApiFileGeneration> {
 }
 
 impl ClaudeApiEvidenceRead {
+    /// Borrow the existing decode and its full health witness without I/O.
+    /// Missing/capped/malformed reads remain present but incomplete; a root
+    /// outside this reader's cohort has no report. The reader owns the strict
+    /// cap boundary and conflicting-id detection, including empty-row reads.
+    pub(crate) fn session_report(
+        &self,
+        root: &str,
+    ) -> Option<crate::telemetry_attach::SessionReport<'_, ClaudeLocalOtelEvidence>> {
+        let health = &self.reads.get(root)?.health;
+        Some(crate::telemetry_attach::SessionReport {
+            rows: self.evidence.get(root).map(Vec::as_slice).unwrap_or(&[]),
+            complete: health.is_complete(),
+            duplicate_keys: &health.conflicting_request_ids,
+        })
+    }
+
     /// The optional root loader has prepaid destination nodes and keys. Move
     /// one disjoint decoded cohort without BTreeMap::append's merge workspace
     /// or a second row graph. Ordinary evidence consumers are unchanged.
@@ -1423,6 +1524,7 @@ fn api_evidence_from_attrs(
         account_identity_checked: true,
         account_identifier_hash: request_identity.account.unambiguous_hash(),
         request_identity: Some(request_identity),
+        fingerprint_check: FingerprintCheck::default(),
     };
     let bytes = serde_json::to_vec(&item).ok()?;
     item.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
@@ -1671,7 +1773,7 @@ fn append_trace_ownership_evidence(
 }
 
 /// Local capture success means the whole row was appended below the strict
-/// reader's usable boundary. It is independent of raw OTLP forwarding success.
+/// reader's usable boundary.
 ///
 /// Preserve the existing final-row append when it reaches/crosses the boundary:
 /// the resulting file size is the existing durable incomplete-evidence signal.
@@ -1858,7 +1960,7 @@ mod tests {
             assert_eq!(output.as_slice(), if writes { row.as_slice() } else { &[] });
             if writes && !succeeds {
                 // Retry at the persisted boundary must refuse without another
-                // duplicate append; the receiver still forwards independently.
+                // duplicate append.
                 let size = output.len();
                 assert!(
                     append_evidence_bytes(&mut output, before + row.len() as u64, row).is_err()
@@ -3746,7 +3848,7 @@ crate::heap_layout_bound::fields!(ApiReadWitness; health, generation);
 crate::heap_layout_bound::fields!(ApiFileGeneration; device, inode, bytes, modified, changed);
 crate::heap_layout_bound::fields!(ClaudeTraceReadGeneration; opened);
 crate::heap_layout_bound::fields!(ClaudeLocalOtelLoadHealth; missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids);
-crate::heap_layout_bound::fields!(ClaudeLocalOtelEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, observed_at, model, effort, query_source, speed, cost_usd_micros, event_sequence, app_version, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, request_count, account_identity_checked, account_identifier_hash, request_identity);
+crate::heap_layout_bound::fields!(ClaudeLocalOtelEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, observed_at, model, effort, query_source, speed, cost_usd_micros, event_sequence, app_version, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, request_count, account_identity_checked, account_identifier_hash, request_identity, fingerprint_check);
 crate::heap_layout_bound::fields!(ClaudeRequestIdentityEvidence; identity_hash_scheme, account, organization, disposition);
 crate::heap_layout_bound::fields!(ClaudeIdentityAttributeEvidence; origin, disposition, resource_hash, log_record_hash);
 crate::heap_layout_bound::fields!(ClaudeTraceOwnershipEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, agent_id, parent_agent_id, workflow_run_id, observed_at);

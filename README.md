@@ -166,7 +166,11 @@ source by default; `--allow-rewrites` is reserved for legacy/test fixtures. The 
 every staged non-manifest file with SHA-256, size, mode, and executable-bit
 metadata plus a deterministic `content_sha256`; run
 `scripts/public_repo_manifest_check.sh --staged-output dist/public-export/ottto`
-to verify that inventory before bootstrap. The generated tree must also pass
+to verify that inventory before bootstrap. This repository does not commit
+`PUBLIC_EXPORT_MANIFEST.json`: `scripts/public_repo_manifest.sh --digest` (or
+`--facts`) derives the same digest and counts from a commit's git tree, and the
+public-surface gate requires the self-exported bundle's manifest to equal the
+one derived from `HEAD`. The generated tree must also pass
 `scripts/public_repo_skeleton_check.sh`, which verifies the public repo shape
 for runtime crates, connectors, docs, release tooling, policies, CI, and agent
 adapters before bootstrap, and
@@ -182,7 +186,9 @@ consumers only validate against the pinned public manifest digest. Once the
 public repo is the runtime authority, run the same contract gate with
 `--require-public-authority`; it requires the private pin to name a
 `public_repo_commit` and verifies that the checked public root is a clean git
-checkout at that commit. Before any public commit or runtime move, run
+checkout at that commit. Without `--staged-output`, the gate derives the public
+manifest digest and counts from the checked root's `HEAD`. Before any public
+commit or runtime move, run
 `scripts/public_repo_secret_scan.sh --staged-output dist/public-export/ottto`
 to scan current export candidates, candidate path history, and the generated
 bundle for private paths and secret-like content.
@@ -194,6 +200,9 @@ secret-scan, contract checks, release/installer dry-run tests, and a
 self-exported bundle verification. This includes release manifest,
 stable-candidate RC, stable preflight, stable closeout, stable QA template,
 Homebrew, hosted installer, and CycloneDX SBOM generator tests.
+The default `--scope all` runs every step and needs macOS. GitHub CI splits the
+gate: `--scope portable` runs on Linux, and `--scope macos` runs the steps that
+need real macOS tools or macOS `/bin/bash` 3.2 inside the Rust contracts job.
 The skeleton gate also requires `docs/support.md`, the public support runbook
 covering redacted triage, diagnostics, escalation, data boundaries, and
 public-v1 closeout readiness.
@@ -275,6 +284,7 @@ ottto login --json --no-browser --no-wait
 ottto account --json
 ottto logout --json
 ottto logout --local-only --json
+ottto logout --forget-installation --confirm --json
 ottto logout --local-only --forget-installation --confirm --json
 ottto doctor --json
 ottto fix --app codex --json
@@ -412,7 +422,18 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
 - native app auth commands: `auth_status`, `auth_start`, `auth_complete`, and
   `auth_reset`. Reset/logout is cloud-first by default: the daemon records a
   `local-client/disconnect` in Ottto before clearing local account, connection,
-  and setup-run token state. `local_only=true` is reserved for emergency local
+  and setup-run token state. That request also presents this Mac's relay-device
+  id and secret, read before any local deletion, so Ottto can release the Mac's
+  server registration; the response reports `device_released`, and `false`
+  (or an older server that omits it) means the registration may still be
+  active until its account disconnects the Mac on the Apps page (Disconnect). An
+  account switch sends the same release for the previous device unless the new
+  binding reuses that device id. When Ottto has already ended this Mac's setup
+  run, an expired connection no longer blocks the release: the daemon presents
+  the same id and secret to `POST /api/v1/telemetry/devices/{device_id}/release`
+  and, once Ottto confirms, finishes the logout like a cloud logout
+  (`cloud_disconnected: false`, `device_released: true`).
+  `local_only=true` is reserved for emergency local
   cleanup when the backend cannot be reached or the website state is stale.
   Neither mode clears account/device identity while Cloud sessions still needs
   an exact backend DELETE confirmation; revoke it in the Ottto app, wait for
@@ -422,17 +443,29 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   logout, device writes, and Cloud-session mutations fail with
   `identity_mutation_in_progress` and are safe to retry. Setup and login are
   idempotent no-ops while a bound user is already connected; they cannot create
-  a pending-claim overlay over a healthy binding. Rejected or unauthorized
+  a pending-claim overlay over a healthy binding. Once Verify or an agent read
+  records that Ottto ended the setup run or refused the device credential, or
+  no setup-run binding is left, login starts a reconnect claim instead; the
+  bound user is kept and completing the claim replaces the binding. Rejected or unauthorized
   setup-run polling is terminal locally instead of retrying a stale run.
-- `ottto logout --local-only --forget-installation --confirm` is the explicit
-  destructive reset path. It clears installation id, account scope, active and
-  prior credentials, setup bindings, destination receipt namespaces, and
-  first-sweep progress together, while leaving Codex, Claude Code, and Pi source
-  data untouched. Restart the daemon before pairing so it creates a fresh
-  installation identity. Because replacement credentials use a new destination
+- `ottto logout --forget-installation --confirm` is the explicit destructive
+  reset path. It first disconnects this Mac in Ottto and releases its server
+  registration, exactly like an ordinary logout, then clears installation id,
+  active and prior credentials, setup bindings, destination receipt namespaces,
+  and first-sweep progress together, while leaving Codex, Claude Code, and Pi
+  source data untouched. It requires an active Ottto connection. The account
+  scope is derived from the Mac and its macOS user, so it is not cleared and
+  is the same after the reset. Restart the daemon before pairing so it creates
+  a fresh installation identity. Because replacement credentials use a new destination
   namespace, ordinary replacement never reuses the old destination's receipts;
   it creates clean receipt and first-sweep state for the new destination while
   preserving the stable `otm_…` machine identity.
+- `ottto logout --local-only --forget-installation --confirm` is the emergency
+  variant for when Ottto cannot be reached. It performs the same local reset
+  without contacting Ottto, so the server registration is not released: this
+  Mac stays registered to the old Ottto account, and a different account can
+  connect it only after the old account removes this Mac on its Apps page
+  (Disconnect).
 - `ottto uninstall` requires `--confirm`, warns about receipt and first-sweep
   loss, and accepts `--backup-state <directory>` to export only those receipts
   and first-sweep state first (never relay credentials or account secrets).
@@ -589,29 +622,28 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   Claude Code setup also installs a local
   `statusLine` wrapper that preserves an existing status line command while
   feeding documented `rate_limits` fields into the local quota cache. The relay
-  uses a source header to route shared-port payloads to source-scoped
-  relay-token exchange before forwarding OTLP payloads to the setup run's
-  persisted backend API base URL. Manual edits to the managed Ottto fence are
-  rejected with `manual_fence_review_required`, leaving local keys in place
+  reduces OTLP payloads locally and answers the exporter itself; it forwards
+  nothing upstream, because Ottto's server retired OTLP ingest. Manual edits
+  to the managed Ottto fence are rejected with `manual_fence_review_required`, leaving local keys in place
   until the user reviews the file instead of guessing at cleanup. Pi setup
-  actions also register or merge the local telemetry device source grant so
-  route-smoke session imports can issue Pi-scoped relay tokens, but they skip
-  Codex/Claude OTLP config patching because Pi telemetry is imported from local
-  session files. The local scan
+  actions also register or merge the local telemetry device source grant, but
+  they skip Codex/Claude OTLP config patching because Pi telemetry is imported
+  from local session files. Pi route Verify no longer uploads smoke transcripts
+  to the retired direct Pi import endpoint. The local scan
   reports Pi as requiring install when the Pi CLI/session files are present but
   the device grant does not yet include `pi`.
 - local Claude Code reasoning-effort reduction at that loopback boundary:
   Claude's documented `claude_code.api_request` logs use OTLP/HTTP JSON while
   metrics and traces remain protobuf. The relay accepts both fixed-length and
-  bounded HTTP/1.1 chunked request bodies, de-chunks before reduction and cloud
-  forwarding, and rejects ambiguous or unsupported transfer framing. It stores only session id, request
+  bounded HTTP/1.1 chunked request bodies, de-chunks before reduction, and
+  rejects ambiguous or unsupported transfer framing. It stores only session id, request
   timestamp, model, applied effort, and token counters in owner-only hashed
   sidecars; prompts, responses, commands, paths, account identity, email, and
   raw OTLP are discarded. Snapshot sync partitions matching transcript
   model/hour rows by this evidence, leaves uncovered residual usage as unknown,
-  and preserves exact transcript totals. Organization-disabled live telemetry
-  still returns its normal OTLP success response after the local reduction;
-  transient forwarding failures retain the existing exporter retry behavior.
+  and preserves exact transcript totals. The relay returns the OTLP success
+  response after the local reduction, and a non-retryable error when the body
+  cannot be decoded or its evidence cannot be stored.
 - source-local snapshot parsing and background sync in `ottto-service` for Codex
   `~/.codex/sessions/**/*.jsonl`, Claude Code
   `~/.claude/projects/**/*.jsonl`, and Pi

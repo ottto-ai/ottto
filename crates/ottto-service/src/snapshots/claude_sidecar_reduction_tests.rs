@@ -303,16 +303,24 @@ fn assert_oracle(fixture: &Fixture, cached: &Run, prior: ScanIndex) {
         serde_json::to_value(&cached.index.claude_usage_family_witnesses).unwrap(),
         serde_json::to_value(&full.index.claude_usage_family_witnesses).unwrap()
     );
-    assert_eq!(
-        serde_json::to_value(&cached.index.claude_usage_authority_quarantine).unwrap(),
-        serde_json::to_value(&full.index.claude_usage_authority_quarantine).unwrap()
-    );
+    let quarantine = |index: &ScanIndex| {
+        let mut records = index.claude_usage_authority_quarantine.clone();
+        for record in records.values_mut() {
+            assert!(claude_usage_authority_deadline_is_bounded(record));
+            // Independent scans can create retry deadlines on opposite sides
+            // of a wall-clock second. Compare every other field exactly.
+            record.retry_after_unix_seconds = 0;
+        }
+        serde_json::to_value(records).unwrap()
+    };
+    assert_eq!(quarantine(&cached.index), quarantine(&full.index));
 }
 fn settle(mut run: Run) -> ScanIndex {
     finalize_scan_after_policy_with_body_witness(
         SOURCE,
         &mut run.result,
         &mut run.index,
+        true,
         snapshot_upload_body_witness,
     );
     // Validate the ordinary per-entity/body ACK before recording acceptance.
@@ -368,6 +376,8 @@ fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize
 
 #[test]
 fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     let prior = seed_predecessor(&f, &cache);
@@ -490,6 +500,7 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
         SOURCE,
         &mut next.result,
         &mut next.index,
+        true,
         snapshot_upload_body_witness,
     );
     assert!(
@@ -530,6 +541,8 @@ fn child_metadata_and_desktop_identity_still_invalidate_native_scope() {
 
 #[test]
 fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
@@ -552,6 +565,7 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
         SOURCE,
         &mut cached.result,
         &mut cached.index,
+        true,
         snapshot_upload_body_witness,
     );
     assert!(cached.result.snapshots.is_empty());
@@ -567,6 +581,10 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
         let cache = if retained_budget {
             Arc::new(SharedCache {
                 inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
+                cursor: Default::default(),
+                side: Default::default(),
+                #[cfg(unix)]
+                durable: Default::default(),
             })
         } else {
             cache.clear();
@@ -605,6 +623,8 @@ fn true_scope_change_at_completion_still_refuses_cached_publication() {
 
 #[test]
 fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
@@ -667,6 +687,8 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
 
 #[test]
 fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     for conflict in [false, true] {
         let f = Fixture::new(2);
         let cache = Arc::new(SharedCache::default());
@@ -817,4 +839,496 @@ fn identity_capture_mode_change_rereads_instead_of_reusing_a_markerless_prefix()
     let steady = raw_scan_capturing(&g, prior, Some(cache), true, |_| {});
     assert_layout_mode(steady.modes, (0, 1, 0));
     assert!(markers_trusted(&steady, &g));
+}
+
+/// M1: a restart (a new process cache) continues from the durable store
+/// instead of a Full read, and matches the unsampled oracle. Reuse needs the
+/// retained copy, so unsupported layouts write nothing and read Full.
+#[cfg(unix)]
+mod durable_restart {
+    use super::*;
+    use crate::locked_state_dir::LockedStateDir;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct State {
+        dir: PathBuf,
+        index_path: PathBuf,
+        /// The daemon's single-writer lock (#801) on this state directory,
+        /// held for the rest of the test process like the daemon's.
+        lock: &'static LockedStateDir,
+    }
+    impl State {
+        fn new(f: &Fixture) -> Self {
+            let dir = f.dir.with_extension("durable-state");
+            fs::create_dir_all(&dir).unwrap();
+            Self {
+                index_path: dir.join("index.json"),
+                lock: crate::locked_state_dir::test_locks::hold(&dir),
+                dir,
+            }
+        }
+        fn begin(&self, cache: &SharedCache) {
+            cache.durable_begin_pass(
+                SOURCE,
+                &self.index_path,
+                &Scope("sidecar-fixture".into()),
+                capture_by_default(),
+            );
+        }
+        fn store_records(&self) -> usize {
+            fs::read_dir(crate::durable_tail_store::store_dir_for_index(
+                &self.index_path,
+            ))
+            .map_or(0, |entries| entries.count())
+        }
+    }
+    impl Drop for State {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Seeds a predecessor in one process cache and writes its record after
+    /// the "save"; returns the committed index.
+    fn seed_and_persist(f: &Fixture, state: &State) -> ScanIndex {
+        let first = Arc::new(SharedCache::default());
+        state.begin(&first);
+        let prior = seed_predecessor(f, &first);
+        first.durable_write_after_save(state.lock, SOURCE, &prior);
+        let expected = usize::from(crate::heap_layout_bound::layout_supported());
+        assert_eq!(state.store_records(), expected);
+        prior
+    }
+
+    fn restored(cache: &SharedCache) -> u64 {
+        cache
+            .durable_counters(SOURCE)
+            .map_or(0, |(counters, _)| counters.restored)
+    }
+
+    /// The pass's index after the scan's own post-policy finalization, with
+    /// the transcript's page entity held: the hold set local-hold settlement
+    /// takes. The fixture's history gate may keep its body off the page, so
+    /// the finalizer's record of the held entity is written here, as in
+    /// `authority_proof_correction_tests`.
+    fn finalized_with_holds(mut run: Run, key: &str) -> (ScanIndex, BTreeSet<String>) {
+        finalize_scan_after_policy_with_body_witness(
+            SOURCE,
+            &mut run.result,
+            &mut run.index,
+            true,
+            snapshot_upload_body_witness,
+        );
+        let entity = format!(
+            "held-entity:{}",
+            run.index.files[key].source_file_fingerprint
+        );
+        run.index
+            .file_snapshot_fingerprints
+            .entry(key.to_owned())
+            .or_default()
+            .insert(entity.clone());
+        (run.index, BTreeSet::from([entity]))
+    }
+
+    fn transcript_key(f: &Fixture, index: &ScanIndex) -> String {
+        let key = local_index_key(&f.path);
+        assert!(
+            index.files.contains_key(&key),
+            "the fixture transcript is indexed"
+        );
+        key
+    }
+
+    /// F2 receipts after a write: the reduction was refused for its
+    /// selection and the key's older record was invalidated (only a
+    /// supported layout admits, and so selects, anything).
+    fn assert_selection_refused(cache: &SharedCache, state: &State) {
+        let supported = u64::from(crate::heap_layout_bound::layout_supported());
+        let (counters, store) = cache.durable_counters(SOURCE).unwrap();
+        println!("{}", counters.summary(SOURCE, &store));
+        assert_eq!(
+            counters
+                .not_persisted
+                .get("selection")
+                .copied()
+                .unwrap_or(0),
+            supported
+        );
+        assert_eq!(store.records_invalidated, supported);
+        assert_eq!(store.records_written, 0);
+        assert_eq!(state.store_records(), 0);
+    }
+
+    /// A fresh process after the settled save restores nothing for the key
+    /// and reads it Full, to the same bodies as a cold Full.
+    fn assert_fresh_restart_reads_full(f: &Fixture, state: &State, settled: ScanIndex) {
+        let fresh = Arc::new(SharedCache::default());
+        state.begin(&fresh);
+        let cached = enriched(f, raw_scan(f, settled.clone(), Some(fresh.clone()), |_| {}));
+        assert_eq!(restored(&fresh), 0);
+        assert_layout_mode(cached.modes, (1, 0, 0));
+        assert_oracle(f, &cached, settled);
+    }
+
+    /// F2, local-hold settlement on the real path: a pass admits a newer
+    /// reduction, the file is held, settlement reverts its entry to the
+    /// committed one. The held reduction is never bound to that entry, the
+    /// key's older record is invalidated, and a restart reads Full.
+    #[test]
+    fn a_held_reverted_selection_is_never_written_and_invalidates_the_old_record() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let key = transcript_key(&f, &prior);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let run = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        let (scanned, held) = finalized_with_holds(run, &key);
+        assert_ne!(
+            scanned.files[&key].source_file_fingerprint,
+            prior.files[&key].source_file_fingerprint
+        );
+        let settled = scanned.into_locally_held_keys_reverted(&prior, &held, &BTreeSet::new());
+        assert_eq!(
+            settled.files[&key].source_file_fingerprint,
+            prior.files[&key].source_file_fingerprint
+        );
+        second.durable_write_after_save(state.lock, SOURCE, &settled);
+        assert_selection_refused(&second, &state);
+        assert_fresh_restart_reads_full(&f, &state, settled);
+    }
+
+    /// F2, the cleared-fingerprint reparse case: settlement clears the held
+    /// entry's fingerprint (reparse debt). A restore refuses it before any
+    /// record is read, the write refuses and invalidates, and a restart
+    /// reads Full.
+    #[test]
+    fn a_cleared_fingerprint_never_restores_or_writes() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let key = transcript_key(&f, &prior);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let run = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        let (scanned, held) = finalized_with_holds(run, &key);
+        let settled = scanned.into_locally_held_keys_reverted(&prior, &held, &held);
+        assert!(settled.files[&key].source_file_fingerprint.is_empty());
+        // The record of the committed selection is still on disk here; the
+        // cleared selection refuses before it is read.
+        let fresh = SharedCache::default();
+        state.begin(&fresh);
+        let namespace = Scope("sidecar-fixture".into());
+        let interpretation = crate::snapshots::sampled_scan::durable_tail::Interpretation::of(
+            SOURCE,
+            &key,
+            &settled,
+            capture_by_default(),
+            &namespace,
+        );
+        assert!(fresh
+            .durable_restore(
+                SOURCE,
+                &key,
+                &f.path,
+                &namespace,
+                &mut File::open(&f.path).unwrap(),
+                &settled,
+                &interpretation,
+            )
+            .is_none());
+        let (counters, store) = fresh.durable_counters(SOURCE).unwrap();
+        assert_eq!(counters.ineligible.get("selection_cleared"), Some(&1));
+        assert_eq!(
+            (counters.missing, store.records_read, counters.restored),
+            (0, 0, 0)
+        );
+        second.durable_write_after_save(state.lock, SOURCE, &settled);
+        assert_selection_refused(&second, &state);
+        assert_fresh_restart_reads_full(&f, &state, settled);
+    }
+
+    /// F2, a RAM reduction ahead of the saved selection: two passes in one
+    /// process, then the save commits the first pass's entry. The resident
+    /// reduction (second pass) is never bound to it; the older record is
+    /// invalidated and a restart reads Full.
+    #[test]
+    fn a_reduction_ahead_of_the_saved_selection_is_never_written() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let key = transcript_key(&f, &prior);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let first_pass = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        f.append_transcript(2);
+        f.evidence(3);
+        state.begin(&second);
+        let ahead = raw_scan(&f, first_pass.index.clone(), Some(second.clone()), |_| {});
+        assert_ne!(
+            ahead.index.files[&key].source_file_fingerprint,
+            first_pass.index.files[&key].source_file_fingerprint
+        );
+        let saved = settle(first_pass);
+        second.durable_write_after_save(state.lock, SOURCE, &saved);
+        assert_selection_refused(&second, &state);
+        assert_fresh_restart_reads_full(&f, &state, saved);
+    }
+
+    #[test]
+    fn restart_restores_then_tails_and_matches_cold_full() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        f.evidence(2);
+        let cached = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        assert_layout_mode(cached.modes, (0, 1, 0));
+        assert_eq!(
+            restored(&second),
+            u64::from(crate::heap_layout_bound::layout_supported())
+        );
+        if let Some((counters, store)) = second.durable_counters(SOURCE) {
+            println!("{}", counters.summary(SOURCE, &store));
+        }
+        assert_oracle(&f, &cached, prior);
+    }
+
+    /// The production evidence pipeline runs attach, side calls, account
+    /// reconciliation and finish before we serialize the upload request.
+    /// A nonempty E2 literal and reported price prevent vacuous equality of
+    /// held pages or pre-finalization accumulators.
+    fn enriched_e2(f: &Fixture, mut run: Run) -> Run {
+        let permit = claude_request_identity::emission_permit(
+            SOURCE,
+            Some(claude_request_identity::COHORT_HINT_TOKEN),
+        )
+        .unwrap();
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
+            &f.support,
+            &mut run.result,
+            &mut run.index,
+            Some(permit),
+        );
+        apply_upload_policy(
+            SOURCE,
+            &mut run.result.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        assert_eq!(
+            run.result.snapshots.len(),
+            1,
+            "an emitted body, never a held empty page"
+        );
+        let item = &run.result.snapshots[0];
+        assert_eq!(
+            item.usage_accounting_contract.as_deref(),
+            Some(claude_history_upgrade::REQUEST_OWNED_USAGE_CONTRACT)
+        );
+        assert!(
+            item.model_usage
+                .iter()
+                .any(|row| row.selector_context.contains_key("request_usage_origin")),
+            "telemetry attached before emission"
+        );
+        run
+    }
+
+    #[test]
+    fn e2_restart_tail_and_quiet_late_sidecar_match_cold_full_emitted_body() {
+        let _gate = claude_request_money::e2::GateForTest::set(true);
+        claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
+            for append_native in [true, false] {
+                let f = Fixture::new(if append_native { 1 } else { 2 });
+                // Quiet arm's LAST native request exists but is still on
+                // estimates. Only the first request has reported money.
+                f.evidence(1);
+                let state = State::new(&f);
+                let first = Arc::new(SharedCache::default());
+                state.begin(&first);
+                let seed = enriched_e2(
+                    &f,
+                    raw_scan(&f, ScanIndex::default(), Some(first.clone()), |_| {}),
+                );
+                let before = exact_bodies(&seed);
+                let mut prior = settle(seed);
+                prior.save(&state.index_path).unwrap();
+                first.durable_write_after_save(state.lock, SOURCE, &prior);
+                assert_eq!(
+                    state.store_records(),
+                    usize::from(crate::heap_layout_bound::layout_supported())
+                );
+                drop(first);
+                let native_before = fs::read(&f.path).unwrap();
+                if append_native {
+                    f.append_transcript(1);
+                }
+                // The second native request's late report replaces its
+                // estimate; req_3 is a side call without a native owner.
+                // Quiet arm changes neither transcript bytes nor extent.
+                f.evidence(3);
+                let prior = ScanIndex::load(&state.index_path).unwrap();
+                let restarted = Arc::new(SharedCache::default());
+                state.begin(&restarted);
+                let warm = enriched_e2(
+                    &f,
+                    raw_scan(&f, prior.clone(), Some(restarted.clone()), |_| {}),
+                );
+                let cold = enriched_e2(&f, raw_scan(&f, prior, None, |_| {}));
+                assert_layout_mode(
+                    warm.modes,
+                    if append_native { (0, 1, 0) } else { (0, 0, 1) },
+                );
+                assert_eq!(
+                    restored(&restarted),
+                    u64::from(crate::heap_layout_bound::layout_supported())
+                );
+                assert_eq!(exact_bodies(&warm), exact_bodies(&cold));
+                // These persist into the next replay and copy-proof pass.
+                // Compare the saved representation, not just today's body.
+                let money_state = |index: &ScanIndex| {
+                    serde_json::to_value((
+                        &index.claude_money_birth_store,
+                        &index.claude_usage_family_witnesses,
+                        &index.claude_usage_authority_quarantine,
+                        &index.accepted_snapshot_fingerprints,
+                        &index.file_snapshot_fingerprints,
+                        &index.quarantined_snapshot_fingerprints,
+                    ))
+                    .unwrap()
+                };
+                assert_eq!(money_state(&warm.index), money_state(&cold.index));
+                assert_ne!(
+                    before.0,
+                    exact_bodies(&warm).0,
+                    "late telemetry changes the emitted body"
+                );
+                assert_eq!(
+                    warm.result.snapshots[0]
+                        .cost
+                        .as_ref()
+                        .unwrap()
+                        .total_cost_usd
+                        .as_deref(),
+                    Some("3")
+                );
+                if !append_native {
+                    assert_eq!(fs::read(&f.path).unwrap(), native_before);
+                    if crate::heap_layout_bound::layout_supported() {
+                        assert_eq!(
+                            warm.native_bytes, 0,
+                            "quiet sidecar does not reacquire native records"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn restart_after_a_metadata_only_touch_restores_unchanged() {
+        let f = Fixture::new(2);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::set_permissions(&f.path, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&f.path, fs::Permissions::from_mode(0o600)).unwrap();
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.evidence(2);
+        let cached = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        assert_layout_mode(cached.modes, (0, 0, 1));
+        assert_eq!(
+            restored(&second),
+            u64::from(crate::heap_layout_bound::layout_supported())
+        );
+        assert_oracle(&f, &cached, prior);
+    }
+
+    #[test]
+    fn an_index_from_another_context_never_restores() {
+        let f = Fixture::new(1);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let second = Arc::new(SharedCache::default());
+        // Another account or destination: the pass binds another scope.
+        second.durable_begin_pass(
+            SOURCE,
+            &state.index_path,
+            &Scope("another-account".into()),
+            capture_by_default(),
+        );
+        f.append_transcript(1);
+        let cached = enriched(
+            &f,
+            raw_scan_with_namespace(&f, prior.clone(), second.clone(), "another-account"),
+        );
+        assert_layout_mode(cached.modes, (1, 0, 0));
+        assert_eq!(restored(&second), 0);
+        assert_oracle(&f, &cached, prior);
+    }
+
+    fn raw_scan_with_namespace(
+        f: &Fixture,
+        index: ScanIndex,
+        cache: Arc<SharedCache>,
+        namespace: &str,
+    ) -> Run {
+        let mut scan = OwnedSourceScan::new_with_identity_capture(
+            SOURCE,
+            std::slice::from_ref(&f.dir),
+            index,
+            COLLECTED,
+            BACKFILL_WINDOW_DAYS,
+            100,
+            false,
+            Some(&f.support),
+            &[],
+            false,
+            true,
+            capture_by_default(),
+        )
+        .with_sampled_acquisition(cache, Scope(namespace.into()));
+        loop {
+            let modes = scan.sampling.as_ref().map_or((0, 0, 0), |c| {
+                (c.full_files, c.tail_files, c.unchanged_files)
+            });
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => {
+                    return Run {
+                        index,
+                        result: scan,
+                        modes,
+                        reasons: [0; 11],
+                        native_bytes: 0,
+                    }
+                }
+            }
+        }
+    }
 }

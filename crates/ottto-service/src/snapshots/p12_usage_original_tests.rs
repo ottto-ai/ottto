@@ -63,7 +63,7 @@ impl Family {
         }
         Self {
             dir,
-            state_dir: temp_dir("claude-usage-proof-rearm-state"),
+            state_dir: crate::test_scratch::private_dir("claude-usage-proof-rearm-state"),
             root_session_id,
             parent_path,
             child_path,
@@ -206,7 +206,8 @@ impl Family {
             None,
             &BTreeSet::new(),
             None,
-            completion.negatives(Some(&lease)),
+            Some(completion.fold_view(Some(&lease))),
+            &BTreeMap::new(),
         );
         items.clone_from_slice(&scan.snapshots);
         completion.capture_native_corrections(
@@ -248,6 +249,7 @@ impl Family {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut self.index,
+            true,
             snapshot_upload_body_witness,
         );
         let request = SnapshotBatchRequest {
@@ -324,7 +326,26 @@ impl Family {
     /// restart control proves that disk state cannot restore a native receipt.
     fn reload(&mut self) {
         let path = self.state_dir.join("scan-index.json");
+        assert!(
+            self.index.files.contains_key(&self.parent_key),
+            "the fixture retains its parent before save"
+        );
         self.index.save(&path).expect("save scan index");
+        assert!(
+            self.index.files.contains_key(&self.parent_key),
+            "the fixture retains its parent after save"
+        );
+        let decoded = lenient_decode::read_file(
+            File::open(&path).expect("open saved fixture"),
+            "load",
+            "unattributed",
+        )
+        .expect("the saved fixture decodes without quarantine");
+        assert!(
+            decoded.files.contains_key(&self.parent_key),
+            "the saved fixture decodes its parent at {path:?}; decoded keys: {:?}",
+            decoded.files.keys().collect::<Vec<_>>()
+        );
         self.index = ScanIndex::load(&path).expect("load scan index");
         assert!(
             self.index.files.contains_key(&self.parent_key),
@@ -497,15 +518,21 @@ fn observe_base_prelude(experimental_base_exit: bool) {
 }
 #[test]
 fn p12_member_change_base_control_reveals_unmet_original_prelude() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(false);
 }
 #[test]
 fn p12_member_change_experiment_base_exit_reveals_unmet_original_prelude() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(true);
 }
 
 #[test]
 fn native_comparison_original_member_change_unit_oracle() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(std::io::stderr().lock(), "native_comparison_original_member_change_unit: supported_positive=UNEXECUTED original_body_ran=false original_passed=false").unwrap();
         return;

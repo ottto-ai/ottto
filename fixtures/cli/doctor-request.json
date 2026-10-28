@@ -4,5 +4,6 @@
   "token": "test-token",
   "client_kind": "cli",
   "command": "status",
-  "refresh_agent_status": false
+  "refresh_agent_status": false,
+  "retry_relay_authorization": true
 }

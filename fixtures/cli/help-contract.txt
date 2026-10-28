@@ -128,6 +128,7 @@ Options:
       --token <TOKEN>    Override the local-control token for CLI and agent requests
       --json             Print one final JSON object and no human summary text
       --no-autostart     Do not kickstart the standard per-user ottto-service
+      --cached           Read daemon memory only; never refresh or start the daemon
       --watch            Emit NDJSON progress events and a final event; requires --json
   -h, --help             Print help
 ### ottto context --help
@@ -154,8 +155,6 @@ Options:
           Emit NDJSON progress events and a final event; requires --json
       --end-date <YYYY-MM-DD>
           Inclusive custom window end date
-      --timezone <TZ>
-          IANA timezone for calendar windows
       --source <SOURCE>
           Source slug to filter context to
       --app <APP>
@@ -194,14 +193,12 @@ Options:
           Emit NDJSON progress events and a final event; requires --json
       --end-date <YYYY-MM-DD>
           Inclusive custom window end date
-      --timezone <TZ>
-          IANA timezone for calendar windows
       --source <SOURCE>
           Source slug to filter costs to
       --app <APP>
           App/source alias to filter costs to [possible values: codex, claude-code, pi]
       --machine-id <MACHINE_ID>
-          Override the local machine filter
+          Filter to one machine (refused while Ottto can't answer it; use by_machine rows)
       --source-plan-profile-id <PROFILE_ID>
           Filter by source plan profile id
       --bucket <BUCKET>
@@ -209,7 +206,11 @@ Options:
       --mode <MODE>
           Breakdown mode such as full or overview
       --all-machines
-          Request account-wide costs instead of this Mac
+          Accepted for compatibility; costs are account-wide by default
+      --dimensions <LIST>
+          Comma-separated groups such as machine,model, or all
+      --daily
+          Include daily series for the selected groups
   -h, --help
           Print help
 ### ottto cloud --help
@@ -343,8 +344,6 @@ Options:
           Inclusive custom window start date
       --end-date <YYYY-MM-DD>
           Inclusive custom window end date
-      --timezone <TZ>
-          IANA timezone for calendar windows
       --source <SOURCE>
           Source slug to filter sessions to
       --app <APP>
@@ -356,7 +355,7 @@ Options:
       --billing-channel <CHANNEL>
           Billing channel filter
       --machine-id <MACHINE_ID>
-          Override the local machine filter
+          Filter to one machine's sessions
       --source-plan-profile-id <PROFILE_ID>
           Filter by source plan profile id
       --min-cost <USD>
@@ -370,7 +369,7 @@ Options:
       --search <TEXT>
           Search text
       --all-machines
-          Request account-wide sessions instead of this Mac
+          Accepted for compatibility; sessions are account-wide by default
   -h, --help
           Print help
 ### ottto recommendations --help
@@ -461,7 +460,7 @@ Options:
       --socket <SOCKET>      Override the ottto-service Unix socket path
       --local-only           Clear local credentials without first disconnecting this Mac in Ottto
       --token <TOKEN>        Override the local-control token for CLI and agent requests
-      --forget-installation  Forget installation identity, account scope, credentials, and local sync receipts
+      --forget-installation  Forget installation identity, credentials, and local sync receipts; without --local-only, first release this Mac in Ottto
       --no-autostart         Do not kickstart the standard per-user ottto-service
       --confirm              Confirm destructive installation reset and local receipt removal
       --watch                Emit NDJSON progress events and a final event; requires --json

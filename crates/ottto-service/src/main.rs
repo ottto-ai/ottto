@@ -24,6 +24,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(hide = true)]
+    ContextCompositionWorker,
+    #[command(hide = true)]
     ClaudeAuthSupervisor {
         #[arg(long)]
         operation_id: String,
@@ -121,6 +123,20 @@ enum Command {
         #[arg(long)]
         out_dir: PathBuf,
     },
+    /// Inspect (`--plan`, read-only) or remove (`--apply`) abandoned snapshot
+    /// checkpoint temp files under a support directory. `--apply` refuses the
+    /// daemon's own support directory, which the daemon cleans at startup.
+    #[command(hide = true)]
+    LocalStateSweep {
+        #[arg(long)]
+        support_dir: PathBuf,
+        #[arg(long, conflicts_with = "apply", required_unless_present = "apply")]
+        plan: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -182,6 +198,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Command::Status { json: true }) {
+        Command::ContextCompositionWorker => {
+            ottto_service::context_composition::run_context_composition_worker()?;
+        }
         Command::ClaudeAuthSupervisor {
             operation_id,
             config_dir,
@@ -260,10 +279,31 @@ fn main() -> Result<()> {
                     .map_err(anyhow::Error::msg)?;
             println!("{summary}");
         }
+        Command::LocalStateSweep {
+            support_dir,
+            plan: _,
+            apply,
+            json,
+        } => {
+            #[cfg(unix)]
+            ottto_service::run_local_state_sweep_command(&support_dir, apply, json)?;
+            #[cfg(not(unix))]
+            {
+                let _ = (support_dir, apply, json);
+                anyhow::bail!("local-state-sweep is supported only on unix");
+            }
+        }
         Command::Status { json } => {
-            let token = load_or_create_control_token()?;
+            // Diagnostic only: never creates or replaces the control token or
+            // the machine binding, which belong to the daemon.
+            let (Some(token), Some(machine)) =
+                (existing_control_token()?, existing_local_machine()?)
+            else {
+                report_local_state_not_initialized(json);
+                std::process::exit(STATUS_NOT_INITIALIZED_EXIT_CODE);
+            };
             let daemon = LocalDaemon::new(
-                local_machine(),
+                machine,
                 ControlToken::new(token.clone())?,
                 current_rfc3339_timestamp(),
             )
@@ -284,17 +324,13 @@ fn main() -> Result<()> {
         Command::Serve { socket, once } => {
             #[cfg(unix)]
             {
+                let _local_state = hold_local_state_or_exit();
                 // Before the relays start, so the first check-in already
                 // reports the transport.
                 ottto_service::control_plane_health::mark_serving(
                     ottto_service::control_plane_health::ControlTransport::UnixSocket,
                 );
-                cleanup_legacy_services_at_startup();
-                if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
-                    eprintln!("pending relay credential recovery deferred");
-                }
-                ottto_service::claude_browser_auth::recover_at_startup();
-                ottto_service::codex_sign_in::recover_at_startup();
+                prepare_to_serve(!once);
                 let token = load_or_create_control_token()?;
                 let daemon = LocalDaemon::new(
                     local_machine(),
@@ -324,6 +360,8 @@ fn main() -> Result<()> {
             mach_service,
             socket,
         } => {
+            #[cfg(unix)]
+            let _local_state = hold_local_state_or_exit();
             // Before the relays start, so the first check-in already reports
             // the transport. Off macOS there is no XPC and only the socket
             // serves.
@@ -332,12 +370,7 @@ fn main() -> Result<()> {
             } else {
                 ottto_service::control_plane_health::ControlTransport::UnixSocket
             });
-            cleanup_legacy_services_at_startup();
-            if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
-                eprintln!("pending relay credential recovery deferred");
-            }
-            ottto_service::claude_browser_auth::recover_at_startup();
-            ottto_service::codex_sign_in::recover_at_startup();
+            prepare_to_serve(true);
             let token = load_or_create_control_token()?;
             let daemon = LocalDaemon::new(
                 local_machine(),
@@ -528,6 +561,91 @@ impl ServiceCommand {
     }
 }
 
+/// How long a daemon launchd started waits before it exits on a held state
+/// directory. A `KeepAlive` job (the Homebrew service) is restarted as soon
+/// as it exits, and an on-demand Mach service on its next connection; this
+/// keeps either from respawning faster than once per interval.
+#[cfg(unix)]
+const HELD_STATE_LAUNCHD_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Takes the single-writer lock on the local state directory before
+/// anything in `serve` or `serve-xpc` can read or write it, and holds it
+/// for the life of the process: an error return from `main` or a panic
+/// never frees it while relays, the snapshot worker or a listener thread
+/// still write. When another daemon holds it, or it cannot be taken,
+/// prints why and exits without writing any state.
+#[cfg(unix)]
+fn hold_local_state_or_exit() -> &'static ottto_service::locked_state_dir::LockedStateDir {
+    use ottto_service::locked_state_dir::{hold_for_process, LockedStateDir};
+    use ottto_service::state_dir_lock::StateDirLockError;
+    match LockedStateDir::acquire(&ottto_core::default_support_dir()) {
+        // Held for the life of the process; the library's single-writer
+        // caches (the durable-tail store) write only while it is held.
+        Ok(locked) => hold_for_process(locked),
+        Err(error) => {
+            eprintln!("ottto-service: {error}; exiting without touching it");
+            // launchd is the parent of every job it starts.
+            if matches!(error, StateDirLockError::Held { .. }) && unsafe { libc::getppid() } == 1 {
+                std::thread::sleep(HELD_STATE_LAUNCHD_BACKOFF);
+            }
+            std::process::exit(error.exit_code());
+        }
+    }
+}
+
+/// Startup work of `serve` and `serve-xpc`, in the order it runs. All of it
+/// runs before the control token, the daemon, its relays and any listener;
+/// the local state sweep runs last, after the recovery hooks and before any
+/// snapshot worker can start a save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupStep {
+    CleanupLegacyServices,
+    RecoverPendingDeviceCredential,
+    RecoverClaudeBrowserAuth,
+    RecoverCodexSignIn,
+    SweepLocalState,
+}
+
+fn startup_steps(sweep_local_state: bool) -> Vec<StartupStep> {
+    let mut steps = vec![
+        StartupStep::CleanupLegacyServices,
+        StartupStep::RecoverPendingDeviceCredential,
+        StartupStep::RecoverClaudeBrowserAuth,
+        StartupStep::RecoverCodexSignIn,
+    ];
+    if sweep_local_state && cfg!(unix) {
+        steps.push(StartupStep::SweepLocalState);
+    }
+    steps
+}
+
+fn run_startup_step(step: StartupStep) {
+    match step {
+        StartupStep::CleanupLegacyServices => cleanup_legacy_services_at_startup(),
+        StartupStep::RecoverPendingDeviceCredential => {
+            if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
+                eprintln!("pending relay credential recovery deferred");
+            }
+        }
+        StartupStep::RecoverClaudeBrowserAuth => {
+            ottto_service::claude_browser_auth::recover_at_startup()
+        }
+        StartupStep::RecoverCodexSignIn => ottto_service::codex_sign_in::recover_at_startup(),
+        StartupStep::SweepLocalState => {
+            #[cfg(unix)]
+            ottto_service::sweep_local_state_at_startup();
+        }
+    }
+}
+
+/// Everything `serve` and `serve-xpc` do before their first relay or
+/// listener. `serve --once` skips the local state sweep.
+fn prepare_to_serve(sweep_local_state: bool) {
+    for step in startup_steps(sweep_local_state) {
+        run_startup_step(step);
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn cleanup_legacy_services_at_startup() {
     match home_dir() {
@@ -581,7 +699,7 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
         Ok(()) => eprintln!("serving mcp inventory harvest"),
         Err(error) => eprintln!("mcp inventory harvest unavailable: {error}"),
     }
-    match ottto_service::context_footprint::spawn_context_footprint_sync() {
+    match ottto_service::context_footprint::spawn_context_footprint_sync(daemon) {
         Ok(()) => eprintln!("serving context footprint harvest"),
         Err(error) => eprintln!("context footprint harvest unavailable: {error}"),
     }
@@ -683,6 +801,64 @@ fn local_machine() -> MachineIdentity {
             let _ = FileMachineStore::default().save(&binding);
         }
     }
+    machine_identity(binding, hostname)
+}
+
+/// `EX_CONFIG`: `status` found no control token or machine binding.
+const STATUS_NOT_INITIALIZED_EXIT_CODE: i32 = 78;
+
+/// The saved control token, without creating one.
+fn existing_control_token() -> Result<Option<String>> {
+    use ottto_core::ControlTokenStore;
+    if let Ok(token) = std::env::var(ottto_core::OTTTO_CONTROL_TOKEN_ENV) {
+        return Ok(Some(token));
+    }
+    match ottto_core::token_store::FileControlTokenStore::default().load() {
+        Ok(token) => Ok(Some(token)),
+        Err(ottto_core::TokenStoreError::Missing) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The saved machine binding, without creating, replacing or completing it.
+fn existing_local_machine() -> Result<Option<MachineIdentity>> {
+    let Some(mut binding) = FileMachineStore::default().load()? else {
+        return Ok(None);
+    };
+    if !ottto_core::is_persistent_machine_id(&binding.machine_id)
+        || !ottto_core::is_persistent_installation_id(&binding.installation_id)
+    {
+        return Ok(None);
+    }
+    if binding.hardware_uuid.is_none() {
+        binding.hardware_uuid = platform_hardware_uuid();
+    }
+    Ok(Some(machine_identity(binding, local_hostname())))
+}
+
+fn report_local_state_not_initialized(json: bool) {
+    let message = format!(
+        "{OTTTO_SERVICE_BINARY_NAME} local state is not initialized (no control token or machine binding); start the service to create it"
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": false,
+                "error": {
+                    "code": "local_state_not_initialized",
+                    "message": message,
+                    "retryable": true
+                }
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        eprintln!("{message}");
+    }
+}
+
+fn machine_identity(binding: LocalMachineBinding, hostname: String) -> MachineIdentity {
     let account_scope = local_account_scope(&binding.machine_id);
     MachineIdentity {
         machine_id: binding.machine_id,
@@ -871,8 +1047,163 @@ fn current_os() -> OperatingSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::ffi::OsString;
     use std::fs;
+
+    #[test]
+    fn local_state_sweep_needs_exactly_one_of_plan_and_apply() {
+        let parse = |flags: &[&str]| {
+            let mut args = vec!["ottto-service", "local-state-sweep", "--support-dir", "/x"];
+            args.extend_from_slice(flags);
+            Cli::try_parse_from(args).map(|cli| cli.command)
+        };
+        assert!(parse(&["--plan", "--apply"]).is_err());
+        assert!(parse(&[]).is_err());
+        assert!(matches!(
+            parse(&["--plan"]),
+            Ok(Some(Command::LocalStateSweep {
+                plan: true,
+                apply: false,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            parse(&["--apply", "--json"]),
+            Ok(Some(Command::LocalStateSweep {
+                plan: false,
+                apply: true,
+                json: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn local_state_sweep_is_hidden_from_help() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("serve-xpc"), "{help}");
+        assert!(!help.contains("local-state-sweep"), "{help}");
+    }
+
+    #[test]
+    fn local_state_sweep_runs_last_in_startup_and_only_without_once() {
+        let recovery = [
+            StartupStep::CleanupLegacyServices,
+            StartupStep::RecoverPendingDeviceCredential,
+            StartupStep::RecoverClaudeBrowserAuth,
+            StartupStep::RecoverCodexSignIn,
+        ];
+        let mut with_sweep = recovery.to_vec();
+        if cfg!(unix) {
+            with_sweep.push(StartupStep::SweepLocalState);
+        }
+        assert_eq!(startup_steps(true), with_sweep);
+        assert_eq!(startup_steps(false), recovery.to_vec());
+    }
+
+    /// `serve` and `serve-xpc` finish their startup steps, including the
+    /// local state sweep, before they build the daemon and start relays.
+    #[test]
+    fn local_state_sweep_and_recovery_precede_relays_in_serve_commands() {
+        let source = include_str!("main.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let arm = |start: &str, end: &str| {
+            let from = source.find(start).expect("command arm");
+            &source[from..from + source[from..].find(end).expect("next arm")]
+        };
+        for (arm, prepare) in [
+            (
+                arm("Command::Serve { socket, once } =>", "Command::ServeXpc {"),
+                "prepare_to_serve(!once);",
+            ),
+            (
+                arm("Command::ServeXpc {", "Command::Service { command } =>"),
+                "prepare_to_serve(true);",
+            ),
+        ] {
+            let at = |needle: &str| arm.find(needle).unwrap_or_else(|| panic!("{needle}"));
+            assert_eq!(arm.matches("prepare_to_serve(").count(), 1, "{arm}");
+            assert!(at(prepare) < at("load_or_create_control_token()"), "{arm}");
+            assert!(at(prepare) < at("LocalDaemon::new("), "{arm}");
+            assert!(at(prepare) < at("start_builtin_relays(&daemon)"), "{arm}");
+            assert!(!arm.contains("sweep_local_state_at_startup"), "{arm}");
+        }
+    }
+
+    /// Every daemon entry point takes the state-directory lock before it
+    /// marks itself serving, runs a startup step or touches any state.
+    #[test]
+    fn state_dir_lock_is_the_first_step_of_serve_commands() {
+        let source = include_str!("main.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let arm = |start: &str, end: &str| {
+            let from = source.find(start).expect("command arm");
+            &source[from..from + source[from..].find(end).expect("next arm")]
+        };
+        for arm in [
+            arm("Command::Serve { socket, once } =>", "Command::ServeXpc {"),
+            arm("Command::ServeXpc {", "Command::Service { command } =>"),
+        ] {
+            let at = |needle: &str| arm.find(needle).unwrap_or_else(|| panic!("{needle}"));
+            assert_eq!(
+                arm.matches("hold_local_state_or_exit()").count(),
+                1,
+                "{arm}"
+            );
+            let lock = at("let _local_state = hold_local_state_or_exit();");
+            assert!(lock < at("mark_serving("), "{arm}");
+            assert!(lock < at("prepare_to_serve("), "{arm}");
+            assert!(lock < at("load_or_create_control_token()"), "{arm}");
+            assert!(lock < at("LocalDaemon::new("), "{arm}");
+        }
+        // One binding per arm and no other caller.
+        assert_eq!(
+            source
+                .matches("let _local_state = hold_local_state_or_exit();")
+                .count(),
+            2
+        );
+        // Held until the process exits, through any error return or unwind.
+        assert!(source.contains(
+            "fn hold_local_state_or_exit() -> &'static ottto_service::locked_state_dir::LockedStateDir {"
+        ));
+        assert!(source.contains("Ok(locked) => hold_for_process(locked),"));
+    }
+
+    /// `status` is a diagnostic: it reads the token and machine binding the
+    /// daemon created and never creates, replaces or completes either.
+    #[test]
+    fn status_never_creates_the_control_token_or_machine_binding() {
+        let source = include_str!("main.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let from = source
+            .find("Command::Status { json } =>")
+            .expect("status arm");
+        let arm = &source[from..from + source[from..].find("Command::Serve {").unwrap()];
+        assert!(arm.contains("existing_control_token()?"), "{arm}");
+        assert!(arm.contains("existing_local_machine()?"), "{arm}");
+        for creating in ["load_or_create_control_token", ".save("] {
+            assert!(!arm.contains(creating), "{creating}: {arm}");
+        }
+        assert_eq!(
+            arm.matches("local_machine()").count(),
+            arm.matches("existing_local_machine()").count(),
+            "{arm}"
+        );
+        let readers = &source[source.find("fn existing_control_token()").unwrap()
+            ..source
+                .find("fn report_local_state_not_initialized(")
+                .unwrap()];
+        for creating in [
+            "load_or_create",
+            "generate_control_token",
+            ".save(",
+            "persistent_machine_binding",
+        ] {
+            assert!(!readers.contains(creating), "{creating}: {readers}");
+        }
+    }
 
     #[test]
     fn service_bootstrap_clears_disabled_state_before_bootstrap() {

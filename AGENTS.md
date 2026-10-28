@@ -20,13 +20,47 @@
 
 - Use existing Cargo tooling and CI. Establish an affected baseline once, run
   compile/focused tests per code patch, then existing formatting, Clippy, and
-  affected-workspace tests at integration. See [.github/workflows/ci.yml](.github/workflows/ci.yml)
+  changed-crate tests at integration. See [.github/workflows/ci.yml](.github/workflows/ci.yml)
   for exact commands. Report failures and concrete unverified limits.
 - Add regression tests for changed decisions, not tests that mirror unchanged
   code. Preserve test discovery, fixtures, platform gates, and environment
   isolation when moving tests. Update source-path validators without weakening them.
-- Coordinate heavy builds; use macOS for native behavior. Use synthetic fixtures
-  rather than live credentials or provider accounts.
+- Locally, check and test only the crates you changed (`cargo check|test -p <crate>`).
+  Full-workspace `cargo build`/`cargo test` runs only in GitHub CI: push a PR and
+  read its result. Coordinate heavy local builds.
+- Iterate on CI, not on the local machine. A local `cargo check -p ottto-service`
+  takes several GB of memory and every core for minutes, and many agents may
+  share one machine. For compile and test feedback, push a branch and run the
+  free Linux lane on it: `gh workflow run linux-tests.yml --ref <branch>`, then
+  read `Rust tests (Linux)`. Pull-request runs use no macOS runner either: the
+  macOS `Rust contracts` job runs only in the merge queue, on `main` pushes and
+  on manual dispatch. Build locally only when
+  no CI path works: one changed crate, one build at a time, on an idle machine,
+  and say why in your report. A Linux green is fast feedback, not Mac evidence;
+  the macOS `Rust contracts` job in the merge queue stays the merge gate.
+- CI runs on pull requests. Push to the PR branch; do not also start Public CI by
+  hand on a branch whose PR is open and mergeable. GitHub starts no pull-request
+  run while a PR has merge conflicts (`gh pr view <n> --json mergeable`): rebase
+  onto `main` and push. Start Public CI by hand (`workflow_dispatch`) only for a
+  `main` commit with no push run, a branch with no PR (for example a red-test
+  proof), a dispatch-only job the branch adds, or macOS evidence before you
+  enqueue a change with macOS-only risk (native code, clippy `-D warnings`,
+  macOS-only tests): `gh workflow run ci.yml --ref <branch>`; one run per head, and never
+  restart a run because it is queued. Do not put `[skip ci]` in PR commits. Merge
+  only after a green pull-request run on the final head.
+- Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
+  ready, waits until the `ci.yml` checks of the pull-request run on the PR's head
+  commit pass (Linux `Public surface checks`, `Rust advisory audit`, `Dependency
+  review`; macOS `Rust contracts` is skipped on pull requests), and enqueues
+  exactly that head. `main`'s ruleset requires `Rust contracts`, `Public surface
+  checks` and `Rust advisory audit` in the merge queue. `gh pr checks` exit 0 is
+  not evidence, and no Linux job stands in for the macOS `Rust contracts` job.
+- `main` has a merge queue: the guard enqueues the PR and waits for the merge (default timeout 2 h; rerunning it for a queued PR resumes the wait). The queue retests the PR on top of `main` and the PRs ahead of it, including the macOS `Rust contracts` job; a PR that fails there is removed (exit 4, with the failing run): fix it, push and rerun the guard.
+- The author merges its own reviewed, green, mergeable PR; no merge window, slot
+  or extra approval is needed. Wait only for a real dependency or conflict, an
+  explicit dated hold, or an announced release freeze.
+- Use macOS for native behavior. Use synthetic fixtures rather than live
+  credentials or provider accounts.
 - No additional skill, dependency, coverage quota, report, or validation gate is
   required merely for refactoring. Use extra tooling only for a concrete need.
 - Before handing off or merging substantive changes, the implementing agent runs
@@ -41,6 +75,7 @@
   references, and operator paths. Follow the contribution/export tooling already
   in this repo.
 - New root export files need `public-export/roots.txt` and `public-export/path-map.tsv`
-  entries. Regenerate `PUBLIC_EXPORT_MANIFEST.json` from the intended clean,
-  Git-tracked export inventory; never include unrelated local files. Run relevant
+  entries. `PUBLIC_EXPORT_MANIFEST.json` is derived from the commit tree
+  (`scripts/public_repo_manifest.sh --facts`); never commit it, and resolve a
+  conflict on it with `git rm PUBLIC_EXPORT_MANIFEST.json`. Run relevant
   export/contract checks when their inputs change.

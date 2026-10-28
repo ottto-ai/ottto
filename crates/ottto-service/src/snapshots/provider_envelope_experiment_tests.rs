@@ -46,12 +46,19 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
             ownership_incomplete_file_count: 0,
             zero_snapshot_usage_evidence: false,
             dropped_usage_record_count: 0,
+            claude_compaction_unlinked_parent_count: 0,
             terminal_line_loss_count: 0,
             state_only_blocked_session_ids: BTreeSet::new(),
             codex_parent_session_ref: None,
             codex_parent_ledger_identity_used: None,
             codex_parent_resolution_pending: false,
             codex_parent_ownership_ledger: None,
+            codex_parent_unresolvable: None,
+            codex_parent_ledger_unusable: None,
+            codex_parent_ledger_consulted: false,
+            codex_parent_prefix_decided: None,
+            codex_parent_proof_used: None,
+            codex_parent_proof_refusal: None,
         };
         let mut payload = Counter::new(usize::MAX);
         for snapshot in &parsed.snapshots {
@@ -75,7 +82,10 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
         }
         let expected_admission = !short && !unknown;
         let mut retained = Vec::new();
-        let (admitted, allocations) = crate::retry_allocation_probe::measure_process(|| {
+        // Synchronous on this thread (no spawn, channel or pool in the call
+        // chain): thread-local accounting counts the same allocation events
+        // and excludes unrelated tests' allocations in parallel hosted runs.
+        let (admitted, allocations) = crate::retry_allocation_probe::measure(|| {
             phase.retain_target_output(&parsed, &mut retained, &mut paid)
         });
         assert_eq!(admitted.is_ok(), expected_admission);
@@ -270,7 +280,11 @@ fn native_comparison_paid_import_reserves_before_membership_and_moves_only_once(
         );
         assert!(paid.as_mut().unwrap().reserve_recovery(recovery));
         let unchanged = serde_json::to_vec(&index).unwrap();
-        let (imported, allocations) = crate::retry_allocation_probe::measure_process(|| {
+        // Synchronous on this thread (no spawn, channel or pool in the call
+        // chain). The import drops the pre-existing window, so keep
+        // born-in-scope accounting (that free cannot hide a later peak) but
+        // charge only this thread, excluding parallel tests' allocations.
+        let (imported, allocations) = crate::retry_allocation_probe::measure_caller_thread(|| {
             phase.import_window_paid(Some(window), &index, &scan.census_window_end, &mut paid)
         });
         assert_eq!(imported, !one_byte_short);
@@ -313,6 +327,7 @@ fn native_comparison_paid_capture_population_reports_guard_viability_without_byp
             entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
             index.files.insert(local_index_key(&path), entry);
             CandidateFile {
+                physical_identity: None,
                 scan_root: PathBuf::from("/synthetic/project"),
                 path,
                 size_bytes: 1,
@@ -322,6 +337,8 @@ fn native_comparison_paid_capture_population_reports_guard_viability_without_byp
                 legacy_source_file_fingerprint: String::new(),
                 legacy_config_reconciliation_required: false,
                 opened_object_identity: "synthetic-descriptor-not-opened-evidence".into(),
+                fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: 0,
             }
         })
         .collect::<Vec<_>>();
@@ -654,6 +671,8 @@ fn qualified_prior(
 
 #[test]
 fn envelope_experiment_frozen_old_proof_does_not_mask_new_native_request() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, parent, raw) = claude_account_family_fixture();
     let (api0, trace0) = reports(&parent, false);
     let mut index = fixture_index(&dir, &parent, &raw);
@@ -738,6 +757,8 @@ impl ProcessPermit {
 
 #[test]
 fn envelope_experiment_native_save_bootstrap_restart_matches_base_owners() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let (dir, parent, raw) = claude_account_family_fixture();
     let scratch = crate::test_scratch::ScratchDir::new("envelope-bootstrap");
     let path = scratch.join("index.json");
@@ -1292,16 +1313,48 @@ fn envelope_experiment_two_successful_deferrals_use_locked_shed_restore_then_dis
     writeln!(std::io::stderr().lock(), "envelope_experiment_attempts: successful_deferrals=2 base_exits=1 no_renewal=true locked_shed_restore=true restart_native_priority=true age_unknown_count=1").unwrap();
 }
 
+/// Restores a file's original mode at teardown, also when an assertion panics.
+#[cfg(unix)]
+struct RestoreFileMode<'a>(&'a Path, fs::Permissions);
+#[cfg(unix)]
+impl Drop for RestoreFileMode<'_> {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(self.0, self.1.clone());
+    }
+}
+
+/// A failed read, not a deletion: a Claude file deleted beneath its present
+/// parent is a removal (N), so the failure is injected as a permission error.
+#[cfg(unix)]
 #[test]
 fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_rearm() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        // SAFETY: geteuid() is always-successful and has no preconditions.
+        unsafe { libc::geteuid() },
+        0,
+        "this test injects a failed open with chmod 000, which root reads through; run it as a non-root user"
+    );
     let fixture = SelectionFixture::new();
     let scope = envelope_selection_experiment::Scope::controlled();
     scope.register("family", BTreeSet::from([fixture.paths[0].clone()]));
     let native = fixture.prepare(fixture.previous.clone(), 1);
     assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
     let bytes = fs::read(&fixture.paths[0]).unwrap();
-    fs::remove_file(&fixture.paths[0]).unwrap(); // after frozen selection, before safe open
-    let (index, scan) = SelectionFixture::run(native);
+    // After frozen selection, before safe open.
+    let unreadable = RestoreFileMode(
+        &fixture.paths[0],
+        fs::metadata(&fixture.paths[0]).unwrap().permissions(),
+    );
+    fs::set_permissions(&fixture.paths[0], fs::Permissions::from_mode(0o000)).unwrap();
+    let ((index, scan), producer_events) =
+        disappearance_diagnostics::observe(|| SelectionFixture::run(native));
+    assert_eq!(
+        producer_events, [[0; 4]; 3],
+        "a failed read is not a NotFound producer"
+    );
+    assert_eq!(scan.disappeared_file_count, 0);
+    assert_eq!(scan.unreadable_path_count, 1);
     assert!(scan.disappeared_file_count + scan.unreadable_path_count > 0);
     scope.defer_after_native("family", &scan);
     assert_eq!(scope.counts().unavailable, 1);
@@ -1310,7 +1363,19 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
         !scope.allowed("family"),
         "fallback revokes reuse, never converts failed read to success"
     );
-    let saved = fixture.checkpoint(&index, &scan);
+    let body_before = serde_json::to_vec(&scan.snapshots).unwrap();
+    let (saved, copy_events) =
+        disappearance_diagnostics::observe(|| fixture.checkpoint(&index, &scan));
+    assert_eq!(
+        copy_events, [[0; 4]; 3],
+        "partial checkpoint must not record producers again"
+    );
+    assert_eq!(serde_json::to_vec(&scan.snapshots).unwrap(), body_before);
+    let saved_bytes = fs::read(&fixture.index_path).unwrap();
+    assert_eq!(saved_bytes, serde_json::to_vec(&saved).unwrap());
+    assert!(!String::from_utf8(saved_bytes.clone())
+        .unwrap()
+        .contains("disappearance_process_totals_v1"));
     assert!(saved.files[&local_index_key(&fixture.paths[0])]
         .source_file_fingerprint
         .is_empty());
@@ -1318,10 +1383,18 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
         saved.accepted_snapshot_fingerprints,
         fixture.previous.accepted_snapshot_fingerprints
     );
+    drop(unreadable);
     fs::write(&fixture.paths[0], bytes).unwrap();
     drop(scope);
     let restarted = envelope_selection_experiment::Scope::restart();
-    let reloaded = ScanIndex::load(&fixture.index_path).unwrap();
+    let (reloaded, reload_events) = disappearance_diagnostics::observe(|| {
+        let loaded = ScanIndex::load(&fixture.index_path).unwrap();
+        let _ = disappearance_diagnostics::snapshot(SnapshotSource::ClaudeCode);
+        loaded
+    });
+    assert_eq!(reload_events, [[0; 4]; 3]);
+    assert_eq!(serde_json::to_vec(&reloaded).unwrap(), saved_bytes);
+    assert_eq!(fs::read(&fixture.index_path).unwrap(), saved_bytes);
     let retry = fixture.prepare(reloaded, 1);
     assert_eq!(retry.identified_candidates[0].path, fixture.paths[0]);
     let (_, scan) = SelectionFixture::run(retry);
@@ -1610,6 +1683,8 @@ fn native_comparison_seeded_index_is_not_an_actual_skip_certificate() {
 
 #[test]
 fn native_comparison_current_nonreported_member_withdraws_whole_family() {
+    // Legacy reported-usage rebuild and selectors; E2 attaches telemetry to native grains.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let fixture = NativePreparationFixture::new();
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
     let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
@@ -2408,7 +2483,47 @@ fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
     let replacement = fixture.dir.join("replacement.tmp");
     fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
     fs::rename(&replacement, &path).unwrap();
-    let mut state = pause_native_comparison(state);
+    let base_bodies = state
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                serde_json::to_vec(item).unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let target_key = local_index_key(&path);
+    let target_entry = serde_json::to_vec(&state.index.files[&target_key]).unwrap();
+    let file_limit = state.file_limit;
+    let sidecar_complete = state.sidecar_census_complete;
+    let (mut state, disappearance_events) =
+        disappearance_diagnostics::observe(|| pause_native_comparison(state));
+    assert_eq!(
+        disappearance_events,
+        [[0; 4], [0, 0, 0, 1], [0; 4]],
+        "a real reopened replacement reaches the frozen revision comparison"
+    );
+    assert_eq!(
+        serde_json::to_vec(&state.index.files[&target_key]).unwrap(),
+        target_entry,
+        "a mismatched target cannot refresh the frozen index entry"
+    );
+    assert_eq!(state.file_limit, file_limit);
+    assert_eq!(state.sidecar_census_complete, sidecar_complete);
+    for (session, bytes) in base_bodies {
+        let retained = state
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == session)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(retained).unwrap(),
+            bytes,
+            "target failure preserves already parsed native bodies"
+        );
+    }
+
     assert!(
         state.census.disappeared_file_count + state.census.unreadable_path_count > 0,
         "the existing safe open must reject a replaced frozen object"
@@ -2856,8 +2971,48 @@ fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
     let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
     let replacement = fixture.dir.join("controller-replacement.tmp");
     fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
-    fs::rename(replacement, path).unwrap();
-    let mut state = pause_native_comparison(state);
+    fs::rename(replacement, &path).unwrap();
+    let base_bodies = state
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                serde_json::to_vec(item).unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let target_key = local_index_key(&path);
+    let target_entry = serde_json::to_vec(&state.index.files[&target_key]).unwrap();
+    let file_limit = state.file_limit;
+    let sidecar_complete = state.sidecar_census_complete;
+    let (mut state, disappearance_events) =
+        disappearance_diagnostics::observe(|| pause_native_comparison(state));
+    assert_eq!(
+        disappearance_events,
+        [[0; 4], [0, 0, 0, 1], [0; 4]],
+        "a real reopened replacement reaches the frozen revision comparison"
+    );
+    assert_eq!(
+        serde_json::to_vec(&state.index.files[&target_key]).unwrap(),
+        target_entry,
+        "a mismatched target cannot refresh the frozen index entry"
+    );
+    assert_eq!(state.file_limit, file_limit);
+    assert_eq!(state.sidecar_census_complete, sidecar_complete);
+    for (session, bytes) in base_bodies {
+        let retained = state
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == session)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(retained).unwrap(),
+            bytes,
+            "target failure preserves already parsed native bodies"
+        );
+    }
+
     assert!(!controller.advance(&mut state, true));
     assert!(
         state
@@ -3658,6 +3813,74 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
     writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: actual_native_copy_peer_observed=true healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
 }
 
+/// Diagnostics only: the comparison fallback's fold and its selected restore
+/// each mark the sweep without naming a path, so both name `unattributed`,
+/// also beside a named page cause and across a reload.
+#[test]
+fn native_comparison_fallback_marks_name_unattributed() {
+    if !native_positive_layout_for_test("native_comparison_fallback_marks_name_unattributed") {
+        return;
+    }
+    let (_fixture, mut index, _scan, mut fallback, previous, path) =
+        native_comparison_selected_fallback_fixture();
+    assert!(index.bounded_sweep_had_unsettled_upload());
+    assert_eq!(
+        index.bounded_sweep_unsettled_cause_names(),
+        ["unattributed"]
+    );
+    // Isolate the restore's own mark.
+    index.bounded_sweep_had_unsettled_upload = false;
+    index.bounded_sweep_unsettled_causes = 0;
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    assert!(index.bounded_sweep_had_unsettled_upload());
+    assert_eq!(
+        index.bounded_sweep_unsettled_cause_names(),
+        ["unattributed"]
+    );
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+    index.save(&path).unwrap();
+    let restored = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        restored.bounded_sweep_unsettled_cause_names(),
+        ["shed", "unattributed"]
+    );
+}
+
+/// Slice D1 (TD1b, SOURCE #588): a selected restore reverts the withheld key
+/// to `previous` and REMOVES its request-census record. No record of the
+/// withheld revision, and none restored from `previous`, survives.
+#[test]
+fn native_comparison_selected_restore_removes_the_withheld_census_record() {
+    if !native_positive_layout_for_test(
+        "native_comparison_selected_restore_removes_the_withheld_census_record",
+    ) {
+        return;
+    }
+    let (fixture, mut index, _scan, mut fallback, mut previous, _path) =
+        native_comparison_selected_fallback_fixture();
+    let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+    let record = |seed: char| {
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &seed.to_string().repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![1],
+        )
+    };
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record('a'));
+    previous
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record('b'));
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&index.files[&key]).unwrap(),
+        serde_json::to_vec(&previous.files[&key]).unwrap()
+    );
+    assert!(index.claude_request_census_for_test().get(&key).is_none());
+}
+
 #[test]
 fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt() {
     if !native_positive_layout_for_test(
@@ -3830,7 +4053,10 @@ fn native_comparison_corrected_native_receipt_fixture(
             0,
             0,
         ));
-        let (_, allocation) = crate::retry_allocation_probe::measure_process(|| {
+        // Synchronous on this thread (no spawn, channel or pool in the call
+        // chain): thread-local accounting counts the same allocation events
+        // and excludes unrelated tests' allocations in parallel hosted runs.
+        let (_, allocation) = crate::retry_allocation_probe::measure(|| {
             completion.prepare_native_corrections(&scan, &previous, &disposition)
         });
         assert_eq!(
@@ -3866,6 +4092,7 @@ fn native_comparison_corrected_native_receipt_fixture(
         SnapshotSource::ClaudeCode,
         &mut baseline_scan,
         &mut baseline_index,
+        true,
         |snapshot| {
             baseline_projections += 1;
             snapshot_upload_body_witness(snapshot)
@@ -3876,6 +4103,7 @@ fn native_comparison_corrected_native_receipt_fixture(
         SnapshotSource::ClaudeCode,
         &mut scan,
         &mut index,
+        true,
         |snapshot| {
             observed_projections += 1;
             let witness = snapshot_upload_body_witness(snapshot);
@@ -3962,6 +4190,8 @@ fn native_comparison_corrected_native_receipt_fixture(
 
 #[test]
 fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_selected_save",
     ) {
@@ -3982,6 +4212,8 @@ fn native_comparison_native_receipt_requires_exact_ack_or_accepted_noop_after_se
 
 #[test]
 fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !native_positive_layout_for_test(
         "native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base",
     ) {

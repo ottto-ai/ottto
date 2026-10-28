@@ -1,10 +1,193 @@
 //! Content-free observations in the existing local service log, never wire data.
 //! CPU includes concurrent process work; maximum RSS is a lifetime high-water mark.
 use serde::{ser::SerializeMap, Serialize};
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod cache_lifecycle;
+pub(crate) mod claude_absence;
+pub(crate) mod claude_contract;
+pub(crate) mod claude_reread;
+pub(crate) mod codex_memo_lifecycle;
+pub(crate) mod codex_side_lifecycle;
+
+/// Nonzero-only counters on the existing native_collection_page line.
+#[derive(Default, Serialize)]
+struct ClaudeRecordCaps {
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_money_record_cap_half_files: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_money_record_cap_hits: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+#[cfg(not(test))]
+static CLAUDE_CAP_HALF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(not(test))]
+static CLAUDE_CAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_CAP_HALF: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(0) };
+    static CLAUDE_CAP_HITS: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(0) };
+}
+fn with_claude_record_caps<T>(
+    f: impl FnOnce(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64) -> T,
+) -> T {
+    #[cfg(test)]
+    {
+        CLAUDE_CAP_HALF.with(|half| CLAUDE_CAP_HITS.with(|hits| f(half, hits)))
+    }
+    #[cfg(not(test))]
+    {
+        f(&CLAUDE_CAP_HALF, &CLAUDE_CAP_HITS)
+    }
+}
+pub(crate) fn claude_record_cap_half_file() {
+    with_claude_record_caps(|half, _| {
+        half.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+pub(crate) fn claude_record_cap_hit() {
+    with_claude_record_caps(|_, hits| {
+        hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+fn take_claude_record_caps() -> ClaudeRecordCaps {
+    with_claude_record_caps(|half, hits| ClaudeRecordCaps {
+        claude_money_record_cap_half_files: half.swap(0, std::sync::atomic::Ordering::Relaxed),
+        claude_money_record_cap_hits: hits.swap(0, std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
+    let c = take_claude_record_caps();
+    (
+        c.claude_money_record_cap_half_files,
+        c.claude_money_record_cap_hits,
+    )
+}
+
+/// K10 (LD): one line observer's counts for a page; nonzero keys only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LineDeliveryCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) lines: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) incomplete: u64,
+}
+
+/// K10 (LD): why a discovery gate left a file unselected.
+pub(crate) enum UnselectedReason {
+    Age,
+    Size,
+}
+/// Claude, Codex, Pi x (age, size), drained by that source's page line.
+#[cfg(not(test))]
+static LINE_UNSELECTED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+#[cfg(test)]
+thread_local! {
+    static LINE_UNSELECTED: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+}
+fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
+    let sources = ["claude_code", "codex", "pi"];
+    let Some(slot) = sources.iter().position(|s| *s == source) else {
+        return 0;
+    };
+    #[cfg(test)]
+    {
+        LINE_UNSELECTED.with(|slots| f(&slots[2 * slot + reason]))
+    }
+    #[cfg(not(test))]
+    {
+        f(&LINE_UNSELECTED[2 * slot + reason])
+    }
+}
+/// One skip decision, recorded after the gate decided; never a gate input.
+pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
+    line_unselected(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
+}
+
 const SCHEMA_VERSION: u8 = 2;
+
+/// Cumulative shared-process totals, NOT events attributed to the finishing
+/// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
+pub(crate) fn cache_lifecycle_totals() {
+    traversal_point(
+        "process_retained_cache_lifecycle_totals",
+        "unknown",
+        &cache_lifecycle::snapshot(),
+    );
+}
+
+/// Cumulative shared-process Codex memo totals (L-2): lifetime counters plus
+/// one resident gauge, NOT events attributed to the finishing page/source.
+/// Codex scans only.
+pub(crate) fn codex_memo_lifecycle_totals(source: &str) {
+    if source == "codex" {
+        traversal_point(
+            "process_codex_memo_lifecycle_totals",
+            "codex",
+            &codex_memo_lifecycle::snapshot(),
+        );
+    }
+}
+
+/// Local alarm, once per process: a Claude context fold first withheld
+/// session scalars for a resource limit (SOURCE Amendment 7). Counts only.
+pub(crate) fn claude_context_resource_withhold(counts: &impl Serialize) {
+    traversal_point("claude_context_resource_withhold", "claude_code", counts);
+}
+
+/// Cumulative shared-process Codex parent side-record totals (U1a-2a):
+/// lifetime counters plus last-measured gauges, NOT events attributed to the
+/// finishing page/source. Codex scans only.
+pub(crate) fn codex_side_lifecycle_totals(source: &str) {
+    if source == "codex" {
+        traversal_point(
+            "process_codex_side_lifecycle_totals",
+            "codex",
+            &codex_side_lifecycle::snapshot(),
+        );
+    }
+}
+
+/// The two point lines of one side read (`codex_side_lifecycle::SideReadGuard`).
+pub(crate) enum SideReadPoint {
+    Start { pseq: u64, attempts: u8 },
+    End { pseq: u64, abandoned: bool },
+}
+
+/// One content-free line per side read start or end, on the existing
+/// best-effort stderr carrier. With `process_id`, a start that has no matching
+/// end before a new `process_id` is the only crash evidence; nothing is
+/// persisted, and no CPU/RSS sample is taken.
+pub(crate) fn side_read_point(point: SideReadPoint) {
+    #[derive(Serialize)]
+    struct Start {
+        pseq: u64,
+        attempts: u8,
+    }
+    #[derive(Serialize)]
+    struct End {
+        pseq: u64,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        abandoned: bool,
+    }
+    match point {
+        SideReadPoint::Start { pseq, attempts } => {
+            traversal_point("side_read_start", "codex", &Start { pseq, attempts })
+        }
+        SideReadPoint::End { pseq, abandoned } => {
+            traversal_point("side_read_end", "codex", &End { pseq, abandoned })
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,12 +247,16 @@ fn process_sample() -> Option<ProcessSample> {
 pub(crate) struct Probe {
     started: Instant,
     process: Option<ProcessSample>,
+    pub(crate) page_events: claude_reread::Counts,
+    pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
 }
 impl Probe {
     pub(crate) fn start() -> Self {
         Self {
             started: Instant::now(),
             process: process_sample(),
+            page_events: Default::default(),
+            line_delivery: None,
         }
     }
     fn observation(&self) -> Observation {
@@ -79,7 +266,69 @@ impl Probe {
             process_sample(),
         )
     }
+    #[cfg(test)]
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
+        self.collection_with_account_pending(source, counts, None);
+    }
+    pub(crate) fn collection_with_account_pending(
+        &self,
+        source: &str,
+        counts: CollectionCounts,
+        pending: Option<ClaudeAccountRetainedPending>,
+    ) {
+        #[derive(Serialize)]
+        struct Counts {
+            #[serde(flatten)]
+            collection: CollectionCounts,
+            #[serde(flatten)]
+            pending: Option<ClaudeAccountRetainedPending>,
+            #[serde(flatten)]
+            money: crate::snapshots::claude_request_money::e2::Counts,
+            #[serde(flatten)]
+            caps: ClaudeRecordCaps,
+            #[serde(flatten)]
+            identity: crate::snapshots::claude_request_identity::IdentityCounts,
+            #[serde(flatten)]
+            reread: claude_reread::Counts,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            line_delivery: Option<BTreeMap<&'static str, LineDeliveryCounts>>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            line_delivery_unselected: BTreeMap<&'static str, u64>,
+        }
+        let claude = source == "claude_code";
+        let counts = Counts {
+            line_delivery: self
+                .line_delivery
+                .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
+                .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
+            line_delivery_unselected: [("age", 0), ("size", 1)]
+                .into_iter()
+                .map(|(key, reason)| (key, line_unselected(source, reason, |n| n.swap(0, Relaxed))))
+                .filter(|(_, count)| *count > 0)
+                .collect(),
+            reread: if claude {
+                self.page_events.with_current()
+            } else {
+                Default::default()
+            },
+            collection: counts,
+            pending,
+            identity: if claude {
+                crate::snapshots::claude_request_identity::take_identity_counts()
+            } else {
+                Default::default()
+            },
+            caps: if claude {
+                take_claude_record_caps()
+            } else {
+                Default::default()
+            },
+            money: if claude {
+                crate::snapshots::claude_request_money::e2::take_counts()
+            } else {
+                Default::default()
+            },
+        };
         emit(&Record {
             schema_version: SCHEMA_VERSION,
             process_id: std::process::id(),
@@ -89,6 +338,15 @@ impl Probe {
             counts,
         });
     }
+}
+
+/// All retained account-pending families, including held/incomplete families;
+/// a conservative local-only gauge, never an authority or eviction decision.
+#[derive(Debug, Serialize)]
+pub(crate) struct ClaudeAccountRetainedPending {
+    pub(crate) claude_account_retained_pending_families: usize,
+    /// Pretty JSON bytes of the retained field, including its field wrapper.
+    pub(crate) claude_account_retained_pending_bytes: u64,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
     const INLINE_ONLY: bool = true;
@@ -185,6 +443,271 @@ pub(crate) fn codex_census_fence(
 #[derive(Serialize)]
 struct EmptyCounts {}
 
+/// Fixed-schema traversal decisions only; no CPU/RSS sample or wire event.
+pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
+    traversal_point("bounded_traversal_transition", source, counts);
+}
+#[derive(Serialize)]
+struct ListMissingCause {
+    cause: &'static str,
+}
+
+/// Local alarm, once per Claude cycle while it lasts: the re-emission list was
+/// installed once and its file is now missing, so the one-time history
+/// re-read is paused. `cause` names why it reads installed: the seen-marker,
+/// Set intent, or intent that could not be read (addendum 3). No path, id or
+/// wire event.
+pub(crate) fn claude_reemission_list_missing(cause: &'static str) {
+    traversal_point(
+        "claude_reemission_list_missing_after_install",
+        "claude_code",
+        &ListMissingCause { cause },
+    );
+}
+/// Local alarm, at most hourly: Claude history owes an upgrade to the active
+/// body-witness revision while the protected list was never installed, so
+/// the history gate holds it. Counts only; no path, id or wire event.
+pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) {
+    traversal_point(
+        "claude_history_upgrade_owed_without_list",
+        "claude_code",
+        counts,
+    );
+}
+/// Local alarm, at most hourly: a complete Claude terminal kept the retired
+/// family tombstone uncertainty fence up, because more absent witnessed roots
+/// need a tombstone than fit under the cap. Counts only; no path, id or wire
+/// event.
+pub(crate) fn claude_absent_family_tombstone_uncertain(counts: &impl Serialize) {
+    traversal_point(
+        "claude_absent_family_tombstone_uncertain",
+        "claude_code",
+        counts,
+    );
+}
+static HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Serialize)]
+struct HistoryProofCorrectionDeferred {
+    history_proof_correction_deferred: u64,
+    history_proof_correction_deferred_total: u64,
+}
+
+/// Local counter (StateMissing M2, SOURCE h695 N6): proof-correction members
+/// the history gate holds, deferred instead of blocking settlement. This
+/// settlement's count and a saturating process total. Counts only; no path,
+/// id or wire event.
+pub(crate) fn claude_history_proof_correction_deferred(members: usize) {
+    let members = u64::try_from(members).unwrap_or(u64::MAX);
+    let previous = HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| Some(total.saturating_add(members)),
+        )
+        .unwrap_or(u64::MAX);
+    traversal_point(
+        "claude_history_proof_correction_deferred",
+        "claude_code",
+        &HistoryProofCorrectionDeferred {
+            history_proof_correction_deferred: members,
+            history_proof_correction_deferred_total: previous.saturating_add(members),
+        },
+    );
+}
+/// Local diagnostic, at most hourly: the backfill state's
+/// `prior_history_unverified` marker has been read set since the given time
+/// (first seen by this process). Counts and times only; no path, id or wire
+/// event.
+pub(crate) fn claude_prior_history_unverified(counts: &impl Serialize) {
+    traversal_point("claude_prior_history_unverified", "claude_code", counts);
+}
+/// Local alarm, once per refusal: a body-witness revision with no history
+/// policy row was not activated, and the previous active revision was kept.
+/// Counts only; no path, id or wire event.
+pub(crate) fn claude_history_revision_activation_refused(counts: &impl Serialize) {
+    traversal_point(
+        "claude_history_revision_activation_refused",
+        "claude_code",
+        counts,
+    );
+}
+static REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Serialize)]
+struct ReemissionFamilyClosureRootAbsentExcluded {
+    claude_reemission_family_closure_root_absent_excluded: u64,
+    claude_reemission_family_closure_root_absent_excluded_total: u64,
+}
+
+/// Local counter (StateMissing M1, SOURCE d680b524): subagent members the
+/// history gate held only through their listed family root while the root
+/// file is absent. This page's count and a saturating process total. Counts
+/// only; no path, id or wire event.
+pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64) {
+    let previous = REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| Some(total.saturating_add(members)),
+        )
+        .unwrap_or(u64::MAX);
+    traversal_point(
+        "claude_reemission_family_closure_root_absent_excluded",
+        "claude_code",
+        &ReemissionFamilyClosureRootAbsentExcluded {
+            claude_reemission_family_closure_root_absent_excluded: members,
+            claude_reemission_family_closure_root_absent_excluded_total: previous
+                .saturating_add(members),
+        },
+    );
+}
+/// Local alarm: the one-time Claude history re-read latched its stop until
+/// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
+/// hourly as a reminder. Counts and hashed root refs only; no wire event.
+pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Serialize) {
+    let stage = if reminder {
+        "claude_reemission_stop_latched_reminder"
+    } else {
+        "claude_reemission_stop_latched"
+    };
+    traversal_point(stage, "claude_code", counts);
+}
+fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage,
+        source: Source::from_slug(source),
+        observation: Observation {
+            observed_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+            wall_elapsed_us: 0,
+            shared_process_cpu_delta_us: None,
+            process_lifetime_max_rss_bytes: None,
+            process_lifetime_max_rss_before_bytes: None,
+        },
+        counts,
+    });
+}
+
+/// One preparation/page observation, never a permit or authority input.
+/// None means that boundary was not reached, not a known false/zero result.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct NativeComparisonDecision {
+    pub(crate) layout_supported: bool,
+    pub(crate) lease_generation: Option<u64>,
+    pub(crate) fold_index_generation: Option<u64>,
+    pub(crate) allowed_at_bind: Option<bool>,
+    pub(crate) controller_created: bool,
+    pub(crate) controller_current_at_finish: Option<bool>,
+    pub(crate) bootstrap: Option<NativeBootstrap>,
+    pub(crate) selected_save: bool,
+    pub(crate) upload_fully_settled: Option<bool>,
+    pub(crate) clean_at_finish: Option<bool>,
+    pub(crate) retained_permit: Option<bool>,
+    pub(crate) revoke_calls: usize,
+    pub(crate) admission_refusal_calls: usize,
+    pub(crate) hit_policy_calls: usize,
+    pub(crate) deferred_decisions: usize,
+    pub(crate) latched_base_decisions: usize,
+    pub(crate) other_base_decisions: usize,
+    pub(crate) terminal_rearm: Option<NativeRearm>,
+    pub(crate) correction_mint: Option<NativeMint>,
+    pub(crate) outcome: NativeDecisionOutcome,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeDecisionOutcome {
+    #[default]
+    Abandoned,
+    CadenceWait,
+    Finished,
+    DisabledBeforeLease,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct NativeBootstrap {
+    pub(crate) native_census_complete: bool,
+    pub(crate) coverage_complete: bool,
+    pub(crate) census_valid: bool,
+    pub(crate) fence_open: bool,
+    pub(crate) pending_occurrences_present: bool,
+    pub(crate) transcript_ownership_complete: bool,
+    pub(crate) scan_census_complete: bool,
+    pub(crate) not_withheld: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct NativeRearm {
+    pub(crate) negative_keys: usize,
+    pub(crate) proof_candidates: usize,
+    /// Actual no-clear decisions: other rearm disjuncts must also be false.
+    pub(crate) suppressed: usize,
+    pub(crate) other_rearm_matches: usize,
+    pub(crate) clear_calls: usize,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct NativeMint {
+    pub(crate) window_available: bool,
+    pub(crate) candidates: usize,
+    pub(crate) insertions: usize,
+    /// This is before later window staging/retirement, not a retained grant.
+    pub(crate) receipts_after_mint: usize,
+}
+/// Inline Cell permits the final read-only negative view to report decisions.
+/// It owns no graph and is included in its lease's existing layout charge.
+pub(crate) struct NativeDecision(
+    pub(crate) std::cell::Cell<NativeComparisonDecision>,
+    std::cell::Cell<claude_reread::Counts>,
+);
+impl NativeDecision {
+    pub(crate) fn new() -> Self {
+        Self(
+            std::cell::Cell::new(NativeComparisonDecision {
+                layout_supported: crate::heap_layout_bound::layout_supported(),
+                ..Default::default()
+            }),
+            std::cell::Cell::new(Default::default()),
+        )
+    }
+    pub(crate) fn update(&self, update: impl FnOnce(&mut NativeComparisonDecision)) {
+        let mut value = self.0.get();
+        update(&mut value);
+        self.0.set(value);
+    }
+    pub(crate) fn add_page_events(&self, counts: claude_reread::Counts) {
+        let mut value = self.1.get();
+        value.merge(counts);
+        self.1.set(value);
+    }
+    pub(crate) fn emit(&self) {
+        #[derive(Serialize)]
+        struct Counts {
+            #[serde(flatten)]
+            decision: NativeComparisonDecision,
+            #[serde(flatten)]
+            events: claude_reread::Counts,
+        }
+        traversal_point(
+            "native_comparison_decision",
+            "claude_code",
+            &Counts {
+                decision: self.0.get(),
+                events: self.1.get().with_current(),
+            },
+        );
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
+    const INLINE_ONLY: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct CollectionCounts {
     pub(crate) scanned_files: usize,
@@ -201,8 +724,224 @@ pub(crate) struct ReadCounts {
     pub(crate) unchanged_selections: usize,
     pub(crate) completed_native_bytes: u64,
     pub(crate) completed_guard_bytes: u64,
+    pub(crate) acquisition_admission: AcquisitionAdmission,
     pub(crate) page_events: PageEvents,
     pub(crate) index_state_at_page_end: IndexState,
+    /// Resumable large-file Codex read cursor (#606). `null` when its
+    /// snapshot could not be obtained (no Codex cursor page tick in this scan,
+    /// or the cursor state was busy at completion): unknown, never zero
+    /// activity.
+    pub(crate) codex_cursor: Option<Box<CodexCursorCounts>>,
+}
+
+/// Content-free, fixed width; each count saturates at `u32::MAX`. Like
+/// `FullReasons`, only nonzero keys are serialized (an absent key is zero);
+/// the block itself is `null` when unknown.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct CodexCursorCounts {
+    /// Process-global cursor counter deltas while this scan's window was
+    /// open (its first cursor page tick to its completion). The cursor is
+    /// shared by every namespace in the process and overlapping scans move
+    /// these counters too: NOT events caused by this scan.
+    pub(crate) during_scan_window: CodexCursorEvents,
+    /// Process-wide cursor gauges when this scan completed.
+    pub(crate) retained: CodexCursorRetained,
+}
+
+/// Process-global cursor events during a scan window (shared process scope,
+/// not attributed to one scan or namespace).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CodexCursorEvents {
+    pub(crate) jobs_started: u32,
+    pub(crate) jobs_paused: u32,
+    pub(crate) jobs_resumed: u32,
+    pub(crate) jobs_certified: u32,
+    pub(crate) jobs_uncertified: u32,
+    pub(crate) jobs_invalidated: u32,
+    pub(crate) jobs_member_changed: u32,
+    pub(crate) jobs_state_bound: u32,
+    pub(crate) jobs_lost: u32,
+    pub(crate) jobs_deferred_inputs: u32,
+    pub(crate) jobs_start_unstartable: u32,
+    pub(crate) jobs_audit_restarted: u32,
+    pub(crate) jobs_finish_failed: u32,
+    pub(crate) jobs_frame_returned: u32,
+    pub(crate) deferred: u32,
+    pub(crate) deferred_rotation: u32,
+    pub(crate) deferred_next_generation: u32,
+    pub(crate) namespace_busy: u32,
+    pub(crate) cursor_disabled_unsupported_layout: u32,
+    pub(crate) audit_overdue: u32,
+    pub(crate) sealed_fragment_withheld: u32,
+    /// A withheld final record applied at a genuine unchanged EOF.
+    pub(crate) eof_record_applied: u32,
+    /// A paused job ended: its path no longer named its object, or its
+    /// evidence stayed unavailable for 3 consecutive resume pages.
+    pub(crate) jobs_unavailable_ended: u32,
+    pub(crate) memo_hits: u32,
+    pub(crate) memo_records: u32,
+    pub(crate) parked_hits: u32,
+}
+
+/// Process-wide cursor state when the scan completed (gauges, not events).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CodexCursorRetained {
+    /// A paused job is waiting in the slot.
+    pub(crate) paused_job: bool,
+    /// Its charged bytes (requested layout, measured at pause).
+    pub(crate) paused_job_charged_bytes: u32,
+    pub(crate) memo_entries: u32,
+    pub(crate) parked_entries: u32,
+    pub(crate) invalidation_entries: u32,
+    pub(crate) rotation_waiters: u32,
+    /// Process-lifetime maximum `now - due` of an overdue certification.
+    pub(crate) lifetime_audit_overdue_max_age_seconds: u32,
+}
+impl Serialize for CodexCursorEvents {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for (key, count) in [
+            ("jobs_started", self.jobs_started),
+            ("jobs_paused", self.jobs_paused),
+            ("jobs_resumed", self.jobs_resumed),
+            ("jobs_certified", self.jobs_certified),
+            ("jobs_uncertified", self.jobs_uncertified),
+            ("jobs_invalidated", self.jobs_invalidated),
+            ("jobs_member_changed", self.jobs_member_changed),
+            ("jobs_state_bound", self.jobs_state_bound),
+            ("jobs_lost", self.jobs_lost),
+            ("jobs_deferred_inputs", self.jobs_deferred_inputs),
+            ("jobs_start_unstartable", self.jobs_start_unstartable),
+            ("jobs_audit_restarted", self.jobs_audit_restarted),
+            ("jobs_finish_failed", self.jobs_finish_failed),
+            ("jobs_frame_returned", self.jobs_frame_returned),
+            ("deferred", self.deferred),
+            ("deferred_rotation", self.deferred_rotation),
+            ("deferred_next_generation", self.deferred_next_generation),
+            ("namespace_busy", self.namespace_busy),
+            (
+                "cursor_disabled_unsupported_layout",
+                self.cursor_disabled_unsupported_layout,
+            ),
+            ("audit_overdue", self.audit_overdue),
+            ("sealed_fragment_withheld", self.sealed_fragment_withheld),
+            ("eof_record_applied", self.eof_record_applied),
+            ("jobs_unavailable_ended", self.jobs_unavailable_ended),
+            ("memo_hits", self.memo_hits),
+            ("memo_records", self.memo_records),
+            ("parked_hits", self.parked_hits),
+        ] {
+            if count != 0 {
+                map.serialize_entry(key, &count)?;
+            }
+        }
+        map.end()
+    }
+}
+impl Serialize for CodexCursorRetained {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if self.paused_job {
+            map.serialize_entry("paused_job", &true)?;
+        }
+        for (key, count) in [
+            ("paused_job_charged_bytes", self.paused_job_charged_bytes),
+            ("memo_entries", self.memo_entries),
+            ("parked_entries", self.parked_entries),
+            ("invalidation_entries", self.invalidation_entries),
+            ("rotation_waiters", self.rotation_waiters),
+            (
+                "lifetime_audit_overdue_max_age_seconds",
+                self.lifetime_audit_overdue_max_age_seconds,
+            ),
+        ] {
+            if count != 0 {
+                map.serialize_entry(key, &count)?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// Fixed page totals, not per-file history. Unassessed is attempts - assessed;
+/// a short-circuited gate is never reported as a known false result.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct AssessedBool {
+    assessed: usize,
+    matched: usize,
+}
+impl AssessedBool {
+    pub(crate) fn observe(&mut self, value: bool) {
+        self.assessed = self.assessed.saturating_add(1);
+        self.matched = self.matched.saturating_add(usize::from(value));
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct AcquisitionAdmission {
+    pub(crate) attempts: usize,
+    pub(crate) cache_lookup_miss_unknown_origin: usize,
+    pub(crate) retained_entry: AssessedBool,
+    pub(crate) owning_header_current: AssessedBool,
+    pub(crate) state_census_complete: AssessedBool,
+    pub(crate) sidecar_census_complete: AssessedBool,
+    pub(crate) reduction_dependencies_available: AssessedBool,
+    pub(crate) index_entry_present: AssessedBool,
+    pub(crate) audit_metadata_supported: AssessedBool,
+    pub(crate) protected_history: AssessedBool,
+    pub(crate) forced_family: AssessedBool,
+    pub(crate) comparison_target: AssessedBool,
+    pub(crate) parent_proof_required: AssessedBool,
+    pub(crate) audit_debt_present: AssessedBool,
+    pub(crate) audit_slot_available: AssessedBool,
+    pub(crate) sampling_allowed: AssessedBool,
+    pub(crate) retained_entry_rejected_by_eligibility: usize,
+    pub(crate) prepare_started: usize,
+    pub(crate) prepare_failed: usize,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for AcquisitionAdmission {
+    const INLINE_ONLY: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// Existing audit point, using already computed final/previous fingerprints.
+/// Additive aliases retain their meaning; neither comparison is an audit-policy
+/// benefit verdict (a suffix or policy change can also change either witness).
+pub(crate) fn sampled_audit_comparison(
+    source: &str,
+    semantic: (Option<&str>, Option<&str>),
+    additive: (Option<&str>, Option<&str>),
+) {
+    #[derive(Serialize)]
+    struct Counts {
+        body_comparison_available: bool,
+        effective_body_changed: bool,
+        semantic_comparison_available: bool,
+        semantic_changed: bool,
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "sampled_audit_comparison",
+        source: Source::from_slug(source),
+        observation: Observation {
+            observed_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+            wall_elapsed_us: 0,
+            shared_process_cpu_delta_us: None,
+            process_lifetime_max_rss_bytes: None,
+            process_lifetime_max_rss_before_bytes: None,
+        },
+        counts: Counts {
+            body_comparison_available: additive.1.is_some(),
+            effective_body_changed: additive.0 != additive.1,
+            semantic_comparison_available: semantic.1.is_some(),
+            semantic_changed: semantic.0 != semantic.1,
+        },
+    });
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct PageEvents {
@@ -366,13 +1105,84 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_proof_correction_deferral_is_counted() {
+        let ((), lines) = capture(|| {
+            claude_history_proof_correction_deferred(2);
+            claude_history_proof_correction_deferred(3);
+        });
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0]["stage"],
+            "claude_history_proof_correction_deferred"
+        );
+        assert_eq!(lines[1]["counts"]["history_proof_correction_deferred"], 3);
+        let first = lines[0]["counts"]["history_proof_correction_deferred_total"]
+            .as_u64()
+            .unwrap();
+        let second = lines[1]["counts"]["history_proof_correction_deferred_total"]
+            .as_u64()
+            .unwrap();
+        assert!(first >= 2 && second >= first + 3, "{first} {second}");
+    }
+    #[test]
+    fn family_closure_root_absent_exclusion_is_counted() {
+        let ((), lines) = capture(|| {
+            claude_reemission_family_closure_root_absent_excluded(1);
+            claude_reemission_family_closure_root_absent_excluded(2);
+        });
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0]["stage"],
+            "claude_reemission_family_closure_root_absent_excluded"
+        );
+        assert_eq!(
+            lines[1]["counts"]["claude_reemission_family_closure_root_absent_excluded"],
+            2
+        );
+        let first = lines[0]["counts"]
+            ["claude_reemission_family_closure_root_absent_excluded_total"]
+            .as_u64()
+            .unwrap();
+        let second = lines[1]["counts"]
+            ["claude_reemission_family_closure_root_absent_excluded_total"]
+            .as_u64()
+            .unwrap();
+        assert!(first >= 1 && second >= first + 2, "{first} {second}");
+    }
     fn max_read_counts() -> ReadCounts {
+        let gate = AssessedBool {
+            assessed: usize::MAX,
+            matched: usize::MAX,
+        };
         ReadCounts {
             full_selections: (usize::MAX / 11) * 11,
             tail_selections: usize::MAX,
             unchanged_selections: usize::MAX,
             completed_native_bytes: u64::MAX,
             completed_guard_bytes: u64::MAX,
+            acquisition_admission: AcquisitionAdmission {
+                attempts: usize::MAX,
+                cache_lookup_miss_unknown_origin: usize::MAX,
+                retained_entry: gate,
+                owning_header_current: gate,
+                state_census_complete: gate,
+                sidecar_census_complete: gate,
+                reduction_dependencies_available: gate,
+                index_entry_present: gate,
+                audit_metadata_supported: gate,
+                protected_history: gate,
+                forced_family: gate,
+                comparison_target: gate,
+                parent_proof_required: gate,
+                audit_debt_present: gate,
+                audit_slot_available: gate,
+                sampling_allowed: gate,
+                retained_entry_rejected_by_eligibility: usize::MAX,
+                prepare_started: usize::MAX,
+                prepare_failed: usize::MAX,
+            },
             page_events: PageEvents {
                 full_reasons: FullReasons([usize::MAX / 11; 11]),
                 priority_full_replays: usize::MAX,
@@ -386,6 +1196,50 @@ mod tests {
                 overdue_audits: usize::MAX,
                 oldest_due_age_seconds: u64::MAX,
             },
+            codex_cursor: Some(Box::new(max_codex_cursor_counts())),
+        }
+    }
+
+    fn max_codex_cursor_counts() -> CodexCursorCounts {
+        let m = u32::MAX;
+        CodexCursorCounts {
+            during_scan_window: CodexCursorEvents {
+                jobs_started: m,
+                jobs_paused: m,
+                jobs_resumed: m,
+                jobs_certified: m,
+                jobs_uncertified: m,
+                jobs_invalidated: m,
+                jobs_member_changed: m,
+                jobs_state_bound: m,
+                jobs_lost: m,
+                jobs_deferred_inputs: m,
+                jobs_start_unstartable: m,
+                jobs_audit_restarted: m,
+                jobs_finish_failed: m,
+                jobs_frame_returned: m,
+                deferred: m,
+                deferred_rotation: m,
+                deferred_next_generation: m,
+                namespace_busy: m,
+                cursor_disabled_unsupported_layout: m,
+                audit_overdue: m,
+                sealed_fragment_withheld: m,
+                eof_record_applied: m,
+                jobs_unavailable_ended: m,
+                memo_hits: m,
+                memo_records: m,
+                parked_hits: m,
+            },
+            retained: CodexCursorRetained {
+                paused_job: true,
+                paused_job_charged_bytes: m,
+                memo_entries: m,
+                parked_entries: m,
+                invalidation_entries: m,
+                rotation_waiters: m,
+                lifetime_audit_overdue_max_age_seconds: m,
+            },
         }
     }
 
@@ -396,6 +1250,116 @@ mod tests {
         assert_eq!(record["counts"], serde_json::json!({}));
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
+    }
+
+    #[test]
+    fn native_comparison_decision_distinguishes_unreached_saved_and_retained() {
+        use crate::snapshots::claude_native_comparison::lifecycle::{Lifecycle, Scope};
+        let owner = std::sync::Arc::new(Lifecycle::default());
+        let (_, rows) = capture(|| {
+            let mut abandoned = owner.begin();
+            abandoned.bind_scope(Scope::from_arguments(format_args!(
+                "private-synthetic-scope"
+            )));
+            drop(abandoned);
+            // Logical lifecycle fixture: the native conjunction is supplied to
+            // the existing settlement seam, not a supported native-path claim.
+            let mut saved = owner.begin();
+            saved.bind_scope(Scope::from_arguments(format_args!(
+                "private-synthetic-scope"
+            )));
+            saved.note_selected_save(true);
+            saved.finish(true);
+            let mut retained = owner.begin();
+            retained.bind_scope(Scope::from_arguments(format_args!(
+                "private-synthetic-scope"
+            )));
+            assert!(retained.allowed());
+            retained.note_selected_save(false);
+            retained.finish(true);
+        });
+        assert_eq!(rows.len(), 3);
+        let a = &rows[0]["counts"];
+        assert_eq!(a["outcome"], "abandoned");
+        assert_eq!(a["allowed_at_bind"], false);
+        assert_eq!(a["selected_save"], false);
+        assert_eq!(a["retained_permit"], false);
+        for unknown in [
+            "bootstrap",
+            "terminal_rearm",
+            "correction_mint",
+            "controller_current_at_finish",
+            "upload_fully_settled",
+        ] {
+            assert!(a[unknown].is_null(), "unreached {unknown} is unknown");
+        }
+        let b = &rows[1]["counts"];
+        assert_eq!(b["allowed_at_bind"], false);
+        assert_eq!(b["selected_save"], true);
+        assert_eq!(b["retained_permit"], true);
+        assert_eq!(rows[2]["counts"]["allowed_at_bind"], true);
+        for row in rows {
+            assert_eq!(row["stage"], "native_comparison_decision");
+            assert_eq!(row["counts"]["deferred_decisions"], 0);
+            assert_eq!(row["observation"]["wall_elapsed_us"], 0);
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            let text = serde_json::to_string(&row).unwrap();
+            assert!(!text.contains("private-synthetic-scope"));
+        }
+    }
+
+    #[test]
+    fn native_comparison_decision_maximum_width_is_bounded() {
+        let diagnostic = NativeDecision::new();
+        diagnostic.update(|d| {
+            *d = NativeComparisonDecision {
+                layout_supported: true,
+                lease_generation: Some(u64::MAX),
+                fold_index_generation: Some(u64::MAX),
+                allowed_at_bind: Some(false),
+                controller_created: false,
+                controller_current_at_finish: Some(false),
+                bootstrap: Some(NativeBootstrap {
+                    native_census_complete: false,
+                    coverage_complete: false,
+                    census_valid: false,
+                    fence_open: false,
+                    pending_occurrences_present: false,
+                    transcript_ownership_complete: false,
+                    scan_census_complete: false,
+                    not_withheld: false,
+                }),
+                selected_save: false,
+                upload_fully_settled: Some(false),
+                clean_at_finish: Some(false),
+                retained_permit: Some(false),
+                revoke_calls: usize::MAX,
+                admission_refusal_calls: usize::MAX,
+                hit_policy_calls: usize::MAX,
+                deferred_decisions: usize::MAX,
+                latched_base_decisions: usize::MAX,
+                other_base_decisions: usize::MAX,
+                terminal_rearm: Some(NativeRearm {
+                    negative_keys: usize::MAX,
+                    proof_candidates: usize::MAX,
+                    suppressed: usize::MAX,
+                    other_rearm_matches: usize::MAX,
+                    clear_calls: usize::MAX,
+                }),
+                correction_mint: Some(NativeMint {
+                    window_available: false,
+                    candidates: usize::MAX,
+                    insertions: usize::MAX,
+                    receipts_after_mint: usize::MAX,
+                }),
+                outcome: NativeDecisionOutcome::DisabledBeforeLease,
+            }
+        });
+        let (_, rows) = capture(|| diagnostic.emit());
+        assert_eq!(rows.len(), 1);
+        let text = serde_json::to_string(&rows[0]).unwrap();
+        assert!(text.len() < 4096);
+        println!("NATIVE_COMPARISON_DECISION_MAX_WIDTH bytes={} inline_bytes={} no_resource_samples=true", text.len(), std::mem::size_of::<NativeDecision>());
     }
 
     #[test]
@@ -580,6 +1544,201 @@ mod tests {
     }
 
     #[test]
+    fn claude_page_events_use_existing_carriers_without_source_leakage() {
+        let (_, rows) = capture(|| {
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::clear(claude_reread::ClearSite::OwnedStart, true);
+            cache_lifecycle::record(cache_lifecycle::Event::TakeHit);
+            let mut probe = Probe::start();
+            probe.page_events.merge(scope.finish());
+            probe.collection(
+                "claude_code",
+                CollectionCounts {
+                    scanned_files: 1,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                },
+            );
+            probe.collection(
+                "codex",
+                CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                },
+            );
+            let scope = claude_reread::Scope::begin(true);
+            claude_reread::restored(true, false, true);
+            NativeDecision::new().emit();
+            drop(scope);
+        });
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["source"], "claude_code");
+        assert_eq!(rows[0]["counts"]["claude_reread"]["owned_start_cleared"], 1);
+        assert_eq!(
+            rows[0]["counts"]["retained_cache_page_events"]["take_hit"],
+            1
+        );
+        assert!(rows[1]["counts"].get("claude_reread").is_none());
+        assert!(rows[1]["counts"]
+            .get("retained_cache_page_events")
+            .is_none());
+        assert_eq!(rows[2]["stage"], "native_comparison_decision");
+        assert_eq!(
+            rows[2]["counts"]["claude_reread"]["restored_empty_sibling"],
+            1
+        );
+        for row in rows {
+            assert_eq!(row["schema_version"], 2);
+            assert!(serde_json::to_string(&row).unwrap().len() < 4096);
+        }
+    }
+
+    #[test]
+    fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
+        let (_, records) = capture(|| {
+            traversal_point(
+                "process_retained_cache_lifecycle_totals",
+                "unknown",
+                &cache_lifecycle::Counts::maximum(),
+            );
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["stage"], "process_retained_cache_lifecycle_totals");
+        assert_eq!(record["source"], "unknown");
+        assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
+        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+        assert!(serde_json::to_string(record).unwrap().len() < 2048);
+        let (_, actual) = capture(cache_lifecycle_totals);
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["stage"], record["stage"]);
+    }
+
+    #[test]
+    fn codex_memo_lifecycle_record_is_bounded_and_explicitly_process_global() {
+        let (_, records) = capture(|| {
+            traversal_point(
+                "process_codex_memo_lifecycle_totals",
+                "codex",
+                &codex_memo_lifecycle::Record::maximum(),
+            );
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["stage"], "process_codex_memo_lifecycle_totals");
+        assert_eq!(record["source"], "codex");
+        assert_eq!(
+            record["counts"]["memo_hit_estimated_avoided_parser_bytes"],
+            u64::MAX
+        );
+        assert_eq!(record["counts"]["memo_miss_exact_stamp_bytes"], u64::MAX);
+        assert_eq!(record["counts"]["memo_resident_bytes"], u64::MAX);
+        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+        let width = serde_json::to_string(record).unwrap().len();
+        println!("CODEX_MEMO_LIFECYCLE_MAX_WIDTH bytes={width}");
+        assert!(width < 2048);
+        let (_, actual) = capture(|| codex_memo_lifecycle_totals("codex"));
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["stage"], record["stage"]);
+        let (_, none) = capture(|| codex_memo_lifecycle_totals("claude_code"));
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn codex_side_lifecycle_record_is_bounded_and_explicitly_process_global() {
+        let (_, records) = capture(|| {
+            traversal_point(
+                "process_codex_side_lifecycle_totals",
+                "codex",
+                &codex_side_lifecycle::Record::maximum(),
+            );
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["stage"], "process_codex_side_lifecycle_totals");
+        assert_eq!(record["source"], "codex");
+        let keys: Vec<_> = record["counts"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // Option B: exactly ten lifetime totals and five last-measured gauges.
+        assert_eq!(
+            keys,
+            [
+                "side_ledger_entries",
+                "side_ledger_evictions",
+                "side_not_due",
+                "side_proof_drops",
+                "side_proof_release_drops",
+                "side_reads_ended",
+                "side_reads_started",
+                "side_record_bytes",
+                "side_records",
+                "side_records_written",
+                "side_refusals",
+                "side_request_bytes",
+                "side_requests",
+                "side_requests_rearmed",
+                "side_requests_tombstoned",
+            ]
+        );
+        assert!(record["counts"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| *value == u64::MAX));
+        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+        let width = serde_json::to_string(record).unwrap().len();
+        println!("CODEX_SIDE_LIFECYCLE_MAX_WIDTH bytes={width}");
+        assert!(width < 2048);
+        let (_, actual) = capture(|| codex_side_lifecycle_totals("codex"));
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["stage"], record["stage"]);
+        let (_, none) = capture(|| codex_side_lifecycle_totals("claude_code"));
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn side_read_lines_are_one_start_and_at_most_one_end_per_read() {
+        use codex_side_lifecycle::{observe, SideReadGuard};
+        let ((_, lines), counts) = observe(|| {
+            capture(|| {
+                SideReadGuard::start(3).end();
+                drop(SideReadGuard::start(7));
+            })
+        });
+        assert_eq!(counts.side_reads_started, 2);
+        assert_eq!(counts.side_reads_ended, 2);
+        let stages: Vec<_> = lines.iter().map(|line| line["stage"].clone()).collect();
+        assert_eq!(
+            stages,
+            [
+                "side_read_start",
+                "side_read_end",
+                "side_read_start",
+                "side_read_end"
+            ]
+        );
+        assert_eq!(lines[0]["counts"]["attempts"], 3);
+        assert_eq!(lines[0]["counts"]["pseq"], lines[1]["counts"]["pseq"]);
+        assert!(lines[1]["counts"].get("abandoned").is_none());
+        assert_eq!(lines[2]["counts"]["pseq"], lines[3]["counts"]["pseq"]);
+        assert_ne!(lines[0]["counts"]["pseq"], lines[2]["counts"]["pseq"]);
+        assert_eq!(lines[3]["counts"]["abandoned"], true);
+        for line in &lines {
+            assert_eq!(line["source"], "codex");
+            assert!(line["process_id"].is_u64());
+            assert!(serde_json::to_string(line).unwrap().len() < 2048);
+        }
+    }
+
+    #[test]
     fn resource_log_sink_failure_does_not_escape() {
         struct FailedSink;
         impl Write for FailedSink {
@@ -712,9 +1871,34 @@ mod tests {
         assert_eq!(records[3]["counts"]["attempted_encoded_body_bytes"], 1100);
         assert_eq!(records[3]["counts"]["attempted_decoded_body_bytes"], 2000);
         assert_eq!(records[3]["source"], "unknown");
+        // The cursor block: a window of shared process deltas plus gauges;
+        // an unobtainable snapshot is `null`, never zeros.
+        let cursor = &records[0]["counts"]["sampled_acquisition"]["codex_cursor"];
+        assert_eq!(cursor["during_scan_window"]["jobs_started"], u32::MAX);
+        assert_eq!(
+            cursor["retained"]["lifetime_audit_overdue_max_age_seconds"],
+            u32::MAX
+        );
+        let unavailable = ReadCounts {
+            codex_cursor: None,
+            ..max_read_counts()
+        };
+        assert!(serde_json::to_value(&unavailable).unwrap()["codex_cursor"].is_null());
+        let idle = serde_json::to_value(CodexCursorCounts::default()).unwrap();
+        assert_eq!(
+            idle,
+            serde_json::json!({"during_scan_window": {}, "retained": {}})
+        );
         for record in records {
             let text = serde_json::to_string(&record).unwrap();
-            assert!(text.len() < 2048);
+            // Fixed page gate totals extend this local diagnostic record only;
+            // upload/finish records and all runtime resource caps stay unchanged.
+            let limit = if record["stage"] == "native_collection_page" {
+                4096
+            } else {
+                2048
+            };
+            assert!(text.len() < limit);
             assert!(!text.contains("secret/path"));
             assert!(!text.contains("cycle_peak"));
             assert_eq!(record["schema_version"], SCHEMA_VERSION);

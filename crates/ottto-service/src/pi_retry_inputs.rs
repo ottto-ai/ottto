@@ -37,6 +37,7 @@ fn stamp(metadata: &fs::Metadata) -> [u8; 32] {
 
 fn identify(root: &Path, path: &Path) -> Option<String> {
     let mut candidate = CandidateFile {
+        physical_identity: None,
         scan_root: root.to_owned(),
         path: path.to_owned(),
         size_bytes: 0,
@@ -46,6 +47,8 @@ fn identify(root: &Path, path: &Path) -> Option<String> {
         legacy_source_file_fingerprint: String::new(),
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
     };
     let _file = open_candidate_file(SnapshotSource::Pi, &mut candidate).ok()?;
     Some(scan_file_fingerprint_with_opened_identity(

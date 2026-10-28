@@ -86,6 +86,8 @@ Existing release checks still apply. No release workflow automation is added.
 Exit 0 means clean (or an explicitly labelled decision-only/skip operation);
 exit 1 means findings; exit 2 means unavailable, invalid, stale or blocked review.
 An incorrect verdict without findings is inconclusive and never cached as clean.
+Findings must cite a selected path, repo-relative or absolute below the review
+root; any other location, traversal or symlinked path makes the review invalid.
 Only a genuine correct verdict with no findings gets an exact-change clean cache.
 Cache keys cover content, endpoints, helper/prompt version and reviewer posture.
 Do not use helper exit status alone as a successful-review receipt.

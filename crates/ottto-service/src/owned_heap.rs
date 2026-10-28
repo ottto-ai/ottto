@@ -37,6 +37,18 @@ impl<T: HeapLayoutBound> OwnedVec<T> {
         self.elements = self.elements.and_then(|n| n.checked_add(heap(&value)?));
         self.values.push(value);
     }
+    pub(crate) fn get_mut(&mut self, index: usize) -> Option<ValueGuard<'_, T>> {
+        let value = self.values.get_mut(index)?;
+        let base = self
+            .elements
+            .take()
+            .and_then(|n| n.checked_sub(heap(value)?));
+        Some(ValueGuard {
+            value,
+            sum: &mut self.elements,
+            base,
+        })
+    }
     pub(crate) fn clear(&mut self) {
         self.values.clear();
         self.elements = Some(0);
@@ -142,9 +154,6 @@ impl<K: Ord + HeapLayoutBound, V: HeapLayoutBound> OwnedMap<K, V> {
             .and_then(|n| n.checked_sub(heap(&key)?)?.checked_sub(heap(&value)?));
         Some(value)
     }
-    pub(crate) fn into_values(self) -> std::collections::btree_map::IntoValues<K, V> {
-        self.values.into_values()
-    }
 }
 impl<K: Ord + Clone + HeapLayoutBound, V: Clone + HeapLayoutBound> Clone for OwnedMap<K, V> {
     fn clone(&self) -> Self {
@@ -237,6 +246,27 @@ mod tests {
         assert!(charge(&values) >= values.values.capacity() * std::mem::size_of::<String>());
         values.push("reset".into());
         assert!(heap_layout_bound::bound(&values, charge(&values) - 1).is_none());
+    }
+    #[test]
+    fn owned_vec_element_guard_remeasures_and_forget_is_conservative() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let (mut grown, alloc) = probe::measure(|| {
+            let mut values = OwnedVec::from(vec![String::new(); 64]);
+            values.get_mut(7).unwrap().reserve(8192);
+            values
+        });
+        assert!(charge(&grown) >= alloc.requested_live as usize);
+        let before = charge(&grown);
+        let mut guard = grown.get_mut(7).unwrap();
+        guard.clear();
+        guard.shrink_to_fit();
+        drop(guard);
+        assert!(charge(&grown) < before);
+        assert!(grown.get_mut(64).is_none());
+        std::mem::forget(grown.get_mut(0).unwrap());
+        assert!(heap_layout_bound::bound(&grown, usize::MAX).is_none());
     }
     #[test]
     fn owned_heap_nested_charges_refuse_external_mutability_and_over_budget() {

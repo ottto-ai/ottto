@@ -153,6 +153,8 @@ struct RearmBodyTrace {
 }
 
 struct RearmFixture {
+    // New structural-guard acceptance opts into the real save-before-read seam.
+    reread_guard_cache: Option<std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>>,
     case: &'static str,
     base: PathBuf,
     root: PathBuf,
@@ -160,8 +162,15 @@ struct RearmFixture {
     index_path: PathBuf,
     progress_path: PathBuf,
     request_identity: bool,
+    // Synthetic watcher events supplied through the actual scan constructor.
+    hinted_paths: Vec<PathBuf>,
     native_file_limit: usize,
+    serial_active_frame: bool,
     owned_base_preparation: bool,
+    /// Sessions every page holds locally after the fold, through the
+    /// production E2 hold (`hold_request_owned`): unbound, so
+    /// progress-blocking. Empty unless a test sets it.
+    local_holds: BTreeSet<String>,
     body_trace: std::cell::RefCell<RearmBodyTrace>,
     native_lifecycle:
         std::sync::Arc<crate::snapshots::claude_native_comparison::lifecycle::Lifecycle>,
@@ -181,10 +190,14 @@ impl RearmFixture {
             std::fs::create_dir_all(directory).expect("create synthetic directory");
         }
         let fixture = Self {
+            reread_guard_cache: None,
             case,
             request_identity: false,
+            hinted_paths: Vec::new(),
             native_file_limit: REARM_PAGE_FILES,
+            serial_active_frame: false,
             owned_base_preparation: false,
+            local_holds: BTreeSet::new(),
             body_trace: Default::default(),
             native_lifecycle: std::sync::Arc::new(Default::default()),
             index_path: base.join("claude-scan-index.json"),
@@ -315,7 +328,11 @@ impl RearmFixture {
         collected_at: &str,
     ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
         let frame = self.native_preparation(index, collected_at);
-        collect_native_preparation_with_rotation(frame, true)
+        if self.serial_active_frame {
+            collect_unparkable_preparation_with_rotation(frame)
+        } else {
+            collect_native_preparation_with_rotation(frame, true)
+        }
     }
 
     fn native_preparation(&self, index: ScanIndex, collected_at: &str) -> SourcePreparation {
@@ -328,11 +345,17 @@ impl RearmFixture {
             self.native_file_limit,
             true, // Match the ordinary test scanner's artifact setting.
             Some(&self.support),
-            &[],
+            &self.hinted_paths,
             false,
             true, // Match its context-curve setting; byte parity includes it.
             self.request_identity,
         );
+        if let Some(cache) = self.reread_guard_cache.as_ref() {
+            scan = scan.with_reread_persistence().with_sampled_acquisition(
+                cache.clone(),
+                crate::transcript_acquisition::Scope("structural-reread-fixture".into()),
+            );
+        }
         if crate::snapshots::claude_native_comparison::enabled() {
             scan.enable_native_comparison();
         }
@@ -407,10 +430,43 @@ impl RearmFixture {
         upload: RearmUpload,
         target: Option<&str>,
     ) -> RearmPage {
-        let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        self.page_with_input_index(collected_at, upload, target, None)
+    }
+
+    /// Scale-only adapter: retain ordinary settled state between the explicit
+    /// durable checkpoints, without repeatedly decoding the same large index.
+    fn scale_page(&self, index: ScanIndex, collected_at: &str) -> RearmPage {
+        assert!(self.serial_active_frame);
+        assert!(!crate::snapshots::claude_native_comparison::enabled());
+        self.page_with_input_index(collected_at, RearmUpload::Accept, None, Some(index))
+    }
+
+    fn page_with_input_index(
+        &self,
+        collected_at: &str,
+        upload: RearmUpload,
+        target: Option<&str>,
+        input: Option<ScanIndex>,
+    ) -> RearmPage {
+        // Ordinary transcripts: each file exists before its records (E2).
+        crate::snapshots::claude_request_money::e2::with_fixture_birth(PIPELINE_FILE_BIRTH, || {
+            self.page_with_input_index_born(collected_at, upload, target, input)
+        })
+    }
+
+    fn page_with_input_index_born(
+        &self,
+        collected_at: &str,
+        upload: RearmUpload,
+        target: Option<&str>,
+        input: Option<ScanIndex>,
+    ) -> RearmPage {
+        let checkpoint = input.is_none();
+        let mut index =
+            input.unwrap_or_else(|| ScanIndex::load(&self.index_path).expect("load scan index"));
         index.activate_upload_context("upload-context-rearm".to_string());
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
         let (mut native_preparation, mut index, mut scan, committed_index) =
             if crate::snapshots::claude_native_comparison::enabled()
@@ -544,6 +600,13 @@ impl RearmFixture {
             &disposition.mixed_uploads,
         );
         disposition.defer_sessions(deferred_accounts);
+        disposition.hold_request_owned(
+            scan.snapshots
+                .iter()
+                .filter(|item| self.local_holds.contains(&item.source_session_id))
+                .map(|item| item.source_session_id.clone())
+                .collect(),
+        );
         apply_upload_policy(
             SnapshotSource::ClaudeCode,
             &mut scan.snapshots,
@@ -569,6 +632,7 @@ impl RearmFixture {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
+            true,
             |snapshot| {
                 let witness = effective_snapshot_upload_body_witness(
                     snapshot,
@@ -708,6 +772,7 @@ impl RearmFixture {
                     RearmUpload::Shed => Err(anyhow::Error::new(UploadShed {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
+                        code: None,
                     })),
                     RearmUpload::AckLost => Err(anyhow!(
                         "synthetic request offered; response ACK unavailable"
@@ -747,6 +812,7 @@ impl RearmFixture {
                 comparison_completion
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
+                Some(UnsettledUploadCause::Shed),
             )
             .expect("checkpoint shed page");
             return RearmPage {
@@ -790,16 +856,18 @@ impl RearmFixture {
         );
         let (window_start, window_end) =
             snapshot_manifest_window(&scan.census_window_end, 183).expect("manifest window");
-        save_index_and_publish_manifest(
-            &mut index,
-            &self.index_path,
-            REARM_DESTINATION,
-            SnapshotSource::ClaudeCode,
-            census_complete,
-            &window_start,
-            &window_end,
-        )
-        .expect("save index and publish manifest");
+        if checkpoint {
+            save_index_and_publish_manifest(
+                &mut index,
+                &self.index_path,
+                REARM_DESTINATION,
+                SnapshotSource::ClaudeCode,
+                census_complete,
+                &window_start,
+                &window_end,
+            )
+            .expect("save index and publish manifest");
+        }
         let mut native_receipts = 0;
         if let Some(frame) = native_preparation.as_mut() {
             if fully_settled
@@ -870,7 +938,11 @@ impl RearmFixture {
             scan,
             duplicate_census,
             parsed,
-            index: ScanIndex::load(&self.index_path).expect("reload scan index"),
+            index: if checkpoint {
+                ScanIndex::load(&self.index_path).expect("reload scan index")
+            } else {
+                index
+            },
             fully_settled,
             held: holds.held_fingerprints,
             offered,
@@ -1277,11 +1349,15 @@ fn observe_base_prelude(experimental_base_exit: bool) {
 #[test]
 #[serial(source_manifests)]
 fn p12_novel_import_base_control_reveals_unmet_original_prelude() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(false);
 }
 #[test]
 #[serial(source_manifests)]
 fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() {
+    // Legacy reported-body proof/delivery; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     observe_base_prelude(true);
 }
 
@@ -1379,13 +1455,19 @@ fn native_comparison_interrupted_correction_is_terminal_base(upload: RearmUpload
 
 #[test]
 #[serial(source_manifests)]
+// A shed page records RatelimitBackoff in the shared client_report counters.
+#[serial(client_report)]
 fn native_comparison_shed_corrective_parse_partial_save_and_terminal_use_base() {
+    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_interrupted_correction_is_terminal_base(RearmUpload::Shed);
 }
 
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_pending_ack_corrective_parse_partial_save_and_terminal_use_base() {
+    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_interrupted_correction_is_terminal_base(RearmUpload::AckLost);
 }
 
@@ -1394,6 +1476,7 @@ fn native_comparison_pending_ack_corrective_parse_partial_save_and_terminal_use_
 fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture {
     let base = test_dir("native-parity-independent-index");
     RearmFixture {
+        reread_guard_cache: None,
         root: source.root.clone(),
         support: source.support.clone(),
         index_path: base.join("claude-scan-index.json"),
@@ -1401,8 +1484,11 @@ fn native_comparison_independent_history(source: &RearmFixture) -> RearmFixture 
         base,
         case: "native-parity-independent-index",
         request_identity: source.request_identity,
+        hinted_paths: source.hinted_paths.clone(),
         native_file_limit: source.native_file_limit,
+        serial_active_frame: source.serial_active_frame,
         owned_base_preparation: source.owned_base_preparation,
+        local_holds: source.local_holds.clone(),
         body_trace: Default::default(),
         native_lifecycle: std::sync::Arc::new(Default::default()),
     }
@@ -1482,6 +1568,8 @@ fn native_comparison_assert_old_bindings(before: &serde_json::Value, index: &Sca
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_novel_import_base_parity() {
+    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(
             std::io::stderr().lock(),
@@ -1649,7 +1737,9 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
     let before_progress = std::fs::read(&fixture.progress_path).ok();
     let mut index = ScanIndex::load(&fixture.index_path).unwrap();
     index.activate_upload_context("upload-context-rearm".into());
-    index.activate_effective_upload_body_witness_revision(EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION);
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        SnapshotSource::ClaudeCode,
+    ));
     let frame = fixture.native_preparation(index, "2026-08-02T14:00:00Z");
     let target_hook =
         crate::snapshots::claude_native_comparison::target_unknown_allowance_for_test();
@@ -1686,6 +1776,8 @@ fn native_comparison_deferred_policy_never_acquires_optional_inpass_target() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_real_copy_hit_after_quiet_requires_native_or_defer() {
+    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use sha2::{Digest, Sha256};
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(
@@ -2016,28 +2108,42 @@ fn native_comparison_copy_offer_interruption(upload: RearmUpload, restart: bool)
 
 #[test]
 #[serial(source_manifests)]
+// A shed page records RatelimitBackoff in the shared client_report counters.
+#[serial(client_report)]
 fn native_comparison_copy_offer_shed_partial_save_recovers() {
+    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_copy_offer_interruption(RearmUpload::Shed, false);
 }
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_copy_offer_ack_loss_partial_save_recovers() {
+    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_copy_offer_interruption(RearmUpload::AckLost, false);
 }
 #[test]
 #[serial(source_manifests)]
+// A shed page records RatelimitBackoff in the shared client_report counters.
+#[serial(client_report)]
 fn native_comparison_copy_offer_shed_restart_recovers() {
+    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_copy_offer_interruption(RearmUpload::Shed, true);
 }
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_copy_offer_ack_loss_restart_recovers() {
+    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     native_comparison_copy_offer_interruption(RearmUpload::AckLost, true);
 }
 
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
+    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use sha2::{Digest, Sha256};
     if !crate::heap_layout_bound::layout_supported() {
         writeln!(
@@ -2140,6 +2246,8 @@ fn native_comparison_novel_import_keeps_own_telemetry_identity_equal_to_base() {
 #[test]
 #[serial(source_manifests)]
 fn native_comparison_deferred_policy_resource_usefulness() {
+    // Native-comparison oracle of the pre-E2 reported body; E2 publishes a request-owned literal instead.
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     if !crate::heap_layout_bound::layout_supported() {
         eprintln!("native_comparison_deferred_usefulness: supported_positive=UNEXECUTED");
         return;

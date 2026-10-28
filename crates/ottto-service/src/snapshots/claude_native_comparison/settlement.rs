@@ -426,7 +426,10 @@ impl Completion {
                 .as_ref()
                 .expect("checked moving recovery")
                 .recovery_bytes_for_test();
-            let (result, allocation) = crate::retry_allocation_probe::measure_process(|| {
+            // Selected recovery is synchronous on this thread: map/set/path
+            // updates spawn no work and transfer no allocations to a worker.
+            // Audit its born-in-scope peak, excluding unrelated parallel tests.
+            let (result, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
                 fallback.restore_selected(index, previous)
             });
             assert!(
@@ -658,9 +661,14 @@ impl Completion {
         previous: &ScanIndex,
         // None is refused/unknown; false permits ONLY the bound accepted no-op.
         acknowledged: impl Fn(&str, &str) -> Option<bool>,
-    ) {
+    ) -> crate::local_resource_diagnostics::NativeMint {
         let Some(window) = self.window.as_mut() else {
-            return;
+            return Default::default();
+        };
+        let mut diagnostic = crate::local_resource_diagnostics::NativeMint {
+            window_available: true,
+            candidates: self.pending_corrections.len(),
+            ..Default::default()
         };
         for candidate in self.pending_corrections.drain(..) {
             if candidate.fingerprint.is_empty() || candidate.body_witness.is_empty() {
@@ -724,6 +732,7 @@ impl Completion {
             };
             if receipt.current(&candidate.key, index) {
                 window.native_corrections.insert(candidate.key, receipt);
+                diagnostic.insertions = diagnostic.insertions.saturating_add(1);
                 if !retain_correction_metadata(&mut self.reservation, owned) {
                     window.native_corrections.clear();
                     break;
@@ -731,6 +740,8 @@ impl Completion {
             }
         }
         self.native_plans.clear();
+        diagnostic.receipts_after_mint = window.native_corrections.len();
+        diagnostic
     }
 }
 
@@ -823,7 +834,10 @@ impl Controller {
         let (occupied, prepaid) = plan.ok_or_else(refuse)?;
         #[cfg(test)]
         let result = {
-            let (result, allocation) = crate::retry_allocation_probe::measure_process(|| {
+            // complete() is synchronous on this thread (no spawn, channel or
+            // pool) and consumes pre-existing state: born-in-scope accounting
+            // charged to this thread only, so parallel tests cannot inflate it.
+            let (result, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
                 self.complete(scan, terminal, current)
             });
             assert!(
@@ -1266,6 +1280,10 @@ impl SelectedFallback {
                     index.terminal_jsonl_dispositions.remove(key);
                 }
             }
+            // Slice D1: fail closed, never a record of either revision. The
+            // first-seen birth of the same physical object stays (an in-place
+            // stub every reader treats as no record; nothing is allocated).
+            index.claude_request_census.invalidate_keeping_birth(key);
             if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
                 match previous.claude_owned_start_census.get(&member) {
                     Some(value) => {

@@ -167,6 +167,7 @@ mod tests {
             client_install_owner: None,
             command: LocalControlCommand::Status {
                 refresh_agent_status: false,
+                retry_relay_authorization: false,
             },
         }
     }

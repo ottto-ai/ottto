@@ -82,6 +82,22 @@ record `pending_audits`, `overdue_audits` and `oldest_due_age_seconds` using the
 existing index calculations. These are state, not events; overdue work remains
 owed until full verification. Both objects are absent when sampling is null.
 
+Additive version 2 Claude counts on the existing page/check-in carrier classify
+refused census-member NotFounds by the **existing immediate-parent metadata
+probe**: `claude_absence_parent_missing`, `claude_absence_parent_symlink`,
+`claude_absence_parent_not_directory`, `claude_absence_parent_metadata_error`.
+Missing includes a NotFound parent or no parent component; metadata_error means
+any other probe error. The same four suffixes under
+`claude_absence_parent_subagent_` count the subset whose path has an exact
+`subagents` component. Fields are omitted at zero, saturate on overflow, and
+count refusals, not distinct files. CandidateWalk, CandidateForcedIndex and Open
+share these totals; there is no site split. Counts follow the existing scoped
+page/check-in accumulation, including cooperative steps, and reset with that
+scope. A live non-symlink parent still authorizes removal and adds no refusal
+count. Codex/Pi, watcher hints and nonmember candidate losses add none. No new
+filesystem probe, event stream, path/key/name output or authority decision is
+introduced; diagnostics only, no behaviour change.
+
 A `source_finish` record wraps rotation finish, including its validation,
 post-policy finalization and upload work. It exists exactly when finish was
 called and returned normally, including an error return. It has `counts: {}`
@@ -126,6 +142,73 @@ outside this measurement slice. Installed comparisons must use the same
 source/encoding settings and distinguish idle, ordinary changes, import and
 recovery. A containing release and matching installation are required before
 calling these measurements installed evidence.
+
+## Line Delivery Counters
+
+Schema 2's `native_collection_page` can add two sparse, counts-only objects.
+They add no wire fields, persisted state or transcript reads, and contain no
+paths, identifiers, hashes or line content. Missing keys mean zero in that
+observation; an absent object also means zero, or a page line that was not
+written. Counts saturate at `u64::MAX`.
+
+`counts.line_delivery` is keyed by the fixed name of the page's one registered
+line observer, for example `{"footprint": {...}}`. The observer receives the
+physical lines the page's primary reads already consumed; proof, parent, side,
+group, native-comparison and one-shot reads deliver nothing. All values are
+page events, not gauges, and are never summed across observers:
+
+- `lines`: newline-complete physical lines delivered, including blank,
+  malformed, invalid UTF-8 and overlong lines. An unterminated final record is
+  not a line until its newline arrives in a later read.
+- `bytes`: physical bytes of those lines, newline and skipped overlong bytes
+  included. These are bytes the read already consumed, never extra reads.
+- `incomplete`: files whose delivery ended before their read completed: removed
+  unfinished by a hold or refusal, a read failure, a paged job pausing, or the
+  page ending or being dropped mid-file. A file the observer skipped is not
+  counted. A later page can count the same file again.
+
+`counts.line_delivery_unselected` counts discovery skip decisions for the
+page's source: `age` (outside the backfill window and not held for
+verification) and `size` (over the source's file-size cap). They are recorded
+after the existing decision, are drained by that source's next completed page,
+and count repeated decisions, not distinct files or bytes. They are recorded
+whether or not an observer is registered.
+
+## Context Footprint Discovery
+
+Context footprint opens no transcript. Its workspaces come from the cwds of
+the Claude lines snapshot sync's primary reads already delivered to the
+`footprint` line observer, kept in RAM only (no transcript path, nothing
+persisted). Coverage follows that read:
+
+- After a daemon restart, only files read since then are known; a workspace
+  idle since the restart is not proposed until it is used again.
+- An org backfill window of 1-13 days narrows footprint's 14 days to that
+  window; 0 days leaves almost no history.
+- While reconciliation is off, Claude is disabled for the source or snapshot
+  sync is down, nothing new is delivered; files already known stay usable
+  until they age out of the 14 days or are evicted.
+- Claude files over 256 MiB are never delivered, and a cwd only on a line
+  over 16 MiB is not seen.
+
+Each footprint cycle's `context_footprint_harvest_metrics` line adds these
+counts, with no paths or values:
+
+- `discovery_path_scopes` (this cycle): workspaces scoped by their own path
+  (no repository, or a repository probe that failed).
+- `footprint_observer_files`, `footprint_observer_bytes` (now): files held and
+  their charged RAM (cwd allocations plus a fixed per-file slot), capped at
+  4 MiB with at most 8 cwds per file.
+- Since daemon start:
+  - `footprint_observer_passes`: snapshot-sync Claude passes that registered
+    the observer. 0 means no delivery reached footprint.
+  - `footprint_observer_evicted_files`: files dropped at the cap, oldest
+    modification time first.
+  - `footprint_observer_cwd_dropped`: cwd values over 4 KiB, not kept.
+  - `footprint_observer_incomplete_files`: deliveries that ended before their
+    read completed, or appended or unchanged reads of a file whose earlier
+    lines this process never saw (restart, durable restore or eviction),
+    counted once per file. What was delivered is kept.
 
 ## Private Codex Census Outcomes
 
@@ -313,3 +396,205 @@ ottto diagnostics collect --json
 
 If support requests an upload, rerun with the upload flags after the user has
 approved the disclosure.
+
+## Checkpointed Hold Settlement Total
+
+The checkpointed-upload log includes a process-lifetime count of settlement
+decisions for Rejected pages with non-progressing, restorable local holds.
+Recorded Claude account holds are included. It increments before the index
+save, so it does not count durable-save successes or unique pages; restarts
+reset it. See [counter scope and hold semantics](session-2026-10-22-terminal-bound-hold-settlement.md).
+
+## Claude Re-read Attribution Counters
+
+Schema 2's existing `native_collection_page` and `native_comparison_decision`
+records can include two sparse, counts-only objects for `source: claude_code`:
+`counts.claude_reread` and `counts.retained_cache_page_events`. Missing keys
+mean zero events in that observation. Counters saturate at `u64::MAX`. They
+add no wire fields, collected data kinds, persisted state or transcript reads.
+No paths, identifiers, fingerprints, bodies or content are emitted.
+
+Collection counters cover initialization and all cooperative steps of one page,
+including steps before a pause or a move to another worker thread. Comparison
+counters cover preparation (including load normalization) and post-collection
+finalization/save. These are disjoint event intervals: sum their events for the
+page; apart from `stamped_without_permit`, neither object is a gauge or a count
+of distinct files across pages.
+Nested operations, other sources and other threads cannot contribute to the
+active interval. Abandoned collection pages have no completed collection line.
+With comparison disabled, the existing `disabled_before_lease` decision still
+reports the gate; additional rows on that same decision stage report nonzero
+preparation/save events after work, without creating a comparison permit.
+
+`claude_reread` contains these closed keys:
+
+- `restored_empty_held`, `restored_nonempty_held`, `restored_empty_sibling`,
+  `restored_nonempty_sibling`: `committable_subset` replaced a working entry
+  with a nonempty parsed source fingerprint by its previous entry. Empty versus
+  nonempty describes the **previous** fingerprint. Held means a decode hold or
+  an entity/head in the caller's local hold set; sibling means neither. Existing
+  empty working debt and keys without a previous entry are excluded. A restored
+  previous nonempty fingerprint can equal the working fingerprint.
+- `sibling_exact_incidence_only`: subset of sibling restorations rejected by
+  the early exact-entity incidence branch whose legacy head/equality fallback
+  would have admitted them. This records the branch, not proof of settled body
+  equivalence, acceptance or permission to advance the checkpoint.
+- `owned_start_calls`, `owned_start_cleared`: corrective owned-start reparse
+  clear calls and actual nonempty-to-empty transitions.
+- `account_reproof_calls`, `account_reproof_cleared`: invalid account witness
+  reproof clear calls and actual nonempty-to-empty transitions.
+- `retry_admission_offered`, `retry_admission_cleared`: existing indexed members
+  in the actually offered oversized-family contiguous prefix, including offers
+  subsequently held by reread admission, and actual nonempty-to-empty clears.
+  This family reserve is distinct from the transcript file byte cap.
+- `authority_normalization_cleared`: nonempty-to-empty transitions while dropping
+  unbound authority records on working load/save. Discarded CAS probes are
+  excluded, matching the existing authority-drop totals.
+- `stamped_without_permit`: the one **gauge** in this object, read from the
+  local mark count at every Claude collection page end
+  (`native_collection_page`, whether or not finalization follows) and at Claude
+  finalization: indexed Claude files whose revision-3 body was stamped in a
+  cycle without the identity permit (local money mark `STAMPED_WITHOUT_PERMIT`,
+  seeded once by money-rule version 2 unless the loaded contract record was the
+  adopted E2 one). The key is sparse like the others: absent = 0 on a Claude
+  page. Merging two observations keeps the larger value. A late identity
+  permit re-reads none of these files, and an identity-contract latch clear
+  keeps their marks; only a permitted restamp clears one. User effect:
+  sessions read while the identity permission was off may show no subscription until re-read.
+- `history_permitted_not_stamped_not_accepted`, `_telemetry_unread`, `_held`,
+  `_other`: upgrades the history gate permitted on this page that did not stamp
+  the active revision. `not_accepted` stamped but a partial save kept the
+  committed entry; `telemetry_unread` and `held` were held after the permit
+  (unread telemetry; the stop latch); `other` finalized below the active
+  revision for any other reason (incomplete parse, decode or local hold).
+
+`retained_cache_page_events` reuses the existing cache lifecycle event keys and
+sites: `take_*`, `insert_*`, `cursor_reservation_entries_evicted`,
+`copy_refusal_*`, `clear_*`, `retention_*`, `prefix_excluded_bodies`, and
+`prefix_tag_clears`. Unlike `process_retained_cache_lifecycle_totals` (which stays
+cumulative, cross-source and labelled `unknown`), these are exact deltas from
+operations executed by the Claude page. Eviction/clear counts describe the
+causing page, **not** the source of each victim in the shared cache. No victim
+identity/history is retained. Existing refusal causes include entry/key/frozen
+charge, layout/disabled, live reservation, missing/invalid plan, incomplete or
+lossy reduction, unsealed EOF, clone/finalization bounds and poisoned locks.
+
+Three additional page-only keys refine those existing sites:
+
+- `insert_count_entries_evicted` and `insert_byte_entries_evicted` partition
+  `insert_entries_evicted`: each victim counts as count pressure when the count
+  cap is exceeded before removal, otherwise byte/layout-bound pressure. Entry
+  bound refusals remain `insert_entry_bound_refused`; they are not evictions.
+- `reinsert_failed`: one destructive cache hit whose acquisition ends without a
+  successful reinsertion, including eligibility/prepare/parse/retention failure
+  and refused insertion. A fixed boolean follows the active read across steps;
+  it stores no identity and disarms only after admission. Events are recorded
+  when that attempt ends, potentially on a later cooperative step. Process
+  termination cannot report an unfinished attempt.
+
+All diagnostics are best-effort local stderr observations. Their counters never
+feed collection, proof, save, memory admission, account attribution or upload
+decisions. Scopes and counters use fixed integers and inline storage, with no
+new locks, heap allocations, event history, lookups or background work.
+
+### Stale-start carry rejection histogram
+
+By design, `stale_carry_rejection_counts` rides the plain census re-arm stderr
+line, separate from the `local_resources` records.
+
+The existing local text line beginning `local snapshot census re-armed stale
+Claude request evidence:` appends `stale_carry_rejection_counts={...}`. This is
+**a text-line suffix**, not a new `local_resources` field or a wire field. The
+JSON object has eleven fixed `u64` keys, including explicit zeros:
+
+- `provenance_or_context`: retained provenance rewind or missing same-context
+  admission prevents this carry route. Valid legacy full-rearm-window carry
+  remains eligible through its existing separate route.
+- `contract`: missing identity contract or its changed latch.
+- `accepted_ledger`: accepted ledger version/reconciliation is not current.
+- `upload_context`: retained and active upload context differ.
+- `window_scratch`: active full-rearm window's combined Fix 2/C1b scratch price
+  refused, selecting the existing empty-carry fallback.
+- `ordinary_scratch`: selected ordinary carry scratch or streaming structural
+  admission refused.
+- `member_evidence`: membership, body/ACK, pending, legacy/fence or evidence
+  qualification refused after earlier route admission.
+- `cancellation_funding`: the selected cancellation price refused.
+- `reserve_allocation`: an actual member/replay vector reservation failed.
+- `eligible_before_funding`: roots that passed member/evidence qualification
+  before the selected route's cancellation reservation. Streaming pre-prices
+  cancellation before member qualification, so an early refusal can have zero
+  observed eligible roots; this is not a claim that no root could qualify.
+- `final_carried`: final carried roots after both cancellation funding passes.
+
+Counts are captured immediately before the existing stale-start fingerprint
+clear and appended where the existing re-arm text line is emitted. A resumed
+page, cadence wait, or start that emits no such line adds no log write or JSON
+serialization. These fixed counters add no retained graph, root history or
+extra source walks. Structured traversal-transition rows and their size budgets
+are unchanged. Integers saturate; no tokens, paths, sessions, hashes or content
+are included.
+
+Each stale root has one first rejection on its selected route or a final carry:
+the nine rejection buckets plus `final_carried` sum to the line's pending-family
+count. Window scratch is checked before entering ordinary carry; within an
+ordinary start-admission refusal, precedence is context, contract, ledger,
+upload context, then remaining legacy/member admission. A successful streaming
+alternate rescues ordinary scratch refusal. Failed whole-set/batch probes are
+discarded when a smaller batch succeeds; uncovered/deferred roots retain the
+first whole-set capacity refusal, while selected roots use their actual outcome.
+An existing admission cursor's whole-set deferral counts as structural scratch
+refusal. This describes carry admission, not unique families over multiple
+starts, proof completeness, actual rereads, or permission to change checkpoints.
+Capped roots retain their earlier carry rejection and cannot be counted again
+if the final combined cancellation funding refuses them.
+
+### Claude Contract Debt Counters (schema 2 additive)
+
+The existing `native_collection_page` / `native_comparison_decision` carrier
+also includes sparse, counts-only `request_identity_permit` (`permitted`,
+`denied`, `fetch_failed`, `hint_failed`), `identity_contract_transition`
+(`from_empty`, `to_empty`, `collector_e2_grouping`, `mid_traversal_placeholder`)
+and `identity_contract_latch` (`set`, `cleared`). The existing synchronous
+preparation, collection and finish scopes own these deltas: merge disjoint
+scopes, never sum a repeated scope twice. Permits are counted once at the first
+Claude prepare observation, not again by scanning or emission. Null and unknown
+tokens remain denials. Relay-token and activity-hint errors retain the last
+contract and reach the existing early decision/unwind carrier, including when
+no page is collected. There is no new event stream or wire check-in payload.
+
+Transitions count observed state changes, not repeated observations of the same
+placeholder. `mid_traversal_placeholder` counts entry into and exit from a
+placeholder, including recording the actual contract at a genuine start.
+`set` / `cleared` count in-memory false-to-true / true-to-false observations;
+a partial save can retain the durable latch through its existing OR rule.
+Decode containment setting the latch is outside these observation counters.
+`deferred_by_contract_debt` counts finally funded families once per traversal
+start, summed only when multiple starts occur in one page. Deferral keeps
+correction debt and the old census window; it grants no current projection,
+identity, ownership or duplicate-fence proof. Unknown or sweep-wide settlement
+debt refuses deferral. The upload-context mismatch veto remains unchanged.
+
+`traversal_context_change` counts comparisons with the process-observed retained
+traversal's start: `backfill_changed`, `active_upload_context_changed`,
+`policy_changed`, `attribution_available_changed`, `attribution_epoch_changed`,
+`cache_capability_changed`, `replay_changed`, `roots_changed`. Each comparison
+may increment multiple components. The first observation in a process, an
+unobserved retained traversal and an unavailable component are unknown and
+increment no change counter. Epoch differences require both epochs available;
+availability has its own counter. Ordered roots are compared through a
+domain-separated SHA-256 digest with length-prefixed normalized path bytes, so a same-count
+replacement or reorder counts. Diagnostics retain no root paths.
+`root_count` is the most recent comparison's gauge, including zero. These process-local observations do not
+persist or affect decisions; no roots, paths, keys, namespaces, hashes, token
+values or body contents are emitted.
+
+The deferral count includes newly classified storage-only singleton deferrals;
+those retain custody without granting carry or proof. Under contract debt the
+existing stale-carry `contract` rejection bucket also includes member-evidence
+refusals. With no comparison lease, per-cycle permit counts use the existing
+prepare decision line once per attempted Claude cycle. A malformed hint window
+counts as `hint_failed`, before any contract observation. While a placeholder
+is stored, permit flaps remain visible in permit outcomes but cannot be
+classified into `from_empty`, `to_empty` or `collector_e2_grouping` from that
+unknown prior contract.

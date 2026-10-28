@@ -113,6 +113,9 @@ struct ConfiguredServer {
     name: String,
     transport: Transport,
     disabled: bool,
+    /// Claude Code `alwaysLoad: true` on the server block: its tool schemas
+    /// are sent up front even while tool search defers everything else.
+    always_load: bool,
     /// Directory of the config file that declared this server. A relative
     /// `cwd` (and the relative paths a server's own `env` points at) resolve
     /// against THIS, exactly as the agent resolves them — never against the
@@ -129,6 +132,11 @@ struct McpToolInput {
     name: String,
     description: String,
     input_schema: Value,
+    /// The tool's `_meta["anthropic/alwaysLoad"]` is `true`: Claude Code sends
+    /// this one schema up front even when its server is deferred. Omitted when
+    /// false so ordinary payloads (and their hashes) are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    always_load: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -137,7 +145,21 @@ struct McpServerInput {
     server: String,
     transport: Option<String>,
     reachable: bool,
+    /// `always_on` (schemas sent every session), `on_demand` (deferred: only
+    /// tool names and server instructions, or nothing, until a tool is
+    /// searched), or `unknown`. See [`LoadingDecision`].
     loading_mode: String,
+    /// Closed reason for `loading_mode` (see [`LoadingDecision::basis`]).
+    loading_mode_basis: String,
+    /// True when `loading_mode` is the client's default for its version
+    /// rather than a setting read from the user's config. Neither case sees a
+    /// shell environment override, which the daemon cannot read.
+    loading_mode_inferred: bool,
+    /// Character length of the server's `initialize` `instructions`, which
+    /// Claude Code sends every session even when tools are deferred. Only the
+    /// length leaves the machine, never the text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions_chars: Option<u32>,
     tools: Vec<McpToolInput>,
 }
 
@@ -157,6 +179,17 @@ struct McpInventoryIngestRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     machine_id: Option<String>,
     context_window_tokens: i64,
+    /// Version of the agent client the loading modes were decided for: Claude
+    /// Code's last-run version from `~/.claude.json`, Codex's from its newest
+    /// session log. No process is spawned to read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_version: Option<String>,
+    /// Claude Code `ENABLE_TOOL_SEARCH=auto[:N]`: tools load up front until
+    /// all deferrable tool schemas exceed N% of the model's context window.
+    /// The backend, which knows both sizes, resolves servers with basis
+    /// `tool_search_auto` against this percentage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_search_auto_pct: Option<u8>,
     servers: Vec<McpServerInput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     capabilities: Vec<McpCapabilityInput>,
@@ -166,15 +199,395 @@ struct McpInventoryIngestRequest {
 // Loading mode
 // ---------------------------------------------------------------------------
 
-/// How an agent loads MCP tool schemas into context.
+/// Earliest Claude Code version proven to defer every MCP server by default
+/// (tool search): a 2.1.170 session log lists user MCP servers among its
+/// deferred tool names. Older builds may send schemas up front.
+const CLAUDE_DEFERRAL_MIN_VERSION: (u64, u64, u64) = (2, 1, 170);
+
+/// Earliest Codex version seen finding MCP tools through code mode's runtime
+/// `ALL_TOOLS` list (0.149). Code-mode builds send no user MCP server names,
+/// schemas or instructions in the first request. Older builds are not assumed.
+const CODEX_CODE_MODE_MIN_VERSION: (u64, u64, u64) = (0, 149, 0);
+
+/// Claude Code's default `ENABLE_TOOL_SEARCH=auto` threshold, in percent of
+/// the model's context window.
+const CLAUDE_TOOL_SEARCH_AUTO_DEFAULT_PCT: u8 = 10;
+
+/// How one configured server's tool schemas reach the model.
 ///
-/// Claude Code defers MCP schemas (tool-search / on-demand); Codex loads them
-/// eagerly every turn. Mirrors `_effective_loading_mode` in harvest.py.
-fn loading_mode_for(source: SnapshotSource) -> &'static str {
-    match source {
-        SnapshotSource::ClaudeCode => "unknown",
-        SnapshotSource::Codex => "always_on",
-        SnapshotSource::Pi => "unknown",
+/// `mode` is `always_on` (every schema is sent every session), `on_demand`
+/// (deferred: Claude Code sends only tool names and server instructions,
+/// Codex code mode sends nothing, until the model looks a tool up) or
+/// `unknown`. `basis` is a closed reason the backend explains to the user:
+///
+/// * `client_default` — the client's default for its version.
+/// * `tool_search_enabled` / `tool_search_disabled` — `ENABLE_TOOL_SEARCH`.
+/// * `tool_search_auto` — `ENABLE_TOOL_SEARCH=auto[:N]`; up front until the
+///   deferrable schemas pass N% of the window, resolved by the backend.
+/// * `always_load` — the server's `alwaysLoad: true`.
+/// * `proxy_base_url` — a non-Anthropic `ANTHROPIC_BASE_URL` without
+///   `ENABLE_TOOL_SEARCH` turns deferral off.
+/// * `experimental_betas_disabled` — `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`.
+/// * `legacy_client` — a client version older than the proven default.
+/// * `unsupported_client` — an agent without MCP loading rules.
+///
+/// Only config files are read. A shell environment variable can still
+/// override any of these, which the daemon cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoadingDecision {
+    mode: &'static str,
+    basis: &'static str,
+    /// True for a client default, false for a setting read from config.
+    inferred: bool,
+}
+
+impl LoadingDecision {
+    const fn configured(mode: &'static str, basis: &'static str) -> Self {
+        Self {
+            mode,
+            basis,
+            inferred: false,
+        }
+    }
+
+    const fn client_default(mode: &'static str, basis: &'static str) -> Self {
+        Self {
+            mode,
+            basis,
+            inferred: true,
+        }
+    }
+}
+
+/// The Claude Code settings `env` values that decide MCP deferral.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ClaudeLoadingEnv {
+    enable_tool_search: Option<String>,
+    third_party_base_url: bool,
+    experimental_betas_disabled: bool,
+}
+
+/// One agent's MCP loading rules, read once per harvest cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoadingPolicy {
+    Claude {
+        home: PathBuf,
+        version: Option<String>,
+        /// The user-scope settings `env`.
+        env: ClaudeLoadingEnv,
+    },
+    Codex {
+        version: Option<String>,
+    },
+    Unsupported,
+}
+
+impl LoadingPolicy {
+    fn read(home: &Path, source: SnapshotSource) -> Self {
+        match source {
+            SnapshotSource::ClaudeCode => LoadingPolicy::Claude {
+                home: home.to_path_buf(),
+                version: claude_client_version(home),
+                env: claude_loading_env(&claude_user_settings(home)),
+            },
+            SnapshotSource::Codex => LoadingPolicy::Codex {
+                version: codex_client_version(home),
+            },
+            SnapshotSource::Pi => LoadingPolicy::Unsupported,
+        }
+    }
+
+    fn client_version(&self) -> Option<String> {
+        match self {
+            LoadingPolicy::Claude { version, .. } | LoadingPolicy::Codex { version } => {
+                version.clone()
+            }
+            LoadingPolicy::Unsupported => None,
+        }
+    }
+
+    fn tool_search_auto_pct(&self) -> Option<u8> {
+        match self {
+            LoadingPolicy::Claude { env, .. } => tool_search_auto_pct(env),
+            _ => None,
+        }
+    }
+
+    fn decide(&self, server: &ConfiguredServer) -> LoadingDecision {
+        match self {
+            LoadingPolicy::Claude { home, version, env } => {
+                // A server declared in a project loads under that project's
+                // settings, which override the user's. A user-scope server
+                // keeps the user settings: the inventory cannot tell which
+                // project a session runs in.
+                let project_env = server
+                    .config_dir
+                    .as_deref()
+                    .filter(|dir| *dir != home.as_path())
+                    .map(|dir| {
+                        let mut files = claude_user_settings(home);
+                        files.extend(claude_project_settings(dir));
+                        claude_loading_env(&files)
+                    });
+                let effective = project_env.as_ref().unwrap_or(env);
+                let decision =
+                    claude_loading_decision(effective, server.always_load, version.as_deref());
+                // The inventory carries one auto threshold (the user's). A
+                // project threshold that differs cannot be resolved with it.
+                if decision.basis == "tool_search_auto"
+                    && tool_search_auto_pct(effective) != tool_search_auto_pct(env)
+                {
+                    return LoadingDecision::configured("unknown", "tool_search_auto_project");
+                }
+                decision
+            }
+            LoadingPolicy::Codex { version } => codex_loading_decision(version.as_deref()),
+            LoadingPolicy::Unsupported => {
+                LoadingDecision::client_default("unknown", "unsupported_client")
+            }
+        }
+    }
+}
+
+/// Claude Code's deferral rules, in the order the client applies them: the
+/// forced up-front cases first, then `alwaysLoad`, then `ENABLE_TOOL_SEARCH`,
+/// then the version default.
+fn claude_loading_decision(
+    env: &ClaudeLoadingEnv,
+    server_always_load: bool,
+    version: Option<&str>,
+) -> LoadingDecision {
+    let tool_search = env
+        .enable_tool_search
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    if env.third_party_base_url && tool_search.is_none() {
+        return LoadingDecision::configured("always_on", "proxy_base_url");
+    }
+    if env.experimental_betas_disabled {
+        return LoadingDecision::configured("always_on", "experimental_betas_disabled");
+    }
+    if server_always_load {
+        return LoadingDecision::configured("always_on", "always_load");
+    }
+    match tool_search.as_deref() {
+        Some("false" | "0") => {
+            return LoadingDecision::configured("always_on", "tool_search_disabled")
+        }
+        Some("true" | "1") => {
+            return LoadingDecision::configured("on_demand", "tool_search_enabled")
+        }
+        Some(value) if value == "auto" || value.starts_with("auto:") => {
+            return LoadingDecision::configured("unknown", "tool_search_auto")
+        }
+        _ => {}
+    }
+    match version.and_then(parse_version) {
+        Some(parsed) if parsed < CLAUDE_DEFERRAL_MIN_VERSION => {
+            LoadingDecision::client_default("unknown", "legacy_client")
+        }
+        _ => LoadingDecision::client_default("on_demand", "client_default"),
+    }
+}
+
+/// Codex code-mode builds keep `[mcp_servers]` tools out of the first request.
+/// Older builds are reported as `unknown`, like older Claude Code builds.
+fn codex_loading_decision(version: Option<&str>) -> LoadingDecision {
+    match version.and_then(parse_version) {
+        Some(parsed) if parsed < CODEX_CODE_MODE_MIN_VERSION => {
+            LoadingDecision::client_default("unknown", "legacy_client")
+        }
+        _ => LoadingDecision::client_default("on_demand", "client_default"),
+    }
+}
+
+/// The `ENABLE_TOOL_SEARCH=auto[:N]` threshold, when that mode is set.
+fn tool_search_auto_pct(env: &ClaudeLoadingEnv) -> Option<u8> {
+    let value = env
+        .enable_tool_search
+        .as_deref()?
+        .trim()
+        .to_ascii_lowercase();
+    if value == "auto" {
+        return Some(CLAUDE_TOOL_SEARCH_AUTO_DEFAULT_PCT);
+    }
+    let pct = value.strip_prefix("auto:")?.trim().parse::<u8>().ok();
+    Some(
+        pct.filter(|pct| *pct <= 100)
+            .unwrap_or(CLAUDE_TOOL_SEARCH_AUTO_DEFAULT_PCT),
+    )
+}
+
+/// `major.minor.patch` from a version string such as `2.1.300 (Claude Code)`
+/// or `0.155.0-alpha.16.4`.
+fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
+    let core = value
+        .trim()
+        .split(|c: char| c.is_whitespace() || c == '-' || c == '+')
+        .next()?;
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+    Some((
+        parts.next()??,
+        parts.next()??,
+        parts.next().flatten().unwrap_or(0),
+    ))
+}
+
+/// The user's Claude Code settings files, lowest precedence first.
+fn claude_user_settings(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".claude").join("settings.json"),
+        home.join(".claude").join("settings.local.json"),
+    ]
+}
+
+/// A project's Claude Code settings files, lowest precedence first.
+fn claude_project_settings(project_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        project_dir.join(".claude").join("settings.json"),
+        project_dir.join(".claude").join("settings.local.json"),
+    ]
+}
+
+/// Read the deferral settings from Claude Code settings `env` blocks; a later
+/// file overrides an earlier one, as in the client.
+fn claude_loading_env(settings_files: &[PathBuf]) -> ClaudeLoadingEnv {
+    let mut merged: BTreeMap<String, String> = BTreeMap::new();
+    for settings in settings_files {
+        let Some(value) = load_json(settings) else {
+            continue;
+        };
+        let Some(env) = value.get("env").and_then(Value::as_object) else {
+            continue;
+        };
+        for key in [
+            "ENABLE_TOOL_SEARCH",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+        ] {
+            let text = match env.get(key) {
+                Some(Value::String(text)) => Some(text.clone()),
+                Some(Value::Bool(flag)) => Some(flag.to_string()),
+                Some(Value::Number(number)) => Some(number.to_string()),
+                _ => None,
+            };
+            if let Some(text) = text {
+                merged.insert(key.to_string(), text);
+            }
+        }
+    }
+    ClaudeLoadingEnv {
+        enable_tool_search: merged.get("ENABLE_TOOL_SEARCH").cloned(),
+        third_party_base_url: merged
+            .get("ANTHROPIC_BASE_URL")
+            .is_some_and(|url| !is_first_party_anthropic_url(url)),
+        experimental_betas_disabled: merged
+            .get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
+            .is_some_and(|value| is_truthy(value)),
+    }
+}
+
+/// An empty base URL or an `anthropic.com` host is Anthropic's own API.
+fn is_first_party_anthropic_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let without_scheme = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == "anthropic.com" || host.ends_with(".anthropic.com")
+}
+
+/// The Claude Code version that last ran interactively (`lastReleaseNotesSeen`
+/// in `~/.claude.json`), without spawning the CLI.
+fn claude_client_version(home: &Path) -> Option<String> {
+    load_json(&home.join(".claude.json"))?
+        .get("lastReleaseNotesSeen")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| parse_version(version).is_some())
+        .map(|version| version.chars().take(64).collect())
+}
+
+/// Bound on the first session-log line read for the Codex version.
+const CODEX_SESSION_META_MAX_BYTES: u64 = 64 * 1024;
+
+/// The `cli_version` of the newest Codex session log under
+/// `~/.codex/sessions/YYYY/MM/DD/`. Directory and file names sort by time, so
+/// only the newest branch is listed and one bounded first line is read.
+fn codex_client_version(home: &Path) -> Option<String> {
+    use std::io::Read;
+
+    fn newest_child(dir: &Path, want_dir: bool) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| {
+                    if want_dir {
+                        kind.is_dir()
+                    } else {
+                        kind.is_file()
+                    }
+                })
+            })
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if want_dir {
+                    name.chars().all(|c| c.is_ascii_digit())
+                } else {
+                    name.starts_with("rollout-") && name.ends_with(".jsonl")
+                }
+            })
+            .max()
+    }
+
+    let mut dir = home.join(".codex").join("sessions");
+    for _ in 0..3 {
+        dir = newest_child(&dir, true)?;
+    }
+    let file = std::fs::File::open(newest_child(&dir, false)?).ok()?;
+    let mut reader = BufReader::new(file.take(CODEX_SESSION_META_MAX_BYTES));
+    let mut first = String::new();
+    reader.read_line(&mut first).ok()?;
+    let meta: Value = serde_json::from_str(first.trim()).ok()?;
+    meta.get("payload")
+        .and_then(|payload| payload.get("cli_version"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| parse_version(version).is_some())
+        .map(|version| version.chars().take(64).collect())
+}
+
+/// Stamp each harvested server with its loading decision.
+fn apply_loading_policy(
+    servers: &mut [McpServerInput],
+    configured: &[ConfiguredServer],
+    policy: &LoadingPolicy,
+) {
+    for server in servers {
+        let Some(config) = configured.iter().find(|c| c.name == server.server) else {
+            continue;
+        };
+        let decision = policy.decide(config);
+        server.loading_mode = decision.mode.to_string();
+        server.loading_mode_basis = decision.basis.to_string();
+        server.loading_mode_inferred = decision.inferred;
     }
 }
 
@@ -234,13 +647,15 @@ fn normalize_claude_server(
         name: name.to_string(),
         transport,
         disabled: false,
+        always_load: cfg.get("alwaysLoad").and_then(Value::as_bool) == Some(true),
     })
 }
 
 /// Normalize one Codex `[mcp_servers.*]` block into a [`Transport`].
 ///
 /// Mirrors `discover_codex` in harvest.py: a `url` is an HTTP transport, else
-/// stdio with `command` + `args`.
+/// stdio with `command` + `args`. An explicit `enabled = false` marks the
+/// server disabled (Codex does not load it); `true` or an absent key is enabled.
 fn normalize_codex_server(
     name: &str,
     cfg: &Value,
@@ -264,7 +679,8 @@ fn normalize_codex_server(
         config_dir: config_dir.map(Path::to_path_buf),
         name: name.to_string(),
         transport,
-        disabled: false,
+        disabled: cfg.get("enabled").and_then(Value::as_bool) == Some(false),
+        always_load: false,
     })
 }
 
@@ -650,6 +1066,14 @@ impl SpawnEnv {
     }
 }
 
+/// What one stdio probe returns: the tool definitions and the length of the
+/// server's `initialize` instructions.
+#[derive(Debug, Clone, PartialEq)]
+struct ProbeOutput {
+    tools: Vec<McpToolInput>,
+    instructions_chars: Option<u32>,
+}
+
 /// Run `initialize` + `tools/list` against a stdio MCP server and return its
 /// tool definitions. The non-Unix fallback retains the threaded handshake.
 /// Unix uses the existing server worker and explicit child/pipe ownership below.
@@ -662,7 +1086,7 @@ fn harvest_stdio(
     config_dir: Option<&Path>,
     server_env: &BTreeMap<String, String>,
     claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
-) -> Result<Vec<McpToolInput>> {
+) -> Result<ProbeOutput> {
     let mut command = env.command_in(command, args, cwd, config_dir, server_env);
     if let Some(login) = claude_login {
         crate::claude_spawn_gate::pin_claude_login(&mut command, login);
@@ -683,7 +1107,7 @@ fn harvest_stdio(
         .take()
         .ok_or_else(|| anyhow!("mcp server stdout unavailable"))?;
 
-    let (tx, rx) = mpsc::channel::<Result<Vec<McpToolInput>>>();
+    let (tx, rx) = mpsc::channel::<Result<ProbeOutput>>();
     // The handshake runs on its own thread so the read loop can be abandoned on
     // timeout without blocking the sync thread. The thread owns stdin/stdout and
     // drops them when it returns, closing the pipes.
@@ -737,7 +1161,7 @@ fn harvest_stdio(
     config_dir: Option<&Path>,
     server_env: &BTreeMap<String, String>,
     claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
-) -> Result<Vec<McpToolInput>> {
+) -> Result<ProbeOutput> {
     harvest_stdio_bounded(
         command,
         args,
@@ -761,7 +1185,7 @@ fn harvest_stdio_bounded(
     server_env: &BTreeMap<String, String>,
     claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
     timeout: Duration,
-) -> Result<Vec<McpToolInput>> {
+) -> Result<ProbeOutput> {
     use crate::claude_spawn_gate::probe::{ChildProbe, Origin, Reader, StartError, Writer};
     let started = Instant::now();
     let deadline = started + timeout.min(HANDSHAKE_TIMEOUT);
@@ -871,18 +1295,27 @@ fn claude_login_of_server(
 /// Sends `initialize`, then the `notifications/initialized` notification, then
 /// `tools/list`, reading newline-delimited JSON-RPC responses and matching them
 /// by request id. Tolerates interleaved server-initiated messages.
-fn run_stdio_handshake(
-    stdin: &mut impl Write,
-    reader: &mut impl BufRead,
-) -> Result<Vec<McpToolInput>> {
+fn run_stdio_handshake(stdin: &mut impl Write, reader: &mut impl BufRead) -> Result<ProbeOutput> {
     write_message(stdin, &initialize_request())?;
-    let _ = read_response(reader, 1)?;
+    let initialized = read_response(reader, 1)?;
 
     write_message(stdin, &initialized_notification())?;
     write_message(stdin, &tools_list_request())?;
     let response = read_response(reader, 2)?;
 
-    Ok(parse_tools(&response))
+    Ok(ProbeOutput {
+        tools: parse_tools(&response),
+        instructions_chars: instructions_chars(&initialized),
+    })
+}
+
+/// Character length of an `initialize` result's `instructions`, if any.
+fn instructions_chars(response: &Value) -> Option<u32> {
+    let instructions = response
+        .get("result")
+        .and_then(|result| result.get("instructions"))
+        .and_then(Value::as_str)?;
+    Some(u32::try_from(instructions.chars().count()).unwrap_or(u32::MAX))
 }
 
 fn initialize_request() -> Value {
@@ -984,6 +1417,11 @@ fn parse_tools(response: &Value) -> Vec<McpToolInput> {
                         .get("inputSchema")
                         .cloned()
                         .unwrap_or_else(|| json!({})),
+                    always_load: tool
+                        .get("_meta")
+                        .and_then(|meta| meta.get("anthropic/alwaysLoad"))
+                        .and_then(Value::as_bool)
+                        == Some(true),
                 })
                 .collect()
         })
@@ -1003,11 +1441,7 @@ fn parse_tools(response: &Value) -> Vec<McpToolInput> {
 /// expiry is saved, or while another Claude Code process refreshes it): it is
 /// returned unreachable with `deferred = true`, and the cycle keeps the last
 /// good inventory (see `harvest_source`).
-fn harvest_server(
-    server: &ConfiguredServer,
-    loading_mode: &str,
-    env: &SpawnEnv,
-) -> (McpServerInput, bool) {
+fn harvest_server(server: &ConfiguredServer, env: &SpawnEnv) -> (McpServerInput, bool) {
     let tools = match &server.transport {
         Transport::Stdio {
             command,
@@ -1020,12 +1454,12 @@ fn harvest_server(
                     None => None,
                     Some(Err(())) => {
                         eprintln!("mcp_harvest claude_server=deferred reason=config_dir");
-                        return (unreachable_server(server, loading_mode), true);
+                        return (unreachable_server(server), true);
                     }
                     Some(Ok(slot)) => {
                         if crate::claude_spawn_gate::check_short_claude_run(&slot).is_err() {
                             eprintln!("mcp_harvest claude_server=deferred reason=quiet_window");
-                            return (unreachable_server(server, loading_mode), true);
+                            return (unreachable_server(server), true);
                         }
                         Some(slot)
                     }
@@ -1045,7 +1479,7 @@ fn harvest_server(
                 .err()
                 .is_some_and(|error| error.downcast_ref::<McpProbeDeferred>().is_some())
             {
-                return (unreachable_server(server, loading_mode), true);
+                return (unreachable_server(server), true);
             }
             result.ok()
         }
@@ -1055,24 +1489,13 @@ fn harvest_server(
         Transport::Http { .. } | Transport::Sse { .. } => None,
     };
     let input = match tools {
-        Some(tools) => McpServerInput {
-            server: server.name.clone(),
-            transport: Some(server.transport.label().to_string()),
+        Some(probe) => McpServerInput {
             reachable: true,
-            loading_mode: loading_mode.to_string(),
-            disabled: false,
-
-            tools,
+            instructions_chars: probe.instructions_chars,
+            tools: probe.tools,
+            ..unreachable_server(server)
         },
-        None => McpServerInput {
-            server: server.name.clone(),
-            transport: Some(server.transport.label().to_string()),
-            reachable: false,
-            loading_mode: loading_mode.to_string(),
-            disabled: false,
-
-            tools: Vec::new(),
-        },
+        None => unreachable_server(server),
     };
     (input, false)
 }
@@ -1118,7 +1541,6 @@ fn probe_chunk_len(configured: &[ConfiguredServer], env: &SpawnEnv) -> usize {
 /// Claude Code servers were deferred by their login's quiet window.
 fn harvest_servers(
     configured: &[ConfiguredServer],
-    loading_mode: &'static str,
     deadline: Instant,
     env: &SpawnEnv,
 ) -> (Vec<McpServerInput>, bool, usize) {
@@ -1147,11 +1569,10 @@ fn harvest_servers(
             .iter()
             .cloned()
             .map(|server| {
-                let mode = loading_mode.to_string();
                 let env = env.clone();
                 std::thread::Builder::new()
                     .name("ottto-mcp-harvest-worker".to_string())
-                    .spawn(move || harvest_server(&server, &mode, &env))
+                    .spawn(move || harvest_server(&server, &env))
             })
             .collect();
         for (handle, server) in handles.into_iter().zip(chunk.iter()) {
@@ -1161,26 +1582,29 @@ fn harvest_servers(
                 Ok(joined) => {
                     let (input, was_deferred) = joined
                         .join()
-                        .unwrap_or_else(|_| (unreachable_server(server, loading_mode), false));
+                        .unwrap_or_else(|_| (unreachable_server(server), false));
                     deferred += usize::from(was_deferred);
                     out.push(input);
                 }
-                Err(_) => out.push(unreachable_server(server, loading_mode)),
+                Err(_) => out.push(unreachable_server(server)),
             }
         }
     }
     (out, throttled, deferred)
 }
 
-/// A configured server reported unreachable with no tools (cost zero).
-fn unreachable_server(server: &ConfiguredServer, loading_mode: &str) -> McpServerInput {
+/// A configured server reported unreachable with no tools (cost zero). Its
+/// loading fields are stamped by [`apply_loading_policy`].
+fn unreachable_server(server: &ConfiguredServer) -> McpServerInput {
     McpServerInput {
         server: server.name.clone(),
         transport: Some(server.transport.label().to_string()),
         reachable: false,
-        loading_mode: loading_mode.to_string(),
-        disabled: false,
-
+        loading_mode: "unknown".to_string(),
+        loading_mode_basis: String::new(),
+        loading_mode_inferred: true,
+        instructions_chars: None,
+        disabled: server.disabled,
         tools: Vec::new(),
     }
 }
@@ -1195,12 +1619,13 @@ fn build_inventory(
     deadline: Instant,
 ) -> BuildResult {
     let started = Instant::now();
-    let loading_mode = loading_mode_for(source);
     let configured = discover_servers(home, source);
     let capabilities = discover_capabilities(home, source);
+    let policy = LoadingPolicy::read(home, source);
     let spawn_env = SpawnEnv::resolve();
-    let (servers, throttled, claude_deferred) =
-        harvest_servers(&configured, loading_mode, deadline, &spawn_env);
+    let (mut servers, throttled, claude_deferred) =
+        harvest_servers(&configured, deadline, &spawn_env);
+    apply_loading_policy(&mut servers, &configured, &policy);
     let reachable = servers.iter().filter(|s| s.reachable).count();
     let metrics = HarvestMetrics {
         source,
@@ -1217,6 +1642,8 @@ fn build_inventory(
             agent_source: agent_source_for(source).to_string(),
             machine_id: machine_id.map(str::to_string),
             context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+            client_version: policy.client_version(),
+            tool_search_auto_pct: policy.tool_search_auto_pct(),
             servers,
             capabilities,
         },
@@ -1444,11 +1871,14 @@ fn write_cache(path: &Path, entry: &InventoryCacheEntry) {
 
 /// SHA-256 over the inventory's meaningful content. `machine_id` and
 /// `context_window_tokens` are constant per machine, so only `agent_source`,
-/// the harvested servers, and allowlisted capability states participate.
+/// the harvested servers (with their loading decisions), the auto tool-search
+/// threshold, and allowlisted capability states participate. A client version
+/// bump alone is not a change: it reaches the backend with the next upload.
 fn inventory_hash(inventory: &McpInventoryIngestRequest) -> Result<String> {
     let canonical = serde_json::to_vec(&json!({
         "agent_source": inventory.agent_source,
         "servers": inventory.servers,
+        "tool_search_auto_pct": inventory.tool_search_auto_pct,
         "capabilities": inventory.capabilities,
     }))
     .map_err(|error| anyhow!("hash encode failed: {error}"))?;
@@ -1748,6 +2178,7 @@ mod tests {
             protected.then_some(&login),
             timeout,
         )
+        .map(|probe| probe.tools)
     }
 
     #[cfg(unix)]
@@ -1829,6 +2260,7 @@ mod tests {
             .map(|name| ConfiguredServer {
                 name: name.to_string(),
                 disabled: false,
+                always_load: false,
                 config_dir: None,
                 transport: Transport::Stdio {
                     command: fixture.script.to_string_lossy().into_owned(),
@@ -1840,7 +2272,6 @@ mod tests {
             .collect();
         let (servers, throttled, deferred) = harvest_servers(
             &configured,
-            "unknown",
             Instant::now() + Duration::from_secs(6),
             &SpawnEnv {
                 path: None,
@@ -1946,6 +2377,7 @@ mod tests {
         let server = ConfiguredServer {
             name: "synthetic".to_string(),
             disabled: false,
+            always_load: false,
             config_dir: None,
             transport: Transport::Stdio {
                 command: fixture.script.to_string_lossy().into_owned(),
@@ -1957,7 +2389,6 @@ mod tests {
         for _ in 0..20 {
             let (input, deferred) = harvest_server(
                 &server,
-                "unknown",
                 &SpawnEnv {
                     path: None,
                     provider: BTreeMap::new(),
@@ -2142,7 +2573,7 @@ mod tests {
         assert_eq!(s.name, "noupstream");
         assert_eq!(s.transport, Transport::Http { url: String::new() });
         // And it harvests as unreachable (cost zero), not a panic.
-        let (h, _) = harvest_server(&s, "on_demand", &test_spawn_env());
+        let (h, _) = harvest_server(&s, &test_spawn_env());
         assert!(!h.reachable);
         assert!(h.tools.is_empty());
     }
@@ -2219,6 +2650,50 @@ enabled = true
     }
 
     #[test]
+    fn codex_enabled_false_is_reported_disabled() {
+        // Codex skips a server with `enabled = false`. It stays in the
+        // inventory, carried as disabled on the wire so the backend leaves it
+        // out of the configured totals; `true` and an absent key stay enabled.
+        let home = test_home("codex-enabled-false");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex").join("config.toml"),
+            r#"
+[mcp_servers.off]
+url = "https://off.test/mcp"
+enabled = false
+
+[mcp_servers.on]
+url = "https://on.test/mcp"
+enabled = true
+
+[mcp_servers.unset]
+url = "https://unset.test/mcp"
+"#,
+        )
+        .unwrap();
+
+        let wire: BTreeMap<String, bool> = discover_codex(&home)
+            .iter()
+            .map(|server| {
+                let (input, _) = harvest_server(server, &test_spawn_env());
+                (input.server, input.disabled)
+            })
+            .collect();
+
+        assert_eq!(
+            wire,
+            BTreeMap::from([
+                ("off".to_string(), true),
+                ("on".to_string(), false),
+                ("unset".to_string(), false),
+            ])
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn network_transports_are_reported_unreachable_with_no_tools() {
         let http = ConfiguredServer {
             config_dir: None,
@@ -2227,14 +2702,16 @@ enabled = true
                 url: "https://remote.test/mcp".to_string(),
             },
             disabled: false,
+            always_load: false,
         };
-        let (harvested, _) = harvest_server(&http, "always_on", &test_spawn_env());
+        let (harvested, _) = harvest_server(&http, &test_spawn_env());
 
         assert_eq!(harvested.server, "remote");
         assert_eq!(harvested.transport.as_deref(), Some("http"));
         assert!(!harvested.reachable);
         assert!(harvested.tools.is_empty());
-        assert_eq!(harvested.loading_mode, "always_on");
+        // Loading fields are stamped per policy after the harvest.
+        assert_eq!(harvested.loading_mode, "unknown");
     }
 
     #[test]
@@ -2249,8 +2726,9 @@ enabled = true
                 env: std::collections::BTreeMap::new(),
             },
             disabled: false,
+            always_load: false,
         };
-        let (harvested, _) = harvest_server(&server, "on_demand", &test_spawn_env());
+        let (harvested, _) = harvest_server(&server, &test_spawn_env());
 
         assert!(!harvested.reachable);
         assert!(harvested.tools.is_empty());
@@ -2459,23 +2937,281 @@ enabled = true
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn claude_env(
+        enable_tool_search: Option<&str>,
+        base_url: bool,
+        betas: bool,
+    ) -> ClaudeLoadingEnv {
+        ClaudeLoadingEnv {
+            enable_tool_search: enable_tool_search.map(str::to_string),
+            third_party_base_url: base_url,
+            experimental_betas_disabled: betas,
+        }
+    }
+
     #[test]
-    fn claude_code_loading_mode_is_unmeasured_not_assumed() {
-        // Claude Code decides deferral at RUNTIME, per model and per session
-        // (its tool-search gate, with an automatic threshold). A given server
-        // can be loaded in one session and deferred in the next, so no
-        // per-agent constant is correct — the previous "on_demand" stamp was
-        // wrong in both directions.
-        //
-        // It reports `unknown` rather than guessing because `always_on` feeds
-        // reclaimable_tokens and the bloat detector: a fabricated value there
-        // would recommend REMOVING servers on evidence we do not have. The
-        // binding rule is that absence is "not measured" — never zero, unused,
-        // or reclaimable.
-        assert_eq!(loading_mode_for(SnapshotSource::ClaudeCode), "unknown");
-        // Codex loads its configured servers up front, which IS an agent-class
-        // property, so it keeps a constant.
-        assert_eq!(loading_mode_for(SnapshotSource::Codex), "always_on");
+    fn claude_code_defers_mcp_by_default_and_honours_upfront_settings() {
+        let current = Some("2.1.300");
+        let default = claude_loading_decision(&claude_env(None, false, false), false, current);
+        assert_eq!(
+            default,
+            LoadingDecision::client_default("on_demand", "client_default")
+        );
+        // A server's own `alwaysLoad` sends its schemas up front.
+        let decision = claude_loading_decision(&claude_env(None, false, false), true, current);
+        assert_eq!(
+            decision,
+            LoadingDecision::configured("always_on", "always_load")
+        );
+        // ENABLE_TOOL_SEARCH turns deferral off, on, or into the threshold mode.
+        for (value, mode, basis) in [
+            ("false", "always_on", "tool_search_disabled"),
+            ("0", "always_on", "tool_search_disabled"),
+            ("true", "on_demand", "tool_search_enabled"),
+            ("auto", "unknown", "tool_search_auto"),
+            ("auto:5", "unknown", "tool_search_auto"),
+        ] {
+            let decision =
+                claude_loading_decision(&claude_env(Some(value), false, false), false, current);
+            assert_eq!(
+                decision,
+                LoadingDecision::configured(mode, basis),
+                "{value}"
+            );
+        }
+        // A proxy base URL forces up-front loading unless tool search is set.
+        let proxy = claude_loading_decision(&claude_env(None, true, false), false, current);
+        assert_eq!(
+            proxy,
+            LoadingDecision::configured("always_on", "proxy_base_url")
+        );
+        let proxy_opt_in =
+            claude_loading_decision(&claude_env(Some("true"), true, false), false, current);
+        assert_eq!(proxy_opt_in.mode, "on_demand");
+        let betas = claude_loading_decision(&claude_env(Some("true"), false, true), false, current);
+        assert_eq!(
+            betas,
+            LoadingDecision::configured("always_on", "experimental_betas_disabled")
+        );
+        // Builds older than the proven default are not assumed either way.
+        let legacy = claude_loading_decision(&claude_env(None, false, false), false, Some("2.0.9"));
+        assert_eq!(
+            legacy,
+            LoadingDecision::client_default("unknown", "legacy_client")
+        );
+        // An unreadable version keeps the current default.
+        let unread = claude_loading_decision(&claude_env(None, false, false), false, None);
+        assert_eq!(unread.mode, "on_demand");
+    }
+
+    #[test]
+    fn codex_code_mode_builds_load_no_mcp_schema_up_front() {
+        assert_eq!(
+            codex_loading_decision(Some("0.162.1")),
+            LoadingDecision::client_default("on_demand", "client_default")
+        );
+        assert_eq!(
+            codex_loading_decision(Some("0.149.0-alpha.4.1")),
+            LoadingDecision::client_default("on_demand", "client_default")
+        );
+        // Builds older than code mode are not assumed either way.
+        assert_eq!(
+            codex_loading_decision(Some("0.146.0-alpha.3.1")),
+            LoadingDecision::client_default("unknown", "legacy_client")
+        );
+        assert_eq!(codex_loading_decision(None).mode, "on_demand");
+    }
+
+    #[test]
+    fn tool_search_auto_threshold_and_versions_parse() {
+        assert_eq!(
+            tool_search_auto_pct(&claude_env(Some("auto"), false, false)),
+            Some(10)
+        );
+        assert_eq!(
+            tool_search_auto_pct(&claude_env(Some("AUTO:0"), false, false)),
+            Some(0)
+        );
+        assert_eq!(
+            tool_search_auto_pct(&claude_env(Some("auto:250"), false, false)),
+            Some(10)
+        );
+        assert_eq!(
+            tool_search_auto_pct(&claude_env(Some("false"), false, false)),
+            None
+        );
+        assert_eq!(tool_search_auto_pct(&claude_env(None, false, false)), None);
+        assert_eq!(parse_version("2.1.300 (Claude Code)"), Some((2, 1, 300)));
+        assert_eq!(parse_version("0.155.0-alpha.16.4"), Some((0, 155, 0)));
+        assert_eq!(parse_version("codex"), None);
+        assert!(is_first_party_anthropic_url("https://api.anthropic.com"));
+        assert!(is_first_party_anthropic_url(""));
+        assert!(!is_first_party_anthropic_url(
+            "https://relay.example.test/v1"
+        ));
+        assert!(!is_first_party_anthropic_url("http://localhost:8080"));
+    }
+
+    #[test]
+    fn loading_policy_applies_project_settings_to_project_servers() {
+        let home = test_home("loading-policy-project");
+        let project = home.join("proj");
+        fs::create_dir_all(project.join(".claude")).unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            json!({
+                "lastReleaseNotesSeen": "2.1.300",
+                "mcpServers": { "global": { "command": "g" } },
+                "projects": {
+                    project.to_string_lossy(): { "mcpServers": { "local": { "command": "l" } } }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            project.join(".mcp.json"),
+            json!({ "mcpServers": { "shared": { "command": "s" } } }).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            project.join(".claude").join("settings.json"),
+            json!({ "env": { "ENABLE_TOOL_SEARCH": "true" } }).to_string(),
+        )
+        .unwrap();
+        // The project's settings.local.json wins over its settings.json.
+        fs::write(
+            project.join(".claude").join("settings.local.json"),
+            json!({ "env": { "ENABLE_TOOL_SEARCH": "false" } }).to_string(),
+        )
+        .unwrap();
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        let configured = discover_claude_code(&home);
+        let mut servers: Vec<McpServerInput> = configured.iter().map(unreachable_server).collect();
+        apply_loading_policy(&mut servers, &configured, &policy);
+        let by_name = |name: &str| servers.iter().find(|s| s.server == name).unwrap();
+        for name in ["local", "shared"] {
+            assert_eq!(by_name(name).loading_mode, "always_on", "{name}");
+            assert_eq!(by_name(name).loading_mode_basis, "tool_search_disabled");
+            assert!(!by_name(name).loading_mode_inferred);
+        }
+        // A user-scope server keeps the user settings (none: client default).
+        assert_eq!(by_name("global").loading_mode, "on_demand");
+        assert_eq!(by_name("global").loading_mode_basis, "client_default");
+
+        // A project auto threshold other than the user's (the one the
+        // inventory carries) stays unresolved.
+        fs::write(
+            project.join(".claude").join("settings.local.json"),
+            json!({ "env": { "ENABLE_TOOL_SEARCH": "auto:5" } }).to_string(),
+        )
+        .unwrap();
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        assert_eq!(policy.tool_search_auto_pct(), None);
+        let mut servers: Vec<McpServerInput> = configured.iter().map(unreachable_server).collect();
+        apply_loading_policy(&mut servers, &configured, &policy);
+        let local = servers.iter().find(|s| s.server == "local").unwrap();
+        assert_eq!(local.loading_mode, "unknown");
+        assert_eq!(local.loading_mode_basis, "tool_search_auto_project");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn loading_policy_reads_claude_settings_and_codex_session_version() {
+        let home = test_home("loading-policy");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            json!({
+                "lastReleaseNotesSeen": "2.1.299",
+                "mcpServers": {
+                    "pinned": { "command": "x", "alwaysLoad": true },
+                    "lazy": { "command": "y" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            json!({ "env": { "ENABLE_TOOL_SEARCH": "false" } }).to_string(),
+        )
+        .unwrap();
+        // settings.local.json wins over settings.json.
+        fs::write(
+            home.join(".claude").join("settings.local.json"),
+            json!({ "env": { "ENABLE_TOOL_SEARCH": "auto:20" } }).to_string(),
+        )
+        .unwrap();
+        let policy = LoadingPolicy::read(&home, SnapshotSource::ClaudeCode);
+        assert_eq!(policy.client_version().as_deref(), Some("2.1.299"));
+        assert_eq!(policy.tool_search_auto_pct(), Some(20));
+
+        let configured = discover_claude_code(&home);
+        let mut servers: Vec<McpServerInput> = configured.iter().map(unreachable_server).collect();
+        apply_loading_policy(&mut servers, &configured, &policy);
+        let by_name = |name: &str| servers.iter().find(|s| s.server == name).unwrap();
+        assert_eq!(by_name("pinned").loading_mode, "always_on");
+        assert_eq!(by_name("pinned").loading_mode_basis, "always_load");
+        assert!(!by_name("pinned").loading_mode_inferred);
+        assert_eq!(by_name("lazy").loading_mode, "unknown");
+        assert_eq!(by_name("lazy").loading_mode_basis, "tool_search_auto");
+
+        // Codex: the newest session log's first line carries the version.
+        let day = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("18");
+        fs::create_dir_all(&day).unwrap();
+        let old_day = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("30");
+        fs::create_dir_all(&old_day).unwrap();
+        fs::write(
+            old_day.join("rollout-2026-09-30T01-00-00-a.jsonl"),
+            "{\"payload\":{\"cli_version\":\"0.140.0\"}}\n",
+        )
+        .unwrap();
+        fs::write(
+            day.join("rollout-2026-10-18T01-00-00-a.jsonl"),
+            "{\"payload\":{\"cli_version\":\"0.160.0\"}}\n",
+        )
+        .unwrap();
+        fs::write(
+            day.join("rollout-2026-10-18T09-00-00-b.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"cli_version\":\"0.162.1\"}}\n{}\n",
+        )
+        .unwrap();
+        let codex = LoadingPolicy::read(&home, SnapshotSource::Codex);
+        assert_eq!(codex.client_version().as_deref(), Some("0.162.1"));
+        assert_eq!(codex.tool_search_auto_pct(), None);
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn handshake_reports_instructions_length_and_tool_always_load() {
+        let initialize = json!({"jsonrpc":"2.0","id":1,"result":{"instructions":"héllo"}});
+        assert_eq!(instructions_chars(&initialize), Some(5));
+        assert_eq!(instructions_chars(&json!({"id":1,"result":{}})), None);
+        let tools = parse_tools(&json!({"id":2,"result":{"tools":[
+            {"name":"pinned","_meta":{"anthropic/alwaysLoad":true}},
+            {"name":"lazy"}
+        ]}}));
+        assert!(tools[0].always_load);
+        assert!(!tools[1].always_load);
+        // The default flag is omitted from the payload.
+        let wire = serde_json::to_value(&tools[1]).unwrap();
+        assert!(wire.get("always_load").is_none());
+        assert_eq!(
+            serde_json::to_value(&tools[0]).unwrap()["always_load"],
+            json!(true)
+        );
     }
 
     #[test]
@@ -2517,16 +3253,22 @@ enabled = true
             agent_source: "claude-code".to_string(),
             machine_id: Some("otm_test".to_string()),
             context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+            client_version: None,
+            tool_search_auto_pct: None,
             servers: vec![McpServerInput {
                 server: "fetch".to_string(),
                 transport: Some("stdio".to_string()),
                 reachable: true,
                 disabled: false,
                 loading_mode: "on_demand".to_string(),
+                loading_mode_basis: "client_default".to_string(),
+                loading_mode_inferred: true,
+                instructions_chars: None,
                 tools: vec![McpToolInput {
                     name: "fetch".to_string(),
                     description: "Fetch a URL".to_string(),
                     input_schema: json!({ "type": "object" }),
+                    always_load: false,
                 }],
             }],
             capabilities: vec![McpCapabilityInput {
@@ -2612,6 +3354,7 @@ enabled = true
                     env: std::collections::BTreeMap::new(),
                 },
                 disabled: false,
+                always_load: false,
             },
             ConfiguredServer {
                 config_dir: None,
@@ -2620,11 +3363,11 @@ enabled = true
                     url: "https://x.test".to_string(),
                 },
                 disabled: false,
+                always_load: false,
             },
         ];
         let past = Instant::now() - Duration::from_secs(1);
-        let (servers, throttled, _) =
-            harvest_servers(&configured, "on_demand", past, &test_spawn_env());
+        let (servers, throttled, _) = harvest_servers(&configured, past, &test_spawn_env());
         assert!(throttled);
         assert!(servers.is_empty(), "no probes launched after the deadline");
     }
@@ -2637,6 +3380,7 @@ enabled = true
             .map(|i| ConfiguredServer {
                 config_dir: None,
                 disabled: false,
+                always_load: false,
                 name: format!("s{i}"),
                 transport: Transport::Http {
                     url: "https://x.test".to_string(),
@@ -2645,7 +3389,6 @@ enabled = true
             .collect();
         let (servers, throttled, _) = harvest_servers(
             &configured,
-            "always_on",
             Instant::now() + Duration::from_secs(30),
             &test_spawn_env(),
         );
@@ -2762,7 +3505,8 @@ done
             &std::collections::BTreeMap::new(),
             None,
         )
-        .expect("handshake succeeds");
+        .expect("handshake succeeds")
+        .tools;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
         assert_eq!(tools[0].description, "Echo input");
@@ -2776,16 +3520,22 @@ done
             agent_source: "claude-code".to_string(),
             machine_id: Some("otm_test".to_string()),
             context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+            client_version: None,
+            tool_search_auto_pct: None,
             servers: vec![McpServerInput {
                 server: server.to_string(),
                 transport: Some("stdio".to_string()),
                 reachable: true,
                 disabled: false,
                 loading_mode: "on_demand".to_string(),
+                loading_mode_basis: "client_default".to_string(),
+                loading_mode_inferred: true,
+                instructions_chars: None,
                 tools: vec![McpToolInput {
                     name: tool.to_string(),
                     description: String::new(),
                     input_schema: json!({ "type": "object" }),
+                    always_load: false,
                 }],
             }],
             capabilities: Vec::new(),
@@ -3275,6 +4025,7 @@ done
                 env: BTreeMap::new(),
             },
             disabled: false,
+            always_load: false,
             config_dir: None,
         };
         let env = SpawnEnv {
@@ -3282,13 +4033,13 @@ done
             provider: [("CLAUDE_CONFIG_DIR".to_string(), OsString::new())].into(),
         };
         fake.default_login_expires_in(time::Duration::minutes(10));
-        let (input, deferred) = harvest_server(&server, "unknown", &env);
+        let (input, deferred) = harvest_server(&server, &env);
         assert!(deferred);
         assert!(!input.reachable);
         assert!(fake.spawns().is_empty(), "not started in the quiet window");
 
         fake.default_login_expires_in(time::Duration::hours(3));
-        let (_, deferred) = harvest_server(&server, "unknown", &env);
+        let (_, deferred) = harvest_server(&server, &env);
         assert!(!deferred);
         assert_eq!(fake.spawns(), vec!["|mcp serve".to_string()]);
     }

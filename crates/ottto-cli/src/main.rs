@@ -2,9 +2,10 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use ottto_core::{
     client_control_token, default_socket_path, execute_local_uninstall,
     ingest_claude_statusline_payload, install_owner_for_path, kickstart_macos_launch_agent,
-    load_or_create_control_token, local_lifecycle_home_dir, request_unix_socket_with_timeout,
-    UninstallExecutionOptions, LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT,
-    OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
+    load_or_create_control_token_unless_daemon_owns, local_lifecycle_home_dir,
+    request_unix_socket_with_timeout, TokenStoreError, UninstallExecutionOptions,
+    LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT, OTTTO_SERVICE_BINARY_NAME,
+    OTTTO_SOCKET_ENV,
 };
 use ottto_protocol::{
     expected_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
@@ -65,7 +66,7 @@ enum Command {
     #[command(about = "List apps or refresh app setup status")]
     Apps(AppsArgs),
     #[command(about = "Refresh one source status using the lower-level source noun")]
-    AgentStatus(SourceArgs),
+    AgentStatus(AgentStatusArgs),
     #[command(about = "Print cloud context for AI agents")]
     Context(ContextArgs),
     #[command(about = "Print cloud cost breakdown for AI agents")]
@@ -385,7 +386,9 @@ struct ContextArgs {
         help = "Inclusive custom window end date"
     )]
     end_date: Option<String>,
-    #[arg(long, value_name = "TZ", help = "IANA timezone for calendar windows")]
+    // Unsupported: calendar windows use the account's saved timezone. Kept
+    // hidden so the daemon can refuse it with that reason.
+    #[arg(long, value_name = "TZ", hide = true)]
     timezone: Option<String>,
     #[arg(long, value_name = "SOURCE", help = "Source slug to filter context to")]
     source: Option<String>,
@@ -454,7 +457,9 @@ struct CostsArgs {
         help = "Inclusive custom window end date"
     )]
     end_date: Option<String>,
-    #[arg(long, value_name = "TZ", help = "IANA timezone for calendar windows")]
+    // Unsupported: calendar windows use the account's saved timezone. Kept
+    // hidden so the daemon can refuse it with that reason.
+    #[arg(long, value_name = "TZ", hide = true)]
     timezone: Option<String>,
     #[arg(long, value_name = "SOURCE", help = "Source slug to filter costs to")]
     source: Option<String>,
@@ -463,7 +468,7 @@ struct CostsArgs {
     #[arg(
         long,
         value_name = "MACHINE_ID",
-        help = "Override the local machine filter"
+        help = "Filter to one machine (refused while Ottto can't answer it; use by_machine rows)"
     )]
     machine_id: Option<String>,
     #[arg(
@@ -480,8 +485,19 @@ struct CostsArgs {
         help = "Breakdown mode such as full or overview"
     )]
     mode: Option<String>,
-    #[arg(long, help = "Request account-wide costs instead of this Mac")]
+    #[arg(
+        long,
+        help = "Accepted for compatibility; costs are account-wide by default"
+    )]
     all_machines: bool,
+    #[arg(
+        long,
+        value_name = "LIST",
+        help = "Comma-separated groups such as machine,model, or all"
+    )]
+    dimensions: Option<String>,
+    #[arg(long, help = "Include daily series for the selected groups")]
+    daily: bool,
 }
 
 impl CostsArgs {
@@ -498,6 +514,8 @@ impl CostsArgs {
             bucket: non_empty_option(self.bucket.as_deref()),
             mode: non_empty_option(self.mode.as_deref()),
             all_machines: self.all_machines,
+            dimensions: non_empty_option(self.dimensions.as_deref()),
+            daily: self.daily,
         }
     }
 }
@@ -539,7 +557,9 @@ struct SessionsArgs {
         help = "Inclusive custom window end date"
     )]
     end_date: Option<String>,
-    #[arg(long, value_name = "TZ", help = "IANA timezone for calendar windows")]
+    // Unsupported: calendar windows use the account's saved timezone. Kept
+    // hidden so the daemon can refuse it with that reason.
+    #[arg(long, value_name = "TZ", hide = true)]
     timezone: Option<String>,
     #[arg(
         long,
@@ -558,7 +578,7 @@ struct SessionsArgs {
     #[arg(
         long,
         value_name = "MACHINE_ID",
-        help = "Override the local machine filter"
+        help = "Filter to one machine's sessions"
     )]
     machine_id: Option<String>,
     #[arg(
@@ -577,7 +597,10 @@ struct SessionsArgs {
     sort_dir: Option<String>,
     #[arg(long, value_name = "TEXT", help = "Search text")]
     search: Option<String>,
-    #[arg(long, help = "Request account-wide sessions instead of this Mac")]
+    #[arg(
+        long,
+        help = "Accepted for compatibility; sessions are account-wide by default"
+    )]
     all_machines: bool,
 }
 
@@ -718,7 +741,7 @@ struct LogoutArgs {
     local_only: bool,
     #[arg(
         long,
-        help = "Forget installation identity, account scope, credentials, and local sync receipts"
+        help = "Forget installation identity, credentials, and local sync receipts; without --local-only, first release this Mac in Ottto"
     )]
     forget_installation: bool,
     #[arg(
@@ -744,6 +767,17 @@ struct SourceArgs {
     app: Option<SourceArg>,
     #[arg(long, help = "Print one final JSON object and no human summary text")]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct AgentStatusArgs {
+    #[command(flatten)]
+    source: SourceArgs,
+    #[arg(
+        long,
+        help = "Read daemon memory only; never refresh or start the daemon"
+    )]
+    cached: bool,
 }
 
 impl SourceArgs {
@@ -1081,6 +1115,7 @@ fn is_long_running_command(command: &LocalControlCommand) -> bool {
         command,
         LocalControlCommand::Status {
             refresh_agent_status: true,
+            ..
         } | LocalControlCommand::AgentStatusRefresh { .. }
             | LocalControlCommand::AgentContext { .. }
             | LocalControlCommand::AgentCosts { .. }
@@ -2087,9 +2122,12 @@ fn print_error(error: CliError, output_mode: OutputMode, request_id: Option<&str
 fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
     let socket_overridden = cli.socket.is_some();
     let env_socket_present = std::env::var_os(OTTTO_SOCKET_ENV).is_some();
-    let token = cli.token.unwrap_or_else(default_cli_control_token);
+    let token = cli
+        .token
+        .unwrap_or_else(|| default_cli_control_token(output_mode));
     let socket = cli.socket.unwrap_or_else(default_socket_path);
     let command = local_command(cli.command);
+    let cached = matches!(command, LocalControlCommand::AgentStatusCached { .. });
     let protocol_version = expected_local_control_protocol_version(&command);
     Invocation {
         socket,
@@ -2106,15 +2144,33 @@ fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
             command,
         },
         output_mode,
-        auto_start: should_auto_start(socket_overridden, cli.no_autostart, env_socket_present),
+        auto_start: !cached
+            && should_auto_start(socket_overridden, cli.no_autostart, env_socket_present),
     }
 }
 
-fn default_cli_control_token() -> String {
+fn default_cli_control_token(output_mode: OutputMode) -> String {
     match client_control_token() {
         Ok(token) => token,
-        Err(_) if !cfg!(debug_assertions) => load_or_create_control_token()
-            .unwrap_or_else(|_| "local-development-control-token".to_string()),
+        Err(_) if !cfg!(debug_assertions) => {
+            // Never creates a token while a daemon owns local state.
+            match load_or_create_control_token_unless_daemon_owns() {
+                Ok(token) => token,
+                Err(TokenStoreError::DaemonNotReady) => std::process::exit(print_error(
+                    CliError {
+                        code: CliErrorCode::DaemonUnavailable,
+                        message: format!(
+                            "{OTTTO_SERVICE_BINARY_NAME} is starting and has not created its control token yet; retry in a few seconds"
+                        ),
+                        retryable: true,
+                        details: BTreeMap::new(),
+                    },
+                    output_mode,
+                    None,
+                )),
+                Err(_) => "local-development-control-token".to_string(),
+            }
+        }
         Err(_) => "local-development-control-token".to_string(),
     }
 }
@@ -2131,6 +2187,7 @@ fn local_command(command: Command) -> LocalControlCommand {
     match command {
         Command::Status(args) => LocalControlCommand::Status {
             refresh_agent_status: args.refresh_agent_status,
+            retry_relay_authorization: false,
         },
         Command::Receipts(args) => LocalControlCommand::Receipts {
             limit: args.limit,
@@ -2140,19 +2197,28 @@ fn local_command(command: Command) -> LocalControlCommand {
         Command::Apps(args) => match args.command {
             None => LocalControlCommand::Status {
                 refresh_agent_status: false,
+                retry_relay_authorization: false,
             },
             Some(AppsCommand::Detect(_)) => LocalControlCommand::Status {
                 refresh_agent_status: true,
+                retry_relay_authorization: false,
             },
             Some(AppsCommand::Status(args)) => LocalControlCommand::AgentStatusRefresh {
                 source: Some(args.app.into()),
                 quota_refresh: false,
             },
         },
-        Command::AgentStatus(args) => LocalControlCommand::AgentStatusRefresh {
-            source: Some(args.selected_source()),
-            quota_refresh: false,
-        },
+        Command::AgentStatus(args) => {
+            let source = Some(args.source.selected_source());
+            if args.cached {
+                LocalControlCommand::AgentStatusCached { source }
+            } else {
+                LocalControlCommand::AgentStatusRefresh {
+                    source,
+                    quota_refresh: false,
+                }
+            }
+        }
         Command::Context(args) => LocalControlCommand::AgentContext {
             query: args.query(),
         },
@@ -2209,6 +2275,7 @@ fn local_command(command: Command) -> LocalControlCommand {
         },
         Command::Doctor(_) => LocalControlCommand::Status {
             refresh_agent_status: false,
+            retry_relay_authorization: true,
         },
         Command::Fix(args) => LocalControlCommand::Repair {
             source: args.selected_source(),
@@ -2265,7 +2332,8 @@ fn command_json(command: &Command) -> bool {
         Command::Sessions(args) => args.json,
         Command::Recommendations(args) => args.json,
         Command::ProviderImpact(args) => args.json,
-        Command::AgentStatus(args) | Command::Fix(args) => args.json,
+        Command::AgentStatus(args) => args.source.json,
+        Command::Fix(args) => args.json,
         Command::Verify(args) => args.json,
         Command::Diagnostics {
             command: DiagnosticsCommand::Collect(args),
@@ -2359,6 +2427,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::Receipts { .. } => "receipts",
         LocalControlCommand::AuthStatus => "auth_status",
         LocalControlCommand::AgentStatusRefresh { .. } => "agent_status_refresh",
+        LocalControlCommand::AgentStatusCached { .. } => "agent_status_cached",
         LocalControlCommand::PersonalMeterLocalSnapshot { .. } => "personal_meter_local_snapshot",
         LocalControlCommand::AgentContext { .. } => "agent_context",
         LocalControlCommand::AgentCosts { .. } => "agent_costs",
@@ -2409,6 +2478,9 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::CodexAccountStopWaiting { .. } => "codex_account_stop_waiting",
         LocalControlCommand::CodexAccountStartSignIn { .. } => "codex_account_start_sign_in",
         LocalControlCommand::CodexAccountRemove { .. } => "codex_account_remove",
+        LocalControlCommand::CodexAccountSetQuotaRefreshConsent { .. } => {
+            "codex_account_set_quota_refresh_consent"
+        }
         LocalControlCommand::Detect { .. } => "detect",
         LocalControlCommand::Setup { .. } => "setup",
         LocalControlCommand::SetupAnswer { .. } => "setup_answer",
@@ -2676,6 +2748,7 @@ mod tests {
         for command in [
             LocalControlCommand::Status {
                 refresh_agent_status: true,
+                retry_relay_authorization: false,
             },
             LocalControlCommand::AgentStatusRefresh {
                 source: None,
@@ -2733,6 +2806,7 @@ mod tests {
         // long-running worst case.
         let plain_status = LocalControlCommand::Status {
             refresh_agent_status: false,
+            retry_relay_authorization: false,
         };
         assert!(!is_long_running_command(&plain_status));
         assert_eq!(
@@ -3940,6 +4014,34 @@ mod tests {
     }
 
     #[test]
+    fn cloud_forget_installation_is_accepted_without_local_only() {
+        let unconfirmed = Cli::parse_from(["ottto", "logout", "--forget-installation"]);
+        let error = validate_cli(&unconfirmed).expect_err("confirmation required");
+        assert!(error.message.contains("--confirm"));
+
+        let confirmed = Cli::parse_from([
+            "ottto",
+            "logout",
+            "--forget-installation",
+            "--confirm",
+            "--json",
+        ]);
+        assert!(validate_cli(&confirmed).is_ok());
+        let invocation = invocation_from_cli(confirmed);
+        assert_eq!(
+            invocation.request.protocol_version,
+            ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AuthReset {
+                local_only: false,
+                forget_installation: true,
+            }
+        );
+    }
+
+    #[test]
     fn logout_local_request_matches_baseline_fixture() {
         let mut invocation = build_invocation(
             Cli {
@@ -4154,6 +4256,33 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_cached_uses_distinct_fast_verb_without_autostart() {
+        let cli = Cli::parse_from([
+            "ottto",
+            "--token",
+            "test-token",
+            "agent-status",
+            "--app",
+            "claude-code",
+            "--cached",
+            "--json",
+        ]);
+        let mut invocation = invocation_from_cli(cli);
+        assert!(!invocation.auto_start);
+        assert!(!is_long_running_command(&invocation.request.command));
+        assert_eq!(
+            local_command_name(&invocation.request.command),
+            "agent_status_cached"
+        );
+        invocation.request.request_id = "req_cli_agent_status_cached_fixture".into();
+        invocation.request.client_install_owner = None;
+        assert_request_matches_fixture(
+            &invocation,
+            include_str!("../../../fixtures/cli/agent-status-cached-request.json"),
+        );
+    }
+
+    #[test]
     fn agent_status_builds_refresh_request() {
         let invocation = build_invocation(
             Cli {
@@ -4161,10 +4290,13 @@ mod tests {
                 token: Some("token".to_string()),
                 no_autostart: false,
                 watch: false,
-                command: Command::AgentStatus(SourceArgs {
-                    source: Some(SourceArg::Codex),
-                    app: None,
-                    json: true,
+                command: Command::AgentStatus(AgentStatusArgs {
+                    source: SourceArgs {
+                        source: Some(SourceArg::Codex),
+                        app: None,
+                        json: true,
+                    },
+                    cached: false,
                 }),
             },
             OutputMode::Json,
@@ -4324,6 +4456,9 @@ mod tests {
             "day",
             "--mode",
             "full",
+            "--dimensions",
+            "machine,model",
+            "--daily",
         ]);
         validate_cli(&cli).expect("costs json valid");
         let invocation = invocation_from_cli(cli);
@@ -4346,6 +4481,8 @@ mod tests {
                     bucket: Some("day".to_string()),
                     mode: Some("full".to_string()),
                     all_machines: false,
+                    dimensions: Some("machine,model".to_string()),
+                    daily: true,
                 }
             }
         );
@@ -4373,6 +4510,8 @@ mod tests {
                     bucket: Some("day".to_string()),
                     mode: Some("full".to_string()),
                     all_machines: false,
+                    dimensions: Some("all".to_string()),
+                    daily: true,
                 }),
             },
             OutputMode::Json,
@@ -4693,7 +4832,8 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::Status {
-                refresh_agent_status: false
+                refresh_agent_status: false,
+                retry_relay_authorization: false,
             }
         );
     }
@@ -4707,7 +4847,8 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::Status {
-                refresh_agent_status: true
+                refresh_agent_status: true,
+                retry_relay_authorization: false,
             }
         );
     }
@@ -4779,7 +4920,8 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::Status {
-                refresh_agent_status: false
+                refresh_agent_status: false,
+                retry_relay_authorization: false,
             }
         );
     }

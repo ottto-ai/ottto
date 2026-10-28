@@ -396,6 +396,7 @@ mod tests {
             let root = format!("family-{i:05}");
             let path = PathBuf::from(format!("/synthetic/{root}.jsonl"));
             let candidate = CandidateFile {
+                physical_identity: None,
                 scan_root: PathBuf::from("/synthetic"),
                 path: path.clone(),
                 size_bytes: 1,
@@ -405,6 +406,8 @@ mod tests {
                 legacy_source_file_fingerprint: String::new(),
                 legacy_config_reconciliation_required: false,
                 opened_object_identity: "descriptor-only".into(),
+                fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: 0,
             };
             roots.insert(
                 root.clone(),

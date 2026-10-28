@@ -314,7 +314,7 @@ fn local_client_peer(stream: &UnixStream) -> Option<LocalClientPeer> {
     Some(LocalClientPeer::from_pid_and_euid(pid, euid))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn peer_euid(stream: &UnixStream) -> Option<u32> {
     // getpeereid is a supported, non-spoofable way to read the connecting
     // peer's effective uid (and gid). It is captured here at accept time and
@@ -326,6 +326,32 @@ fn peer_euid(stream: &UnixStream) -> Option<u32> {
     // `libc::uid_t` is `u32` on every supported unix target.
     if rc == 0 {
         Some(uid)
+    } else {
+        None
+    }
+}
+
+// glibc has no getpeereid; SO_PEERCRED reads the same kernel-recorded
+// credentials. Linux is a test-only host; macOS takes the branch above.
+#[cfg(target_os = "linux")]
+fn peer_euid(stream: &UnixStream) -> Option<u32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 && len as usize == std::mem::size_of::<libc::ucred>() {
+        Some(cred.uid)
     } else {
         None
     }
@@ -511,6 +537,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )
@@ -555,6 +582,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )
@@ -664,6 +692,7 @@ mod tests {
             client_install_owner: None,
             command: LocalControlCommand::Status {
                 refresh_agent_status: false,
+                retry_relay_authorization: false,
             },
         };
         let mut stream = UnixStream::connect(&path).expect("connect socket");
@@ -749,6 +778,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )
@@ -826,6 +856,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
             Duration::from_millis(500),
@@ -880,6 +911,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )
@@ -951,6 +983,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )
@@ -983,6 +1016,7 @@ mod tests {
             client_install_owner: None,
             command: LocalControlCommand::Status {
                 refresh_agent_status: false,
+                retry_relay_authorization: false,
             },
         };
         let mut stream = UnixStream::connect(&path).expect("connect socket");
@@ -1058,6 +1092,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )

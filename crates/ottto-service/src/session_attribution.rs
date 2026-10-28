@@ -26,6 +26,8 @@ use zeroize::Zeroizing;
 
 pub const SESSION_ATTRIBUTION_SCHEMA_VERSION: &str = "session_attribution.v1";
 pub const MAX_SESSION_ATTRIBUTION_FACTS: usize = 24;
+/// `skill_id` facts per session; invocations are emitted before references.
+pub(crate) const MAX_SKILL_FACTS: usize = 8;
 pub const MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES: usize = 128;
 pub const MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES: usize = 32;
 pub const MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES: usize = 96;
@@ -72,6 +74,32 @@ pub struct SessionFieldEvidence {
     pub observed_at: String,
     pub source_version: String,
     pub evidence_ref: String,
+}
+
+/// Parser ids whose lineage facts state a controller starting an independent
+/// run: an instrumented launcher, or the Claude desktop app's `start_session`.
+/// Mirrors `_LAUNCHED_CAPTURE_SOURCES` in the backend's session-family facts,
+/// which serves an edge from these parsers as `launched` rather than as nested
+/// work inside one job. The two sets must stay equal.
+const LAUNCHED_CAPTURE_SOURCES: [&str; 2] = ["launcher_event", "claude_desktop_spawn"];
+
+impl SessionFieldEvidence {
+    /// Whether this evidence comes from a launched capture source: the exact
+    /// parser id before the first `:` of `source_version`, matched the way the
+    /// backend matches it. No prefix or substring match, so a look-alike parser
+    /// keeps its current meaning.
+    ///
+    /// A launched session is its own run and its account is its own question.
+    /// Account consumers therefore never read a launched lineage fact as
+    /// account-family membership or as an account to borrow. The fact itself
+    /// still uploads and still draws the backend's `launched` edge.
+    pub(crate) fn states_independent_launch(&self) -> bool {
+        let parser = self
+            .source_version
+            .split_once(':')
+            .map_or(self.source_version.as_str(), |(parser, _)| parser);
+        LAUNCHED_CAPTURE_SOURCES.contains(&parser)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -299,6 +327,12 @@ impl SessionAttributionContext {
         facts
     }
 
+    /// Tenant-keyed opaque id for one kind of local material, the same scheme
+    /// as skill and template ids. Exists only while attribution is collected.
+    pub(crate) fn opaque_id(&self, domain: &str, material: &str) -> Option<String> {
+        opaque_hmac_id(&self.key, domain, material)
+    }
+
     pub fn grouping_facts(
         &self,
         input: SessionAttributionGroupingInput<'_>,
@@ -344,8 +378,12 @@ impl SessionAttributionContext {
             }
         }
 
+        // Keyed case-insensitively: provider names arrive lowercased, while
+        // SKILL.md directory names keep their case, and one skill must not
+        // take two fact slots. Each fact still hashes its own spelling, and
+        // `activity_summary` uploads those same spellings for promotion.
         let mut emitted_skills = BTreeSet::new();
-        for skill in input.provider_skills.iter().take(8) {
+        for skill in input.provider_skills.iter().take(MAX_SKILL_FACTS) {
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
                 let display_label = skill_name_display_label(skill);
                 push_labeled_fact(
@@ -358,11 +396,13 @@ impl SessionAttributionContext {
                     "direct",
                     &evidence_context,
                 );
-                emitted_skills.insert(skill.clone());
+                emitted_skills.insert(skill.to_ascii_lowercase());
             }
         }
         for skill in input.activity_skills {
-            if emitted_skills.len() >= 8 || emitted_skills.contains(skill) {
+            if emitted_skills.len() >= MAX_SKILL_FACTS
+                || emitted_skills.contains(&skill.to_ascii_lowercase())
+            {
                 continue;
             }
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
@@ -377,11 +417,13 @@ impl SessionAttributionContext {
                     "direct",
                     &evidence_context,
                 );
-                emitted_skills.insert(skill.clone());
+                emitted_skills.insert(skill.to_ascii_lowercase());
             }
         }
         if let Some(skill) = input.first_prompt.and_then(slash_skill_name) {
-            if emitted_skills.len() < 8 && !emitted_skills.contains(&skill) {
+            if emitted_skills.len() < MAX_SKILL_FACTS
+                && !emitted_skills.contains(&skill.to_ascii_lowercase())
+            {
                 if let Some(value) = opaque_hmac_id(&self.key, "skill", &skill) {
                     let display_label = skill_name_display_label(&skill);
                     push_labeled_fact(
@@ -1097,6 +1139,62 @@ pub fn claude_subagent_facts(
     facts
 }
 
+/// Parser id stamped on the lineage facts read from the Claude desktop app's
+/// per-session store. The backend serves an edge with this capture source as
+/// `launched`: the parent started a separate session rather than sub-work.
+pub const CLAUDE_DESKTOP_SPAWN_SOURCE_VERSION: &str = "claude_desktop_spawn:v1";
+
+/// Fixed-name lineage facts for a Claude Code session another session started
+/// from the Claude desktop app (its `start_session` tool). The app records the
+/// starting session as `spawnedFrom` in the child's own store file, so these
+/// are provider-owned artifacts, not inference. `parent_session_ref` is the
+/// starting session's transcript id (its `cliSessionId`).
+///
+/// Same shape as a launcher edge: the child is a separate top-level session,
+/// not sub-work inside the parent's job. `root_session_ref` and `spawn_depth`
+/// are deliberately absent: `root_session_ref` is the Task/Workflow family
+/// rollup key the usage-family, request-ownership and account consumers read,
+/// and the child's family is still its own transcript.
+///
+/// The reference is exported only as a canonical lowercase UUID, the form
+/// Claude Code names its transcripts with. Anything else (a path, a malformed
+/// or re-cased id) yields no facts at all rather than a partial edge.
+///
+/// Ordered most- to least-load-bearing because the caller trims from the tail
+/// to stay inside the bounded payload budget.
+pub fn claude_desktop_spawn_facts(
+    parent_session_ref: &str,
+    source_session_id: &str,
+    observed_at: &str,
+) -> Vec<SessionAttributionFact> {
+    let mut facts = Vec::new();
+    if crate::claude_local_otel::canonical_uuid(parent_session_ref).as_deref()
+        != Some(parent_session_ref)
+    {
+        return facts;
+    }
+    let evidence_context = EvidenceContext {
+        source_session_id,
+        observed_at,
+        source_version: CLAUDE_DESKTOP_SPAWN_SOURCE_VERSION,
+    };
+    for (field, value) in [
+        ("parent_session_ref", parent_session_ref),
+        ("origin_kind", "agent_spawn"),
+        ("agent_kind", "claude_desktop_session"),
+    ] {
+        push_fact(
+            &mut facts,
+            field,
+            value,
+            "provider_artifact",
+            "direct",
+            &evidence_context,
+        );
+    }
+    facts
+}
+
 /// Exact Codex subagent identity plus optional family facts.
 ///
 /// The rollout itself supplies the subagent identity and an independently
@@ -1392,6 +1490,10 @@ fn push_fact(
     push_labeled_fact(facts, field, value, None, None, kind, strength, context);
 }
 
+// X_out (#665): `snapshots.rs`'s `fact_limit_scratch_bound` charges each of
+// a fact's `field`, `kind` and `strength` at `FACT_LITERAL_BYTES` (64). Pass
+// only `'static` literals of at most 64 bytes for them (the longest today is
+// 22); a longer or dynamic one needs that constant raised first.
 #[allow(clippy::too_many_arguments)]
 fn push_labeled_fact(
     facts: &mut Vec<SessionAttributionFact>,
@@ -1791,6 +1893,57 @@ mod tests {
     }
 
     #[test]
+    fn claude_desktop_spawn_facts_state_the_starting_session_as_provider_artifact() {
+        let facts = claude_desktop_spawn_facts(
+            "94bd328b-f2a9-4c31-bbfe-e174d41b4310",
+            "da1dc804-1c50-4401-8c3c-0898b126772f",
+            "2026-10-18T10:20:00Z",
+        );
+
+        // A launched top-level session: no Task/Workflow family root or depth.
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| (fact.field.as_str(), fact.value.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("parent_session_ref", "94bd328b-f2a9-4c31-bbfe-e174d41b4310"),
+                ("origin_kind", "agent_spawn"),
+                ("agent_kind", "claude_desktop_session"),
+            ]
+        );
+        for fact in &facts {
+            assert_eq!(fact.evidence.kind, "provider_artifact");
+            assert_eq!(fact.evidence.strength, "direct");
+            assert_eq!(fact.evidence.source_version, "claude_desktop_spawn:v1");
+        }
+        validate_fact_limits(&facts).expect("facts fit the wire contract");
+    }
+
+    #[test]
+    fn claude_desktop_spawn_facts_refuse_a_non_uuid_starting_session() {
+        for parent in [
+            "/Users/example/project",
+            "~/project/94bd328b-f2a9-4c31-bbfe-e174d41b4310",
+            "94BD328B-F2A9-4C31-BBFE-E174D41B4310",
+            " 94bd328b-f2a9-4c31-bbfe-e174d41b4310",
+            "94bd328b-f2a9-4c31-bbfe-e174d41b4310_agent-a1b2c3d4e5f6a7b8c",
+            "local_parent",
+            "",
+        ] {
+            assert!(
+                claude_desktop_spawn_facts(
+                    parent,
+                    "da1dc804-1c50-4401-8c3c-0898b126772f",
+                    "2026-10-18T10:20:00Z",
+                )
+                .is_empty(),
+                "{parent:?}"
+            );
+        }
+    }
+
+    #[test]
     fn launch_event_facts_state_the_controller_edge_as_direct_evidence() {
         let event = launch_event();
         let context = launch_context(vec![event.clone()]);
@@ -1865,6 +2018,37 @@ mod tests {
         assert!(launch_context(Vec::new())
             .launch_event_facts(&launch_event().worker_session_ref, "2026-08-09T15:20:00Z")
             .is_empty());
+    }
+
+    #[test]
+    fn only_exact_launched_parsers_state_an_independent_launch() {
+        let launcher_fact = launch_context(vec![launch_event()])
+            .launch_event_facts(&launch_event().worker_session_ref, "2026-08-09T15:20:00Z")
+            .remove(0);
+        assert!(launcher_fact.evidence.states_independent_launch());
+        for (source_version, launched) in [
+            ("launcher_event:v1", true),
+            ("claude_desktop_spawn:v1", true),
+            ("launcher_event", true),
+            ("launcher_events:v1", false),
+            ("claude_desktop_spawner:v1", false),
+            ("xlauncher_event:v1", false),
+            ("launcher_event_v1", false),
+            ("Launcher_event:v1", false),
+            ("", false),
+            (
+                crate::snapshots::SnapshotSource::ClaudeCode.parser_version(),
+                false,
+            ),
+        ] {
+            let mut evidence = launcher_fact.evidence.clone();
+            evidence.source_version = source_version.to_string();
+            assert_eq!(
+                evidence.states_independent_launch(),
+                launched,
+                "{source_version:?}"
+            );
+        }
     }
 
     #[test]
@@ -2032,9 +2216,10 @@ mod tests {
             launch_events: crate::launch_events::LaunchEventInventory::default(),
         };
         let provider_skills = BTreeSet::from(["shared-skill".to_string()]);
+        // Same skill as the invocation, spelled with its directory's case.
         let activity_skills = BTreeSet::from([
             "repo-task-lifecycle".to_string(),
-            "shared-skill".to_string(),
+            "Shared-Skill".to_string(),
         ]);
 
         let facts = context.grouping_facts(SessionAttributionGroupingInput {

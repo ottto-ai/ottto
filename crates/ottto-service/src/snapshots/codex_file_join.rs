@@ -2,8 +2,13 @@
 //! retain the existing reader's meaning; response ownership is a separate fact.
 use super::*;
 
-pub(super) const MAX_MEMBERS: usize = 32;
-pub(super) const MAX_RECORDS: usize = 50_000;
+mod group_job;
+pub(super) use group_job::{
+    disclose_members, disclose_strict, end_group, group_counting_is_v2, job_key,
+    refusal_disclosure, step_group, take_charge, Boot, EndInputs, GroupBoot, GroupEnd, GroupJob,
+    GroupStep, JobInputs, StepInputs,
+};
+
 pub(super) const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 pub(super) const MAX_HEADER_FILES: usize = 32_768;
@@ -12,7 +17,6 @@ pub(super) const MAX_HEADER_FILES: usize = 32_768;
 // 32MiB ceiling permanently refused otherwise-valid inventories. Reads still
 // yield one header per step, and no decoded header is retained between steps.
 const MAX_HEADER_READ_BYTES: usize = MAX_HEADER_FILES * (MAX_HEADER_BYTES + 1);
-pub(super) const MAX_GROUP_BYTES: u64 = 256 * 1024 * 1024;
 
 fn metadata_witness(metadata: &fs::Metadata) -> String {
     let mut digest = Sha256::new();
@@ -142,6 +146,7 @@ pub(super) struct HeaderWitness {
     pub(super) candidate: CandidateFile,
     pub(super) owner: String,
     pub(super) home: PathBuf,
+    pub(super) created_unix_ms: Option<i64>,
     metadata: String,
 }
 pub(super) fn member_home(root: &Path) -> PathBuf {
@@ -178,14 +183,20 @@ fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usiz
     let read_bytes = (MAX_HEADER_BYTES + 1) - reader.get_ref().limit() as usize;
     Ok((bytes, witness, read_bytes))
 }
-fn read_header(candidate: &CandidateFile) -> Result<(String, String, usize)> {
+type ReadHeader = (String, Option<i64>, String, usize);
+fn read_header(candidate: &CandidateFile) -> Result<ReadHeader> {
     let (bytes, witness, read_bytes) = read_header_bytes(candidate)?;
     let value: Value = serde_json::from_slice(&bytes)?;
     let meta =
         codex_session_meta_payload(&value).context("Codex first record is not a owning header")?;
     let owner = resolve_codex_identity_option(codex_identity_at(meta, &["id"]))
         .context("Codex header lacks ownership")?;
-    Ok((owner, witness, read_bytes))
+    let created_unix_ms = meta
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        .and_then(|created| i64::try_from(created.unix_timestamp_nanos() / 1_000_000).ok());
+    Ok((owner, created_unix_ms, witness, read_bytes))
 }
 /// Live rollouts are appended to while the inventory reads them. An append
 /// that lands during the bounded first-record read moves the bracketing
@@ -196,7 +207,7 @@ fn read_header(candidate: &CandidateFile) -> Result<(String, String, usize)> {
 /// repeated; every other refusal is final on its first read.
 const HEADER_READ_ATTEMPTS: usize = 3;
 const HEADER_CHANGED_WHILE_READ: &str = "Codex header changed while read";
-fn read_header_settled(candidate: &CandidateFile) -> (Result<(String, String, usize)>, usize) {
+fn read_header_settled(candidate: &CandidateFile) -> (Result<ReadHeader>, usize) {
     let mut retried = 0;
     loop {
         match read_header(candidate) {
@@ -241,6 +252,13 @@ pub(super) struct HeaderInventory {
     /// directory census. Only a fresh walk can change that.
     pub(super) bounded_out: bool,
 }
+
+/// A group's key in `HeaderInventory::groups`, which is also the order the
+/// inventory reads groups in.
+fn group_key(home: &Path, owner: &str) -> String {
+    sha256_hex(&["codex_file_group:v1", &local_index_key(home), owner])
+}
+
 impl HeaderInventory {
     pub(super) fn new(
         roots: &[PathBuf],
@@ -303,6 +321,7 @@ impl HeaderInventory {
             );
             let seconds = stat.modified().ok().and_then(unix_seconds).unwrap_or(0);
             let mut candidate = CandidateFile {
+                physical_identity: None,
                 scan_root,
                 path,
                 size_bytes: stat.len(),
@@ -316,6 +335,8 @@ impl HeaderInventory {
                 legacy_source_file_fingerprint: String::new(),
                 legacy_config_reconciliation_required: false,
                 opened_object_identity: String::new(),
+                fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: 0,
             };
             prepare_owned_scan_candidate(
                 SnapshotSource::Codex,
@@ -329,12 +350,13 @@ impl HeaderInventory {
             self.read_bytes = self
                 .read_bytes
                 .saturating_add(retried.saturating_mul(MAX_HEADER_BYTES + 1));
-            let (owner, witness, bytes) = header?;
+            let (owner, created_unix_ms, witness, bytes) = header?;
             self.read_bytes = self.read_bytes.saturating_add(bytes);
             Ok(HeaderWitness {
                 home: member_home(&candidate.scan_root),
                 candidate,
                 owner,
+                created_unix_ms,
                 metadata: witness,
             })
         })();
@@ -357,17 +379,14 @@ impl HeaderInventory {
     pub(super) fn groups(&self) -> BTreeMap<String, Group> {
         let mut groups = BTreeMap::<String, Group>::new();
         for header in &self.headers {
-            let key = sha256_hex(&[
-                "codex_file_group:v1",
-                &local_index_key(&header.home),
-                &header.owner,
-            ]);
+            let key = group_key(&header.home, &header.owner);
             groups
                 .entry(key)
                 .or_insert_with(|| Group {
                     owner: header.owner.clone(),
                     home: header.home.clone(),
                     members: Vec::new(),
+                    live: None,
                 })
                 .members
                 .push(header.candidate.clone());
@@ -400,7 +419,7 @@ impl HeaderInventory {
             if metadata_witness(&stat) == header.metadata {
                 continue;
             }
-            let (current_owner, _, _) = read_header(&header.candidate)?;
+            let (current_owner, _, _, _) = read_header(&header.candidate)?;
             anyhow::ensure!(
                 current_owner == header.owner
                     || (!selected.contains(&current_owner) && !selected.contains(&header.owner)),
@@ -411,7 +430,7 @@ impl HeaderInventory {
     }
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
-crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, metadata);
+crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata);
 crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, refused, bounded_out);
 
 #[derive(Clone, Debug)]
@@ -419,6 +438,10 @@ pub(super) struct Group {
     pub(super) owner: String,
     pub(super) home: PathBuf,
     pub(super) members: Vec<CandidateFile>,
+    /// A paged group's live member (index key) and the grant its sealed-prefix
+    /// certificate passed with (S12): validation then accepts that member's
+    /// growth past the frozen extent on the same object, like `finish`.
+    pub(super) live: Option<(String, sampled_scan::codex_cursor::SealedPrefix)>,
 }
 #[derive(Clone, Debug)]
 pub(super) struct Validation {
@@ -454,9 +477,12 @@ impl Validation {
             }
             for member in &group.members {
                 let mut opened = member.clone();
-                let _file = open_candidate_file(SnapshotSource::Codex, &mut opened)?;
+                let file = open_candidate_file(SnapshotSource::Codex, &mut opened)?;
+                let granted = group.live.as_ref().is_some_and(|(key, prefix)| {
+                    *key == local_index_key(&member.path) && prefix.holds(&file)
+                });
                 anyhow::ensure!(
-                    opened.opened_object_identity == member.opened_object_identity,
+                    granted || opened.opened_object_identity == member.opened_object_identity,
                     "Codex joined member changed after replay"
                 );
             }
@@ -464,7 +490,7 @@ impl Validation {
         Ok(checked_headers)
     }
 }
-crate::heap_layout_bound::fields!(Group; owner, home, members);
+crate::heap_layout_bound::fields!(Group; owner, home, members, live);
 crate::heap_layout_bound::fields!(Validation; inventory, groups);
 
 pub(super) fn captured_join(witness: &str) -> String {
@@ -605,6 +631,8 @@ pub(super) struct TierReplay {
     scope: String,
     prefix_matched: bool,
     invalid: bool,
+    /// The group proof while this replay reads a joined member.
+    pub(super) join: Option<Box<StreamProof>>,
 }
 impl TierReplay {
     pub(super) fn new(previous: Option<AppliedTierReceipt>, required: bool, scope: String) -> Self {
@@ -633,9 +661,13 @@ impl TierReplay {
             scope,
             prefix_matched: false,
             invalid,
+            join: None,
         }
     }
     pub(super) fn observe(&mut self, value: &Value) {
+        if let Some(join) = self.join.as_mut() {
+            join.observe(value);
+        }
         self.records += 1;
         if serde_json::to_writer(&mut self.digest, value).is_err() {
             self.invalid = true;
@@ -718,6 +750,21 @@ impl TierReplay {
             self.tiers.insert(key, source);
         }
     }
+    /// S10: the parser admitted usage from `value` (after actual admission),
+    /// under the accumulator's counting version `v2`.
+    pub(super) fn admitted_usage(
+        &mut self,
+        value: &Value,
+        from_last: bool,
+        identity: Option<&str>,
+        turn: Option<&str>,
+        v2: bool,
+    ) {
+        if let Some(join) = self.join.as_mut() {
+            join.decide_v2(v2);
+            join.admitted_usage(value, from_last, identity, turn);
+        }
+    }
     /// A sampled prefix cannot authorize a new protected receipt. The host
     /// reopens and fully replays before calling finish when this is true.
     pub(super) fn has_protected_tiers(&self) -> bool {
@@ -748,484 +795,714 @@ impl TierReplay {
     }
 }
 crate::heap_layout_bound::fields!(AppliedTierReceipt; version, derivation, scope, records, prefix_digest, tiers);
-crate::heap_layout_bound::fields!(TierReplay; previous, digest, records, matched, tiers, scope, prefix_matched, invalid);
-/// A proof pass followed by the existing parser, with a physical-line yield in
-/// both passes. Only the canonical copies contribute to the derived body.
-type ReplayedGroup = (
-    OwnedJsonlParser,
-    CandidateFile,
-    Vec<CandidateFile>,
-    BTreeMap<String, Option<AppliedTierReceipt>>,
-);
-pub(super) struct GroupReader {
-    launch_owner: Option<String>,
-    pub(super) members: Vec<CandidateFile>,
-    proofs: Vec<MemberProof>,
-    identified: usize,
-    proof_reader: Option<OwnedJsonlParser>,
-    proof: ProofBuilder,
-    records: usize,
-    replay_order: VecDeque<usize>,
-    canonical_order: Vec<usize>,
-    proof_prefix_matched: bool,
-    replay_member: Option<usize>,
-    parser: Option<OwnedJsonlParser>,
-    replay_digest: ContentDigest,
-    report: JsonlReadReport,
-    pub(super) applied_receipts: BTreeMap<String, Option<AppliedTierReceipt>>,
-    previous_receipts: BTreeMap<String, (Option<AppliedTierReceipt>, bool)>,
-    receipt_scope: String,
-    legacy_expected: BTreeMap<String, String>,
-    legacy_baselines: Vec<LegacyBaseline>,
+crate::heap_layout_bound::fields!(TierReplay; previous, digest, records, matched, tiers, scope, prefix_matched, invalid, join);
+/// Named group refusals (§i). The discriminant is the RAM counter slot of
+/// `codex_join_terminal_debt`. Every reason but `ProbeBudgetOrder` is
+/// terminal debt for the attempt (outcome R): the members are disclosed as
+/// settleable residue, never as an unreadable file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum JoinRefusal {
+    Overlap,
+    Gap,
+    Corrupt,
+    CumulativeOnly,
+    UiShape,
+    UiOnlyMember,
+    UiUnmatched,
+    UiRepeatUnproven,
+    OrdinalRestart,
+    HistoryBase,
+    AmbiguousPredecessor,
+    ForkedFromOtherSession,
+    CreatedThreadGroup,
+    MixedOrdinal,
+    EqualBeforeTie,
+    CandidateCopy,
+    V2UiOnlyTurn,
+    V2UnboundUi,
+    /// A `history_base.thread_id` names no member of this owner's group:
+    /// typically a compressed (`.zst`, not yet scanned) predecessor, or
+    /// another owner's file named without `forked_from_id`.
+    MissingPredecessor,
+    /// A chain refusal (`Gap`, `Overlap`) of a legacy group replayed in
+    /// chronological order because its probes exceeded their budget (R1-M1,
+    /// R2-N2): the order may be our own artifact, so it is strict, never
+    /// settleable or memoized.
+    ProbeBudgetOrder,
 }
-impl GroupReader {
-    pub(super) fn new(members: Vec<CandidateFile>) -> Result<Self> {
-        anyhow::ensure!(
-            members.len() >= 2 && members.len() <= MAX_MEMBERS,
-            "Codex joining member cap"
-        );
-        let bytes = members
-            .iter()
-            .try_fold(0u64, |sum, member| sum.checked_add(member.size_bytes));
-        anyhow::ensure!(
-            bytes.is_some_and(|bytes| bytes <= MAX_GROUP_BYTES),
-            "Codex joining byte cap"
-        );
-        Ok(Self {
-            launch_owner: None,
-            members,
-            proofs: Vec::new(),
-            identified: 0,
-            proof_reader: None,
-            proof: ProofBuilder::default(),
-            records: 0,
-            replay_order: VecDeque::new(),
-            canonical_order: Vec::new(),
-            proof_prefix_matched: false,
-            replay_member: None,
-            parser: None,
-            replay_digest: ContentDigest(Sha256::new()),
-            report: JsonlReadReport::default(),
-            applied_receipts: BTreeMap::new(),
-            previous_receipts: BTreeMap::new(),
-            receipt_scope: String::new(),
-            legacy_expected: BTreeMap::new(),
-            legacy_baselines: Vec::new(),
-        })
+pub(super) const JOIN_REFUSALS: usize = 20;
+impl JoinRefusal {
+    pub(super) fn slot(self) -> usize {
+        self as usize
     }
-    pub(super) fn configure_receipts(&mut self, index: &ScanIndex) {
-        self.receipt_scope = index
-            .active_upload_context_fingerprint
-            .clone()
-            .unwrap_or_default();
-        for member in &self.members {
-            let key = local_index_key(&member.path);
-            if let Some(entry) = index.files.get(&key) {
-                if entry.codex_joined_member_set.is_none()
-                    && entry.codex_captured_joined_member_set.is_none()
-                    && entry.codex_applied_tier_receipt.is_none()
-                    && entry.codex_captured_tier_receipt.is_none()
-                {
-                    if let Some(expected) = &entry.last_snapshot_fingerprint {
-                        self.legacy_expected.insert(key.clone(), expected.clone());
-                    }
-                }
-                self.previous_receipts
-                    .insert(key, receipt_state(Some(entry)));
-            }
+    /// Growth of the live member may cure these (§d.4). Every other reason,
+    /// and any reason whose first failing member is sealed, is append-incurable.
+    pub(super) fn append_curable(self) -> bool {
+        matches!(
+            self,
+            Self::Gap
+                | Self::UiOnlyMember
+                | Self::UiUnmatched
+                | Self::UiRepeatUnproven
+                | Self::V2UiOnlyTurn
+        )
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for JoinRefusal {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// First eight bytes of SHA-256: the exact compact set element. A collision
+/// errs toward `Overlap`, never toward admission.
+fn compact(tag: &[u8], value: &str) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(tag);
+    digest.update(value.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
+}
+
+/// Header-derived facts of one canonical member position (§a.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct MemberPlan {
+    /// Header ordinal (ordinal groups only): the member's first ordinal.
+    pub(super) first: Option<u64>,
+    /// Ordinals a later continuation binds to; their record starts are kept.
+    pub(super) watch: Vec<u64>,
+    /// `(predecessor position, end_ordinal_exclusive, end_byte_offset)`.
+    pub(super) binding: Option<(usize, u64, u64)>,
+    /// A duplicate origin that must end neutral (F1).
+    pub(super) stub: bool,
+}
+crate::heap_layout_bound::fields!(MemberPlan; first, watch, binding, stub);
+
+/// What a completed member left for later bindings.
+#[derive(Clone, Debug, Default)]
+struct MemberSeen {
+    last: Option<u64>,
+    end: u64,
+    starts: Vec<(u64, u64)>,
+}
+crate::heap_layout_bound::fields!(MemberSeen; last, end, starts);
+
+#[derive(Clone, Debug, Default)]
+struct MemberState {
+    records: u64,
+    natives: u64,
+    admissions: u64,
+    last_after: Option<Tokens>,
+    balance: BTreeMap<Tokens, i64>,
+    repeat: BTreeMap<Tokens, u64>,
+    last_admitted: Option<Tokens>,
+    native_since_admit: bool,
+    usage_shaped: bool,
+    next_ordinal: Option<u64>,
+    last_ordinal: Option<u64>,
+    starts: Vec<(u64, u64)>,
+}
+
+/// The group proof, fed inside the one native replay: the native side in
+/// `TierReplay::observe`, the UI side by the parser admission tap (S10)
+/// after actual admission. It moves from member to member with the replay.
+/// Only compact identities, counters and per-member tuple balances are kept.
+#[derive(Clone, Debug)]
+pub(super) struct StreamProof {
+    owner: String,
+    v2: bool,
+    plans: Vec<MemberPlan>,
+    seen: Vec<MemberSeen>,
+    position: usize,
+    member: MemberState,
+    responses: BTreeSet<u64>,
+    ui: BTreeSet<u64>,
+    /// `after` of the last native of the previous usage-bearing member.
+    chain: Tokens,
+    refusal: Option<(JoinRefusal, usize)>,
+    /// Start offset of the record the reader delivers in this step.
+    record_start: u64,
+    turn: Option<u64>,
+    native_turns: BTreeSet<u64>,
+    ui_turns: BTreeSet<u64>,
+    unbound_ui: bool,
+}
+
+/// Heap bytes of a std B-tree of `len` inline entries (R2-M4). Every
+/// non-root node holds at least `MIN_LEN = 5` of its 11 slots (std
+/// `btree/map.rs` invariant) and every entry lives in exactly one node, so a
+/// tree has at most `len / 5 + 1` nodes. Each is charged as a full internal
+/// node (11 slots, 12 edges) plus the same 256-byte header slack as
+/// `tree_nodes`, which charges one such node per entry (five times this).
+fn proof_tree_bytes<K, V>(len: usize) -> Option<usize> {
+    let node = 256usize
+        .checked_add(12 * size_of::<usize>())?
+        .checked_add(11usize.checked_mul(size_of::<K>().checked_add(size_of::<V>())?)?)?;
+    (len / 5).checked_add(1)?.checked_mul(node)
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for StreamProof {
+    // Fixed visits per walk: the compact sets and balance maps are charged by
+    // length (`proof_tree_bytes`), never element by element, so a large
+    // group stays within one walk's visit limit and its bytes are counted.
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        self.owner.heap_bound(c)?;
+        self.plans.heap_bound(c)?;
+        self.seen.heap_bound(c)?;
+        self.member.starts.heap_bound(c)?;
+        let trees = [
+            proof_tree_bytes::<Tokens, i64>(self.member.balance.len())?,
+            proof_tree_bytes::<Tokens, u64>(self.member.repeat.len())?,
+            proof_tree_bytes::<u64, ()>(self.responses.len())?,
+            proof_tree_bytes::<u64, ()>(self.ui.len())?,
+            proof_tree_bytes::<u64, ()>(self.native_turns.len())?,
+            proof_tree_bytes::<u64, ()>(self.ui_turns.len())?,
+        ];
+        c.add(
+            trees
+                .iter()
+                .try_fold(0usize, |sum, bytes| sum.checked_add(*bytes))?,
+        )
+    }
+}
+
+impl StreamProof {
+    pub(super) fn new(owner: String, v2: bool, plans: Vec<MemberPlan>) -> Self {
+        Self {
+            owner,
+            v2,
+            plans,
+            seen: Vec::new(),
+            position: 0,
+            member: MemberState::default(),
+            responses: BTreeSet::new(),
+            ui: BTreeSet::new(),
+            chain: Tokens::default(),
+            refusal: None,
+            record_start: 0,
+            turn: None,
+            native_turns: BTreeSet::new(),
+            ui_turns: BTreeSet::new(),
+            unbound_ui: false,
         }
-    }
-    pub(super) fn configure_launch_owner(&mut self, owner: &str) {
-        self.launch_owner = Some(owner.to_owned());
     }
 
-    pub(super) fn unchanged_joined(&self, index: &ScanIndex) -> bool {
-        if self.identified != self.members.len() || !self.proofs.is_empty() {
-            return false;
-        }
-        let witness = member_set_witness(&self.members);
-        self.members.iter().all(|member| {
-            index.candidate_decision(member) == CandidateDecision::Skip
-                && index
-                    .files
-                    .get(&local_index_key(&member.path))
-                    .is_some_and(|entry| {
-                        entry.codex_joined_member_set.as_deref() == Some(witness.as_str())
-                            && !index.effective_upload_body_witness_revision_requires_adoption(
-                                &local_index_key(&member.path),
-                            )
-                    })
-        })
+    /// The first refusal and the canonical position of its failing member.
+    pub(super) fn refusal(&self) -> Option<(JoinRefusal, usize)> {
+        self.refusal
     }
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn step(
-        &mut self,
-        metadata: &CodexTitleMetadata,
-        traces: Option<Arc<CodexTurnTraceMap>>,
-        ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
-        artifacts: bool,
-        context_curve: bool,
-        attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-    ) -> Result<bool> {
-        if self.identified < self.members.len() {
-            let i = self.identified;
-            let mut candidate = self.members[i].clone();
-            if let Some(context) = attribution_context {
-                let workers = self
-                    .launch_owner
-                    .as_ref()
-                    .map(|owner| vec![owner.clone()])
-                    .unwrap_or_else(|| {
-                        launch_workers_for_path(SnapshotSource::Codex, &candidate.path)
-                    });
-                match context.prepare_launch_step(&workers) {
-                    Ok(false) => return Ok(false),
-                    Err(()) => anyhow::bail!("Codex joined launch evidence incomplete"),
-                    Ok(true) => {}
-                }
-                if let Some(witness) = context.launch_witness(&workers) {
-                    candidate.source_file_fingerprint = sha256_hex(&[
-                        "launcher_worker_context:v1",
-                        &candidate.source_file_fingerprint,
-                        &witness,
-                    ]);
-                }
-            }
-            let mut census = ScanCensus::default();
-            let (opened, _file) = open_and_identify_scan_candidate(
-                SnapshotSource::Codex,
-                candidate,
-                &mut census,
-                None,
-                0,
-                &BTreeMap::new(),
-            )
-            .context("Codex joining member could not open")?;
-            self.members[i] = opened;
-            self.identified += 1;
-            return Ok(false);
+
+    fn refuse(&mut self, reason: JoinRefusal) {
+        if self.refusal.is_none() {
+            self.refusal = Some((reason, self.position));
         }
-        if self.proofs.len() < self.members.len() {
-            let i = self.proofs.len();
-            if self.proof_reader.is_none() {
-                let mut opened = self.members[i].clone();
-                let file = open_candidate_file(SnapshotSource::Codex, &mut opened)?;
-                anyhow::ensure!(
-                    opened.opened_object_identity == self.members[i].opened_object_identity,
-                    "Codex joining proof object changed before read"
-                );
-                let previous = self
-                    .previous_receipts
-                    .get(&local_index_key(&self.members[i].path));
-                self.proof_prefix_matched =
-                    previous.map_or(true, |(receipt, required)| !required && receipt.is_none());
-                anyhow::ensure!(
-                    previous.map_or(true, |(receipt, required)| (!required || receipt.is_some())
-                        && receipt.as_ref().map_or(true, |receipt| receipt.version
-                            == RECEIPT_VERSION
-                            && receipt.derivation == SnapshotSource::Codex.parser_version()
-                            && receipt.scope == self.receipt_scope
-                            && receipt.tiers.len() <= MAX_APPLIED_TIERS)),
-                    "Codex protected copy receipt is unavailable"
-                );
-                self.proof_reader = Some(OwnedJsonlParser::new(
-                    file,
-                    &self.members[i].path,
-                    SnapshotSource::Codex,
-                    apply_codex_line,
-                    Some(metadata),
-                    traces,
-                    ledgers,
-                    artifacts,
-                    context_curve,
-                )?);
-                return Ok(false);
-            }
-            let reader = self.proof_reader.as_mut().expect("proof reader opened");
-            let proof = &mut self.proof;
-            let records = &mut self.records;
-            let previous = self
-                .previous_receipts
-                .get(&local_index_key(&self.members[i].path))
-                .and_then(|(receipt, _)| receipt.as_ref());
-            let prefix_matched = &mut self.proof_prefix_matched;
-            let complete = reader.step_with_observer(|value| {
-                *records += 1;
-                proof.observe(value);
-                if let Some(previous) = previous {
-                    if proof.records == previous.records {
-                        *prefix_matched = format!("{:x}", proof.content.0.clone().finalize())
-                            == previous.prefix_digest;
-                    }
+    }
+
+    pub(super) fn set_record_start(&mut self, offset: u64) {
+        self.record_start = offset;
+    }
+
+    /// Open canonical position `position`. A continuation binds only when its
+    /// predecessor (read before it) holds a record with ordinal `E` starting
+    /// at `end_byte_offset`, or ended exactly there with `last + 1 == E`.
+    pub(super) fn begin_member(&mut self, position: usize) {
+        self.position = position;
+        self.member = MemberState {
+            next_ordinal: self.plans.get(position).and_then(|plan| plan.first),
+            ..MemberState::default()
+        };
+        self.turn = None;
+        let Some((predecessor, end, offset)) =
+            self.plans.get(position).and_then(|plan| plan.binding)
+        else {
+            return;
+        };
+        let bound = self.seen.get(predecessor).is_some_and(|seen| {
+            seen.starts.contains(&(end, offset))
+                || (seen.last.and_then(|last| last.checked_add(1)) == Some(end)
+                    && seen.end == offset)
+        });
+        if !bound {
+            self.refuse(JoinRefusal::HistoryBase);
+        }
+    }
+
+    pub(super) fn observe(&mut self, value: &Value) {
+        if self.refusal.is_some() {
+            return;
+        }
+        if let Err(reason) = self.observe_record(value) {
+            self.refuse(reason);
+        }
+    }
+
+    fn observe_record(&mut self, value: &Value) -> std::result::Result<(), JoinRefusal> {
+        self.member.records += 1;
+        let first = self.member.records == 1;
+        match codex_session_meta_payload(value) {
+            Some(meta) => {
+                if !first {
+                    return Err(JoinRefusal::Corrupt);
                 }
-            })?;
-            anyhow::ensure!(
-                self.records <= MAX_RECORDS,
-                "Codex joining retained record cap"
-            );
-            if !complete {
-                return Ok(false);
-            }
-            anyhow::ensure!(
-                reader.reader.report.complete(),
-                "Codex joining physical line loss"
-            );
-            anyhow::ensure!(
-                opened_object_identity(SnapshotSource::Codex, reader.reader.reader.get_mut())?
-                    == self.members[i].opened_object_identity,
-                "Codex joining proof object changed"
-            );
-            anyhow::ensure!(
-                self.proof_prefix_matched,
-                "Codex protected copy prefix changed"
-            );
-            if self
-                .legacy_expected
-                .contains_key(&local_index_key(&self.members[i].path))
-            {
-                if let Some(context) = attribution_context {
-                    let workers = reader
-                        .accumulator
-                        .source_session_id
-                        .as_ref()
-                        .map(|id| vec![resolve_codex_identity(id)])
-                        .unwrap_or_else(|| {
-                            launch_workers_for_path(SnapshotSource::Codex, &self.members[i].path)
-                        });
-                    // A proof can outlive the lookup TTL. Park its completed
-                    // parser before taking either proof or legacy baseline.
-                    match context.prepare_launch_step(&workers) {
-                        Ok(false) => return Ok(false),
-                        Err(()) => anyhow::bail!("Codex legacy launch evidence incomplete"),
-                        Ok(true) => {}
-                    }
+                let owner = resolve_codex_identity_option(codex_identity_at(meta, &["id"]));
+                if owner.as_deref() != Some(self.owner.as_str()) {
+                    return Err(JoinRefusal::Overlap);
                 }
             }
-            self.proofs.push(
-                std::mem::take(&mut self.proof)
-                    .finish()
-                    .context("Codex joining contribution proof failed")?,
-            );
-            if let Some(expected) = self
-                .legacy_expected
-                .get(&local_index_key(&self.members[i].path))
-            {
-                let member = &self.members[i];
-                let parsed = self
-                    .proof_reader
-                    .take()
-                    .expect("proof parser completed")
-                    .finish(
-                        &member.opened_object_identity,
-                        &member.path,
-                        "1970-01-01T00:00:00Z",
-                        member.source_file_fingerprint.clone(),
-                        Some(metadata),
-                        None,
-                        attribution_context,
-                    )?;
-                anyhow::ensure!(
-                    parsed.complete(),
-                    "Codex legacy pricing baseline is incomplete"
-                );
-                let mut snapshots = parsed.snapshots;
-                for snapshot in &mut snapshots {
-                    apply_codex_state_evidence(snapshot, metadata);
+            None if first => return Err(JoinRefusal::Corrupt),
+            None => {}
+        }
+        let ordinal_member = self
+            .plans
+            .get(self.position)
+            .is_some_and(|plan| plan.first.is_some());
+        match (ordinal_member, value.get("ordinal")) {
+            (true, None) => return Err(JoinRefusal::Corrupt),
+            (true, Some(ordinal)) => {
+                let ordinal = ordinal.as_u64().ok_or(JoinRefusal::Corrupt)?;
+                if Some(ordinal) != self.member.next_ordinal {
+                    return Err(JoinRefusal::Corrupt);
                 }
-                self.legacy_baselines.push(LegacyBaseline {
-                    owner: self.proofs[i].owner.clone(),
-                    index_key: local_index_key(&member.path),
-                    expected: expected.clone(),
-                    snapshots,
+                self.member.next_ordinal = ordinal.checked_add(1);
+                self.member.last_ordinal = Some(ordinal);
+                if self.plans[self.position].watch.contains(&ordinal) {
+                    self.member.starts.push((ordinal, self.record_start));
+                }
+            }
+            (false, Some(_)) => return Err(JoinRefusal::MixedOrdinal),
+            (false, None) => {}
+        }
+        // The parser's running turn: `turn_context` or a payload turn id.
+        if let Some(turn) = string_at(value, &["turn_context", "payload", "turn_id"])
+            .or_else(|| string_at(value, &["payload", "turn_id"]))
+        {
+            self.turn = Some(compact(b"t:", &turn));
+        }
+        let native = string_eq_at(value, &["type"], "token_usage_record");
+        if native
+            || codex_total_usage(value).is_some_and(|usage| !usage.is_zero())
+            || codex_last_usage(value).is_some_and(|usage| !usage.is_zero())
+        {
+            self.member.usage_shaped = true;
+        }
+        if native {
+            self.observe_native(value)?;
+        }
+        Ok(())
+    }
+
+    fn observe_native(&mut self, value: &Value) -> std::result::Result<(), JoinRefusal> {
+        let payload = value.get("payload").ok_or(JoinRefusal::Corrupt)?;
+        let thread = payload
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .ok_or(JoinRefusal::Corrupt)?;
+        if resolve_codex_identity(thread) != self.owner {
+            return Err(JoinRefusal::Overlap);
+        }
+        let response = payload
+            .get("response_id")
+            .and_then(Value::as_str)
+            .filter(|response| !response.is_empty() && response.len() <= 256)
+            .ok_or(JoinRefusal::Corrupt)?;
+        let usage = payload
+            .get("usage")
+            .and_then(Tokens::read)
+            .ok_or(JoinRefusal::Corrupt)?;
+        let after = payload
+            .get("thread_token_usage")
+            .and_then(Tokens::read)
+            .ok_or(JoinRefusal::Corrupt)?;
+        let before = after.before(usage).ok_or(JoinRefusal::Corrupt)?;
+        if !self.responses.insert(compact(b"r:", response)) {
+            return Err(JoinRefusal::Overlap);
+        }
+        match self.member.last_after {
+            // A non-monotone counter inside one member is a reset.
+            Some(previous) if previous != before => return Err(JoinRefusal::Gap),
+            Some(_) => {}
+            None if before != self.chain => {
+                return Err(if before.covers(self.chain) {
+                    JoinRefusal::Gap
+                } else {
+                    JoinRefusal::Overlap
                 });
             }
-            self.proof_reader = None;
-            if self.proofs.len() == self.members.len() {
-                self.canonical_order =
-                    disjoint_plan(&self.proofs).context("Codex joining overlap or gap")?;
-                for canonical in &mut self.canonical_order {
-                    // Prefer the existing applied evidence when a newly named
-                    // complete copy sorts before a previously priced member.
-                    if let Some(preferred) = self
-                        .proofs
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, proof)| proof.content == self.proofs[*canonical].content)
-                        .filter_map(|(i, _)| {
-                            self.previous_receipts
-                                .get(&local_index_key(&self.members[i].path))
-                                .and_then(|(receipt, _)| receipt.as_ref())
-                                .map(|receipt| (receipt.records, i))
-                        })
-                        .max()
-                    {
-                        *canonical = preferred.1;
-                    }
-                }
-                self.replay_order = self.canonical_order.clone().into();
-                // The response/event sets have served their purpose. Replay keeps
-                // only the full-content hash for each frozen member.
-                for proof in &mut self.proofs {
-                    proof.responses.clear();
-                    proof.ui_events.clear();
-                }
-            }
-            return Ok(false);
+            None => {}
         }
-        if self.replay_member.is_none() {
-            let Some(i) = self.replay_order.pop_front() else {
-                return Ok(true);
-            };
-            let member = &self.members[i];
-            let mut opened = member.clone();
-            let file = open_candidate_file(SnapshotSource::Codex, &mut opened)?;
-            anyhow::ensure!(
-                opened.opened_object_identity == member.opened_object_identity,
-                "Codex joining replay object changed"
-            );
-            if let Some(parser) = self.parser.as_mut() {
-                parser.reader =
-                    BoundedJsonlReader::new(BufReader::new(file), MAX_JSONL_LINE_BYTES, true);
-                // Context that was inferred in one physical file must not price
-                // an unrelated record at the beginning of another file.
-                parser.accumulator.current_selector = SelectorCapture::default();
-                parser.accumulator.latest_model = None;
-                parser.accumulator.latest_reasoning_effort = None;
-                parser.accumulator.latest_turn_id = None;
-            } else {
-                self.parser = Some(OwnedJsonlParser::new(
-                    file,
-                    &member.path,
-                    SnapshotSource::Codex,
-                    apply_codex_line,
-                    Some(metadata),
-                    traces,
-                    ledgers,
-                    artifacts,
-                    context_curve,
-                )?);
-            }
-            let previous = self
-                .previous_receipts
-                .get(&local_index_key(&member.path))
-                .cloned()
-                .unwrap_or_default();
-            self.parser
-                .as_mut()
-                .expect("replay parser opened")
-                .accumulator
-                .codex_tier_replay = Some(TierReplay::new(
-                previous.0,
-                previous.1,
-                self.receipt_scope.clone(),
-            ));
-            self.replay_digest = ContentDigest(Sha256::new());
-            self.replay_member = Some(i);
-            return Ok(false);
+        let member = &mut self.member;
+        member.last_after = Some(after);
+        member.natives += 1;
+        member.native_since_admit = true;
+        let balance = member.balance.entry(usage).or_default();
+        *balance += 1;
+        if *balance == 0 {
+            member.balance.remove(&usage);
         }
-        let i = self.replay_member.expect("replay member opened");
-        let parser = self.parser.as_mut().expect("replay parser opened");
-        let digest = &mut self.replay_digest;
-        if !parser.step_with_observer(|value| {
-            // Serialization is identical to the proof pass and cannot retain
-            // content. An error propagates through the digest's result below.
-            let _ = serde_json::to_writer(&mut *digest, value);
-            digest.0.update(b"\n");
-        })? {
-            return Ok(false);
+        if let Some(turn) = self.turn {
+            self.native_turns.insert(turn);
         }
-        anyhow::ensure!(
-            parser.reader.report.complete(),
-            "Codex joining replay line loss"
-        );
-        anyhow::ensure!(
-            opened_object_identity(SnapshotSource::Codex, parser.reader.reader.get_mut())?
-                == self.members[i].opened_object_identity,
-            "Codex joining replay object changed"
-        );
-        let observed = format!(
-            "{:x}",
-            std::mem::replace(&mut self.replay_digest, ContentDigest(Sha256::new()))
-                .0
-                .finalize()
-        );
-        anyhow::ensure!(
-            observed == self.proofs[i].content,
-            "Codex joining replay content changed"
-        );
-        let receipt = parser
-            .accumulator
-            .codex_tier_replay
-            .take()
-            .expect("member receipt capture installed")
-            .finish()?;
-        self.applied_receipts
-            .insert(local_index_key(&self.members[i].path), receipt);
-        let report = parser.reader.report;
-        self.report.physical_line_count += report.physical_line_count;
-        self.report.parsed_json_line_count += report.parsed_json_line_count;
-        self.replay_member = None;
-        if self.replay_order.is_empty() {
-            parser.reader.report = self.report;
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(())
     }
-    pub(super) fn take_legacy_baselines(&mut self) -> Vec<LegacyBaseline> {
-        std::mem::take(&mut self.legacy_baselines)
+
+    /// The replay's counting version (§k.3), decided by the accumulator on
+    /// the session's first owned record, which precedes every admission and
+    /// member end; until then the value given at construction stands.
+    pub(super) fn decide_v2(&mut self, v2: bool) {
+        self.v2 = v2;
     }
-    pub(super) fn finish(mut self) -> Result<ReplayedGroup> {
-        anyhow::ensure!(
-            self.replay_member.is_none() && self.replay_order.is_empty(),
-            "Codex joining replay unfinished"
-        );
-        let parser = self.parser.take().context("Codex joining lacks a parser")?;
-        // The existing single-file optional witness can be cleared on conflict.
-        // A joined replacement must not reach account fallback through that None.
-        anyhow::ensure!(
-            !parser.accumulator.codex_creator_evidence_conflicted,
-            "Codex joining creator evidence conflicts"
-        );
-        // The final reader descriptor owns the final canonical member, selected
-        // by the same counter order used above (not physical path order).
-        let order = &self.canonical_order;
-        for i in 0..self.members.len() {
-            let key = local_index_key(&self.members[i].path);
-            if self.applied_receipts.contains_key(&key) {
-                continue;
+
+    /// S10: the parser admitted UI usage from this record. `from_last` is
+    /// false when it used a cumulative delta; `identity` is the parser's own
+    /// usage event identity and `turn` its running turn id.
+    pub(super) fn admitted_usage(
+        &mut self,
+        value: &Value,
+        from_last: bool,
+        identity: Option<&str>,
+        turn: Option<&str>,
+    ) {
+        if self.refusal.is_some() {
+            return;
+        }
+        if let Err(reason) = self.admit(value, from_last, identity, turn) {
+            self.refuse(reason);
+        }
+    }
+
+    fn admit(
+        &mut self,
+        value: &Value,
+        from_last: bool,
+        identity: Option<&str>,
+        turn: Option<&str>,
+    ) -> std::result::Result<(), JoinRefusal> {
+        self.member.admissions += 1;
+        if !from_last {
+            return Err(JoinRefusal::CumulativeOnly);
+        }
+        let identity = identity.ok_or(JoinRefusal::UiShape)?;
+        if !self.ui.insert(compact(b"u:", identity)) {
+            return Err(JoinRefusal::Overlap);
+        }
+        let tokens = codex_last_usage_root(value)
+            .and_then(Tokens::read)
+            .ok_or(JoinRefusal::UiShape)?;
+        if self.v2 {
+            // §k.3 interim: admissions are not money under V2. Only turn
+            // binding is recorded; the group is held at its end otherwise.
+            match turn {
+                Some(turn) => {
+                    self.ui_turns.insert(compact(b"t:", turn));
+                }
+                None => self.unbound_ui = true,
             }
-            let canonical = *order
+            return Ok(());
+        }
+        let member = &mut self.member;
+        let balance = member.balance.entry(tokens).or_default();
+        *balance -= 1;
+        if *balance == 0 {
+            member.balance.remove(&tokens);
+        }
+        if member.last_admitted == Some(tokens) && !member.native_since_admit {
+            *member.repeat.entry(tokens).or_default() += 1;
+        }
+        member.last_admitted = Some(tokens);
+        member.native_since_admit = false;
+        Ok(())
+    }
+
+    /// Member EOF at physical offset `end`: duplicate-origin stubs must be
+    /// neutral, and every UI admission must be backed by a native of the
+    /// same tuple in the same member (Legacy).
+    pub(super) fn end_member(&mut self, end: u64) {
+        if self.refusal.is_some() {
+            return;
+        }
+        let member = std::mem::take(&mut self.member);
+        let stub = self.plans.get(self.position).is_some_and(|plan| plan.stub);
+        if stub && (member.usage_shaped || member.natives > 0 || member.admissions > 0) {
+            self.refuse(JoinRefusal::OrdinalRestart);
+            return;
+        }
+        if !self.v2 && member.balance.values().any(|balance| *balance < 0) {
+            let reason = if member.natives == 0 {
+                JoinRefusal::UiOnlyMember
+            } else if member
+                .balance
                 .iter()
-                .find(|canonical| self.proofs[**canonical].content == self.proofs[i].content)
-                .context("Codex copy has no canonical member")?;
-            let receipt = self
-                .applied_receipts
-                .get(&local_index_key(&self.members[canonical].path))
-                .cloned()
-                .context("Codex copy lacks applied receipt")?;
-            if let Some(previous) = self
-                .previous_receipts
-                .get(&key)
-                .and_then(|(receipt, _)| receipt.as_ref())
+                .filter(|(_, balance)| **balance < 0)
+                .all(|(tokens, balance)| {
+                    balance.unsigned_abs() <= member.repeat.get(tokens).copied().unwrap_or(0)
+                })
             {
-                anyhow::ensure!(
-                    receipt.as_ref().is_some_and(|current| previous
-                        .tiers
-                        .iter()
-                        .all(|(key, source)| current.tiers.get(key) == Some(source))),
-                    "Codex complete copies have conflicting applied pricing"
-                );
-            }
-            self.applied_receipts.insert(key, receipt);
+                JoinRefusal::UiRepeatUnproven
+            } else {
+                JoinRefusal::UiUnmatched
+            };
+            self.refuse(reason);
+            return;
         }
-        let last = self.members[*order.last().context("Codex joining empty plan")?].clone();
-        Ok((parser, last, self.members, self.applied_receipts))
+        if let Some(after) = member.last_after {
+            self.chain = after;
+        }
+        self.seen.push(MemberSeen {
+            last: member.last_ordinal,
+            end,
+            starts: member.starts,
+        });
+    }
+
+    /// After the last member: the §k.3 interim V2 hold.
+    pub(super) fn finish_group(&mut self) {
+        if self.refusal.is_some() || !self.v2 {
+            return;
+        }
+        if self.unbound_ui {
+            self.refuse(JoinRefusal::V2UnboundUi);
+        } else if !self.ui_turns.is_subset(&self.native_turns) {
+            self.refuse(JoinRefusal::V2UiOnlyTurn);
+        }
     }
 }
-crate::heap_layout_bound::fields!(GroupReader; launch_owner, members, proofs, identified, proof_reader, proof, records, replay_order, canonical_order, proof_prefix_matched, replay_member, parser, replay_digest, report, applied_receipts, previous_receipts, receipt_scope, legacy_expected, legacy_baselines);
+
+/// A member's line 0, read through the parent's `read_header_bytes`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct MemberHeader {
+    digest: String,
+    size: u64,
+    created: Option<i128>,
+    ordinal: Option<u64>,
+    /// `history_base`: `(thread_id, end_ordinal_exclusive, end_byte_offset)`.
+    history_base: Option<(Option<String>, Option<u64>, Option<u64>)>,
+    forked: bool,
+    subagent_start: bool,
+    created_thread: bool,
+    classification: (Option<String>, Option<String>),
+    /// Identities the member's rollout file name carries.
+    names: Vec<String>,
+}
+crate::heap_layout_bound::fields!(MemberHeader; digest, size, created, ordinal, history_base,
+    forked, subagent_start, created_thread, classification, names);
+
+impl MemberHeader {
+    pub(super) fn parse(bytes: &[u8], member: &CandidateFile) -> Option<Self> {
+        let value: Value = serde_json::from_slice(bytes).ok()?;
+        let meta = codex_session_meta_payload(&value)?;
+        let created = string_at(meta, &["timestamp"])
+            .or_else(|| string_at(&value, &["timestamp"]))
+            .as_deref()
+            .and_then(rfc3339_unix_nanos);
+        let history_base = meta
+            .get("history_base")
+            .filter(|base| !base.is_null())
+            .map(|base| {
+                (
+                    resolve_codex_identity_option(codex_identity_at(base, &["thread_id"])),
+                    u64_at(base, &["end_ordinal_exclusive"]),
+                    u64_at(base, &["end_byte_offset"]),
+                )
+            });
+        Some(Self {
+            digest: format!("{:x}", Sha256::digest(bytes)),
+            size: member.size_bytes,
+            created,
+            ordinal: u64_at(&value, &["ordinal"]),
+            history_base,
+            forked: meta
+                .get("forked_from_id")
+                .is_some_and(|value| !value.is_null()),
+            subagent_start: meta
+                .get("subagent_history_start_ordinal")
+                .is_some_and(|value| !value.is_null()),
+            created_thread: string_eq_at(meta, &["thread_source"], "agent_created_thread"),
+            classification: (
+                string_at(meta, &["thread_source"]),
+                meta.get("source").map(Value::to_string),
+            ),
+            names: codex_session_id_candidates_from_path(&member.path)
+                .iter()
+                .map(|name| resolve_codex_identity(name))
+                .collect(),
+        })
+    }
+
+    pub(super) fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub(super) fn ordinal(&self) -> bool {
+        self.ordinal.is_some()
+    }
+}
+
+/// Canonical order and per-position plans.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct GroupPlan {
+    /// Member indices in canonical (replay) order.
+    pub(super) order: Vec<usize>,
+    pub(super) plans: Vec<MemberPlan>,
+    pub(super) ordinal: bool,
+}
+crate::heap_layout_bound::fields!(GroupPlan; order, plans, ordinal);
+
+/// §a.3 from headers alone. `keys` are the members' local index keys (the
+/// chronological tiebreak). Non-ordinal groups still need `order_by_probes`.
+pub(super) fn plan_group(
+    headers: &[MemberHeader],
+    keys: &[String],
+) -> std::result::Result<GroupPlan, JoinRefusal> {
+    let n = headers.len();
+    // Two members with equal line-0 bytes (digest) and equal size are one
+    // copied candidate; one set lookup per member (O(n)).
+    let mut seen = std::collections::HashSet::with_capacity(n);
+    if !headers
+        .iter()
+        .all(|header| seen.insert((header.digest.as_str(), header.size)))
+    {
+        return Err(JoinRefusal::CandidateCopy);
+    }
+    let ordinal = headers.first().is_some_and(MemberHeader::ordinal);
+    if headers.iter().any(|header| header.ordinal() != ordinal) {
+        return Err(JoinRefusal::MixedOrdinal);
+    }
+    if headers.iter().any(|header| header.created_thread) {
+        return Err(JoinRefusal::CreatedThreadGroup);
+    }
+    let mut order = (0..n).collect::<Vec<_>>();
+    order.sort_by(|a, b| (headers[*a].created, &keys[*a]).cmp(&(headers[*b].created, &keys[*b])));
+    let Some(first) = order.first().map(|first| &headers[*first]) else {
+        return Err(JoinRefusal::Corrupt);
+    };
+    if first.forked || first.subagent_start {
+        return Err(JoinRefusal::ForkedFromOtherSession);
+    }
+    if let Some((thread, _, _)) = &first.history_base {
+        let named = thread.as_ref().map(|thread| {
+            headers
+                .iter()
+                .any(|header| header.names.iter().any(|name| name == thread))
+        });
+        return Err(match named {
+            // The predecessor is outside the inventory (R1-M3).
+            Some(false) => JoinRefusal::MissingPredecessor,
+            Some(true) | None => JoinRefusal::HistoryBase,
+        });
+    }
+    let mut plans = vec![MemberPlan::default(); n];
+    if !ordinal {
+        if headers
+            .iter()
+            .any(|header| header.forked || header.subagent_start || header.history_base.is_some())
+        {
+            return Err(JoinRefusal::HistoryBase);
+        }
+        return Ok(GroupPlan {
+            order,
+            plans,
+            ordinal,
+        });
+    }
+    let mut position = vec![0; n];
+    for (at, member) in order.iter().enumerate() {
+        position[*member] = at;
+    }
+    let origins = order
+        .iter()
+        .copied()
+        .filter(|member| headers[*member].history_base.is_none())
+        .collect::<Vec<_>>();
+    let main = *origins.last().expect("the first member is an origin");
+    for origin in &origins {
+        let header = &headers[*origin];
+        if header.ordinal != Some(0)
+            || header.forked
+            || header.subagent_start
+            || header.classification != headers[main].classification
+        {
+            return Err(JoinRefusal::OrdinalRestart);
+        }
+        plans[position[*origin]].stub = *origin != main;
+    }
+    for (at, member) in order.iter().enumerate() {
+        let header = &headers[*member];
+        plans[at].first = header.ordinal;
+        let Some(base) = &header.history_base else {
+            continue;
+        };
+        if header.forked || header.subagent_start {
+            return Err(JoinRefusal::HistoryBase);
+        }
+        let (Some(thread), Some(end), Some(offset)) = base else {
+            return Err(JoinRefusal::HistoryBase);
+        };
+        let mut named = (0..n).filter(|other| {
+            *other != *member && headers[*other].names.iter().any(|name| name == thread)
+        });
+        let predecessor = match (named.next(), named.next()) {
+            (Some(predecessor), None) => predecessor,
+            (None, _) => return Err(JoinRefusal::MissingPredecessor),
+            (Some(_), Some(_)) => return Err(JoinRefusal::AmbiguousPredecessor),
+        };
+        // Topological, and the continuation starts exactly at its base.
+        if header.ordinal != Some(*end) || position[predecessor] >= at {
+            return Err(JoinRefusal::HistoryBase);
+        }
+        plans[at].binding = Some((position[predecessor], *end, *offset));
+        plans[position[predecessor]].watch.push(*end);
+    }
+    Ok(GroupPlan {
+        order,
+        plans,
+        ordinal,
+    })
+}
+
+/// v2 probe order for non-ordinal groups: members without a native record
+/// first (chronologically), then by the first native's `before`. An equal
+/// `before` is `EqualBeforeTie` (no pre-read).
+pub(super) fn order_by_probes(
+    chronological: &[usize],
+    probes: &[Option<Tokens>],
+) -> std::result::Result<Vec<usize>, JoinRefusal> {
+    let mut order = chronological
+        .iter()
+        .copied()
+        .filter(|member| probes[*member].is_none())
+        .collect::<Vec<_>>();
+    let mut usage = chronological
+        .iter()
+        .copied()
+        .filter(|member| probes[*member].is_some())
+        .collect::<Vec<_>>();
+    usage.sort_by_key(|member| probes[*member]);
+    if usage
+        .windows(2)
+        .any(|pair| probes[pair[0]] == probes[pair[1]])
+    {
+        return Err(JoinRefusal::EqualBeforeTie);
+    }
+    order.extend(usage);
+    Ok(order)
+}
+
+/// The first native's `before` of one probed record, if it is one.
+pub(super) fn probe_before(value: &Value) -> Option<Tokens> {
+    if !string_eq_at(value, &["type"], "token_usage_record") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    let usage = Tokens::read(payload.get("usage")?)?;
+    Tokens::read(payload.get("thread_token_usage")?)?.before(usage)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct Tokens([u64; 6]);
+pub(super) struct Tokens([u64; 6]);
 impl Tokens {
     fn read(value: &Value) -> Option<Self> {
         Some(Self([
@@ -1246,6 +1523,10 @@ impl Tokens {
         }
         Some(Self(values))
     }
+    /// Componentwise `self >= other`.
+    fn covers(self, other: Self) -> bool {
+        self.0.iter().zip(other.0).all(|(a, b)| *a >= b)
+    }
 }
 
 #[derive(Clone)]
@@ -1265,224 +1546,96 @@ impl std::io::Write for ContentDigest {
     }
 }
 
-/// No prompt/output or raw response identity is retained. Full-record hashing
-/// distinguishes complete copies from overlap without caching transcript bytes.
-#[derive(Default)]
-pub(super) struct ProofBuilder {
-    content: ContentDigest,
-    owner: Option<String>,
-    first_before: Option<Tokens>,
-    last_after: Option<Tokens>,
-    responses: BTreeSet<String>,
-    ui_events: BTreeSet<String>,
-    native_usage: BTreeMap<Tokens, usize>,
-    ui_usage: BTreeMap<Tokens, usize>,
-    previous_ui: Option<String>,
-    records: usize,
-    invalid: bool,
-}
-impl ProofBuilder {
-    pub(super) fn observe(&mut self, value: &Value) {
-        self.records = self.records.saturating_add(1);
-        if self.records > MAX_RECORDS {
-            self.invalid = true;
-            return;
-        }
-        if serde_json::to_writer(&mut self.content, value).is_err() {
-            self.invalid = true;
-        }
-        self.content.0.update(b"\n");
-        // Ordinal/recovery/fork histories have their own ownership rules. The
-        // first disjoint-continuation domain does not splice those epochs.
-        if value.get("ordinal").is_some() {
-            self.invalid = true;
-        }
-        if let Some(meta) = codex_session_meta_payload(value) {
-            let owner = resolve_codex_identity_option(codex_identity_at(meta, &["id"]));
-            if self.records != 1 || owner.is_none() {
-                self.invalid = true;
-            }
-            self.owner = owner;
-        }
-        if string_eq_at(value, &["type"], "token_usage_record")
-            && self.observe_response(value).is_none()
-        {
-            self.invalid = true;
-        }
-        if let Some(last) = codex_last_usage(value) {
-            // A context-only estimate has no priced usage; match the existing
-            // reader's adjacent exact-event duplicate handling.
-            if last.input_tokens == 0 && last.output_tokens == 0 {
-                return;
-            }
-            let Some(identity) = codex_usage_event_identity(value) else {
-                self.invalid = true;
-                return;
-            };
-            if self.previous_ui.as_ref() == Some(&identity) {
-                return;
-            }
-            self.previous_ui = Some(identity.clone());
-            if !self.ui_events.insert(identity) {
-                self.invalid = true;
-            }
-            let root = value
-                .pointer("/payload/info/last_token_usage")
-                .or_else(|| value.pointer("/token_count/info/last_token_usage"))
-                .or_else(|| value.pointer("/info/last_token_usage"));
-            match root.and_then(Tokens::read) {
-                Some(tokens) => *self.ui_usage.entry(tokens).or_default() += 1,
-                None => self.invalid = true,
-            }
-        } else if codex_total_usage(value).is_some() {
-            // A cumulative-only delta cannot safely gain another member's
-            // baseline. Preserve legacy single-file behavior outside this domain.
-            self.invalid = true;
-        }
-    }
-    fn observe_response(&mut self, value: &Value) -> Option<()> {
-        let payload = value.get("payload")?;
-        let owner = resolve_codex_identity(payload.get("thread_id")?.as_str()?);
-        if self.owner.as_deref() != Some(&owner) {
-            return None;
-        }
-        let response = payload.get("response_id")?.as_str()?;
-        if response.is_empty() || response.len() > 256 {
-            return None;
-        }
-        let identity = sha256_hex(&["codex_join_response:v1", response]);
-        if !self.responses.insert(identity) {
-            return None;
-        }
-        let usage = Tokens::read(payload.get("usage")?)?;
-        let after = Tokens::read(payload.get("thread_token_usage")?)?;
-        let before = after.before(usage)?;
-        if self.last_after.is_some_and(|previous| previous != before) {
-            return None;
-        }
-        self.first_before.get_or_insert(before);
-        self.last_after = Some(after);
-        *self.native_usage.entry(usage).or_default() += 1;
-        Some(())
-    }
-    pub(super) fn finish(self) -> Option<MemberProof> {
-        if self.invalid
-            || self.responses.is_empty()
-            || self
-                .ui_usage
-                .iter()
-                .any(|(usage, count)| self.native_usage.get(usage).copied().unwrap_or(0) < *count)
-        {
-            return None;
-        }
-        Some(MemberProof {
-            content: format!("{:x}", self.content.0.finalize()),
-            owner: self.owner?,
-            before: self.first_before?,
-            after: self.last_after?,
-            responses: self.responses,
-            ui_events: self.ui_events,
-        })
-    }
-}
-
-pub(super) struct MemberProof {
-    pub(super) content: String,
-    owner: String,
-    before: Tokens,
-    after: Tokens,
-    responses: BTreeSet<String>,
-    ui_events: BTreeSet<String>,
-}
-/// Returns canonical members in source-counter order. Complete copies alias a
-/// canonical member; partial overlaps, gaps and resets have no admitted plan.
-pub(super) fn disjoint_plan(proofs: &[MemberProof]) -> Option<Vec<usize>> {
-    if proofs.len() < 2 || proofs.len() > MAX_MEMBERS {
-        return None;
-    }
-    let owner = &proofs.first()?.owner;
-    let mut copies = BTreeSet::new();
-    let mut order = Vec::new();
-    for (i, proof) in proofs.iter().enumerate() {
-        if &proof.owner != owner {
-            return None;
-        }
-        if copies.insert(proof.content.as_str()) {
-            order.push(i);
-        }
-    }
-    order.sort_by_key(|i| proofs[*i].before);
-    let mut previous = Tokens::default();
-    let mut responses = BTreeSet::new();
-    let mut ui_events = BTreeSet::new();
-    for i in &order {
-        let proof = &proofs[*i];
-        if proof.before != previous {
-            return None;
-        }
-        for response in &proof.responses {
-            if !responses.insert(response) {
-                return None;
-            }
-        }
-        for event in &proof.ui_events {
-            if !ui_events.insert(event) {
-                return None;
-            }
-        }
-        previous = proof.after;
-    }
-    Some(order)
-}
-
 impl crate::heap_layout_bound::HeapLayoutBound for ContentDigest {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Tokens {
+    const INLINE_ONLY: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         c.add(0)
     }
 }
-crate::heap_layout_bound::fields!(ProofBuilder; content, owner, first_before, last_after, responses, ui_events, native_usage, ui_usage, previous_ui, records, invalid);
-crate::heap_layout_bound::fields!(MemberProof; content, owner, before, after, responses, ui_events);
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
 
-    fn usage(input: u64) -> Value {
+    pub(crate) fn usage(input: u64) -> Value {
         json!({"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":0,
             "output_tokens":0,"reasoning_output_tokens":0,"total_tokens":input})
     }
-    fn member(owner: &str, response: &str, input: u64, cumulative: u64) -> Vec<Value> {
+    pub(crate) fn member(owner: &str, response: &str, input: u64, cumulative: u64) -> Vec<Value> {
+        // Header time follows the counter: equal header bytes and size would
+        // be one copied candidate (`CandidateCopy`).
+        let created = format!(
+            "2026-10-01T10:{:02}:00Z",
+            cumulative.saturating_sub(input) / 100
+        );
         vec![
-            json!({"type":"session_meta","timestamp":"2026-10-01T10:00:00Z","payload":{"id":owner}}),
+            json!({"type":"session_meta","timestamp":created,"payload":{"id":owner}}),
             json!({"type":"token_usage_record","timestamp":"2026-10-01T10:01:00Z","payload":{
                 "thread_id":owner,"response_id":response,"usage":usage(input),"thread_token_usage":usage(cumulative)}}),
             json!({"type":"event_msg","timestamp":format!("2026-10-01T10:{:02}:01Z",cumulative / 100),
                 "payload":{"type":"token_count","info":{"last_token_usage":usage(input),"total_token_usage":usage(cumulative)}}}),
         ]
     }
-    fn proof(rows: &[Value]) -> MemberProof {
-        let mut builder = ProofBuilder::default();
-        for row in rows {
-            builder.observe(row);
+    /// Boot and replay one group in page (no cursor) to its last EOF.
+    pub(crate) fn replay_group(
+        group: Group,
+        traces: Option<Arc<CodexTurnTraceMap>>,
+        index: &ScanIndex,
+    ) -> std::result::Result<Box<OwnedActiveFile>, GroupEnd> {
+        let mut boot = GroupBoot::new(group, index);
+        loop {
+            match boot.step(None, index) {
+                Boot::Pending => {}
+                Boot::Ready => break,
+                Boot::Refused(reason) => {
+                    return Err(GroupEnd::Refused {
+                        reason,
+                        position: 0,
+                        offset: 0,
+                        at_eof: false,
+                    })
+                }
+                Boot::Strict | Boot::Unchanged => return Err(GroupEnd::Strict),
+            }
         }
-        builder
-            .finish()
-            .expect("synthetic member has complete native contribution proof")
+        let metadata = CodexTitleMetadata::default();
+        boot.admit_for_test(index);
+        let mut job = boot.into_job(JobInputs {
+            metadata: &metadata,
+            traces,
+            ledgers: None,
+            artifacts: false,
+            context_curve: false,
+            index,
+        })?;
+        let no_scope = |_: &CandidateFile| None;
+        let inputs = StepInputs {
+            index,
+            metadata: &metadata,
+            attribution: None,
+            artifacts: false,
+            context_curve: false,
+            live_scope: &no_scope,
+        };
+        for _ in 0..10_000 {
+            match step_group(&mut job, &inputs) {
+                GroupStep::Read(Ok(true)) => return Ok(job),
+                GroupStep::Read(Ok(false)) => {}
+                GroupStep::Read(Err(_)) => return Err(GroupEnd::Strict),
+                GroupStep::End(end) => return Err(end),
+            }
+        }
+        panic!("bounded group replay did not finish");
     }
-    fn fixture() -> (PathBuf, HeaderInventory) {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-codex-join-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    pub(crate) fn fixture() -> (PathBuf, HeaderInventory) {
+        // Not keyed on the clock: macOS reads it in whole microseconds, so two
+        // tests could share (and one remove) the other's root.
+        let root = crate::test_scratch::unique_path("ottto-codex-join");
         let sessions = root.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -1651,20 +1804,14 @@ pub(super) mod tests {
     #[test]
     fn group_replay_uses_native_parser_and_revalidates_both_passes() {
         let (root, inventory) = fixture();
-        let members = inventory.groups().into_values().next().unwrap().members;
-        let mut group = GroupReader::new(members).unwrap();
-        while !group
-            .step(
-                &CodexTitleMetadata::default(),
-                None,
-                None,
-                false,
-                false,
-                None,
-            )
-            .unwrap()
-        {}
-        let (parser, last, members, _receipts) = group.finish().unwrap();
+        let group = inventory.groups().into_values().next().unwrap();
+        let job = replay_group(group, None, &ScanIndex::default()).unwrap();
+        let OwnedActiveFile {
+            parser,
+            candidate: last,
+            aliases: members,
+            ..
+        } = *job;
         assert_eq!(members.len(), 2);
         let parsed = parser
             .finish(
@@ -1708,7 +1855,11 @@ pub(super) mod tests {
         }
         root
     }
-    fn scan(root: &Path, index: ScanIndex, limit: usize) -> (ScanIndex, SourceScanResult) {
+    pub(crate) fn scan(
+        root: &Path,
+        index: ScanIndex,
+        limit: usize,
+    ) -> (ScanIndex, SourceScanResult) {
         let mut owned = OwnedSourceScan::new(
             SnapshotSource::Codex,
             &[root.join("sessions")],
@@ -1777,6 +1928,184 @@ pub(super) mod tests {
         assert_eq!(restarted.semantic_noop_count, 2);
         fs::remove_dir_all(root).unwrap();
     }
+    /// The two-member fixture with creation times, so a cutover can select V2.
+    /// Each member's native and UI share one bound turn (#630: a V2 group
+    /// proves native-turn UI, §k.3 rule 2).
+    pub(crate) fn counting_v2_fixture() -> (PathBuf, [String; 2]) {
+        counting_v2_fixture_with(true)
+    }
+    /// #603's original rows: UI in an unbound span, which a V2 group holds
+    /// (§k.3 rule 5).
+    pub(crate) fn counting_v2_unbound_fixture() -> (PathBuf, [String; 2]) {
+        counting_v2_fixture_with(false)
+    }
+    fn counting_v2_fixture_with(bound: bool) -> (PathBuf, [String; 2]) {
+        let (root, _) = fixture();
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        for (name, mut rows) in [
+            ("a", member(owner, "r-a", 100, 100)),
+            ("b", member(owner, "r-b", 200, 300)),
+        ] {
+            if bound {
+                let turn = format!("turn-{name}");
+                // The native names its turn (`payload.turn_id`), as Codex
+                // writes it; the UI follows inside the same open turn.
+                rows[1]["payload"]["turn_id"] = json!(turn);
+                let at = rows[0]["timestamp"].clone();
+                rows.insert(
+                    1,
+                    json!({"type":"event_msg","timestamp":at,
+                        "payload":{"type":"task_started","turn_id":turn}}),
+                );
+                let at = rows[rows.len() - 1]["timestamp"].clone();
+                rows.push(json!({"type":"event_msg","timestamp":at,
+                    "payload":{"type":"task_complete","turn_id":turn}}));
+            }
+            let body = rows
+                .into_iter()
+                .map(|mut row| {
+                    if row["type"] == "session_meta" {
+                        row["payload"]["timestamp"] = json!("2026-10-01T10:00:00Z");
+                    }
+                    serde_json::to_string(&row).unwrap() + "\n"
+                })
+                .collect::<String>();
+            fs::write(root.join("sessions").join(format!("{name}.jsonl")), body).unwrap();
+        }
+        let keys = ["a", "b"]
+            .map(|name| local_index_key(&root.join("sessions").join(format!("{name}.jsonl"))));
+        (root, keys)
+    }
+    /// The selected local ACK facts the counting mark must move with.
+    fn local_ack(
+        entry: &ScanIndexEntry,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
+        (
+            entry.last_snapshot_fingerprint.clone(),
+            entry.last_upload_body_witness.clone(),
+            entry.codex_joined_member_set.clone(),
+            entry.codex_protected_owner.clone(),
+        )
+    }
+    /// Finalizes one scan, saves its selected index over `file` (compare-and-
+    /// swap against the generation it was loaded at) and reloads it.
+    fn save_selected(
+        root: &Path,
+        file: &str,
+        mut working: ScanIndex,
+        mut result: SourceScanResult,
+        previous: &ScanIndex,
+        hold_owner: Option<&str>,
+    ) -> ScanIndex {
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
+        if let Some(owner) = hold_owner {
+            result.hold_codex_groups(
+                &mut working,
+                previous,
+                &BTreeSet::from([resolve_codex_identity(owner)]),
+                "synthetic counting hold",
+            );
+        }
+        result.finish_codex_capture_boundary(&mut working);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        let path = root.join(file);
+        working
+            .committable_subset(previous, &accepted, &BTreeMap::new())
+            .save(&path)
+            .unwrap();
+        ScanIndex::load(&path).unwrap()
+    }
+    #[test]
+    fn counting_v2_group_is_configured_once_and_folded_once() {
+        let (root, keys) = counting_v2_fixture();
+        let (legacy_index, legacy) = scan(&root, ScanIndex::default(), 2);
+        let _cutover = codex_counting_version::TestCutover::set(0);
+        let (index, counted) = scan(&root, ScanIndex::default(), 2);
+        assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
+        let receipts = counted
+            .codex_counting_v2
+            .as_deref()
+            .expect("an executed configured group parse owns receipts");
+        assert_eq!(receipts.v2_sessions, 1, "a joined group folds once");
+        // One carried accumulator saw both members' records, each inside
+        // its member's bound turn (#630 re-fixture: was 2 and 2 unbound).
+        assert_eq!(receipts.native_counted, 2, "both members' natives");
+        assert_eq!(receipts.native_outside_open_turn, 0);
+        assert_eq!(receipts.ui_in_unbound_span, 0);
+        for key in &keys {
+            assert!(index.files[key].codex_counting_v2, "V2 marks every member");
+            assert!(!legacy_index.files[key].codex_counting_v2);
+        }
+        assert!(
+            legacy.codex_counting_v2.is_none(),
+            "an inactive scan reports no receipts, not a zero block"
+        );
+        for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
+            assert_eq!(counted.input_tokens, legacy.input_tokens);
+            assert_eq!(counted.input_tokens, 300);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn counting_v2_member_mark_moves_only_with_the_selected_saved_ack() {
+        let (root, keys) = counting_v2_fixture();
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let previous = {
+            let _cutover = codex_counting_version::TestCutover::set(0);
+            let (index, result) = scan(&root, ScanIndex::default(), 2);
+            save_selected(&root, "v2.json", index, result, &ScanIndex::default(), None)
+        };
+        for key in &keys {
+            assert!(previous.files[key].codex_counting_v2, "saved V2 ACK");
+            assert!(previous.files[key].last_snapshot_fingerprint.is_some());
+        }
+        // The held and settled outcomes are alternatives: each starts from its
+        // own copy of the saved index the cycle loaded.
+        for file in ["held.json", "settled.json"] {
+            fs::copy(root.join("v2.json"), root.join(file)).unwrap();
+        }
+        // New content, parsed by an inactive build: a Legacy group decision.
+        let path = root.join("sessions/b.jsonl");
+        let mut text = fs::read_to_string(&path).unwrap();
+        for row in member(owner, "r-c", 200, 500).into_iter().skip(1) {
+            text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
+        }
+        fs::write(&path, text).unwrap();
+        let legacy_scan = || {
+            let (working, result) = scan(&root, previous.clone(), 2);
+            for key in &keys {
+                assert!(!working.files[key].codex_counting_v2);
+            }
+            (working, result)
+        };
+        // A held group restores the old mark with the old ACK in saved state.
+        let (working, result) = legacy_scan();
+        let held = save_selected(&root, "held.json", working, result, &previous, Some(owner));
+        for key in &keys {
+            assert!(held.files[key].codex_counting_v2, "mark kept with its ACK");
+            assert_eq!(local_ack(&held.files[key]), local_ack(&previous.files[key]));
+        }
+        // Paired control: the selected save records false with the new facts.
+        let (working, result) = legacy_scan();
+        let settled = save_selected(&root, "settled.json", working, result, &previous, None);
+        for key in &keys {
+            assert!(!settled.files[key].codex_counting_v2, "false with new ACK");
+            assert_ne!(
+                settled.files[key].last_snapshot_fingerprint,
+                previous.files[key].last_snapshot_fingerprint
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn applied_priority_survives_trace_expiry_without_pricing_appended_same_turn() {
         let (root, inventory) = fixture();
@@ -1794,22 +2123,19 @@ pub(super) mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let mut group =
-            GroupReader::new(inventory.groups().into_values().next().unwrap().members).unwrap();
         let mut traces = CodexTurnTraceMap::default();
         traces.priority_turns.insert(turn.into());
-        while !group
-            .step(
-                &CodexTitleMetadata::default(),
-                Some(Arc::new(traces.clone())),
-                None,
-                false,
-                false,
-                None,
-            )
-            .unwrap()
-        {}
-        let (_parser, _last, members, receipts) = group.finish().unwrap();
+        let job = replay_group(
+            inventory.groups().into_values().next().unwrap(),
+            Some(Arc::new(traces.clone())),
+            &ScanIndex::default(),
+        )
+        .unwrap();
+        let OwnedActiveFile {
+            aliases: members,
+            applied_receipts: receipts,
+            ..
+        } = *job;
         let mut index = ScanIndex::default();
         for member in members {
             let key = local_index_key(&member.path);
@@ -1841,21 +2167,13 @@ pub(super) mod tests {
             while !fresh.step(&CodexTitleMetadata::default()) {}
             ((), fresh)
         };
-        let mut group =
-            GroupReader::new(fresh.groups().into_values().next().unwrap().members).unwrap();
-        group.configure_receipts(&index);
-        while !group
-            .step(
-                &CodexTitleMetadata::default(),
-                None,
-                None,
-                false,
-                false,
-                None,
-            )
-            .unwrap()
-        {}
-        let (parser, last, _members, receipts) = group.finish().unwrap();
+        let job = replay_group(fresh.groups().into_values().next().unwrap(), None, &index).unwrap();
+        let OwnedActiveFile {
+            parser,
+            candidate: last,
+            applied_receipts: receipts,
+            ..
+        } = *job;
         let parsed = parser
             .finish(
                 &last.opened_object_identity,
@@ -2270,12 +2588,7 @@ pub(super) mod tests {
         );
         let mut added = false;
         loop {
-            if !added
-                && owned
-                    .codex_join_active
-                    .as_ref()
-                    .is_some_and(|(_, reader)| reader.replay_member.is_some())
-            {
+            if !added && owned.codex_join_active.is_some() {
                 let rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "late", 100, 400);
                 fs::write(
                     root.join("sessions/c.jsonl"),
@@ -2338,8 +2651,11 @@ pub(super) mod tests {
         let (index, first) = scan(&root, ScanIndex::default(), 2);
         assert!(first.snapshots.is_empty());
         assert!(!first.census_complete);
+        // Outcome R: the refused owner stays blocked as settleable residue.
+        assert!(index
+            .codex_state_only_blocked_session_ids
+            .contains("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
         let (_, next) = scan(&root, index, 2);
-        assert!(!next.census_complete);
         assert_eq!(next.snapshots.len(), 1);
         assert_eq!(next.snapshots[0].source_session_id, healthy);
         fs::remove_dir_all(root).unwrap();
@@ -2385,14 +2701,7 @@ pub(super) mod tests {
     /// A settled `known` rollout beside one whose malformed line keeps the
     /// generation red, so it is retained behind its bounded retry deadline.
     fn retained_red_generation(known: Vec<Value>) -> (PathBuf, ScanIndex) {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-codex-retained-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = crate::test_scratch::unique_path("ottto-codex-retained");
         let sessions = root.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         write_rows(&sessions.join("a.jsonl"), &known);
@@ -3322,7 +3631,7 @@ pub(super) mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
-    fn legacy_index(
+    pub(crate) fn legacy_index(
         inventory: &HeaderInventory,
         traces: Option<Arc<CodexTurnTraceMap>>,
     ) -> ScanIndex {
@@ -3365,15 +3674,10 @@ pub(super) mod tests {
                 .iter()
                 .map(|item| snapshot_fingerprint(SnapshotSource::Codex, item))
                 .collect::<BTreeSet<_>>();
-            let mut digest = Sha256::new();
-            update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
-            for fingerprint in &fingerprints {
-                update_length_prefixed(&mut digest, fingerprint.as_bytes());
-            }
             let key = local_index_key(&member.path);
             index.record(
                 member,
-                Some(format!("{:x}", digest.finalize())),
+                Some(snapshot_file_entity_set_hex(&fingerprints)),
                 ScanParseOutcome::Snapshot,
             );
             index.file_snapshot_fingerprints.insert(key, fingerprints);
@@ -3386,9 +3690,6 @@ pub(super) mod tests {
         let previous = legacy_index(&inventory, None);
         let group = inventory.groups().into_values().next().unwrap();
         let workers = vec![group.owner.clone()];
-        let mut reader = GroupReader::new(group.members).unwrap();
-        reader.configure_launch_owner(&group.owner);
-        reader.configure_receipts(&previous);
         let key = base64::Engine::encode(
             &base64::engine::general_purpose::URL_SAFE_NO_PAD,
             [13_u8; 32],
@@ -3402,10 +3703,13 @@ pub(super) mod tests {
         )
         .unwrap();
         let metadata = CodexTitleMetadata::default();
-        while reader.proof_reader.is_none() {
-            assert!(!reader
-                .step(&metadata, None, None, false, false, Some(&context))
-                .unwrap());
+        let mut boot = GroupBoot::new(group, &previous);
+        loop {
+            match boot.step(Some(&context), &previous) {
+                Boot::Pending => {}
+                Boot::Ready => break,
+                _ => panic!("the legacy group boots"),
+            }
         }
         assert!(context.launches_prepared(&workers));
         context.expire_launch_lookup_for_test();
@@ -3430,29 +3734,55 @@ pub(super) mod tests {
             )
             .unwrap();
         }
-        let mut steps = 0;
-        while !reader.proof_reader.as_ref().unwrap().reader.finished {
-            assert!(!reader
-                .step(&metadata, None, None, false, false, Some(&context))
-                .unwrap());
+        boot.admit_for_test(&previous);
+        let mut job = boot
+            .into_job(JobInputs {
+                metadata: &metadata,
+                traces: None,
+                ledgers: None,
+                artifacts: false,
+                context_curve: false,
+                index: &previous,
+            })
+            .unwrap();
+        let no_scope = |_: &CandidateFile| None;
+        let inputs = StepInputs {
+            index: &previous,
+            metadata: &metadata,
+            attribution: Some(&context),
+            artifacts: false,
+            context_curve: false,
+            live_scope: &no_scope,
+        };
+        let (mut steps, mut yields) = (0, 0);
+        loop {
+            let before = (
+                job.group.as_ref().unwrap().current,
+                job.parser.reader.consumed_bytes(),
+            );
+            match step_group(&mut job, &inputs) {
+                GroupStep::Read(Ok(true)) => break,
+                GroupStep::Read(Ok(false)) => {}
+                _ => panic!("the legacy group replays"),
+            }
+            let after = (
+                job.group.as_ref().unwrap().current,
+                job.parser.reader.consumed_bytes(),
+            );
+            if before == after && job.parser.reader.finished {
+                // A finished member re-entered its EOF: the lookup yielded.
+                yields += 1;
+            }
             steps += 1;
             assert!(steps < 100);
         }
-        assert!(!context.launches_prepared(&workers));
-        assert!(reader.proofs.is_empty());
-        assert!(reader.legacy_baselines.is_empty());
-        while !reader
-            .step(&metadata, None, None, false, false, Some(&context))
-            .unwrap()
-        {
-            steps += 1;
-            assert!(steps < 100);
-        }
-        assert!(steps > 2, "lookup must yield across the retained backlog");
-        assert_eq!(reader.records, 6, "completed proofs must not be read twice");
-        assert_eq!(reader.legacy_baselines.len(), 2);
+        assert!(yields > 0, "lookup must yield across the retained backlog");
+        assert_eq!(
+            job.parser.reader.report.parsed_json_line_count, 6,
+            "completed members must not be read twice"
+        );
+        assert_eq!(job.group.as_mut().unwrap().take_legacy_baselines().len(), 2);
         assert!(context.launches_prepared(&workers));
-        reader.finish().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3529,54 +3859,78 @@ pub(super) mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
-    #[test]
-    fn disjoint_continuation_uses_counter_order_and_collapses_complete_copies() {
-        let a = member("owner", "response-a", 100, 100);
-        let b = member("owner", "response-b", 200, 300);
-        assert_eq!(disjoint_plan(&[proof(&b), proof(&a)]), Some(vec![1, 0]));
-        assert_eq!(disjoint_plan(&[proof(&a), proof(&a)]), Some(vec![0]));
-        assert_eq!(
-            disjoint_plan(&[proof(&a), proof(&b), proof(&a)]),
-            Some(vec![0, 1])
+    const OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    /// Feed members in order through one `StreamProof`, with the parser's
+    /// S10 tap after every UI usage record.
+    pub(crate) fn stream(members: &[Vec<Value>]) -> Option<(JoinRefusal, usize)> {
+        let mut proof = StreamProof::new(
+            OWNER.into(),
+            false,
+            vec![MemberPlan::default(); members.len()],
         );
+        for (position, rows) in members.iter().enumerate() {
+            proof.begin_member(position);
+            for row in rows {
+                proof.observe(row);
+                if codex_last_usage(row).is_some() {
+                    let identity = codex_usage_event_identity(row);
+                    proof.admitted_usage(row, true, identity.as_deref(), None);
+                }
+            }
+            proof.end_member(0);
+        }
+        proof.finish_group();
+        proof.refusal()
     }
     #[test]
-    fn overlapping_identity_gap_reset_or_different_owner_has_no_plan() {
-        let a = member("owner", "response-a", 100, 100);
-        for b in [
-            member("owner", "response-a", 200, 300),
-            member("owner", "response-b", 200, 400),
-            member("owner", "response-b", 200, 200),
-            member("other-owner", "response-b", 200, 300),
+    fn disjoint_continuation_uses_counter_order() {
+        let a = member(OWNER, "response-a", 100, 100);
+        let b = member(OWNER, "response-b", 200, 300);
+        assert_eq!(stream(&[a.clone(), b.clone()]), None);
+        let probes = [probe_before(&b[1]), probe_before(&a[1])];
+        assert_eq!(order_by_probes(&[0, 1], &probes), Ok(vec![1, 0]));
+    }
+    #[test]
+    fn overlapping_identity_gap_reset_or_different_owner_is_refused() {
+        let a = member(OWNER, "response-a", 100, 100);
+        for (b, reason) in [
+            (member(OWNER, "response-a", 200, 300), JoinRefusal::Overlap),
+            (member(OWNER, "response-b", 200, 400), JoinRefusal::Gap),
+            (member(OWNER, "response-b", 200, 200), JoinRefusal::Overlap),
+            (
+                member(
+                    "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                    "response-b",
+                    200,
+                    300,
+                ),
+                JoinRefusal::Overlap,
+            ),
         ] {
-            assert!(disjoint_plan(&[proof(&a), proof(&b)]).is_none());
+            assert_eq!(stream(&[a.clone(), b]), Some((reason, 1)));
         }
     }
     #[test]
     fn copied_ui_contribution_cannot_gain_a_second_member() {
-        let a = member("owner", "response-a", 100, 100);
-        let mut b = member("owner", "response-b", 100, 200);
+        let a = member(OWNER, "response-a", 100, 100);
+        let mut b = member(OWNER, "response-b", 100, 200);
         b[2] = a[2].clone();
-        assert!(disjoint_plan(&[proof(&a), proof(&b)]).is_none());
+        assert_eq!(stream(&[a, b]), Some((JoinRefusal::Overlap, 1)));
     }
     #[test]
     fn missing_owner_native_fields_or_ui_coverage_is_not_accepted() {
-        let rows = member("owner", "response", 100, 100);
+        let rows = member(OWNER, "response", 100, 100);
         for field in ["thread_id", "response_id", "usage", "thread_token_usage"] {
             let mut changed = rows.clone();
             changed[1]["payload"].as_object_mut().unwrap().remove(field);
-            let mut builder = ProofBuilder::default();
-            for row in &changed {
-                builder.observe(row);
-            }
-            assert!(builder.finish().is_none(), "{field}");
+            assert_eq!(
+                stream(&[changed]),
+                Some((JoinRefusal::Corrupt, 0)),
+                "{field}"
+            );
         }
         let mut changed = rows;
         changed[2]["payload"]["info"]["last_token_usage"] = usage(200);
-        let mut builder = ProofBuilder::default();
-        for row in &changed {
-            builder.observe(row);
-        }
-        assert!(builder.finish().is_none());
+        assert_eq!(stream(&[changed]), Some((JoinRefusal::UiUnmatched, 0)));
     }
 }

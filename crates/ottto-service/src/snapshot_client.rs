@@ -189,6 +189,42 @@ fn encoding_was_refused(outcome: &Result<ureq::Response, ureq::Error>) -> bool {
 pub struct UploadShed {
     pub status: u16,
     pub retry_after: Option<Duration>,
+    /// The backend's error code when it is one the daemon recognizes. Only
+    /// this fixed name survives; the rest of the response body is discarded.
+    pub code: Option<UploadShedCode>,
+}
+
+/// The backend error code of the 503 that defers a batch while an original
+/// session identity cannot be evaluated.
+pub const SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE: &str = "snapshot_original_identity_unavailable";
+
+/// A shed's backend error code, kept only when it is one of these fixed names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadShedCode {
+    /// `snapshot_original_identity_unavailable`: the decision waits for the
+    /// identity, not for the request, so it keeps its own backoff whatever
+    /// `Retry-After` accompanies it and is never resent in place.
+    OriginalIdentityUnavailable,
+}
+
+impl UploadShedCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OriginalIdentityUnavailable => SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE,
+        }
+    }
+
+    fn recognize(code: &str) -> Option<Self> {
+        (code == SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE)
+            .then_some(Self::OriginalIdentityUnavailable)
+    }
+}
+
+impl UploadShed {
+    /// The identity deferral, recognized by its fixed backend code.
+    pub fn is_original_identity_unavailable(&self) -> bool {
+        self.code == Some(UploadShedCode::OriginalIdentityUnavailable)
+    }
 }
 
 impl std::fmt::Display for UploadShed {
@@ -242,13 +278,34 @@ pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Dura
     Some(Duration::from_secs(delta.whole_seconds().unsigned_abs()).min(MAX_HONOURED_RETRY_AFTER))
 }
 
-fn shed_from_response(status: u16, response: &ureq::Response) -> UploadShed {
+/// Bytes of a shed body read to recognize its code. The backend's error
+/// envelope is a few hundred bytes; a longer body is not recognized.
+const SHED_BODY_EXCERPT_BYTES: u64 = 4 * 1024;
+
+fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
+    let retry_after = response
+        .header("Retry-After")
+        .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc()));
+    let mut excerpt = Vec::new();
+    let code = response
+        .into_reader()
+        .take(SHED_BODY_EXCERPT_BYTES)
+        .read_to_end(&mut excerpt)
+        .ok()
+        .and_then(|_| shed_code(&excerpt));
     UploadShed {
         status,
-        retry_after: response
-            .header("Retry-After")
-            .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc())),
+        retry_after,
+        code,
     }
+}
+
+/// The recognized top-level `code` of a backend error envelope, which must be
+/// a JSON object. Any other code, a malformed or truncated body, a non-object
+/// body or a non-string code is `None`; no body text outlives this call.
+fn shed_code(excerpt: &[u8]) -> Option<UploadShedCode> {
+    let envelope = serde_json::from_slice::<Value>(excerpt).ok()?;
+    UploadShedCode::recognize(envelope.as_object()?.get("code")?.as_str()?)
 }
 
 /// The backend refused a snapshot batch before payload validation because the
@@ -397,6 +454,7 @@ struct CloudSessionScanFinalizeAckV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayTokenAuthorizationRejected {
     pub status: u16,
+    pub suppressed: bool,
 }
 
 impl std::fmt::Display for RelayTokenAuthorizationRejected {
@@ -513,6 +571,14 @@ impl UploadFailureDiagnostics {
             && (self.status_family == "transport_timeout" || self.http_status == Some(504))
     }
 
+    /// The status of a snapshot-batch server error that a prompt resend of
+    /// the same idempotent page may clear: 500 or 502 only. Other endpoints,
+    /// other statuses and transport failures never qualify.
+    pub(crate) fn transient_batch_status(&self) -> Option<u16> {
+        self.http_status
+            .filter(|status| self.endpoint == "snapshot_batch" && matches!(status, 500 | 502))
+    }
+
     pub fn safe_message(&self) -> String {
         format!(
             "{} failed (endpoint={}, status_family={}, retryable={}, request_id={})",
@@ -585,6 +651,11 @@ pub struct ActivityHintResponse {
     pub session_titles_enabled: bool,
     #[serde(default = "default_true")]
     pub workspace_labels_enabled: bool,
+    /// `workspace_labels_enabled` exactly as sent; `None` when the response
+    /// omitted it (the field above then defaults to on). Set only by
+    /// `decode_activity_hint`. Instruction-file paths need `Some(true)`.
+    #[serde(skip)]
+    pub workspace_labels_explicit: Option<bool>,
     #[serde(default)]
     pub session_artifacts_enabled: bool,
     // Opt-out (default on). The backend resolves the full cascade (telemetry-off
@@ -594,6 +665,9 @@ pub struct ActivityHintResponse {
     pub mcp_inventory_harvest_enabled: bool,
     #[serde(default = "default_true")]
     pub context_footprint_harvest_enabled: bool,
+    /// Exact additive composition detail contract; missing/null/unknown stays legacy.
+    #[serde(default)]
+    pub context_composition_details_contract: Option<String>,
     #[serde(default)]
     pub session_attribution_enabled: bool,
     /// Additive server capability for bounded private labels on opaque
@@ -637,6 +711,24 @@ pub struct ActivityHintResponse {
     pub recommended_scan_after: String,
 }
 
+/// Decodes an activity hint and records whether `workspace_labels_enabled`
+/// was actually sent.
+pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse> {
+    let mut hint = ActivityHintResponse::deserialize(&value)
+        .map_err(|error| anyhow!("parse activity hint response failed: {error}"))?;
+    hint.workspace_labels_explicit = value
+        .get("workspace_labels_enabled")
+        .and_then(Value::as_bool);
+    Ok(hint)
+}
+
+/// Whether the context harvesters may upload workspace and repository labels.
+/// `None` is a failed hint fetch: the policy is unknown, so labels are
+/// withheld. A fetched hint keeps its `workspace_labels_enabled` as sent.
+pub(crate) fn workspace_labels_allowed(hint: Option<&ActivityHintResponse>) -> bool {
+    hint.is_some_and(|hint| hint.workspace_labels_enabled)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -674,6 +766,12 @@ pub struct SnapshotEntityRef {
     pub head_etag: Option<String>,
     #[serde(default)]
     pub head_challenge: Option<String>,
+    /// Set only on an `unchanged` ref the server settled because its stored
+    /// head already covers this body's usage (`usage_identical`,
+    /// `dominated_by_head`). The server did NOT store this body, so no
+    /// body-scoped state may be recorded as stored. Read, never persisted.
+    #[serde(default)]
+    pub unchanged_basis: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -705,6 +803,8 @@ impl SnapshotEntityRejection {
                 "occurred_at_utc_normalization_out_of_range"
             }
             "usage_accounting_authority_downgrade" => "usage_accounting_authority_downgrade",
+            // Logged by name; persisted as the old enum value `other`.
+            "original_pair_candidate_unproved" => "original_pair_candidate_unproved",
             _ => "other",
         }
     }
@@ -816,7 +916,8 @@ impl SnapshotBatchResponse {
                     return Err(anyhow!("legacy snapshot response accepted count mismatch"));
                 }
                 if request.snapshots.iter().any(|item| {
-                    item.context_curve.is_some()
+                    crate::snapshots::claude_request_money::is_request_owned_literal(item)
+                        || item.context_curve.is_some()
                         || item.session_account_evidence.is_some()
                         || item.cache_observations.is_some()
                 }) {
@@ -972,6 +1073,7 @@ impl SnapshotBatchResponse {
                 body_witness_digest: None,
                 head_etag: None,
                 head_challenge: None,
+                unchanged_basis: None,
             };
             validate_snapshot_entity_ref(&reference)?;
             if !rejection.permanent {
@@ -1541,6 +1643,15 @@ pub struct SnapshotApiClient {
 }
 
 impl SnapshotApiClient {
+    pub(crate) fn relay_auth_binding(
+        &self,
+        device: &LocalDeviceBinding,
+        secret: &str,
+        source: SnapshotSource,
+    ) -> [u8; 32] {
+        crate::relay_auth::binding_key(&self.api_base_url, device, secret, source.api_slug())
+    }
+
     pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
         self.api_base_url == expected
     }
@@ -1633,12 +1744,15 @@ impl SnapshotApiClient {
         device_secret: &str,
         source: SnapshotSource,
     ) -> Result<String> {
+        // The shared upload agent follows redirects and pools nothing (see
+        // `timeout_agent`), so a per-call credential agent loses no warm socket.
         self.issue_relay_token_with_agent(
-            &self.agent,
+            &credential_timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT),
             device,
             device_secret,
             source,
             SNAPSHOT_HTTP_READ_TIMEOUT,
+            None,
         )
     }
 
@@ -1650,7 +1764,34 @@ impl SnapshotApiClient {
         timeout: Duration,
     ) -> Result<String> {
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        self.issue_relay_token_with_agent(&agent, device, device_secret, source, request_timeout)
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            None,
+        )
+    }
+
+    /// One optional parent-side token request, with the same DNS, TLS and
+    /// request deadline and response admission bound as the health transport.
+    pub(crate) fn issue_composition_health_relay_token(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+        timeout: Duration,
+    ) -> Result<String> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            Some(crate::snapshot_retry::TOKEN_RESPONSE_BYTES),
+        )
     }
 
     fn issue_relay_token_with_agent(
@@ -1660,7 +1801,14 @@ impl SnapshotApiClient {
         device_secret: &str,
         source: SnapshotSource,
         timeout: Duration,
+        response_cap: Option<usize>,
     ) -> Result<String> {
+        let mut probe = crate::relay_auth::Probe::begin(
+            &self.api_base_url,
+            device,
+            device_secret,
+            source.api_slug(),
+        )?;
         let url = self.api_url(&format!(
             "/api/v1/telemetry/devices/{}/relay-token",
             device.device_id
@@ -1673,7 +1821,11 @@ impl SnapshotApiClient {
             .send_json(relay_token_request_payload(device, source.api_slug()))
             .map_err(|error| match error {
                 ureq::Error::Status(status @ (401 | 403), _response) => {
-                    anyhow::Error::new(RelayTokenAuthorizationRejected { status })
+                    probe.reject(status);
+                    anyhow::Error::new(RelayTokenAuthorizationRejected {
+                        status,
+                        suppressed: false,
+                    })
                 }
                 ureq::Error::Status(status, response) => {
                     anyhow::Error::new(UploadFailureDiagnostics::http(
@@ -1689,10 +1841,14 @@ impl SnapshotApiClient {
                     &other,
                 )),
             })?;
-        let response: RelayTokenResponse =
-            require_cloud_session_success(response, "relay token request", "relay_token")?
-                .into_json()
-                .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+        let response =
+            require_cloud_session_success(response, "relay token request", "relay_token")?;
+        let response: RelayTokenResponse = match response_cap {
+            Some(cap) => bounded_response_json(response, cap),
+            None => response.into_json().map_err(anyhow::Error::from),
+        }
+        .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+        probe.success();
         Ok(response.token)
     }
 
@@ -1712,41 +1868,17 @@ impl SnapshotApiClient {
             ));
         }
         let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
-        let url = self.api_url(&format!(
-            "/api/v1/telemetry/devices/{}/relay-token",
-            device.device_id
-        ));
-        let response = agent
-            .post(&url)
-            .timeout(timeout)
-            .set("Accept", "application/json")
-            .set("X-Ottto-Device-Secret", device_secret)
-            .send_json(relay_token_request_payload(device, source.api_slug()))
-            .map_err(|error| match error {
-                ureq::Error::Status(status @ (401 | 403), _) => {
-                    anyhow::Error::new(RelayTokenAuthorizationRejected { status })
-                }
-                ureq::Error::Status(status, response) => {
-                    anyhow::Error::new(UploadFailureDiagnostics::http(
-                        "relay token request",
-                        "relay_token",
-                        status,
-                        &response,
-                    ))
-                }
-                other => anyhow::Error::new(UploadFailureDiagnostics::transport(
-                    "relay token request",
-                    "relay_token",
-                    &other,
-                )),
-            })?;
-        let response =
-            require_cloud_session_success(response, "relay token request", "relay_token")?;
-        let token: RelayTokenResponse =
-            bounded_response_json(response, crate::snapshot_retry::TOKEN_RESPONSE_BYTES)?;
+        let token = self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            timeout,
+            Some(crate::snapshot_retry::TOKEN_RESPONSE_BYTES),
+        )?;
         budget.remaining(Instant::now())?;
         validate()?;
-        Ok(token.token)
+        Ok(token)
     }
 
     pub(crate) fn get_activity_hint_bounded(
@@ -1795,8 +1927,9 @@ impl SnapshotApiClient {
                     &other,
                 )),
             })?
-            .into_json()
+            .into_json::<Value>()
             .map_err(|error| anyhow!("parse activity hint response failed: {error}"))
+            .and_then(decode_activity_hint)
     }
 
     pub fn upload_batch(
@@ -1936,6 +2069,11 @@ impl SnapshotApiClient {
                             enforce_head_cas,
                             retry.is_some(),
                         );
+                        self.record_composition_start_verdicts(
+                            request,
+                            &response,
+                            enforce_head_cas,
+                        );
                         Ok(response)
                     }
                     Err(_) => {
@@ -1957,12 +2095,13 @@ impl SnapshotApiClient {
             // server's own backoff so the caller can honour it instead of
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
-                let shed = shed_from_response(code, &response);
+                let server_request_id = response.header("X-Request-ID").map(str::to_string);
+                let shed = shed_from_response(code, response);
                 self.record_batch_http_failure(
                     request,
                     ottto_protocol::UploadReceiptOutcomeV1::Shed,
                     code,
-                    response.header("X-Request-ID"),
+                    server_request_id.as_deref(),
                     shed.retry_after.map(|retry_after| retry_after.as_secs()),
                     retry.is_some(),
                 );
@@ -2030,6 +2169,66 @@ impl SnapshotApiClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn record_composition_start_verdicts(
+        &self,
+        request: &SnapshotBatchRequest,
+        response: &SnapshotBatchResponse,
+        enforce_head_cas: bool,
+    ) {
+        let Some(support) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        let Some(namespace) = self.receipt_destination_namespace.as_deref() else {
+            return;
+        };
+        let destination = crate::snapshots::start_verdict_store::destination(
+            namespace,
+            &self.api_base_url,
+            &request.machine_id,
+        );
+        if response.disabled
+            || response
+                .validate_entity_ack_with_head_cas(request, enforce_head_cas)
+                .is_err()
+        {
+            return;
+        }
+        // This is the final folded, budget-trimmed wire item. A well-formed
+        // ACK can still reject or conflict individual items: record only the
+        // accepted/unchanged bodies, never those other outcomes.
+        let acknowledged: std::collections::BTreeSet<_> = response
+            .accepted_entities
+            .iter()
+            .chain(&response.unchanged_entities)
+            .map(|r| {
+                (
+                    r.source_session_id.as_str(),
+                    r.snapshot_fingerprint.as_str(),
+                )
+            })
+            .collect();
+        let items = request.snapshots.iter().filter(|item| {
+            response.entity_ack_contract.is_none()
+                || acknowledged.contains(&(
+                    item.source_session_id.as_str(),
+                    item.snapshot_fingerprint.as_str(),
+                ))
+        });
+        match crate::snapshots::start_verdict_store::record(
+            support,
+            &destination,
+            &request.source,
+            items,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        ) {
+            Ok(bytes) if bytes > 0 => {
+                eprintln!("ottto-service: composition_start_verdict bytes_appended={bytes}")
+            }
+            Ok(_) => {}
+            Err(_) => eprintln!("ottto-service: composition start verdict persistence failed"),
+        }
+    }
+
     fn record_batch_success(
         &self,
         request: &SnapshotBatchRequest,
@@ -2217,6 +2416,7 @@ impl SnapshotApiClient {
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
                     status: code,
+                    suppressed: false,
                 }))
             }
             Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
@@ -2240,6 +2440,7 @@ impl SnapshotApiClient {
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
                     status: code,
+                    suppressed: false,
                 }))
             }
             Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
@@ -2512,12 +2713,77 @@ impl SnapshotApiClient {
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
                     status: code,
+                    suppressed: false,
                 }))
             }
             Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
                 Err(anyhow!("backend rejected context composition: HTTP {code}"))
             }
             Err(error) => Err(anyhow!("upload context composition failed: {error}")),
+        }
+    }
+
+    /// The composition upload from its serialized body, so the bytes the
+    /// run counts are the bytes sent (the same body `send_json` would send).
+    pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
+        match self
+            .agent
+            .post(&self.api_url("/api/v1/context-composition/snapshot"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .set("Content-Type", "application/json")
+            .send_bytes(body)
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse context composition response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                    status: code,
+                    suppressed: false,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+                Err(anyhow!("backend rejected context composition: HTTP {code}"))
+            }
+            Err(error) => Err(anyhow!("upload context composition failed: {error}")),
+        }
+    }
+
+    /// The daily composition run health: one request, never retried. A
+    /// refusal is counted by the caller and the next day's run sends again.
+    pub fn post_context_composition_run_health(
+        &self,
+        relay_token: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        self.post_context_composition_run_health_with_timeout(
+            relay_token,
+            body,
+            Duration::from_secs(10),
+        )
+    }
+
+    pub(crate) fn post_context_composition_run_health_with_timeout(
+        &self,
+        relay_token: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        match agent
+            .post(&self.api_url("/api/v1/context-composition/run-health"))
+            .timeout(request_timeout)
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(body)
+        {
+            Ok(response) => bounded_response_json(response, 64 * 1024)
+                .map_err(|error| anyhow!("parse composition run health response failed: {error}")),
+            Err(ureq::Error::Status(code, _response)) => Err(anyhow!(
+                "backend refused composition run health: HTTP {code}"
+            )),
+            Err(error) => Err(anyhow!("send composition run health failed: {error}")),
         }
     }
 
@@ -2766,7 +3032,16 @@ fn validate_cloud_session_scan_receipt(
 }
 
 pub(crate) fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
+    with_snapshot_timeouts(crate::retry_tls::agent_builder(), read_timeout)
+}
+
+/// `timeout_agent` for a request that carries the device secret: no redirects.
+fn credential_timeout_agent(read_timeout: Duration) -> ureq::Agent {
+    with_snapshot_timeouts(crate::retry_tls::credential_agent_builder(), read_timeout)
+}
+
+fn with_snapshot_timeouts(builder: ureq::AgentBuilder, read_timeout: Duration) -> ureq::Agent {
+    builder
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
         .timeout_read(read_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
@@ -2835,8 +3110,8 @@ fn bounded_snapshot_deadline_agent(deadline: Instant) -> Result<(ureq::Agent, Du
         .resolver(crate::net_resilience::deadline_fallback_resolver(
             dns_timeout,
         ))
-        .tls_connector(connector)
-        .build();
+        .tls_connector(connector);
+    let agent = crate::retry_tls::guard_unit_test_egress(agent).build();
     Ok((agent, request_timeout))
 }
 
@@ -2851,14 +3126,13 @@ fn cloud_session_deadline_agent(timeout: Duration) -> Result<(ureq::Agent, Durat
     if dns_timeout.is_zero() || request_timeout.is_zero() {
         return Err(anyhow!("cloud-session request deadline is too small"));
     }
-    let agent = ureq::AgentBuilder::new()
+    // Cloud-session requests carry either the long-lived device secret or
+    // a relay bearer token. Never let ureq replay either credential to a
+    // redirect target; a 3xx is handled as an ordinary non-success status.
+    let agent = crate::retry_tls::credential_agent_builder()
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT.min(request_timeout))
         .timeout_read(request_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT.min(request_timeout))
-        // Cloud-session requests carry either the long-lived device secret or
-        // a relay bearer token. Never let ureq replay either credential to a
-        // redirect target; a 3xx is handled as an ordinary non-success status.
-        .redirects(0)
         .max_idle_connections(0)
         .resolver(crate::net_resilience::deadline_fallback_resolver(
             dns_timeout,
@@ -2977,6 +3251,42 @@ mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
     use std::io::Read;
+
+    #[test]
+    fn bounded_unit_test_agent_refuses_production_before_dns_or_tls() {
+        let (agent, _) =
+            bounded_snapshot_deadline_agent(Instant::now() + Duration::from_secs(5)).unwrap();
+        let error = agent.get("https://api.ottto.net").call().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unit tests may only send HTTP requests to loopback fixtures"));
+    }
+
+    #[test]
+    fn relay_token_request_never_follows_redirects_or_reaches_a_host_logger() {
+        use crate::retry_tls::credential_test_support::{
+            assert_never_logged, install_host_logger, RedirectingBackend,
+        };
+        install_host_logger();
+        let device = LocalDeviceBinding {
+            device_id: "device-synthetic".to_string(),
+            machine_id: None,
+            sources: vec!["codex".to_string()],
+        };
+        for status in ["302 Found", "307 Temporary Redirect"] {
+            let secret = format!("synthetic-snapshot-device-secret-{}", &status[..3]);
+            let backend = RedirectingBackend::start(status);
+            assert!(SnapshotApiClient::new(backend.base_url.clone())
+                .issue_relay_token(&device, &secret, SnapshotSource::Codex)
+                .is_err());
+            let request = backend.finish();
+            assert!(
+                request.starts_with("POST /api/v1/telemetry/devices/device-synthetic/relay-token ")
+            );
+            assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
+            assert_never_logged(&secret);
+        }
+    }
 
     #[test]
     fn stale_older_rejection_reason_is_safe_but_unknown_reasons_are_not() {
@@ -3207,6 +3517,25 @@ mod tests {
     }
 
     #[test]
+    fn harvester_labels_need_a_fetched_hint_that_allows_them() {
+        let hint =
+            |json: String| decode_activity_hint(serde_json::from_str(&json).unwrap()).unwrap();
+        let on = hint(activity_hint_json(""));
+        let off = hint(activity_hint_json("").replace(
+            "\"workspace_labels_enabled\":true",
+            "\"workspace_labels_enabled\":false",
+        ));
+        let omitted =
+            hint(activity_hint_json("").replace("\"workspace_labels_enabled\":true,", ""));
+        assert!(workspace_labels_allowed(Some(&on)));
+        assert!(!workspace_labels_allowed(Some(&off)));
+        // A fetched hint from an older backend keeps the legacy default.
+        assert!(workspace_labels_allowed(Some(&omitted)));
+        // A failed fetch leaves the policy unknown: labels stay on the machine.
+        assert!(!workspace_labels_allowed(None));
+    }
+
+    #[test]
     fn batch_rejected_downcasts_from_anyhow_and_keeps_status() {
         // The upload_batch validation path wraps BatchRejected in anyhow::Error;
         // the snapshot_sync caller relies on downcast_ref to choose the loud
@@ -3303,7 +3632,10 @@ mod tests {
 
     #[test]
     fn relay_token_authorization_rejected_downcasts_separately() {
-        let err = anyhow::Error::new(RelayTokenAuthorizationRejected { status: 403 });
+        let err = anyhow::Error::new(RelayTokenAuthorizationRejected {
+            status: 403,
+            suppressed: false,
+        });
         let rejected = err
             .downcast_ref::<RelayTokenAuthorizationRejected>()
             .expect("RelayTokenAuthorizationRejected must downcast from anyhow::Error");
@@ -3384,6 +3716,45 @@ mod tests {
         assert!(excerpt.contains("[path]"));
         assert!(!excerpt.contains("/Users/ron"));
         assert!(excerpt.chars().count() <= 503);
+    }
+
+    #[test]
+    fn shed_code_keeps_only_a_recognized_backend_code() {
+        let identity = br#"{"error":"ServiceOverloadedError","detail":"Original session identity evaluation is temporarily unavailable","request_id":"synthetic","code":"snapshot_original_identity_unavailable"}"#;
+        assert_eq!(
+            shed_code(identity),
+            Some(UploadShedCode::OriginalIdentityUnavailable)
+        );
+        assert_eq!(
+            UploadShedCode::OriginalIdentityUnavailable.as_str(),
+            SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE
+        );
+        let oversized = format!(
+            r#"{{"detail":"{}","code":"snapshot_original_identity_unavailable"}}"#,
+            "x".repeat(SHED_BODY_EXCERPT_BYTES as usize)
+        );
+        let truncated = &oversized.as_bytes()[..SHED_BODY_EXCERPT_BYTES as usize];
+        let bodies: [&[u8]; 11] = [
+            br#"{"code":"cursor_allocation_timeout"}"#,
+            br#"{"code":"accept_discovery_shared_lock_timeout"}"#,
+            br#"{"detail":"snapshot_original_identity_unavailable"}"#,
+            br#"{"code":"Snapshot_Original_Identity_Unavailable"}"#,
+            br#"{"code":17}"#,
+            br#"{"code":null}"#,
+            br#"["snapshot_original_identity_unavailable"]"#,
+            b"snapshot_original_identity_unavailable",
+            b"<html>503 Service Unavailable</html>",
+            b"",
+            truncated,
+        ];
+        for body in bodies {
+            assert_eq!(
+                shed_code(body),
+                None,
+                "{}",
+                String::from_utf8_lossy(&body[..body.len().min(80)])
+            );
+        }
     }
 
     #[test]
@@ -3998,6 +4369,7 @@ mod tests {
             body_witness_digest: None,
             head_etag: None,
             head_challenge: None,
+            unchanged_basis: None,
         }
     }
 
@@ -4017,6 +4389,67 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn composition_start_verdict_records_only_final_acknowledged_items() {
+        use crate::snapshots::{start_verdict_store, SnapshotSessionStart, StartVerdict};
+        let support = crate::test_scratch::private_dir("composition-ack-verdict");
+        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        item.context_curve = None;
+        item.cache_observations = None;
+        item.session_account_evidence = None;
+        item.session_start = Some(Box::new(SnapshotSessionStart {
+            user_turn_count: Some(1),
+            ..Default::default()
+        }));
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: vec![item],
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let client = SnapshotApiClient::new("https://example.invalid")
+            .with_receipt_state_dir(&support)
+            .with_receipt_destination_namespace("synthetic-namespace".into());
+        let id = &request.snapshots[0].source_session_id;
+        let destination = start_verdict_store::destination(
+            "synthetic-namespace",
+            "https://example.invalid",
+            &request.machine_id,
+        );
+        let get = || {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            start_verdict_store::load(&support, &destination, now).get("codex", id, now)
+        };
+        let mut conflict = entity_ack(0, vec![]);
+        conflict.conflict_entities.push(entity_ref(
+            id,
+            &request.snapshots[0].snapshot_fingerprint,
+            1,
+        ));
+        conflict.validate_entity_ack(&request).unwrap();
+        client.record_composition_start_verdicts(&request, &conflict, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        let mut disabled = entity_ack(0, vec![]);
+        disabled.disabled = true;
+        client.record_composition_start_verdicts(&request, &disabled, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        // Legacy all-accepted ACK; the final wire body measures this start.
+        let mut accepted = entity_ack(1, vec![]);
+        accepted.entity_ack_contract = None;
+        client.record_composition_start_verdicts(&request, &accepted, false);
+        assert_eq!(get(), StartVerdict::Measured);
+        // A later final-body clear (including a payload-budget clear) must
+        // replace the verdict, not retain the earlier folded start.
+        let mut cleared = request.clone();
+        cleared.snapshots[0].session_start = None;
+        client.record_composition_start_verdicts(&cleared, &accepted, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        std::fs::remove_dir_all(support).unwrap();
     }
 
     #[test]
@@ -4041,6 +4474,7 @@ mod tests {
                 body_witness_digest: Some(crate::snapshots::snapshot_upload_body_witness(&item)),
                 head_etag: Some("e".repeat(64)),
                 head_challenge: None,
+                unchanged_basis: None,
             }],
         );
         let reference = &ack.accepted_entities[0];
@@ -4634,7 +5068,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

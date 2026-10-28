@@ -1,14 +1,12 @@
 use crate::control::handle_request;
-use crate::snapshot_client::{load_snapshot_device_credentials, relay_token_request_payload};
+use crate::snapshot_client::load_snapshot_device_credentials;
 use crate::snapshots::SnapshotSource;
 use crate::LocalDaemon;
 use anyhow::{anyhow, Context, Result};
-use base64::Engine;
 use ottto_core::{FileConnectionStore, FileDeviceStore};
 use ottto_protocol::{
     LocalControlCommand, LocalControlRequest, RelayRuntimeState, RelayState, StableMessage,
 };
-use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -16,11 +14,11 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, IntoRawFd};
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -37,18 +35,11 @@ const LOCAL_RELAY_FALLBACK_BASE_PORT: u16 = 44120;
 const LOCAL_RELAY_FALLBACK_SPAN: u16 = 2000;
 const LOCAL_RELAY_FALLBACK_ATTEMPTS: u16 = 24;
 const MAX_OTLP_BODY_BYTES: usize = 25 * 1024 * 1024;
-const RELAY_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(30);
 /// Per-connection read/write timeout. A local client that never finishes
 /// sending its request line + headers (classic slowloris) — or that stops
 /// reading our response — trips this and is dropped instead of pinning a
 /// worker thread forever.
 const RELAY_IO_TIMEOUT: Duration = Duration::from_secs(20);
-/// Upstream relay HTTP calls run inside one daemon thread per local OTLP
-/// request. Bound every phase so a slow backend/network path cannot consume
-/// the LaunchAgent thread budget and starve status/XPC control calls.
-const RELAY_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const RELAY_UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
-const RELAY_UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum bytes accepted for a single request line or header line. Caps the
 /// per-line heap allocation a client can force with one unterminated line.
 const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
@@ -136,27 +127,6 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RelayTokenResponse {
-    token: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct RelayTokenCacheKey {
-    api_base_url: String,
-    source: &'static str,
-}
-
-#[derive(Debug, Clone)]
-struct CachedRelayToken {
-    token: String,
-    refresh_after: SystemTime,
-}
-
-static RELAY_TOKEN_CACHE: OnceLock<Mutex<BTreeMap<RelayTokenCacheKey, CachedRelayToken>>> =
-    OnceLock::new();
-static UPSTREAM_HTTP_AGENT: OnceLock<Mutex<ureq::Agent>> = OnceLock::new();
-
 pub fn spawn_local_otlp_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
     spawn_source_relay(daemon, SnapshotSource::ClaudeCode)
 }
@@ -166,7 +136,7 @@ pub fn spawn_claude_code_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
 }
 
 fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<SocketAddr> {
-    let listener = match bind_local_relay_listener(None) {
+    let listener = match bind_startup_local_relay_listener() {
         Ok(listener) => listener,
         Err(error) => {
             let _ = daemon.set_relay_state_for_trusted_client(RelayState {
@@ -231,7 +201,7 @@ fn dispatch_relay_connection(mut stream: TcpStream, source: SnapshotSource, daem
     let spawned = thread::Builder::new().spawn(move || {
         let _guard = guard;
         if let Err(error) = handle_client(stream, source, client_daemon) {
-            // BrokenPipe / ConnectionReset are routine when the upstream agent
+            // BrokenPipe / ConnectionReset are routine when the exporting agent
             // (Codex / Claude Code) times out before we finish writing the
             // response — drop those silently so we don't fill the daemon log
             // with one line per disconnected client. Slow-client I/O timeouts
@@ -543,8 +513,24 @@ fn relay_listener_failed_state(bound_addr: Option<SocketAddr>) -> RelayState {
     }
 }
 
-/// Binds the relay listener. `preferred_port` (the port a failed listener
-/// held) is tried first, then the default port and the per-user fallbacks.
+pub(crate) fn bind_startup_local_relay_listener() -> Result<TcpListener> {
+    let endpoint =
+        crate::control::approved_managed_claude_relay_endpoint().unwrap_or_else(|error| {
+            relay_log!("could not read approved Claude relay endpoint: {error}");
+            None
+        });
+    // Existing exporters keep their startup endpoint across daemon restarts.
+    // Only reuse an address the daemon itself could have selected for this user.
+    let preferred_port = endpoint
+        .as_deref()
+        .filter(|endpoint| endpoint.starts_with("http://127.0.0.1:"))
+        .and_then(local_relay_port_from_endpoint)
+        .filter(|port| candidate_relay_ports(current_uid()).contains(port));
+    bind_local_relay_listener(preferred_port)
+}
+
+/// Binds the relay listener. `preferred_port` (from approved settings or a
+/// failed listener) is tried first, then the default and per-user fallbacks.
 fn bind_local_relay_listener(preferred_port: Option<u16>) -> Result<TcpListener> {
     let mut ports = Vec::new();
     if let Some(port) = preferred_port {
@@ -559,9 +545,7 @@ fn bind_local_relay_listener(preferred_port: Option<u16>) -> Result<TcpListener>
         match TcpListener::bind(bind_addr) {
             Ok(listener) => {
                 if port != LOCAL_RELAY_DEFAULT_PORT {
-                    relay_log!(
-                        "local OTLP relay default port {LOCAL_RELAY_DEFAULT_PORT} is unavailable; using fallback port {port}"
-                    );
+                    relay_log!("local OTLP relay using per-user port {port}");
                 }
                 return Ok(listener);
             }
@@ -621,7 +605,7 @@ pub fn local_relay_port_from_state(relay: &RelayState) -> u16 {
         .unwrap_or(LOCAL_RELAY_DEFAULT_PORT)
 }
 
-fn candidate_relay_ports(uid: u32) -> Vec<u16> {
+pub(crate) fn candidate_relay_ports(uid: u32) -> Vec<u16> {
     let mut ports = Vec::with_capacity(usize::from(LOCAL_RELAY_FALLBACK_ATTEMPTS) + 1);
     push_unique_port(&mut ports, LOCAL_RELAY_DEFAULT_PORT);
     let start = fallback_relay_port_for_uid(uid);
@@ -698,61 +682,148 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
     }
 
     let request_source = source_from_request(&request).unwrap_or(source);
-    // Claude Code transcripts do not persist the applied effort tier. Reduce the
-    // official per-request OTLP log locally before cloud forwarding, so an
-    // organization-disabled upstream still feeds the content-free snapshot/GOLD
-    // path. Cloud forwarding remains synchronous: enabled telemetry keeps its
-    // existing delivery/retry contract, while a disabled upstream returns its
-    // normal OTLP-compatible 200 response.
-    if request_source == SnapshotSource::ClaudeCode && request.path == "/v1/logs" {
-        match crate::claude_local_otel::capture_claude_api_request_logs(
-            &ottto_core::default_support_dir(),
-            &request.body,
-            request
-                .headers
-                .get("content-type")
-                .map(String::as_str)
-                .unwrap_or("application/octet-stream"),
-        ) {
-            Ok(_) => {}
-            Err(_error) => {
-                relay_log!(
-                    "local Claude API-request reduction failed; raw forwarding remains independent"
-                );
-            }
+    let response =
+        local_otlp_export_response(request_source, &request, &ottto_core::default_support_dir());
+    write_raw_response(
+        &mut stream,
+        response.status,
+        response.content_type,
+        &response.body,
+    )
+}
+
+struct LocalExportResponse {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+}
+
+/// Ottto's server retired OTLP ingest, so the relay forwards nothing upstream
+/// and requests no relay token. It keeps only the content-free local Claude
+/// evidence that session snapshots and accounting read, then answers the
+/// exporter itself. Other sources and signals have no local consumer and are
+/// acknowledged without being stored. A failed local reduction is reported
+/// with a non-retryable OTLP status instead of being hidden behind success.
+fn local_otlp_export_response(
+    source: SnapshotSource,
+    request: &HttpRequest,
+    support_dir: &Path,
+) -> LocalExportResponse {
+    match capture_local_evidence(source, request, support_dir) {
+        Ok(()) => otlp_export_success(request),
+        Err(LocalCaptureFailure::Undecodable) => {
+            relay_log!("local Claude OTLP reduction could not decode a request body");
+            json_export_response(
+                400,
+                json!({"error":"bad_request","message":"OTLP body could not be decoded"}),
+            )
+        }
+        Err(LocalCaptureFailure::NotStored) => {
+            relay_log!("local Claude OTLP evidence could not be stored");
+            json_export_response(
+                500,
+                json!({"error":"local_capture_failed","message":"local evidence was not stored"}),
+            )
         }
     }
-    if request_source == SnapshotSource::ClaudeCode && request.path == "/v1/traces" {
-        match crate::claude_local_otel::capture_claude_llm_request_traces(
-            &ottto_core::default_support_dir(),
-            &request.body,
-            request
-                .headers
-                .get("content-type")
-                .map(String::as_str)
-                .unwrap_or("application/octet-stream"),
-        ) {
-            Ok(_) => {}
-            Err(_error) => {
-                relay_log!(
-                    "local Claude trace ownership reduction failed; raw forwarding remains independent"
-                );
-            }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalCaptureFailure {
+    /// The body (or its content encoding) could not be decoded.
+    Undecodable,
+    /// The body decoded but the reduced evidence could not be stored.
+    NotStored,
+}
+
+fn capture_local_evidence(
+    source: SnapshotSource,
+    request: &HttpRequest,
+    support_dir: &Path,
+) -> std::result::Result<(), LocalCaptureFailure> {
+    if source != SnapshotSource::ClaudeCode
+        || !matches!(request.path.as_str(), "/v1/logs" | "/v1/traces")
+    {
+        return Ok(());
+    }
+    let body = decoded_request_body(request).ok_or(LocalCaptureFailure::Undecodable)?;
+    let content_type = request_content_type(request);
+    let captured = if request.path == "/v1/logs" {
+        // Claude Code transcripts do not persist the applied effort tier, so
+        // the official per-request log carries it.
+        crate::claude_local_otel::capture_claude_api_request_logs(support_dir, &body, content_type)
+    } else {
+        crate::claude_local_otel::capture_claude_llm_request_traces(
+            support_dir,
+            &body,
+            content_type,
+        )
+    };
+    match captured {
+        Ok(_) => Ok(()),
+        Err(error) if crate::claude_local_otel::is_undecodable_body(&error) => {
+            Err(LocalCaptureFailure::Undecodable)
+        }
+        Err(_) => Err(LocalCaptureFailure::NotStored),
+    }
+}
+
+/// The request body with its OTLP content encoding removed. OTLP/HTTP allows
+/// gzip; the inflated size keeps the same cap as a raw body.
+fn decoded_request_body(request: &HttpRequest) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let encoding = request
+        .headers
+        .get("content-encoding")
+        .map(|value| value.trim().to_ascii_lowercase());
+    match encoding.as_deref() {
+        None | Some("") | Some("identity") => Some(std::borrow::Cow::Borrowed(&request.body)),
+        Some("gzip") => {
+            let mut inflated = Vec::new();
+            flate2::read::MultiGzDecoder::new(request.body.as_slice())
+                .take(MAX_OTLP_BODY_BYTES as u64 + 1)
+                .read_to_end(&mut inflated)
+                .ok()?;
+            (inflated.len() <= MAX_OTLP_BODY_BYTES).then_some(std::borrow::Cow::Owned(inflated))
+        }
+        Some(_) => None,
+    }
+}
+
+/// An empty OTLP export response: full success with no partial rejection, in
+/// the encoding the exporter used so it never retries an accepted request.
+fn otlp_export_success(request: &HttpRequest) -> LocalExportResponse {
+    if request_content_type(request)
+        .to_ascii_lowercase()
+        .contains("json")
+    {
+        LocalExportResponse {
+            status: 200,
+            content_type: "application/json",
+            body: b"{}".to_vec(),
+        }
+    } else {
+        LocalExportResponse {
+            status: 200,
+            content_type: "application/x-protobuf",
+            body: Vec::new(),
         }
     }
-    match forward_otlp_request(request_source, &request) {
-        Ok(response) => write_raw_response(
-            &mut stream,
-            response.status,
-            &response.content_type,
-            &response.body,
-        ),
-        Err(error) => write_json_response(
-            &mut stream,
-            502,
-            json!({"error":"relay_forward_failed","message": error.to_string()}),
-        ),
+}
+
+fn json_export_response(status: u16, body: serde_json::Value) -> LocalExportResponse {
+    LocalExportResponse {
+        status,
+        content_type: "application/json",
+        body: body.to_string().into_bytes(),
     }
+}
+
+fn request_content_type(request: &HttpRequest) -> &str {
+    request
+        .headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or("application/octet-stream")
 }
 
 fn handle_control_request(
@@ -1037,206 +1108,6 @@ fn source_from_relay_header(value: &str) -> Option<SnapshotSource> {
     }
 }
 
-struct ForwardResponse {
-    status: u16,
-    content_type: String,
-    body: Vec<u8>,
-}
-
-fn forward_otlp_request(source: SnapshotSource, request: &HttpRequest) -> Result<ForwardResponse> {
-    // Cached bearer tokens must not bypass a confirmed credential-promotion
-    // journal. Confirmation may invalidate the old server authority for an
-    // ordinary rotation as well as a cross-account claim, so every relay
-    // admission stays fenced until the local binding is fully promoted.
-    relay_admission_ready()?;
-    let api_base_url = current_api_base_url();
-    let relay_token = cached_relay_token(&api_base_url, source)?;
-    let response = send_otlp_request(&api_base_url, &relay_token, request)?;
-    if response.status != 401 {
-        return Ok(response);
-    }
-
-    evict_cached_relay_token(&api_base_url, source)?;
-    let relay_token = cached_relay_token(&api_base_url, source)?;
-    send_otlp_request(&api_base_url, &relay_token, request)
-}
-
-pub(crate) fn relay_admission_ready() -> Result<()> {
-    crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
-}
-
-fn send_otlp_request(
-    api_base_url: &str,
-    relay_token: &str,
-    request: &HttpRequest,
-) -> Result<ForwardResponse> {
-    let url = format!("{}{}", api_base_url.trim_end_matches('/'), request.path);
-    let content_type = request
-        .headers
-        .get("content-type")
-        .map(String::as_str)
-        .unwrap_or("application/x-protobuf");
-    let mut upstream = upstream_http_agent()
-        .post(&url)
-        .set("Accept", "application/json")
-        .set("Authorization", &format!("Bearer {relay_token}"))
-        .set("Content-Type", content_type);
-    if let Some(encoding) = request.headers.get("content-encoding") {
-        upstream = upstream.set("Content-Encoding", encoding);
-    }
-
-    match upstream.send_bytes(&request.body) {
-        Ok(response) => {
-            // Transport success on the relay path is the sync-stall watchdog's
-            // evidence that a concurrent snapshot-sync outage is process-local
-            // (this warm-pooled path survived the 2026-07-15 DNS pinning
-            // incident while every cold path failed).
-            crate::net_resilience::note_upstream_upload_succeeded("otlp_relay");
-            response_from_ureq(response)
-        }
-        Err(ureq::Error::Status(_, response)) => {
-            crate::net_resilience::note_upstream_upload_succeeded("otlp_relay");
-            response_from_ureq(response)
-        }
-        Err(ureq::Error::Transport(error)) => Err(anyhow!("upstream transport failed: {error}")),
-    }
-}
-
-fn cached_relay_token(api_base_url: &str, source: SnapshotSource) -> Result<String> {
-    let key = RelayTokenCacheKey {
-        api_base_url: api_base_url.trim_end_matches('/').to_string(),
-        source: source.api_slug(),
-    };
-    let now = SystemTime::now();
-    if let Some(token) = {
-        let cache = relay_token_cache()
-            .lock()
-            .map_err(|_| anyhow!("relay token cache lock poisoned"))?;
-        cache
-            .get(&key)
-            .filter(|entry| entry.refresh_after > now)
-            .map(|entry| entry.token.clone())
-    } {
-        return Ok(token);
-    }
-
-    let token = issue_relay_token(api_base_url, source)?;
-    let refresh_after = relay_token_refresh_after(&token, now);
-    let mut cache = relay_token_cache()
-        .lock()
-        .map_err(|_| anyhow!("relay token cache lock poisoned"))?;
-    cache.insert(
-        key,
-        CachedRelayToken {
-            token: token.clone(),
-            refresh_after,
-        },
-    );
-    Ok(token)
-}
-
-fn evict_cached_relay_token(api_base_url: &str, source: SnapshotSource) -> Result<()> {
-    let key = RelayTokenCacheKey {
-        api_base_url: api_base_url.trim_end_matches('/').to_string(),
-        source: source.api_slug(),
-    };
-    let mut cache = relay_token_cache()
-        .lock()
-        .map_err(|_| anyhow!("relay token cache lock poisoned"))?;
-    cache.remove(&key);
-    Ok(())
-}
-
-fn relay_token_cache() -> &'static Mutex<BTreeMap<RelayTokenCacheKey, CachedRelayToken>> {
-    RELAY_TOKEN_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn upstream_http_agent() -> ureq::Agent {
-    let mut agent = UPSTREAM_HTTP_AGENT
-        .get_or_init(|| Mutex::new(build_upstream_http_agent()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if crate::net_resilience::take_upstream_otlp_agent_rebuild_request() {
-        eprintln!(
-            "OTTTO-NET-RESILIENCE: rebuilding the OTLP upstream HTTP agent after a sustained \
-             transport-layer outage or network transition so the next forward starts from \
-             fresh pool state.",
-        );
-        *agent = build_upstream_http_agent();
-    }
-    // An `Agent` clone shares the underlying pool, so callers keep pooling
-    // while the swap above stays possible without a long-held lock.
-    agent.clone()
-}
-
-// A process-lifetime agent with a deliberately warm keep-alive pool: that
-// pool is the path that keeps working through process-local DNS breakage, so
-// it is NOT rebuilt on the DNS ladder. It IS swapped (via the rebuild-request
-// flag above) on a sustained transport-layer outage or a macOS network
-// transition, when its pooled sockets are exactly the ones presumed dead.
-// New connections still get the fallback resolver below.
-fn build_upstream_http_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(RELAY_UPSTREAM_CONNECT_TIMEOUT)
-        .timeout_read(RELAY_UPSTREAM_READ_TIMEOUT)
-        .timeout_write(RELAY_UPSTREAM_WRITE_TIMEOUT)
-        .resolver(crate::net_resilience::shared_fallback_resolver())
-        .build()
-}
-
-fn relay_token_refresh_after(token: &str, now: SystemTime) -> SystemTime {
-    relay_token_expires_at(token)
-        .and_then(|expires_at| expires_at.checked_sub(RELAY_TOKEN_REFRESH_SKEW))
-        .filter(|refresh_after| *refresh_after > now)
-        .unwrap_or(now)
-}
-
-fn relay_token_expires_at(token: &str) -> Option<SystemTime> {
-    let payload = token.split('.').nth(1)?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.as_bytes())
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    let exp = value.get("exp")?.as_u64()?;
-    Some(UNIX_EPOCH + Duration::from_secs(exp))
-}
-
-fn response_from_ureq(response: ureq::Response) -> Result<ForwardResponse> {
-    let status = response.status();
-    let content_type = response
-        .header("content-type")
-        .unwrap_or("application/json")
-        .to_string();
-    let mut body = Vec::new();
-    response
-        .into_reader()
-        .read_to_end(&mut body)
-        .context("read upstream response")?;
-    Ok(ForwardResponse {
-        status,
-        content_type,
-        body,
-    })
-}
-
-fn issue_relay_token(api_base_url: &str, source: SnapshotSource) -> Result<String> {
-    let (device, device_secret) = load_snapshot_device_credentials()?;
-    let url = format!(
-        "{}/api/v1/telemetry/devices/{}/relay-token",
-        api_base_url.trim_end_matches('/'),
-        device.device_id
-    );
-    let response: RelayTokenResponse = upstream_http_agent()
-        .post(&url)
-        .set("Accept", "application/json")
-        .set("X-Ottto-Device-Secret", &device_secret)
-        .send_json(relay_token_request_payload(&device, source.api_slug()))
-        .map_err(|error| anyhow!("issue relay token failed: {error}"))?
-        .into_json()
-        .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
-    Ok(response.token)
-}
-
 fn current_api_base_url() -> String {
     FileConnectionStore::default()
         .load()
@@ -1342,9 +1213,8 @@ fn read_http_request_from<R: BufRead>(reader: &mut R) -> Result<HttpRequest> {
     })
 }
 
-/// Read and normalize the HTTP/1.1 message body. The relay forwards a
-/// de-chunked payload with a fresh Content-Length generated by `ureq`; it never
-/// forwards client-controlled transfer framing.
+/// Read and normalize the HTTP/1.1 message body into a de-chunked payload; the
+/// local reducers never see client-controlled transfer framing.
 fn read_http_request_body<R: BufRead>(
     reader: &mut R,
     headers: &BTreeMap<String, String>,
@@ -1352,7 +1222,7 @@ fn read_http_request_body<R: BufRead>(
     if let Some(transfer_encoding) = headers.get("transfer-encoding") {
         // Reject ambiguous framing rather than applying precedence rules. This
         // loopback server has no compatibility need for TE+CL and failing
-        // closed avoids request-smuggling differentials with the upstream.
+        // closed avoids request-smuggling differentials.
         if headers.contains_key("content-length") {
             return Err(anyhow!(
                 "transfer-encoding and content-length cannot be combined"
@@ -1612,6 +1482,8 @@ mod tests {
         LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
         MachineIdentity, OperatingSystem,
     };
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     const TOKEN: &str = "test-control-token";
 
@@ -1837,39 +1709,6 @@ mod tests {
             }),
             Some("device_current_installation".to_string())
         );
-    }
-
-    #[test]
-    fn relay_token_expiry_is_read_from_jwt_payload_without_verification() {
-        let payload =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":4102444800}"#);
-        let token = format!("header.{payload}.signature");
-
-        assert_eq!(
-            relay_token_expires_at(&token),
-            Some(UNIX_EPOCH + Duration::from_secs(4_102_444_800))
-        );
-    }
-
-    #[test]
-    fn relay_token_refreshes_before_expiry() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1090}"#);
-        let token = format!("header.{payload}.signature");
-
-        assert_eq!(
-            relay_token_refresh_after(&token, now),
-            UNIX_EPOCH + Duration::from_secs(1_060)
-        );
-    }
-
-    #[test]
-    fn relay_token_with_near_expiry_refreshes_immediately() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_000);
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1020}"#);
-        let token = format!("header.{payload}.signature");
-
-        assert_eq!(relay_token_refresh_after(&token, now), now);
     }
 
     #[test]
@@ -2476,13 +2315,6 @@ mod tests {
             MAX_CONCURRENT_RELAY_CONNECTIONS <= 16,
             "relay workers must leave LaunchAgent thread headroom for local control"
         );
-        assert!(
-            RELAY_UPSTREAM_CONNECT_TIMEOUT <= Duration::from_secs(3)
-                && RELAY_UPSTREAM_READ_TIMEOUT <= Duration::from_secs(10)
-                && RELAY_UPSTREAM_WRITE_TIMEOUT <= Duration::from_secs(10),
-            "upstream relay I/O must stay bounded so telemetry cannot starve the daemon"
-        );
-        let _agent = build_upstream_http_agent();
     }
 
     #[test]
@@ -2515,6 +2347,7 @@ mod tests {
         // Verify that genuinely unknown commands do NOT match the allowlist.
         let cmd = LocalControlCommand::Status {
             refresh_agent_status: false,
+            retry_relay_authorization: false,
         };
 
         let is_allowed = matches!(
@@ -2527,5 +2360,165 @@ mod tests {
             !is_allowed,
             "Status command must not be in the browser-gate allowlist"
         );
+    }
+
+    const CLAUDE_API_REQUEST_LOG: &[u8] = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"high"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
+    const CLAUDE_LLM_REQUEST_TRACE: &[u8] = br#"{"resourceSpans":[{"resource":{"attributes":[{"key":"session.id","value":{"stringValue":"retired-forward-session"}}]},"scopeSpans":[{"spans":[{"name":"claude_code.llm_request","startTimeUnixNano":"1783728000000000000","attributes":[{"key":"request_id","value":{"stringValue":"req-retired-forward"}},{"key":"client_request_id","value":{"stringValue":"client-req-retired-forward"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
+
+    fn otlp_post(path: &str, content_type: &str, body: &[u8]) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            headers: BTreeMap::from([("content-type".to_string(), content_type.to_string())]),
+            body: body.to_vec(),
+        }
+    }
+
+    fn assert_export_success(response: &LocalExportResponse, content_type: &str, body: &[u8]) {
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, content_type);
+        assert_eq!(response.body, body);
+    }
+
+    #[test]
+    fn retired_forward_keeps_claude_log_evidence_identical_to_direct_capture() {
+        let relay_dir = crate::test_scratch::ScratchDir::new("relay-retired-logs");
+        let direct_dir = crate::test_scratch::ScratchDir::new("relay-retired-logs-direct");
+        let request = otlp_post("/v1/logs", "application/json", CLAUDE_API_REQUEST_LOG);
+
+        let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &relay_dir);
+        crate::claude_local_otel::capture_claude_api_request_logs(
+            &direct_dir,
+            CLAUDE_API_REQUEST_LOG,
+            "application/json",
+        )
+        .expect("direct capture succeeds");
+
+        assert_export_success(&response, "application/json", b"{}");
+        let session = ["retired-forward-session".to_string()];
+        let relayed =
+            crate::claude_local_otel::load_claude_effort_evidence(&relay_dir, session.clone())
+                .expect("relayed evidence loads");
+        let direct = crate::claude_local_otel::load_claude_effort_evidence(&direct_dir, session)
+            .expect("direct evidence loads");
+        assert_eq!(relayed["retired-forward-session"].len(), 1);
+        assert_eq!(
+            serde_json::to_value(&relayed).expect("serialize relayed"),
+            serde_json::to_value(&direct).expect("serialize direct")
+        );
+        assert!(!serde_json::to_string(&relayed)
+            .expect("serialize relayed")
+            .contains("must-not-persist"));
+    }
+
+    #[test]
+    fn retired_forward_keeps_claude_trace_ownership_identical_to_direct_capture() {
+        let relay_dir = crate::test_scratch::ScratchDir::new("relay-retired-traces");
+        let direct_dir = crate::test_scratch::ScratchDir::new("relay-retired-traces-direct");
+        let request = otlp_post(
+            "/v1/traces",
+            "application/x-protobuf",
+            CLAUDE_LLM_REQUEST_TRACE,
+        );
+        let json_request = otlp_post("/v1/traces", "application/json", CLAUDE_LLM_REQUEST_TRACE);
+
+        // A protobuf exporter sending a JSON body is undecodable, not stored.
+        let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &relay_dir);
+        assert_eq!(response.status, 400);
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &json_request, &relay_dir);
+        crate::claude_local_otel::capture_claude_llm_request_traces(
+            &direct_dir,
+            CLAUDE_LLM_REQUEST_TRACE,
+            "application/json",
+        )
+        .expect("direct capture succeeds");
+
+        assert_export_success(&response, "application/json", b"{}");
+        let session = ["retired-forward-session".to_string()];
+        let relayed = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+            &relay_dir,
+            session.clone(),
+        );
+        let direct =
+            crate::claude_local_otel::load_claude_trace_ownership_evidence(&direct_dir, session);
+        assert_eq!(relayed.evidence["retired-forward-session"].len(), 1);
+        assert_eq!(relayed, direct);
+    }
+
+    #[test]
+    fn retired_forward_acknowledges_protobuf_exports_without_a_local_consumer() {
+        let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-ack");
+        for (source, path) in [
+            (SnapshotSource::ClaudeCode, "/v1/metrics"),
+            (SnapshotSource::Codex, "/v1/logs"),
+            (SnapshotSource::Codex, "/v1/traces"),
+        ] {
+            let request = otlp_post(path, "application/x-protobuf", b"\x0a\x00");
+            let response = local_otlp_export_response(source, &request, &support_dir);
+            assert_export_success(&response, "application/x-protobuf", b"");
+        }
+        assert_eq!(
+            std::fs::read_dir(&*support_dir)
+                .expect("scratch dir lists")
+                .count(),
+            0,
+            "exports without a local consumer store nothing"
+        );
+    }
+
+    #[test]
+    fn retired_forward_reports_local_failures_with_non_retryable_statuses() {
+        let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-failures");
+        let malformed = otlp_post("/v1/logs", "application/json", b"{not json");
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &malformed, &support_dir);
+        assert_eq!(response.status, 400);
+
+        // A regular file where the support directory should be makes the
+        // evidence append fail after a successful decode.
+        let blocked = support_dir.join("not-a-directory");
+        std::fs::write(&blocked, b"").expect("write blocking file");
+        let request = otlp_post("/v1/logs", "application/json", CLAUDE_API_REQUEST_LOG);
+        let response = local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &blocked);
+        assert_eq!(response.status, 500);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("JSON error body");
+        assert_eq!(body["error"], "local_capture_failed");
+    }
+
+    #[test]
+    fn retired_forward_inflates_gzip_claude_exports_and_refuses_unknown_encodings() {
+        use std::io::Write as _;
+        let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-gzip");
+        let gzip_member = |bytes: &[u8]| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(bytes).expect("compress fixture");
+            encoder.finish().expect("finish gzip")
+        };
+        // An empty first member must not hide the export in the next one.
+        let mut body = gzip_member(b"");
+        body.extend(gzip_member(CLAUDE_API_REQUEST_LOG));
+        let mut request = otlp_post("/v1/logs", "application/json", &body);
+        request
+            .headers
+            .insert("content-encoding".to_string(), "gzip".to_string());
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+        assert_export_success(&response, "application/json", b"{}");
+        let evidence = crate::claude_local_otel::load_claude_effort_evidence(
+            &support_dir,
+            ["retired-forward-session".to_string()],
+        )
+        .expect("gzip evidence loads");
+        assert_eq!(evidence["retired-forward-session"].len(), 1);
+
+        request
+            .headers
+            .insert("content-encoding".to_string(), "br".to_string());
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+        assert_eq!(response.status, 400);
     }
 }
