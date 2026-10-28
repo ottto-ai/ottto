@@ -1536,7 +1536,7 @@ fn rejected_selector_candidates_never_save_and_restore_tail_equals_full() {
             SnapshotSource::ClaudeCode => DurableSource::ClaudeCode,
             _ => DurableSource::Codex,
         };
-        let mut store = DurableTailStore::new(state.0.join("records"));
+        let mut store = DurableTailStore::new(state.0.join("records"), durable_source);
         let saved = store
             .write_after_save(
                 &lock,
