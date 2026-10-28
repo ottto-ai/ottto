@@ -31180,9 +31180,6 @@ impl OwnedSourceScan {
                 // Main-index budget coverage is an enforcement follow-up.
                 Some(reread_guard::observation_ticket())
             } else if matches!(
-                source,
-                SnapshotSource::ClaudeCode | SnapshotSource::Codex | SnapshotSource::Pi
-            ) && matches!(
                 decision,
                 CandidateDecision::Parse | CandidateDecision::ReconcileLegacy
             ) && index.reread_unchanged_candidate(&candidate)
@@ -42211,16 +42208,8 @@ fn open_candidate_file_stat_retained(
         .map(|cache| (cache, candidate.path.as_path()));
     let (identity, stat) = opened_object_identity_and_stat_retained(source, &mut file, retained)?;
     candidate.opened_object_identity = identity;
-    let tracked = stat.filter(|_| {
-        matches!(
-            source,
-            SnapshotSource::ClaudeCode | SnapshotSource::Codex | SnapshotSource::Pi
-        )
-    });
-    candidate.fingerprint_changed_nanos = tracked.map_or(0, |stat| stat.changed_unix_nanos());
-    candidate.fingerprint_birth_nanos = tracked
-        .and_then(|stat| stat.birth_nanos)
-        .unwrap_or_default();
+    candidate.fingerprint_changed_nanos = stat.map_or(0, |stat| stat.changed_unix_nanos());
+    candidate.fingerprint_birth_nanos = stat.and_then(|stat| stat.birth_nanos).unwrap_or_default();
     let metadata = file.metadata()?;
     candidate.physical_identity = reread_guard::physical_identity(&metadata);
     let modified = metadata.modified().ok();
@@ -42331,7 +42320,7 @@ fn open_and_identify_scan_candidate_with_rescue(
     // `opened_object_identity` stays the live identity: the parse-time TOCTOU
     // check compares against it. Only the re-read trigger uses the adoption.
     let Ok(adopted_identity) =
-        adopt_stored_changed_time(source, &mut candidate, files, live, &mut opened_file)
+        adopt_stored_changed_time(&mut candidate, files, live, &mut opened_file)
     else {
         census.record_unreadable(UnreadableCause::OpenRead, 1);
         return None;
@@ -42547,18 +42536,11 @@ fn opened_object_identity_and_stat_retained(
 /// the live identity and reads.
 /// Returns the opened-object identity to fingerprint with, if adopted.
 fn adopt_stored_changed_time(
-    source: SnapshotSource,
     candidate: &mut CandidateFile,
     files: &BTreeMap<String, ScanIndexEntry>,
     live: Option<OpenedObjectStat>,
     file: &mut File,
 ) -> std::io::Result<Option<String>> {
-    if !matches!(
-        source,
-        SnapshotSource::ClaudeCode | SnapshotSource::Codex | SnapshotSource::Pi
-    ) {
-        return Ok(None);
-    }
     let (Some(entry), Some(live)) = (files.get(&local_index_key(&candidate.path)), live) else {
         return Ok(None);
     };

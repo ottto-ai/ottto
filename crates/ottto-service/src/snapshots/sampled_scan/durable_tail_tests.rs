@@ -966,7 +966,7 @@ fn pi_uses_shared_content_only_ctime_adoption_and_store_slots() {
     let (mut file, stat) = open_candidate_file_stat(source, &mut after).unwrap();
     assert_eq!(after.size_bytes, first.size_bytes);
     assert_eq!(after.modified_unix_nanos, first.modified_unix_nanos);
-    let adopted = adopt_stored_changed_time(source, &mut after, &files, stat, &mut file).unwrap();
+    let adopted = adopt_stored_changed_time(&mut after, &files, stat, &mut file).unwrap();
     let exercised = first.fingerprint_birth_nanos != 0
         && stat.unwrap().changed_unix_nanos() != first.fingerprint_changed_nanos;
     // APFS has birth times and chmod moves ctime: macOS never skips this control.
@@ -990,7 +990,7 @@ fn pi_uses_shared_content_only_ctime_adoption_and_store_slots() {
     let mut moved = after.clone();
     moved.modified_unix_nanos += 1;
     assert!(
-        adopt_stored_changed_time(source, &mut moved, &files, stat, &mut file)
+        adopt_stored_changed_time(&mut moved, &files, stat, &mut file)
             .unwrap()
             .is_none()
     );
