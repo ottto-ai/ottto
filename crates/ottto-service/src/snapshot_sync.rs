@@ -6937,6 +6937,7 @@ fn finish_sync_source(
             prepared_claude_evidence,
             comparison_completion.as_mut(),
             native_comparison_lease.as_ref(),
+            Some((&daemon.transcript_cache, &committed_index)),
         );
         let (disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
@@ -8835,6 +8836,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         prepared,
         comparison,
         lease,
+        None,
     )
     .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
@@ -8847,6 +8849,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[allow(clippy::too_many_arguments)] // Optional process owner beside existing fold inputs.
 fn try_apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -8855,6 +8858,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     mut prepared: Option<PreparedClaudeLocalEvidence>,
     mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+    retained: Option<(&crate::snapshots::sampled_scan::SharedCache, &ScanIndex)>,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -9171,6 +9175,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
         },
     );
+    if let Some((cache, committed)) = retained {
+        cache.record_e2_held_new_files(committed, index, &scan_result.snapshots, &withheld);
+    }
     disposition.hold_request_owned(withheld);
     if request_owned_enabled {
         for item in &mut scan_result.snapshots {
@@ -11652,6 +11659,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let owner = std::sync::Arc::new(lifecycle::Lifecycle::default());
@@ -11669,6 +11677,7 @@ mod tests {
                 None,
                 completion.as_mut(),
                 Some(&lease),
+                None,
             )
             .unwrap()
         });

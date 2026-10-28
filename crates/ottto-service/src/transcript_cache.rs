@@ -49,6 +49,10 @@ struct Entry<S> {
     /// The finalization copy's charge reserved beside this entry at its
     /// admission (P1-RETAIN R0, Q-PR13(iii) β). Inline; it charges no heap.
     finalization_charge: usize,
+    /// Read eligibility only, owned by this resident and lost on take. Never
+    /// persisted or exposed to delivery/census authority readers. The B-tree
+    /// node layout charges this inline flag, including any padding.
+    e2_held_new_file: bool,
 }
 impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
@@ -58,6 +62,7 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
             heap_bytes,
             modified_hint: _,
             finalization_charge: _,
+            e2_held_new_file: _,
         } = self;
         c.add(*heap_bytes)
     }
@@ -88,6 +93,7 @@ pub(crate) struct Taken<S> {
     pub(crate) modified_hint: (i64, i64),
     /// The finalization charge reserved beside the entry at its admission.
     pub(crate) finalization_charge: usize,
+    pub(crate) e2_held_new_file: bool,
 }
 
 /// The victim-order hint an entry modified at `modified` is admitted at,
@@ -177,6 +183,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             retained: entry.retained,
             modified_hint: entry.modified_hint,
             finalization_charge: entry.finalization_charge,
+            e2_held_new_file: entry.e2_held_new_file,
         });
         record(if taken.is_some() {
             Event::TakeHit
@@ -184,6 +191,15 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             Event::TakeAbsent
         });
         taken
+    }
+    /// Allocation-free update of inline eligibility on existing residents.
+    /// `None` leaves an unvisited resident alone; no new registry or entry.
+    pub(crate) fn update_e2_held(&mut self, mut update: impl FnMut(&str) -> Option<bool>) {
+        for (key, entry) in &mut self.entries {
+            if let Some(held) = update(key) {
+                entry.e2_held_new_file = held;
+            }
+        }
     }
     pub(crate) fn clear(&mut self) {
         add(Event::ClearEntriesReleased, self.entries.len() as u64);
@@ -473,6 +489,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             used: next,
             heap_bytes,
             finalization_charge,
+            e2_held_new_file: false,
         };
         let Some(state_bytes) = heap_layout_bound::bound(&entry, self.entry_limit) else {
             record(Event::InsertEntryBoundRefused);
@@ -683,6 +700,40 @@ mod tests {
             state: text,
         }
     }
+    #[test]
+    fn e2_held_eligibility_lives_only_with_resident_and_is_inline_charged() {
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 1);
+        if !heap_layout_bound::layout_supported() {
+            assert!(!cache.insert("a".into(), retained("private".into())));
+            return;
+        }
+        assert!(cache.insert("a".into(), retained("private".into())));
+        let charge = cache.resident_bound().unwrap();
+        cache.update_e2_held(|_| Some(true));
+        assert_eq!(cache.resident_bound(), Some(charge));
+        let taken = cache.take("a").unwrap();
+        assert!(taken.e2_held_new_file);
+        assert!(cache.take("a").is_none());
+        assert!(cache.insert("a".into(), taken.retained));
+        assert!(
+            !cache.take("a").unwrap().e2_held_new_file,
+            "reinsertion never inherits eligibility; finish_page must stamp it anew"
+        );
+        assert!(cache.insert("a".into(), retained("private".into())));
+        cache.update_e2_held(|_| Some(true));
+        assert!(cache.insert("b".into(), retained("other".into())));
+        assert!(
+            cache.take("a").is_none(),
+            "count eviction loses eligibility"
+        );
+        assert!(!cache.take("b").unwrap().e2_held_new_file);
+        assert!(cache.insert("a".into(), retained("private".into())));
+        cache.update_e2_held(|_| Some(true));
+        cache.clear();
+        assert!(cache.take("a").is_none());
+        assert!(TranscriptCache::<String>::default().take("a").is_none());
+    }
+
     #[test]
     fn sampled_cache_count_eviction_moves_state_and_refuses_oversized_replacement() {
         let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 2);

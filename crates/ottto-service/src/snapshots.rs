@@ -31618,6 +31618,8 @@ impl OwnedSourceScan {
                         taken.retained.state.usage_witness(),
                     )
                 });
+                let e2_held_new_file = source == SnapshotSource::ClaudeCode
+                    && taken.as_ref().is_some_and(|taken| taken.e2_held_new_file);
                 let retained = taken.map(|taken| taken.retained);
                 let retained_present = retained.is_some();
                 let reinsertion =
@@ -31689,9 +31691,10 @@ impl OwnedSourceScan {
                                 .iter()
                                 .any(|id| index.codex_parent_ownership_refs.contains(id));
                         let allow_sample = context.audit_metadata_supported
-                        // A RAM certificate cannot replace missing durable
-                        // first-import/recovery authority.
-                        && index.files.contains_key(&key)
+                        // A same-process E2-held native read may reuse its own
+                        // certificate. It grants no persisted/index authority;
+                        // scope, object, prefix and audit checks still apply.
+                        && (index.files.contains_key(&key) || e2_held_new_file)
                         && !protected
                         && !forced_family
                         && !comparison_target
