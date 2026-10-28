@@ -464,3 +464,14 @@ pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -
     )
     .unwrap()
 }
+
+/// Grows a Pi reduction's ledger to one key past `PI_LEDGER_MAX_KEYS`.
+#[cfg(test)]
+pub(crate) fn overfill_pi_ledger(reduction: &mut CachedJsonlReduction) {
+    for n in 0..=PI_LEDGER_MAX_KEYS {
+        reduction
+            .accumulator
+            .seen_pi_usage_keys
+            .insert(format!("{n:064x}"), PiUsageDedupState::default());
+    }
+}

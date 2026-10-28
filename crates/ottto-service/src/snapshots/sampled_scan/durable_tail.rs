@@ -83,6 +83,8 @@ pub(crate) struct Counters {
     /// state-directory lock (not the daemon).
     pub(crate) write_unlocked: u64,
     pub(crate) peak_body_bytes: u64,
+    /// Pi records over either cap (ledger keys or record bytes); printed in
+    /// the Pi summary only.
     pub(crate) retained_refused_pi_ledger_cap: u64,
     /// GC's largest keep map: index keys with a record on disk, at most the
     /// store's `INVENTORY_BOUND`, whatever the index size.
@@ -103,12 +105,20 @@ impl Counters {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let pi = if source == SnapshotSource::Pi {
+            format!(
+                " retained_refused_pi_ledger_cap={}",
+                self.retained_refused_pi_ledger_cap
+            )
+        } else {
+            String::new()
+        };
         format!(
             "ottto-service: durable_tail source={} restore_attempts={} restored={} missing={} \
              refused_record={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
              not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
-             write_deferred={} write_unlocked={} peak_body_bytes={} retained_refused_pi_ledger_cap={} disk_records={} disk_bytes={} \
+             write_deferred={} write_unlocked={} peak_body_bytes={}{pi} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
@@ -132,7 +142,6 @@ impl Counters {
             self.write_deferred,
             self.write_unlocked,
             self.peak_body_bytes,
-            self.retained_refused_pi_ledger_cap,
             store.disk_records,
             store.disk_bytes,
             store.bytes_written,

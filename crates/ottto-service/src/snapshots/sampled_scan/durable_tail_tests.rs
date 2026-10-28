@@ -857,6 +857,73 @@ fn pi_stripped_section_refuses_restore_and_preserves_the_record() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A Pi ledger past `PI_LEDGER_MAX_KEYS` refuses on the post-save write and
+/// counts once, with no record. The 8 MiB RAM entry bound refuses such a
+/// reduction before it is retained (one tree node charged per key), so only
+/// this test cache widens it.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_ledger_cap_refusal_counts_on_the_write_path() {
+    let root = crate::test_scratch::private_dir("ottto-dt-pi-cap");
+    let lock = test_locks::hold(&root);
+    let path = root.join("pi.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            "{\"type\":\"message\",\"timestamp\":\"2026-10-20T10:00:00Z\",",
+            "\"message\":{\"role\":\"assistant\",\"responseId\":\"fixture-response\",",
+            "\"model\":\"fixture-model\",\"usage\":{\"input\":10,\"output\":3}}}\n"
+        ),
+    )
+    .unwrap();
+    let source = SnapshotSource::Pi;
+    let namespace = Scope("pi-cap".into());
+    let scope = Scope("pi-cap-file".into());
+    let key = local_index_key(&path);
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":std::fs::metadata(&path).unwrap().len(),
+            "modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    let (mut reduction, checkpoint) = native_record_of(&path, &scope, source);
+    codec::overfill_pi_ledger(&mut reduction);
+    let cache = SharedCache::default();
+    *cache.inner.lock().unwrap() =
+        crate::transcript_cache::TranscriptCache::with_entry_limit(512 << 20, 256 << 20);
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    assert!(cache.insert_admitted(
+        key.clone(),
+        sampled_jsonl::CompletedNativeAcquisition {
+            checkpoint,
+            reduction: Some(reduction),
+            released: None,
+            unsealed: false,
+        },
+        0
+    ));
+    cache.durable_note_selection(&key, "fp");
+    index.save(&index_path).unwrap();
+    let receipt = cache
+        .durable_write_after_save(lock, source, &index)
+        .unwrap();
+    let (counts, disk) = cache.durable_counters(source).unwrap();
+    let summary = counts.summary(source, &disk);
+    println!("pi_cap: {summary}");
+    assert_eq!(counts.retained_refused_pi_ledger_cap, 1);
+    assert_eq!(counts.not_persisted.get("pi_ledger_cap"), Some(&1));
+    assert_eq!((receipt.written, disk.disk_records), (0, 0));
+    assert!(summary.contains(" retained_refused_pi_ledger_cap=1 "));
+    assert!(!Counters::default()
+        .summary(SnapshotSource::Codex, &disk)
+        .contains("pi_ledger_cap"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn pi_uses_shared_content_only_ctime_adoption_and_store_slots() {
     use std::os::unix::fs::PermissionsExt;

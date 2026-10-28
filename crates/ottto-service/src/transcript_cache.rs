@@ -175,6 +175,11 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     pub(crate) fn with_byte_limit(byte_limit: usize) -> Self {
         Self::new(byte_limit, ENTRY_BYTES, CACHE_ENTRIES)
     }
+    /// Test seam: retains state larger than `ENTRY_BYTES` admits.
+    #[cfg(test)]
+    pub(crate) fn with_entry_limit(byte_limit: usize, entry_limit: usize) -> Self {
+        Self::new(byte_limit, entry_limit, CACHE_ENTRIES)
+    }
     /// Moves state into the existing active frame: there is no cached duplicate
     /// while the provider mutates it. The active frame must count this allocation
     /// through its own existing HeapLayoutBound admission.
