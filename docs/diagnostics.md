@@ -653,8 +653,10 @@ JSON class key, not extra nested objects:
   changes remain `ineligible.scope`. Registered audit rows cover body witness
   r3 and money rules v1/v2; they grant no new replay.
 
-Sample I/O errors are `certificate_refused.read_error`, never evidence of a
-real edit. This precursor changes diagnostics only: it adds no Full-admission
-policy, new body reads, persisted fields, record grants, or integrity holds.
+A disabled store reports `unavailable`, while an absent record in a usable
+store reports `missing`. Sample reads cut short by concurrent truncation report
+`certificate_refused.shrunk`. Other sample I/O errors are
+`certificate_refused.read_error`, never evidence of a real edit. This precursor
+changes diagnostics only: it adds no Full-admission policy, new body reads, persisted fields, record grants, or integrity holds.
 Capacity/availability retain their existing degraded behavior. Full-cause
 admission and its other counter projections arrive in subsequent slices.

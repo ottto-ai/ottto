@@ -736,7 +736,7 @@ pub(crate) struct RestoreCounts {
     #[serde(skip_serializing_if = "is_zero")]
     held: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    miss: BTreeMap<String, u64>,
+    miss: BTreeMap<&'static str, u64>,
 }
 impl RestoreCounts {
     #[cfg(unix)]

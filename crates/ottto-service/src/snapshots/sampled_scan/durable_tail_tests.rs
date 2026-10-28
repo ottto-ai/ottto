@@ -1442,3 +1442,143 @@ fn certificate_read_error_is_not_edit_evidence() {
     );
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Fixture (e): crossing T14's breaker disables the store; later attempts
+/// report unavailable rather than conflating the disable with a missing record.
+#[test]
+fn store_unavailable_after_t14_breaker_is_not_missing() {
+    let root = crate::test_scratch::private_dir("ottto-restore-store-unavailable");
+    let lock = test_locks::hold(&root);
+    let path = root.join("fixture.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let ds = durable_source(source).unwrap();
+    let namespace = Scope("breaker-outcome".into());
+    let scope = Scope("breaker-file".into());
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let attempt = || {
+        cache.durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &index,
+            &interpretation,
+        )
+    };
+    assert!(matches!(
+        attempt(),
+        RestoreOutcome::Miss(MissClass::Missing)
+    ));
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let keys: Vec<_> = (0..=store::T14_BREAKER)
+        .map(|n| store::key_digest(ds, &format!("/synthetic/corrupt-{n}.jsonl")))
+        .collect();
+    let allowlist = codec::allowlist_digest(source);
+    let certificate = certificate(&path, &scope);
+    disk.write_after_save(
+        lock,
+        1,
+        keys.iter()
+            .map(|key| PendingRecord {
+                binding: Binding {
+                    source: ds,
+                    key: *key,
+                    context: [0; 32],
+                    scope: [0; 32],
+                    entry: [0; 32],
+                },
+                certificate: certificate.clone(),
+                body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+                allowlist,
+            })
+            .collect(),
+    )
+    .unwrap();
+    for key in &keys {
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        let record = disk.dir().join(format!("{hex}.rec"));
+        let mut bytes = std::fs::read(&record).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&record, bytes).unwrap();
+    }
+    {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(ds).as_mut().unwrap();
+        for key in &keys {
+            assert_eq!(slot.store.hold(key), None);
+        }
+        assert_eq!(slot.store.disabled(), Some("t14_breaker"));
+    }
+    let outcome = attempt();
+    assert!(matches!(
+        outcome,
+        RestoreOutcome::Miss(MissClass::Unavailable)
+    ));
+    let mut page = crate::local_resource_diagnostics::RestoreCounts::default();
+    page.record(&outcome);
+    let json = serde_json::to_value(page).unwrap();
+    assert_eq!(json["miss"]["unavailable"], 1);
+    assert!(json["miss"].get("missing").is_none());
+    let (old, disk) = cache.durable_counters(source).unwrap();
+    assert_eq!((old.restore_attempts, old.missing), (2, 2));
+    assert_eq!(disk.t14_rebuild, store::T14_BREAKER);
+    assert_eq!(disk.records_read, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn certificate_sample_truncation_is_shrunk_for_both_windows() {
+    use crate::transcript_acquisition::set_between_guards;
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            set_between_guards(None);
+        }
+    }
+    let root = crate::test_scratch::private_dir("ottto-certificate-sample-truncation");
+    let path = root.join("fixture.jsonl");
+    let scope = Scope("sample-truncation".into());
+    for target in [1, 2] {
+        std::fs::write(&path, b"{}\n".repeat(10_000)).unwrap();
+        let certificate = certificate(&path, &scope);
+        let shrink_to = if target == 1 {
+            u64::from(certificate.sample_len) - 1
+        } else {
+            certificate.sealed_offset - 1
+        };
+        let truncate = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = calls.clone();
+        let _clear = ClearHook;
+        set_between_guards(Some(Box::new(move || {
+            observed.set(observed.get() + 1);
+            if observed.get() == target {
+                truncate.set_len(shrink_to).unwrap();
+            }
+        })));
+        // Opening metadata still matches; the selected existing sample read
+        // consumes a partial window then hits UnexpectedEof after truncation.
+        assert_eq!(
+            certificate
+                .restore(&mut File::open(&path).unwrap(), scope.clone())
+                .err(),
+            Some(CertificateRefusal::Changed(FullReason::Shrunk))
+        );
+        assert_eq!(calls.get(), target);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}

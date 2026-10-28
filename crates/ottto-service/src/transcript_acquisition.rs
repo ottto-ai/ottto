@@ -1484,6 +1484,17 @@ pub(crate) enum CertificateRefusal {
 }
 
 #[cfg(unix)]
+impl CertificateRefusal {
+    fn sample_error(error: io::Error) -> Self {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            Self::Changed(FullReason::Shrunk)
+        } else {
+            Self::ReadError
+        }
+    }
+}
+
+#[cfg(unix)]
 impl DurableCertificate {
     /// Whether the held FD is still this certificate's object with `[0, s)`
     /// unchanged as far as samples can tell: the same device, inode and (when
@@ -1567,18 +1578,22 @@ impl DurableCertificate {
         }
         let len = self.sample_len as usize;
         let mut read = 0;
+        #[cfg(test)]
+        between_guards();
         let head =
-            read_sample(file, 0, len, &mut read).map_err(|_| CertificateRefusal::ReadError)?;
+            read_sample(file, 0, len, &mut read).map_err(CertificateRefusal::sample_error)?;
         if durable_sample_digest(&head) != self.head_sha256 {
             return Err(CertificateRefusal::Changed(FullReason::HeadChanged));
         }
+        #[cfg(test)]
+        between_guards();
         let boundary = read_sample(
             file,
             self.sealed_offset - u64::from(self.sample_len),
             len,
             &mut read,
         )
-        .map_err(|_| CertificateRefusal::ReadError)?;
+        .map_err(CertificateRefusal::sample_error)?;
         if durable_sample_digest(&boundary) != self.boundary_sha256 {
             return Err(CertificateRefusal::Changed(FullReason::BoundaryChanged));
         }
@@ -1613,7 +1628,8 @@ thread_local! {
 }
 
 /// Tests only: the hook `prepare`, `PrefixSeal::admits` and `unpark` run
-/// between their opening stamp capture and its re-capture.
+/// between their opening stamp capture and its re-capture. Durable restore
+/// also runs it before each sample read, after capturing the opening stamp.
 #[cfg(test)]
 fn between_guards() {
     BETWEEN_GUARDS.with(|hook| {

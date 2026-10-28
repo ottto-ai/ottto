@@ -565,15 +565,22 @@ impl SharedCache {
                 Counters::bump(&mut stores.counters.ineligible, "history_owed");
                 return Err(MissClass::HistoryOwed);
             }
-            let outcome = match stores.slot(source).as_mut() {
-                Some(slot) => slot.store.read(&expected.binding.key, &allowlist),
+            let (outcome, disabled) = match stores.slot(source).as_mut() {
+                Some(slot) => (
+                    slot.store.read(&expected.binding.key, &allowlist),
+                    slot.store.disabled().is_some(),
+                ),
                 None => return Err(MissClass::Unavailable),
             };
             match outcome {
                 ReadOutcome::Found(record) => record,
                 ReadOutcome::Missing => {
                     stores.counters.missing += 1;
-                    return Err(MissClass::Missing);
+                    return Err(if disabled {
+                        MissClass::Unavailable
+                    } else {
+                        MissClass::Missing
+                    });
                 }
                 ReadOutcome::Refused(reason) => {
                     stores.counters.refused_record += 1;
@@ -583,6 +590,18 @@ impl SharedCache {
         };
         let restored =
             self.durable_restore_record(snapshot_source, &record, &expected, path, scope, held);
+        // Registry probes include allowlist hashing; keep them outside Stores.
+        let owed = if matches!(restored, Err(Failure::Ineligible(store::Ineligible::Scope))) {
+            unregistered_scope(
+                snapshot_source,
+                scope,
+                index,
+                interpretation,
+                record.record.binding.scope,
+            )
+        } else {
+            None
+        };
         let mut stores = self.durable().ok_or(MissClass::Unavailable)?;
         let (checkpoint, reduction, receipt) = match restored {
             Ok(restored) => restored,
@@ -604,16 +623,8 @@ impl SharedCache {
                         Counters::bump(&mut counters.not_rederived, refuse_class(refuse))
                     }
                 }
-                if matches!(class, Failure::Ineligible(store::Ineligible::Scope)) {
-                    if let Some(owed) = unregistered_scope(
-                        snapshot_source,
-                        scope,
-                        index,
-                        interpretation,
-                        record.record.binding.scope,
-                    ) {
-                        return Err(MissClass::Unregistered(owed));
-                    }
+                if let Some(owed) = owed {
+                    return Err(MissClass::Unregistered(owed));
                 }
                 return Err(MissClass::Failure(class));
             }
@@ -1028,46 +1039,79 @@ pub(crate) enum MissClass {
 }
 
 impl MissClass {
-    pub(crate) fn label(self) -> String {
+    pub(crate) fn label(self) -> &'static str {
+        // Restore's producers use this closed set of content-free suffixes.
+        // Unknown codec labels retain the existing static_label class.
+        macro_rules! prefixed {
+            ($prefix:literal, $suffix:expr, $($label:literal),+ $(,)?) => {
+                match $suffix {
+                    $($label => concat!($prefix, $label),)+
+                    _ => concat!($prefix, "static_label"),
+                }
+            };
+        }
         match self {
-            Self::Unavailable => "unavailable".into(),
-            Self::NoEntry => "no_entry".into(),
-            Self::SelectionCleared => "ineligible.selection_cleared".into(),
-            Self::HistoryOwed => "ineligible.history_owed".into(),
-            Self::Missing => "missing".into(),
-            Self::BudgetRefused => "budget_refused".into(),
-            Self::TakeLost => "restore_take_lost".into(),
-            Self::Unregistered(owed) => format!(
-                "unregistered_replay.{}",
-                match owed.kind {
-                    ObligationKind::BodyWitness => "body_witness",
-                    ObligationKind::MoneyRule => "money_rule",
-                }
+            Self::Unavailable => "unavailable",
+            Self::NoEntry => "no_entry",
+            Self::SelectionCleared => "ineligible.selection_cleared",
+            Self::HistoryOwed => "ineligible.history_owed",
+            Self::Missing => "missing",
+            Self::BudgetRefused => "budget_refused",
+            Self::TakeLost => "restore_take_lost",
+            Self::Unregistered(owed) => match owed.kind {
+                ObligationKind::BodyWitness => "unregistered_replay.body_witness",
+                ObligationKind::MoneyRule => "unregistered_replay.money_rule",
+            },
+            Self::Record(reason) => match reason {
+                store::Refusal::NewerFormat => "refused_record.newer",
+                store::Refusal::Unknown => "refused_record.unknown",
+                store::Refusal::Undecodable => "refused_record.undecodable",
+                store::Refusal::Unbindable => "refused_record.unbindable",
+                store::Refusal::Corrupt => "refused_record.corrupt",
+            },
+            Self::Failure(Failure::Corrupt) => "corrupt_body",
+            Self::Failure(Failure::Ineligible(reason)) => prefixed!(
+                "ineligible.",
+                ineligible_class(reason),
+                "source",
+                "key",
+                "context",
+                "scope",
+                "generation_ahead",
+                "entry_changed"
             ),
-            Self::Record(reason) => format!(
-                "refused_record.{}",
-                match reason {
-                    store::Refusal::NewerFormat => "newer",
-                    store::Refusal::Unknown => "unknown",
-                    store::Refusal::Undecodable => "undecodable",
-                    store::Refusal::Unbindable => "unbindable",
-                    store::Refusal::Corrupt => "corrupt",
-                }
-            ),
-            Self::Failure(Failure::Corrupt) => "corrupt_body".into(),
-            Self::Failure(Failure::Ineligible(reason)) => {
-                format!("ineligible.{}", ineligible_class(reason))
-            }
-            Self::Failure(Failure::Certificate(reason)) => format!(
-                "certificate_refused.{}",
+            Self::Failure(Failure::Certificate(reason)) => prefixed!(
+                "certificate_refused.",
                 match reason {
                     CertificateRefusal::Changed(reason) => full_reason_class(reason),
                     CertificateRefusal::ReadError => "read_error",
-                }
+                },
+                "state_missing",
+                "audit_due",
+                "clock_changed",
+                "scope_changed",
+                "invalid_checkpoint",
+                "replaced",
+                "shrunk",
+                "same_size_edit",
+                "head_changed",
+                "boundary_changed",
+                "unsupported_identity",
+                "read_error"
             ),
-            Self::Failure(Failure::NotRederived(refuse)) => {
-                format!("not_rederived.{}", refuse_class(refuse))
-            }
+            Self::Failure(Failure::NotRederived(refuse)) => prefixed!(
+                "not_rederived.",
+                refuse_class(refuse),
+                "descriptor",
+                "parser",
+                "head",
+                "record_bytes",
+                "SnapshotAccumulator.first_prompt_material",
+                "SnapshotAccumulator.workspace_path",
+                "SnapshotAccumulator.codex_agent_label",
+                "SessionStartState.content_end",
+                "SnapshotAccumulator.title"
+            ),
         }
     }
 }
