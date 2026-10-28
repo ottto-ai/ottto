@@ -506,7 +506,7 @@ impl OwnedSourceScan {
     ) -> Self {
         if matches!(
             self.source,
-            SnapshotSource::ClaudeCode | SnapshotSource::Codex
+            SnapshotSource::ClaudeCode | SnapshotSource::Codex | SnapshotSource::Pi
         ) {
             sampled_audit::normalize_marker_storage(&mut self.index);
             if self.source == SnapshotSource::ClaudeCode {

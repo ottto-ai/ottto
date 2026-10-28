@@ -42,6 +42,88 @@ crate::durable_tail_codec::durable_struct!(Rederive {
     H title: Option<[u8; 32]>,
 });
 
+/// Response-id keys, not occurrences. Oversized ledgers refuse, never truncate.
+pub(crate) const PI_LEDGER_MAX_KEYS: usize = 65_536;
+
+struct PiSection {
+    usage_keys: BTreeMap<String, PiUsageDedupState>,
+}
+crate::durable_tail_codec::durable_struct!(borrowed PiSection {
+    H usage_keys: BTreeMap<String, PiUsageDedupState>,
+});
+
+// E5-REBASE(5a2): replace this framing/source dispatch with the registered
+// (format, source, allowlist) Pi optional section. Other sources keep their bytes.
+impl PiSection {
+    fn put_record(
+        reduction: &CachedJsonlReduction,
+        rederive: &Rederive,
+        e: &mut Enc,
+    ) -> Result<(), Refuse> {
+        if reduction.accumulator.source != SnapshotSource::Pi {
+            reduction.put(e)?;
+            return rederive.put(e);
+        }
+        let keys = &reduction.accumulator.seen_pi_usage_keys;
+        if keys.len() > PI_LEDGER_MAX_KEYS {
+            return Err(Refuse::NonEmpty("pi_ledger_cap"));
+        }
+        e.with_pi_ledger(|e| reduction.put(e))?;
+        rederive.put(e)?;
+        e.section(1, |e| Self::put_borrowed(e, keys))
+    }
+    fn section<'a>(d: &mut Dec<'a>) -> Result<Dec<'a>, Corrupt> {
+        if d.varint()? != 1 {
+            return Err(Corrupt);
+        }
+        let len = u64::from_le_bytes(d.raw(8)?.try_into().map_err(|_| Corrupt)?);
+        let bytes = d.raw(usize::try_from(len).map_err(|_| Corrupt)?)?;
+        if Dec::new(bytes).take_len()? > PI_LEDGER_MAX_KEYS {
+            return Err(Corrupt);
+        }
+        Ok(Dec::new(bytes))
+    }
+    fn take_record(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
+        let mut d = Dec::new(body);
+        if source == SnapshotSource::Pi {
+            d.require_pi_section();
+        }
+        let mut reduction = CachedJsonlReduction::take(&mut d)?;
+        let rederive = Rederive::take(&mut d)?;
+        if reduction.accumulator.source != source {
+            return Err(Corrupt);
+        }
+        if source == SnapshotSource::Pi {
+            let mut section = Self::section(&mut d)?;
+            reduction.accumulator.seen_pi_usage_keys = Self::take(&mut section)?.usage_keys;
+            section.finish()?;
+            d.refilled_pi_section();
+        }
+        d.finish()?;
+        Ok(Decoded {
+            reduction,
+            rederive,
+        })
+    }
+    fn verify_record(body: &[u8]) -> Result<(), Corrupt> {
+        // The shared reduction starts with accumulator.source on this parent.
+        let source = SnapshotSource::take(&mut Dec::new(body))?;
+        let mut d = Dec::new(body);
+        if source == SnapshotSource::Pi {
+            d.require_pi_section();
+        }
+        CachedJsonlReduction::verify(&mut d)?;
+        Rederive::verify(&mut d)?;
+        if source == SnapshotSource::Pi {
+            let mut section = Self::section(&mut d)?;
+            Self::verify(&mut section)?;
+            section.finish()?;
+            d.refilled_pi_section();
+        }
+        d.finish()
+    }
+}
+
 fn digest(
     domain: &str,
     put: impl FnOnce(&mut Enc) -> Result<(), Refuse>,
@@ -85,6 +167,10 @@ pub(crate) fn allowlist_digest(source: SnapshotSource) -> [u8; 32] {
     ));
     CachedJsonlReduction::shape(&mut shape);
     Rederive::shape(&mut shape);
+    if source == SnapshotSource::Pi {
+        shape.push("ottto-dt-ext:pi-ledger:v1");
+        PiSection::shape(&mut shape);
+    }
     shape.digest()
 }
 
@@ -93,6 +179,7 @@ pub(crate) fn shape_text() -> String {
     let mut shape = Shape::default();
     CachedJsonlReduction::shape(&mut shape);
     Rederive::shape(&mut shape);
+    PiSection::shape(&mut shape);
     shape.text().to_string()
 }
 
@@ -135,23 +222,15 @@ fn rederive_digests(acc: &SnapshotAccumulator, line_cap: u64) -> Result<Rederive
 }
 
 /// The record body for a retained reduction, or why it is not persisted.
-/// Only Claude Code and Codex entries are persisted in M1.
+/// All sources use the shared field classifier and bounded encoder.
 pub(crate) fn encode(
     reduction: &CachedJsonlReduction,
     limit: usize,
     line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
-    let acc = &reduction.accumulator;
-    if !matches!(
-        acc.source,
-        SnapshotSource::ClaudeCode | SnapshotSource::Codex
-    ) {
-        return Err(Refuse::NotRederivable("SnapshotAccumulator.source"));
-    }
-    let rederive = rederive_digests(acc, line_cap)?;
-    let mut e = Enc::bytes(limit);
-    reduction.put(&mut e)?;
-    rederive.put(&mut e)?;
+    let rederive = rederive_digests(&reduction.accumulator, line_cap)?;
+    let mut e = Enc::bytes(limit.min(crate::durable_tail_store::RECORD_BYTES));
+    PiSection::put_record(reduction, &rederive, &mut e)?;
     Ok(e.into_bytes())
 }
 
@@ -159,10 +238,7 @@ pub(crate) fn encode(
 /// inputs. The caller separately checks source/binding and envelope integrity.
 /// Precondition: check size, mode and the envelope trailer before this walk.
 pub(crate) fn verify(body: &[u8]) -> Result<(), Corrupt> {
-    let mut d = Dec::new(body);
-    CachedJsonlReduction::verify(&mut d)?;
-    Rederive::verify(&mut d)?;
-    d.finish()
+    PiSection::verify_record(body)
 }
 
 /// A decoded record before re-derivation. Its content fields are empty.
@@ -172,17 +248,7 @@ pub(crate) struct Decoded {
 }
 
 pub(crate) fn decode(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
-    let mut d = Dec::new(body);
-    let reduction = CachedJsonlReduction::take(&mut d)?;
-    let rederive = Rederive::take(&mut d)?;
-    d.finish()?;
-    if reduction.accumulator.source != source {
-        return Err(Corrupt);
-    }
-    Ok(Decoded {
-        reduction,
-        rederive,
-    })
+    PiSection::take_record(body, source)
 }
 
 /// Re-derivation I/O, for the per-pass receipt.

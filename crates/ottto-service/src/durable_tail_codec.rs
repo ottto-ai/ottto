@@ -62,11 +62,13 @@ enum Sink {
 /// be checked against the digest without storing it.
 pub(crate) struct Enc {
     sink: Sink,
+    moved_field: Option<&'static str>,
 }
 
 impl Enc {
     pub(crate) fn bytes(limit: usize) -> Self {
         Self {
+            moved_field: None,
             sink: Sink::Bytes {
                 out: Vec::new(),
                 limit,
@@ -79,7 +81,46 @@ impl Enc {
         hasher.update(domain.as_bytes());
         Self {
             sink: Sink::Hash(Box::new(hasher)),
+            moved_field: None,
         }
+    }
+    /// One record's Pi body may omit exactly this E field. Drop clears the
+    /// allowance on success, refusal and unwind, including a reused encoder.
+    pub(crate) fn with_pi_ledger<T>(
+        &mut self,
+        put: impl FnOnce(&mut Enc) -> Result<T, Refuse>,
+    ) -> Result<T, Refuse> {
+        struct Guard<'a>(&'a mut Enc);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.moved_field = None;
+            }
+        }
+        self.moved_field = Some("SnapshotAccumulator.seen_pi_usage_keys");
+        let guard = Guard(self);
+        put(guard.0)
+    }
+    pub(crate) fn field_moved(&self, path: &str) -> bool {
+        self.moved_field == Some(path)
+    }
+    /// Tagged, length-prefixed section in the same bounded byte encoder.
+    pub(crate) fn section(
+        &mut self,
+        tag: u64,
+        put: impl FnOnce(&mut Enc) -> Result<(), Refuse>,
+    ) -> Result<(), Refuse> {
+        self.varint(tag)?;
+        let Sink::Bytes { out, .. } = &self.sink else {
+            return Err(Refuse::UnknownLabel);
+        };
+        let start = out.len();
+        self.raw(&[0; 8])?;
+        put(self)?;
+        if let Sink::Bytes { out, .. } = &mut self.sink {
+            let len = (out.len() - start - 8) as u64;
+            out[start..start + 8].copy_from_slice(&len.to_le_bytes());
+        }
+        Ok(())
     }
     pub(crate) fn hashing(&self) -> bool {
         matches!(self.sink, Sink::Hash(_))
@@ -144,11 +185,16 @@ impl Enc {
 pub(crate) struct Dec<'a> {
     bytes: &'a [u8],
     at: usize,
+    pi_section: Option<bool>,
 }
 
 impl<'a> Dec<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            pi_section: None,
+        }
     }
     pub(crate) fn raw(&mut self, len: usize) -> Result<&'a [u8], Corrupt> {
         let end = self.at.checked_add(len).ok_or(Corrupt)?;
@@ -189,8 +235,16 @@ impl<'a> Dec<'a> {
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
     }
+    pub(crate) fn require_pi_section(&mut self) {
+        self.pi_section = Some(false);
+    }
+    pub(crate) fn refilled_pi_section(&mut self) {
+        self.pi_section = Some(true);
+    }
     pub(crate) fn finish(self) -> Result<(), Corrupt> {
-        (self.at == self.bytes.len()).then_some(()).ok_or(Corrupt)
+        (self.at == self.bytes.len() && self.pi_section != Some(false))
+            .then_some(())
+            .ok_or(Corrupt)
     }
 }
 
@@ -361,6 +415,36 @@ impl<T: HDigestKey + Ord> HDigest for BTreeSet<T> {
     }
 }
 
+/// H keys with N counts or D values; values retain their own field classes.
+impl<K: HDigestKey + Ord, V: Durable> HDigest for BTreeMap<K, V> {
+    fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse> {
+        e.varint(self.len() as u64)?;
+        for (key, value) in self {
+            key.put_h(e, path)?;
+            value.put(e)?;
+        }
+        Ok(())
+    }
+    fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
+        let mut out = BTreeMap::new();
+        for _ in 0..d.take_len()? {
+            if out.insert(K::take_h(d)?, V::take(d)?).is_some() {
+                return Err(Corrupt);
+            }
+        }
+        Ok(out)
+    }
+    fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        verify_entries(d, K::key_h, V::verify)
+    }
+    fn shape_h(s: &mut Shape) {
+        s.push("HKeyMap<");
+        K::shape_h(s);
+        V::shape(s);
+        s.push(">");
+    }
+}
+
 fn verify_seq(
     d: &mut Dec<'_>,
     mut item: impl FnMut(&mut Dec<'_>) -> Result<(), Corrupt>,
@@ -500,6 +584,7 @@ fn verify_entries<'a, K: Ord>(
             let mut earlier = Dec {
                 bytes: d.bytes,
                 at: start,
+                pi_section: None,
             };
             for _ in 0..i {
                 if key(&mut earlier)? == current {
@@ -1131,7 +1216,7 @@ macro_rules! durable_field {
     }};
     (put E, $e:ident, $f:ident, $ty:ty, $path:expr) => {{
         let value: &$ty = $f;
-        if !$crate::durable_tail_codec::DurableEmpty::durable_empty(value) {
+        if !$e.field_moved($path) && !$crate::durable_tail_codec::DurableEmpty::durable_empty(value) {
             return Err($crate::durable_tail_codec::Refuse::NonEmpty($path));
         }
     }};
@@ -1204,6 +1289,18 @@ pub(crate) use durable_field;
 /// struct `durable_struct!(T(N a: u64, H b: [u8; 32]))` with names chosen
 /// for the positions.
 macro_rules! durable_struct {
+    (borrowed $t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
+        $crate::durable_tail_codec::durable_struct!($t { $($c $f: $ty),* });
+        impl $t {
+            fn put_borrowed(e: &mut $crate::durable_tail_codec::Enc, $($f: &$ty),*)
+                -> Result<(), $crate::durable_tail_codec::Refuse> {
+                $($crate::durable_tail_codec::durable_field!(
+                    put $c, e, $f, $ty, concat!(stringify!($t), ".", stringify!($f))
+                );)*
+                Ok(())
+            }
+        }
+    };
     (key $t:ident $body:tt) => {
         $crate::durable_tail_codec::durable_struct!($t $body);
         $crate::durable_tail_codec::durable_struct!(@key $t $body);
