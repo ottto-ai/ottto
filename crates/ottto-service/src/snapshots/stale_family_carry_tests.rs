@@ -4108,6 +4108,10 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
         }
         carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
         if changed_member {
+            assert!(
+                fixture.index.claude_stale_family_carry.contains(CARRY_ROOT),
+                "{case}: the family is carried before its member changes"
+            );
             let traversal = fixture.index.traversal.as_mut().unwrap();
             traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
             traversal.observed_index_keys.extend(carry_family_keys());
@@ -4140,6 +4144,14 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
                 &VecDeque::new(),
             );
             assert!(!fixture.index.claude_stale_family_carry.contains(&root));
+            let agent_key = carry_key(CARRY_ROOT, Some(CARRY_AGENT));
+            assert!(fixture.index.files[&agent_key]
+                .source_file_fingerprint
+                .is_empty());
+            assert_eq!(
+                fixture.index.claude_stale_family_carry.replay,
+                vec![carry_replayed(&agent_key)]
+            );
         }
         assert_eq!(fixture.index.accepted_snapshot_fingerprints, before);
         assert!(fixture.index.claude_request_identity_contract_changed);
