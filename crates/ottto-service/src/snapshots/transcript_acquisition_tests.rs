@@ -1697,7 +1697,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 source,
                 &index_path,
                 &namespace,
-                claude_request_identity::capture_by_default(),
+                true, // Match OwnedSourceScan::new outside a sync cycle.
             );
             let (mut index, initial, modes) = production_scan(
                 &fixture,
@@ -1795,7 +1795,7 @@ fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks(
                 source,
                 &index_path,
                 &namespace,
-                claude_request_identity::capture_by_default(),
+                true, // Match OwnedSourceScan::new outside a sync cycle.
             );
             assert!(second.take(&key).is_none(), "restore must start cold");
             if arm == "restore_miss_debt" {

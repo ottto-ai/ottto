@@ -1,4 +1,9 @@
-# R2 audit gates on checkpoint reuse
+# Standalone audit gates on checkpoint reuse
+
+Approved 2026-10-29: this gate-only slice lands standalone on main, ahead
+of its former R2 slot. It can enter R1 if green and merged before the R1 cut.
+It supplies the LA-1 audit-gate dependency for the Pi restore work. Only the
+two audit-gate commits are transplanted; bootstrap and format work stay separate.
 
 Ordinary checkpoint-backed acquisition now chooses Tail or Unchanged from
 content identity, scope and the existing head/boundary checks. An old full-check
@@ -37,8 +42,12 @@ context metrics; it does not measure rederive, other readers or page-cache disk
 activity. Quiet restore reads both samples, so total zero-byte restore remains
 unmet. Existing proof-fence assertions retain their clock and audit refusals.
 
-Validation for this static branch: explicit-file rustfmt and `git diff --check`.
-No Cargo, tests or CI were run. Native restore fixtures require the supported
-heap layout and are unexecuted until the authorized native lane runs. Linux,
-native contracts, money equality and independent owner review are integration
-gates after the predecessor lands.
+The restore fixture uses main's always-capturing scanner binding outside a sync
+cycle, replacing the retired capture-default helper in its two store openings.
+All assertions and real writer/restore paths are retained.
+
+Validation: explicit-file rustfmt and `git diff --check`; no local Cargo build,
+test or Clippy. Linux CI runs on the review-ready standalone PR. Native restore
+fixtures still require the supported heap layout; native contracts, money
+equality and E3/Lead B owner review remain owed. The Mac slot order is #857,
+then #854, then this PR; the owning integration agent dispatches those checks.
