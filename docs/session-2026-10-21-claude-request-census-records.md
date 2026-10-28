@@ -1,4 +1,4 @@
-# Claude request-census records (shadow only)
+# Claude request-census records
 
 Each Claude transcript index key now has one durable request-census record in
 `ScanIndex::claude_request_census`. The record has these fields:
@@ -39,36 +39,21 @@ record.
 **Prune.** At a complete Claude terminal, before any fold, records are pruned to
 keys that are indexed or were walked in this generation.
 
-## Shadow
+## Terminal maintenance
 
-The scan then measures the shadow predicate and carries it on
-`SourceScanResult`. The usage fold copies it into
-`ClaudeDuplicateCensusCounts::request_census`, which is logged with the
-existing census counters.
+Complete Claude terminals retain indexed or observed records, retire old
+transcript hashes, and count actual retirements before folds. The terminal
+`would_open` join, flip/drift statistics, serialization/heap measurement and
+optional `duplicate_census.request_census` disclosure have been removed.
+Census records, request hashes, birth stubs and retirement semantics remain.
+The shared join is compiled only for tests of live record behavior.
 
-`would_open` is true when all of these hold:
-
-- the census is complete;
-- every indexed family-member key that is not confirmed empty has a record of
-  the current derivation, matching its entry fingerprint or parsed in this
-  census window;
-- the hash total fits the budget;
-- duplicate owners fit the existing owner bound.
-
-Uncovered keys are counted once each, under the first matching cause:
-over budget, account hold, residue, placeholder, empty fingerprint,
-fingerprint mismatch, then migrate. The shadow also counts:
-
-- quarantine roots without a record;
-- shapes, unverified records, twins and census-unknown roots;
-- records, hashes, duplicate hashes, duplicate owners and shared keys;
-- `would_open` flips between terminals;
-- a derivation-drift tripwire: a verified, complete re-parse at the same
-  fingerprint and derivation that yields other ids;
-- JSON and heap bytes.
-
-`ClaudeRequestCensusShadowState` persists only the last `would_open`, the flip
-count and the drift count.
+The old `claude_request_census_shadow` slot is a decode-only `IgnoredAny`
+placeholder, named `retired_claude_request_census_shadow` in Rust. Its wire name
+and positional registry slot stay fixed. Old map and array values (including
+optional duplicates and bounded hostile evidence) are consumed and discarded;
+new maps omit the key. Earlier readers default the absent field. No schema,
+semantic version, scope key or per-entry layout changes are needed.
 
 ## Decoder
 
@@ -87,7 +72,8 @@ the field.
 
 - `MAX_CLAUDE_REQUEST_CENSUS_HASHES = 1_048_576` (8 MiB of hashes). A
   production record past it becomes an inert `over_budget` tombstone.
-- Both new fields are charged through `fields!(ScanIndex)`. `ScanIndexEntry` is
+- The census and zero-sized retired placeholder are charged through
+  `fields!(ScanIndex)`. `ScanIndexEntry` is
   unchanged, so #588 per-entry restore pricing is unchanged.
 - The derivation canary pins the shape and hash table of a fixed synthetic
   corpus to `CLAUDE_REQUEST_CENSUS_CANARY`. A test shows the canary fails for

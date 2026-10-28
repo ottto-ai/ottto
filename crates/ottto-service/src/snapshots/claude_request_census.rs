@@ -1266,21 +1266,6 @@ impl ClaudeRequestCensus {
     }
 }
 
-/// Count-only derivation drift; nothing reads it into a decision.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ClaudeRequestCensusShadowState {
-    /// S3(d) tripwire: a verified complete re-parse at an unchanged
-    /// fingerprint and derivation changed the hash set or shape.
-    derivation_drift: u64,
-}
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; derivation_drift);
-
-impl ClaudeRequestCensusShadowState {
-    pub(crate) fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
 /// Compact wire form, keys short on purpose:
 /// `{"v":1,"fp":"<64 hex>","w":<unix>,"s":"exact","tw":true,"u":true,"b":"<base64>"}`.
 /// `b` is the request hashes as base64 of big-endian u64s (10.67 B per hash);
@@ -1374,16 +1359,6 @@ impl Serialize for ClaudeRequestCensus {
     }
 }
 
-impl Serialize for ClaudeRequestCensusShadowState {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        if self.derivation_drift > 0 {
-            map.serialize_entry("d", &self.derivation_drift)?;
-        }
-        map.end()
-    }
-}
-
 /// Persisted readers bound raw optional evidence before Serde can buffer a
 /// scalar. Ordinary index bytes pass through unchanged. Oversized evidence is
 /// drained with constant space and replaced by null; interpretation stops at
@@ -1393,12 +1368,12 @@ pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<Sc
     CensusRead::new(reader).decode()
 }
 
-pub(super) fn normalized_bounded_bytes(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, bool, bool)> {
+pub(super) fn normalized_bounded_bytes(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, bool)> {
     use std::io::Read;
     let mut normalized = Vec::new();
     let mut reader = CensusRead::new(bytes);
     reader.read_to_end(&mut normalized)?;
-    Ok((normalized, reader.duplicate_census, reader.duplicate_shadow))
+    Ok((normalized, reader.duplicate_census))
 }
 
 pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
@@ -1478,7 +1453,6 @@ struct CensusRead<R> {
     seen_census: bool,
     seen_shadow: bool,
     duplicate_census: bool,
-    duplicate_shadow: bool,
     shadow_key: bool,
     shadow_state: bool,
     capture: bool,
@@ -1506,7 +1480,6 @@ impl<R: std::io::Read> CensusRead<R> {
             seen_census: false,
             seen_shadow: false,
             duplicate_census: false,
-            duplicate_shadow: false,
             shadow_key: false,
             shadow_state: false,
             capture: false,
@@ -1529,9 +1502,6 @@ impl<R: std::io::Read> CensusRead<R> {
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
         if self.duplicate_census {
             index.claude_request_census = ClaudeRequestCensus::default();
-        }
-        if self.duplicate_shadow {
-            index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
         }
     }
 
@@ -1573,7 +1543,6 @@ impl<R: std::io::Read> CensusRead<R> {
                         self.shadow_state = true;
                         let duplicate = self.seen_shadow;
                         self.seen_shadow = true;
-                        self.duplicate_shadow |= duplicate;
                         duplicate
                     }
                     "reread_guard" => {
@@ -1617,7 +1586,8 @@ impl<R: std::io::Read> CensusRead<R> {
         // Original admitted evidence was grammar-checked by the lexical
         // boundary. The syntax-only pass substitutes null without buffering
         // or interpreting census records, even before header controls run.
-        let mut overflow = self.syntax_only || self.retired_guard;
+        // Retired values are drained without allocating or interpreting them.
+        let mut overflow = self.syntax_only || self.shadow_state || self.retired_guard;
         while let Some(byte) = self.byte()? {
             if !quoted && depth == 0 && matches!(byte, b',' | b'}' | b']') {
                 self.replay = Some(byte);
@@ -1660,16 +1630,9 @@ impl<R: std::io::Read> CensusRead<R> {
         // Parsing is isolated from the enclosing index, including numeric
         // conversion and wrong-token errors. Only canonical, finite tokens
         // leave this reader. JSON syntax outside the optional field is intact.
-        Ok(if self.shadow_state {
-            let state = serde_json::from_slice::<ClaudeRequestCensusShadowState>(&bytes)
-                .unwrap_or_default();
-            drop(bytes);
-            serde_json::to_vec(&state).expect("shadow serialization")
-        } else {
-            let census = serde_json::from_slice::<ClaudeRequestCensus>(&bytes).unwrap_or_default();
-            drop(bytes);
-            serde_json::to_vec(&census).expect("census serialization")
-        })
+        let census = serde_json::from_slice::<ClaudeRequestCensus>(&bytes).unwrap_or_default();
+        drop(bytes);
+        Ok(serde_json::to_vec(&census).expect("census serialization"))
     }
 
     fn next(&mut self) -> std::io::Result<Option<u8>> {
@@ -1846,20 +1809,6 @@ pub(crate) fn decode_ledger_shard(bytes: &[u8]) -> Option<ClaudeRequestCensus> {
     (dropped == 0).then_some(census)
 }
 
-/// Tolerant like the census: anything unexpected reads as the default.
-impl<'de> Deserialize<'de> for ClaudeRequestCensusShadowState {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
-        if raw.get().len() > MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES {
-            return Ok(Self::default());
-        }
-        let mut isolated = serde_json::Deserializer::from_str(raw.get());
-        Ok(isolated
-            .deserialize_any(ShadowStateVisitor)
-            .unwrap_or_default())
-    }
-}
-
 /// Every non-map JSON shape: drained and read as `Self::Value::default()`.
 macro_rules! tolerate_non_map {
     ($de:lifetime) => {
@@ -1949,28 +1898,6 @@ impl<'de> Visitor<'de> for CensusVisitor {
             dropped += u64::from(!kept);
         }
         Ok((census, dropped))
-    }
-}
-
-struct ShadowStateVisitor;
-impl<'de> Visitor<'de> for ShadowStateVisitor {
-    type Value = ClaudeRequestCensusShadowState;
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a Claude request-census shadow state")
-    }
-    tolerate_non_map!('de);
-    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
-        Ok(Self::Value::default())
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut state = ClaudeRequestCensusShadowState::default();
-        while let Some(field) = map.next_key::<String>()? {
-            let value = map.next_value::<Loose>()?;
-            if let ("d", Loose::U64(drift)) = (field.as_str(), value) {
-                state.derivation_drift = drift;
-            }
-        }
-        Ok(state)
     }
 }
 
@@ -2675,28 +2602,6 @@ pub(crate) fn record_claude_request_census(
         .carried_birth(parse.index_key, parse.opened_birth);
     record.modified = (parse.modified_unix_seconds > 0).then_some(parse.modified_unix_seconds);
     if let Some(old) = index.claude_request_census.get(parse.index_key) {
-        // S3(d): the same verified revision under the same derivation must
-        // yield the same census. Residue, lossy and budget tombstones (whose
-        // shape and hashes the budget replaced) and retired records (whose
-        // hashes retirement dropped) are excluded.
-        let comparable = |record: &ClaudeRequestCensusRecord| {
-            !record.unverified
-                && record.retired.is_none()
-                && !matches!(
-                    record.shape,
-                    ClaudeRequestCensusShape::Lossy | ClaudeRequestCensusShape::OverBudget
-                )
-        };
-        if parse.complete
-            && comparable(old)
-            && comparable(&record)
-            && old.derivation == record.derivation
-            && old.source_file_fingerprint == record.source_file_fingerprint
-            && (old.shape != record.shape || old.request_hashes != record.request_hashes)
-        {
-            let state = &mut index.claude_request_census_shadow;
-            state.derivation_drift = state.derivation_drift.saturating_add(1);
-        }
         // An unchanged re-parse of a retired record (a backfill, a resume
         // miss) stays retired while its file is still past the cutoff: its
         // hashes, and the index bytes, do not bounce back.
@@ -3432,13 +3337,6 @@ impl ClaudeRequestCensus {
 }
 
 #[cfg(test)]
-impl ClaudeRequestCensusShadowState {
-    pub(crate) fn derivation_drift_for_test(&self) -> u64 {
-        self.derivation_drift
-    }
-}
-
-#[cfg(test)]
 impl ScanIndex {
     pub(crate) fn claude_request_census_for_test(&self) -> &ClaudeRequestCensus {
         &self.claude_request_census
@@ -3446,10 +3344,6 @@ impl ScanIndex {
 
     pub(crate) fn claude_request_census_mut_for_test(&mut self) -> &mut ClaudeRequestCensus {
         &mut self.claude_request_census
-    }
-
-    pub(crate) fn claude_request_census_shadow_for_test(&self) -> &ClaudeRequestCensusShadowState {
-        &self.claude_request_census_shadow
     }
 
     pub(crate) fn seed_census_correction_for_test(&mut self, root: &str) {
@@ -3471,8 +3365,7 @@ impl ScanIndex {
     /// Every decision the census, fence, rearm, quarantine and settlement
     /// paths persist, with paths made relative to `base` and source
     /// fingerprints reduced to present/cleared, so two fixtures at different
-    /// temporary paths compare. The record map and shadow state are excluded:
-    /// they are the only state D1 adds.
+    /// temporary paths compare. The record map is excluded.
     pub(crate) fn claude_census_decision_view_for_test(&self, base: &Path) -> serde_json::Value {
         let canonical_base = std::fs::canonicalize(base).unwrap_or_default();
         let relative = |key: &str| {
@@ -3661,9 +3554,6 @@ mod reader_regression_tests {
                 "synthetic/member": {"v": 1, "fp": "00".repeat(32), "w": 7, "s": "empty"},
             }))
             .expect("valid evidence"),
-            claude_request_census_shadow: ClaudeRequestCensusShadowState {
-                derivation_drift: 0,
-            },
             ..ScanIndex::default()
         };
         index
@@ -3671,7 +3561,9 @@ mod reader_regression_tests {
             .insert(format!("synthetic/{}", "x".repeat(16 * 1024)));
         assert!(!index.claude_request_census.is_empty());
         let expected = serde_json::to_value(&index).expect("expected index");
-        let bytes = serde_json::to_vec(&index).expect("index bytes");
+        let mut legacy = expected.clone();
+        legacy["claude_request_census_shadow"] = serde_json::json!({"o": true, "f": 7, "d": 9});
+        let bytes = serde_json::to_vec(&legacy).expect("old index bytes");
         // Every chunk is followed by an interruption. This includes ordinary
         // copied runs, root-key capture and optional evidence capture. The
         // schema-prefix case specifically interrupts after a consumed prefix.

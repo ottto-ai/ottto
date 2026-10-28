@@ -252,10 +252,6 @@ impl Serialize for ScanIndex {
         field!(held claude_usage_family_witnesses);
         field!(held claude_usage_family_pending);
         field!(claude_request_census, ClaudeRequestCensus::is_empty);
-        field!(
-            claude_request_census_shadow,
-            ClaudeRequestCensusShadowState::is_empty
-        );
         field!(held claude_usage_authority_quarantine);
         field!(claude_retired_family_tombstones);
         field!(claude_retired_family_tombstones_initialized);
@@ -785,7 +781,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
     reader.consume(1);
     let close = if array { b']' } else { b'}' };
     let mut position = 0;
-    let mut resources = [false; 2];
+    let mut census_resources = [false; 2];
     if whitespace(reader)? != Some(close) {
         loop {
             let name = if array {
@@ -819,12 +815,8 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
             }
             let value = lexical_span(reader, optional, 1)?;
             if optional {
-                if matches!(
-                    name,
-                    Some("claude_request_census" | "claude_request_census_shadow")
-                ) {
-                    resources[usize::from(name == Some("claude_request_census_shadow"))] |=
-                        value.resource;
+                if matches!(name, Some("claude_request_census" | "claude_request_census_shadow")) {
+                    census_resources[usize::from(name == Some("claude_request_census_shadow"))] |= value.resource;
                 }
                 if !value.resource {
                     checked_grammar(reader, value)?;
@@ -856,7 +848,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
         }
     })?;
     reader.seek(SeekFrom::Start(0))?;
-    Ok(resources)
+    Ok(census_resources)
 }
 fn optional_census(name: Option<&str>) -> bool {
     matches!(
@@ -1553,10 +1545,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                 if !seen.insert(name) {
                     if name == "claude_request_census" {
                         index.claude_request_census = ClaudeRequestCensus::default();
-                    } else if name == "claude_request_census_shadow" {
-                        index.claude_request_census_shadow =
-                            ClaudeRequestCensusShadowState::default();
-                    } else if name != "reread_guard" {
+                    } else if !matches!(name, "claude_request_census_shadow" | "reread_guard") {
                         return Err(Error::Refused("duplicate index field"));
                     }
                 } else {
@@ -1673,11 +1662,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 .census(value, "claude_request_census")?
                                 .claude_request_census
                         }
-                        "claude_request_census_shadow" => {
-                            index.claude_request_census_shadow = self
-                                .census(value, "claude_request_census_shadow")?
-                                .claude_request_census_shadow
-                        }
+                        "claude_request_census_shadow" => {} // Preserve the legacy positional slot.
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine = self.authorities(value)?
                         }
@@ -2149,10 +2134,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         Ok(())
     }
     fn census(&mut self, span: Span, field: &str) -> std::result::Result<ScanIndex, Error> {
-        if span.resource
-            || (optional_census(Some(field))
-                && self.census_resources[usize::from(field == "claude_request_census_shadow")])
-        {
+        if span.resource || (field == "claude_request_census" && self.census_resources[0]) {
             return Ok(ScanIndex::default());
         }
         self.reader.seek(SeekFrom::Start(span.start))?;
@@ -2330,8 +2312,7 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     validate_original(&mut std::io::Cursor::new(bytes)).inspect_err(|error| {
         note_refusal(error, "cas", "unattributed");
     })?;
-    let (normalized, duplicate_census, duplicate_shadow) =
-        claude_request_census::normalized_bounded_bytes(bytes)?;
+    let (normalized, duplicate_census) = claude_request_census::normalized_bounded_bytes(bytes)?;
     bounded_shape(&normalized).inspect_err(|_| {
         note_refusal(
             &Error::Refused("nesting resource cap"),
@@ -2342,9 +2323,6 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     let mut index = read(std::io::Cursor::new(normalized), "cas", "unattributed")?;
     if duplicate_census {
         index.claude_request_census = ClaudeRequestCensus::default();
-    }
-    if duplicate_shadow {
-        index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
     }
     Ok(index)
 }

@@ -1276,9 +1276,9 @@ fn optional_raw_cap_counts_object_field_leading_whitespace() {
     file.flush().unwrap();
     drop(file);
     let native = claude_request_census::decode_index(File::open(&path).unwrap()).unwrap();
-    assert!(native.claude_request_census_shadow.is_empty());
+    assert!(serde_json::to_value(&native).unwrap().get("claude_request_census_shadow").is_none());
     let loaded = ScanIndex::load(&path).unwrap();
-    assert!(loaded.claude_request_census_shadow.is_empty());
+    assert!(serde_json::to_value(&loaded).unwrap().get("claude_request_census_shadow").is_none());
     assert_sibling(&loaded);
     assert_eq!(corrupt_count(scratch.as_ref()), 0);
 }
@@ -2114,7 +2114,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
         lenient_decode::FIELDS
             .iter()
             .copied()
-            .filter(|name| *name != "reread_guard")
+            .filter(|name| !matches!(*name, "reread_guard" | "claude_request_census_shadow"))
             .collect()
     );
     let decoded =
@@ -4717,4 +4717,193 @@ fn retired_reread_new_writer_keeps_previous_default_contract() {
         serde_json::to_vec(&old.claude_request_census).unwrap(),
         serde_json::to_vec(&seed.claude_request_census).unwrap()
     );
+}
+
+/// F1/F2: an old slot is consumed, including on the full positional schema.
+/// Every other field is non-default so a shift or reset cannot pass silently.
+#[test]
+fn retired_census_shadow_keeps_old_map_and_array_custody() {
+    let seed = every_persisted_field_fixture();
+    let expected = serde_json::to_value(&seed).unwrap();
+    let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
+    let mut old = expected.clone();
+    old["claude_request_census_shadow"] = serde_json::json!({"o":true,"f":7,"d":9});
+    let array = Value::Array(
+        lenient_decode::FIELDS
+            .iter()
+            .map(|name| old[*name].clone())
+            .collect(),
+    );
+    let escaped = "claude_request_census_shadow"
+        .chars()
+        .map(|ch| format!("\\u{:04x}", ch as u32))
+        .collect::<String>();
+    let map = serde_json::to_string(&old).unwrap();
+    let prefix = map.strip_suffix('}').unwrap();
+    let mut forms = vec![map.clone(), serde_json::to_string(&array).unwrap()];
+    for key in ["claude_request_census_shadow", escaped.as_str()] {
+        forms.push(format!(
+            "{prefix},\"{key}\":{{\"o\":false,\"f\":3,\"d\":4}}}}"
+        ));
+    }
+    // Both sides of the old normalization depth bound, and its byte bound.
+    for depth in [65, 300] {
+        forms.push(format!(
+            "{prefix},\"{escaped}\":{}0{}}}",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        ));
+    }
+    forms.push(format!(
+        "{prefix},\"{escaped}\":\"{}\"}}",
+        "x".repeat(claude_request_census::MAX_RAW_BYTES + 1)
+    ));
+    let scratch = crate::test_scratch::ScratchDir::new("retired-census-custody");
+    for (number, json) in forms.iter().enumerate() {
+        let bytes = json.as_bytes();
+        let native = claude_request_census::decode_index(bytes).expect("native old index");
+        let streaming = lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed")
+            .expect("streamed old index, no extra positional field");
+        let bounded = lenient_decode::read_bounded(bytes).expect("bounded old index");
+        let path = scratch.as_ref().join(format!("old-{number}.json"));
+        fs::write(&path, bytes).unwrap();
+        let disk = ScanIndex::load(&path).expect("old index accepted");
+        for mut decoded in [native, streaming, bounded, disk] {
+            assert!(
+                decoded.decode_holds.is_empty(),
+                "no quarantine or custody repair"
+            );
+            assert_eq!(
+                serde_json::to_vec(&decoded.claude_request_census).unwrap(),
+                census
+            );
+            assert_eq!(
+                serde_json::to_value(&decoded).unwrap(),
+                expected,
+                "all selection/identity fields unchanged"
+            );
+            fs::write(&path, bytes).unwrap();
+            decoded.save(&path).expect("CAS discards retired evidence");
+            let reloaded = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&reloaded.claude_request_census).unwrap(),
+                census
+            );
+            assert!(serde_json::to_value(&reloaded)
+                .unwrap()
+                .get("claude_request_census_shadow")
+                .is_none());
+        }
+        assert!(path.exists());
+    }
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
+}
+
+/// F3: this is the previous binary's shadow field/default contract. The new
+/// writer emits a map without that optional field, so downgrade keeps census.
+#[test]
+fn retired_census_shadow_new_writer_loads_with_previous_default_contract() {
+    #[derive(Debug, Default, PartialEq, serde::Deserialize)]
+    struct PreviousShadow {
+        #[serde(rename = "o", default)]
+        open: Option<bool>,
+        #[serde(rename = "f", default)]
+        flips: u64,
+        #[serde(rename = "d", default)]
+        drift: u64,
+    }
+    #[derive(serde::Deserialize)]
+    struct PreviousIndex {
+        files: BTreeMap<String, ScanIndexEntry>,
+        #[serde(default)]
+        claude_request_census: claude_request_census::ClaudeRequestCensus,
+        #[serde(default)]
+        claude_request_census_shadow: PreviousShadow,
+    }
+    let seed = every_persisted_field_fixture();
+    let bytes = serde_json::to_vec(&seed).unwrap();
+    let old: PreviousIndex =
+        serde_json::from_slice(&bytes).expect("previous reader defaults shadow");
+    assert_eq!(old.claude_request_census_shadow, PreviousShadow::default());
+    assert_eq!(
+        serde_json::to_vec(&old.claude_request_census).unwrap(),
+        serde_json::to_vec(&seed.claude_request_census).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&old.files).unwrap(),
+        serde_json::to_value(&seed.files).unwrap()
+    );
+}
+
+/// A real census resource refusal must not reset the other fields decoded
+/// through Decoder::census, including durable Codex proof state and sweep debt.
+#[test]
+fn real_census_resource_limits_preserve_unrelated_durable_fields() {
+    let seed = every_persisted_field_fixture();
+    let mut expected = serde_json::to_value(&seed).unwrap();
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_request_census");
+    let defaults = serde_json::to_value(ScanIndex::default()).unwrap();
+    for field in [
+        "codex_parent_side_requests",
+        "codex_parent_side",
+        "codex_parent_prefix_proofs",
+        "bounded_sweep_unsettled_causes",
+    ] {
+        assert_ne!(
+            expected[field], defaults[field],
+            "exercise nondefault {field}"
+        );
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("census-resource-scope");
+    let path = scratch.join("index.json");
+    fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+    let identity_expected = serde_json::to_value(
+        lenient_decode::read_identity_carry(File::open(&path).unwrap(), "claude_code").unwrap(),
+    )
+    .unwrap();
+    let mut old = serde_json::to_value(&seed).unwrap();
+    old["claude_request_census"] = serde_json::json!("real-census-resource");
+    let map = serde_json::to_string(&old).unwrap();
+    let array = serde_json::to_string(&Value::Array(
+        lenient_decode::FIELDS
+            .iter()
+            .map(|field| old[*field].clone())
+            .collect(),
+    ))
+    .unwrap();
+    for raw in [
+        format!("{}0{}", "[".repeat(300), "]".repeat(300)),
+        format!(
+            "\"{}\"",
+            "x".repeat(claude_request_census::MAX_RAW_BYTES + 1)
+        ),
+    ] {
+        for form in [&map, &array] {
+            let json = form.replace("\"real-census-resource\"", &raw);
+            let bytes = json.as_bytes();
+            fs::write(&path, bytes).unwrap();
+            let native = claude_request_census::decode_index(bytes).unwrap();
+            let streaming =
+                lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed").unwrap();
+            let bounded = lenient_decode::read_bounded(bytes).unwrap();
+            let disk = ScanIndex::load(&path).unwrap();
+            for decoded in [native, streaming, bounded, disk] {
+                assert!(decoded.decode_holds.is_empty());
+                assert!(decoded.claude_request_census.is_empty());
+                assert_eq!(
+                    serde_json::to_value(&decoded).unwrap(),
+                    expected,
+                    "only the resource-limited census may be discarded"
+                );
+            }
+            let carry =
+                lenient_decode::read_identity_carry(File::open(&path).unwrap(), "claude_code")
+                    .unwrap();
+            assert_eq!(serde_json::to_value(carry).unwrap(), identity_expected);
+        }
+    }
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
 }
