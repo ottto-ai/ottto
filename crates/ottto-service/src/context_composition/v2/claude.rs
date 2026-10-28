@@ -88,7 +88,6 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
     let ts_secs = ts.map(|ts| ts.unix_timestamp());
     state.note_ts(ts_secs);
     let day: Day = ts.map_or(out.fallback_day, |ts| ts.date().to_julian_day());
-    out.stats.undated += u64::from(ts.is_none());
     let line_type = view.kind.str();
     let line_type = line_type.as_deref().unwrap_or("");
 

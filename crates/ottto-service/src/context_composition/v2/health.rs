@@ -57,6 +57,10 @@ pub(super) struct HealthEntry {
     /// Unix seconds: the end of the agent's run (its start until then).
     pub(super) scan_completed_at: i64,
     pub(super) files_checked: u64,
+    /// The backend requires this field. Runs from collectors that include
+    /// the audit's removal (#820) always send 0, meaning "not audited", never
+    /// "audited and equal": it is no evidence of composition equality.
+    /// Pending records from older collectors keep their stored value.
     pub(super) audit_differences: u64,
     pub(super) full_read_waiting_files: u64,
     pub(super) full_read_backlog_bytes: u64,
@@ -91,15 +95,14 @@ impl HealthEntry {
             finished: true,
             scan_completed_at: completed.unix_timestamp(),
             files_checked: stats.files_checked,
-            audit_differences: stats.audit_differences,
+            audit_differences: 0,
             full_read_waiting_files: stats.full_read_waiting_files,
             full_read_backlog_bytes: stats.full_read_backlog_bytes,
             backlog_growth_days: u64::from(backlog_growth_days),
             bytes_read: stats.bytes_new
                 + stats.bytes_repair
                 + stats.bytes_head
-                + stats.bytes_failed
-                + stats.bytes_audit,
+                + stats.bytes_failed,
             // Nearest whole second of the reading thread's own CPU time.
             cpu_seconds: (stats.cpu_micros + 500_000) / 1_000_000,
             duration_ms: stats.wall_micros / 1000,

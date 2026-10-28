@@ -9224,19 +9224,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         ),
     };
     drop(identity_evidence);
-    // E2 grains have served their last consumer: contract 5 and account
-    // qualification now own the final rows. Do not retain or clone the fold
-    // alongside upload entities. A withheld entity still needs its original
-    // fold for the hold; it has no request-owned emitted body.
-    #[cfg(test)]
-    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
-        &scan_result.snapshots,
-    );
-    for item in &mut scan_result.snapshots {
-        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
-            crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
-        }
-    }
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -9299,6 +9286,19 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // stays pending while any RetryPending family remains.
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
+    }
+    // All local consumers (comparison/fallback, finalizer, identity, account
+    // qualification and the optional shadow) have finished. Release native
+    // inputs only for emitted E2 bodies before upload clones/checkpoints.
+    // Held and legacy bodies retain their inputs for their existing owners.
+    #[cfg(test)]
+    crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(
+        &scan_result.snapshots,
+    );
+    for item in &mut scan_result.snapshots {
+        if crate::snapshots::claude_request_money::request_owned_family_root(item).is_some() {
+            crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
+        }
     }
     Ok((disposition, census_withheld, stats))
 }
