@@ -519,9 +519,9 @@ fn c1b_changed_member_after_carry_is_reparsed() {
     assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
 }
 
-/// Condition X(b): the contract-5 record is lost after the red window (a
-/// downgrade, then an upgrade). The retry start latches, nothing is carried,
-/// and every retry re-reads the family exactly as BASE.
+/// Contract-only debt now defers the exactly ACKed family. Admission refusal
+/// still takes BASE's whole re-arm; retain every original read/liveness
+/// assertion in that arm, and separately assert the new no-read arm.
 #[test]
 #[serial(source_manifests)]
 fn c1b_identity_contract_change_keeps_base_rearm() {
@@ -529,21 +529,39 @@ fn c1b_identity_contract_change_keeps_base_rearm() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let forget = |fixture: &RearmFixture| {
-        c1a_edit_index(fixture, |saved| {
-            saved.remove("claude_request_identity_contract");
-            saved.remove("claude_request_identity_contract_changed");
-        });
-    };
-    let fix = c1b_red_chain("c1b-identity-contract", "fix", forget);
-    let base = c1b_base_red_chain("c1b-identity-contract-base", forget);
-    let family = rearm_family_sessions().len();
-    for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(2).take(2) {
-        assert_eq!(window.family_reads, family, "the latch keeps the re-arm");
-        assert_eq!(window.family_reads, base_window.family_reads);
-        assert_eq!(window.start, base_window.start, "the start is BASE's");
+    for refused in [false, true] {
+        let _budget =
+            refused.then(|| crate::snapshots::ClaudeStaleFamilyCarryFundingBudgetForTest::new(0));
+        let forget = |fixture: &RearmFixture| {
+            c1a_edit_index(fixture, |saved| {
+                saved.remove("claude_request_identity_contract");
+                saved.remove("claude_request_identity_contract_changed");
+            });
+        };
+        let fix = c1b_red_chain("c1b-identity-contract", "fix", forget);
+        let base = c1b_base_red_chain("c1b-identity-contract-base", forget);
+        let family = rearm_family_sessions().len();
+        for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(2).take(2) {
+            if refused {
+                assert_eq!(window.family_reads, family, "the latch keeps the re-arm");
+                assert_eq!(window.family_reads, base_window.family_reads);
+                assert_eq!(window.start, base_window.start, "the start is BASE's");
+            } else {
+                assert_eq!(
+                    base_window.family_reads, family,
+                    "BASE still reads every member"
+                );
+                assert_eq!(window.family_reads, 0, "contract-only debt adds no read");
+                assert!(window.fence_after && window.census_invalid);
+                assert!(!window.full_rearm, "no fresh uniqueness proof");
+            }
+        }
+        if refused {
+            assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
+        }
+        assert_eq!(fix.heads_after, base.heads_after);
+        assert_eq!(fix.witness_after, base.witness_after);
     }
-    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
 }
 
 /// A request the provider ledger records for the first subagent from the
@@ -1434,3 +1452,493 @@ fn scoped_unhealthy_retry_beside_a_mark_and_authority_debt_carries_accepted_fami
 }
 
 include!("retry_admission_pipeline_tests.rs");
+
+// Mirror prepare's existing baseline ordering, then use the shared full pipeline
+// and save/reload every synthetic page. No fixture alters acquisition policy.
+fn latch_contract_generation(fixture: &RearmFixture, minute: usize) -> Vec<RearmPage> {
+    source_latch_generation(fixture, minute, RearmUpload::Accept, None).0
+}
+
+fn source_latch_generation(
+    fixture: &RearmFixture,
+    minute: usize,
+    upload: RearmUpload,
+    target: Option<&str>,
+) -> (Vec<RearmPage>, Vec<serde_json::Value>) {
+    let mut pages = Vec::new();
+    let mut diagnostics = Vec::new();
+    for number in 0..C1B_MAX_PAGES {
+        let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+        index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(
+            SnapshotSource::ClaudeCode,
+        ));
+        index.adopt_effective_upload_body_witness_revision_monotonically();
+        index.load_claude_reemission_exclusions(&fixture.support);
+        crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
+        index.observe_claude_request_identity_contract(fixture.request_identity);
+        let (mut page, rows) = crate::local_resource_diagnostics::capture(|| {
+            let fold_diagnostics =
+                crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            let page = fixture.page_with_input_index(
+                &format!("2026-08-02T08:{:02}:00Z", minute + number),
+                upload,
+                target,
+                Some(index),
+            );
+            // Observe the real terminal fold, outside the scanner's nested
+            // scopes, on the existing diagnostic carrier (test harness only).
+            crate::local_resource_diagnostics::claude_reread::emit_without_lease(
+                fold_diagnostics.finish(),
+            );
+            page
+        });
+        diagnostics.extend(rows);
+        page.index.save(&fixture.index_path).unwrap();
+        let ended = c1b_traversal_ended(&page.index).0;
+        let interrupted = !matches!(upload, RearmUpload::Accept)
+            && !page.fully_settled
+            && page.offered.iter().any(|fp| !page.uploaded.contains(fp));
+        pages.push(page);
+        if ended || interrupted {
+            return (pages, diagnostics);
+        }
+    }
+    panic!("bounded fixture ends");
+}
+
+#[test]
+#[serial(source_manifests)]
+fn latch_contract_money_both_arms_preserve_accepted_grown_held_and_listed_bodies() {
+    if !c1a_layout_supported("latch-contract-money") {
+        return;
+    }
+    let _manifests = SourceManifestTestGuard::new();
+    for e2 in [false, true] {
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(e2);
+        let contract = if e2 {
+            crate::snapshots::claude_request_identity::E2_GROUPING
+        } else {
+            crate::snapshots::claude_request_identity::COLLECTOR
+        };
+        crate::snapshots::claude_request_identity::with_cycle_contract_for_test(contract, || {
+            for case in ["accepted", "held", "listed"] {
+                for base in [false, true] {
+                    let _base = base.then(crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new);
+                    let mut fixture = c1a_fixture("e3-latch-contract-money");
+                    fixture.owned_base_preparation = true;
+                    fixture.native_file_limit = 100;
+                    let session = "e7000000-0000-4000-8000-000000000007";
+                    let path = fixture.root.join(format!("{session}.jsonl"));
+                    std::fs::write(
+                        &path,
+                        rearm_transcript_line(session, None, "req_latch_1", 0),
+                    )
+                    .unwrap();
+                    if case == "held" {
+                        fixture.local_holds.insert(session.to_owned());
+                    }
+                    let list = fixture
+                        .support
+                        .join("snapshots/claude_code-reemission-exclusions.txt");
+                    std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+                    let listed = if case == "listed" {
+                        format!("{:x}\n", sha2::Sha256::digest(session.as_bytes()))
+                    } else {
+                        String::new()
+                    };
+                    std::fs::write(list, listed).unwrap();
+                    latch_contract_generation(&fixture, 0);
+                    RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+                    c1a_edit_index(&fixture, |saved| {
+                        for entry in saved["files"].as_object_mut().unwrap().values_mut() {
+                            entry["source_file_fingerprint"] = serde_json::json!("");
+                        }
+                    });
+                    latch_contract_generation(&fixture, 10);
+                    let accepted = fixture.body_trace.borrow().finalizer_bodies[session].clone();
+                    assert_eq!(accepted["input_tokens"], 10, "{case}/{base}/{e2}");
+                    assert_eq!(accepted["output_tokens"], 10);
+                    assert_eq!(accepted["request_count"], 1);
+                    c1a_edit_index(&fixture, |saved| {
+                        saved.insert(
+                            "claude_request_identity_contract_changed".into(),
+                            serde_json::json!(true),
+                        );
+                    });
+                    let retry = latch_contract_generation(&fixture, 20);
+                    let reads = rearm_parsed(&retry).contains(session);
+                    if case == "accepted" {
+                        assert_eq!(reads, base, "exact-ACK unchanged {base}/{e2}");
+                        if !base {
+                            assert_eq!(
+                                fixture.body_trace.borrow().finalizer_bodies[session],
+                                accepted
+                            );
+                        }
+                    } else if case == "held" {
+                        assert!(reads, "held keeps today's path {base}/{e2}");
+                        assert!(retry.iter().all(|page| !page
+                            .uploaded
+                            .contains(accepted["snapshot_fingerprint"].as_str().unwrap())));
+                    } else {
+                        assert_eq!(
+                            fixture.body_trace.borrow().finalizer_bodies[session]["input_tokens"],
+                            10
+                        );
+                        assert_ne!(
+                            fixture.body_trace.borrow().finalizer_bodies[session]
+                                ["usage_accounting_contract"],
+                            crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT
+                        );
+                    }
+                    let saved = c1a_saved(&fixture);
+                    assert_eq!(saved["claude_request_identity_contract_changed"], true);
+                    assert_eq!(saved["claude_duplicate_request_witness_overflowed"], true);
+                    assert!(retry.iter().all(|page| !page.scan.census_complete));
+                    if case == "accepted" {
+                        RearmFixture::append(
+                            &path,
+                            &rearm_transcript_line(session, None, "req_latch_2", 1),
+                        );
+                        let grown = latch_contract_generation(&fixture, 30);
+                        assert!(rearm_parsed(&grown).contains(session));
+                        let body = fixture.body_trace.borrow().finalizer_bodies[session].clone();
+                        let cold = native_comparison_independent_history(&fixture);
+                        let full = latch_contract_generation(&cold, 30);
+                        assert!(rearm_parsed(&full).contains(session));
+                        let expected = cold.body_trace.borrow().finalizer_bodies[session].clone();
+                        assert_eq!(body["input_tokens"], 20);
+                        assert_eq!(body["output_tokens"], 20);
+                        assert_eq!(body["request_count"], 2);
+                        assert_eq!(
+                            body, expected,
+                            "grown accepted body equals cold Full {base}/{e2}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn source_latch_clear_count(rows: &[serde_json::Value]) -> u64 {
+    rows.iter()
+        .filter_map(|row| row["counts"]["identity_contract_latch"]["cleared"].as_u64())
+        .sum()
+}
+
+// SOURCE T1: a genuine Started record must not make a later mid-walk flip
+// eligible for terminal clearing, even when the last page runs under B.
+#[test]
+#[serial(source_manifests)]
+fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    if !c1a_layout_supported("source-t1-started-a-b") {
+        return;
+    }
+    let _manifests = SourceManifestTestGuard::new();
+    let mut fixture = c1a_fixture("source-t1-started-a-b");
+    fixture.owned_base_preparation = true;
+    fixture.request_identity = false;
+    c1a_generation(&fixture, "A", (8, 0));
+    assert_eq!(c1a_latch(&fixture), (Some(String::new()), false));
+    let mut ended = false;
+    for number in 0..C1A_MAX_PAGES {
+        fixture.request_identity = number != 0;
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+        let page = fixture.page(
+            &format!("2026-08-02T08:{:02}:00Z", 10 + number),
+            RearmUpload::Accept,
+        );
+        let counts = diagnostics.finish().contract;
+        ended = !page.index.scan_traversal_in_progress_for_test();
+        if number == 0 {
+            assert!(!ended, "B must arrive inside the Started A traversal");
+            assert_eq!(c1a_latch(&fixture), (Some(String::new()), false));
+        } else {
+            assert_eq!(
+                c1a_latch(&fixture),
+                (Some(C1A_MID_TRAVERSAL.to_owned()), true)
+            );
+            assert_eq!(
+                serde_json::to_value(&page.index).unwrap()
+                    ["claude_request_identity_contract_changed"],
+                true,
+                "the durable save retains the latch"
+            );
+        }
+        if ended {
+            assert!(page.scan.census_complete && page.fully_settled);
+            assert!(page.duplicate_census.fence_before && page.duplicate_census.fence_after);
+            assert_eq!(
+                counts.identity_contract_latch.cleared, 0,
+                "the real fold cannot clear, independently of partial-save OR"
+            );
+            break;
+        }
+    }
+    assert!(ended, "the B terminal was actually exercised");
+    assert_eq!(
+        c1a_latch(&fixture),
+        (Some(C1A_MID_TRAVERSAL.to_owned()), true)
+    );
+}
+
+// SOURCE T2: finish the invariant/current-contract G first while F remains
+// owed. The next debt retry carries G, but must read and ACK F's new body.
+#[test]
+#[serial(source_manifests)]
+fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
+    if !c1a_layout_supported("source-t2-owed-f-invariant-g") {
+        return;
+    }
+    let _manifests = SourceManifestTestGuard::new();
+    for (upload, keep_held) in [
+        (RearmUpload::Accept, false),
+        (RearmUpload::AckLost, false),
+        (RearmUpload::Accept, true),
+    ] {
+        let mut fixture = c1a_fixture("source-t2-owed-f-invariant-g");
+        fixture.owned_base_preparation = true;
+        fixture.native_file_limit = 2;
+        c1a_add_family_request_identity(&fixture);
+        {
+            let _a = crate::snapshots::claude_request_money::e2::GateForTest::off();
+            crate::snapshots::claude_request_identity::with_cycle_contract_for_test(
+                crate::snapshots::claude_request_identity::COLLECTOR,
+                || {
+                    latch_contract_generation(&fixture, 0);
+                    latch_contract_generation(&fixture, 10);
+                },
+            );
+        }
+        let old_f = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
+        // Keep the migration traversal red so G's accepted pending remains
+        // available for the next start; only this unrelated file is repaired.
+        RearmFixture::append(&c1b_terminal_path(&fixture), "not-json\n");
+        let _b = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+        crate::snapshots::claude_request_identity::with_cycle_contract_for_test(
+            crate::snapshots::claude_request_identity::E2_GROUPING,
+            || {
+                fixture.local_holds.insert(REARM_ROOT.to_owned());
+                let migrated = latch_contract_generation(&fixture, 20);
+                assert!(c1a_latch(&fixture).1, "F is still owed after A -> B");
+                let saved = c1a_saved(&fixture);
+                let f_key = fixture.member_path(None).to_string_lossy().into_owned();
+                let g_key = c1b_sibling_path(&fixture).to_string_lossy().into_owned();
+                assert_eq!(
+                    saved["files"][&f_key]["effective_upload_body_witness_revision"],
+                    2
+                );
+                assert_eq!(
+                    saved["files"][&g_key]["effective_upload_body_witness_revision"],
+                    3
+                );
+                let invariant_g =
+                    fixture.body_trace.borrow().finalizer_bodies[REARM_SIBLING].clone();
+                let g_fp = invariant_g["snapshot_fingerprint"].as_str().unwrap();
+                assert!(saved["claude_request_census"].get(&g_key).is_some());
+                assert!(migrated.iter().any(|page| page.uploaded.contains(g_fp)));
+                // An id-less companion settles its own revision but cannot
+                // carry under contract debt: G must be the only such family.
+                std::fs::write(
+                    c1b_terminal_path(&fixture),
+                    serde_json::json!({
+                        "timestamp":"2026-08-02T07:00:00Z", "type":"assistant",
+                        "sessionId":REARM_TERMINAL,
+                        "message":{"model":"claude-haiku-4-5",
+                            "usage":{"input_tokens":10,"output_tokens":10}},
+                    })
+                    .to_string()
+                        + "\n",
+                )
+                .unwrap();
+                // The repaired terminal also owes B's revision. Its fold
+                // runs BEFORE its ACK stamps revision 3, so settle it while
+                // F is still held: the target retry must owe only F, rather
+                // than correctly retain the latch for this unrelated file.
+                // Keep this warm-up incomplete: a complete fold retires G's
+                // stale pending (:9924), which the target retry must carry.
+                let invalid_path = c1a_invalid_path(&fixture);
+                let invalid_body = std::fs::read(&invalid_path).unwrap();
+                RearmFixture::append(&invalid_path, "not-json\n");
+                let (prepared, prepared_rows) =
+                    source_latch_generation(&fixture, 25, RearmUpload::Accept, None);
+                assert!(!prepared.last().unwrap().scan.census_complete);
+                assert!(!rearm_parsed(&prepared).contains(REARM_SIBLING));
+                assert!(c1a_latch(&fixture).1, "held F still forbids clearing");
+                assert_eq!(source_latch_clear_count(&prepared_rows), 0);
+                let prepared_index = c1a_saved(&fixture);
+                assert_eq!(
+                    prepared_index["files"][&f_key]["effective_upload_body_witness_revision"],
+                    2
+                );
+                assert!(prepared_index["claude_usage_family_pending"]
+                    .get(REARM_SIBLING)
+                    .is_some());
+                assert_eq!(
+                    prepared_index["claude_usage_family_pending"][REARM_TERMINAL]["invalid"], true,
+                    "the paid companion must remain ineligible for contract-debt carry"
+                );
+                for path in [c1a_invalid_path(&fixture), c1b_terminal_path(&fixture)] {
+                    assert_eq!(
+                        prepared_index["files"][path.to_string_lossy().as_ref()]
+                            ["effective_upload_body_witness_revision"],
+                        3
+                    );
+                }
+                for (key, entry) in prepared_index["files"].as_object().unwrap() {
+                    assert_eq!(
+                        entry["effective_upload_body_witness_revision"],
+                        if key == &f_key { 2 } else { 3 },
+                        "only F may remain owed before the target retry"
+                    );
+                }
+                assert_eq!(
+                    prepared_index["claude_request_census"].get(&g_key),
+                    saved["claude_request_census"].get(&g_key),
+                    "preparing the unrelated terminal gives G no new credit"
+                );
+                std::fs::write(invalid_path, invalid_body).unwrap();
+                if !keep_held {
+                    fixture.local_holds.clear();
+                } else {
+                    // An earlier-page hold withholds the effective census
+                    // (:30247). Put the held probe on one page so its fold
+                    // actually reaches the owed-revision terminal veto.
+                    fixture.native_file_limit = 64;
+                }
+                let (retry, rows) = source_latch_generation(&fixture, 30, upload, Some(REARM_ROOT));
+                let carried = rows
+                    .iter()
+                    .filter(|row| {
+                        row["stage"] == "bounded_traversal_transition"
+                            && row["counts"]["event"] == "starting"
+                    })
+                    .map(|row| {
+                        row["counts"]["carried_pending_families"]
+                            .as_u64()
+                            .unwrap_or(0)
+                    })
+                    .sum::<u64>();
+                assert_eq!(carried, 1, "only invariant G can be carried");
+                assert!(
+                    !rearm_parsed(&retry).contains(REARM_SIBLING),
+                    "G adds no read"
+                );
+                assert!(
+                    rearm_parsed(&retry).contains(REARM_ROOT),
+                    "owed F cannot carry"
+                );
+                let new_f = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
+                let f_fp = new_f["snapshot_fingerprint"].as_str().unwrap();
+                if !keep_held {
+                    assert_ne!(new_f["snapshot_fingerprint"], old_f["snapshot_fingerprint"]);
+                }
+                assert_eq!(
+                    fixture.body_trace.borrow().finalizer_bodies[REARM_SIBLING],
+                    invariant_g
+                );
+                if !keep_held {
+                    assert!(
+                        retry.iter().any(|page| page.offered.contains(f_fp)),
+                        "F re-emits"
+                    );
+                }
+                assert!(retry.iter().all(|page| page.duplicate_census.fence_after));
+                assert!(retry.iter().all(|page| !page.duplicate_census.full_rearm));
+                assert!(
+                    !retry.last().unwrap().transcript_ownership_complete,
+                    "G supplies no current-contract ownership/projection completeness"
+                );
+                let mut acked_f = false;
+                for page in &retry {
+                    acked_f |= page.uploaded.contains(f_fp);
+                    let state = serde_json::to_value(&page.index).unwrap();
+                    if !acked_f {
+                        assert_eq!(state["claude_request_identity_contract_changed"], true);
+                    }
+                    // G's retained accepted body is never current-window
+                    // request projection or fence/uniqueness evidence.
+                    let record = state["claude_request_census"]
+                        .get(&g_key)
+                        .expect("G keeps its old census record");
+                    assert_eq!(record, saved["claude_request_census"].get(&g_key).unwrap());
+                }
+                if keep_held {
+                    let terminal = retry.last().unwrap();
+                    assert!(
+                        terminal.scan.census_complete,
+                        "exercise a real terminal clear decision"
+                    );
+                    assert!(!terminal.fully_settled);
+                    assert!(!terminal.duplicate_census.coverage_complete);
+                    assert!(!acked_f);
+                    assert!(c1a_latch(&fixture).1);
+                    let held = c1a_saved(&fixture);
+                    assert_eq!(
+                        held["files"][&f_key]["effective_upload_body_witness_revision"],
+                        2
+                    );
+                    // snapshots.rs:9730 (e2_identity_owed) vetoes; :9722
+                    // adds a veto when an earlier page recorded F's hold.
+                    let cleared = source_latch_clear_count(&rows);
+                    assert_eq!(cleared, 0, "partial-save OR cannot mask an in-memory clear");
+                    fixture.local_holds.clear();
+                    // F's ACK must precede the terminal fold, which checks
+                    // owed revisions before this page's upload can stamp.
+                    fixture.native_file_limit = 1;
+                    let (accepted, release_rows) =
+                        source_latch_generation(&fixture, 40, RearmUpload::Accept, None);
+                    assert!(!accepted.first().unwrap().scan.census_complete);
+                    assert!(accepted.last().unwrap().scan.census_complete);
+                    assert_eq!(
+                        source_latch_clear_count(&release_rows),
+                        1,
+                        "positive control: the real fold clear is observable"
+                    );
+                    let body = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
+                    let fp = body["snapshot_fingerprint"].as_str().unwrap();
+                    assert_ne!(body["snapshot_fingerprint"], old_f["snapshot_fingerprint"]);
+                    assert!(accepted.first().unwrap().uploaded.contains(fp));
+                    assert!(accepted.iter().any(|page| page.uploaded.contains(fp)));
+                    assert!(
+                        !c1a_latch(&fixture).1,
+                        "clear only after the release's exact ACK"
+                    );
+                    assert_eq!(
+                        c1a_saved(&fixture)["files"][&f_key]
+                            ["effective_upload_body_witness_revision"],
+                        3
+                    );
+                    return;
+                }
+                match upload {
+                    RearmUpload::Accept => {
+                        assert!(acked_f);
+                        assert!(!c1a_latch(&fixture).1, "clear follows F's exact ACK");
+                        let accepted = c1a_saved(&fixture);
+                        assert_eq!(
+                            accepted["files"][&f_key]["effective_upload_body_witness_revision"],
+                            3
+                        );
+                        assert_eq!(
+                            accepted["claude_request_identity_contract"],
+                            crate::snapshots::claude_request_identity::E2_GROUPING
+                        );
+                    }
+                    RearmUpload::AckLost => {
+                        assert!(!acked_f);
+                        assert!(c1a_latch(&fixture).1, "partial save preserves owed F");
+                        let saved = c1a_saved(&fixture);
+                        assert_eq!(
+                            saved["files"][&f_key]["effective_upload_body_witness_revision"],
+                            2
+                        );
+                    }
+                    RearmUpload::Shed => unreachable!(),
+                }
+            },
+        );
+    }
+}
