@@ -1799,7 +1799,7 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
     // P2 review: preserve size/mtime while replacing the object. The healthy
     // production exit must still invalidate stale request-hash authority.
     let mut index = index;
-    assert!(index.claude_request_census.contains_key(&key));
+    assert!(index.claude_request_census.get(&key).is_some());
     let replacement = held.with_extension("replacement");
     let bytes = std::fs::read(&held).unwrap();
     std::fs::write(&replacement, &bytes[..accepted.size_bytes as usize]).unwrap();
@@ -1834,7 +1834,7 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
         &candidate,
         &mut census,
     );
-    assert!(!index.claude_request_census.contains_key(&key));
+    assert!(index.claude_request_census.get(&key).is_none());
     assert_eq!(census.unreadable_path_count, 0);
     let mut restarted = DurableTailStore::new(disk.dir().to_path_buf(), DurableSource::ClaudeCode);
     assert_eq!(restarted.full_hold(&digest, true), None);
