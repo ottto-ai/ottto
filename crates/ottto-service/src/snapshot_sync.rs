@@ -9039,10 +9039,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.exact_request_set_root_count += 1;
         } else {
             stats.request_set_mismatch_root_count += 1;
-            index.note_claude_ignored_rearm_veto(
-                &scan_result.census_window_end,
-                crate::local_resource_diagnostics::claude_reread::IgnoredVeto::EvidenceGap.bit(),
-            );
             stats.api_only_request_count += api_request_ids.difference(&trace_request_ids).count();
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
@@ -9055,6 +9051,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_evidence_row_count += rows.len();
             trace_report.evidence.insert(root_session_id, rows);
         }
+    }
+    if stats.request_set_mismatch_root_count > 0 {
+        index.note_claude_ignored_rearm_veto(
+            &scan_result.census_window_end,
+            crate::local_resource_diagnostics::claude_reread::IgnoredVeto::EvidenceGap.bit(),
+        );
     }
     // E2 side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(

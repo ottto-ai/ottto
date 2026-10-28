@@ -9794,9 +9794,6 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 == Some(claude_request_identity::cycle_contract(identity.is_some()))
             && !index.claude_full_rearm_progress.other_invalidation_observed;
         let full_rearm = full_rearm_due && !full_rearm_suppressed && !post_rebuild_skipped;
-        if full_rearm_due && stays_closed && native_duplicate_veto {
-            crate::local_resource_diagnostics::claude_reread::structural_native_duplicate();
-        }
         if !index.claude_duplicate_request_witness_overflowed {
             index.claude_duplicate_fence_rearm_attempt = 0;
             index.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
@@ -10111,12 +10108,15 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             }
             preserved += u64::from(!rearmed && !entry.source_file_fingerprint.is_empty());
         }
-        if full_rearm_suppressed || post_rebuild_skipped {
-            crate::local_resource_diagnostics::claude_reread::ignored_vetoes(
-                index.claude_full_rearm_progress.ignored_vetoes,
-                preserved,
-            );
-        }
+        crate::local_resource_diagnostics::claude_reread::terminal_rearm(
+            if full_rearm_suppressed || post_rebuild_skipped {
+                index.claude_full_rearm_progress.ignored_vetoes
+            } else {
+                0
+            },
+            preserved,
+            full_rearm_due && stays_closed && native_duplicate_veto,
+        );
         // Spent only where the latch's re-arm causes ran (a closed fence).
         if cutover_terminal && fence_stays_closed {
             index.claude_full_rearm_progress.contract_cutover = CLAUDE_CONTRACT_CUTOVER_SPENT;

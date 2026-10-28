@@ -545,6 +545,15 @@ activate this native veto. Strict loader/read-health failures remain retryable e
 semantic reducer. No extra reader, output stream or persisted diagnostic state
 is introduced.
 
+The three terminal scheduling fields (`rearm_veto_ignored`,
+`rearm_fingerprints_preserved`, `rearm_structural_native_duplicate`) are emitted
+only on the existing `native_collection_page` carrier. The fold follows scan
+collection, so a terminal with nonzero scheduling counts emits an additional
+row with `scanned_files: 0` and `semantic_noops: 0`. This row reports only the
+terminal delta; it does not drain identity, money or record-cap observations.
+The comparison carrier omits these fields to avoid counting them twice. Sum
+counters rather than treating diagnostic row count as a page/file count.
+
 `claude_reread` contains these closed keys:
 
 - `restored_empty_held`, `restored_nonempty_held`, `restored_empty_sibling`,

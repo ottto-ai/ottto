@@ -114,6 +114,22 @@ pub(crate) fn structural_native_duplicate() {
     });
 }
 
+/// The terminal fold follows collection. Publish its delta on the same #799
+/// page carrier, then retain it for scoped inspection (not comparison output).
+pub(crate) fn terminal_rearm(mask: u16, preserved: u64, native_duplicate: bool) {
+    if mask == 0 && !native_duplicate {
+        return;
+    }
+    let scope = Scope::begin(true);
+    ignored_vetoes(mask, preserved);
+    if native_duplicate {
+        structural_native_duplicate();
+    }
+    let counts = scope.finish();
+    update(|page| page.merge(counts));
+    super::rearm_collection(counts);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Rearm {
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -260,6 +276,12 @@ impl Counts {
         self.retained_cache_page_events
             .merge(other.retained_cache_page_events);
     }
+    pub(super) fn without_terminal_rearm(mut self) -> Self {
+        self.rearm_veto_ignored = Default::default();
+        self.rearm_fingerprints_preserved = 0;
+        self.rearm_structural_native_duplicate = 0;
+        self
+    }
     pub(crate) fn with_current(mut self) -> Self {
         CURRENT.with(|current| {
             if let Some(counts) = current.get() {
@@ -309,6 +331,7 @@ impl Drop for Scope {
     }
 }
 pub(crate) fn emit_without_lease(counts: Counts) {
+    let counts = counts.without_terminal_rearm();
     if counts != Counts::default() {
         // The disabled-before-lease point has already reported the gate.
         // Reuse its stage at the end of work only when there are actual events.
