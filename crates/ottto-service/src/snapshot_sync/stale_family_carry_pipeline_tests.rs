@@ -1739,9 +1739,6 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 let g_fp = invariant_g["snapshot_fingerprint"].as_str().unwrap();
                 assert!(saved["claude_request_census"].get(&g_key).is_some());
                 assert!(migrated.iter().any(|page| page.uploaded.contains(g_fp)));
-                if !keep_held {
-                    fixture.local_holds.clear();
-                }
                 std::fs::write(
                     c1b_terminal_path(&fixture),
                     rearm_transcript_line(
@@ -1752,6 +1749,32 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                     ),
                 )
                 .unwrap();
+                // The repaired terminal also owes B's revision. Its fold
+                // runs BEFORE its ACK stamps revision 3, so settle it while
+                // F is still held: the target retry must owe only F, rather
+                // than correctly retain the latch for this unrelated file.
+                let (prepared, prepared_rows) =
+                    source_latch_generation(&fixture, 25, RearmUpload::Accept, None);
+                assert!(prepared.last().unwrap().scan.census_complete);
+                assert!(!rearm_parsed(&prepared).contains(REARM_SIBLING));
+                assert!(c1a_latch(&fixture).1, "held F still forbids clearing");
+                assert_eq!(source_latch_clear_count(&prepared_rows), 0);
+                let prepared_index = c1a_saved(&fixture);
+                for (key, entry) in prepared_index["files"].as_object().unwrap() {
+                    assert_eq!(
+                        entry["effective_upload_body_witness_revision"],
+                        if key == &f_key { 2 } else { 3 },
+                        "only F may remain owed before the target retry"
+                    );
+                }
+                assert_eq!(
+                    prepared_index["claude_request_census"].get(&g_key),
+                    saved["claude_request_census"].get(&g_key),
+                    "preparing the unrelated terminal gives G no new credit"
+                );
+                if !keep_held {
+                    fixture.local_holds.clear();
+                }
                 let (retry, rows) = source_latch_generation(&fixture, 30, upload, Some(REARM_ROOT));
                 let carried = rows
                     .iter()
