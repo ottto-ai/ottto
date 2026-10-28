@@ -46,9 +46,10 @@ pub(super) const CODEX_UNSET: &[&str] = &[
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
     // Codex 0.150 auth/manager.rs: ambient PAT/agent identity wins over
-    // persisted home auth; refresh overrides must not redirect that credential.
+    // persisted home auth; refresh/revoke overrides must not redirect that credential.
     "CODEX_ACCESS_TOKEN",
     "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+    "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
     "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
     "OPENAI_BASE_URL",
     "OPENAI_ORG_ID",

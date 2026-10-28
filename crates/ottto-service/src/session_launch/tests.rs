@@ -578,6 +578,7 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     let ambient_keys = [
         "CODEX_ACCESS_TOKEN",
         "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+        "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
         "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
     ];
     for key in ambient_keys {
@@ -613,7 +614,7 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     let quoted = quote_launch_executable(witness.to_str().unwrap()).unwrap();
     let cli = bin.join("codex");
     let write_cli = |version: &str| {
-        fs::write(&cli, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted}\n[ \"$1\" = --version ] || exit 99\ntest -z \"${{CODEX_ACCESS_TOKEN+x}}${{CODEX_REFRESH_TOKEN_URL_OVERRIDE+x}}${{CODEX_APP_SERVER_LOGIN_CLIENT_ID+x}}\" || exit 97\nprintf 'codex-cli {version}\\n'\n")).unwrap();
+        fs::write(&cli, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {quoted}\n[ \"$1\" = --version ] || exit 99\ntest -z \"${{CODEX_ACCESS_TOKEN+x}}${{CODEX_REFRESH_TOKEN_URL_OVERRIDE+x}}${{CODEX_REVOKE_TOKEN_URL_OVERRIDE+x}}${{CODEX_APP_SERVER_LOGIN_CLIENT_ID+x}}\" || exit 97\nprintf 'codex-cli {version}\\n'\n")).unwrap();
         fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
     };
     write_cli("0.170.0");
