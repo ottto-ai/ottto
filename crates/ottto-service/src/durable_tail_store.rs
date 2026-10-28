@@ -663,7 +663,8 @@ impl DurableTailStore {
         }
         let bytes = match read_private(&self.record_path(key)) {
             Ok(Some(bytes)) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            Ok(None) => return ReadOutcome::Missing,
+            Err(e) if e.kind() != io::ErrorKind::InvalidData => {
                 self.disable("record_access");
                 return ReadOutcome::Missing;
             }
@@ -1069,6 +1070,14 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 /// `Ok(None)` when absent. Refuses a non-regular file, a file readable by
 /// group or others, and a file over the record bound.
 fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    #[cfg(test)]
+    if let Err(error) = test_hooks::before_access(path, "restore_open") {
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -1078,6 +1087,8 @@ fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    #[cfg(test)]
+    test_hooks::before_access(path, "restore_metadata")?;
     let metadata = file.metadata()?;
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(io::Error::new(

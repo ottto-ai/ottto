@@ -1951,3 +1951,39 @@ fn process_rebuild_history_overflow_disables_without_forgetting_an_attempt() {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
 }
+
+#[test]
+fn restore_read_access_failure_disables_but_disappearance_is_absence() {
+    for arm in ["permission", "metadata", "missing"] {
+        let _reset = ResetFaults;
+        let scratch = Scratch::new();
+        let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+        let transcript = scratch.transcript("t.jsonl", b"{}\n");
+        let b = binding("acct", "scope", ("fp", None));
+        let mut store = scratch.store();
+        store
+            .write_after_save(
+                &lock,
+                1,
+                vec![pending(b.clone(), certificate(&transcript), 1)],
+            )
+            .unwrap();
+        let path = record_file(&store, &b.key);
+        let before = fs::read(&path).unwrap();
+        test_hooks::set_before_access(Some(Box::new(move |_, op| match (arm, op) {
+            ("permission", "restore_open") => Err(io::ErrorKind::PermissionDenied.into()),
+            ("metadata", "restore_metadata") => Err(io::ErrorKind::Other.into()),
+            ("missing", "restore_open") => Err(io::ErrorKind::NotFound.into()),
+            _ => Ok(()),
+        })));
+        let mut cold = scratch.store();
+        assert_eq!(
+            cold.read(&b.key, &placeholder_allowlist()),
+            ReadOutcome::Missing
+        );
+        assert_eq!(cold.disabled().is_some(), arm != "missing");
+        assert_eq!(cold.counters().format_hold, [0; 5]);
+        assert_eq!(cold.counters().t14_rebuild, 0);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
