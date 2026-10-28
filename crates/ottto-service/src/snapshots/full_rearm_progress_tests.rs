@@ -1147,54 +1147,47 @@ fn always_on_terminal(
     (rearm.reread(index, &disposition), parent, state)
 }
 
-/// The family root's paired sidecars. Without identity: `req_1` only, a dark
-/// row with its account unchecked. With identity: every parent request, each
-/// account-checked with complete request identity (login and organization),
-/// so the legacy account path binds the session rather than withholding it
-/// for incomplete request evidence.
-fn write_parent_sidecars(rearm: &Rearm, support: &Path, identity: bool) {
-    let requests: &[&str] = if identity {
-        &["req_1", "req_2", "req_3", "req_4"]
-    } else {
-        &["req_1"]
-    };
-    let mut api_rows = Vec::new();
-    let mut trace_rows = Vec::new();
-    for (sequence, request) in requests.iter().enumerate() {
-        let mut api = complete_api_row(&rearm.parent, request, sequence as u64, 10, 10, 0);
-        if identity {
-            api.request_identity = Some(
-                serde_json::from_value(serde_json::json!({
-                    "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
-                    "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":"a".repeat(64)},
-                    "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":"d".repeat(64)},
-                }))
-                .unwrap(),
-            );
-        } else {
-            api.account_identity_checked = false;
-            api.account_identifier_hash = None;
-        }
-        api.fingerprint.clear();
-        api.fingerprint = format!(
-            "sha256:{:x}",
-            Sha256::digest(serde_json::to_vec(&api).unwrap())
+/// The family root's paired sidecars for `req_1`: a dark row, or one with
+/// complete request identity (login and organization). `account_checked`
+/// keeps the legacy account check on the row; covering one of the parent's
+/// four requests, it withholds the session account for incomplete request
+/// evidence. Unchecked, the account stays unknown and contract 5 tags it.
+fn write_parent_sidecars(rearm: &Rearm, support: &Path, identity: bool, account_checked: bool) {
+    let mut api = complete_api_row(&rearm.parent, "req_1", 0, 10, 10, 0);
+    if identity {
+        api.request_identity = Some(
+            serde_json::from_value(serde_json::json!({
+                "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
+                "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":"a".repeat(64)},
+                "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":"d".repeat(64)},
+            }))
+            .unwrap(),
         );
-        api_rows.push(serde_json::to_string(&api).unwrap());
-        trace_rows
-            .push(serde_json::to_string(&complete_trace_row(&rearm.parent, request, "")).unwrap());
     }
+    if !account_checked {
+        api.account_identity_checked = false;
+        api.account_identifier_hash = None;
+    }
+    api.fingerprint.clear();
+    api.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&api).unwrap())
+    );
+    let trace = complete_trace_row(&rearm.parent, "req_1", "");
     let digest = format!("{:x}", Sha256::digest(rearm.parent.as_bytes()));
-    for (kind, rows) in [
-        ("claude-code-effort", api_rows),
-        ("claude-code-trace-ownership", trace_rows),
+    for (kind, row) in [
+        ("claude-code-effort", serde_json::to_string(&api).unwrap()),
+        (
+            "claude-code-trace-ownership",
+            serde_json::to_string(&trace).unwrap(),
+        ),
     ] {
         let path = support
             .join("local-otel")
             .join(kind)
             .join(format!("{digest}.jsonl"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, format!("{}\n", rows.join("\n"))).unwrap();
+        fs::write(path, format!("{row}\n")).unwrap();
     }
 }
 
@@ -1248,7 +1241,7 @@ fn always_on_terminals_keep_the_structural_suppression() {
                 let rearm = Rearm::new();
                 let support = temp_dir("full-rearm-always-on");
                 if cause != "absent" {
-                    write_parent_sidecars(&rearm, &support, cause == "matched-identity");
+                    write_parent_sidecars(&rearm, &support, cause == "matched-identity", false);
                 }
                 let mut index = rearm.index();
                 index.claude_request_identity_contract = Some(contract.to_string());
@@ -1311,6 +1304,54 @@ fn always_on_terminals_keep_the_structural_suppression() {
             }
         });
     }
+}
+
+/// Control for the structural suppression (Lead B condition D): a family
+/// whose one telemetry row is account-checked, covering one of the parent's
+/// four requests, withholds the session account for incomplete request
+/// evidence (legacy account path). That non-structural veto keeps every due
+/// terminal re-arming. It does not depend on the contract: the always-on
+/// build (tagged contract-5 body) and a pre-cutover build without evidence
+/// re-arm the same terminals.
+#[test]
+fn a_withheld_account_rearms_the_same_before_and_after_the_cutover() {
+    claude_request_identity::with_cycle_contract_for_test(
+        claude_request_identity::E2_GROUPING,
+        || {
+            let runs = [false, true].map(|always_on| {
+                let rearm = Rearm::new();
+                let support = temp_dir("full-rearm-withheld-account");
+                write_parent_sidecars(&rearm, &support, true, true);
+                let mut index = rearm.index();
+                let _pre_cutover =
+                    (!always_on).then(claude_request_identity::PreCutoverEvidenceForTest::enter);
+                index.claude_request_identity_contract =
+                    Some(claude_request_identity::cycle_contract(always_on).to_string());
+                let runs = (0..3)
+                    .map(|_| {
+                        let (run, parent, state) = always_on_terminal(&rearm, &support, &mut index);
+                        assert!(
+                            parent.claude_account_withheld_reason.is_some(),
+                            "always_on={always_on}: {state}"
+                        );
+                        (
+                            run.counts.full_rearm,
+                            run.suppression.full_rearm_suppressed,
+                            run.rearmed_files,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let _ = fs::remove_dir_all(support);
+                runs
+            });
+            assert_eq!(runs[0], runs[1], "the cutover adds no re-arm");
+            assert_eq!(
+                runs[1],
+                vec![(true, false, 2); 3],
+                "a liveness re-arm at each due terminal"
+            );
+        },
+    );
 }
 
 /// Lead B condition D: a real contract change re-arms once. A never-permitted
