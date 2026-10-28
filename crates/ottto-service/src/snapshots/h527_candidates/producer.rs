@@ -2371,6 +2371,7 @@ fn scan_peer_file(
     let mut copies = Vec::new();
     let mut lineage_owner_bound = false;
     let mut replica_responses: Option<SnapshotAccumulator> = None;
+    let mut idless_before_owner = false;
     loop {
         line.clear();
         let read = (&mut reader)
@@ -2488,6 +2489,9 @@ fn scan_peer_file(
         let Some(request_id) = line_request_id(&value) else {
             if counted_usage && provenance == ClaudeForkLineProvenance::None {
                 scan.unidentified_usage_line_count += 1;
+                if owner.is_none() {
+                    idless_before_owner = true;
+                }
                 if owner_index.is_some() {
                     // Buffer only the few owned id-less replica responses with
                     // the ordinary response resolver. Progressive physical rows
@@ -2585,6 +2589,16 @@ fn scan_peer_file(
         scan.grown_during_read_count += 1;
     }
     let holder_session = subagent_session.or(file_session);
+    if idless_before_owner {
+        if let Some(owner) = holder_session
+            .as_ref()
+            .and_then(|owner| session_index.get(owner.as_str()))
+        {
+            // Existing owner refusal, without buffering an unknown owner's
+            // transcript. Late ownership cannot erase earlier usage evidence.
+            scan.replica_divergent_ids[*owner].insert("idless-before-owner".into());
+        }
+    }
     if let Some((owner, responses)) = holder_session
         .as_ref()
         .and_then(|owner| session_index.get(owner.as_str()))

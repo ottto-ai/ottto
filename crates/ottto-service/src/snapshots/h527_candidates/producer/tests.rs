@@ -1541,3 +1541,33 @@ fn source_r4_native_only_corpus_does_no_tuple_hashing() {
     assert_eq!(TUPLE_HASH_COUNT_TEST.with(std::cell::Cell::get), 0);
     fs::remove_dir_all(fixture.root).unwrap();
 }
+
+#[test]
+fn source_r4_idless_before_replica_owner_holds_late_owner() {
+    let fixture = fixture();
+    let target = &fixture.input.targets[17];
+    let mut early = assistant_line(
+        &target.source_session_id,
+        5,
+        ("pre-owner-extra", 123, 7, 456),
+    );
+    early.as_object_mut().unwrap().remove("requestId");
+    early.as_object_mut().unwrap().remove("sessionId");
+    let mut lines = vec![early];
+    lines.extend(transcript_lines(
+        &target.source_session_id,
+        &[("req-t18-a", 25, 2, 100)],
+    ));
+    write_lines(
+        &fixture.input.peer_roots[1]
+            .path
+            .join("replica")
+            .join(format!("{}.jsonl", session_id(18))),
+        &lines,
+    );
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    assert_eq!(target_report(&artifact, 18)["held_reason"], "unknown_owner");
+    assert!(target_report(&artifact, 18).get("body").is_none());
+    fs::remove_dir_all(fixture.root).unwrap();
+}

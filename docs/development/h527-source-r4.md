@@ -66,7 +66,7 @@ are retained. A v2-only consumer must refuse v3 until deliberately updated.
 Changes the consumer must understand:
 
 - Manifest counters: `vanished_census_used`, `vanished_no_census` and optional
-  `census_snapshot { generation, sha256 }`.
+  `census_snapshot { generation, sha256 }` and `vanished_census_limit`.
 - Peer rows may carry vanished classification instead of content bytes/hash.
   Census witnesses have `peer_line_count: null` and
   `evidence_basis: vanished_census_used`; no transcript-line count is fabricated.
@@ -104,6 +104,11 @@ owner; identical progressive replicas keep the owner's count. A native-to-idless
 identity change conservatively holds the owner. Only owned id-less replica
 responses are buffered, bounded by the existing ordinary response-record cap.
 
-Tuple membership indexes are built once from the already-resolved targets. A
-native-only target corpus performs no tuple hashes; per-peer matching uses
+Tuple membership indexes are built once from the already-resolved targets. An entirely
+native-ID-only corpus performs no tuple hashes; per-peer matching uses
 indexed lookups and never re-hashes a target's full native occurrence collection.
+
+Id-less usage before the peer's first observed owner is remembered as a boolean
+uncertainty. If the file later identifies as a target replica, the existing
+UnknownOwner gate holds that target; no pre-owner response buffer or extra read
+is added.
