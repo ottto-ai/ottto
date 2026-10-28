@@ -99,7 +99,8 @@ impl FileStamp {
 
 /// LD: an opened object's RAM-only identity, never a path, persisted field or
 /// proof authority. A reused inode can alias an old entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Ordering is for deterministic tie-breaks only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct FileObject {
     dev: u64,
     ino: u64,

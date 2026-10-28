@@ -445,6 +445,8 @@ fn unplanned_claude_read_delivers_all_lines_from_zero_and_counts_them() {
         object: FileObject::of(&fs::File::open(&path).unwrap()).unwrap().0,
         mtime: held.modified().ok(),
         mode: DeliveryMode::Full,
+        root: Some(0),
+        start: 0,
     })];
     let values = [Some(first), None, None, None, Some(inherited)];
     expected.extend(values.into_iter().map(Event::Line));
@@ -590,7 +592,7 @@ fn side_read_calls_no_observer() {
     scan.line_delivery
         .as_mut()
         .unwrap()
-        .begin_armed(scan.active_file.as_deref().unwrap());
+        .begin_armed(scan.active_file.as_deref().unwrap(), &scan.roots);
     let active = scan.active_file.as_deref_mut().unwrap();
     active.side_origin.take().unwrap().end();
     finish(scan);

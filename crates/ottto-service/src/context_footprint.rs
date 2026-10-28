@@ -2550,6 +2550,7 @@ mod tests {
                 observer.line(
                     &view,
                     &PhysicalLine {
+                        end: 0,
                         value: value.as_ref(),
                     },
                 );
@@ -2562,6 +2563,8 @@ mod tests {
         let (object, _) = FileObject::of(&File::open(path).unwrap()).unwrap();
         FileView {
             source: SnapshotSource::ClaudeCode,
+            root: Some(0),
+            start: 0,
             object,
             mtime: Some(mtime),
             mode,
@@ -2911,9 +2914,21 @@ mod tests {
         let want = observer.begin(view);
         if want == Want::Lines {
             for value in lines {
-                observer.line(view, &PhysicalLine { value: Some(value) });
+                observer.line(
+                    view,
+                    &PhysicalLine {
+                        end: 0,
+                        value: Some(value),
+                    },
+                );
             }
-            observer.line(view, &PhysicalLine { value: None });
+            observer.line(
+                view,
+                &PhysicalLine {
+                    end: 0,
+                    value: None,
+                },
+            );
         }
         observer.end(view, &end);
     }

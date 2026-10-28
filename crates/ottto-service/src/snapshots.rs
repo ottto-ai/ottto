@@ -27691,7 +27691,7 @@ impl OwnedSourceScan {
             }
             if let Some(mut active) = active_file.take() {
                 if let Some(delivery) = line_delivery.as_mut() {
-                    delivery.begin_armed(&active);
+                    delivery.begin_armed(&active, &roots);
                 }
                 let mut group_end = None;
                 let stepped = if active.group.is_some() {
@@ -34254,9 +34254,16 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                 max_line_bytes,
                 salvage_codex_envelope,
                 // An unterminated trailing line reaches money only, never LD.
-                on_line
-                    .filter(|_| line_complete)
-                    .map(|tap| (self.consumed - line_start, tap)),
+                on_line.filter(|_| line_complete).map(|tap| {
+                    (
+                        self.consumed - line_start,
+                        self.acquisition
+                            .as_ref()
+                            .map_or(0, |plan| plan.start_offset())
+                            .saturating_add(self.consumed),
+                        tap,
+                    )
+                }),
                 &mut on_value,
             )
         });
@@ -34275,7 +34282,7 @@ fn apply_physical_line(
     early: Option<EarlySalvage>,
     max_line_bytes: usize,
     salvage_codex_envelope: bool,
-    deliver: Option<(u64, line_delivery::LineTap<'_>)>,
+    deliver: Option<(u64, u64, line_delivery::LineTap<'_>)>,
     on_value: &mut impl FnMut(&Value),
 ) {
     #[cfg(test)]
@@ -34283,9 +34290,9 @@ fn apply_physical_line(
     report.physical_line_count += 1;
     if overflowed {
         report.over_line_cap_count += 1;
-        if let Some((length, tap)) = deliver {
+        if let Some((length, end, tap)) = deliver {
             // Never a salvaged envelope.
-            tap(length, &line_delivery::PhysicalLine { value: None });
+            tap(length, &line_delivery::PhysicalLine { end, value: None });
         }
         // Codex created-thread ownership requires a gap-free ordinal and
         // timestamp stream. Image-bearing response/compaction rows carry
@@ -34329,9 +34336,9 @@ fn apply_physical_line(
             None
         }
     };
-    if let Some((length, tap)) = deliver {
+    if let Some((length, end, tap)) = deliver {
         let value = value.as_ref();
-        tap(length, &line_delivery::PhysicalLine { value });
+        tap(length, &line_delivery::PhysicalLine { end, value });
     }
     if let Some(value) = value {
         on_value(&value);
