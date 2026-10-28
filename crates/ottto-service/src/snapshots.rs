@@ -28861,11 +28861,9 @@ impl OwnedSourceScan {
                     .get_mut(&local_index_key(&candidate.path))
                     .and_then(|entry| entry.archive.as_mut())
                 {
-                    if let Some(owner) = &archive_owner {
-                        index
-                            .codex_state_only_blocked_session_ids
-                            .insert(owner.clone());
-                    }
+                    index
+                        .codex_state_only_blocked_session_ids
+                        .extend(archive_owner.iter().cloned());
                     let complete = evidence.finish(archive_owner, &candidate.path, &parsed_file);
                     if !complete {
                         census.record_unreadable(UnreadableCause::Reduction, 1);
