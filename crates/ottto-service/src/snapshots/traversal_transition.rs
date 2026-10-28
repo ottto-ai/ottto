@@ -875,7 +875,12 @@ mod tests {
         let mut value = serde_json::to_value(ScanTraversalCounts::default()).unwrap();
         for (name, value) in value.as_object_mut().unwrap() {
             if let Some(object) = value.as_object_mut() {
-                for counter in object.get_mut("counts").unwrap().as_array_mut().unwrap() {
+                let field = if name == "causes" {
+                    "contributions"
+                } else {
+                    "counts"
+                };
+                for counter in object.get_mut(field).unwrap().as_array_mut().unwrap() {
                     *counter = json!(u64::MAX);
                 }
             } else {
