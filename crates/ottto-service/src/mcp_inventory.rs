@@ -590,6 +590,7 @@ fn newest_archive_is_newer(dir: &Path, newest_plain: Option<&Path>) -> bool {
     };
     let newest_archive = entries
         .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
             let stem = name.strip_suffix(".zst")?;
@@ -2497,8 +2498,12 @@ mod tests {
         // A plain log's own archive twin is not newer.
         fs::write(day.join("rollout-2026-10-28T01-00-00-a.jsonl.zst"), b"x").unwrap();
         assert!(!newest_archive_is_newer(&day, Some(&older)));
-        // A newer archive is reported; the version still comes from the
-        // older plain log (the archive is not zstd and is never opened).
+        // A directory named like an archive is not one.
+        fs::create_dir(day.join("rollout-2026-10-28T03-00-00-c.jsonl.zst")).unwrap();
+        assert!(!newest_archive_is_newer(&day, Some(&older)));
+        fs::remove_dir(day.join("rollout-2026-10-28T03-00-00-c.jsonl.zst")).unwrap();
+        // A newer archive is reported, from its name alone; the version still
+        // comes from the older plain log.
         fs::write(day.join("rollout-2026-10-28T02-00-00-b.jsonl.zst"), b"x").unwrap();
         assert!(newest_archive_is_newer(&day, Some(&older)));
         assert!(newest_archive_is_newer(&day, None));

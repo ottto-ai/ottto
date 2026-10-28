@@ -1929,7 +1929,8 @@ fn failed_read_counts_nothing_and_keeps_the_rest_of_the_scope() {
 fn codex_archive_never_read_while_plain_is_counted_unpinned() {
     let env = Env::new("composition-v2-archive-unpinned");
     let now = base_now();
-    // Not zstd: decoding it would fail, so the counts prove it was not read.
+    // Not zstd, so a decode would fail; the zero read and failure counts
+    // show no counted read touched it.
     let compressed = env
         .root
         .join("archived_sessions/rollout-2026-10-01T00-00-00-zzz.jsonl.zst");
