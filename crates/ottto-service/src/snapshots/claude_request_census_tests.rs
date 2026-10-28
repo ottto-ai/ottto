@@ -2397,11 +2397,12 @@ fn held_original_keeps_dependent_copy_proof_only_for_unchanged_stamp() {
 }
 
 /// Review F3 / L26 on the production path: a Held durable record for an
-/// unchanged original takes the common-hold exit; the dependent copy is
-/// rescanned in the same pass. Its emitted envelopes, witnesses and money
-/// equal the cold arm's (original read Full), the original's census record
-/// and last accepted body stay, and the stale original equals what a cold
-/// read emits. Changed-stamp control: the same hold invalidates the record
+/// unchanged original takes the common-hold exit; the dependent copy (which
+/// gained a request) is rescanned in the same pass. Its emitted envelopes,
+/// witnesses and money equal the cold arm's (original read Full), and the
+/// original's census record and last accepted body stay; a cold re-read of
+/// the unchanged original emits nothing new either, so emitted money is
+/// conserved. Changed-stamp control: the same hold invalidates the record
 /// (birth stub) and the copy loses its proof.
 #[cfg(unix)]
 #[test]
@@ -2453,6 +2454,26 @@ fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidat
     };
     let last_accepted = accepted(&seeded);
     assert!(last_accepted.0.is_some());
+    census_write(
+        &root,
+        "dependent-copy.jsonl",
+        &[
+            census_response(
+                "dependent-copy",
+                Some("req_held_shared"),
+                "msg_held_shared",
+                1,
+                100,
+            ),
+            census_response(
+                "dependent-copy",
+                Some("req_copy_new"),
+                "msg_copy_new",
+                2,
+                50,
+            ),
+        ],
+    );
     let session = |snapshots: &[SnapshotItem], id: &str| {
         snapshots
             .iter()
@@ -2467,11 +2488,13 @@ fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidat
         let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
         let namespace = crate::transcript_acquisition::Scope("held-census-production".to_owned());
         cache.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &namespace, false);
-        // Both entries are reparse debt, so both files are Parse while unchanged.
+        // Reparse debt: the unchanged original is Parse; the copy changed.
         let mut index = seeded.clone();
-        for key in [&original, &copy] {
-            index.files.get_mut(key).unwrap().source_file_fingerprint = String::new();
-        }
+        index
+            .files
+            .get_mut(&original)
+            .unwrap()
+            .source_file_fingerprint = String::new();
         if arm != "cold" {
             let dir = crate::durable_tail_store::store_dir_for_index(&index_path);
             std::fs::DirBuilder::new()
@@ -2539,10 +2562,11 @@ fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidat
             "cold" => {
                 assert_eq!(counts.durable_held, [0; 5]);
                 assert_eq!(copy_status, ClaudeCensusMemberStatus::SharesHash);
-                // Money conservation premise: the stale accepted original
-                // equals what a cold read of the unchanged original emits.
+                // Money conservation premise: a cold read of the unchanged
+                // original emits nothing new; its accepted body stands.
                 assert_eq!(accepted(&index), last_accepted);
-                assert!(!session(&emitted, "held-original").is_empty());
+                assert!(session(&emitted, "held-original").is_empty());
+                assert!(!session(&emitted, "dependent-copy").is_empty());
                 cold = Some((session(&emitted, "dependent-copy"), copy_entry(&index)));
             }
             "held" => {

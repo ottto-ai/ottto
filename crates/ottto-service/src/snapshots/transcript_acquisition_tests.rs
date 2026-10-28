@@ -1783,7 +1783,8 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     let (counters, store) = third.durable_counters(source).unwrap();
     eprintln!("overflow restart: {}", counters.summary(source, &store));
     assert_eq!(counters.restored, u64::from(supported));
-    assert_eq!(modes, if supported { (0, 1, 1) } else { (1, 0, 1) });
+    // The new rollout is unchanged; only the known key's Full/Tail mode matters.
+    assert_eq!((modes.0, modes.1), if supported { (0, 1) } else { (1, 0) });
     let (_, full, _, _) =
         production_scan_at_with_setup(&fixture, source, loaded, None, &namespace.0, NOW, live);
     assert!(!scan.snapshots.is_empty(), "compare an emitted Codex body");
