@@ -796,13 +796,10 @@ fn fe_claude_sp7b_lossy_grown_tail_is_excluded_and_refused() {
     assert!(tail.snapshots.is_empty(), "SP-7b-c: nothing published");
 }
 
-/// SP-8c-c (RED): a grown Claude `Full(AuditDue)` earns no audit credit: FE
-/// publishes the prefix, the due debt stays staged at its deadline, and the
-/// next page is `Full(AuditDue)` again.
-///
-/// Red on main: D1 (one `OpenRead`).
+/// An overdue checkpoint still Tails the append without Full-audit credit.
+/// In-page grown-prefix deadline handling remains a separate full-S1 concern.
 #[test]
-fn fe_claude_sp8c_grown_full_audit_due_keeps_debt_staged() {
+fn fe_claude_sp8c_overdue_checkpoint_tails_and_keeps_debt_staged() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -813,22 +810,17 @@ fn fe_claude_sp8c_grown_full_audit_due_keeps_debt_staged() {
         .get_mut(&base.key)
         .unwrap()
         .set_unverified_deadline(due);
-    let path = base.path.clone();
-    let appended = row_bytes(CLAUDE, 6..9);
     let index = std::mem::take(&mut base.index);
-    let (index, full, seen, read) =
-        page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
-            append_raw(&path, &appended)
-        });
-    assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
-    assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
-    assert_prefix_published("SP-8c-c", &base, &index, full, &seen, &read, read.frozen);
+    let (index, result, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+    assert_eq!(seen.modes, (0, 1, 0));
+    assert_eq!(seen.full_reasons[AUDIT_DUE], 0);
+    assert_eq!(seen.unreadable, 0);
+    assert_eq!(index.files[&base.key].unverified_deadline(), Some(due));
     assert_eq!(
-        index.files[&base.key].unverified_deadline(),
-        Some(due),
-        "SP-8c-c: no audit credit; the debt stays staged"
+        content(production_body(CLAUDE, result)),
+        content(full_body(&base.fixture, CLAUDE))
     );
-    next_full("SP-8c-c", &base, index, AUDIT_DUE);
+    assert!(base.cache.retained_checkpoint(&base.key).is_some());
 }
 
 /// SP-11-c, Codex (GREEN): FE is Claude-only. A Codex in-page `Full` with an
@@ -1299,8 +1291,8 @@ fn fe_claude_growth_after_e1_applied_fragment_keeps_strict_identity() {
     );
 }
 
-/// Review F2: exhausted/unsupported audit metadata retains strict Full
-/// behavior, creates no new marker and cannot disable reuse source-wide.
+/// Review F2: exhausted/unsupported legacy prefix slots still refuse a
+/// grown prefix. Ordinary acquisition keeps its frozen extent independently.
 #[test]
 fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1319,8 +1311,9 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
                 if let Some(opened) = opened(scan) {
                     assert!(is_full(opened.mode));
                     assert_eq!(
-                        opened.extent_limit, None,
-                        "no optional frozen read without capacity"
+                        opened.extent_limit,
+                        Some(opened.frozen - opened.start),
+                        "audit capacity does not disable the acquisition extent"
                     );
                     append_raw(&base.path, &row_bytes(CLAUDE, 6..9));
                     read = Some(opened);

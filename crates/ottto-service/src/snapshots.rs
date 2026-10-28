@@ -31738,16 +31738,15 @@ impl OwnedSourceScan {
                             && codex_session_id_candidates_from_path(&candidate.path)
                                 .iter()
                                 .any(|id| index.codex_parent_ownership_refs.contains(id));
-                        let allow_sample = context.audit_metadata_supported
-                        // A same-process E2-held native read may reuse its own
-                        // certificate. It grants no persisted/index authority;
-                        // scope, object, prefix and audit checks still apply.
-                        && (index.files.contains_key(&key) || e2_held_new_file)
-                        && !protected
-                        && !forced_family
-                        && !comparison_target
-                        && !parent_proof_required
-                        && (debt.is_some() || context.audit_slots > 0);
+                        // Audit population/deadlines never gate ordinary
+                        // restore. The legacy prefix/proof paths retain their
+                        // own rules until S1. A same-process E2-held read may
+                        // reuse only its own certificate, without authority.
+                        let allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
+                            && !protected
+                            && !forced_family
+                            && !comparison_target
+                            && !parent_proof_required;
                         context
                             .admission
                             .audit_metadata_supported

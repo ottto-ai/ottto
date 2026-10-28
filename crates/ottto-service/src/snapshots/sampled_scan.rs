@@ -528,6 +528,8 @@ impl OwnedSourceScan {
             self.sampling = Some(Context {
                 cache,
                 namespace,
+                // Legacy prefix/audit scheduling and diagnostic observations
+                // keep these values; ordinary restore never gates on them.
                 audit_metadata_supported: pending <= CACHE_ENTRIES,
                 audit_slots: CACHE_ENTRIES.saturating_sub(pending),
                 full_files: 0,
@@ -727,7 +729,8 @@ fn release_for_copy_refusal(
     // baseline. Its local layout refusal forbids optional copies, but
     // does not invalidate other already bounded resident reductions.
     // Acquisition/path scratch still uses the separate 1MiB reserve.
-    // Borrowed tail state and unsupported audit metadata keep a release.
+    // Borrowed tail state keeps its existing release accounting; audit
+    // population is not a cache or restore admission bound.
     let native_full_baseline = active.is_some_and(|active| {
         active
             .sampling
@@ -736,9 +739,7 @@ fn release_for_copy_refusal(
     });
     // The optional charge the residents must fit beside, and the clear's
     // cause where it cannot be fitted (no charge: clear).
-    let (charge, cause) = if !context.audit_metadata_supported {
-        (None, Event::ClearMetadataUnsupported)
-    } else if native_full_baseline {
+    let (charge, cause) = if native_full_baseline {
         if crate::heap_layout_bound::bound(context, STATE_BYTES).is_some() {
             return;
         }
@@ -1040,7 +1041,7 @@ pub(super) fn copy_budget_step(
     active: Option<&mut OwnedActiveFile>,
     completing: bool,
 ) -> (usize, StepMeasure) {
-    let Some(context) = sampling.filter(|context| context.audit_metadata_supported) else {
+    let Some(context) = sampling else {
         return (0, StepMeasure::default());
     };
     // U1a-2a (R2-B3): main's view, any suspended proof charged as none, so

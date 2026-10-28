@@ -2848,9 +2848,8 @@ fn unchanged_candidate(fixture: &ScanRoot, index: &ScanIndex) -> CandidateFile {
 /// Selection semantics after convergence: in later census generations, past
 /// `commit + I`, the scheduler skips the file (`Skip`: same fingerprint, no
 /// marker), so no acquisition opens it: neither `Unchanged` nor `AuditDue`
-/// is selected. This is not "an unchanged file never needs an audit": the
-/// retained copy's horizon runs from the commit, so the next change after
-/// `commit + I` is read in full as `AuditDue`, not tailed.
+/// is selected. After R2's gate removal, a later append reuses the
+/// retained checkpoint as Tail even beyond `commit + I`.
 #[test]
 fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2912,6 +2911,11 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                     Some(opened + interval),
                     "{case}: due marker"
                 );
+                // Keep AD-1's stable Full-completion control distinct from
+                // R2's valid-checkpoint Tail case below. No RAM state survives
+                // this explicit eviction; the legacy no-state audit remains.
+                cache.clear();
+                assert!(cache.retained_checkpoint(&key).is_none());
                 let (next, opened, committed, reasons) = certify_job(
                     &fixture,
                     &cache,
@@ -2971,8 +2975,8 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 assert_eq!(selections.unchanged, 0, "{case}: not an acquisition");
             }
             assert_eq!(counter(&cache, |c| c.jobs_started), jobs, "{case}");
-            // What `+I` still means: the next change, after `commit + I`, is
-            // a full audit read of the retained copy, not a tail.
+            // A valid retained checkpoint is not reread for its age: the
+            // next append selects Tail even after the old audit horizon.
             assert!(now >= committed + interval);
             fixture.append(SESSION, &token_line(90));
             page_number += 1;
@@ -2985,10 +2989,10 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 |_| {},
                 10_000,
             );
-            assert_eq!(selections.modes, (1, 0), "{case}: a full read");
+            assert_eq!(selections.modes, (0, 1), "{case}: a tail read");
             assert_eq!(
                 selections.full_reasons[FullReason::AuditDue.slot()],
-                1,
+                0,
                 "{case}: {selections:?}"
             );
             assert_eq!(counter(&cache, |c| c.jobs_started), jobs + 1, "{case}");
