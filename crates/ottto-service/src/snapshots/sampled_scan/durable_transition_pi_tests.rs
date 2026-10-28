@@ -5,10 +5,13 @@
 //
 // GATE: registered under `cfg(all(test, ottto_e5_pi_codec))` because the fixture
 // branch has no Pi codec (`DurableSource::Pi`, `PiSection`) or Pi line builders
-// (`pi_seed`, `pi_turn`, `pi_json`, `pi_grow`). The Pi PR removes the gate when it
-// merges the codec on top of 5c1b; until then this file is not compiled. The
-// P-ACTIVE-BOUND and P-LEDGER-CAP rows also wait on cap knobs that do not exist
-// yet (`cfg(ottto_e5_fixture_knobs)`, E5-PI-FIXTURE questions for E1).
+// (`pi_seed`, `pi_turn`, `pi_json`, `pi_grow`). PR-Pi-b2 removes the gate when it
+// merges the codec on top of 5c1b (PR-Pi-b1 is folded into E1's 5b-B, which
+// adds the source-keyed `DurableSource` table); until then this file is not
+// compiled. The P-ACTIVE-BOUND and P-LEDGER-CAP rows also wait on cap knobs
+// that do not exist yet (`cfg(ottto_e5_fixture_knobs)`, E5-PI-FIXTURE questions
+// for E1), and assert `Harness::full_reads(cause)`, assumed from r2-interfaces
+// (5c1a0a-2).
 //
 // P-PREACT (a binary without Pi support meeting Pi files and a Pi store) is a
 // cross-build property: it belongs to the money_equivalence base-vs-candidate
@@ -227,6 +230,14 @@ impl PiDriver {
         (counts.missing, counts.refused_record, store.t14_rebuild)
     }
 
+    /// This route's `full_reads{cause}`. ASSUMED: `Harness::full_reads(cause)`
+    /// (r2-interfaces, R2 plan) arrives with 5c1a0a-2; the receiver and
+    /// arguments here are a guess until it lands.
+    #[cfg(ottto_e5_fixture_knobs)]
+    fn full_reads(&self, mode: Mode, cause: &str) -> u64 {
+        fixture::Harness::full_reads(&self.pages[&mode].cache, SOURCE, cause)
+    }
+
     /// This route's content-free durable summary line for source=pi.
     fn summary(&self, mode: Mode) -> String {
         let (counts, store) = self.pages[&mode].cache.durable_counters(SOURCE).unwrap();
@@ -342,7 +353,9 @@ fn pi_quiet_restart_twice_reads_nothing_and_posts_nothing() {
         assert_eq!(quiet.io.rederive_named, 0, "{restart}: named-line pread");
         assert!(quiet.batches.is_empty(), "{restart}: quiet restart POSTed");
         // Cheap/raw I/O is unmeasured, so the zero-byte receipt cannot be
-        // claimed yet; flip to the positive oracle call once it is measured.
+        // claimed yet (unmet, disclosed). E1's 5b-A0 brings the seam
+        // (`RetailAttempt::accounted` / `AccountedReader`); flip to the
+        // positive oracle call then.
         assert!(quiet.io.cheap_checks.is_none() && quiet.io.other_reads.is_none());
         assert!(
             std::panic::catch_unwind(|| money_oracle::assert_quiet_restart_zero_bytes(&quiet))
@@ -534,8 +547,11 @@ fn pi_restored_tail_behind_accepted_extent_holds() {
     money_oracle::assert_no_smaller_reemit(&f.entity, &cold, &restored, &cold, behind);
 }
 
-// P-T14: a corrupt or truncated Pi section is read Full once (counted T14
-// rebuild), then replaced by a record the next restart restores.
+// P-T14 / P-T14-SECTION: a corrupt, truncated or stripped Pi section is read
+// Full once (counted T14 rebuild), then replaced by a record the next restart
+// restores. The first two arms break the trailer, so framing refuses them; the
+// stripped arm is re-framed with a valid trailer, so only the Pi section
+// check can refuse it (never decoded as an empty ledger).
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -545,21 +561,36 @@ fn pi_corrupt_or_missing_section_rebuilds_once_then_replaces_the_record() {
     if !supported("pi_transition_t14") {
         return;
     }
+    use sha2::{Digest, Sha256};
     const TRAILER: usize = 32;
-    for truncate in [false, true] {
-        let name = if truncate {
-            "transition-pi-t14-missing"
-        } else {
-            "transition-pi-t14-corrupt"
-        };
-        let mut f = PiDriver::warm(name, &pi_seed());
+    for arm in ["corrupt", "missing", "stripped"] {
+        let name = format!("transition-pi-t14-{arm}");
+        let mut f = PiDriver::warm(&name, &pi_seed());
         // The Pi section closes the body, immediately before the trailer.
         let (path, mut bytes) = only_record(&f.disk);
         let last = bytes.len() - TRAILER - 1;
-        if truncate {
-            bytes.remove(last);
-        } else {
-            bytes[last] ^= 0xff;
+        match arm {
+            "corrupt" => bytes[last] ^= 0xff,
+            "missing" => {
+                bytes.remove(last);
+            }
+            _ => {
+                let valid = bytes.len();
+                // E5-PI-FIXTURE: reframe hook (E1 takes it into r2-fixture-ext).
+                fixture::reframe_record(&path, |body| {
+                    let section = fixture::trailing_section(body, 1)
+                        .expect("the Pi section (tag 1) closes the body");
+                    body.truncate(section.start);
+                });
+                bytes = std::fs::read(&path).unwrap();
+                let end = bytes.len() - TRAILER;
+                assert!(end < valid - TRAILER, "{name}: section stripped");
+                assert_eq!(
+                    bytes[end..],
+                    Sha256::digest(&bytes[..end])[..],
+                    "{name}: the trailer still verifies"
+                );
+            }
         }
         std::fs::write(&path, &bytes).unwrap();
         f.restart();
@@ -730,11 +761,10 @@ fn pi_active_bound_publishes_new_keys_without_record_and_never_fulls_on_restore(
     assert!(f
         .summary(Mode::Restart)
         .contains("durable_live_finish_not_persisted={active_bound:1}"));
-    // E5-PI-FIXTURE: degraded_no_record accessor. Assert
-    // full_reads{degraded_no_record} once E1 exposes it; until then the
-    // DT `missing` counter plus the Full mode stand in.
-    let (missing, refused, _) = f.counters(Mode::Restart);
-    assert_eq!((missing, refused), (1, 0));
+    // The one named exception: a NEW key published without a record.
+    assert_eq!(f.full_reads(Mode::Restart, "degraded_no_record"), 1);
+    let (_, refused, t14) = f.counters(Mode::Restart);
+    assert_eq!((refused, t14), (0, 0), "not a refused record");
     money_oracle::assert_equivalent(&cold, &full);
 
     fixture::set_active_budget(None);
@@ -805,9 +835,9 @@ fn pi_ledger_over_cap_refuses_the_codec_and_keeps_an_existing_record() {
         summary.contains("durable_live_finish_not_persisted={codec:1}"),
         "{summary}"
     );
-    // E5-PI-FIXTURE: degraded_no_record accessor (DT `missing` until then).
-    let (missing, refused, _) = f.counters(Mode::Restart);
-    assert_eq!((missing, refused), (1, 0));
+    assert_eq!(f.full_reads(Mode::Restart, "degraded_no_record"), 1);
+    let (_, refused, t14) = f.counters(Mode::Restart);
+    assert_eq!((refused, t14), (0, 0), "not a refused record");
     money_oracle::assert_equivalent(&cold, &full);
 
     let mut f = PiDriver::warm("transition-pi-ledger-existing", &pi_seed());
@@ -913,6 +943,9 @@ fn seed_at_version(version: u64) -> String {
 // `real_edit.<check>`, the fresh extent exempt from the P11-S2 floor
 // (`s2_skipped_real_edit{cause}`), never T13; then restore + Tail resumes.
 // v1->v3 grows the file; v2->v3 renames hookMessage to custom and shrinks it.
+// In both arms the Full comes from the head change (the version line, so
+// HeadChanged), not from the size: a same-head cut below the accepted extent
+// is P-S, held by the floor.
 #[test]
 #[cfg_attr(
     not(target_os = "macos"),
@@ -952,10 +985,17 @@ fn pi_version_rewrite_is_one_real_edit_full_then_restore_and_tail() {
         f.restart();
         let key = fixture::local_key(&f.path);
         let inode = std::fs::metadata(&f.path).unwrap().ino();
+        let head = |bytes: &[u8]| bytes.split(|&b| b == b'\n').next().unwrap().to_vec();
+        let old_head = head(&std::fs::read(&f.path).unwrap());
         std::fs::write(&f.path, &rewritten).unwrap();
         input_clock(&f.path);
         let meta = std::fs::metadata(&f.path).unwrap();
         assert_eq!(meta.ino(), inode, "{name}: rewritten in place");
+        assert_ne!(
+            head(&std::fs::read(&f.path).unwrap()),
+            old_head,
+            "{name}: the header line (version) changed"
+        );
         assert_eq!(
             meta.len() < f.prior.files[&key].size_bytes,
             shrinks,
