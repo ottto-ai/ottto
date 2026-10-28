@@ -101,33 +101,34 @@ pub(crate) const fn captures(source: SnapshotSource) -> bool {
     matches!(source, SnapshotSource::ClaudeCode)
 }
 
-/// Every Claude sync cycle builds contract-5 evidence. A test may pin the
-/// legacy account path (D1 qualification, mixed bodies, owner holds) that
-/// production now reaches only for bodies contract 5 leaves untagged.
+/// Every Claude sync cycle builds contract-5 evidence. A test may model a
+/// pre-cutover daemon's unpermitted page, or pin the legacy account path
+/// (D1 qualification, mixed bodies, owner holds) that production now
+/// reaches only for bodies contract 5 leaves untagged.
 pub(crate) fn builds_evidence() -> bool {
     #[cfg(test)]
-    if LEGACY_ACCOUNT_PATH.with(std::cell::Cell::get) {
+    if PRE_CUTOVER.with(std::cell::Cell::get) {
         return false;
     }
     true
 }
 #[cfg(test)]
-thread_local! { static LEGACY_ACCOUNT_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static PRE_CUTOVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 /// Runs this thread's sync evidence stage without contract-5 evidence until
 /// dropped, as every unpermitted cycle did before the cutover. Only for
-/// fixtures whose subject is that legacy path.
+/// fixtures that model that daemon or whose subject is the legacy path.
 #[cfg(test)]
-pub(crate) struct LegacyAccountPathForTest(bool);
+pub(crate) struct PreCutoverEvidenceForTest(bool);
 #[cfg(test)]
-impl LegacyAccountPathForTest {
+impl PreCutoverEvidenceForTest {
     pub(crate) fn enter() -> Self {
-        Self(LEGACY_ACCOUNT_PATH.with(|v| v.replace(true)))
+        Self(PRE_CUTOVER.with(|v| v.replace(true)))
     }
 }
 #[cfg(test)]
-impl Drop for LegacyAccountPathForTest {
+impl Drop for PreCutoverEvidenceForTest {
     fn drop(&mut self) {
-        LEGACY_ACCOUNT_PATH.with(|v| v.set(self.0));
+        PRE_CUTOVER.with(|v| v.set(self.0));
     }
 }
 

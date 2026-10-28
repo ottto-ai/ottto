@@ -23618,7 +23618,7 @@ mod tests {
     #[test]
     fn claude_p92_typed_mixed_uses_full_enrichment_order() {
         // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-        let _legacy = crate::snapshots::claude_request_identity::LegacyAccountPathForTest::enter();
+        let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
         // Legacy session-account wire shape; E2 emits request-owned account partitions.
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
         use crate::claude_local_otel::ClaudeIdentityDisposition;

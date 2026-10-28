@@ -1420,7 +1420,7 @@ fn changed_proof_after_terminal_authority_owes_one_exact_correction() {
 #[serial(source_manifests)]
 fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::LegacyAccountPathForTest::enter();
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
@@ -1961,7 +1961,7 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
 #[serial(source_manifests)]
 fn controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held() {
     // Subject: the legacy account path contract 5 now leaves to untagged bodies.
-    let _legacy = crate::snapshots::claude_request_identity::LegacyAccountPathForTest::enter();
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     // Reported-authority replacement/proof corrections; E2 literals never demote to native.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     let _source_manifests = SourceManifestTestGuard::new();
