@@ -20,7 +20,7 @@ use super::decode::{
 };
 use super::file::LineSink;
 use crate::composition_kinds::{
-    self as kinds, Agent, Author, ClaudeAttachment, Kind, KindsVersion, LineCtx, Part, Verdict,
+    self as kinds, Author, ClaudeAttachment, Kind, KindsVersion, LineCtx, Part, Verdict,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -159,7 +159,6 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
     let cwd = state.cwd.clone();
     let ctx = out.ctx(
         state,
-        Agent::Claude,
         cwd.as_deref().map(Path::new),
         state.has_rendered,
         author,
@@ -333,13 +332,7 @@ fn attachment(
         has_rendered,
     };
     // This line may be the file's first with `rendered` text.
-    let ctx = out.ctx(
-        state,
-        Agent::Claude,
-        ctx.cwd,
-        state.has_rendered,
-        ctx.author,
-    );
+    let ctx = out.ctx(state, ctx.cwd, state.has_rendered, ctx.author);
     match kinds::claude_attachment(&ctx, &facts) {
         Verdict::Count { kind, part } => {
             let text = serialize_attachment(&att);

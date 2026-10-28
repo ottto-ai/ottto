@@ -1047,6 +1047,7 @@ mod durable_restart {
                 &settled,
                 &interpretation,
             )
+            .into_test_option()
             .is_none());
         let (counters, store) = fresh.durable_counters(SOURCE).unwrap();
         assert_eq!(counters.ineligible.get("selection_cleared"), Some(&1));
@@ -1329,6 +1330,23 @@ mod durable_restart {
                     }
                 }
             }
+        }
+    }
+}
+
+trait RestoreTestOutcome {
+    fn into_test_option(
+        self,
+    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>;
+}
+impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
+    fn into_test_option(
+        self,
+    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
+        match self {
+            Self::Restored(taken) => Some(*taken),
+            Self::Miss => None,
+            Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }
     }
 }

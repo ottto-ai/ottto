@@ -620,6 +620,11 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
     };
     traversal_point(stage, "claude_code", counts);
 }
+/// Local alarm (5a1b): durable-store holds, T14 rebuilds, mode repairs and a
+/// disabled store, as [since last, total] counts. No path, id or wire event.
+pub(crate) fn durable_tail_alarm(source: &str, counts: &impl Serialize) {
+    traversal_point("durable_tail_alarm", source, counts);
+}
 fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,

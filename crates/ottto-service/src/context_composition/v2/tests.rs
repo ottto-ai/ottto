@@ -2534,7 +2534,6 @@ fn parse_state_round_trips() {
 
     // An open call keeps every share (kind, part, weight, file, tool).
     let ctx = crate::composition_kinds::LineCtx::v2(
-        crate::composition_kinds::Agent::Claude,
         crate::composition_kinds::Request1::No,
         Some(Path::new("/w")),
         false,

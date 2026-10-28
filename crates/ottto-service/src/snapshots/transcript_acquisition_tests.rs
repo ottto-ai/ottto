@@ -1650,6 +1650,167 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         );
     }
 }
+/// Review F1: more kept opaque records than the store's inventory bound
+/// never block the known key's replacement. Restore + Tail an append, save,
+/// restart: the next append Tails again (no Full) and matches the cold Full.
+/// A new key admitted under the overflow is a counted deferral, and every
+/// kept record survives byte-for-byte.
+#[cfg(unix)]
+#[test]
+fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let source = SnapshotSource::Codex;
+    let supported = crate::heap_layout_bound::layout_supported();
+    let _cutover = codex_counting_version::TestCutover::set(0);
+    let capture = claude_request_identity::capture_by_default();
+    let namespace = Scope("durable-overflow".into());
+    let fixture = ScanFixture::new(source);
+    fixture.file.append(
+        &json!({"type":"turn_context","timestamp":"2026-10-07T10:00:00Z",
+        "payload":{"turn_id":"turn-overflow-1","model":"fixture-model"}}),
+    );
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let live = |scan: &mut OwnedSourceScan| {
+        scan.codex_turn_traces = Some(Arc::new(CodexTurnTraceMap {
+            priority_turns: BTreeSet::new(),
+            incomplete: false,
+        }));
+        scan.codex_parent_ownership_ledgers = Some(Arc::new(Mutex::new(BTreeMap::new())));
+    };
+    let state = fixture.dir.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let index_path = state.join("index.json");
+    let lock = crate::locked_state_dir::test_locks::hold(&state);
+    let store_dir = crate::durable_tail_store::store_dir_for_index(&index_path);
+    let records = || fs::read_dir(&store_dir).map_or(0, |entries| entries.count());
+
+    let first = Arc::new(sampled_scan::SharedCache::default());
+    first.durable_begin_pass(source, &index_path, &namespace, capture);
+    let (mut index, _, modes, _) = production_scan_at_with_setup(
+        &fixture,
+        source,
+        ScanIndex::default(),
+        Some(first.clone()),
+        &namespace.0,
+        NOW,
+        live,
+    );
+    assert_eq!(modes, (1, 0, 0));
+    index.save(&index_path).unwrap();
+    first.durable_write_after_save(lock, source, &index);
+    assert_eq!(records(), usize::from(supported));
+
+    // Kept U records (opaque headers) past the inventory bound.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&store_dir)
+        .unwrap();
+    let bound = crate::durable_tail_store::INVENTORY_BOUND;
+    let kept = (0..=bound)
+        .map(|n| store_dir.join(format!("{n:064x}.rec")))
+        .collect::<Vec<_>>();
+    for path in &kept {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(b"opaque-newer-writer-record").unwrap();
+    }
+    let opaque = || {
+        kept.iter()
+            .all(|path| fs::read(path).unwrap() == b"opaque-newer-writer-record")
+    };
+
+    // Restart 1: restore + Tail the append; a new rollout is read Full.
+    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+    let new_id = "019fa111-2222-7333-8444-666666666666";
+    let new_rollout = Fixture(
+        fixture
+            .root
+            .join(format!("rollout-2026-10-07T10-00-00-{new_id}.jsonl")),
+    );
+    new_rollout.append(&json!({"type":"session_meta","payload":{"id":new_id}}));
+    new_rollout.append(
+        &json!({"type":"turn_context","timestamp":"2026-10-07T10:00:00Z",
+        "payload":{"turn_id":"turn-overflow-new","model":"fixture-model"}}),
+    );
+    new_rollout.append(&usage(source, 50, 0, "fixture-model"));
+    let second = Arc::new(sampled_scan::SharedCache::default());
+    second.durable_begin_pass(source, &index_path, &namespace, capture);
+    let before = ScanIndex::load(&index_path).unwrap();
+    let (mut warm, warm_scan, modes, _) = production_scan_at_with_setup(
+        &fixture,
+        source,
+        before.clone(),
+        Some(second.clone()),
+        &namespace.0,
+        NOW,
+        live,
+    );
+    assert_eq!(modes, if supported { (1, 1, 0) } else { (2, 0, 0) });
+    // Lead B: only the new key's durable record is deferred; its money
+    // uploads on this pass, equal to a cold Full of the same input.
+    let (_, cold_scan, _, _) =
+        production_scan_at_with_setup(&fixture, source, before, None, &namespace.0, NOW, live);
+    let new_session = |scan: &SourceScanResult| {
+        scan.snapshots
+            .iter()
+            .filter(|snapshot| snapshot.source_session_id == new_id)
+            .count()
+    };
+    assert!(
+        new_session(&warm_scan) > 0,
+        "the deferred key's body is emitted"
+    );
+    assert_eq!(new_session(&warm_scan), new_session(&cold_scan));
+    assert_eq!(
+        production_body(source, warm_scan),
+        production_body(source, cold_scan)
+    );
+    warm.save(&index_path).unwrap();
+    second.durable_write_after_save(lock, source, &warm);
+    let (counters, store) = second.durable_counters(source).unwrap();
+    eprintln!("overflow save: {}", counters.summary(source, &store));
+    assert_eq!(counters.restored, u64::from(supported));
+    // The known key is replaced; the new key is deferred, counted.
+    assert_eq!(store.records_written, u64::from(supported));
+    assert_eq!(store.budget_refused, 0);
+    assert_eq!(store.store_write_skipped, [0, u64::from(supported)]);
+    if supported {
+        assert_eq!(store.disk_records, bound as u64 + 2);
+    }
+    second.durable_gc(lock, source, &warm).unwrap();
+    assert_eq!(records(), bound + 1 + usize::from(supported));
+    assert!(opaque());
+
+    // Restart 2: the replaced record restores; the next append Tails.
+    fixture.file.append(&usage(source, 160, 2, "fixture-model"));
+    let loaded = ScanIndex::load(&index_path).unwrap();
+    let third = Arc::new(sampled_scan::SharedCache::default());
+    third.durable_begin_pass(source, &index_path, &namespace, capture);
+    let (_, scan, modes, _) = production_scan_at_with_setup(
+        &fixture,
+        source,
+        loaded.clone(),
+        Some(third.clone()),
+        &namespace.0,
+        NOW,
+        live,
+    );
+    let (counters, store) = third.durable_counters(source).unwrap();
+    eprintln!("overflow restart: {}", counters.summary(source, &store));
+    assert_eq!(counters.restored, u64::from(supported));
+    // The new rollout is unchanged; only the known key's Full/Tail mode matters.
+    assert_eq!((modes.0, modes.1), if supported { (0, 1) } else { (1, 0) });
+    let (_, full, _, _) =
+        production_scan_at_with_setup(&fixture, source, loaded, None, &namespace.0, NOW, live);
+    assert!(!scan.snapshots.is_empty(), "compare an emitted Codex body");
+    assert_eq!(production_body(source, scan), production_body(source, full));
+    assert!(opaque());
+}
 fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value {
     apply_upload_policy(source, &mut scan.snapshots, SnapshotUploadPolicy::default());
     serde_json::to_value(scan.snapshots).unwrap()
