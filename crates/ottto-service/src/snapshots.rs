@@ -88547,7 +88547,7 @@ crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_p
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
-crate::durable_tail_codec::durable_struct!(RowKey {
+crate::durable_tail_codec::durable_struct!(key RowKey {
     U model: String,
     // "base" or a 16-hex prefix of SHA-256 over `selector_context`, which
     // the upload carries (U): not a 32-byte digest, so not H.
@@ -88577,7 +88577,7 @@ crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, pr
 crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids, codex_inventory_hold);
 crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
 crate::heap_layout_bound::fields!(ActivityCallId; id);
-crate::durable_tail_codec::durable_struct!(ActivityCallId { L id: String });
+crate::durable_tail_codec::durable_struct!(key ActivityCallId { L id: String });
 crate::heap_layout_bound::fields!(ActivityCallTool; name);
 crate::durable_tail_codec::durable_struct!(ActivityCallTool { U name: String });
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
@@ -88613,6 +88613,13 @@ impl crate::durable_tail_codec::Durable for SelectorCapture {
             context: <Map as crate::durable_tail_codec::Durable>::take(d)?,
             sources: <Map as crate::durable_tail_codec::Durable>::take(d)?,
         })
+    }
+    fn verify(
+        d: &mut crate::durable_tail_codec::Dec<'_>,
+    ) -> Result<(), crate::durable_tail_codec::Corrupt> {
+        type Map = BTreeMap<String, String>;
+        <Map as crate::durable_tail_codec::Durable>::verify(d)?;
+        <Map as crate::durable_tail_codec::Durable>::verify(d)
     }
     fn shape(s: &mut crate::durable_tail_codec::Shape) {
         type Map = BTreeMap<String, String>;

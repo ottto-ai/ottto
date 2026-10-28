@@ -157,6 +157,8 @@ impl<'a> Dec<'a> {
         Ok(slice)
     }
     pub(crate) fn varint(&mut self) -> Result<u64, Corrupt> {
+        #[cfg(test)]
+        note_verify_visit(self.at, true);
         let mut value = 0_u64;
         for shift in (0..64).step_by(7) {
             let byte = self.raw(1)?[0];
@@ -232,6 +234,8 @@ impl Shape {
 pub(crate) trait Durable: Sized {
     fn put(&self, e: &mut Enc) -> Result<(), Refuse>;
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt>;
+    /// Walk the stored fields without constructing the value or allocating.
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt>;
     fn shape(s: &mut Shape);
 }
 
@@ -244,6 +248,7 @@ pub(crate) trait Durable: Sized {
 pub(crate) trait HDigest: Sized {
     fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse>;
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt>;
+    fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt>;
     fn shape_h(s: &mut Shape);
 }
 
@@ -253,6 +258,9 @@ impl HDigest for [u8; 32] {
     }
     fn take_h(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         d.raw(32)?.try_into().map_err(|_| Corrupt)
+    }
+    fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        d.raw(32).map(|_| ())
     }
     fn shape_h(s: &mut Shape) {
         s.push("digest32");
@@ -285,6 +293,9 @@ impl HDigest for String {
             .map(|byte| format!("{byte:02x}"))
             .collect())
     }
+    fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        d.raw(32).map(|_| ())
+    }
     fn shape_h(s: &mut Shape) {
         s.push("hex64");
     }
@@ -307,6 +318,13 @@ impl<T: HDigest> HDigest for Option<T> {
             _ => Err(Corrupt),
         }
     }
+    fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        match d.varint()? {
+            0 => Ok(()),
+            1 => T::verify_h(d),
+            _ => Err(Corrupt),
+        }
+    }
     fn shape_h(s: &mut Shape) {
         s.push("Option<");
         T::shape_h(s);
@@ -314,7 +332,7 @@ impl<T: HDigest> HDigest for Option<T> {
     }
 }
 
-impl<T: HDigest + Ord> HDigest for BTreeSet<T> {
+impl<T: HDigestKey + Ord> HDigest for BTreeSet<T> {
     fn put_h(&self, e: &mut Enc, path: &'static str) -> Result<(), Refuse> {
         e.varint(self.len() as u64)?;
         self.iter().try_for_each(|value| value.put_h(e, path))
@@ -328,6 +346,9 @@ impl<T: HDigest + Ord> HDigest for BTreeSet<T> {
             }
         }
         Ok(out)
+    }
+    fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        verify_entries(d, T::key_h, |_| Ok(()))
     }
     fn shape_h(s: &mut Shape) {
         s.push("BTreeSet<");
@@ -351,11 +372,133 @@ impl<T: HDigest + crate::heap_layout_bound::HeapLayoutBound> HDigest
         }
         Ok(Self::from(out))
     }
+    fn verify_h(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        for _ in 0..d.take_len()? {
+            T::verify_h(d)?;
+        }
+        Ok(())
+    }
     fn shape_h(s: &mut Shape) {
         s.push("OwnedVec<");
         T::shape_h(s);
         s.push(">");
     }
+}
+
+/// Borrowed equality/order views for scalar and product keys. Collections are
+/// intentionally not keys: their decoded equality need not match wire order.
+pub(crate) trait DurableKey: Durable {
+    type View<'a>: Ord;
+    fn key<'a>(d: &mut Dec<'a>) -> Result<Self::View<'a>, Corrupt>;
+}
+pub(crate) trait HDigestKey: HDigest {
+    type View<'a>: Ord;
+    fn key_h<'a>(d: &mut Dec<'a>) -> Result<Self::View<'a>, Corrupt>;
+}
+macro_rules! scalar_keys {
+    ($($t:ty),*) => {$(
+        impl DurableKey for $t {
+            type View<'a> = Self;
+            fn key<'a>(d: &mut Dec<'a>) -> Result<Self, Corrupt> { Self::take(d) }
+        }
+    )*};
+}
+scalar_keys!(
+    u8,
+    u16,
+    u32,
+    u64,
+    usize,
+    i32,
+    i64,
+    i128,
+    u128,
+    bool,
+    (),
+    std::num::NonZeroU64,
+    &'static str
+);
+impl DurableKey for String {
+    type View<'a> = &'a str;
+    fn key<'a>(d: &mut Dec<'a>) -> Result<Self::View<'a>, Corrupt> {
+        std::str::from_utf8(d.len_prefixed()?).map_err(|_| Corrupt)
+    }
+}
+impl<T: DurableKey> DurableKey for Option<T> {
+    type View<'a> = Option<T::View<'a>>;
+    fn key<'a>(d: &mut Dec<'a>) -> Result<Self::View<'a>, Corrupt> {
+        #[cfg(test)]
+        note_verify_visit(d.at, false);
+        match d.raw(1)?[0] {
+            0 => Ok(None),
+            1 => T::key(d).map(Some),
+            _ => Err(Corrupt),
+        }
+    }
+}
+impl<A: DurableKey, B: DurableKey> DurableKey for (A, B) {
+    type View<'a> = (A::View<'a>, B::View<'a>);
+    fn key<'a>(d: &mut Dec<'a>) -> Result<Self::View<'a>, Corrupt> {
+        Ok((A::key(d)?, B::key(d)?))
+    }
+}
+impl<A: DurableKey, B: DurableKey, C: DurableKey> DurableKey for (A, B, C) {
+    type View<'a> = (A::View<'a>, B::View<'a>, C::View<'a>);
+    fn key<'a>(d: &mut Dec<'a>) -> Result<Self::View<'a>, Corrupt> {
+        Ok((A::key(d)?, B::key(d)?, C::key(d)?))
+    }
+}
+macro_rules! digest_keys {
+    ($($t:ty),*) => {$(
+        impl HDigestKey for $t {
+            type View<'a> = &'a [u8];
+            fn key_h<'a>(d: &mut Dec<'a>) -> Result<Self::View<'a>, Corrupt> { d.raw(32) }
+        }
+    )*};
+}
+digest_keys!(String, [u8; 32]);
+impl<T: HDigestKey> HDigestKey for Option<T> {
+    type View<'a> = Option<T::View<'a>>;
+    fn key_h<'a>(d: &mut Dec<'a>) -> Result<Self::View<'a>, Corrupt> {
+        match d.varint()? {
+            0 => Ok(None),
+            1 => T::key_h(d).map(Some),
+            _ => Err(Corrupt),
+        }
+    }
+}
+
+/// Canonically sorted entries take one linear walk. Decode also accepts
+/// unsorted unique entries: re-walk earlier borrowed keys in that case to
+/// reject duplicates exactly, using constant space (worst-case quadratic time).
+fn verify_entries<'a, K: Ord>(
+    d: &mut Dec<'a>,
+    key: impl Fn(&mut Dec<'a>) -> Result<K, Corrupt>,
+    value: impl Fn(&mut Dec<'a>) -> Result<(), Corrupt>,
+) -> Result<(), Corrupt> {
+    let len = d.take_len()?;
+    let start = d.at;
+    let mut previous = None;
+    let mut sorted = true;
+    for i in 0..len {
+        let current = key(d)?;
+        sorted &= previous.as_ref().map_or(true, |p| p < &current);
+        if !sorted {
+            let mut earlier = Dec {
+                bytes: d.bytes,
+                at: start,
+            };
+            for _ in 0..i {
+                if key(&mut earlier)? == current {
+                    return Err(Corrupt);
+                }
+                value(&mut earlier)?;
+            }
+        }
+        value(d)?;
+        previous = Some(current);
+    }
+    Ok(())
 }
 
 /// The default value an `E` field must hold for the record to be written.
@@ -370,6 +513,9 @@ impl Durable for u64 {
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         d.varint()
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::take(d).map(|_| ())
+    }
     fn shape(s: &mut Shape) {
         s.push("u64");
     }
@@ -381,6 +527,9 @@ impl Durable for usize {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         Self::try_from(d.varint()?).map_err(|_| Corrupt)
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::take(d).map(|_| ())
     }
     fn shape(s: &mut Shape) {
         s.push("usize");
@@ -395,6 +544,9 @@ macro_rules! narrow_unsigned {
             }
             fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
                 <$t>::try_from(d.varint()?).map_err(|_| Corrupt)
+            }
+            fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+                Self::take(d).map(|_| ())
             }
             fn shape(s: &mut Shape) {
                 s.push(stringify!($t));
@@ -431,6 +583,9 @@ impl Durable for i64 {
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         take_signed(d)
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::take(d).map(|_| ())
+    }
     fn shape(s: &mut Shape) {
         s.push("i64");
     }
@@ -442,6 +597,9 @@ impl Durable for i32 {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         Self::try_from(take_signed(d)?).map_err(|_| Corrupt)
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::take(d).map(|_| ())
     }
     fn shape(s: &mut Shape) {
         s.push("i32");
@@ -456,6 +614,9 @@ impl Durable for i128 {
         let bytes: [u8; 16] = d.raw(16)?.try_into().map_err(|_| Corrupt)?;
         Ok(Self::from_le_bytes(bytes))
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::take(d).map(|_| ())
+    }
     fn shape(s: &mut Shape) {
         s.push("i128");
     }
@@ -469,6 +630,9 @@ impl Durable for u128 {
         let bytes: [u8; 16] = d.raw(16)?.try_into().map_err(|_| Corrupt)?;
         Ok(Self::from_le_bytes(bytes))
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::take(d).map(|_| ())
+    }
     fn shape(s: &mut Shape) {
         s.push("u128");
     }
@@ -480,6 +644,9 @@ impl Durable for std::num::NonZeroU64 {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         Self::new(d.varint()?).ok_or(Corrupt)
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::take(d).map(|_| ())
     }
     fn shape(s: &mut Shape) {
         s.push("NonZeroU64");
@@ -496,6 +663,11 @@ impl Durable for bool {
             1 => Ok(true),
             _ => Err(Corrupt),
         }
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        #[cfg(test)]
+        note_verify_visit(d.at, false);
+        Self::take(d).map(|_| ())
     }
     fn shape(s: &mut Shape) {
         s.push("bool");
@@ -514,6 +686,9 @@ impl Durable for () {
     fn take(_: &mut Dec<'_>) -> Result<Self, Corrupt> {
         Ok(())
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::take(d).map(|_| ())
+    }
     fn shape(s: &mut Shape) {
         s.push("()");
     }
@@ -527,6 +702,11 @@ impl Durable for String {
         let bytes = d.len_prefixed()?;
         std::str::from_utf8(bytes)
             .map(str::to_string)
+            .map_err(|_| Corrupt)
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        std::str::from_utf8(d.len_prefixed()?)
+            .map(|_| ())
             .map_err(|_| Corrupt)
     }
     fn shape(s: &mut Shape) {
@@ -552,6 +732,9 @@ impl Durable for std::path::PathBuf {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         String::take(d).map(Self::from)
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        String::verify(d)
     }
     fn shape(s: &mut Shape) {
         s.push("PathBuf");
@@ -583,6 +766,9 @@ impl Durable for &'static str {
         let index = usize::try_from(d.varint()?).map_err(|_| Corrupt)?;
         STATIC_LABELS.get(index).copied().ok_or(Corrupt)
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        Self::take(d).map(|_| ())
+    }
     fn shape(s: &mut Shape) {
         s.push("static_label");
         for label in STATIC_LABELS {
@@ -608,6 +794,15 @@ impl<T: Durable> Durable for Option<T> {
             _ => Err(Corrupt),
         }
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        #[cfg(test)]
+        note_verify_visit(d.at, false);
+        match d.raw(1)?[0] {
+            0 => Ok(()),
+            1 => T::verify(d),
+            _ => Err(Corrupt),
+        }
+    }
     fn shape(s: &mut Shape) {
         s.push("Option<");
         T::shape(s);
@@ -626,6 +821,9 @@ impl<T: Durable> Durable for Box<T> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         T::take(d).map(Box::new)
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        T::verify(d)
     }
     fn shape(s: &mut Shape) {
         T::shape(s);
@@ -656,6 +854,12 @@ impl<T: Durable> Durable for Vec<T> {
         }
         Ok(out)
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        for _ in 0..d.take_len()? {
+            T::verify(d)?;
+        }
+        Ok(())
+    }
     fn shape(s: &mut Shape) {
         s.push("Vec<");
         T::shape(s);
@@ -674,6 +878,12 @@ impl<T: Durable> Durable for VecDeque<T> {
     }
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         Vec::<T>::take(d).map(VecDeque::from)
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        for _ in 0..d.take_len()? {
+            T::verify(d)?;
+        }
+        Ok(())
     }
     fn shape(s: &mut Shape) {
         s.push("VecDeque<");
@@ -696,13 +906,19 @@ impl<T: Durable, const N: usize> Durable for [T; N] {
         }
         out.try_into().map_err(|_| Corrupt)
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        for _ in 0..N {
+            T::verify(d)?;
+        }
+        Ok(())
+    }
     fn shape(s: &mut Shape) {
         s.push(&format!("[{N}]"));
         T::shape(s);
     }
 }
 
-impl<T: Durable + Ord> Durable for BTreeSet<T> {
+impl<T: DurableKey + Ord> Durable for BTreeSet<T> {
     fn put(&self, e: &mut Enc) -> Result<(), Refuse> {
         put_seq(e, self.len(), self.iter())
     }
@@ -715,6 +931,9 @@ impl<T: Durable + Ord> Durable for BTreeSet<T> {
             }
         }
         Ok(out)
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        verify_entries(d, T::key, |_| Ok(()))
     }
     fn shape(s: &mut Shape) {
         s.push("BTreeSet<");
@@ -741,7 +960,7 @@ fn put_map<'a, K: Durable + 'a, V: Durable + 'a>(
     Ok(())
 }
 
-impl<K: Durable + Ord, V: Durable> Durable for BTreeMap<K, V> {
+impl<K: DurableKey + Ord, V: Durable> Durable for BTreeMap<K, V> {
     fn put(&self, e: &mut Enc) -> Result<(), Refuse> {
         put_map(e, self.len(), self.iter())
     }
@@ -756,6 +975,9 @@ impl<K: Durable + Ord, V: Durable> Durable for BTreeMap<K, V> {
             }
         }
         Ok(out)
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        verify_entries(d, K::key, V::verify)
     }
     fn shape(s: &mut Shape) {
         s.push("BTreeMap<");
@@ -779,6 +1001,12 @@ impl<T: Durable + crate::heap_layout_bound::HeapLayoutBound> Durable
     fn take(d: &mut Dec<'_>) -> Result<Self, Corrupt> {
         Vec::<T>::take(d).map(Self::from)
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        for _ in 0..d.take_len()? {
+            T::verify(d)?;
+        }
+        Ok(())
+    }
     fn shape(s: &mut Shape) {
         s.push("OwnedVec<");
         T::shape(s);
@@ -793,7 +1021,7 @@ impl<T> DurableEmpty for crate::owned_heap::OwnedVec<T> {
 
 impl<K, V> Durable for crate::owned_heap::OwnedMap<K, V>
 where
-    K: Durable + Ord + crate::heap_layout_bound::HeapLayoutBound,
+    K: DurableKey + Ord + crate::heap_layout_bound::HeapLayoutBound,
     V: Durable + crate::heap_layout_bound::HeapLayoutBound,
 {
     fn put(&self, e: &mut Enc) -> Result<(), Refuse> {
@@ -810,6 +1038,9 @@ where
             }
         }
         Ok(out)
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        verify_entries(d, K::key, V::verify)
     }
     fn shape(s: &mut Shape) {
         s.push("OwnedMap<");
@@ -833,6 +1064,10 @@ impl<A: Durable, B: Durable> Durable for (A, B) {
         let a = A::take(d)?;
         Ok((a, B::take(d)?))
     }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        A::verify(d)?;
+        B::verify(d)
+    }
     fn shape(s: &mut Shape) {
         s.push("(");
         A::shape(s);
@@ -851,6 +1086,11 @@ impl<A: Durable, B: Durable, C: Durable> Durable for (A, B, C) {
         let a = A::take(d)?;
         let b = B::take(d)?;
         Ok((a, b, C::take(d)?))
+    }
+    fn verify(d: &mut Dec<'_>) -> Result<(), Corrupt> {
+        A::verify(d)?;
+        B::verify(d)?;
+        C::verify(d)
     }
     fn shape(s: &mut Shape) {
         s.push("(");
@@ -925,6 +1165,15 @@ macro_rules! durable_field {
     (take $other:ident, $d:ident, $ty:ty) => {
         <$ty as ::std::default::Default>::default()
     };
+    (verify H, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigest>::verify_h($d)? };
+    (verify X, $d:ident, $ty:ty) => {};
+    (verify E, $d:ident, $ty:ty) => {};
+    (verify I, $d:ident, $ty:ty) => {};
+    (verify $c:ident, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::Durable>::verify($d)? };
+    (key_type H, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigestKey>::View<'a> };
+    (key_type $c:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::DurableKey>::View<'a> };
+    (key H, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::HDigestKey>::key_h($d)? };
+    (key $c:ident, $d:ident, $ty:ty) => { <$ty as $crate::durable_tail_codec::DurableKey>::key($d)? };
     (shape X, $s:ident, $f:ident, $ty:ty) => {{
         $s.push(concat!("X ", stringify!($f)));
         <$ty as $crate::durable_tail_codec::Durable>::shape($s);
@@ -950,6 +1199,21 @@ pub(crate) use durable_field;
 /// struct `durable_struct!(T(N a: u64, H b: [u8; 32]))` with names chosen
 /// for the positions.
 macro_rules! durable_struct {
+    (key $t:ident $body:tt) => {
+        $crate::durable_tail_codec::durable_struct!($t $body);
+        $crate::durable_tail_codec::durable_struct!(@key $t $body);
+    };
+    (@key $t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
+        $crate::durable_tail_codec::durable_struct!(@key $t ($($c $f: $ty),*));
+    };
+    (@key $t:ident ( $($c:ident $f:ident : $ty:ty),* $(,)? )) => {
+        impl $crate::durable_tail_codec::DurableKey for $t {
+            type View<'a> = ($($crate::durable_tail_codec::durable_field!(key_type $c, $ty),)*);
+            fn key<'a>(d: &mut $crate::durable_tail_codec::Dec<'a>) -> Result<Self::View<'a>, $crate::durable_tail_codec::Corrupt> {
+                Ok(($($crate::durable_tail_codec::durable_field!(key $c, d, $ty),)*))
+            }
+        }
+    };
     ($t:ident { $($c:ident $f:ident : $ty:ty),* $(,)? }) => {
         impl $crate::durable_tail_codec::Durable for $t {
             #[allow(unused_variables)]
@@ -968,6 +1232,11 @@ macro_rules! durable_struct {
                 d: &mut $crate::durable_tail_codec::Dec<'_>,
             ) -> Result<Self, $crate::durable_tail_codec::Corrupt> {
                 Ok(Self { $($f: $crate::durable_tail_codec::durable_field!(take $c, d, $ty)),* })
+            }
+            #[allow(unused_variables)]
+            fn verify(d: &mut $crate::durable_tail_codec::Dec<'_>) -> Result<(), $crate::durable_tail_codec::Corrupt> {
+                $($crate::durable_tail_codec::durable_field!(verify $c, d, $ty);)*
+                Ok(())
             }
             fn shape(s: &mut $crate::durable_tail_codec::Shape) {
                 if s.enter(stringify!($t)) {
@@ -995,6 +1264,11 @@ macro_rules! durable_struct {
                 d: &mut $crate::durable_tail_codec::Dec<'_>,
             ) -> Result<Self, $crate::durable_tail_codec::Corrupt> {
                 Ok(Self($($crate::durable_tail_codec::durable_field!(take $c, d, $ty)),*))
+            }
+            #[allow(unused_variables)]
+            fn verify(d: &mut $crate::durable_tail_codec::Dec<'_>) -> Result<(), $crate::durable_tail_codec::Corrupt> {
+                $($crate::durable_tail_codec::durable_field!(verify $c, d, $ty);)*
+                Ok(())
             }
             fn shape(s: &mut $crate::durable_tail_codec::Shape) {
                 if s.enter(stringify!($t)) {
@@ -1045,6 +1319,16 @@ macro_rules! durable_enum {
                         $({ $($sf: $crate::durable_tail_codec::durable_field!(take $sc, d, $sty)),* })?,)*
                     _ => return Err($crate::durable_tail_codec::Corrupt),
                 })
+            }
+            fn verify(d: &mut $crate::durable_tail_codec::Dec<'_>) -> Result<(), $crate::durable_tail_codec::Corrupt> {
+                match d.varint()? {
+                    $($tag => {
+                        $($($crate::durable_tail_codec::durable_field!(verify $tc, d, $tty);)*)?
+                        $($($crate::durable_tail_codec::durable_field!(verify $sc, d, $sty);)*)?
+                        Ok(())
+                    },)*
+                    _ => Err($crate::durable_tail_codec::Corrupt),
+                }
             }
             fn shape(s: &mut $crate::durable_tail_codec::Shape) {
                 if s.enter(stringify!($t)) {
@@ -1149,6 +1433,27 @@ pub(crate) fn take_l_spans() -> Vec<(usize, usize, &'static str)> {
     L_SPANS.with(|spans| std::mem::take(&mut *spans.borrow_mut()))
 }
 
+// Optional test trace; disabled during allocation probes. Records every
+// varint (including tags/lengths) and every raw optional/bool tag visited.
+#[cfg(test)]
+thread_local! {
+    static VERIFY_VISITS: std::cell::RefCell<Option<Vec<(usize, bool)>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn note_verify_visit(at: usize, varint: bool) {
+    VERIFY_VISITS.with(|visits| {
+        if let Some(visits) = visits.borrow_mut().as_mut() {
+            visits.push((at, varint));
+        }
+    });
+}
+#[cfg(test)]
+pub(crate) fn trace_verify(f: impl FnOnce()) -> Vec<(usize, bool)> {
+    VERIFY_VISITS.with(|visits| *visits.borrow_mut() = Some(Vec::new()));
+    f();
+    VERIFY_VISITS.with(|visits| visits.borrow_mut().take().unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,6 +1462,12 @@ mod tests {
         let mut e = Enc::bytes(1 << 20);
         value.put(&mut e).expect("encode");
         let bytes = e.into_bytes();
+        let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            let mut d = Dec::new(&bytes);
+            T::verify(&mut d).and_then(|()| d.finish())
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(stats.allocations, 0, "{stats:?}");
         let mut d = Dec::new(&bytes);
         assert_eq!(T::take(&mut d).expect("decode"), value);
         d.finish().expect("consumed");
@@ -1165,6 +1476,20 @@ mod tests {
     #[test]
     fn primitives_and_containers_round_trip_exactly() {
         round(0_u64);
+        round(usize::MAX);
+        round(u16::MAX);
+        round(i32::MIN);
+        round(std::num::NonZeroU64::new(1).unwrap());
+        round(());
+        round(None::<String>);
+        round(Box::new(String::from("boxed")));
+        round((1_u8, 2_u16));
+        round(crate::owned_heap::OwnedVec::from(vec![String::from(
+            "owned",
+        )]));
+        let mut owned = crate::owned_heap::OwnedMap::new();
+        owned.insert(String::from("key"), 3_u64);
+        round(owned);
         round(u64::MAX);
         round(i64::MIN);
         round(-1_i64);
@@ -1202,6 +1527,73 @@ mod tests {
             Err(Corrupt),
             "duplicate set member"
         );
+    }
+
+    fn agrees<T: Durable>(bytes: &[u8]) {
+        let mut d = Dec::new(bytes);
+        let decoded = T::take(&mut d).and_then(|_| d.finish());
+        let (verified, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            let mut d = Dec::new(bytes);
+            T::verify(&mut d).and_then(|()| d.finish())
+        });
+        assert_eq!(verified, decoded, "bytes={bytes:?}");
+        assert_eq!(stats.allocations, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn verifier_rejects_duplicates_but_preserves_unsorted_and_overlong_decode() {
+        for bytes in [
+            &[3, 3, 1, 2][..], // unsorted unique
+            &[3, 3, 1, 3],     // non-adjacent duplicate
+            &[2, 1, 0x81, 0],  // duplicate with overlong varint
+            &[1, 0x81, 0],     // overlong singleton is accepted by decode
+            &[0xff; 10],       // length overflow
+        ] {
+            agrees::<BTreeSet<u64>>(bytes);
+        }
+        for bytes in [
+            &[3, 3, 0, 1, 0, 2, 0][..],
+            &[3, 3, 0, 1, 0, 3, 0],
+            &[2, 1, 0, 0x81, 0, 0],
+        ] {
+            agrees::<BTreeMap<u64, bool>>(bytes);
+            agrees::<crate::owned_heap::OwnedMap<u64, bool>>(bytes);
+        }
+        agrees::<String>(&[1, 0xff]); // invalid UTF-8
+        agrees::<std::path::PathBuf>(&[1, 0xff]);
+        agrees::<std::path::PathBuf>(&[1, b'a']);
+        agrees::<bool>(&[2]);
+        agrees::<Option<u8>>(&[2]);
+        agrees::<u8>(&[0x80, 2]);
+        agrees::<i32>(&[0xff; 10]);
+        agrees::<std::num::NonZeroU64>(&[0]);
+        agrees::<&'static str>(&[0x7f]);
+        agrees::<ProbeKind>(&[0x7f]);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct HContainers(crate::owned_heap::OwnedVec<Option<String>>);
+    durable_struct!(HContainers(H hashes: crate::owned_heap::OwnedVec<Option<String>>));
+
+    #[test]
+    fn verifier_walks_h_containers_and_rejects_duplicate_h_keys() {
+        round(HContainers(crate::owned_heap::OwnedVec::from(vec![
+            None,
+            Some("a".repeat(64)),
+        ])));
+        let mut bytes = vec![2];
+        bytes.extend_from_slice(&[7; 64]);
+        let mut d = Dec::new(&bytes);
+        assert!(<BTreeSet<String> as HDigest>::take_h(&mut d).is_err());
+        let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            <BTreeSet<String> as HDigest>::verify_h(&mut Dec::new(&bytes))
+        });
+        assert_eq!(result, Err(Corrupt));
+        assert_eq!(stats.allocations, 0);
+        bytes[33..].fill(6); // unsorted, unique H keys remain accepted
+        let mut d = Dec::new(&bytes);
+        assert!(<BTreeSet<String> as HDigest>::take_h(&mut d).is_ok());
+        assert!(<BTreeSet<String> as HDigest>::verify_h(&mut Dec::new(&bytes)).is_ok());
     }
 
     #[test]
@@ -1266,6 +1658,12 @@ mod tests {
         assert_eq!(bytes.len(), 1 + 32 + 32 + 1 + 2 * 32);
         assert!(!bytes.windows(16).any(|w| w == b"0123456789abcdef"));
         assert_eq!(Digests::take(&mut Dec::new(&bytes)).expect("decode"), value);
+        round(value);
+        round(ProbeKind::Unit);
+        round(ProbeKind::Pair(7, "payload".into()));
+        round(ProbeKind::Named { at: 9 });
+        round(DurableMarks::default());
+        round(Digests::default());
         for bad in [
             "abc".to_string(),
             hex.to_uppercase(),
