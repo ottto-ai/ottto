@@ -2915,7 +2915,7 @@ fn build_target(
     let estimate = if matched.is_empty() {
         estimate_dollars(input.catalog_prices.as_ref(), original, &excluded_ids)
     } else {
-        Err("tuple exclusions require admission catalog valuation".to_string())
+        Err("tuple exclusions require admission catalog valuation")
     };
     report["exclusion_estimate"] = match &estimate {
         Ok(dollars) => json!({
