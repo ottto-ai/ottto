@@ -967,9 +967,16 @@ fn pi_uses_shared_content_only_ctime_adoption_and_store_slots() {
     assert_eq!(after.size_bytes, first.size_bytes);
     assert_eq!(after.modified_unix_nanos, first.modified_unix_nanos);
     let adopted = adopt_stored_changed_time(source, &mut after, &files, stat, &mut file).unwrap();
-    if first.fingerprint_birth_nanos != 0
-        && stat.unwrap().changed_unix_nanos() != first.fingerprint_changed_nanos
-    {
+    let exercised = first.fingerprint_birth_nanos != 0
+        && stat.unwrap().changed_unix_nanos() != first.fingerprint_changed_nanos;
+    // APFS has birth times and chmod moves ctime: macOS never skips this control.
+    assert!(
+        exercised || !cfg!(target_os = "macos"),
+        "chmod must move ctime of a born file"
+    );
+    if !exercised {
+        println!("SKIP pi ctime adoption: no birth time, or chmod left ctime unchanged");
+    } else {
         assert_eq!(
             adopted.as_deref(),
             Some(first.opened_object_identity.as_str())
