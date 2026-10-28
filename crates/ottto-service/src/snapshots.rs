@@ -31146,12 +31146,13 @@ impl OwnedSourceScan {
                 // Identity-only side exits may mutate only PS state.
                 // Main-index budget coverage is an enforcement follow-up.
                 Some(reread_guard::observation_ticket())
-            } else if matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex)
-                && matches!(
-                    decision,
-                    CandidateDecision::Parse | CandidateDecision::ReconcileLegacy
-                )
-                && index.reread_unchanged_candidate(&candidate)
+            } else if matches!(
+                source,
+                SnapshotSource::ClaudeCode | SnapshotSource::Codex | SnapshotSource::Pi
+            ) && matches!(
+                decision,
+                CandidateDecision::Parse | CandidateDecision::ReconcileLegacy
+            ) && index.reread_unchanged_candidate(&candidate)
             {
                 match index.admit_unchanged_reread(
                     &local_index_key(&candidate.path),
@@ -37453,6 +37454,7 @@ fn pi_usage_dedup_key(value: &Value) -> Option<String> {
         .or_else(|| string_at(value, &["message", "response_id"]))
         .or_else(|| string_at(value, &["responseId"]))
         .or_else(|| string_at(value, &["response_id"]))
+        .map(|id| pi_usage_hash("ottto-pi-usage-key:v1", &[&id]))
 }
 
 fn apply_pi_usage_line(
@@ -37486,6 +37488,17 @@ fn apply_pi_usage_line(
     }
 }
 
+/// Domain and each part use a u64 little-endian byte length followed by
+/// UTF-8 bytes. NULs within provider ids or selector values stay unambiguous.
+fn pi_usage_hash(domain: &str, parts: &[&str]) -> String {
+    let mut hash = Sha256::new();
+    for part in std::iter::once(domain).chain(parts.iter().copied()) {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
 fn pi_usage_occurrence_digest(
     model: Option<&str>,
     usage: &UsageTotals,
@@ -37493,28 +37506,31 @@ fn pi_usage_occurrence_digest(
     timestamp: Option<&str>,
 ) -> String {
     let selector_context = serde_json::to_string(&selector.context).unwrap_or_default();
-    sha256_hex(&[
-        model.unwrap_or(""),
-        &timestamp
-            .and_then(pi_usage_timestamp_identity)
-            .unwrap_or_default(),
-        &usage.input_tokens.to_string(),
-        &usage.output_tokens.to_string(),
-        &usage.cache_read_tokens.to_string(),
-        &usage.cache_creation_5m_tokens.to_string(),
-        &usage.cache_creation_1h_tokens.to_string(),
-        &usage.reasoning_output_tokens.to_string(),
-        &usage.unattributed_total_tokens.to_string(),
-        &usage.request_count.to_string(),
-        &usage.costs.observed.to_string(),
-        &usage.costs.reported.to_string(),
-        &format!("{:?}", usage.costs.total),
-        &format!("{:?}", usage.costs.input),
-        &format!("{:?}", usage.costs.output),
-        &format!("{:?}", usage.costs.cache_read),
-        &format!("{:?}", usage.costs.cache_creation),
-        &selector_context,
-    ])
+    pi_usage_hash(
+        "ottto-pi-usage-occurrence:v1",
+        &[
+            model.unwrap_or(""),
+            &timestamp
+                .and_then(pi_usage_timestamp_identity)
+                .unwrap_or_default(),
+            &usage.input_tokens.to_string(),
+            &usage.output_tokens.to_string(),
+            &usage.cache_read_tokens.to_string(),
+            &usage.cache_creation_5m_tokens.to_string(),
+            &usage.cache_creation_1h_tokens.to_string(),
+            &usage.reasoning_output_tokens.to_string(),
+            &usage.unattributed_total_tokens.to_string(),
+            &usage.request_count.to_string(),
+            &usage.costs.observed.to_string(),
+            &usage.costs.reported.to_string(),
+            &format!("{:?}", usage.costs.total),
+            &format!("{:?}", usage.costs.input),
+            &format!("{:?}", usage.costs.output),
+            &format!("{:?}", usage.costs.cache_read),
+            &format!("{:?}", usage.costs.cache_creation),
+            &selector_context,
+        ],
+    )
 }
 
 fn pi_message_text(value: &Value) -> Option<String> {
@@ -37611,6 +37627,12 @@ struct PiUsageDedupState {
     message_end: BTreeMap<String, usize>,
     paired_digests: BTreeSet<String>,
 }
+
+crate::durable_tail_codec::durable_struct!(PiUsageDedupState {
+    H message: BTreeMap<String, usize>,
+    H message_end: BTreeMap<String, usize>,
+    H paired_digests: BTreeSet<String>,
+});
 
 impl PiUsageDedupState {
     /// Returns true when this record is a new billable occurrence. An exact
@@ -42132,8 +42154,12 @@ fn open_candidate_file_stat_retained(
         .map(|cache| (cache, candidate.path.as_path()));
     let (identity, stat) = opened_object_identity_and_stat_retained(source, &mut file, retained)?;
     candidate.opened_object_identity = identity;
-    let tracked =
-        stat.filter(|_| matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex));
+    let tracked = stat.filter(|_| {
+        matches!(
+            source,
+            SnapshotSource::ClaudeCode | SnapshotSource::Codex | SnapshotSource::Pi
+        )
+    });
     candidate.fingerprint_changed_nanos = tracked.map_or(0, |stat| stat.changed_unix_nanos());
     candidate.fingerprint_birth_nanos = tracked
         .and_then(|stat| stat.birth_nanos)
@@ -42470,7 +42496,10 @@ fn adopt_stored_changed_time(
     live: Option<OpenedObjectStat>,
     file: &mut File,
 ) -> std::io::Result<Option<String>> {
-    if !matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
+    if !matches!(
+        source,
+        SnapshotSource::ClaudeCode | SnapshotSource::Codex | SnapshotSource::Pi
+    ) {
         return Ok(None);
     }
     let (Some(entry), Some(live)) = (files.get(&local_index_key(&candidate.path)), live) else {
