@@ -17585,11 +17585,11 @@ pub(crate) fn session_launch_claude_identity(
     let identity = read_claude_cli_oauth_account(&slot.identity_path(home))?;
     Some((
         billing_identity_hash("anthropic", "account", identity.account_uuid.as_deref()?)?,
-        identity
-            .organization_uuid
-            .as_deref()
-            .and_then(|org| billing_identity_hash("anthropic", "organization", org))
-            .unwrap_or_default(),
+        billing_identity_hash(
+            "anthropic",
+            "organization",
+            identity.organization_uuid.as_deref()?,
+        )?,
     ))
 }
 

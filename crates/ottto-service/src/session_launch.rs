@@ -30,6 +30,10 @@ use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(120);
 const MAX_PENDING: usize = 16;
+// Deliberate evaluator compatibility ranges; review before expanding them.
+const CLAUDE_CLI_MAJOR: u64 = 2; // >=2.0.0, <3.0.0
+const CODEX_CLI_MAJOR: u64 = 0;
+const CODEX_CLI_MIN_MINOR: u64 = 150; // >=0.150.0, <1.0.0
 
 pub(super) fn block(reason: Reason) -> Block {
     Block {
@@ -62,6 +66,8 @@ struct Entry {
     ino: u64,
     program: PathBuf,
     program_identity: ProgramIdentity,
+    cli_version: String,
+    path_env: String,
     secret: [u8; 32],
     created: Instant,
     created_wall: std::time::SystemTime,
@@ -214,15 +220,22 @@ impl Registry {
             &binding.user.home,
         )
         .ok_or_else(|| block(Reason::CliNotFound))?;
-        let probe_path = crate::command_env::interactive_probe_path(&binding.user.home, &program);
+        let probe_path = crate::command_env::interactive_probe_path(&binding.user.home, &program)
+            .and_then(|path| path.into_string().ok())
+            .ok_or_else(|| block(Reason::CliVersionUnsupported))?;
         let program = program
             .canonicalize()
             .map_err(|_| block(Reason::CliNotFound))?;
         let program_identity =
             program_identity(&program).ok_or_else(|| block(Reason::CliNotFound))?;
-        let cli_version = supported_version(&program, &binding, &cwd, probe_path.as_ref())?;
+        let cli_version = supported_version(
+            &program,
+            &binding,
+            &cwd,
+            Some(std::ffi::OsStr::new(&probe_path)),
+        )?;
         if self::program_identity(&program).as_ref() != Some(&program_identity) {
-            return Err(block(Reason::CliVersionUnsupported));
+            return Err(block(Reason::CliChanged));
         }
         let ottto = ottto
             .filter(|path| executable(path))
@@ -270,7 +283,7 @@ impl Registry {
             folder_label: cwd
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned()),
-            cli_version: Some(cli_version),
+            cli_version: Some(cli_version.clone()),
             block: None,
         };
         self.entries.insert(
@@ -282,6 +295,8 @@ impl Registry {
                 ino,
                 program,
                 program_identity,
+                cli_version,
+                path_env: probe_path,
                 secret: Sha256::digest(secret.as_bytes()).into(),
                 created: Instant::now(),
                 created_wall: std::time::SystemTime::now(),
@@ -481,12 +496,16 @@ fn check_entry(entry: &Entry, secret: &str) -> Result<SessionLaunchExecPlanV1, B
     }
     preflight::evaluate(&entry.binding, &entry.cwd)?;
     if !executable(&entry.program) {
-        return Err(block(Reason::CliNotFound));
+        return Err(block(Reason::CliChanged));
     }
     if program_identity(&entry.program).as_ref() != Some(&entry.program_identity) {
+        return Err(block(Reason::CliChanged));
+    }
+    if parse_version(entry.cli_version.as_bytes(), entry.binding.provider).is_none() {
         return Err(block(Reason::CliVersionUnsupported));
     }
-    let (env_unset, env_set) = environment(&entry.binding);
+    let (env_unset, mut env_set) = environment(&entry.binding);
+    env_set.insert("PATH".into(), entry.path_env.clone());
     Ok(SessionLaunchExecPlanV1 {
         program: Some(entry.program.to_string_lossy().into_owned()),
         argv: Some(Vec::new()),
@@ -536,7 +555,7 @@ fn supported_version(
     program: &Path,
     binding: &Binding,
     cwd: &Path,
-    path: Option<&std::ffi::OsString>,
+    path: Option<&std::ffi::OsStr>,
 ) -> Result<String, Block> {
     let (unset, set) = environment(binding);
     let mut command = Command::new(program);
@@ -620,12 +639,13 @@ fn parse_version(bytes: &[u8], provider: Provider) -> Option<String> {
     let major = components[0].parse::<u64>().ok()?;
     if !version.contains('.')
         || version.chars().any(char::is_control)
-        || major
-            != if provider == Provider::ClaudeCode {
-                2
-            } else {
-                0
+        || match provider {
+            Provider::ClaudeCode => major != CLAUDE_CLI_MAJOR,
+            Provider::Codex => {
+                major != CODEX_CLI_MAJOR || components[1].parse::<u64>().ok()? < CODEX_CLI_MIN_MINOR
             }
+            Provider::Unknown => true,
+        }
     {
         return None;
     }

@@ -1581,6 +1581,19 @@ pub struct AgentStatusSnapshotUploadRequest {
     pub snapshots: Vec<AgentStatusSnapshot>,
 }
 
+// Missing org is unknown; only an explicitly uploaded empty component can
+// admit personal-account display metadata from the response.
+fn uploaded_nickname_identity_matches(
+    pair: &ottto_protocol::AccountNicknamePairV1,
+    account: &Option<String>,
+    organization: &Option<String>,
+) -> bool {
+    pair.account_identifier_hash.is_some()
+        && pair.organization_identifier_hash.is_some()
+        && &pair.account_identifier_hash == account
+        && &pair.organization_identifier_hash == organization
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentStatusSnapshotUploadResponse {
     /// Optional display metadata: absent/malformed must never fail ingest.
@@ -2495,28 +2508,18 @@ impl SnapshotApiClient {
                                     );
                                     source_matches
                                         && (snapshot.account.as_ref().is_some_and(|account| {
-                                            pair.account_identifier_hash
-                                                == account.account_identifier_hash
-                                                && pair
-                                                    .organization_identifier_hash
-                                                    .as_deref()
-                                                    .unwrap_or("")
-                                                    == account
-                                                        .organization_identifier_hash
-                                                        .as_deref()
-                                                        .unwrap_or("")
+                                            uploaded_nickname_identity_matches(
+                                                pair,
+                                                &account.account_identifier_hash,
+                                                &account.organization_identifier_hash,
+                                            )
                                         }) || snapshot.plan_observations.iter().any(
                                             |observation| {
-                                                pair.account_identifier_hash
-                                                    == observation.account_identifier_hash
-                                                    && pair
-                                                        .organization_identifier_hash
-                                                        .as_deref()
-                                                        .unwrap_or("")
-                                                        == observation
-                                                            .organization_identifier_hash
-                                                            .as_deref()
-                                                            .unwrap_or("")
+                                                uploaded_nickname_identity_matches(
+                                                    pair,
+                                                    &observation.account_identifier_hash,
+                                                    &observation.organization_identifier_hash,
+                                                )
                                             },
                                         ))
                                 })
@@ -3443,6 +3446,24 @@ mod tests {
             assert_never_logged(token);
             assert_never_logged("כינוי 🚀");
         }
+    }
+
+    #[test]
+    fn nickname_admission_requires_explicit_organization_evidence() {
+        let mut pair = ottto_protocol::AccountNicknamePairV1 {
+            source: ottto_protocol::SessionLaunchProviderV1::Codex,
+            account_identifier_hash: Some("a".repeat(64)),
+            organization_identifier_hash: Some(String::new()),
+        };
+        let account = pair.account_identifier_hash.clone();
+        assert!(!uploaded_nickname_identity_matches(&pair, &account, &None));
+        assert!(uploaded_nickname_identity_matches(
+            &pair,
+            &account,
+            &Some(String::new())
+        ));
+        pair.organization_identifier_hash = None;
+        assert!(!uploaded_nickname_identity_matches(&pair, &account, &None));
     }
 
     #[test]

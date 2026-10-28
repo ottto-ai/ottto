@@ -49,6 +49,8 @@ fn fixture_entry(root: &Path) -> Entry {
         ino: metadata.ino(),
         program: PathBuf::from("/bin/false"),
         program_identity: program_identity(Path::new("/bin/false")).unwrap(),
+        cli_version: "2.1.310".into(),
+        path_env: "/usr/bin:/bin".into(),
         secret: Sha256::digest(b"secret").into(),
         created: Instant::now(),
         created_wall: std::time::SystemTime::now(),
@@ -189,12 +191,13 @@ fn supported_major_versions_only() {
         Some("2.1.310")
     );
     assert_eq!(
-        parse_version(b"codex-cli 0.138.0\n", Provider::Codex).as_deref(),
-        Some("0.138.0")
+        parse_version(b"codex-cli 0.170.0\n", Provider::Codex).as_deref(),
+        Some("0.170.0")
     );
     for (text, provider) in [
         ("3.0.0", Provider::ClaudeCode),
         ("1.0.0", Provider::Codex),
+        ("0.149.99", Provider::Codex),
         ("future", Provider::Codex),
         ("0.1\nunsafe", Provider::Codex),
     ] {
@@ -342,6 +345,23 @@ fn fresh_identity_switch_and_needs_login_are_refused_without_spawning() {
 
     fs::write(
         root.join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"account-one"}}"#,
+    )
+    .unwrap();
+    assert!(crate::agent_status::session_launch_claude_identity(
+        &ClaudeConfigDirSlot::Default,
+        root
+    )
+    .is_none());
+    let mut missing_org_pair = pair.clone();
+    missing_org_pair.organization_identifier_hash = Some(String::new());
+    assert!(!nickname_target_is_current_for_user(
+        &missing_org_pair,
+        user.clone()
+    ));
+
+    fs::write(
+        root.join(".claude.json"),
         r#"{"oauthAccount":{"accountUuid":"account-two","organizationUuid":"org-one"}}"#,
     )
     .unwrap();
@@ -437,12 +457,9 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
         .to_owned();
     let result = registry.consume(&id, &secret);
     assert_eq!(result.state, Some(State::Starting));
-    assert!(!result
-        .plan
-        .unwrap()
-        .env_set
-        .unwrap()
-        .contains_key("CLAUDE_CONFIG_DIR"));
+    let env = result.plan.unwrap().env_set.unwrap();
+    assert!(!env.contains_key("CLAUDE_CONFIG_DIR"));
+    assert!(env["PATH"].split(':').any(|part| Path::new(part) == bin));
     assert_eq!(
         registry.consume(&id, &secret).block.unwrap().reason,
         Reason::LaunchAlreadyUsed
@@ -481,10 +498,12 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
         registry.status(&old_id, false).block.unwrap().reason,
         Reason::LaunchCancelled
     );
+    let original_cli = fs::read(&cli).unwrap();
     for reason in [
         Reason::SlotNeedsLogin,
         Reason::SettingsEnvOverride,
         Reason::AccountMismatch,
+        Reason::CliChanged,
         Reason::FolderChanged,
     ] {
         let result = prepare(&mut registry);
@@ -509,12 +528,22 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
                 r#"{"oauthAccount":{"accountUuid":"account-two","organizationUuid":"org-one"}}"#,
             )
             .unwrap(),
+            Reason::CliChanged => {
+                use std::io::Write;
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&cli)
+                    .unwrap()
+                    .write_all(b"# changed after prepare\n")
+                    .unwrap();
+            }
             _ => {
                 fs::rename(&project, root.join("old-project")).unwrap();
                 fs::create_dir(&project).unwrap();
             }
         }
         assert_eq!(registry.consume(&id, &secret).block.unwrap().reason, reason);
+        fs::write(&cli, &original_cli).unwrap();
         let _ = fs::remove_file(home.join(".claude/settings.json"));
         write_login(&home);
         fs::write(
@@ -672,7 +701,7 @@ fn version_probe_finds_the_selected_installs_shebang_interpreter() {
     std::env::set_var("PATH", "/usr/bin:/bin");
     let path = crate::command_env::interactive_probe_path(root, &cli);
     assert_eq!(
-        supported_version(&cli, &fixture_binding(root), root, path.as_ref()).unwrap(),
+        supported_version(&cli, &fixture_binding(root), root, path.as_deref()).unwrap(),
         "2.1.310"
     );
 }

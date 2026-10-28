@@ -290,26 +290,50 @@ fn merge(cache: &mut Cache, entries: &[Entry]) -> bool {
 }
 
 pub(crate) fn normalize(text: Option<&str>) -> Result<Option<String>, ()> {
+    use unicode_general_category::{get_general_category, GeneralCategory};
+    use unicode_normalization::UnicodeNormalization;
     let Some(text) = text else {
         return Ok(None);
     };
-    // Reject controls even at the ends; trimming cannot hide newlines/bidi.
-    if text.chars().any(|ch| ch.is_control() || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) { return Err(()); }
+    // Match the write endpoint: reject before trimming; never echo submitted text.
+    if text.chars().count() > 256
+        || text.chars().any(|ch| {
+            // Category data is Unicode 15.0 plus the three additions in 15.1,
+            // matching the endpoint's Unicode 15.1 validation baseline.
+            // https://www.unicode.org/versions/Unicode15.1.0/
+            let category = match ch {
+                '\u{2ebf0}'..='\u{2ee5d}' => GeneralCategory::OtherLetter,
+                '\u{2ffc}'..='\u{2fff}' | '\u{31ef}' => GeneralCategory::OtherSymbol,
+                _ => get_general_category(ch),
+            };
+            matches!(
+                category,
+                GeneralCategory::Control
+                    | GeneralCategory::Surrogate
+                    | GeneralCategory::PrivateUse
+                    | GeneralCategory::Unassigned
+                    | GeneralCategory::LineSeparator
+                    | GeneralCategory::ParagraphSeparator
+            ) || (category == GeneralCategory::Format && ch != '\u{200d}')
+        })
+    {
+        return Err(());
+    }
+    let text = text.nfc().collect::<String>();
     let text = text.trim();
     if text.is_empty() {
         return Ok(None);
     }
-    if text.chars().count() > 40 {
-        return Err(());
-    }
-    if text.split_whitespace().any(|word| {
-        word.split_once('@').is_some_and(|(left, right)| {
-            !left.is_empty()
-                && right
-                    .split_once('.')
-                    .is_some_and(|(host, suffix)| !host.is_empty() && !suffix.is_empty())
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() > 40
+        || chars.windows(3).any(|part| {
+            part[1] == '@'
+                && part[0] != '@'
+                && part[2] != '@'
+                && !part[0].is_whitespace()
+                && !part[2].is_whitespace()
         })
-    }) {
+    {
         return Err(());
     }
     Ok(Some(text.to_owned()))
@@ -467,14 +491,41 @@ mod tests {
         );
         for text in [
             "a@example.invalid",
+            "a@b",
             "line\nbreak",
+            "\nedge",
             "\u{202e}hidden",
             "\u{2067}hidden",
+            "\u{00ad}hidden",
+            "\u{200c}hidden",
+            "\u{e000}private",
+            "\u{0378}unassigned",
+            "\u{2028}separator",
         ] {
             assert!(normalize(Some(text)).is_err());
         }
+        assert_eq!(normalize(Some("e\u{301}")).unwrap(), Some("é".into()));
+        assert_eq!(
+            normalize(Some("👩\u{200d}💻")).unwrap(),
+            Some("👩\u{200d}💻".into())
+        );
+        assert_eq!(
+            normalize(Some(&"e\u{301}".repeat(40))).unwrap(),
+            Some("é".repeat(40))
+        );
+        assert!(normalize(Some("\u{2ebf0}\u{2ee5d}\u{2ffc}\u{31ef}")).is_ok());
+        assert!(normalize(Some("a@@b")).is_ok());
         assert!(normalize(Some(&"a".repeat(41))).is_err());
         assert_eq!(normalize(Some("  ")).unwrap(), None);
+    }
+
+    #[test]
+    fn missing_organization_is_unknown_not_personal() {
+        let mut pair = entry(1, None).pair.unwrap();
+        assert!(valid_pair(&pair));
+        pair.organization_identifier_hash = None;
+        assert!(!valid_pair(&pair));
+        assert_eq!(set(pair, None, None).outcome, Some(Outcome::Invalid));
     }
 
     #[test]

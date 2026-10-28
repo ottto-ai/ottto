@@ -59,12 +59,15 @@ CLI. No launcher shell runs after the environment scrub. Directory and exec
 failures are reported before exit. Launch blocks use exit 60, malformed plans
 use 2, and an unavailable daemon uses 10. It never runs provider doctor, auth
 or login commands. The daemon runs only a bounded, three-second `--version`
-probe at prepare; unknown versions refuse with `cli_version_unsupported`.
+probe at prepare; supported ranges are Claude Code >=2.0 and <3, and Codex
+>=0.150 and <1. Unknown versions refuse with `cli_version_unsupported`.
+The daemon records the version and executable path, dev/ino, size and mtime.
+Any executable change before consume refuses with `cli_changed`.
 Lookup searches the inherited daemon PATH first, then known per-user install
 prefixes; Codex app bundles come last, and Claude Desktop's private binary is
 excluded. The version probe includes the selected install's bin directory in
-PATH so npm/nvm shebang interpreters work under launchd. A terminal's interactive
-PATH can differ from the daemon's inherited PATH.
+PATH so npm/nvm shebang interpreters work under launchd. That exact PATH is also
+applied at exec, with the same selected folder and account environment as the probe.
 
 ## Effective environment and settings
 
@@ -126,7 +129,9 @@ local control only: no uploads, diagnostics, analytics or disk history are added
 `account_nicknames` reads the 0600 local cache only. The optional
 `account_nicknames` field in existing status-upload responses carries
 `[{pair:{source,account_identifier_hash,organization_identifier_hash},nickname,revision}]`.
-The no-organization component is an explicit empty string. The daemon applies
+The no-organization component is an explicit empty string backed by positive
+provider evidence. A missing organization hash remains unknown and cannot
+become a nickname target. The daemon applies
 only strictly newer revisions, keeps null tombstones, and admits only pairs
 present in that upload request. Missing fields preserve the cache. Lookup
 errors or malformed optional metadata never fail ingest.
@@ -142,6 +147,9 @@ with the existing relay-token client to
 `nickname` or null, and optional `base_revision`. Backend principal checks own
 organization/user authority and uploaded-pair eligibility. Requests follow no
 redirects, parse success bodies only after 2xx, and never log body/error text.
+Nickname validation matches the write endpoint: NFC, trimming, 40 characters,
+no email-shaped text or controls, formatting characters (except emoji ZWJ),
+private-use, unassigned or line/paragraph separators (Unicode 15.1 baseline).
 401/403 makes editing not connected; no retry, offline queue or registration
 is attempted. An older backend's absent upload field is a no-op.
 Successful ordinary uploads do not clear a nickname authorization rejection;

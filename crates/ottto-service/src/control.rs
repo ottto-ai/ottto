@@ -1031,9 +1031,7 @@ fn handle_command(
                 ottto_protocol::AccountNicknamePairV1 {
                     source,
                     account_identifier_hash: Some(account_identifier_hash),
-                    organization_identifier_hash: Some(
-                        organization_identifier_hash.unwrap_or_default(),
-                    ),
+                    organization_identifier_hash,
                 },
                 nickname,
                 base_revision,

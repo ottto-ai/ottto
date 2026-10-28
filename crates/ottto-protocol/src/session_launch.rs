@@ -39,6 +39,7 @@ lenient_enum!(SessionLaunchBlockReasonV1 {
     SlotNotVerified,
     CliNotFound,
     CliVersionUnsupported,
+    CliChanged,
     CloudProviderRoute,
     ApiKeyRoute,
     SettingsEnvOverride,
