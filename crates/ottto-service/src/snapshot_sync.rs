@@ -7568,7 +7568,24 @@ fn finish_sync_source(
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
     // Settle exact current bodies before selection can restore older file facts.
-    index.settle_archive_bodies(&upload_progress.accepted_body_witnesses);
+    let submitted = scan_result
+        .snapshots
+        .iter()
+        .map(|s| {
+            (
+                s.snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(s),
+            )
+        })
+        .collect();
+    index.settle_archive_outcome(
+        &upload_progress.accepted_body_witnesses,
+        matches!(
+            &upload_result,
+            Ok(ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. })
+        ),
+        Some(&submitted),
+    );
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
