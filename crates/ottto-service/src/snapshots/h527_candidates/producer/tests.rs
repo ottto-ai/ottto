@@ -1356,3 +1356,98 @@ fn source_r4_target_tuple_copy_keeps_one_b2_counter() {
     );
     fs::remove_dir_all(fixture.root).unwrap();
 }
+
+#[test]
+fn source_r4_vanished_divergent_replica_holds_its_owner() {
+    use crate::snapshots::claude_request_census::claude_request_census_record;
+    let mut fixture = fixture();
+    let peer = fixture.input.peer_roots[1]
+        .path
+        .join("replica")
+        .join(format!("{}.jsonl", session_id(2)));
+    write_transcript(
+        &peer,
+        &session_id(2),
+        &[
+            ("req-t02-a", 20, 2, 100),
+            ("req-b2-ack", 300, 30, 0),
+            ("req-t18-a", 25, 2, 100),
+        ],
+    );
+    let parsed =
+        parse_target_transcript(&peer, &fixture.input.collected_at, false, false, None).unwrap();
+    let record = claude_request_census_record(
+        &(session_id(2), session_id(2)),
+        &parsed.snapshots,
+        vec![],
+        &"a".repeat(64),
+        1,
+        true,
+        false,
+        false,
+    )
+    .unwrap();
+    let mut census = ClaudeRequestCensus::default();
+    census.insert_for_test(peer.to_str().unwrap(), record);
+    let index = fixture.root.join("index.json");
+    fs::write(
+        &index,
+        serde_json::to_vec(&json!({"generation":1,"claude_request_census":census})).unwrap(),
+    )
+    .unwrap();
+    fixture.input.census_index_path = Some(index);
+    vanish_after_plan(peer);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    assert_eq!(target_report(&artifact, 2)["held_reason"], "unknown_owner");
+    assert!(target_report(&artifact, 2).get("body").is_none());
+    assert_eq!(
+        target_report(&artifact, 18)["partition"]["excluded"]["request_count"],
+        1
+    );
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_incomplete_census_uses_positive_ids_and_holds_lineage() {
+    use crate::snapshots::claude_request_census::claude_request_census_record;
+    let mut fixture = fixture();
+    let peer = add_vanishing_peer(&fixture.input, "proj-a");
+    let parsed =
+        parse_target_transcript(&peer, &fixture.input.collected_at, false, false, None).unwrap();
+    let record = claude_request_census_record(
+        &(session_id(900), session_id(900)),
+        &parsed.snapshots,
+        vec![],
+        &"a".repeat(64),
+        1,
+        true,
+        false,
+        true,
+    )
+    .unwrap();
+    let mut census = ClaudeRequestCensus::default();
+    census.insert_for_test(peer.to_str().unwrap(), record);
+    let index = fixture.root.join("index.json");
+    fs::write(
+        &index,
+        serde_json::to_vec(&json!({"generation":1,"claude_request_census":census})).unwrap(),
+    )
+    .unwrap();
+    fixture.input.census_index_path = Some(index);
+    vanish_after_plan(peer);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    assert_eq!(artifact["input_manifest"]["vanished_census_used"], 1);
+    assert_eq!(
+        artifact["input_manifest"]["vanished_no_census"]["held_targets"],
+        18
+    );
+    // Allocation precedes coverage holds, so positive census IDs are disclosed
+    // even when no target body can be produced.
+    assert!(artifact["b2_allocation"]["entries"]
+        .to_string()
+        .contains(&sha256_hex(b"req-t18-a")));
+    assert_eq!(output.summary["computed_unqualified_candidates"], 0);
+    fs::remove_dir_all(fixture.root).unwrap();
+}

@@ -29,7 +29,7 @@ over budget, and has an Exact/Empty shape. Its request hash prefixes count as
 present. Matching target IDs are excluded and the peer is classified
 `vanished_census_used`. Prefix collisions have negligible probability but can undercount money;
 these are not newly recovered exact IDs, line counts, ACKs or dollar proof.
-Available positive IDs from incomplete records are still used; their unknown remainder additionally uses the lineage hold. Retired/over-budget/stale-derivation records have no usable IDs and use the no-census fallback. A same-session target replica is the target's own counter, so its IDs stay in B2, as for a live replica. The snapshot records historical observed IDs, not necessarily the vanished file's latest revision.
+Available positive IDs from incomplete records are still used; their unknown remainder additionally uses the lineage hold. Twin/retired/over-budget/stale-derivation records have no usable IDs and use the no-census fallback. A same-session target replica is the target's own counter, so its IDs stay in B2, as for a live replica. Census prefixes absent from that owner's current request set trigger the existing divergent-replica owner hold, preventing its smaller body from replacing counted history. The snapshot records historical observed IDs, not necessarily the vanished file's latest revision.
 
 With no usable record the producer re-stats the peer once, at the end of the
 run after target rebuilds. A still-absent peer holds only related targets, disclosed as

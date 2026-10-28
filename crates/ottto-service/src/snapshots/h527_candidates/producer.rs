@@ -334,6 +334,22 @@ fn resolve_vanished(
                 .position(|target| target.source_session_id == owner)
         });
     if let Some(record) = record {
+        if let Some(owner) = owner_index {
+            let owned_hashes = originals[owner]
+                .request_ids
+                .iter()
+                .flatten()
+                .map(|id| claude_request_hash(id))
+                .collect::<BTreeSet<_>>();
+            for hash in record.request_hashes() {
+                if !owned_hashes.contains(hash) {
+                    // The census has only prefixes, not recoverable native IDs.
+                    // This set supplies only count/emptiness to the same owner
+                    // refusal used by live divergent replicas.
+                    scan.replica_divergent_ids[owner].insert(format!("census-prefix:{hash:016x}"));
+                }
+            }
+        }
         for (index, original) in originals.iter().enumerate() {
             for request_id in original.request_ids.iter().flatten() {
                 if record.holds_hash(claude_request_hash(request_id)) {
