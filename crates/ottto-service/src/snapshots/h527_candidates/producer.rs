@@ -1312,6 +1312,7 @@ pub(crate) fn produce(
         "inherited_copy_resolved_line_count": peers.inherited_resolved_line_count,
         "inherited_copy_absent_source_line_count": peers.inherited_absent_source_line_count,
         "vanished_census_used": peers.vanished_census_used,
+        "vanished_census_limit": "owned request IDs only; inherited fork lines and vanished-file fork edges unavailable",
         "vanished_no_census": {"peers": peers.vanished_no_census, "held_targets": peers.lineage_held.len()},
         "census_snapshot": census.as_ref().map(|census| json!({"generation": census.generation, "sha256": census.sha256})),
         "peer_unidentified_usage_note": "usage lines without a native request id cannot be compared; disclosed, not excluded",
