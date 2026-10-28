@@ -60,14 +60,15 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     );
 }
 
-/// One ambiguous rollout entry without committed owner coverage, per pass.
-/// Observation only: no identity, path, token value or persistent counter.
-pub(crate) fn codex_state_only_ambiguous_identity() {
-    traversal_point(
-        "codex_state_only_ambiguous_identity",
-        "codex",
-        &BTreeMap::from([("codex_state_only_ambiguous_identity", 1_u64)]),
-    );
+/// Per-pass observations, not distinct entries/files or a lifetime counter.
+pub(crate) fn codex_state_only_ambiguous_identity(observations: u64) {
+    if observations > 0 {
+        traversal_point(
+            "codex_state_only_ambiguous_identity",
+            "codex",
+            &BTreeMap::from([("codex_state_only_ambiguous_identity", observations)]),
+        );
+    }
 }
 
 /// Nonzero-only counters on the existing native_collection_page line.

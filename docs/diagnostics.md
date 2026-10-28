@@ -698,27 +698,32 @@ explicit release, including real durable I/O paths.
 
 ## Codex state-only coverage and retained bodies
 
-Prior state-only coverage uses the existing committed header/counting or
-protected owner hash with its last accepted fingerprint before consulting
-filename evidence. Accepted-body retention and coverage require nonempty exact
-file incidence whose entities are in the accepted ledger and not quarantined;
-a permanent refusal or local wire-size rejection grants neither. This also covers a header id outside both filename
-candidates. Such Codex index entries survive physical retirement and missing-file
-reconciliation, preserving prior coverage without rereading a transcript.
-Retention keeps the existing entry and strings for each accepted owner-bound
-body; it adds no field, store or cache, but those entries remain resident and
-persisted after their files disappear. Retention alone grants no joined-history,
-account or decoder authority. Claude and Pi retention are unchanged.
+Prior coverage retains both the uniquely resolved filename identity and the
+existing committed header/counting or protected owner hash, including a header
+outside both filename candidates. Accepted-body retention requires nonempty
+exact file incidence whose entities are accepted, not quarantined or decode-held;
+a permanent refusal or local wire-size rejection grants no new coverage.
 
-When a timestamp-shaped filename has two supported identities and no committed
-owner binding, both candidates are withheld from state-only output. The existing
-`local_resources` carrier emits stage `codex_state_only_ambiguous_identity` with
-`counts.codex_state_only_ambiguous_identity: 1` once per unresolved index entry
-per state-only pass. Sum observations to count decisions, not distinct sessions
-or money. No path, identity or token value is logged. Unambiguous legacy and
-modern names retain their existing filename fallback behavior.
+Missing ordinary accepted entries age out when their latest fingerprint semantic
+activity leaves the configured backfill window, using the existing window
+predicate rather than file mtime. Missing/invalid activity stays held conservatively;
+strong joined-history and unverified/decode holds retain their existing rules.
+Once a fresh accepted body for the same counting owner has at least as recent
+activity, the older ordinary body is retired. Its superseded fingerprint leaves
+the manifest so moved-then-resumed sessions agree with the server's current head.
+Opaque held incidence defers this cleanup. No new store, field or transcript read
+is introduced; Claude and Pi retention are unchanged.
 
-An emitted state-only total is not evidence of a server-side overwrite. Backend
-authority rules independently govern successor acceptance. A later complete
-native parse still emits its exclusive body for the same session even when an
-earlier state-only row exists; local prior coverage does not suppress that body.
+With a prior snapshot fingerprint, exactly two evidence-supported filename
+identities, and no committed owner coverage, both candidates are withheld from
+state-only output. No fingerprint preserves ordinary fallback; zero supported
+candidates are not counted. The existing `local_resources` carrier emits at most
+one `codex_state_only_ambiguous_identity` line per state-only pass, whose
+`counts.codex_state_only_ambiguous_identity` is the number of ambiguous entry
+observations in that pass. Repeated passes observe the same entries again: this
+is NOT a distinct-entry/file/session count, and sums must not be reported as
+files. No path, identity or token value is logged.
+
+A later complete native parse still emits its exclusive body for a session with
+an earlier state-only row. An emitted total alone does not prove a server-side
+overwrite; backend authority rules independently govern successor acceptance.

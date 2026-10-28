@@ -263,7 +263,7 @@ pub(super) struct CountingTombstone {
 
 /// The first valid owner a complete parse proved for this entry. An invalid
 /// (corrupt or future-format) binding never masks a valid one.
-fn proven_owner(entry: &ScanIndexEntry) -> Option<&String> {
+pub(super) fn proven_owner(entry: &ScanIndexEntry) -> Option<&String> {
     [
         entry.codex_counting_owner.as_ref(),
         entry.codex_protected_owner.as_ref(),
