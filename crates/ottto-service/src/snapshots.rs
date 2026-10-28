@@ -8149,9 +8149,10 @@ pub fn finalize_scan_after_policy_with_body_witness(
         .flat_map(BTreeSet::iter)
         .chain(index.codex_state_only_snapshot_fingerprints.values())
         .collect::<BTreeSet<_>>();
+    let opaque = index.decode_has_opaque_file_incidence();
     index
         .snapshot_activity_at
-        .retain(|fingerprint, _| current_fingerprints.contains(fingerprint));
+        .retain(|fingerprint, _| opaque || current_fingerprints.contains(fingerprint));
 }
 
 /// The producer-side event clock mirrored by the accepted-log append path.
@@ -45683,6 +45684,7 @@ impl ScanIndex {
                     .insert(fingerprint.clone());
             }
         }
+        self.retire_superseded_codex_bodies(&fresh);
         let current = self.current_snapshot_fingerprints();
         let opaque_incidence = self.decode_has_opaque_file_incidence();
         let carried = self.carried_ack_fingerprints();
@@ -45694,7 +45696,6 @@ impl ScanIndex {
                     .contains_key(fingerprint)
         });
         self.accepted_snapshot_fingerprints = retained;
-        self.retire_superseded_codex_bodies(&fresh);
     }
 
     #[cfg(test)]
@@ -47282,9 +47283,10 @@ impl ScanIndex {
         }
         result.restore_claude_empty_map_advances(empty_advances);
         let current = result.current_snapshot_fingerprints();
+        let opaque = result.decode_has_opaque_file_incidence();
         result
             .snapshot_activity_at
-            .retain(|fingerprint, _| current.contains(fingerprint));
+            .retain(|fingerprint, _| opaque || current.contains(fingerprint));
         result
     }
 
@@ -47401,8 +47403,9 @@ impl ScanIndex {
         }
         self.restore_claude_empty_map_advances(empty_advances);
         let current = self.current_snapshot_fingerprints();
+        let opaque = self.decode_has_opaque_file_incidence();
         self.snapshot_activity_at
-            .retain(|fingerprint, _| current.contains(fingerprint));
+            .retain(|fingerprint, _| opaque || current.contains(fingerprint));
         self
     }
 
@@ -47567,7 +47570,7 @@ impl ScanIndex {
                 }
             }
         }
-        let committable_fingerprints = file_snapshot_fingerprints
+        let mut committable_fingerprints = file_snapshot_fingerprints
             .values()
             .flat_map(BTreeSet::iter)
             .chain(codex_state_only_snapshot_fingerprints.values())
@@ -47615,6 +47618,9 @@ impl ScanIndex {
                 || committable_fingerprints.contains(fingerprint))
                 && !retained_quarantine.contains_key(fingerprint)
         });
+        if opaque_incidence {
+            committable_fingerprints.extend(&accepted_snapshot_fingerprints);
+        }
         let mut snapshot_activity_at = BTreeMap::new();
         for fingerprint in committable_fingerprints {
             if let Some(activity_at) = self
@@ -47857,10 +47863,8 @@ impl ScanIndex {
                     .iter()
                     .any(|fp| fresh.contains(fp))
             {
-                if let Some((owner, activity)) = entry
-                    .codex_counting_owner
-                    .as_ref()
-                    .zip(codex_file_activity(self, key))
+                if let (Some(owner), Some(activity)) =
+                    (&entry.codex_counting_owner, codex_file_activity(self, key))
                 {
                     let newest = newer.entry(owner.clone()).or_insert(activity);
                     *newest = (*newest).max(activity);
@@ -47870,39 +47874,30 @@ impl ScanIndex {
         let obsolete = self
             .files
             .iter()
-            .filter(|(key, entry)| {
-                !entry.codex_history_is_protected()
+            .filter_map(|(key, entry)| {
+                let new = newer.get(entry.codex_counting_owner.as_ref()?)?;
+                let old = codex_file_activity(self, key)?;
+                (!entry.codex_history_is_protected()
                     && !entry.has_unverified_source()
                     && codex_index_file_body_accepted(self, key, entry)
-                    && entry
-                        .codex_counting_owner
-                        .as_ref()
-                        .and_then(|owner| newer.get(owner))
-                        .zip(codex_file_activity(self, key))
-                        .is_some_and(|(new, old)| *new >= old)
-                    && self.file_snapshot_fingerprints[*key]
+                    && *new >= old
+                    && self.file_snapshot_fingerprints[key]
                         .iter()
-                        .all(|fp| !fresh.contains(fp))
+                        .all(|fp| !fresh.contains(fp)))
+                .then(|| key.clone())
             })
-            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
-        let mut removed = BTreeSet::new();
         for key in obsolete {
             self.files.remove(&key);
-            if let Some(fps) = self.file_snapshot_fingerprints.remove(&key) {
-                removed.extend(fps);
-            }
+            self.file_snapshot_fingerprints.remove(&key);
             self.terminal_jsonl_dispositions.remove(&key);
             self.drop_codex_proof_items(&key, None);
         }
-        for fp in self.upload_progress_ack_incidence() {
-            removed.remove(fp);
-        }
         if !self.decode_has_opaque_file_incidence() {
-            self.accepted_snapshot_fingerprints
-                .retain(|fp| !removed.contains(fp));
+            let mut current = self.current_snapshot_fingerprints();
+            current.extend(self.upload_progress_ack_incidence());
             self.snapshot_activity_at
-                .retain(|fp, _| !removed.contains(fp));
+                .retain(|fp, _| current.contains(fp));
         }
     }
 
@@ -59202,6 +59197,38 @@ mod tests {
             );
             settled = lenient_decode::read_bounded(&serde_json::to_vec(&settled).unwrap()).unwrap();
             assert_eq!(settled.current_snapshot_fingerprints(), server_heads);
+            settled = settled.committable_subset(&settled, &BTreeSet::new(), &BTreeMap::new());
+            assert!(settled.snapshot_activity_at.contains_key(&first_fp));
+            let previous = settled.clone();
+            settled = settled.with_locally_held_keys_reverted(
+                &previous,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            );
+            assert!(settled.snapshot_activity_at.contains_key(&first_fp));
+            settled = settled.into_locally_held_keys_reverted(
+                &previous,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            );
+            assert!(settled.snapshot_activity_at.contains_key(&first_fp));
+            let mut quiet = scan_source_roots(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut settled,
+                "2026-05-14T11:05:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap();
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut quiet, &mut settled);
+            settled = lenient_decode::read_bounded(&serde_json::to_vec(&settled).unwrap()).unwrap();
+            assert!(settled.snapshot_activity_at.contains_key(&first_fp));
+            assert!(settled.accepted_snapshot_fingerprints.contains(&first_fp));
+            assert_eq!(
+                serde_json::to_value(&settled).unwrap()["files"][opaque_key],
+                json!(false)
+            );
+            assert_eq!(settled.current_snapshot_fingerprints(), server_heads);
             // A later exact empty incidence resolves the unrelated opaque debt.
             settled
                 .file_snapshot_fingerprints
@@ -59210,6 +59237,8 @@ mod tests {
             assert!(server_heads.is_subset(&settled.accepted_snapshot_fingerprints));
             settled.record_accepted_snapshot_fingerprints(&server_heads);
             assert!(!settled.accepted_snapshot_fingerprints.contains(&first_fp));
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut quiet, &mut settled);
+            assert!(!settled.snapshot_activity_at.contains_key(&first_fp));
             assert!(!settled.files.contains_key(&local_index_key(&old)));
             assert_eq!(settled.current_snapshot_fingerprints(), server_heads);
         }
