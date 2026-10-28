@@ -2,15 +2,16 @@
 //! bundle (`h527_producer_input:v2`).
 //!
 //! It reads only the files the bundle names: the 18 target transcripts and
-//! every `.jsonl` file under the named peer roots. It never touches a scan
-//! index, upload progress, sidecar, network or daemon state, and it writes only
+//! every `.jsonl` file under the named peer roots, plus an optional read-only
+//! snapshot of the existing census index. It never touches upload progress,
+//! sidecars or network, and writes only
 //! to its own new output directory.
 //!
 //! Steps, in this order:
 //!
 //! 1. Parse each target with the unchanged Claude parser. A target needs a
-//!    complete parse, exactly one item, a native id on every counted request
-//!    and totals equal to the sum of its per-request usage.
+//!    complete parse, exactly one item, and totals equal to native-request
+//!    usage plus disclosed id-less residual usage.
 //! 2. Plan the peer walk from metadata alone, within explicit entry, file and
 //!    byte budgets. Any budget overrun or over-cap peer is counted and holds
 //!    every target before a single peer byte is read: never a partial census.
@@ -18,7 +19,8 @@
 //!    compare native request ids exactly, in memory, against all 18 targets. A
 //!    shrunk, rewritten or unreadable file, a compressed transcript or an
 //!    unparseable id-bearing line leaves coverage unknown, and then every
-//!    target is held without a body.
+//!    target is held without a body. Vanished peers use existing census ids,
+//!    else hold only related lineages after a final re-stat.
 //! 3. Resolve every fork-copied line, in peer and target files alike, per line:
 //!    it belongs to the session it names only if that session (or the source
 //!    its own copy names, recursively) counts the request. Otherwise its source
@@ -66,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 pub(crate) const PRODUCER_INPUT_CONTRACT_VERSION: &str = "h527_producer_input:v2";
-pub(crate) const PRODUCER_ARTIFACT_CONTRACT_VERSION: &str = "h527_producer_diagnostic:v2";
+pub(crate) const PRODUCER_ARTIFACT_CONTRACT_VERSION: &str = "h527_producer_diagnostic:v3";
 const PRODUCER_SUMMARY_CONTRACT_VERSION: &str = "h527_producer_summary:v1";
 const PRODUCER_DISCLOSURES_CONTRACT_VERSION: &str = "h527_producer_disclosures:v1";
 const B2_ALLOCATION_RULE: &str =
@@ -106,6 +108,229 @@ const NOT_REPRODUCED_STAGES: [&str; 6] = [
     "cache_head_identity: cache observations not attached, as with cache upload disabled",
 ];
 
+// SOURCE R4: all additional state is private to this offline diagnostic.
+use crate::snapshots::claude_request_census::{claude_request_hash, ClaudeRequestCensus};
+#[cfg(test)]
+thread_local! {
+    static AFTER_PLAN_FOR_TEST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+const VANISHED_ON_OPEN: &str = "vanished_on_open";
+const MAX_CENSUS_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone)]
+struct MissingUsage {
+    tuple: Option<String>,
+    dims: Dims,
+}
+fn sum_missing(missing: &[MissingUsage]) -> Option<Dims> {
+    missing
+        .iter()
+        .try_fold(Dims::default(), |sum, usage| sum.checked_add(usage.dims))
+}
+fn usage_tuple(
+    timestamp: Option<&str>,
+    model: Option<&str>,
+    usage: &UsageTotals,
+) -> Option<String> {
+    // Missing timestamp/model never establishes a copy. Hash only typed data,
+    // never transcript text. All eight counting dimensions participate.
+    Some(sha256_hex(
+        serde_json::to_string(&(timestamp?, model?, Dims::of_usage(usage).fields()))
+            .ok()?
+            .as_bytes(),
+    ))
+}
+fn line_usage_tuple(value: &Value) -> Option<String> {
+    if claude_fork_line_provenance(value) != ClaudeForkLineProvenance::None {
+        return None;
+    }
+    usage_tuple(
+        string_at(value, &["timestamp"])
+            .or_else(|| string_at(value, &["created_at"]))
+            .or_else(|| string_at(value, &["message", "created_at"]))
+            .as_deref(),
+        string_at(value, &["message", "model"])
+            .or_else(|| string_at(value, &["model"]))
+            .or_else(|| string_at(value, &["payload", "model"]))
+            .as_deref(),
+        &claude_code_delta_usage(value)?,
+    )
+}
+thread_local! {
+    static EXCLUDED_TUPLES: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+}
+struct TupleExclusionGuard(BTreeSet<String>);
+impl TupleExclusionGuard {
+    fn install(tuples: BTreeSet<String>) -> Self {
+        Self(EXCLUDED_TUPLES.with(|cell| cell.replace(tuples)))
+    }
+}
+impl Drop for TupleExclusionGuard {
+    fn drop(&mut self) {
+        EXCLUDED_TUPLES.with(|cell| {
+            cell.replace(std::mem::take(&mut self.0));
+        });
+    }
+}
+
+#[derive(Deserialize)]
+struct CensusFields {
+    generation: u64,
+    claude_request_census: ClaudeRequestCensus,
+}
+struct CensusSnapshot {
+    generation: u64,
+    sha256: String,
+    stamp: (u64, Option<std::time::SystemTime>, u64, u64),
+    records: ClaudeRequestCensus,
+}
+fn census_stamp(path: &Path) -> Result<(u64, Option<std::time::SystemTime>, u64, u64), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "census index stat refused")?;
+    if !metadata.is_file() {
+        return Err("census index must be a regular file".into());
+    }
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let identity = (0, 0);
+    Ok((
+        metadata.len(),
+        metadata.modified().ok(),
+        identity.0,
+        identity.1,
+    ))
+}
+impl CensusSnapshot {
+    fn read(path: &Path) -> Result<Self, String> {
+        let stamp = census_stamp(path)?;
+        let bytes =
+            read_bounded(path, MAX_CENSUS_INDEX_BYTES).map_err(|_| "census index read refused")?;
+        let fields: CensusFields =
+            serde_json::from_slice(&bytes).map_err(|_| "census index decode refused")?;
+        if census_stamp(path)? != stamp {
+            return Err(
+                "census index changed while copying; retry only after operator review".into(),
+            );
+        }
+        Ok(Self {
+            generation: fields.generation,
+            sha256: sha256_hex(&bytes),
+            stamp,
+            records: fields.claude_request_census,
+        })
+    }
+    fn verify(&self, path: &Path) -> Result<(), String> {
+        let before = census_stamp(path)?;
+        let (_, sha) = hash_file(path, MAX_CENSUS_INDEX_BYTES)
+            .map_err(|_| "census index verification refused")?;
+        if before != self.stamp || census_stamp(path)? != self.stamp || sha != self.sha256 {
+            return Err("census index changed during run; no output published".into());
+        }
+        Ok(())
+    }
+}
+
+fn family_root(path: &Path) -> Option<&str> {
+    claude_index_path_member_ref(path).map(|member| member.root)
+}
+fn project_name(path: &Path) -> Option<&std::ffi::OsStr> {
+    let root = family_root(path)?;
+    if let Some(subagents) = crate::snapshots::claude_family_subagents_dir(path, root) {
+        subagents.parent()?.parent()?.file_name()
+    } else {
+        path.parent()?.file_name()
+    }
+}
+fn root_id(session: &str) -> &str {
+    session.split("_agent-").next().unwrap_or(session)
+}
+fn same_lineage(left: &Path, right: &Path, edges: &[(String, String)]) -> bool {
+    let (Some(left_root), Some(right_root)) = (family_root(left), family_root(right)) else {
+        // An unclassifiable vanished path cannot prove non-lineage.
+        return true;
+    };
+    if left_root == right_root
+        || project_name(left)
+            .zip(project_name(right))
+            .is_some_and(|(a, b)| a == b)
+    {
+        return true;
+    }
+    let mut reached = BTreeSet::from([left_root.to_string()]);
+    loop {
+        let before = reached.len();
+        for (a, b) in edges {
+            let (a, b) = (root_id(a), root_id(b));
+            if reached.contains(a) || reached.contains(b) {
+                reached.insert(a.to_string());
+                reached.insert(b.to_string());
+            }
+        }
+        if reached.contains(right_root) {
+            return true;
+        }
+        if reached.len() == before {
+            return false;
+        }
+    }
+}
+fn resolve_vanished(
+    peer: &PlannedPeer,
+    input: &ProducerInput,
+    originals: &[TargetParse],
+    census: Option<&CensusSnapshot>,
+    scan: &mut PeerScan,
+    coverage: &mut GlobalCoverage,
+) {
+    let record = census
+        .and_then(|snapshot| snapshot.records.get(&peer.path.to_string_lossy()))
+        .filter(|record| {
+            record.proves_scan()
+                && !record.unverified_or_twin()
+                && record.can_bind_recomposed_body()
+        });
+    let witness = path_sha256(&peer.path);
+    if let Some(record) = record {
+        for (index, original) in originals.iter().enumerate() {
+            for request_id in original.request_ids.iter().flatten() {
+                if record.holds_hash(claude_request_hash(request_id)) {
+                    scan.hits[index].insert(
+                        request_id.clone(),
+                        PeerHit {
+                            path_sha256: witness.clone(),
+                            owner_session_sha256: None,
+                            line_count: 1,
+                            inherited_from_absent_source: false,
+                        },
+                    );
+                }
+            }
+        }
+        scan.vanished_census_used += 1;
+        scan.files.push(json!({"class": input.peer_roots[peer.root_index].class, "path_sha256": witness, "classification": "vanished_census_used", "census_hash_scheme": "sha256_prefix_64bit", "collision_policy": "conservative_exclusion"}));
+        return;
+    }
+    match fs::symlink_metadata(&peer.path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            scan.vanished_no_census += 1;
+            let mut held = Vec::new();
+            for (index, target) in input.targets.iter().enumerate() {
+                if same_lineage(&target.transcript_path, &peer.path, &scan.lineage_edges) {
+                    scan.lineage_held.insert(index);
+                    held.push(target.session_key_sha256.clone());
+                }
+            }
+            scan.files.push(json!({"class": input.peer_roots[peer.root_index].class, "path_sha256": witness, "classification": "vanished_no_census", "held_targets": held}));
+        }
+        _ => coverage.unknown.push(format!(
+            "vanished peer {witness} reappeared or restat refused"
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Input bundle
 
@@ -123,6 +348,9 @@ pub(crate) struct ProducerInput {
     pub(crate) bounds: InputBounds,
     #[serde(default)]
     pub(crate) catalog_prices: Option<CatalogPrices>,
+    /// Existing daemon scan index, opened read-only. No default discovery.
+    #[serde(default)]
+    pub(crate) census_index_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -450,13 +678,16 @@ fn line_request_id(value: &Value) -> Option<String> {
 /// reach the ordinary step unchanged, so their own provenance handling holds.
 fn apply_claude_code_line_excluding(value: &Value, accumulator: &mut SnapshotAccumulator) {
     let excluded = claude_fork_line_provenance(value) == ClaudeForkLineProvenance::None
-        && line_request_id(value).is_some_and(|request_id| {
-            EXCLUDED_REQUEST_IDS.with(|cell| {
-                cell.borrow()
-                    .as_ref()
-                    .is_some_and(|excluded| excluded.contains(&request_id))
-            })
-        });
+        && (line_request_id(value).is_none()
+            && line_usage_tuple(value)
+                .is_some_and(|tuple| EXCLUDED_TUPLES.with(|cell| cell.borrow().contains(&tuple)))
+            || line_request_id(value).is_some_and(|request_id| {
+                EXCLUDED_REQUEST_IDS.with(|cell| {
+                    cell.borrow()
+                        .as_ref()
+                        .is_some_and(|excluded| excluded.contains(&request_id))
+                })
+            }));
     if excluded {
         // Same first step as the ordinary line: the session id is file-level.
         if accumulator.source_session_id.is_none() {
@@ -470,6 +701,8 @@ fn apply_claude_code_line_excluding(value: &Value, accumulator: &mut SnapshotAcc
 }
 
 struct ParsedTarget {
+    missing: Vec<MissingUsage>,
+    lineage_edges: Vec<(String, String)>,
     complete: bool,
     snapshots: Vec<SnapshotItem>,
 }
@@ -513,7 +746,7 @@ fn parse_target_transcript(
             apply_claude_code_line_excluding,
             Some(ExclusionGuard::install(excluded)),
         ),
-        None => (apply_claude_code_line, None),
+        None => (apply_claude_code_line_excluding, None),
     };
     let mut listed = ScanIndex::default();
     if let Some(member) = claude_index_path_member_ref(path) {
@@ -532,6 +765,33 @@ fn parse_target_transcript(
     )
     .map_err(|error| format!("parse: {error:#}"))?;
     while !parser.step().map_err(|error| format!("parse: {error:#}"))? {}
+    // Reuse the ordinary resolver's already-buffered responses, including its
+    // progressive-record deduplication. No extra transcript read.
+    let mut missing = Vec::new();
+    for response in parser.accumulator.claude_responses.values() {
+        if let Ok(response) = response
+            .clone()
+            .resolve_classified(&parser.accumulator.claude_responses.selectors)
+        {
+            if response.request_id.is_none() {
+                missing.push(MissingUsage {
+                    tuple: usage_tuple(
+                        response.terminal_timestamp.as_deref(),
+                        response.model.as_deref(),
+                        &response.usage,
+                    ),
+                    dims: Dims::of_usage(&response.usage),
+                });
+            }
+        }
+    }
+    let lineage_edges = parser
+        .accumulator
+        .claude_fork_parent
+        .as_ref()
+        .zip(parser.accumulator.source_session_id.as_ref())
+        .map(|(parent, child)| vec![(parent.clone(), child.clone())])
+        .unwrap_or_default();
     let parsed = parser
         .finish_with_repository_identity(
             &opened,
@@ -550,6 +810,8 @@ fn parse_target_transcript(
         )
         .map_err(|error| format!("parse: {error:#}"))?;
     Ok(ParsedTarget {
+        missing,
+        lineage_edges,
         complete: parsed.complete(),
         snapshots: parsed.snapshots,
     })
@@ -590,6 +852,8 @@ struct TargetParse {
 }
 
 struct OriginalTarget {
+    missing: Vec<MissingUsage>,
+    lineage_edges: Vec<(String, String)>,
     item: SnapshotItem,
     request_ids: BTreeSet<String>,
     totals: Dims,
@@ -693,6 +957,11 @@ struct PeerScan {
     target_inherited_copy_line_count: u64,
     inherited_resolved_line_count: u64,
     inherited_absent_source_line_count: u64,
+    vanished_census_used: u64,
+    vanished_no_census: u64,
+    lineage_held: BTreeSet<usize>,
+    lineage_edges: Vec<(String, String)>,
+    tuple_hits: Vec<BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -764,6 +1033,11 @@ pub(crate) fn produce(
     }
     let upload_policy = SnapshotUploadPolicy::from(input.upload_policy);
     let target_count = input.targets.len();
+    let census = input
+        .census_index_path
+        .as_deref()
+        .map(CensusSnapshot::read)
+        .transpose()?;
     let mut coverage = GlobalCoverage::default();
 
     // 1. Targets: exact files and canonical original request sets.
@@ -797,7 +1071,14 @@ pub(crate) fn produce(
     }
 
     // 2. Peers: one bounded streaming pass, exact native id comparison.
-    let peers = scan_peers(input, &files, &originals, &mut coverage);
+    let peers = scan_peers(input, &files, &originals, &mut coverage, census.as_ref());
+
+    // Refuse concurrent state publication even if no vanished peer used it.
+    // Atomic replacement, same-generation rewrites and in-place writes are all
+    // detected by the content digest plus opened/path metadata and generation.
+    if let (Some(path), Some(snapshot)) = (&input.census_index_path, &census) {
+        snapshot.verify(path)?;
+    }
 
     // 3. B2 allocation for the whole batch, frozen before bodies and money.
     let allocation = allocate(input, &originals, &peers)?;
@@ -918,6 +1199,9 @@ pub(crate) fn produce(
         "target_inherited_copy_line_count": peers.target_inherited_copy_line_count,
         "inherited_copy_resolved_line_count": peers.inherited_resolved_line_count,
         "inherited_copy_absent_source_line_count": peers.inherited_absent_source_line_count,
+        "vanished_census_used": peers.vanished_census_used,
+        "vanished_no_census": {"peers": peers.vanished_no_census, "held_targets": peers.lineage_held.len()},
+        "census_snapshot": census.as_ref().map(|census| json!({"generation": census.generation, "sha256": census.sha256})),
         "peer_unidentified_usage_note": "usage lines without a native request id cannot be compared; disclosed, not excluded",
     });
     let artifact = json!({
@@ -1213,13 +1497,12 @@ fn original_target(
         request_ids: Some(request_ids.clone()),
         original: Err(TargetHold::new(HeldReason::MissingEvidence, detail)),
     };
-    // Every counted request needs a native id for exact comparison.
-    if item.claude_usage_occurrences.len() != request_ids.len()
-        || item.request_count != request_ids.len() as u64
-    {
-        return held("counted usage without a native request id");
+    // Id-less responses are disclosed residuals, not missing money. A duplicate
+    // native id on distinct responses is still unsupported.
+    if item.claude_usage_occurrences.len() != request_ids.len() {
+        return held("native request occurrence set does not reconcile");
     }
-    if request_ids.is_empty() {
+    if item.request_count == 0 {
         return held("no counted usage");
     }
     let totals = Dims::of_item(&item);
@@ -1228,7 +1511,8 @@ fn original_target(
             .values()
             .map(|occurrence| &occurrence.usage),
     );
-    if occurrence_sum != Some(totals) {
+    let missing_sum = sum_missing(&parsed.missing);
+    if occurrence_sum.and_then(|dims| dims.checked_add(missing_sum?)) != Some(totals) {
         return held("unsupported grain: item totals differ from per-request usage");
     }
     if let Some(detail) = row_mismatch(&item, totals) {
@@ -1245,6 +1529,8 @@ fn original_target(
     TargetParse {
         request_ids: Some(request_ids.clone()),
         original: Ok(OriginalTarget {
+            missing: parsed.missing,
+            lineage_edges: parsed.lineage_edges,
             item,
             request_ids,
             totals,
@@ -1331,10 +1617,12 @@ fn scan_peers(
     targets: &[TargetFile],
     originals: &[TargetParse],
     coverage: &mut GlobalCoverage,
+    census: Option<&CensusSnapshot>,
 ) -> PeerScan {
     let target_count = targets.len();
     let mut scan = PeerScan {
         hits: vec![BTreeMap::new(); target_count],
+        tuple_hits: vec![BTreeSet::new(); target_count],
         same_session_line_count: vec![0; target_count],
         shared_target_replica_line_count: 0,
         replica_divergent_ids: vec![BTreeSet::new(); target_count],
@@ -1352,6 +1640,50 @@ fn scan_peers(
         .iter()
         .filter_map(|file| file.canonical_path.clone())
         .collect::<BTreeSet<_>>();
+    for (index, original) in originals.iter().enumerate() {
+        let Ok(original) = &original.original else {
+            continue;
+        };
+        for (other_index, other) in originals.iter().enumerate() {
+            if index == other_index {
+                continue;
+            }
+            let Ok(other) = &other.original else {
+                continue;
+            };
+            for missing in &original.missing {
+                let Some(tuple) = &missing.tuple else {
+                    continue;
+                };
+                let native_match = other.item.claude_usage_occurrences.values().any(|usage| {
+                    usage_tuple(
+                        usage.timestamp.as_deref(),
+                        usage.model.as_deref(),
+                        &usage.usage,
+                    )
+                    .as_ref()
+                        == Some(tuple)
+                });
+                let rank = |i: usize| {
+                    (
+                        input.targets[i].b2_first_ack_order.unwrap_or(u64::MAX),
+                        &input.targets[i].session_key_sha256,
+                    )
+                };
+                let residual_match = rank(other_index) < rank(index)
+                    && other
+                        .missing
+                        .iter()
+                        .any(|missing| missing.tuple.as_ref() == Some(tuple));
+                if native_match || residual_match {
+                    scan.tuple_hits[index].insert(format!(
+                        "{}\n{tuple}",
+                        input.targets[other_index].transcript_path.to_string_lossy()
+                    ));
+                }
+            }
+        }
+    }
     let mut canonical_roots = Vec::new();
     for root in &input.peer_roots {
         match fs::canonicalize(&root.path) {
@@ -1371,6 +1703,13 @@ fn scan_peers(
         &mut scan,
         coverage,
     );
+    #[cfg(test)]
+    AFTER_PLAN_FOR_TEST.with(|cell| {
+        if let Some(run) = cell.borrow_mut().take() {
+            run();
+        }
+    });
+    let mut vanished = Vec::new();
     let mut root_totals = vec![(0_u64, 0_u64); canonical_roots.len()];
     if coverage.cap_overflow.is_empty() {
         for peer in &planned {
@@ -1382,6 +1721,16 @@ fn scan_peers(
                 break;
             }
             let bytes_before = scan.total_bytes;
+            // Only an ENOENT on the initial open gets the vanished-peer rule.
+            // Later read/stat failures retain the existing global fail-closed gate.
+            if fs::metadata(&peer.path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                vanished.push(peer);
+                scan.file_count += 1;
+                root_totals[peer.root_index].0 += 1;
+                continue;
+            }
             let outcome = scan_peer_file(
                 &peer.path,
                 input.bounds,
@@ -1402,6 +1751,9 @@ fn scan_peers(
                         "size_bytes": bytes,
                         "content_sha256": content_sha256,
                     }));
+                }
+                Err(detail) if detail == VANISHED_ON_OPEN => {
+                    vanished.push(peer);
                 }
                 Err(detail) => {
                     scan.files.push(json!({
@@ -1448,6 +1800,18 @@ fn scan_peers(
     }
     scan_target_copies(input, targets, originals, &holders, &mut scan, coverage);
     resolve_fork_copies(&mut scan, &holders, &session_index, originals);
+    for original in originals
+        .iter()
+        .filter_map(|parse| parse.original.as_ref().ok())
+    {
+        scan.lineage_edges
+            .extend(original.lineage_edges.iter().cloned());
+    }
+    // Re-stat exactly once at the end. Reappeared/unknown peers keep the old
+    // global hold; still absent peers without usable census hold only lineage.
+    for peer in vanished {
+        resolve_vanished(peer, input, originals, census, &mut scan, coverage);
+    }
     scan
 }
 
@@ -1659,6 +2023,7 @@ struct TargetCopies {
     content_sha256: String,
     /// (request id, the source session the copy names)
     copies: Vec<(String, Option<String>)>,
+    lineage_edges: Vec<(String, String)>,
 }
 
 /// Stream one target transcript for its fork-copied lines carrying a request
@@ -1673,6 +2038,7 @@ fn read_target_copies(
     let mut total = 0_u64;
     let mut line = Vec::new();
     let mut copies = Vec::new();
+    let mut lineage_edges = Vec::new();
     loop {
         line.clear();
         let read = (&mut reader)
@@ -1691,6 +2057,9 @@ fn read_target_copies(
         let Ok(value) = serde_json::from_slice::<Value>(text) else {
             continue;
         };
+        if let Some((owner, parent)) = line_session_id(&value).zip(forked_from_session(&value)) {
+            lineage_edges.push((owner, parent));
+        }
         if claude_fork_line_provenance(&value) != ClaudeForkLineProvenance::Inherited
             || claude_code_delta_usage(&value).is_none()
         {
@@ -1706,6 +2075,7 @@ fn read_target_copies(
         size_bytes: total,
         content_sha256: format!("{:x}", digest.finalize()),
         copies,
+        lineage_edges,
     })
 }
 
@@ -1816,7 +2186,13 @@ fn scan_peer_file(
     originals: &[TargetParse],
     scan: &mut PeerScan,
 ) -> Result<(u64, String), String> {
-    let file = File::open(path).map_err(|error| format!("open: {error}"))?;
+    let file = File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            VANISHED_ON_OPEN.to_string()
+        } else {
+            format!("open: {error}")
+        }
+    })?;
     let before = file.metadata().map_err(|error| format!("stat: {error}"))?;
     let opened_len = before.len();
     if opened_len > bounds.max_peer_file_bytes {
@@ -1862,7 +2238,12 @@ fn scan_peer_file(
             ]
             .iter()
             .any(|key| contains(text, key));
-        if !has_id_key && !may_name_session && !contains(text, b"usage") {
+        if !has_id_key
+            && !may_name_session
+            && !contains(text, b"usage")
+            && !contains(text, b"parentSessionId")
+            && !contains(text, b"forkedFrom")
+        {
             continue;
         }
         let Ok(value) = serde_json::from_slice::<Value>(text) else {
@@ -1886,6 +2267,32 @@ fn scan_peer_file(
         };
         if file_session.is_none() {
             file_session = line_session_id(&value);
+        }
+        let owner = subagent_session.as_ref().or(file_session.as_ref());
+        for parent in [
+            forked_from_session(&value),
+            string_at(&value, &["parentSessionId"]),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(owner) = owner {
+                scan.lineage_edges.push((owner.clone(), parent));
+            }
+        }
+        // Retain only tuples that a target's already-resolved id-less response
+        // needs. Same-lineage check is repeated after the full graph is known.
+        if let Some(tuple) = line_usage_tuple(&value) {
+            for (index, original) in originals.iter().enumerate() {
+                if original.original.as_ref().is_ok_and(|original| {
+                    original
+                        .missing
+                        .iter()
+                        .any(|missing| missing.tuple.as_ref() == Some(&tuple))
+                }) {
+                    scan.tuple_hits[index].insert(format!("{}\n{}", path.to_string_lossy(), tuple));
+                }
+            }
         }
         let provenance = claude_fork_line_provenance(&value);
         let counted_usage = claude_code_delta_usage(&value).is_some();
@@ -2156,7 +2563,12 @@ fn build_target(
         "request_set_fingerprint": request_set_fingerprint(&original.request_ids),
         "totals": original.totals.json(),
     });
-    if let Some(reason) = coverage.held_reason() {
+    if let Some(reason) = coverage.held_reason().or_else(|| {
+        peers
+            .lineage_held
+            .contains(&index)
+            .then_some(HeldReason::IncompleteCensus)
+    }) {
         return hold(
             report,
             TargetHold::new(
@@ -2198,8 +2610,39 @@ fn build_target(
             .collect::<Option<Vec<_>>>()
             .and_then(sum_dims)
     };
-    let (Some(excluded_dims), Some(kept_dims)) = (usage_of(&excluded_ids), usage_of(&kept_ids))
-    else {
+    let matched = original
+        .missing
+        .iter()
+        .filter(|missing| {
+            missing.tuple.as_ref().is_some_and(|tuple| {
+                peers.tuple_hits[index].iter().any(|hit| {
+                    hit.rsplit_once('\n').is_some_and(|(path, found)| {
+                        found == tuple
+                            && same_lineage(
+                                &target.transcript_path,
+                                Path::new(path),
+                                &peers.lineage_edges,
+                            )
+                    })
+                })
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let matched_tuples = matched
+        .iter()
+        .filter_map(|missing| missing.tuple.clone())
+        .collect::<BTreeSet<_>>();
+    let missing_dims = sum_missing(&original.missing).expect("validated missing sum");
+    let matched_dims = sum_missing(&matched).expect("subset sum");
+    let residual_dims = missing_dims.checked_sub(matched_dims).expect("subset");
+    report["missing_evidence_counted"] = json!({"lines": residual_dims.request_count, "totals": residual_dims.json(), "usd": Value::Null, "usd_basis": "admission_catalog_required"});
+    report["missing_evidence_matched_by_tuple"] =
+        json!({"lines": matched.len(), "totals": matched_dims.json()});
+    let (Some(excluded_dims), Some(kept_dims)) = (
+        usage_of(&excluded_ids).and_then(|dims| dims.checked_add(matched_dims)),
+        usage_of(&kept_ids).and_then(|dims| dims.checked_add(residual_dims)),
+    ) else {
         return hold(
             report,
             TargetHold::new(
@@ -2260,7 +2703,7 @@ fn build_target(
             "totals": kept_dims.json(),
         },
     });
-    if kept_ids.is_empty() {
+    if kept_ids.is_empty() && residual_dims.request_count == 0 {
         return hold(
             report,
             TargetHold::new(HeldReason::MissingEvidence, "every request is excluded"),
@@ -2268,7 +2711,8 @@ fn build_target(
     }
 
     // Rebuild through the same parser, then reconcile exactly.
-    let mut item = if excluded_ids.is_empty() {
+    let _tuple_guard = TupleExclusionGuard::install(matched_tuples.clone());
+    let mut item = if excluded_ids.is_empty() && matched_tuples.is_empty() {
         original.item.clone()
     } else {
         let parsed = match parse_target_transcript(
@@ -2405,7 +2849,11 @@ fn build_target(
         "allocation_identity_changes": identity_changes,
         "note": "no Contract-5 permit in this producer: every kept request is untagged under its starting subscription; an identity-less body cannot authorize replacing an existing name",
     });
-    let estimate = estimate_dollars(input.catalog_prices.as_ref(), original, &excluded_ids);
+    let estimate = if matched.is_empty() {
+        estimate_dollars(input.catalog_prices.as_ref(), original, &excluded_ids)
+    } else {
+        Err("tuple exclusions require admission catalog valuation".to_string())
+    };
     report["exclusion_estimate"] = match &estimate {
         Ok(dollars) => json!({
             "label": ESTIMATE_LABEL,

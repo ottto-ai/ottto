@@ -306,6 +306,7 @@ fn fixture() -> Fixture {
             max_peer_file_bytes: 1 << 20,
             max_line_bytes: 1 << 16,
         },
+        census_index_path: None,
         catalog_prices: Some(CatalogPrices {
             publication: CatalogPublication {
                 source: "fixture catalog".to_string(),
@@ -906,4 +907,193 @@ fn directory_listing_stops_at_the_walk_budget() {
         .expect("listing")
         .expect("within budget");
     assert_eq!((entries.len(), count), (5, 5));
+}
+
+fn vanish_after_plan(path: PathBuf) {
+    AFTER_PLAN_FOR_TEST.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(move || {
+            fs::remove_file(path).expect("vanish planned peer");
+        }))
+    });
+}
+
+fn add_vanishing_peer(input: &ProducerInput, project: &str) -> PathBuf {
+    let path = input.peer_roots[0]
+        .path
+        .join(project)
+        .join(format!("{}.jsonl", session_id(900)));
+    write_transcript(&path, &session_id(900), &[("req-t18-a", 25, 2, 100)]);
+    path
+}
+
+#[test]
+fn source_r4_vanished_census_excludes_shared_ids() {
+    use crate::snapshots::claude_request_census::claude_request_census_record;
+    let mut fixture = fixture();
+    let peer = add_vanishing_peer(&fixture.input, "proj-other");
+    let parsed =
+        parse_target_transcript(&peer, &fixture.input.collected_at, false, false, None).unwrap();
+    let record = claude_request_census_record(
+        &(session_id(900), session_id(900)),
+        &parsed.snapshots,
+        vec![],
+        &"a".repeat(64),
+        1,
+        true,
+        false,
+        false,
+    )
+    .expect("record");
+    let mut census = ClaudeRequestCensus::default();
+    census.insert_for_test(peer.to_str().unwrap(), record);
+    let index_path = fixture.root.join("index.json");
+    let bytes =
+        serde_json::to_vec(&json!({"generation": 1, "claude_request_census": census})).unwrap();
+    fs::write(&index_path, &bytes).unwrap();
+    fixture.input.census_index_path = Some(index_path.clone());
+    vanish_after_plan(peer);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    assert_eq!(artifact["input_manifest"]["vanished_census_used"], 1);
+    assert_eq!(
+        target_report(&artifact, 18)["partition"]["excluded"]["request_count"],
+        1
+    );
+    assert_eq!(artifact["global_coverage"]["complete"], true);
+    assert_eq!(
+        fs::read(index_path).unwrap(),
+        bytes,
+        "producer cannot write census"
+    );
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_vanished_without_census_holds_only_lineage() {
+    let mut fixture = fixture();
+    // Put target 18 in a separate project, with its own unchanged bytes.
+    let unrelated = fixture.input.peer_roots[0]
+        .path
+        .join("proj-unrelated")
+        .join(format!("{}.jsonl", session_id(18)));
+    fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+    fs::rename(&fixture.input.targets[17].transcript_path, &unrelated).unwrap();
+    fixture.input.targets[17].transcript_path = unrelated;
+    let peer = add_vanishing_peer(&fixture.input, "proj-a");
+    vanish_after_plan(peer);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    assert_eq!(artifact["input_manifest"]["vanished_no_census"]["peers"], 1);
+    assert_eq!(
+        artifact["input_manifest"]["vanished_no_census"]["held_targets"],
+        17
+    );
+    assert_eq!(
+        target_report(&artifact, 1)["held_reason"],
+        "incomplete_census"
+    );
+    assert_eq!(
+        target_report(&artifact, 18)["candidate_status"],
+        "computed_unqualified"
+    );
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_unrelated_target_proceeds_and_copy_lineage_is_transitive() {
+    let fixture = fixture();
+    let peer = add_vanishing_peer(&fixture.input, "proj-unrelated");
+    vanish_after_plan(peer);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    assert_eq!(
+        artifact["input_manifest"]["vanished_no_census"]["held_targets"],
+        0
+    );
+    assert_eq!(
+        target_report(&artifact, 18)["candidate_status"],
+        "computed_unqualified"
+    );
+    let left = Path::new("/projects/a/root-a.jsonl");
+    let right = Path::new("/projects/b/root-b.jsonl");
+    assert!(same_lineage(
+        left,
+        right,
+        &[
+            ("root-a".into(), "middle".into()),
+            ("middle".into(), "root-b".into())
+        ]
+    ));
+    assert!(!same_lineage(left, right, &[]));
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_census_rewrite_refuses_output_even_same_generation() {
+    let mut fixture = fixture();
+    let path = fixture.root.join("index.json");
+    fs::write(&path, b"{\"generation\":1,\"claude_request_census\":{}}").unwrap();
+    fixture.input.census_index_path = Some(path.clone());
+    AFTER_PLAN_FOR_TEST.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(move || {
+            fs::write(
+                path,
+                b"{\"generation\":1,\"claude_request_census\":{},\"changed\":true}",
+            )
+            .unwrap();
+        }))
+    });
+    let error = produce(&fixture.input, &"0".repeat(64), &fixture_build())
+        .err()
+        .unwrap();
+    assert!(error.contains("census index changed"), "{error}");
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_missing_evidence_counted_and_exact_tuple_copy_excluded() {
+    for (peer_project, expect_match) in [
+        (None, false),
+        (Some("proj-a"), true),
+        (Some("proj-unrelated"), false),
+    ] {
+        let fixture = fixture();
+        let target = &fixture.input.targets[17];
+        let mut missing = assistant_line(&target.source_session_id, 3, ("missing", 123, 7, 456));
+        missing.as_object_mut().unwrap().remove("requestId");
+        let mut lines = transcript_lines(&target.source_session_id, &[("req-t18-a", 25, 2, 100)]);
+        lines.push(missing.clone());
+        write_lines(&target.transcript_path, &lines);
+        if let Some(project) = peer_project {
+            missing["sessionId"] = json!(session_id(901));
+            write_lines(
+                &fixture.input.peer_roots[0]
+                    .path
+                    .join(project)
+                    .join(format!("{}.jsonl", session_id(901))),
+                &[missing],
+            );
+        }
+        let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+        let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+        let report = target_report(&artifact, 18);
+        assert_eq!(
+            report["candidate_status"], "computed_unqualified",
+            "{report}"
+        );
+        assert_eq!(
+            report["missing_evidence_counted"]["lines"],
+            u64::from(!expect_match)
+        );
+        assert_eq!(
+            report["missing_evidence_matched_by_tuple"]["lines"],
+            u64::from(expect_match)
+        );
+        assert_eq!(
+            report["body"]["item_totals"]["input_tokens"],
+            if expect_match { 25 } else { 148 }
+        );
+        assert!(report["missing_evidence_counted"]["usd"].is_null());
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
 }
