@@ -1295,7 +1295,6 @@ mod tests {
         let json = serde_json::to_value(&probe.full_causes).unwrap();
         assert_eq!(json["restore_outcome"]["restored"], 1);
     }
-    use super::*;
 
     #[test]
     fn history_proof_correction_deferral_is_counted() {
