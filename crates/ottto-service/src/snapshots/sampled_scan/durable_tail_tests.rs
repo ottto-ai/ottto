@@ -775,7 +775,7 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
     ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
         match self {
             Self::Restored(taken) => Some(*taken),
-            Self::Miss => None,
+            Self::Miss(_) => None,
             Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }
     }
@@ -1253,4 +1253,192 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     let (_, disk_counters) = cache.durable_counters(source).unwrap();
     assert_eq!(disk_counters.gc_records_deleted, 1);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn restore_scope_attribution_is_typed_and_preserves_binding_formula() {
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("diagnostic-namespace".into());
+    let scope = Scope("diagnostic-scope".into());
+    let mut index = ScanIndex {
+        active_effective_upload_body_witness_revision: 3,
+        ..ScanIndex::default()
+    };
+    index.claude_money_birth_store.set_money_rule_version(2);
+    let interpretation = Interpretation::of(source, "fixture", &index, false, &namespace);
+    let base = replay_scope(source, &scope, &index, &interpretation, None);
+    let prior_formula = store::replay_scope_digest(
+        &store::scope_digest(
+            &scope.0,
+            &codec::allowlist_digest(source),
+            &interpretation.identity_contract,
+            &interpretation.counting_view,
+        ),
+        crate::snapshot_sync::effective_upload_body_witness_revision(source),
+        index.active_effective_upload_body_witness_revision,
+        index.claude_money_birth_store.money_rule_version(),
+        claude_request_money::e2::enabled(),
+    );
+    assert_eq!(
+        base, prior_formula,
+        "existing persisted binding is unchanged"
+    );
+    assert_eq!(
+        unregistered_scope(source, &scope, &index, &interpretation, base),
+        None
+    );
+    index.active_effective_upload_body_witness_revision = 4;
+    let body = Obligation {
+        kind: ObligationKind::BodyWitness,
+        revision: 4,
+    };
+    assert_eq!(
+        unregistered_scope(source, &scope, &index, &interpretation, base),
+        Some(body)
+    );
+    assert_eq!(
+        MissClass::Unregistered(body).label(),
+        "unregistered_replay.body_witness"
+    );
+    assert_eq!(
+        unregistered_scope(
+            source,
+            &Scope("other".into()),
+            &index,
+            &interpretation,
+            base
+        ),
+        None
+    );
+    index.active_effective_upload_body_witness_revision = 3;
+    index.claude_money_birth_store.set_money_rule_version(3);
+    let money = Obligation {
+        kind: ObligationKind::MoneyRule,
+        revision: 3,
+    };
+    assert_eq!(
+        unregistered_scope(source, &scope, &index, &interpretation, base),
+        Some(money)
+    );
+    assert_eq!(
+        MissClass::Unregistered(money).label(),
+        "unregistered_replay.money_rule"
+    );
+    // Codex has no money-rule scope input, even when the store knows a rule.
+    let codex = SnapshotSource::Codex;
+    let codex_scope = replay_scope(codex, &scope, &index, &interpretation, None);
+    assert_eq!(
+        unregistered_scope(codex, &scope, &index, &interpretation, codex_scope),
+        None
+    );
+}
+
+#[test]
+fn restore_reports_each_early_exit_without_changing_old_totals() {
+    let root = crate::test_scratch::private_dir("ottto-restore-provenance");
+    let _lock = test_locks::hold(&root);
+    let path = root.join("fixture.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("restore-outcome".into());
+    let scope = Scope("restore-file".into());
+    let index_path = root.join("index.json");
+    let cache = SharedCache::default();
+    let mut index = ScanIndex::default();
+    let attempt = |index: &ScanIndex| {
+        let interpretation = Interpretation::of(source, &key, index, false, &namespace);
+        cache.durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            index,
+            &interpretation,
+        )
+    };
+    let label = |outcome: RestoreOutcome| match outcome {
+        RestoreOutcome::Miss(class) => class.label(),
+        _ => panic!("expected a typed miss"),
+    };
+    assert_eq!(label(attempt(&index)), "no_entry");
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp",
+            "effective_upload_body_witness_revision":3
+        }))
+        .unwrap(),
+    );
+    index.active_effective_upload_body_witness_revision = 3;
+    assert_eq!(label(attempt(&index)), "unavailable");
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    assert_eq!(label(attempt(&index)), "missing");
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    assert_eq!(label(attempt(&index)), "ineligible.selection_cleared");
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = "fp".into();
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .effective_upload_body_witness_revision = 2;
+    assert_eq!(label(attempt(&index)), "ineligible.history_owed");
+    let (old, disk) = cache.durable_counters(source).unwrap();
+    assert_eq!((old.restore_attempts, old.missing, old.restored), (3, 1, 0));
+    assert_eq!(old.ineligible["selection_cleared"], 1);
+    assert_eq!(old.ineligible["history_owed"], 1);
+    assert_eq!(old.durable_held, [0; 5]);
+    let text = old.summary(source, &disk);
+    assert!(!text.contains("restore_attempts="));
+    assert!(text.contains("disk_records="));
+    assert!(text.contains("not_persisted="));
+    // No new record or recovery operation is performed by these diagnostics.
+    assert_eq!(disk.records_read, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn certificate_read_error_is_not_edit_evidence() {
+    let root = crate::test_scratch::private_dir("ottto-certificate-read-error");
+    let path = root.join("fixture.jsonl");
+    std::fs::write(&path, b"{\"n\":1}\n").unwrap();
+    let scope = Scope("certificate-error".into());
+    let certificate = certificate(&path, &scope);
+    // Metadata succeeds; the first existing sample read fails on a write-only FD.
+    let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    assert_eq!(
+        certificate.restore(&mut held, scope.clone()).err(),
+        Some(CertificateRefusal::ReadError)
+    );
+    assert_eq!(
+        MissClass::Failure(Failure::Certificate(CertificateRefusal::ReadError)).label(),
+        "certificate_refused.read_error"
+    );
+    let mut invalid = certificate.clone();
+    invalid.sample_len += 1;
+    assert_eq!(
+        invalid
+            .restore(&mut File::open(&path).unwrap(), scope.clone())
+            .err(),
+        Some(CertificateRefusal::Changed(FullReason::InvalidCheckpoint))
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(1)
+        .unwrap();
+    assert_eq!(
+        certificate
+            .restore(&mut File::open(&path).unwrap(), scope)
+            .err(),
+        Some(CertificateRefusal::Changed(FullReason::Shrunk))
+    );
+    let _ = std::fs::remove_dir_all(root);
 }

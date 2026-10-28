@@ -1475,8 +1475,15 @@ impl Checkpoint {
     }
 }
 
+/// A sample I/O failure is not evidence that this file was edited.
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))] // First production caller: the M1 restore hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CertificateRefusal {
+    Changed(FullReason),
+    ReadError,
+}
+
+#[cfg(unix)]
 impl DurableCertificate {
     /// Whether the held FD is still this certificate's object with `[0, s)`
     /// unchanged as far as samples can tell: the same device, inode and (when
@@ -1485,8 +1492,14 @@ impl DurableCertificate {
     /// the windows were read. ctime is never compared. A refusal is the reason
     /// the read must be Full; no partial state exists to undo. It seeks the
     /// FD; the caller's read plan positions it again before any native read.
+    #[cfg(test)]
     pub(crate) fn admits(&self, file: &mut File) -> Result<DurableAdmission, FullReason> {
-        self.admit_samples(file).map(|(admission, ..)| admission)
+        self.admit_samples(file)
+            .map(|(admission, ..)| admission)
+            .map_err(|refusal| match refusal {
+                CertificateRefusal::Changed(reason) => reason,
+                CertificateRefusal::ReadError => FullReason::InvalidCheckpoint,
+            })
     }
 
     /// `admits`, then the RAM checkpoint a restore continues from: this
@@ -1498,7 +1511,7 @@ impl DurableCertificate {
         &self,
         file: &mut File,
         scope: Scope,
-    ) -> Result<(Checkpoint, DurableAdmission), FullReason> {
+    ) -> Result<(Checkpoint, DurableAdmission), CertificateRefusal> {
         let (admission, head, boundary, current) = self.admit_samples(file)?;
         let checkpoint = Checkpoint {
             stamp: FileStamp {
@@ -1520,7 +1533,7 @@ impl DurableCertificate {
                 .map(|due_unix_seconds| AuditDebt { due_unix_seconds }),
         };
         if !checkpoint.samples.valid_for(checkpoint.stamp.length) {
-            return Err(FullReason::InvalidCheckpoint);
+            return Err(CertificateRefusal::Changed(FullReason::InvalidCheckpoint));
         }
         Ok((checkpoint, admission))
     }
@@ -1529,33 +1542,35 @@ impl DurableCertificate {
     fn admit_samples(
         &self,
         file: &mut File,
-    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), FullReason> {
-        let metadata = file.metadata().map_err(|_| FullReason::Replaced)?;
-        let stamp = FileStamp::capture(metadata.clone()).map_err(|_| FullReason::Replaced)?;
+    ) -> Result<(DurableAdmission, Vec<u8>, Vec<u8>, FileStamp), CertificateRefusal> {
+        let metadata = file.metadata().map_err(|_| CertificateRefusal::ReadError)?;
+        let stamp =
+            FileStamp::capture(metadata.clone()).map_err(|_| CertificateRefusal::ReadError)?;
         if u64::from(self.sample_len) != self.sealed_offset.min(SAMPLE_BYTES as u64)
             || self.sealed_offset > self.length
         {
-            return Err(FullReason::InvalidCheckpoint);
+            return Err(CertificateRefusal::Changed(FullReason::InvalidCheckpoint));
         }
         let birth = birth_unix_nanos(&metadata);
         if stamp.device != self.device
             || stamp.inode != self.inode
             || (self.birth_nanos != 0 && birth != 0 && birth != self.birth_nanos)
         {
-            return Err(FullReason::Replaced);
+            return Err(CertificateRefusal::Changed(FullReason::Replaced));
         }
         if stamp.length < self.length {
-            return Err(FullReason::Shrunk);
+            return Err(CertificateRefusal::Changed(FullReason::Shrunk));
         }
         let unchanged = stamp.length == self.length;
         if unchanged && stamp.modified != self.modified {
-            return Err(FullReason::SameSizeEdit);
+            return Err(CertificateRefusal::Changed(FullReason::SameSizeEdit));
         }
         let len = self.sample_len as usize;
         let mut read = 0;
-        let head = read_sample(file, 0, len, &mut read).map_err(|_| FullReason::HeadChanged)?;
+        let head =
+            read_sample(file, 0, len, &mut read).map_err(|_| CertificateRefusal::ReadError)?;
         if durable_sample_digest(&head) != self.head_sha256 {
-            return Err(FullReason::HeadChanged);
+            return Err(CertificateRefusal::Changed(FullReason::HeadChanged));
         }
         let boundary = read_sample(
             file,
@@ -1563,20 +1578,20 @@ impl DurableCertificate {
             len,
             &mut read,
         )
-        .map_err(|_| FullReason::BoundaryChanged)?;
+        .map_err(|_| CertificateRefusal::ReadError)?;
         if durable_sample_digest(&boundary) != self.boundary_sha256 {
-            return Err(FullReason::BoundaryChanged);
+            return Err(CertificateRefusal::Changed(FullReason::BoundaryChanged));
         }
         let after = file
             .metadata()
             .and_then(FileStamp::capture)
-            .map_err(|_| FullReason::Replaced)?;
+            .map_err(|_| CertificateRefusal::ReadError)?;
         if after.device != stamp.device
             || after.inode != stamp.inode
             || after.length != stamp.length
             || after.modified != stamp.modified
         {
-            return Err(FullReason::Replaced);
+            return Err(CertificateRefusal::Changed(FullReason::Replaced));
         }
         Ok((
             DurableAdmission {

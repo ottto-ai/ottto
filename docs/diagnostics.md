@@ -615,3 +615,46 @@ counts as `hint_failed`, before any contract observation. While a placeholder
 is stored, permit flaps remain visible in permit outcomes but cannot be
 classified into `from_empty`, `to_empty` or `collector_e2_grouping` from that
 unknown prior contract.
+
+### Restore Provenance (schema 2 additive)
+
+Completed `native_collection_page` records can include
+`counts.full_causes.restore_outcome`. Counts are saturating u64 values,
+scoped to that page's attempted durable restores. A resumed scan keeps its
+counts until the page completes. This is separate from process-lifetime
+store/write/GC totals, which remain on the existing `durable_tail` line;
+restore-class totals on that text line are retired.
+
+| Field under `restore_outcome` | Unit / meaning |
+|---|---|
+| `restored` | Restore returned a charged, retained reduction. |
+| `held` | Restore's existing integrity guard returned Held. |
+| `miss.<class>` | Restore returned no retained reduction, with the class below. |
+
+Zero fields and an empty `full_causes` block are omitted. An absent miss
+class means zero attempts of that class, not a disabled store.
+`sampled_acquisition: null` retains its existing unavailable meaning.
+A pre-acquisition guard hold is not a restore attempt and adds no count here.
+Retries count again; a cooperative yield does not recount a completed decision.
+
+Miss keys are fixed, content-free class labels. Dots below are part of the
+JSON class key, not extra nested objects:
+
+- `unavailable`, `no_entry`, `missing`, `budget_refused`, `restore_take_lost`;
+- `ineligible.{selection_cleared,history_owed,source,key,context,scope,generation_ahead,entry_changed}`;
+- `refused_record.{newer,unknown,undecodable,unbindable,corrupt}`, `corrupt_body`;
+- `certificate_refused.{replaced,shrunk,same_size_edit,head_changed,boundary_changed,invalid_checkpoint,read_error}`;
+- `not_rederived.<field>` preserves the existing codec's static field/class
+  labels, including `SnapshotAccumulator.title`; these are code field names,
+  never filesystem paths or transcript values;
+- `unregistered_replay.{body_witness,money_rule}` attributes a scope miss
+  only when the current replay lever has no registry row and replacing that
+  lever with a registered value reproduces the record's scope. Unattributed
+  changes remain `ineligible.scope`. Registered audit rows cover body witness
+  r3 and money rules v1/v2; they grant no new replay.
+
+Sample I/O errors are `certificate_refused.read_error`, never evidence of a
+real edit. This precursor changes diagnostics only: it adds no Full-admission
+policy, new body reads, persisted fields, record grants, or integrity holds.
+Capacity/availability retain their existing degraded behavior. Full-cause
+admission and its other counter projections arrive in subsequent slices.

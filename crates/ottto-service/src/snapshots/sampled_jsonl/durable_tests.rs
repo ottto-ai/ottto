@@ -963,7 +963,9 @@ fn edits_after_the_checkpoint_refuse_restore() {
         certificate
             .restore(&mut File::open(&path).unwrap(), scope())
             .err(),
-        Some(FullReason::Shrunk)
+        Some(crate::transcript_acquisition::CertificateRefusal::Changed(
+            FullReason::Shrunk
+        ))
     );
 
     let scratch = Scratch::new("replace");
@@ -974,7 +976,9 @@ fn edits_after_the_checkpoint_refuse_restore() {
         certificate
             .restore(&mut File::open(&path).unwrap(), scope())
             .err(),
-        Some(FullReason::Replaced)
+        Some(crate::transcript_acquisition::CertificateRefusal::Changed(
+            FullReason::Replaced
+        ))
     );
 
     let scratch = Scratch::new("head-edit");
@@ -984,7 +988,9 @@ fn edits_after_the_checkpoint_refuse_restore() {
         certificate
             .restore(&mut File::open(&path).unwrap(), scope())
             .err(),
-        Some(FullReason::HeadChanged)
+        Some(crate::transcript_acquisition::CertificateRefusal::Changed(
+            FullReason::HeadChanged
+        ))
     );
 
     let scratch = Scratch::new("prompt-edit");

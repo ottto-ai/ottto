@@ -30728,12 +30728,14 @@ impl OwnedSourceScan {
                     }
                     resource_probe.line_delivery = Some(delivery.take_page());
                 }
+                let full_causes = std::mem::take(&mut resource_probe.full_causes);
                 resource_probe.collection_with_account_pending(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {
                         scanned_files: scanned_file_count,
                         semantic_noops: semantic_noop_count,
                         sampled_acquisition,
+                        full_causes,
                     },
                     if source == SnapshotSource::ClaudeCode {
                         index.claude_account_retained_pending_resources()
@@ -31803,7 +31805,7 @@ impl OwnedSourceScan {
                                     claude_request_identity_capture,
                                     &context.namespace,
                                 );
-                                match context.cache.durable_restore(
+                                let restore = context.cache.durable_restore(
                                     source,
                                     &key,
                                     &candidate.path,
@@ -31811,7 +31813,9 @@ impl OwnedSourceScan {
                                     parser.reader.reader.get_mut(),
                                     index,
                                     &interpretation,
-                                ) {
+                                );
+                                resource_probe.full_causes.restore_outcome.record(&restore);
+                                match restore {
                                     sampled_scan::durable_tail::RestoreOutcome::Restored(taken) => {
                                         retained_offset =
                                             Some(taken.retained.checkpoint.sealed_offset());
@@ -31822,7 +31826,7 @@ impl OwnedSourceScan {
                                         );
                                         (Some(taken.retained), Some(admission))
                                     }
-                                    sampled_scan::durable_tail::RestoreOutcome::Miss => {
+                                    sampled_scan::durable_tail::RestoreOutcome::Miss(_) => {
                                         (None, taken_admission)
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Held(reason) => {
@@ -66476,6 +66480,7 @@ mod tests {
                         scanned_files: 0,
                         semantic_noops: 0,
                         sampled_acquisition: None,
+                        full_causes: Default::default(),
                     },
                     index.claude_account_retained_pending_resources(),
                 );
