@@ -1245,6 +1245,7 @@ fn unfunded_replay_refreshes_the_plan_before_clearing_on_every_platform() {
             CARRY_FAILED,
             &context,
             false,
+            false,
         ));
     }
     let fix_value = serde_json::to_value(&fix).unwrap();
@@ -2531,9 +2532,34 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
     record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
     let holds = fixture.index.claude_usage_authority_quarantine.clone();
     let bindings = fixture.index.session_account_bindings.clone();
-    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
-    assert_eq!(row["carried_pending_families"], 32);
-    assert_eq!(row["rearmed_index_files"], 0);
+    fixture.index.traversal.as_mut().unwrap().scan_roots = vec![fixture._scratch.to_path_buf()];
+    let before = serde_json::to_value(&fixture.index).unwrap();
+    let (progress, rows) = crate::local_resource_diagnostics::capture(|| {
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut fixture.index,
+            CARRY_RETRY,
+            BACKFILL_WINDOW_DAYS,
+        )
+    });
+    assert_eq!(progress, TraversalProgress::Resumed);
+    assert!(!rows.iter().any(|r| r["counts"]["event"] == "starting"));
+    assert_eq!(
+        serde_json::to_value(&fixture.index).unwrap()["files"],
+        before["files"]
+    );
+    let offered = fixture
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_candidates
+        .drain(..)
+        .collect::<Vec<_>>();
+    assert_eq!(offered.len(), 8);
+    claude_retry_note_offered(&mut fixture.index, &offered, CARRY_RETRY);
+    claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
     assert_eq!(
         scoped_retry_full_reads(&fixture.index, &fixture.candidates),
         8

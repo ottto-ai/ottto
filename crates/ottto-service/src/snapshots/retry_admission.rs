@@ -18,16 +18,190 @@ fn claude_retry_record_due(
 }
 
 fn claude_retry_due_family_exists(index: &ScanIndex, collected_at: &str) -> bool {
-    let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
-    let served = index
-        .traversal
+    let Some(now) = rfc3339_unix_seconds(collected_at) else {
+        return false;
+    };
+    let state = index
+        .claude_stale_family_carry
+        .origin
         .as_ref()
-        .and_then(|t| rfc3339_unix_seconds(&t.census_window_end))
-        .unwrap_or_default();
-    index
-        .claude_usage_authority_quarantine
-        .values()
-        .any(|record| claude_retry_record_due(record, now, served))
+        .and_then(|o| o.admission.as_ref());
+    let served = state
+        .map(|s| {
+            if s.due_complete {
+                s.due_through
+            } else {
+                s.served_before
+            }
+        })
+        .or_else(|| {
+            index
+                .traversal
+                .as_ref()
+                .and_then(|t| rfc3339_unix_seconds(&t.census_window_end))
+        })
+        .unwrap_or(now);
+    index.files.keys().any(|key| {
+        let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+            return false;
+        };
+        index
+            .claude_usage_authority_quarantine
+            .get(member.root)
+            .is_some_and(|record| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                    && record.retry_after_unix_seconds > served
+                    && record.retry_after_unix_seconds <= now
+                    && index
+                        .claude_usage_family_witnesses
+                        .get(member.root)
+                        .is_some_and(|w| claude_usage_authority_preserves_pending(record, w))
+                    && state.map_or(true, |s| {
+                        s.due_complete
+                            || claude_retry_path_due(
+                                s,
+                                &index.claude_usage_authority_quarantine,
+                                key,
+                                now,
+                            )
+                    })
+            })
+    })
+}
+
+// Refresh only a drained deadline epoch. Root and singleton positions belong
+// to independent finite walks; completing one must not rewind the other.
+fn claude_retry_refresh_epoch(index: &ScanIndex, state: &mut ClaudeRetryAdmission, now: u64) {
+    if state.due_complete && now > state.due_through {
+        let served = state.due_through;
+        if index.claude_usage_authority_quarantine.values().any(|r| {
+            r.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                && r.retry_after_unix_seconds > served
+                && r.retry_after_unix_seconds <= now
+        }) {
+            state.served_before = served;
+            state.due_through = now;
+            state.due_after_path = None;
+            state.due_upper_path = index.files.keys().next_back().cloned();
+            state.due_complete = false;
+            state.complete = false;
+        }
+    }
+}
+
+// A persisted cursor grants no process-local carry proof. Rebuild eligibility
+// before selection; an unrefundable/replay-bearing carry stays in custody.
+fn claude_retry_carry_ready(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    at: &str,
+    context: &str,
+    changed: bool,
+) -> bool {
+    let carry = &index.claude_stale_family_carry;
+    if carry
+        .origin
+        .as_ref()
+        .is_some_and(|o| o.process != claude_full_rearm_process())
+    {
+        if !carry.replay.is_empty() || !carry.capped_roots.is_empty() {
+            return false;
+        }
+        let Ok(mut rebuilt) = (if carry.roots.is_empty() {
+            Ok(ClaudeStaleFamilyCarry::default())
+        } else {
+            claude_stream_accepted_retry_carry_observed(
+                index,
+                &carry.roots,
+                &mut Default::default(),
+                claude_contract_debt_scope(index),
+            )
+        }) else {
+            return false;
+        };
+        rebuilt.origin = carry.origin.clone();
+        rebuilt.origin.as_mut().expect("origin").process = claude_full_rearm_process();
+        index.claude_stale_family_carry = rebuilt;
+    }
+    refund_claude_stale_family_carry(index, source, at, context, changed, true)
+}
+
+fn claude_retry_scoped_service(index: &mut ScanIndex, at: &str, context: &str) {
+    let Some(now) = rfc3339_unix_seconds(at) else {
+        return;
+    };
+    let previous = index
+        .claude_stale_family_carry
+        .origin
+        .as_ref()
+        .and_then(|o| o.admission.clone());
+    let mut state = previous.unwrap_or_else(|| {
+        let (_, _, mut state) = claude_retry_admit_batch_observed(
+            index,
+            &BTreeSet::new(),
+            None,
+            at,
+            &mut Default::default(),
+            claude_contract_debt_scope(index),
+        );
+        state.roots_complete = true; // F-only initializes scheduling, never accepted carry.
+        state
+    });
+    claude_retry_refresh_epoch(index, &mut state, now);
+    if !state.roots_complete && index.claude_stale_family_carry.replay.is_empty() {
+        // Borrowed range, bounded allocation: do not copy the whole history or
+        // union successive batches into a growing carry.
+        let lower = state
+            .after_root
+            .clone()
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let stale = index
+            .claude_usage_family_pending
+            .range((lower, std::ops::Bound::Included(state.upper_root.clone())))
+            .filter(|(_, p)| {
+                p.census_window_end
+                    != index
+                        .traversal
+                        .as_ref()
+                        .expect("retained")
+                        .census_window_end
+            })
+            .take(CLAUDE_RETRY_ADMISSION_ROOTS)
+            .map(|(r, _)| r.clone())
+            .collect::<BTreeSet<_>>();
+        let (carry, _, next) = claude_retry_admit_batch_observed(
+            index,
+            &stale,
+            Some(&state),
+            at,
+            &mut Default::default(),
+            claude_contract_debt_scope(index),
+        );
+        state = next;
+        state.roots_complete = state.after_root.as_ref().map_or(stale.is_empty(), |after| {
+            !index.claude_usage_family_pending.iter().any(|(r, p)| {
+                r > after
+                    && r <= &state.upper_root
+                    && p.census_window_end
+                        != index
+                            .traversal
+                            .as_ref()
+                            .expect("retained")
+                            .census_window_end
+            })
+        });
+        if state.progressed {
+            index.claude_stale_family_carry = carry;
+        }
+    }
+    // Refusal leaves the existing carry/replay and every pending/ACK byte.
+    index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+        context_fingerprint: context.to_owned(),
+        process: claude_full_rearm_process(),
+        full_rearm_window: false,
+        admission: Some(state),
+    });
+    claude_retry_queue_due_families(index, at);
 }
 
 #[cfg(test)]
@@ -64,36 +238,32 @@ fn claude_retry_admit_batch_observed(
     ClaudeRetryAdmission,
 ) {
     *diagnostics = StaleCarryRejectionCounts::default();
-    let mut state = previous
-        .filter(|state| {
-            !(state.complete
-                || (state.roots_complete
-                    && state.storage_deferred
-                    && state.oversized_root.is_none()
-                    && state.due_complete))
-        })
-        .cloned()
-        .unwrap_or_else(|| ClaudeRetryAdmission {
-            after_root: None,
-            upper_root: stale.last().cloned().unwrap_or_default(),
-            complete: false,
-            roots_complete: false,
-            progressed: false,
-            served_before: previous.map(|state| state.due_through).unwrap_or_else(|| {
-                index
-                    .traversal
-                    .as_ref()
-                    .and_then(|t| rfc3339_unix_seconds(&t.census_window_end))
-                    .unwrap_or_default()
-            }),
-            due_through: rfc3339_unix_seconds(collected_at).unwrap_or_default(),
-            due_after_path: None,
-            due_upper_path: index.files.keys().next_back().cloned(),
-            due_complete: false,
-            oversized_root: None,
-            oversized_after_path: None,
-            storage_deferred: false,
-        });
+    let mut state = previous.cloned().unwrap_or_else(|| ClaudeRetryAdmission {
+        after_root: None,
+        upper_root: stale.last().cloned().unwrap_or_default(),
+        complete: false,
+        roots_complete: false,
+        progressed: false,
+        served_before: previous.map(|state| state.due_through).unwrap_or_else(|| {
+            index
+                .traversal
+                .as_ref()
+                .and_then(|t| rfc3339_unix_seconds(&t.census_window_end))
+                .unwrap_or_default()
+        }),
+        due_through: rfc3339_unix_seconds(collected_at).unwrap_or_default(),
+        due_after_path: None,
+        due_upper_path: index.files.keys().next_back().cloned(),
+        due_complete: false,
+        oversized_root: None,
+        oversized_after_path: None,
+        storage_deferred: false,
+    });
+    claude_retry_refresh_epoch(
+        index,
+        &mut state,
+        rfc3339_unix_seconds(collected_at).unwrap_or_default(),
+    );
     state.progressed = false;
     let lower = state
         .after_root
@@ -512,61 +682,17 @@ fn claude_retry_note_offered(
         crate::local_resource_diagnostics::claude_reread::retry_offered();
         oversized_after = Some(key.clone());
     }
-    let oversized = state.oversized_root.clone();
-    let previous = state.oversized_after_path.clone();
-    let context = index
-        .traversal
-        .as_ref()
-        .expect("active traversal")
-        .context_fingerprint
-        .clone();
-    let held = oversized_after.is_some()
-        && index.reread_plan_for_rearms(
-            SnapshotSource::ClaudeCode,
-            collected_at,
-            &context,
-            false,
-            |key| {
-                oversized.as_deref().is_some_and(|root| {
-                    claude_index_path_member_ref(Path::new(key)).is_some_and(|m| m.root == root)
-                }) && previous.as_deref().map_or(true, |after| key > after)
-                    && oversized_after.as_deref().is_some_and(|after| key <= after)
-                    && offered(key)
-            },
-        );
-    if !held && oversized_after.is_some() {
-        for path in paths {
-            let key = local_index_key(&path.path);
-            if claude_index_path_member_ref(&path.path)
-                .is_some_and(|m| oversized.as_deref() == Some(m.root))
-                && previous
-                    .as_deref()
-                    .map_or(true, |after| key.as_str() > after)
-                && oversized_after
-                    .as_deref()
-                    .is_some_and(|after| key.as_str() <= after)
-            {
-                if let Some(entry) = index.files.get_mut(&key) {
-                    crate::local_resource_diagnostics::claude_reread::clear(
-                        crate::local_resource_diagnostics::claude_reread::ClearSite::RetryAdmission,
-                        !entry.source_file_fingerprint.is_empty(),
-                    );
-                    entry.source_file_fingerprint.clear();
-                }
-            }
-        }
-    }
     let state = index
         .claude_stale_family_carry
         .origin
         .as_mut()
         .and_then(|origin| origin.admission.as_mut())
         .expect("retained admission");
-    state.progressed |= due_after.is_some() || (!held && oversized_after.is_some());
+    state.progressed |= due_after.is_some() || oversized_after.is_some();
     if due_after.is_some() {
         state.due_after_path = due_after;
     }
-    if !held && oversized_after.is_some() {
+    if oversized_after.is_some() {
         state.oversized_after_path = oversized_after;
     }
 }

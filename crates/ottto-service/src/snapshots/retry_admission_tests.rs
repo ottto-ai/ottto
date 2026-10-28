@@ -899,3 +899,469 @@ fn stale_carry_batch_diagnostics_discard_failed_larger_attempts() {
     );
     assert_eq!(diagnostics.eligible_before_funding, 1);
 }
+
+// The release-0.1.201 shape: exhausted, red, attempt saturated, ordinary
+// recovery still in the future. The tracked size loss remains raw census loss.
+fn restart_red_fixture(held: usize, healthy: usize) -> ScopedRetryFixture {
+    let mut f = retry_durable_fixture(held, healthy);
+    let root = f._scratch.to_path_buf();
+    retry_test_context(&mut f.index, &root);
+    f.index.bounded_sweep_had_unsettled_upload = true;
+    f.index.bounded_sweep_unsettled_causes = UnsettledUploadCause::CompletedBlockingHolds.bit();
+    let t = f.index.traversal.as_mut().unwrap();
+    t.counts = ScanTraversalCounts {
+        oversized_file_count: 1,
+        ..Default::default()
+    };
+    t.oversized_discovery.insert(
+        "held-size-loss".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "content_hash": "a".repeat(64), "observations": 1
+        }))
+        .unwrap(),
+    );
+    t.observed_index_keys = f.index.files.keys().cloned().collect();
+    t.unhealthy_retry_not_before_unix_seconds =
+        rfc3339_unix_seconds(CARRY_RETRY).map(|now| now + 3500);
+    for r in f.index.claude_usage_authority_quarantine.values_mut() {
+        r.retry_after_unix_seconds = rfc3339_unix_seconds(CARRY_FAILED).unwrap() + 1;
+    }
+    f
+}
+
+fn restart_dispatch(f: &mut ScopedRetryFixture, at: &str) -> serde_json::Value {
+    let before = serde_json::to_value(&f.index).unwrap();
+    let root = f._scratch.to_path_buf();
+    let (progress, rows) = crate::local_resource_diagnostics::capture(|| {
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[root],
+            &mut f.index,
+            at,
+            BACKFILL_WINDOW_DAYS,
+        )
+    });
+    assert_eq!(progress, TraversalProgress::Resumed, "zero root restart");
+    assert!(!rows.iter().any(|r| r["counts"]["event"] == "starting"));
+    let after = serde_json::to_value(&f.index).unwrap();
+    for key in [
+        "files",
+        "accepted_snapshot_fingerprints",
+        "file_snapshot_fingerprints",
+        "claude_usage_authority_quarantine",
+        "claude_usage_family_witnesses",
+        "session_account_bindings",
+        "bounded_sweep_had_unsettled_upload",
+        "bounded_sweep_unsettled_causes",
+        "upload_context_fingerprint",
+        "active_upload_context_fingerprint",
+        "claude_retired_family_tombstones",
+        "claude_retired_family_tombstones_uncertain",
+    ] {
+        assert_eq!(
+            after[key], before[key],
+            "dispatch preserves {key}; zero indexed fingerprint clears"
+        );
+    }
+    for key in [
+        "census_window_end",
+        "observed_index_keys",
+        "counts",
+        "reconciliation_after",
+        "reconciliation_upper_bound",
+        "unhealthy_retry_not_before_unix_seconds",
+    ] {
+        assert_eq!(
+            after["traversal"][key], before["traversal"][key],
+            "retained census {key}"
+        );
+    }
+    assert!(f
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_directories
+        .is_empty());
+    rows.into_iter()
+        .find(|r| r["counts"]["event"] == "retry_decision")
+        .unwrap()["counts"]
+        .clone()
+}
+
+#[test]
+fn restart_dispatch_f_p_both_neither_preserves_red_census_and_custody() {
+    for (family, admission) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut f = restart_red_fixture(usize::from(family), 1);
+        if admission {
+            let (_, _, mut state) =
+                claude_retry_admit_batch(&f.index, &BTreeSet::new(), None, CARRY_RETRY);
+            state.oversized_root = Some(f.roots.last().unwrap().clone());
+            state.progressed = true;
+            f.index.claude_stale_family_carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+                context_fingerprint: f
+                    .index
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .context_fingerprint
+                    .clone(),
+                process: claude_full_rearm_process(),
+                full_rearm_window: false,
+                admission: Some(state),
+            });
+        }
+        let decision = restart_dispatch(&mut f, CARRY_RETRY);
+        assert_eq!(decision["family_retry_due"], family);
+        assert_eq!(decision["admission_present"], admission);
+        assert_eq!(decision["ordinary_deadline_eligible"], false);
+        assert_eq!(
+            decision["selected_action"],
+            if family || admission {
+                "scoped_retry"
+            } else {
+                "resume"
+            }
+        );
+        let paths = f
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_candidates
+            .drain(..)
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), usize::from(family) + usize::from(admission));
+        // Includes the old oversized-family fallback: offering must never clear
+        // even its selected indexed fingerprint. A refusal is scheduling debt.
+        let files = serde_json::to_value(&f.index.files).unwrap();
+        finish_claude_retry_selection(&mut f.index, &mut paths.clone(), paths.len(), CARRY_RETRY);
+        assert_eq!(serde_json::to_value(&f.index.files).unwrap(), files);
+        claude_retry_queue_due_families(&mut f.index, CARRY_RETRY);
+        if family || admission {
+            let path = f._scratch.join("dispatch-state.json");
+            f.index = retry_test_reload(&mut f.index, &path);
+            assert_eq!(
+                restart_dispatch(&mut f, CARRY_RETRY)["selected_action"],
+                "resume",
+                "same deadline cannot spin"
+            );
+        }
+    }
+    for count in [50, 81] {
+        let mut f = restart_red_fixture(0, count);
+        assert_eq!(
+            restart_dispatch(&mut f, CARRY_RETRY)["selected_action"],
+            "resume",
+            "carried population growth alone never wakes"
+        );
+    }
+}
+
+#[test]
+fn restart_due_epochs_drain_once_across_small_pages_reload_and_root_backlog() {
+    let mut f = restart_red_fixture(70, 1);
+    let root = f._scratch.to_path_buf();
+    restart_dispatch(&mut f, CARRY_RETRY); // F-only: no previous admission.
+    let first_horizon = rfc3339_unix_seconds(CARRY_RETRY).unwrap();
+    let mut seen = BTreeSet::new();
+    for page in 0..70 {
+        let t = f.index.traversal.as_mut().unwrap();
+        let state = f
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        let mut paths = Vec::new();
+        claude_retry_select_due_paths(
+            state,
+            &f.index.claude_usage_authority_quarantine,
+            &mut t.pending_candidates,
+            &mut paths,
+            first_horizon,
+            1,
+        );
+        assert_eq!(paths.len(), 1, "file_limit=1 page {page}");
+        assert!(seen.insert(local_index_key(&paths[0].path)));
+        // A later offer cannot consume an earlier owed gap.
+        if page == 0 {
+            let before = f
+                .index
+                .claude_stale_family_carry
+                .origin
+                .as_ref()
+                .unwrap()
+                .admission
+                .as_ref()
+                .unwrap()
+                .due_after_path
+                .clone();
+            let later = f
+                .index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_candidates
+                .back()
+                .unwrap()
+                .clone();
+            claude_retry_note_offered(&mut f.index, &[later], CARRY_RETRY);
+            assert_eq!(
+                f.index
+                    .claude_stale_family_carry
+                    .origin
+                    .as_ref()
+                    .unwrap()
+                    .admission
+                    .as_ref()
+                    .unwrap()
+                    .due_after_path,
+                before
+            );
+        }
+        finish_claude_retry_selection(&mut f.index, &mut paths, 1, CARRY_RETRY);
+        claude_retry_queue_due_families(&mut f.index, CARRY_RETRY);
+        f.index = retry_test_reload(&mut f.index, &root.join("epochs.json"));
+    }
+    assert_eq!(seen.len(), 70);
+    assert_eq!(
+        restart_dispatch(&mut f, CARRY_RETRY)["selected_action"],
+        "resume"
+    );
+    let state = f
+        .index
+        .claude_stale_family_carry
+        .origin
+        .as_mut()
+        .unwrap()
+        .admission
+        .as_mut()
+        .unwrap();
+    assert!(state.complete && state.due_complete);
+    // Refreshing deadlines must preserve independently unfinished root paging.
+    state.roots_complete = false;
+    state.complete = false;
+    state.after_root = Some("z".repeat(36));
+    state.upper_root = state.after_root.clone().unwrap();
+    let after = state.after_root.clone();
+    let record = f
+        .index
+        .claude_usage_authority_quarantine
+        .values_mut()
+        .next()
+        .unwrap();
+    record.retry_after_unix_seconds = first_horizon + 1;
+    let next = OffsetDateTime::from_unix_timestamp((first_horizon + 2) as i64)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    assert_eq!(
+        restart_dispatch(&mut f, &next)["selected_action"],
+        "scoped_retry"
+    );
+    let state = f
+        .index
+        .claude_stale_family_carry
+        .origin
+        .as_ref()
+        .unwrap()
+        .admission
+        .as_ref()
+        .unwrap();
+    assert_eq!(state.served_before, first_horizon);
+    assert_eq!(state.after_root, after);
+    assert_eq!(state.due_through, first_horizon + 2);
+    assert_eq!(
+        f.index.traversal.as_ref().unwrap().pending_candidates.len(),
+        1
+    );
+}
+
+#[test]
+fn restart_reload_provenance_refusal_and_invalid_clock_preserve_custody() {
+    let mut f = restart_red_fixture(1, 1);
+    restart_dispatch(&mut f, CARRY_RETRY);
+    let origin = f.index.claude_stale_family_carry.origin.as_mut().unwrap();
+    origin.process = claude_full_rearm_process().wrapping_add(1);
+    // A live replay with old process proof cannot be silently rebranded, lost,
+    // cleared or replaced by BASE. No new reader or recovery queue is minted.
+    f.index.claude_stale_family_carry.replay.push(
+        f.index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_candidates
+            .pop_front()
+            .unwrap(),
+    );
+    let before = serde_json::to_value(&f.index.claude_stale_family_carry).unwrap();
+    restart_dispatch(&mut f, CARRY_RETRY);
+    assert_eq!(
+        serde_json::to_value(&f.index.claude_stale_family_carry).unwrap(),
+        before
+    );
+    assert_eq!(
+        restart_dispatch(&mut f, "invalid-clock")["selected_action"],
+        "resume"
+    );
+    assert_eq!(
+        serde_json::to_value(&f.index.claude_stale_family_carry).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn restart_independent_sweep_recovery_context_and_six_hour_floor_still_start() {
+    for case in ["error", "context", "floor"] {
+        let mut f = restart_red_fixture(1, 1);
+        let mut days = BACKFILL_WINDOW_DAYS;
+        let at = match case {
+            "error" => {
+                let t = f.index.traversal.as_mut().unwrap();
+                t.counts.unreadable_path_count = 1;
+                t.unhealthy_retry_not_before_unix_seconds = Some(0);
+                CARRY_RETRY.to_owned()
+            }
+            "context" => {
+                days += 1;
+                CARRY_RETRY.to_owned()
+            }
+            _ => OffsetDateTime::from_unix_timestamp(
+                (rfc3339_unix_seconds(CARRY_FAILED).unwrap() + 6 * 3600) as i64,
+            )
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap(),
+        };
+        let root = f._scratch.to_path_buf();
+        assert_eq!(
+            ensure_bounded_traversal(SnapshotSource::ClaudeCode, &[root], &mut f.index, &at, days),
+            TraversalProgress::Started
+        );
+        assert_eq!(f.index.traversal.as_ref().unwrap().census_window_end, at);
+    }
+}
+
+#[test]
+fn restart_refund_refusal_never_uncarries_or_clears_f_only_or_p() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for admission in [false, true] {
+        let mut f = restart_red_fixture(1, 1);
+        let healthy = BTreeSet::from([f.roots[1].clone()]);
+        let mut carry = claude_stream_accepted_retry_carry(&f.index, &healthy).unwrap();
+        assert_eq!(carry.roots, healthy);
+        let state = admission.then(|| {
+            let (_, _, mut s) =
+                claude_retry_admit_batch(&f.index, &BTreeSet::new(), None, CARRY_RETRY);
+            s.progressed = true;
+            s
+        });
+        carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+            context_fingerprint: f
+                .index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .context_fingerprint
+                .clone(),
+            process: claude_full_rearm_process(),
+            full_rearm_window: false,
+            admission: state,
+        });
+        f.index.claude_stale_family_carry = carry;
+        let before = serde_json::to_value(&f.index.claude_stale_family_carry).unwrap();
+        let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+        assert_eq!(
+            restart_dispatch(&mut f, CARRY_RETRY)["selected_action"],
+            "scoped_retry"
+        );
+        assert_eq!(
+            serde_json::to_value(&f.index.claude_stale_family_carry).unwrap(),
+            before
+        );
+        assert!(f
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .is_empty());
+    }
+}
+
+#[test]
+fn restart_large_family_uses_one_existing_queue_without_forced_expansion() {
+    let mut f = restart_red_fixture(1, 0);
+    let root = f._scratch.to_path_buf();
+    let family = f.roots[0].clone();
+    let template = f.index.files.values().next().unwrap().clone();
+    for n in 0..70 {
+        let path = root
+            .join(&family)
+            .join("subagents")
+            .join(format!("agent-{n:016x}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{}\n").unwrap();
+        f.index
+            .files
+            .insert(local_index_key(&path), template.clone());
+    }
+    let heads = serde_json::to_value(&f.index.files).unwrap();
+    restart_dispatch(&mut f, CARRY_RETRY);
+    assert_eq!(
+        f.index.traversal.as_ref().unwrap().pending_candidates.len(),
+        64
+    );
+    let mut scan = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        &[root.clone()],
+        f.index,
+        CARRY_RETRY,
+        BACKFILL_WINDOW_DAYS,
+        1,
+        false,
+        Some(&root.join("support")),
+        &[],
+        false,
+        true,
+        true,
+    );
+    assert!(
+        scan.identified_candidates.len() <= 1,
+        "family expansion must honor file_limit=1"
+    );
+    assert_eq!(
+        serde_json::to_value(&scan.index.files).unwrap(),
+        heads,
+        "selection clears no fingerprint"
+    );
+    let before = serde_json::to_value(&scan.index.claude_usage_authority_quarantine).unwrap();
+    let mut finished = false;
+    for _ in 0..256 {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                index,
+                scan: result,
+                ..
+            } => {
+                assert!(!result.census_complete);
+                assert_eq!(
+                    serde_json::to_value(&index.claude_usage_authority_quarantine).unwrap(),
+                    before,
+                    "one partial family is not a new co-observed authority proof"
+                );
+                assert!(index.claude_duplicate_fence_closed_for_test());
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(finished);
+}

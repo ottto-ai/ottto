@@ -94,6 +94,19 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
     saved["claude_usage_authority_quarantine"][REARM_ROOT]["retry_after_unix_seconds"] =
         serde_json::json!(due);
     saved["traversal"]["unhealthy_retry_not_before_unix_seconds"] = serde_json::json!(due + 3600);
+    // Resume debt written by an earlier bounded root-admission start. F-only
+    // service now creates deadline scheduling only; it must not invent this
+    // independent root backlog merely because accepted counts are large.
+    saved["claude_stale_family_carry"] = serde_json::json!({
+        "origin": {"context_fingerprint": saved["traversal"]["context_fingerprint"],
+            "process": 0, "full_rearm_window": false,
+            "admission": {"after_root": null, "upper_root": saved["claude_usage_family_pending"].as_object().unwrap().keys().next_back().unwrap(),
+                "roots_complete": false, "complete": false, "progressed": true,
+                "served_before": old_started, "due_through": due + 1,
+                "due_after_path": null, "due_upper_path": saved["files"].as_object().unwrap().keys().next_back().unwrap(),
+                "due_complete": false, "storage_deferred": false}},
+        "roots": [], "capped_roots": [], "replay": []
+    });
     index = serde_json::from_value(saved).unwrap();
     index.save(&fixture.index_path).unwrap();
     index = ScanIndex::load(&fixture.index_path).unwrap();
@@ -139,7 +152,24 @@ fn persistent_structural_refusal_serves_due_authority_and_finishes_bounded_admis
         }
         // The same real scanner, upload/ACK validator and fold run every page.
         // Durable save/reload and the full custody oracle run at checkpoints.
-        let page = fixture.scale_page(retained, &admission_clock(due + 1 + tick));
+        let (page, rows) = crate::local_resource_diagnostics::capture(|| {
+            fixture.scale_page(retained, &admission_clock(due + 1 + tick))
+        });
+        assert!(
+            !rows.iter().any(|r| r["counts"]["event"] == "starting"),
+            "no F/P root restart at {tick}"
+        );
+        let saved = serde_json::to_value(&page.index).unwrap();
+        for field in [
+            "census_window_end",
+            "observed_index_keys",
+            "unhealthy_retry_not_before_unix_seconds",
+        ] {
+            assert_eq!(
+                saved["traversal"][field], baseline["traversal"][field],
+                "scoped service retains {field}"
+            );
+        }
         assert!(
             page.parsed.is_disjoint(&healthy),
             "no healthy Full reads at tick {tick}: {:?}",
@@ -288,4 +318,66 @@ fn admission_clock(seconds: i64) -> String {
         .unwrap()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap()
+}
+
+// Pair gate: oversized is absent and the real census completes. This must not
+// pass merely because an unrelated red checkpoint suppresses observe_page.
+#[test]
+#[ignore = "requires e3/withheld-account-rearm (all four non-structural vetoes); run after that PR lands"]
+#[serial(source_manifests)]
+fn restart_pair_complete_withheld_census_later_deadline_and_reload_stays_quiet() {
+    if !c1a_layout_supported("restart-pair") {
+        return;
+    }
+    let _manifests = SourceManifestTestGuard::new();
+    let mut f = RearmFixture::new("restart-pair");
+    f.request_identity = true;
+    let first = c1b_generation(&f, "complete-withheld-seed", (8, 0));
+    assert!(
+        first.census_complete,
+        "genuine healthy census, no oversized veto"
+    );
+    let loaded = ScanIndex::load(&f.index_path).unwrap();
+    let before = serde_json::to_value(&loaded).unwrap();
+    assert!(before["files"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|e| !e["source_file_fingerprint"].as_str().unwrap().is_empty()));
+    // No account identity is supplied by rearm_evidence_lines: unchanged
+    // family usage has disclosed NULL account attribution, never fabricated $0.
+    for hour in [10, 12] {
+        c1a_edit_index(&f, |saved| {
+            saved["claude_duplicate_request_witness_overflowed"] = serde_json::json!(true);
+            saved["claude_duplicate_fence_next_full_rearm_unix_seconds"] = serde_json::json!(0);
+        });
+        let reloaded = ScanIndex::load(&f.index_path).unwrap();
+        assert!(reloaded.claude_duplicate_fence_closed_for_test());
+        let later = c1b_generation(&f, "quiet-after-reload-and-deadline", (hour, 0));
+        assert!(
+            later.census_complete,
+            "the pair remains eligible for complete census cleanup"
+        );
+        assert!(
+            !later.full_rearm,
+            "unchanged non-structural veto cannot arm observe_page.other"
+        );
+        assert_eq!(
+            later.family_reads, 0,
+            "no unrelated Full work from the rearm deadline"
+        );
+        let after = serde_json::to_value(ScanIndex::load(&f.index_path).unwrap()).unwrap();
+        for (key, entry) in before["files"].as_object().unwrap() {
+            assert_eq!(
+                after["files"][key]["source_file_fingerprint"],
+                entry["source_file_fingerprint"]
+            );
+        }
+    }
+    f.append_family_request(None, "req_changed-proof", 4, 5);
+    let changed = c1b_generation(&f, "changed-evidence-control", (13, 0));
+    assert!(
+        changed.family_reads > 0,
+        "actual changed proof keeps its existing correction path"
+    );
 }
