@@ -1477,21 +1477,29 @@ fn source_latch_generation(
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
         index.observe_claude_request_identity_contract(fixture.request_identity);
         let (mut page, rows) = crate::local_resource_diagnostics::capture(|| {
-            fixture.page_with_input_index(
+            let fold_diagnostics =
+                crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            let page = fixture.page_with_input_index(
                 &format!("2026-08-02T08:{:02}:00Z", minute + number),
                 upload,
                 target,
                 Some(index),
-            )
+            );
+            // Observe the real terminal fold, outside the scanner's nested
+            // scopes, on the existing diagnostic carrier (test harness only).
+            crate::local_resource_diagnostics::claude_reread::emit_without_lease(
+                fold_diagnostics.finish(),
+            );
+            page
         });
         diagnostics.extend(rows);
         page.index.save(&fixture.index_path).unwrap();
         let ended = c1b_traversal_ended(&page.index).0;
+        let interrupted = !matches!(upload, RearmUpload::Accept)
+            && !page.fully_settled
+            && page.offered.iter().any(|fp| !page.uploaded.contains(fp));
         pages.push(page);
-        if ended
-            || (matches!(upload, RearmUpload::AckLost | RearmUpload::Shed)
-                && !pages.last().unwrap().fully_settled)
-        {
+        if ended || interrupted {
             return (pages, diagnostics);
         }
     }
@@ -1631,10 +1639,12 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
     let mut ended = false;
     for number in 0..C1A_MAX_PAGES {
         fixture.request_identity = number != 0;
+        let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
         let page = fixture.page(
             &format!("2026-08-02T08:{:02}:00Z", 10 + number),
             RearmUpload::Accept,
         );
+        let counts = diagnostics.finish().contract;
         ended = !page.index.scan_traversal_in_progress_for_test();
         if number == 0 {
             assert!(!ended, "B must arrive inside the Started A traversal");
@@ -1648,10 +1658,16 @@ fn source_t1_started_a_then_b_keeps_placeholder_through_terminal() {
                 serde_json::to_value(&page.index).unwrap()
                     ["claude_request_identity_contract_changed"],
                 true,
-                "neither the in-memory terminal nor its durable save clears"
+                "the durable save retains the latch"
             );
         }
         if ended {
+            assert!(page.scan.census_complete && page.fully_settled);
+            assert!(page.duplicate_census.fence_before && page.duplicate_census.fence_after);
+            assert_eq!(
+                counts.identity_contract_latch.cleared, 0,
+                "the real fold cannot clear, independently of partial-save OR"
+            );
             break;
         }
     }
@@ -1671,7 +1687,11 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
         return;
     }
     let _manifests = SourceManifestTestGuard::new();
-    for upload in [RearmUpload::Accept, RearmUpload::AckLost] {
+    for (upload, keep_held) in [
+        (RearmUpload::Accept, false),
+        (RearmUpload::AckLost, false),
+        (RearmUpload::Accept, true),
+    ] {
         let mut fixture = c1a_fixture("source-t2-owed-f-invariant-g");
         fixture.owned_base_preparation = true;
         fixture.native_file_limit = 2;
@@ -1713,7 +1733,9 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 let g_fp = invariant_g["snapshot_fingerprint"].as_str().unwrap();
                 assert!(saved["claude_request_census"].get(&g_key).is_some());
                 assert!(migrated.iter().any(|page| page.uploaded.contains(g_fp)));
-                fixture.local_holds.clear();
+                if !keep_held {
+                    fixture.local_holds.clear();
+                }
                 std::fs::write(
                     c1b_terminal_path(&fixture),
                     rearm_transcript_line(
@@ -1728,14 +1750,16 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 let carried = rows
                     .iter()
                     .filter_map(|row| {
-                        (row["counts"]["event"] == "starting").then(|| {
-                            row["counts"]["carried_pending_families"]
-                                .as_u64()
-                                .unwrap_or(0)
-                        })
+                        (row["stage"] == "bounded_traversal_transition"
+                            && row["counts"]["event"] == "starting")
+                            .then(|| {
+                                row["counts"]["carried_pending_families"]
+                                    .as_u64()
+                                    .unwrap_or(0)
+                            })
                     })
                     .sum::<u64>();
-                assert!(carried > 0, "a real contract-debt carry was admitted");
+                assert_eq!(carried, 1, "only invariant G can be carried");
                 assert!(
                     !rearm_parsed(&retry).contains(REARM_SIBLING),
                     "G adds no read"
@@ -1746,15 +1770,19 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 );
                 let new_f = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
                 let f_fp = new_f["snapshot_fingerprint"].as_str().unwrap();
-                assert_ne!(new_f["snapshot_fingerprint"], old_f["snapshot_fingerprint"]);
+                if !keep_held {
+                    assert_ne!(new_f["snapshot_fingerprint"], old_f["snapshot_fingerprint"]);
+                }
                 assert_eq!(
                     fixture.body_trace.borrow().finalizer_bodies[REARM_SIBLING],
                     invariant_g
                 );
-                assert!(
-                    retry.iter().any(|page| page.offered.contains(f_fp)),
-                    "F re-emits"
-                );
+                if !keep_held {
+                    assert!(
+                        retry.iter().any(|page| page.offered.contains(f_fp)),
+                        "F re-emits"
+                    );
+                }
                 assert!(retry.iter().all(|page| page.duplicate_census.fence_after));
                 assert!(retry.iter().all(|page| !page.duplicate_census.full_rearm));
                 assert!(
@@ -1770,15 +1798,66 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                     }
                     // G's retained accepted body is never current-window
                     // request projection or fence/uniqueness evidence.
-                    if let Some(record) = state["claude_request_census"].get(&g_key) {
-                        let before = saved["claude_request_census"].get(&g_key).unwrap();
-                        assert_eq!(record, before);
-                    }
+                    let record = state["claude_request_census"]
+                        .get(&g_key)
+                        .expect("G keeps its old census record");
+                    assert_eq!(record, saved["claude_request_census"].get(&g_key).unwrap());
+                }
+                if keep_held {
+                    let terminal = retry.last().unwrap();
+                    assert!(
+                        terminal.scan.census_complete,
+                        "exercise a real terminal clear decision"
+                    );
+                    assert!(!terminal.fully_settled);
+                    assert!(!terminal.duplicate_census.coverage_complete);
+                    assert!(!acked_f);
+                    assert!(c1a_latch(&fixture).1);
+                    let held = c1a_saved(&fixture);
+                    assert_eq!(
+                        held["files"][&f_key]["effective_upload_body_witness_revision"],
+                        2
+                    );
+                    // snapshots.rs:9730 (e2_identity_owed) and :9722
+                    // (sweep_fully_settled) veto this complete terminal.
+                    let cleared: u64 = rows
+                        .iter()
+                        .filter_map(|row| {
+                            row["counts"]["identity_contract_latch"]["cleared"].as_u64()
+                        })
+                        .sum();
+                    assert_eq!(cleared, 0, "partial-save OR cannot mask an in-memory clear");
+                    fixture.local_holds.clear();
+                    let accepted =
+                        source_latch_generation(&fixture, 40, RearmUpload::Accept, None).0;
+                    let body = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
+                    let fp = body["snapshot_fingerprint"].as_str().unwrap();
+                    assert_ne!(body["snapshot_fingerprint"], old_f["snapshot_fingerprint"]);
+                    assert!(accepted.iter().any(|page| page.uploaded.contains(fp)));
+                    assert!(
+                        !c1a_latch(&fixture).1,
+                        "clear only after the release's exact ACK"
+                    );
+                    assert_eq!(
+                        c1a_saved(&fixture)["files"][&f_key]
+                            ["effective_upload_body_witness_revision"],
+                        3
+                    );
+                    return;
                 }
                 match upload {
                     RearmUpload::Accept => {
                         assert!(acked_f);
                         assert!(!c1a_latch(&fixture).1, "clear follows F's exact ACK");
+                        let accepted = c1a_saved(&fixture);
+                        assert_eq!(
+                            accepted["files"][&f_key]["effective_upload_body_witness_revision"],
+                            3
+                        );
+                        assert_eq!(
+                            accepted["claude_request_identity_contract"],
+                            crate::snapshots::claude_request_identity::E2_GROUPING
+                        );
                     }
                     RearmUpload::AckLost => {
                         assert!(!acked_f);
