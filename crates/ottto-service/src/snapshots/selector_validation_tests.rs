@@ -444,7 +444,7 @@ fn all_existing_object_aliases_match_their_expected_formats_and_sources() {
                 &["plan_window_bucket", "planWindowBucket"],
             ),
         ] {
-            for alias in aliases {
+            for &alias in aliases {
                 let selector = selector_from_object(&json!({alias:raw}), "selector_context");
                 assert_eq!(
                     selector.context.get(field).map(String::as_str),
