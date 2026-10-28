@@ -17,6 +17,10 @@ const STATE_BYTES: usize =
 pub(super) mod codex_cursor;
 #[cfg(unix)]
 pub(super) mod durable_tail;
+#[cfg(all(unix, test))]
+pub(crate) use durable_tail::MissClass;
+#[cfg(unix)]
+pub(crate) use durable_tail::RestoreOutcome;
 pub(super) mod side_ledger;
 
 /// The retained-copy cache behind `SharedCache::retained`.

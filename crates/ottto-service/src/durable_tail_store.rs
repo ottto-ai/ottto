@@ -79,6 +79,7 @@ const TRAILER_BYTES: usize = 32;
 /// (`h_fields_are_audited`) pins what fills each one alongside the body's
 /// `H` fields (M1, SOURCE P2-5). The SHA-256 trailer is an integrity
 /// checksum over the record's own bytes, not a value, so it is not listed.
+#[cfg(test)]
 pub(crate) const ENVELOPE_H: [&str; 7] = [
     "Envelope.allowlist",
     "Binding.key",
@@ -134,6 +135,7 @@ fn digest(domain: &str, parts: &[&[u8]]) -> Digest32 {
 }
 
 /// The SHA-256 of a codec's compiled field list, in order.
+#[cfg(test)]
 pub(crate) fn allowlist_digest(fields: &[&str]) -> Digest32 {
     let parts = fields
         .iter()
@@ -489,6 +491,7 @@ impl DurableTailStore {
         self.disabled.is_none()
     }
 
+    #[cfg(test)]
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
@@ -499,6 +502,7 @@ impl DurableTailStore {
 
     /// The counters since the last call, which resets them. The disk totals
     /// are a level, not a flow, and are kept.
+    #[cfg(test)]
     pub(crate) fn take_pass(&mut self) -> StoreCounters {
         let pass = self.counters;
         self.counters = StoreCounters {
