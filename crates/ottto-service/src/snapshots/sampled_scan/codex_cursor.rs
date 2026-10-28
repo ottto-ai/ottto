@@ -6790,10 +6790,10 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
     if settleable {
         targets.census.ownership_incomplete_file_count +=
             disclosure.ownership_incomplete_file_count;
-        targets.census.causes.add(
-            disclosure.cause,
-            std::iter::repeat(&candidate.path).take(disclosure.ownership_incomplete_file_count),
-        );
+        targets
+            .census
+            .causes
+            .add(disclosure.cause, disclosure.ownership_incomplete_file_count);
         targets.census.zero_snapshot_usage_evidence_count +=
             usize::from(disclosure.zero_snapshot_usage_evidence);
         // PR-1: the fresh finish's line and drop totals.

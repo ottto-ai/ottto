@@ -13784,7 +13784,7 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
     for cause in [ownership::CREATED, ownership::PARENT, ownership::PARSER] {
         let mut index = ScanIndex::default();
         let mut census = ScanCensus::default();
-        census.causes = census.causes.page(10);
+        census.causes = census.causes.page();
         let mut residue = BTreeSet::new();
         let mut blocked = BTreeSet::new();
         let mut residue_blocked = BTreeSet::new();
@@ -13806,12 +13806,11 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
                 },
             );
         }
-        let (c, d, unknown) = census
+        let (c, [unknown, _, _]) = census
             .causes
             .summary(census.ownership_incomplete_file_count);
         assert_eq!(census.ownership_incomplete_file_count, 2);
         assert_eq!(c[cause], 2);
-        assert_eq!(d[cause], 1);
         assert_eq!(c[..6].iter().sum::<usize>() + unknown, 2);
         assert_eq!(residue.len(), 1);
         codex_file_join::disclose_strict(
@@ -13825,11 +13824,10 @@ fn ownership_disclosure_replays_preserve_cause_and_group_strict_uses_group_bucke
                 pending_finalization: &mut pending,
             },
         );
-        let (c, d, unknown) = census
+        let (c, [unknown, _, _]) = census
             .causes
             .summary(census.ownership_incomplete_file_count);
         assert_eq!(c[ownership::GROUP], 1);
-        assert_eq!(d[ownership::GROUP], 0, "the earlier singleton cause wins");
         assert_eq!(c[..6].iter().sum::<usize>() + unknown, 3);
     }
 }

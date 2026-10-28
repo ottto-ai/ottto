@@ -2841,7 +2841,7 @@ pub(super) mod tests {
         let (held_index, held) = retained_page(&root, settled, &[unreadable.clone(), new.clone()]);
         assert!(held.snapshots.is_empty(), "{:?}", held.snapshots);
         assert!(held.ownership_incomplete_file_count > 0);
-        let (c, _, unknown) = held.causes.summary(held.ownership_incomplete_file_count);
+        let (c, [unknown, _, _]) = held.causes.summary(held.ownership_incomplete_file_count);
         assert!(c[ownership::INVENTORY] > 0);
         assert_eq!(
             c[..6].iter().sum::<usize>() + unknown,
@@ -3011,7 +3011,7 @@ pub(super) mod tests {
         let (after, held) = scan(&root, previous.clone(), 3);
         assert!(!held.census_complete);
         assert_eq!(held.ownership_incomplete_file_count, 2);
-        let (c, _, unknown) = held.causes.summary(held.ownership_incomplete_file_count);
+        let (c, [unknown, _, _]) = held.causes.summary(held.ownership_incomplete_file_count);
         assert_eq!(c[ownership::ABSENT], 2);
         assert_eq!(c[..6].iter().sum::<usize>() + unknown, 2);
         assert!(held

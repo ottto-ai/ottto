@@ -1,89 +1,54 @@
 use super::*;
 
 fn conserved(counts: &Counts, total: usize) {
-    let (c, _, unknown) = counts.summary(total);
-    assert_eq!(c[..N].iter().sum::<usize>() + unknown, total);
-    assert_eq!(c[..N].iter().sum::<usize>(), c[N] + c[N + 1]);
+    let (c, [unknown, _, _]) = counts.summary(total);
+    assert_eq!(
+        c[..N]
+            .iter()
+            .try_fold(0usize, |n, v| n.checked_add(*v))
+            .unwrap()
+            .checked_add(unknown),
+        Some(total)
+    );
 }
 
 #[test]
-fn cause_cardinality_and_all_contribution_slots_are_pinned() {
+fn cause_cardinality_and_each_contribution_slot_are_pinned_and_sum_to_s() {
     let all = [INVENTORY, CREATED, PARENT, ABSENT, GROUP, PARSER];
     assert_eq!(all.len(), N);
     assert_eq!(all.into_iter().collect::<BTreeSet<_>>(), (0..N).collect());
     assert_eq!(NAMES.split(' ').count(), N);
     let mut traversal = Counts::default();
-    let mut page = traversal.page(100);
-    for (i, cause) in all.into_iter().enumerate() {
-        page.add(cause, [format!("private-{i}.jsonl")]);
+    let mut page = traversal.page();
+    for cause in all {
+        page.add(cause, 1);
     }
     traversal.merge(&page);
-    conserved(&traversal, N);
     assert_eq!(traversal.summary(N).0[..N], [1; N]);
-    assert_eq!(traversal.summary(N).1[..N], [1; N]);
-    let encoded = serde_json::to_string(&traversal).unwrap();
-    assert!(!encoded.contains("private"));
-    assert!(!encoded.contains("distinct"));
+    assert_eq!(traversal.summary(N).1[0], 0);
+    conserved(&traversal, N);
 }
 
 #[test]
-fn repeated_key_adds_two_contributions_and_one_distinct_first_cause_wins() {
-    let mut generation = Counts::default();
-    let mut first = generation.page(2);
-    first.add(INVENTORY, ["same.jsonl", "same.jsonl"]);
-    generation.merge(&first);
-    let (c, d, _) = generation.summary(2);
-    assert_eq!(c[INVENTORY], 2);
-    assert_eq!(d[INVENTORY], 1);
-    let mut next = generation.page(2);
-    next.add(CREATED, ["same.jsonl"]);
-    generation.merge(&next);
-    let (c, d, _) = generation.summary(3);
-    assert_eq!(c[CREATED], 1);
-    assert_eq!(d[CREATED], 0);
-    assert_eq!(d[INVENTORY], 1);
-    conserved(&generation, 3);
+fn repeated_work_counts_every_contribution_and_marker_stays_in_generation() {
+    let mut traversal = Counts::default();
+    let mut first = traversal.page();
+    let marker = first.summary(0).1[1];
+    assert!(marker > 0);
+    first.add(INVENTORY, 2);
+    traversal.merge(&first);
+    let mut second = traversal.page();
+    assert_eq!(second.summary(0).1[1], marker);
+    second.add(CREATED, 1);
+    traversal.merge(&second);
+    assert_eq!(traversal.summary(3).0[INVENTORY], 2);
+    assert_eq!(traversal.summary(3).0[CREATED], 1);
+    conserved(&traversal, 3);
+    assert!(Counts::default().page().summary(0).1[1] > marker);
 }
 
 #[test]
-fn distinct_cap_is_bounded_sticky_and_never_caps_contributions() {
-    let mut counts = Counts::default().page(1);
-    counts.add(PARSER, ["a.jsonl", "b.jsonl", "b.jsonl", "a.jsonl"]);
-    assert_eq!(counts.state().0.len(), 1);
-    assert_eq!(counts.summary(4).1[PARSER], 1);
-    assert_eq!(counts.summary(4).1[N], 1);
-    assert_eq!(counts.summary(4).0[PARSER], 4);
-    // Increasing the index later cannot renew this generation's insertion allowance.
-    let mut next = counts.page(100);
-    next.add(PARSER, ["c.jsonl"]);
-    assert_eq!(counts.state().0.len(), 1);
-    assert_eq!(Counts::default().page(100_000).state().2, Some(65_536));
-    let mut empty = Counts::default().page(0);
-    empty.add(PARSER, ["a.jsonl"]);
-    assert_eq!(empty.summary(1).1[N], 1);
-    assert_eq!(empty.state().0.len(), 0);
-    conserved(&counts, 4);
-}
-
-#[test]
-fn known_compression_is_input_only_and_absent_parent_does_not_imply_compressed() {
-    let mut counts = Counts::default().page(10);
-    counts.add(PARENT, ["plain-child.jsonl"]);
-    counts.add(GROUP, ["known-input.jsonl.zst"]);
-    let (c, _, unknown) = counts.summary(2);
-    assert_eq!(c[PARENT], 1);
-    assert_eq!(c[N], 1);
-    assert_eq!(c[N + 1], 1);
-    assert_eq!(unknown, 0);
-    let emitted = line(counts.summary(2));
-    assert!(emitted.contains("ownership_input_compressed=1"));
-    assert!(emitted.contains("ownership_parent_unresolvable=1"));
-    assert!(!emitted.contains("plain-child"));
-    conserved(&counts, 2);
-}
-
-#[test]
-fn index_restart_retains_contributions_but_resets_distinct_and_fresh_generation_resets_both() {
+fn index_restart_retains_contributions_and_fresh_generation_resets_them() {
     let dir = crate::test_scratch::ScratchDir::new("ownership-causes-restart");
     let path = dir.join("index.json");
     let mut index = ScanIndex::default();
@@ -95,22 +60,22 @@ fn index_restart_retains_contributions_but_resets_distinct_and_fresh_generation_
         30,
     );
     let counts = &mut index.traversal.as_mut().unwrap().counts;
-    counts.causes = counts.causes.page(10);
-    counts.causes.add(PARENT, ["same.jsonl", "same.jsonl"]);
+    counts.causes = counts.causes.page();
+    counts.causes.add(PARENT, 2);
     counts.ownership_incomplete_file_count = 2;
-    assert_eq!(counts.causes.summary(2).1[PARENT], 1);
+    let marker = counts.causes.summary(2).1[1];
     index.save(&path).unwrap();
     let mut restored = ScanIndex::load(&path).unwrap();
     let counts = &mut restored.traversal.as_mut().unwrap().counts;
     assert_eq!(counts.causes.summary(2).0[PARENT], 2);
-    assert_eq!(counts.causes.summary(2).1, [0; N + 1]);
-    let mut page = counts.causes.page(10);
-    page.add(PARENT, ["same.jsonl"]);
+    assert_eq!(counts.causes.summary(2).1, [0; 3]);
+    let mut page = counts.causes.page();
+    assert!(page.summary(0).1[1] > marker);
+    page.add(PARENT, 1);
     counts.causes.merge(&page);
     counts.ownership_incomplete_file_count += 1;
     assert_eq!(counts.causes.summary(3).0[PARENT], 3);
-    assert_eq!(counts.causes.summary(3).1[PARENT], 1);
-    conserved(&counts.causes, counts.ownership_incomplete_file_count);
+    conserved(&counts.causes, 3);
     restored.traversal = None;
     ensure_bounded_traversal(
         SnapshotSource::Codex,
@@ -120,7 +85,77 @@ fn index_restart_retains_contributions_but_resets_distinct_and_fresh_generation_
         30,
     );
     let fresh = &restored.traversal.as_ref().unwrap().counts;
-    assert_eq!(fresh.causes.summary(0), ([0; N + 2], [0; N + 1], 0));
+    assert_eq!(fresh.causes.summary(0), ([0; N + 2], [0; 3]));
+}
+
+#[test]
+fn sparse_closed_wire_and_json_omit_empty_causes_and_keep_unattributed_last() {
+    assert!(line(Counts::default().summary(0)).is_empty());
+    assert!(serde_json::to_value(ScanTraversalCounts::default())
+        .unwrap()
+        .get("causes")
+        .is_none());
+    let mut counts = Counts::default().page();
+    counts.add(PARENT, 1);
+    let emitted = line(counts.summary(4));
+    assert!(emitted.contains("ownership_incomplete_generation="));
+    assert!(
+        emitted.contains("ownership_incomplete_contributions{bucket=\"parent_unresolvable\"}=1")
+    );
+    assert!(emitted.contains("ownership_incomplete_contributions{bucket=\"unattributed\"}=3"));
+    assert!(!emitted.contains("created_thread_proof"));
+    assert!(!emitted.contains("distinct"));
+    assert!(!emitted.contains("invalid_resets"));
+    assert!(emitted.find("parent_unresolvable").unwrap() < emitted.find("unattributed").unwrap());
+    let saved = serde_json::to_value(&counts).unwrap();
+    assert_eq!(saved.as_object().unwrap().len(), 1);
+    assert_eq!(saved["contributions"].as_array().unwrap().len(), 8);
+    conserved(&counts, 4);
+}
+
+#[test]
+fn overclassified_restored_state_is_disclosed_and_projected_to_all_unattributed() {
+    let c: Counts = serde_json::from_value(json!({"contributions":[1,0,0,0,0,0,0,0]})).unwrap();
+    assert_eq!(c.summary(0), ([0; N + 2], [0, 0, 1]));
+    assert!(line(c.summary(0)).contains("ownership_incomplete_invalid_resets=1"));
+    conserved(&c, 0);
+}
+
+#[test]
+fn aggregate_overflow_and_slot_add_merge_overflow_are_counted_without_wrapping() {
+    let mut c = Counts::default();
+    c.add(INVENTORY, usize::MAX);
+    c.add(PARENT, 1);
+    assert_eq!(c.summary(usize::MAX), ([0; N + 2], [usize::MAX, 0, 1]));
+    conserved(&c, usize::MAX);
+    let mut slot = Counts::default();
+    slot.add(INVENTORY, usize::MAX);
+    slot.add(INVENTORY, 1);
+    assert_eq!(slot.summary(10), ([0; N + 2], [10, 0, 1]));
+    let mut page = Counts::default();
+    page.add(PARENT, usize::MAX);
+    slot.add(PARENT, 1);
+    slot.merge(&page);
+    assert_eq!(slot.summary(10), ([0; N + 2], [10, 0, 2]));
+}
+
+#[test]
+fn legacy_remainder_overflow_is_disclosed_even_when_legacy_scalar_wraps_to_zero() {
+    let mut legacy = Counts::default();
+    let scalar = usize::MAX;
+    assert_eq!(legacy.summary(scalar).1[0], scalar);
+    legacy.add(PARENT, 1);
+    // Diagnostic-only seam: do not execute or change the pre-existing unchecked scalar addition.
+    assert_eq!(scalar.checked_add(1), None);
+    let wrapped_scalar = scalar.wrapping_add(1);
+    assert_eq!(legacy.summary(wrapped_scalar), ([0; N + 2], [0, 0, 1]));
+    conserved(&legacy, wrapped_scalar);
+    legacy.observation[1] = usize::MAX;
+    assert_eq!(
+        legacy.summary(wrapped_scalar).1[2],
+        usize::MAX,
+        "reset counter saturates explicitly"
+    );
 }
 
 #[test]
@@ -165,15 +200,95 @@ fn prior_map_and_positional_counts_default_the_appended_split_without_shifting_n
         assert_eq!(restored.ownership_incomplete_file_count, 17);
         assert_eq!(restored.dropped_usage_record_count, 23);
         assert_eq!(restored.terminal_zero_snapshot_usage_evidence_count, 29);
-        assert_eq!(restored.causes.summary(17).2, 17);
+        assert_eq!(restored.causes.summary(17).1[0], 17);
         conserved(&restored.causes, 17);
     }
-    let mut added = Counts::default().page(2);
-    added.add(GROUP, ["a.jsonl"]);
+    let mut added = Counts::default().page();
+    added.add(GROUP, 1);
     positional.push(serde_json::to_value(added).unwrap());
     let restored: ScanTraversalCounts = serde_json::from_value(json!(positional)).unwrap();
     assert_eq!(restored.causes.summary(17).0[GROUP], 1);
-    assert_eq!(restored.causes.summary(17).2, 16);
-    assert_eq!(restored.causes.summary(17).1, [0; N + 1]);
+    assert_eq!(restored.causes.summary(17).1[0], 16);
     conserved(&restored.causes, 17);
+}
+
+// Exact merge-base ScanTraversalCounts serde shape, including retired positional slots.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct MergeBaseScanTraversalCounts {
+    discovered_file_count: usize,
+    directory_entry_cap_exceeded_count: usize,
+    symlink_rejected_count: usize,
+    unreadable_path_count: usize,
+    unreadable_causes: UnreadableCauses,
+    /// PR-P: held fork children per parent cause, traversal-cumulative.
+    /// Additive: old checkpoints load as zero (struct-level `serde(default)`).
+    parent_unresolvable: ParentUnresolvableCauses,
+    oversized_file_count: usize,
+    disappeared_file_count: usize,
+    malformed_json_line_count: usize,
+    invalid_utf8_line_count: usize,
+    over_line_cap_count: usize,
+    recognized_usage_drop_count: usize,
+    ownership_incomplete_file_count: usize,
+    zero_snapshot_usage_evidence_count: usize,
+    dropped_usage_record_count: u64,
+    /// Subset of the public loss counters above that has a durable terminal
+    /// disposition. These remain disclosed but do not make an exhausted
+    /// traversal retryable.
+    #[serde(default)]
+    terminal_over_line_cap_count: usize,
+    #[serde(default)]
+    terminal_recognized_usage_drop_count: usize,
+    #[serde(default)]
+    terminal_dropped_usage_record_count: u64,
+    /// Non-progressing residue promoted to terminal by the generation that
+    /// re-derived it. Ownership-incomplete Codex rollouts whose parent
+    /// resolution is not pending, files with usage evidence but no entity, and
+    /// the usage records those files drop are deterministic functions of their
+    /// unchanged bytes, sidecar and parent evidence. Their files are never
+    /// checkpointed, so every generation parses them again and reaches the
+    /// same counts; retrying the traversal cannot change them. Once discovery
+    /// finishes without any retryable problem they are settled here so the
+    /// census can complete with the loss named, instead of holding every
+    /// downstream completeness gate red for as long as those files exist.
+    /// See `settle_non_progressing_residue`.
+    #[serde(default)]
+    terminal_ownership_incomplete_file_count: usize,
+    #[serde(default)]
+    terminal_zero_snapshot_usage_evidence_count: usize,
+    // Persisted positional slots: diagnostic additions must remain last.
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    #[serde(rename = "unchanged_reread_admitted", default, skip_serializing)]
+    retired_unchanged_reread_admitted: serde::de::IgnoredAny,
+    /// retired_<old>: decode-only placeholder; keeps positional slots; never written.
+    #[serde(rename = "reread_budget_refused", default, skip_serializing)]
+    retired_reread_budget_refused: serde::de::IgnoredAny,
+}
+
+#[test]
+fn current_object_old_reader_current_roundtrip_retains_s_but_explicitly_loses_split() {
+    let mut current = ScanTraversalCounts {
+        ownership_incomplete_file_count: 17,
+        dropped_usage_record_count: 23,
+        terminal_zero_snapshot_usage_evidence_count: 29,
+        ..ScanTraversalCounts::default()
+    };
+    current.causes.add(PARENT, 5);
+    let object = serde_json::to_value(&current).unwrap();
+    assert!(object.is_object());
+    assert_eq!(object["causes"]["contributions"][PARENT], 5);
+    let old: MergeBaseScanTraversalCounts = serde_json::from_value(object).unwrap();
+    assert_eq!(old.ownership_incomplete_file_count, 17);
+    assert_eq!(old.dropped_usage_record_count, 23);
+    assert_eq!(old.terminal_zero_snapshot_usage_evidence_count, 29);
+    let saved = serde_json::to_value(old).unwrap();
+    assert!(saved.is_object());
+    assert!(saved.get("causes").is_none());
+    let upgraded: ScanTraversalCounts = serde_json::from_value(saved).unwrap();
+    assert_eq!(upgraded.ownership_incomplete_file_count, 17);
+    assert_eq!(upgraded.dropped_usage_record_count, 23);
+    assert_eq!(upgraded.terminal_zero_snapshot_usage_evidence_count, 29);
+    assert_eq!(upgraded.causes.summary(17), ([0; N + 2], [17, 0, 0]));
+    conserved(&upgraded.causes, 17);
 }

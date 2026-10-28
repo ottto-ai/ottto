@@ -1,6 +1,6 @@
-use super::codex_compressed_input::is_compressed_codex_rollout;
 use super::*;
-use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
+static NEXT_GENERATION: AtomicUsize = AtomicUsize::new(1);
 pub(super) const INVENTORY: usize = 0;
 pub(super) const CREATED: usize = 1;
 pub(super) const PARENT: usize = 2;
@@ -9,66 +9,82 @@ pub(super) const GROUP: usize = 4;
 pub(super) const PARSER: usize = 5;
 const N: usize = PARSER + 1;
 const NAMES: &str = "inventory_hold created_thread_proof parent_unresolvable protected_absent other_group_receipt_legacy other_parser";
-type Distinct = (BTreeSet<u64>, [usize; N + 1], Option<usize>);
-pub(crate) type Summary = ([usize; N + 2], [usize; N + 1], usize);
+pub(crate) type Summary = ([usize; N + 2], [usize; 3]);
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub(crate) struct Counts {
+    // Last two slots retain the prior input counters; no longer incremented or emitted.
     contributions: [usize; N + 2],
     #[serde(skip)]
-    distinct: Arc<Mutex<Distinct>>,
+    observation: [usize; 2], // generation marker, diagnostic resets; process-only
 }
 impl Counts {
-    fn state(&self) -> std::sync::MutexGuard<'_, Distinct> {
-        self.distinct.lock().unwrap_or_else(|e| e.into_inner())
+    pub(super) fn is_empty(&self) -> bool {
+        self.contributions == [0; N + 2]
     }
-    pub(super) fn page(&self, index_size: usize) -> Self {
-        self.state().2.get_or_insert(index_size.min(65_536));
+    fn reset(&mut self) {
+        self.contributions = [0; N + 2];
+        self.observation[1] = self.observation[1].saturating_add(1);
+    }
+    pub(super) fn page(&mut self) -> Self {
+        if self.observation[0] == 0 {
+            self.observation[0] = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
         Self {
-            distinct: Arc::clone(&self.distinct),
+            observation: [self.observation[0], 0],
             ..Self::default()
         }
     }
-    pub(super) fn add<P: AsRef<Path>>(&mut self, cause: usize, keys: impl IntoIterator<Item = P>) {
-        let mut d = self.distinct.lock().unwrap_or_else(|e| e.into_inner());
-        for path in keys {
-            let path = path.as_ref();
-            self.contributions[cause] += 1;
-            self.contributions[N + usize::from(is_compressed_codex_rollout(Some(path), None))] += 1;
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            local_index_key(path).hash(&mut hash);
-            let key = hash.finish();
-            if !d.0.contains(&key) {
-                if d.0.len() < d.2.unwrap_or(0) {
-                    d.0.insert(key);
-                    d.1[cause] += 1;
-                } else {
-                    d.1[N] = 1;
-                }
-            }
+    pub(super) fn add(&mut self, cause: usize, count: usize) {
+        match self.contributions[cause].checked_add(count) {
+            Some(n) => self.contributions[cause] = n,
+            None => self.reset(),
         }
     }
     pub(super) fn merge(&mut self, page: &Self) {
-        for (a, b) in self.contributions.iter_mut().zip(page.contributions) {
-            *a += b;
+        self.observation[1] = self.observation[1].saturating_add(page.observation[1]);
+        for (i, count) in page.contributions.iter().enumerate() {
+            self.add(i, *count);
         }
     }
     pub(crate) fn summary(&self, total: usize) -> Summary {
-        let unknown = total.saturating_sub(self.contributions[..N].iter().sum());
-        (self.contributions, self.state().1, unknown)
+        let mut c = self.clone();
+        let remainder = c.contributions[..N]
+            .iter()
+            .try_fold(0usize, |n, v| n.checked_add(*v))
+            .and_then(|n| total.checked_sub(n));
+        if remainder.is_none() {
+            c.reset();
+        }
+        let meta = [
+            remainder.unwrap_or(total),
+            c.observation[0],
+            c.observation[1],
+        ];
+        (c.contributions, meta)
     }
 }
-pub(crate) fn line((c, d, unattributed): Summary) -> String {
+pub(crate) fn line((c, [unattributed, generation, invalid]): Summary) -> String {
     let mut line = String::new();
-    for (i, name) in NAMES.split(' ').enumerate() {
-        line.push_str(&format!(
-            " ownership_{name}={} ownership_{name}_distinct={}",
-            c[i], d[i]
-        ));
+    for (name, count) in NAMES
+        .split(' ')
+        .chain(["unattributed"])
+        .zip(c[..N].iter().copied().chain([unattributed]))
+    {
+        if count != 0 {
+            line.push_str(&format!(
+                " ownership_incomplete_contributions{{bucket=\"{name}\"}}={count}"
+            ));
+        }
     }
-    line.push_str(&format!(" ownership_unattributed={unattributed} ownership_input_plain={} ownership_input_compressed={} ownership_distinct_capped={}", c[N], c[N + 1], d[N] != 0));
+    for (name, count) in [("generation", generation), ("invalid_resets", invalid)] {
+        if count != 0 {
+            line.push_str(&format!(" ownership_incomplete_{name}={count}"));
+        }
+    }
     line
 }
-crate::heap_layout_bound::fields!(Counts; contributions, distinct);
+crate::heap_layout_bound::fields!(Counts; contributions, observation);
 #[cfg(test)]
 #[path = "ownership_diagnostics_tests.rs"]
 mod tests;

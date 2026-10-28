@@ -174,10 +174,7 @@ pub(in crate::snapshots) fn disclose_strict(
     targets: DisclosureTargets<'_>,
 ) {
     targets.census.ownership_incomplete_file_count += members.len();
-    targets
-        .census
-        .causes
-        .add(ownership::GROUP, members.iter().map(|m| &m.path));
+    targets.census.causes.add(ownership::GROUP, members.len());
     targets
         .census
         .record_unreadable(UnreadableCause::AliasParser, 1);
