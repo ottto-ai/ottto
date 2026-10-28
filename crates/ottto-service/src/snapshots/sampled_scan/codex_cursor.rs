@@ -3797,6 +3797,13 @@ impl Drop for DecoderOwner {
                 &BTreeMap::from([("leaked_release", 1_u64)]),
             );
         }
+        if cursor_held() {
+            // Strand the charged claim and singleton; never re-lock during Drop.
+            if let Some(mut credit) = self.0.take() {
+                credit.settled = true;
+            }
+            return;
+        }
         self.refund(); // cancellation/unwind safety net, observable as a leak
     }
 }
@@ -4103,9 +4110,8 @@ impl SharedCache {
         let claimed = self
             .with_cursor(|cursor| {
                 let admitted = if free_only {
-                    crate::heap_layout_bound::bound(&*retained, STATE_BYTES)
-                        .and_then(|floor| floor.checked_add(super::side_ledger::SIDE_LEDGER_BYTES))
-                        .and_then(|floor| charge.checked_add(floor))
+                    charge
+                        .checked_add(super::ENTRY_BYTES + super::side_ledger::SIDE_LEDGER_BYTES)
                         .is_some_and(|with_floor| proof_free_room(&retained, cursor, with_floor))
                 } else {
                     admit_locked(&mut retained, cursor, charge, true, Admitter::Main)

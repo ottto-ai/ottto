@@ -681,7 +681,8 @@ legal identity observations; they establish no decoded-offset certificate.
 
 A paid compressed-input decoder reserves the existing SharedCache credit under
 retained → cursor before taking the durable Stores leaf lock. It keeps an
-additional admission floor free for primary Tail reads; admission never evicts.
+fixed admission floor (one 8 MiB primary entry plus side-ledger bytes) free
+for primary Tail reads; admission never evicts or charges retained bytes twice.
 Only one paid decoder is live per process, with the existing 2 GiB decoded cap.
 A short reservation or busy singleton yields `None`, counts
 `CompressedAdmissionRefused` on `codex_zst_refused`, and changes no acquisition
