@@ -86,7 +86,9 @@ fn members() -> Vec<ApprovedMember> {
 }
 
 /// One real parser item from a synthetic transcript. The parser leaves the
-/// usage unproven; nothing here claims session-exclusive ownership.
+/// usage unproven; nothing here claims session-exclusive ownership. The h527
+/// families are protected-list families, which the pipeline reads fold-absent:
+/// ordinary per-hour buckets, as the gate-off read builds them.
 fn parsed_item(source_session_id: &str, request_ids: &[&str]) -> SnapshotItem {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -123,11 +125,13 @@ fn parsed_item(source_session_id: &str, request_ids: &[&str]) -> SnapshotItem {
             .join("\n"),
     )
     .expect("write transcript");
-    let item = parse_claude_code_jsonl_file(
-        &path,
-        "2026-09-02T07:00:00Z",
-        "fixture-file-fingerprint".to_string(),
-    )
+    let item = crate::snapshots::claude_request_money::e2::with_disabled(|| {
+        parse_claude_code_jsonl_file(
+            &path,
+            "2026-09-02T07:00:00Z",
+            "fixture-file-fingerprint".to_string(),
+        )
+    })
     .expect("parse")
     .into_iter()
     .next()

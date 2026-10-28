@@ -47,9 +47,10 @@ use super::{
 };
 use crate::snapshots::{
     apply_claude_code_line, apply_upload_policy, claude_code_delta_usage,
-    claude_fork_line_provenance, claude_request_id_set_fingerprint, claude_subagent_identity,
-    opened_object_identity, parse_opened_jsonl_file, scan_file_fingerprint_with_opened_identity,
-    string_at, ClaudeForkLineProvenance, ClaudeTitleMetadata, SnapshotAccumulator, SnapshotItem,
+    claude_fork_line_provenance, claude_index_path_member_ref, claude_request_id_set_fingerprint,
+    claude_request_money, claude_subagent_identity, opened_object_identity,
+    scan_file_fingerprint_with_opened_identity, string_at, ClaudeForkLineProvenance,
+    ClaudeTitleMetadata, OwnedJsonlParser, ScanIndex, SnapshotAccumulator, SnapshotItem,
     SnapshotSource, SnapshotUploadPolicy, UsageTotals, MAX_JSONL_FILE_BYTES, MAX_JSONL_LINE_BYTES,
 };
 use serde::Deserialize;
@@ -475,6 +476,11 @@ struct ParsedTarget {
 /// The production open, opened-object identity and fingerprint, then the
 /// ordinary parser. The scan fingerprint carries no sidecar part, because
 /// sidecars are not read here.
+///
+/// The targets are protected-list families, which the daemon reads
+/// fold-absent: ordinary pre-E2 money with native per-hour buckets, never the
+/// E2 request-owned fold. The parse reproduces exactly that read by listing
+/// the target's own family in an otherwise empty index.
 fn parse_target_transcript(
     path: &Path,
     collected_at: &str,
@@ -508,23 +514,40 @@ fn parse_target_transcript(
         ),
         None => (apply_claude_code_line, None),
     };
-    let parsed = parse_opened_jsonl_file(
+    let mut listed = ScanIndex::default();
+    if let Some(member) = claude_index_path_member_ref(path) {
+        listed.claude_reemission_exclusions.list_root(member.root);
+    }
+    let mut parser = OwnedJsonlParser::new(
         file,
-        &opened,
         path,
-        collected_at,
-        fingerprint,
         source,
         apply_line,
         None,
-        Some(&ClaudeTitleMetadata::default()),
         None,
         None,
         artifacts_enabled,
-        None,
         context_curve_enabled,
     )
     .map_err(|error| format!("parse: {error:#}"))?;
+    while !parser.step().map_err(|error| format!("parse: {error:#}"))? {}
+    let parsed = parser
+        .finish_with_repository_identity(
+            &opened,
+            path,
+            collected_at,
+            fingerprint,
+            None,
+            Some(&ClaudeTitleMetadata::default()),
+            None,
+            None,
+            Some(claude_request_money::e2::ReadContext {
+                index: &listed,
+                path,
+                twins: &std::cell::OnceCell::new(),
+            }),
+        )
+        .map_err(|error| format!("parse: {error:#}"))?;
     Ok(ParsedTarget {
         complete: parsed.complete(),
         snapshots: parsed.snapshots,
@@ -1212,6 +1235,11 @@ fn original_target(
     }
     if has_request_identity_evidence(&item) {
         return held("unsupported: body carries request identity evidence");
+    }
+    if item.claude_money.is_some() {
+        return held(
+            "unsupported: E2 request-owned fold applied; only the ordinary read is produced",
+        );
     }
     TargetParse {
         request_ids: Some(request_ids.clone()),
