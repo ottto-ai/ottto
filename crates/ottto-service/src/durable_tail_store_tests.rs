@@ -1386,7 +1386,8 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
     assert!(live.exists());
     assert!(unrelated.exists());
     assert!(!dead.exists());
-    assert_eq!(store.counters().disk_records, INVENTORY_BOUND as u64);
+    // Records past the bound are untouched but still counted in the level.
+    assert_eq!(store.counters().disk_records, INVENTORY_BOUND as u64 + 6);
     assert_eq!(store.counters().uninventoried_records, 6);
     assert_eq!(store.counters().gc_temps_deleted, 1);
 }
@@ -1411,7 +1412,9 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
     assert_eq!(receipt.written, 1);
     let store = scratch.store();
     let mut kept = Vec::new();
-    for n in 0..=INVENTORY_BOUND {
+    // One record past the bound: whether the known record or a kept one is
+    // unlisted, promoting the known key must not admit the new key.
+    for n in 0..INVENTORY_BOUND {
         let mut record = pending(b.clone(), certificate(&transcript), 1);
         record.binding.key = key_digest(DurableSource::ClaudeCode, &format!("kept-{n}"));
         let mut bytes = encode(&DurableRecord {
@@ -1445,7 +1448,7 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
     assert_eq!(receipt.deferred_keys, vec![new.key]);
     let counters = store.counters();
     assert_eq!(counters.store_write_skipped, [0, 0, 1]);
-    assert_eq!(counters.disk_records, INVENTORY_BOUND as u64 + 2);
+    assert_eq!(counters.disk_records, INVENTORY_BOUND as u64 + 1);
     assert!(!record_file(&store, &new.key).exists());
     let record = found(scratch.store().read(&b.key, &placeholder_allowlist()));
     assert_eq!(record.index_generation, 2);

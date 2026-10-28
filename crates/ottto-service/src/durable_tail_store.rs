@@ -587,13 +587,16 @@ impl DurableTailStore {
                         unlisted = [unlisted[0] - 1, unlisted[1].saturating_sub(metadata.len())];
                         on_disk.insert(key, metadata.len());
                     }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        self.counters.store_write_skipped[2] += 1;
-                        receipt.deferred_keys.push(key);
-                        continue;
-                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
                 }
+            }
+            if !on_disk.contains_key(&key)
+                && on_disk.len() as u64 + unlisted[0] > INVENTORY_BOUND as u64
+            {
+                self.counters.store_write_skipped[2] += 1;
+                receipt.deferred_keys.push(key);
+                continue;
             }
             let stored = DurableRecord {
                 record,
@@ -675,6 +678,7 @@ impl DurableTailStore {
         let mut on_disk = BTreeMap::new();
         self.counters.uninventoried_records = 0;
         let mut seen = 0_usize;
+        let mut unlisted_bytes = 0;
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
@@ -692,13 +696,14 @@ impl DurableTailStore {
                 continue;
             };
             seen += 1;
+            let len = entry.metadata().map_or(0, |m| m.len());
             if seen > INVENTORY_BOUND {
                 self.counters.uninventoried_records += 1;
+                unlisted_bytes += len;
                 continue;
             }
             self.counters.gc_records_read += 1;
             self.counters.gc_bytes_read += HEADER_BYTES as u64;
-            let len = entry.metadata().map_or(0, |m| m.len());
             let verdict = match self.classify(&key, "delete") {
                 Ok(Some(binding)) => {
                     let live = binding.context == *live_context
@@ -728,7 +733,10 @@ impl DurableTailStore {
         if deleted {
             sync_dir(&self.dir)?;
         }
-        self.set_disk_level(&on_disk, [0; 2]);
+        self.set_disk_level(
+            &on_disk,
+            [self.counters.uninventoried_records, unlisted_bytes],
+        );
         Ok(())
     }
 
