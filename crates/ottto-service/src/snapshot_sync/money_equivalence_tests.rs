@@ -1077,6 +1077,12 @@ impl PiProof {
         } else {
             "UNSUPPORTED"
         };
+        let capability = if self.durable {
+            "SUPPORTED"
+        } else {
+            "UNSUPPORTED"
+        };
+        println!("MONEY_EQUIVALENCE_PI_CAPABILITY {name} {capability}");
         println!("MONEY_EQUIVALENCE_DISK {name} {status}");
     }
 }
@@ -1530,6 +1536,8 @@ fn pi_cli_fork_preserves_double_count() {
     if !supported("pi_cli_fork_preserves_double_count") {
         return;
     }
+    // M-2 will change these request/input totals when inherited usage is skipped.
+    const EXPECTED_FORK_TOTALS: (u64, u64) = (3, 40);
     let (c, disk, path, scanner, prior, mut proof) =
         pi_disk_corpus("pi_cli_fork_preserves_double_count", &pi_seed());
     let fork = c.root.join("fork.jsonl");
@@ -1564,12 +1572,11 @@ fn pi_cli_fork_preserves_double_count() {
     );
     assert_eq!(scan.snapshots.len(), 2);
     assert_eq!(
-        scan.snapshots.iter().map(|s| s.request_count).sum::<u64>(),
-        3
-    );
-    assert_eq!(
-        scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(),
-        40
+        (
+            scan.snapshots.iter().map(|s| s.request_count).sum::<u64>(),
+            scan.snapshots.iter().map(|s| s.input_tokens).sum::<u64>(),
+        ),
+        EXPECTED_FORK_TOTALS
     );
     proof.finish(&c);
 }

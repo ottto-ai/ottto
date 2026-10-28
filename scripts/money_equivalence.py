@@ -63,7 +63,7 @@ def main():
     head_sha = output(["git", "rev-parse", "HEAD"])
     manifest = {"base": base_sha, "head": head_sha, "base_ref": ref,
                 "arms": ["retained_ram_tail_or_unchanged", "cold_full", "disk_restore"],
-                "disk_restore": {}}
+                "disk_restore": {}, "pi_durable_capability": {}, "receipt_counts": {}}
     (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     base = root / "base"
     command(["git", "worktree", "add", "--detach", str(base), base_sha])
@@ -96,7 +96,6 @@ def main():
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             print(result.stdout, flush=True)
             (receipts / f"{arm}.log").write_text(result.stdout)
-            result.check_returncode()
             verified = re.findall(r"\bMONEY_EQUIVALENCE (\w+) VERIFIED ", result.stdout, re.M)
             expected = {
                 "progressive_response", "duplicate_request_ids", "resolver_conflict",
@@ -104,21 +103,36 @@ def main():
                 "side_owner_directory_unlisted", "failed_then_healthy_telemetry",
                 "codex_v2_sticky", "codex_legacy_acked_sticky",
             } | set(PI_FIXTURES)
+            disk = re.findall(r"\bMONEY_EQUIVALENCE_DISK (\w+) (\w+)", result.stdout, re.M)
+            capabilities = re.findall(r"\bMONEY_EQUIVALENCE_PI_CAPABILITY (\w+) (\w+)",
+                                      result.stdout, re.M)
+            pi_capability = dict(capabilities)
+            manifest["pi_durable_capability"][arm] = pi_capability
+            manifest["disk_restore"][arm] = dict(disk)
+            manifest["receipt_counts"][arm] = {
+                "build_sha": base_sha if arm == "base" else head_sha,
+                "cross_build": {"existing": sum(name not in PI_FIXTURES for name in verified),
+                                "pi": sum(name in PI_FIXTURES for name in verified),
+                                "total": len(verified), "expected": len(expected)},
+                "disk": {"existing": sum(name not in PI_FIXTURES for name, _ in disk),
+                         "pi": sum(name in PI_FIXTURES for name, _ in disk),
+                         "total": len(disk), "expected": len(DISK_FIXTURES)},
+            }
+            (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            result.check_returncode()
             if len(verified) != len(expected) or set(verified) != expected or "UNEXECUTED" in result.stdout:
                 raise RuntimeError(f"incomplete native coverage: {verified}")
-            disk = re.findall(r"\bMONEY_EQUIVALENCE_DISK (\w+) (\w+)", result.stdout, re.M)
-            if len(disk) != len(DISK_FIXTURES) or {name for name, _ in disk} != set(DISK_FIXTURES):
-                raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
-            pi_states = {status for name, status in disk if name in PI_FIXTURES}
-            # A base without the Pi store reports UNSUPPORTED uniformly, from
-            # the runtime capability probe; never excuse a partial/broken store.
-            allowed_pi = ({"VERIFIED"}, {"UNSUPPORTED"}) if arm == "base" else ({"VERIFIED"},)
-            if pi_states not in allowed_pi or any(
-                status != "VERIFIED" for name, status in disk if name not in PI_FIXTURES
-            ):
+            if len(capabilities) != len(PI_FIXTURES) or {name for name, _ in capabilities} != set(PI_FIXTURES):
+                raise RuntimeError(f"incomplete {arm} Pi capability declarations: {capabilities}")
+            pi_support = {status for _, status in capabilities}
+            allowed_support = ({"SUPPORTED"}, {"UNSUPPORTED"}) if arm == "base" else ({"SUPPORTED"},)
+            if pi_support not in allowed_support:
+                raise RuntimeError(f"invalid {arm} Pi capability: {capabilities}")
+            expected_disk = [(name, "UNSUPPORTED" if name in PI_FIXTURES
+                              and pi_capability[name] == "UNSUPPORTED" else "VERIFIED")
+                             for name in DISK_FIXTURES]
+            if sorted(disk) != sorted(expected_disk):
                 raise RuntimeError(f"invalid {arm} disk-restore coverage: {disk}")
-            manifest["disk_restore"][arm] = dict(disk)
-            (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
             if len(verified) + len(disk) != len(expected) + len(DISK_FIXTURES):
                 raise RuntimeError(f"expected {len(expected)} + {len(DISK_FIXTURES)} receipts")
         left, right = receipts / "base", receipts / "head"
