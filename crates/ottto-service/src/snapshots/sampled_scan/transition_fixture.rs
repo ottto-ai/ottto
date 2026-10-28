@@ -36,28 +36,17 @@ pub(crate) fn seed_old_writer(
 ) -> Vec<u8> {
     super::durable_tail::seed_pinned_v1(cache, source, key, index, pin)
 }
-// E5-PI-FIXTURE: the scan clock and a pending-audit population for the Pi
-// audit row (P-AUDIT), from adapters outside `snapshots`. Unused until the
-// gated Pi rows compile.
+// E5-PI-FIXTURE: pure forwarders (cfg(test), like this module) for the Pi
+// audit row (P-AUDIT), from adapters outside `snapshots`. The row inserts its
+// pending entries through `ScanIndex::files`. Unused until the gated Pi rows
+// compile.
 #[allow(dead_code)]
 pub(crate) fn set_now(now: Option<u64>) {
     super::set_test_now(now);
 }
-/// `count` copies of `like`'s entry with audit deadline `due`, at synthetic
-/// keys outside discovery: the audit population, not files to read.
 #[allow(dead_code)]
-pub(crate) fn stage_pending_audits(
-    index: &mut crate::snapshots::ScanIndex,
-    like: &str,
-    count: usize,
-    due: u64,
-) {
-    for n in 0..count {
-        let mut entry = index.files[like].clone();
-        entry.set_unverified_deadline(due);
-        let key = format!("/synthetic-pending-audits/{n}.jsonl");
-        index.files.insert(key, entry);
-    }
+pub(crate) fn set_unverified_deadline(entry: &mut crate::snapshots::ScanIndexEntry, due: u64) {
+    entry.set_unverified_deadline(due);
 }
 // E5-PI-FIXTURE: reframe hook (E1 takes it into r2-fixture-ext). Source
 // generic: a row edits a record body and only the body's own checks refuse it.
