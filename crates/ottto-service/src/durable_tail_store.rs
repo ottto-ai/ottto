@@ -413,8 +413,8 @@ pub(crate) struct DurableTailStore {
 /// admission cap, so a full store plus its replacements always fits; any
 /// file past it is left untouched and counted.
 pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
-pub(crate) const MEMO_RESIDENT_BOUND: usize =
-    2 * MAX_RECORDS * std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp))>();
+// A memo entry stays within the 128 bytes per record `STORES_RESIDENT_BOUND` charges.
+const _: () = assert!(std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp))>() <= 128);
 
 impl DurableTailStore {
     pub(crate) fn new(dir: PathBuf, source: DurableSource) -> Self {
@@ -525,6 +525,7 @@ impl DurableTailStore {
         };
         self.counters.records_read += 1;
         self.counters.bytes_read += bytes.len() as u64;
+        self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
         self.note_codec(bytes.capacity() + bytes.len().saturating_sub(HEADER_BYTES));
         match decode(&bytes, allowlist) {
             Ok(record) => {
@@ -896,10 +897,13 @@ fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Stamp(u64, u64, u64, i64, i64, i64, i64);
+struct Stamp(u64);
 impl Stamp {
+    /// Process-local memo key over (dev, ino, size, mtime, ctime).
     fn of(m: &fs::Metadata) -> Self {
-        Self(
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (
             m.dev(),
             m.ino(),
             m.len(),
@@ -908,6 +912,8 @@ impl Stamp {
             m.ctime(),
             m.ctime_nsec(),
         )
+            .hash(&mut hasher);
+        Self(hasher.finish())
     }
 }
 

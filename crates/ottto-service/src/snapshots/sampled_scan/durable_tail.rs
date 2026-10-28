@@ -15,8 +15,8 @@
 //!   record, in a bounded batch.
 //!
 //! The stores live beside the RAM cache for the process lifetime and are not
-//! part of its state budget: each holds at most `MAX_RECORDS` 64-byte digest
-//! pairs (`STORES_RESIDENT_BOUND`).
+//! part of its state budget: each holds at most `MAX_RECORDS` digest and
+//! verification-stamp entries (`STORES_RESIDENT_BOUND`).
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,7 +44,7 @@ use sampled_jsonl::CachedJsonlReduction;
 pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper bound of both stores' resident digest maps (two sources).
-pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MEMO_RESIDENT_BOUND;
+pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 128;
 
 /// Head re-parse bytes of restores, per source, for the process lifetime.
 /// The re-parse bypasses the reread guard (bounded at `HEAD_BOUND`, on a RAM
@@ -453,7 +453,7 @@ impl SharedCache {
             index,
             interpretation,
         ) {
-            Some(taken) => RestoreOutcome::Restored(taken),
+            Some(taken) => RestoreOutcome::Restored(Box::new(taken)),
             None => self
                 .durable_hold(snapshot_source, key)
                 .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
@@ -882,7 +882,7 @@ impl SharedCache {
 }
 
 pub(crate) enum RestoreOutcome {
-    Restored(Taken<CachedJsonlReduction>),
+    Restored(Box<Taken<CachedJsonlReduction>>),
     Miss,
     Held(store::Refusal),
 }

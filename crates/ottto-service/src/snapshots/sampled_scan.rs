@@ -2015,11 +2015,11 @@ pub(super) fn configure_tier_replay(
     ));
 }
 
-/// Actual path-scoped interpretation dependencies. Decode no provider row here;
-/// reuse existing sidecar inventory and bounded owning-header authority.
 #[cfg(test)]
 thread_local! { static TEST_REFUSE_REDUCTION_DEPENDENCIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
+/// Actual path-scoped interpretation dependencies. Decode no provider row here;
+/// reuse existing sidecar inventory and bounded owning-header authority.
 pub(super) fn reduction_dependencies(
     source: SnapshotSource,
     candidate: &CandidateFile,
