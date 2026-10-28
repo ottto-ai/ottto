@@ -47847,7 +47847,7 @@ impl ScanIndex {
     }
 
     fn retire_superseded_codex_bodies(&mut self, fresh: &BTreeSet<String>) {
-        if fresh.is_empty() || self.decode_has_opaque_file_incidence() {
+        if fresh.is_empty() {
             return;
         }
         let mut newer = BTreeMap::<String, u64>::new();
@@ -47898,10 +47898,12 @@ impl ScanIndex {
         for fp in self.upload_progress_ack_incidence() {
             removed.remove(fp);
         }
-        self.accepted_snapshot_fingerprints
-            .retain(|fp| !removed.contains(fp));
-        self.snapshot_activity_at
-            .retain(|fp, _| !removed.contains(fp));
+        if !self.decode_has_opaque_file_incidence() {
+            self.accepted_snapshot_fingerprints
+                .retain(|fp| !removed.contains(fp));
+            self.snapshot_activity_at
+                .retain(|fp, _| !removed.contains(fp));
+        }
     }
 
     pub fn retain_quarantined_fingerprints(
@@ -59177,6 +59179,40 @@ mod tests {
         );
         let server_heads = BTreeSet::from([item.snapshot_fingerprint.clone()]);
         let cumulative_acks = BTreeSet::from([first_fp.clone(), item.snapshot_fingerprint.clone()]);
+        for partial in [false, true] {
+            let opaque_key = "/synthetic/future-format.jsonl";
+            let mut value = serde_json::to_value(&working).unwrap();
+            value["files"][opaque_key] = json!(false);
+            let mut held =
+                lenient_decode::read_bounded(&serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(held.decode_has_opaque_file_incidence());
+            let mut settled = if partial {
+                held.committable_subset(&held, &server_heads, &BTreeMap::new())
+            } else {
+                held.record_accepted_snapshot_fingerprints(&cumulative_acks);
+                held
+            };
+            assert!(!settled.files.contains_key(&local_index_key(&old)));
+            assert_eq!(settled.current_snapshot_fingerprints(), server_heads);
+            assert!(settled.accepted_snapshot_fingerprints.contains(&first_fp));
+            assert!(settled.snapshot_activity_at.contains_key(&first_fp));
+            assert_eq!(
+                serde_json::to_value(&settled).unwrap()["files"][opaque_key],
+                json!(false)
+            );
+            settled = lenient_decode::read_bounded(&serde_json::to_vec(&settled).unwrap()).unwrap();
+            assert_eq!(settled.current_snapshot_fingerprints(), server_heads);
+            // A later exact empty incidence resolves the unrelated opaque debt.
+            settled
+                .file_snapshot_fingerprints
+                .insert(opaque_key.into(), BTreeSet::new());
+            assert!(!settled.decode_has_opaque_file_incidence());
+            assert!(server_heads.is_subset(&settled.accepted_snapshot_fingerprints));
+            settled.record_accepted_snapshot_fingerprints(&server_heads);
+            assert!(!settled.accepted_snapshot_fingerprints.contains(&first_fp));
+            assert!(!settled.files.contains_key(&local_index_key(&old)));
+            assert_eq!(settled.current_snapshot_fingerprints(), server_heads);
+        }
         let mut full = working.clone();
         full.record_accepted_snapshot_fingerprints(&cumulative_acks);
         assert_eq!(

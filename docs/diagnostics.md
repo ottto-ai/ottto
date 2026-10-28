@@ -711,8 +711,9 @@ strong joined-history and unverified/decode holds retain their existing rules.
 Once a fresh accepted body for the same counting owner has at least as recent
 activity, the older ordinary body is retired. Its superseded fingerprint leaves
 the manifest so moved-then-resumed sessions agree with the server's current head.
-Opaque held incidence defers this cleanup. No new store, field or transcript read
-is introduced; Claude and Pi retention are unchanged.
+Unrelated opaque incidence preserves ACK/activity custody while known superseded
+file associations retire. No new store, field or transcript read is introduced;
+Claude and Pi retention are unchanged.
 
 With a prior snapshot fingerprint, exactly two evidence-supported filename
 identities, and no committed owner coverage, both candidates are withheld from
