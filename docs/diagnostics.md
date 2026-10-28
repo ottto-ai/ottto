@@ -202,7 +202,8 @@ cause. No path, endpoint, account or error text is emitted.
 The existing canonical health blocker registry, used by `ottto doctor` and
 status, checks endpoint resolution too. An unreadable binding adds the blocking
 `connection_binding_unreadable` finding: run `ottto login` to reconnect this
-Mac and resume uploads. The finding clears on the next health projection after
+Mac and resume uploads. Human doctor/status output shows the first blocker's
+guidance; `--json` retains all findings. The finding clears on the next health projection after
 the binding is repaired or removed. Each failed diagnostic check counts as a
 load attempt too. This uses the existing health and diagnostic channels; it
 adds no background subsystem or upload fallback.
