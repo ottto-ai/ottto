@@ -15,18 +15,18 @@ pub(crate) struct PiRetryInputs {
 struct Input {
     path: PathBuf,
     stamp: [u8; 32],
-    file_fingerprint: Option<String>,
+    is_file: bool,
 }
 
-fn stamp(metadata: &fs::Metadata) -> [u8; 32] {
+// FileStamp::same_content semantics, also applicable to directory membership.
+// A same-length rewrite that restores ns mtime is the accepted residual.
+fn content_stamp(metadata: &fs::Metadata) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(metadata.len().to_be_bytes());
     #[cfg(unix)]
     for n in [
         metadata.dev(),
         metadata.ino(),
-        metadata.ctime() as u64,
-        metadata.ctime_nsec() as u64,
         metadata.mtime() as u64,
         metadata.mtime_nsec() as u64,
     ] {
@@ -35,36 +35,10 @@ fn stamp(metadata: &fs::Metadata) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn identify(root: &Path, path: &Path) -> Option<String> {
-    let mut candidate = CandidateFile {
-        physical_identity: None,
-        scan_root: root.to_owned(),
-        path: path.to_owned(),
-        size_bytes: 0,
-        modified_unix_seconds: 0,
-        modified_unix_nanos: 0,
-        source_file_fingerprint: String::new(),
-        legacy_source_file_fingerprint: String::new(),
-        legacy_config_reconciliation_required: false,
-        opened_object_identity: String::new(),
-        fingerprint_changed_nanos: 0,
-        fingerprint_birth_nanos: 0,
-    };
-    let _file = open_candidate_file(SnapshotSource::Pi, &mut candidate).ok()?;
-    Some(scan_file_fingerprint_with_opened_identity(
-        path,
-        candidate.size_bytes,
-        candidate.modified_unix_nanos,
-        SnapshotSource::Pi.scan_identity_version(),
-        "",
-        &candidate.opened_object_identity,
-    ))
-}
-
 impl PiRetryInputs {
     pub(crate) fn capture(root: &Path) -> Option<Self> {
-        // Canonicalize once to reject symlink roots and every ancestor. The
-        // native opener subsequently uses no-follow descriptor-relative opens.
+        // Freeze the complete path set without opening transcripts. Canonicalize
+        // to reject symlink roots and every ancestor.
         if !root.is_absolute() || root.canonicalize().ok()?.as_path() != root {
             return None;
         }
@@ -83,7 +57,7 @@ impl PiRetryInputs {
             if before.file_type().is_symlink() {
                 return None;
             }
-            let fingerprint = if before.is_dir() {
+            if before.is_dir() {
                 for entry in fs::read_dir(&path).ok()? {
                     let child = entry.ok()?.path();
                     path_bytes = path_bytes.checked_add(child.as_os_str().len())?;
@@ -94,26 +68,24 @@ impl PiRetryInputs {
                     }
                     pending.push(child);
                 }
-                None
             } else if before.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
                 content_bytes = content_bytes.checked_add(before.len())?;
                 if content_bytes > MAX_CONTENT_BYTES {
                     return None;
                 }
-                Some(identify(root, &path)?)
             } else {
                 // Non-transcript files and special objects have no closed
                 // provider semantics in this initial admission.
                 return None;
-            };
+            }
             let after = fs::symlink_metadata(&path).ok()?;
-            if stamp(&before) != stamp(&after) {
+            if content_stamp(&before) != content_stamp(&after) {
                 return None;
             }
             result.paths.push(Input {
                 path,
-                stamp: stamp(&after),
-                file_fingerprint: fingerprint,
+                stamp: content_stamp(&after),
+                is_file: after.is_file(),
             });
         }
         result.validate().ok()?;
@@ -134,15 +106,11 @@ impl PiRetryInputs {
         for input in self.paths.iter().chain(self.paths.iter().rev()) {
             let current = fs::symlink_metadata(&input.path)?;
             anyhow::ensure!(
-                !current.file_type().is_symlink() && stamp(&current) == input.stamp,
+                !current.file_type().is_symlink()
+                    && current.is_file() == input.is_file
+                    && content_stamp(&current) == input.stamp,
                 "optional Pi dependency changed"
             );
-            if let Some(expected) = &input.file_fingerprint {
-                anyhow::ensure!(
-                    identify(&self.root, &input.path).as_ref() == Some(expected),
-                    "optional Pi opened file changed"
-                );
-            }
         }
         Ok(())
     }
@@ -158,11 +126,11 @@ impl PiRetryInputs {
                 && item.repository_label_source.is_none()
                 && item.repository_identity_source.is_none()
                 && item.workspace_kind.is_none()
-                && item.source_file_fingerprint.as_ref().is_some_and(|fp| {
-                    self.paths
-                        .iter()
-                        .any(|input| input.file_fingerprint.as_ref() == Some(fp))
-                })
+                // Identity tags come from the completed parse. The stat closure
+                // covers every transcript in the root, not a second fingerprint
+                // minted by reopening an individual file.
+                && self.paths.iter().any(|input| input.is_file)
+                && item.source_file_fingerprint.as_ref().is_some_and(|fp| !fp.is_empty())
         })
     }
 }
@@ -175,10 +143,9 @@ impl HeapLayoutBound for PiRetryInputs {
             let Input {
                 path,
                 stamp: _,
-                file_fingerprint,
+                is_file: _,
             } = input;
             path.heap_bound(c)?;
-            file_fingerprint.heap_bound(c)?;
         }
         Some(())
     }

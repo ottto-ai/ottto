@@ -29,7 +29,10 @@ fn bounded_retry_cutoff_shape_refuses_before_typed_map_decode() {
     });
     eprintln!(
         "cutoff_preparation bytes={} requested_peak={} usable_peak={} optional_admitted={}",
-        bytes.len(), allocation.requested_peak, allocation.usable_peak, live.is_some()
+        bytes.len(),
+        allocation.requested_peak,
+        allocation.usable_peak,
+        live.is_some()
     );
     assert!(live.is_none());
     assert!(allocation.requested_peak < 256 * 1024);
@@ -53,13 +56,20 @@ fn bounded_retry_cutoff_node_boundary_preserves_ordinary_state() {
             .join(",");
         let bytes = format!("{{\"completed_parser_versions\":{{{entries}}}}}");
         assert!(bytes.len() < crate::snapshot_retry::RESPONSE_BYTES);
-        assert_eq!(crate::snapshot_retry::state_nodes(bytes.as_bytes()).unwrap(), 3 + count * 2);
+        assert_eq!(
+            crate::snapshot_retry::state_nodes(bytes.as_bytes()).unwrap(),
+            3 + count * 2
+        );
         std::fs::write(&path, &bytes).unwrap();
         let ordinary = crate::backfill::load_backfill_state(&f.support);
         assert_eq!(ordinary.completed_parser_versions.len(), count);
         let live = live_snapshot_retry::LiveAuthority::capture(
-            SnapshotSource::Pi, &f.home.0, &f.support, &f.hint,
-            &f.progress.destination_namespace_hash, &ordinary,
+            SnapshotSource::Pi,
+            &f.home.0,
+            &f.support,
+            &f.hint,
+            &f.progress.destination_namespace_hash,
+            &ordinary,
         );
         assert_eq!(live.is_some(), expected);
         if let Some(live) = live {
@@ -88,8 +98,13 @@ impl PiLiveFixture {
     fn new() -> Self {
         Self::with_models(1)
     }
-    fn with_models(models: usize) -> Self { Self::with_shape(models, 0) }
+    fn with_models(models: usize) -> Self {
+        Self::with_shape(models, 0)
+    }
     fn with_shape(models: usize, label_bytes: usize) -> Self {
+        Self::with_page(1, models, label_bytes)
+    }
+    fn with_page(files: usize, models: usize, label_bytes: usize) -> Self {
         assert!(
             std::env::var_os("PI_CODING_AGENT_DIR").is_none(),
             "synthetic live retry tests require an isolated Pi root"
@@ -103,17 +118,32 @@ impl PiLiveFixture {
         let bytes = if models == 1 && label_bytes == 0 {
             format!("{row}\n")
         } else {
-            (0..models).map(|i| {
-                let label = (0..label_bytes).map(|j| match j % 23 {
-                    0 => '\\', 1 => '\"', 2 => '\u{1}',
-                    _ => char::from(b'a' + ((i * 17 + j * 31) % 26) as u8),
-                }).collect::<String>();
-                serde_json::json!({"type":"message_end","message":{
+            (0..models)
+                .map(|i| {
+                    let label = (0..label_bytes)
+                        .map(|j| match j % 23 {
+                            0 => '\\',
+                            1 => '\"',
+                            2 => '\u{1}',
+                            _ => char::from(b'a' + ((i * 17 + j * 31) % 26) as u8),
+                        })
+                        .collect::<String>();
+                    serde_json::json!({"type":"message_end","message":{
                     "model":format!("synthetic-{i:04}-{label}"),"timestamp":1791280801000i64,
-                    "usage":{"input":100,"output":1}}}).to_string() + "\n"
-            }).collect::<String>()
+                    "usage":{"input":100,"output":1}}})
+                    .to_string()
+                        + "\n"
+                })
+                .collect::<String>()
         };
-        std::fs::write(roots[0].join("one.jsonl"), bytes).unwrap();
+        for file in 0..files {
+            let name = if file == 0 {
+                "one.jsonl".into()
+            } else {
+                format!("{file}.jsonl")
+            };
+            std::fs::write(roots[0].join(name), &bytes).unwrap();
+        }
         let support = home.0.join("support");
         std::fs::create_dir_all(&support).unwrap();
         let hint = Self::hint();
@@ -124,6 +154,7 @@ impl PiLiveFixture {
         let mut progress = test_upload_progress();
         progress.save(&progress_path).unwrap();
         // The real hook freezes inputs before the native parser starts.
+        let opens_before = crate::snapshots::retry_transcript_opens_for_test();
         let live = live_snapshot_retry::LiveAuthority::capture(
             SnapshotSource::Pi,
             &home.0,
@@ -133,6 +164,10 @@ impl PiLiveFixture {
             &Default::default(),
         )
         .unwrap();
+        assert_eq!(
+            crate::snapshots::retry_transcript_opens_for_test(),
+            opens_before
+        );
         let mut working = baseline.clone();
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Pi,
@@ -150,9 +185,15 @@ impl PiLiveFixture {
             SnapshotUploadPolicy::default(),
         );
         finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut working);
-        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(scan.snapshots.len(), files);
+        assert!(crate::snapshots::retry_transcript_opens_for_test() > opens_before);
         let items = scan.snapshots;
+        let opens_after_scan = crate::snapshots::retry_transcript_opens_for_test();
         live.validate_capture(&home.0, &items).unwrap();
+        assert_eq!(
+            crate::snapshots::retry_transcript_opens_for_test(),
+            opens_after_scan
+        );
         Self {
             daemon: test_daemon(&"a".repeat(64)),
             home,
@@ -194,6 +235,7 @@ impl PiLiveFixture {
         )
         .unwrap();
         let mut owner = live_snapshot_retry::LiveRetryOwner::isolated();
+        let opens_before = crate::snapshots::retry_transcript_opens_for_test();
         let admitted = owner.capture_after_shed(
             self.live.take().unwrap(),
             &self.home.0,
@@ -209,6 +251,10 @@ impl PiLiveFixture {
             &self.progress_path,
             Instant::now(),
             delay,
+        );
+        assert_eq!(
+            crate::snapshots::retry_transcript_opens_for_test(),
+            opens_before
         );
         admitted.then_some(owner)
     }
@@ -258,7 +304,7 @@ fn bounded_retry_live_inputs_decline_rewrites_replacements_new_paths_and_cutoff(
                 .unwrap();
             }
             "workspace" => f.items[0].workspace_hash = Some("b".repeat(64)),
-            _ => f.items[0].source_file_fingerprint = Some("b".repeat(64)),
+            _ => f.items[0].source_file_fingerprint = None,
         }
         assert!(
             f.live
@@ -285,7 +331,8 @@ fn bounded_retry_live_inputs_decline_rewrites_replacements_new_paths_and_cutoff(
     hint.session_attribution_enabled = false;
     hint.snapshot_head_cas_required = true;
     assert!(live_snapshot_retry::policy_seal(&hint).is_none());
-    let closed = live_snapshot_retry::LiveRetryOwner::production();
+    assert!(live_snapshot_retry::LiveRetryOwner::production().enabled());
+    let closed = live_snapshot_retry::LiveRetryOwner::closed();
     assert!(!closed.enabled());
     let deadline = Instant::now() + Duration::from_secs(300);
     assert_eq!(closed.wake_before(deadline), deadline);
@@ -336,7 +383,39 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         .unwrap_or_else(|p| p.into_inner());
     let (_, allocation) = crate::retry_allocation_probe::measure(|| {
         let mut f = PiLiveFixture::new();
+        let ordinary_body = {
+            let mut index = f.baseline.clone();
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Pi,
+                &f.roots,
+                &mut index,
+                "2026-10-06T10:05:00Z",
+                30,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                false,
+            )
+            .unwrap();
+            apply_upload_policy(
+                SnapshotSource::Pi,
+                &mut scan.snapshots,
+                SnapshotUploadPolicy::default(),
+            );
+            finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index);
+            serde_json::to_value(SnapshotBatchRequest {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                source: "pi".into(),
+                machine_id: "a".repeat(64),
+                collector_version: Some(collector_version()),
+                snapshots: scan.snapshots,
+                upload_policy: SnapshotUploadPolicy::default(),
+                client_report: crate::client_report::ClientReport::empty(),
+            })
+            .unwrap()["snapshots"]
+                .clone()
+        };
         let mut owner = f.capture(Duration::from_millis(30));
+        assert!(owner.enabled());
+        let opens_before_retry = crate::snapshots::retry_transcript_opens_for_test();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
             .with_bounded_retry_loopback_http_for_test();
@@ -385,7 +464,6 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
                 owner.isolated_boundary(|page| {
                     turns += 1;
                     assert!(page.bound() <= 1024 * 1024);
-                    page.budget.force_gzip_for_test();
                     let expected_account = page.authority();
                     let live = page.take_live_authority()?;
                     let result = page.turn_live(
@@ -424,6 +502,13 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         assert!(trace[0].starts_with("POST ") && trace[0].contains("/relay-token "));
         assert!(trace[1].starts_with("GET ") && trace[1].contains("/activity-hints "));
         assert!(trace[2].contains("/batches "));
+        let request_body = trace[2].split_once("\r\n\r\n").unwrap().1;
+        let request: serde_json::Value = serde_json::from_str(request_body).unwrap();
+        assert_eq!(request["snapshots"], ordinary_body);
+        assert_eq!(
+            crate::snapshots::retry_transcript_opens_for_test(),
+            opens_before_retry
+        );
         let durable = SnapshotUploadProgress::load(
             &f.progress_path,
             &f.progress.destination_namespace_hash,
@@ -472,13 +557,22 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    for change in ["policy", "stop", "account", "file", "cutoff"] {
+    for change in [
+        "policy",
+        "stop",
+        "account",
+        "file",
+        "cutoff",
+        "destination",
+        "grant",
+    ] {
         let mut f = PiLiveFixture::new();
         let mut owner = f.capture(Duration::ZERO);
         let before = std::fs::read(&f.index_path).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
             .with_bounded_retry_loopback_http_for_test();
+        let no_post = listener.try_clone().unwrap();
         let server = if change != "policy" {
             None
         } else {
@@ -519,7 +613,11 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
             .unwrap();
         }
         let device = LocalDeviceBinding {
-            sources: vec!["pi".into()],
+            sources: if change == "grant" {
+                vec![]
+            } else {
+                vec!["pi".into()]
+            },
             ..bounded_native_device()
         };
         let mut attempted = 0;
@@ -538,6 +636,12 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
                         daemon.snapshot_scan_account_witness().unwrap() == expected_account,
                         "account changed"
                     );
+                    let destination = if change == "destination" {
+                        "changed"
+                    } else {
+                        &f.progress.destination_namespace_hash
+                    };
+                    anyhow::ensure!(live.destination() == destination, "destination changed");
                     live.validate_inputs(&f.home.0)
                 },
             );
@@ -548,6 +652,8 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
         });
         assert_eq!(attempted, 1);
         assert_eq!(std::fs::read(&f.index_path).unwrap(), before);
+        no_post.set_nonblocking(true).unwrap();
+        assert!(matches!(no_post.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
         if let Some(server) = server {
             let listener = server.join().unwrap();
             assert!(matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
@@ -674,4 +780,87 @@ fn bounded_retry_json_escape_admission_declines_before_retained_copy_and_wire_gr
         "native_escape_refusal requested_peak={} no_retained_copy=true",
         stats.requested_peak
     );
+}
+
+#[test]
+fn pi_retry_stat_witness_ignores_chmod_but_refuses_append_and_mtime() {
+    use std::os::unix::fs::PermissionsExt;
+    for change in ["chmod", "append", "mtime"] {
+        let f = PiLiveFixture::new();
+        let path = f.roots[0].join("one.jsonl");
+        let opens = crate::snapshots::retry_transcript_opens_for_test();
+        match change {
+            "chmod" => {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap()
+            }
+            "append" => {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"\n")
+                    .unwrap();
+            }
+            _ => {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            f.live
+                .as_ref()
+                .unwrap()
+                .validate_capture(&f.home.0, &f.items)
+                .is_ok(),
+            change == "chmod",
+            "{change}"
+        );
+        assert_eq!(crate::snapshots::retry_transcript_opens_for_test(), opens);
+    }
+}
+
+#[test]
+fn pi_retry_index_representation_transition_refuses_before_post() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut f = PiLiveFixture::new();
+    let mut owner = f.capture(Duration::ZERO);
+    let mut representation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&f.index_path).unwrap()).unwrap();
+    // E1's existing V-row contract: a changed index schema is a new
+    // representation even with unchanged checkpoint generation and Pi bytes.
+    representation["schema_version"] = serde_json::json!(f.baseline.schema_version + 1);
+    std::fs::write(&f.index_path, serde_json::to_vec(&representation).unwrap()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
+        .with_bounded_retry_loopback_http_for_test();
+    let device = LocalDeviceBinding {
+        sources: vec!["pi".into()],
+        ..bounded_native_device()
+    };
+    let mut turns = 0;
+    owner.isolated_boundary(|page| {
+        turns += 1;
+        let live = page.take_live_authority()?;
+        let result = page.turn_live(
+            &client,
+            &device,
+            "synthetic-secret",
+            live.policy(),
+            &mut || live.validate_inputs(&f.home.0),
+        );
+        assert!(result.is_err());
+        assert_eq!(page.budget.posts_left(), 3);
+        page.restore_live_authority(live);
+        result
+    });
+    assert_eq!(turns, 1);
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
 }

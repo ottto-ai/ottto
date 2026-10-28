@@ -1,5 +1,5 @@
-//! Source-owned capture/wake plumbing. Production remains closed; isolated
-//! native callers exercise the same owner with synthetic authority adapters.
+//! Source-owned Pi capture/wake plumbing. The one-shot caller keeps a closed
+//! owner because it has no later collection boundary.
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use bounded_snapshot_retry::{PreparedRetry, RetryOwner};
@@ -117,7 +117,7 @@ impl LiveAuthority {
         self.validate_inputs(home)?;
         anyhow::ensure!(
             self.inputs.covers(items),
-            "optional Pi body lacks opened-file authority"
+            "optional Pi body lacks stat closure authority"
         );
         Ok(())
     }
@@ -157,16 +157,13 @@ impl LiveRetryOwner {
     }
     pub(super) fn production() -> Self {
         Self {
-            enabled: bounded_snapshot_retry::production_activation_reviewed(),
+            enabled: true,
             retry: RetryOwner::default(),
         }
     }
     #[cfg(test)]
     pub(super) fn isolated() -> Self {
-        Self {
-            enabled: true,
-            retry: RetryOwner::default(),
-        }
+        Self::production()
     }
     pub(super) fn enabled(&self) -> bool {
         self.enabled
