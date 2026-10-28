@@ -63,7 +63,7 @@ impl Family {
         }
         Self {
             dir,
-            state_dir: temp_dir("claude-usage-proof-rearm-state"),
+            state_dir: crate::test_scratch::private_dir("claude-usage-proof-rearm-state"),
             root_session_id,
             parent_path,
             child_path,
