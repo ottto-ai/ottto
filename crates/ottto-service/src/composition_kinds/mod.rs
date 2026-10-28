@@ -55,8 +55,9 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
-    /// The kinds_version 1 categories in wire order. The methodology
-    /// fingerprint (`config_hash`) and per-session totals use this list.
+    /// The kinds_version 1 categories in wire order, used by the test-only
+    /// kinds_version 1 oracle and the kinds tests.
+    #[cfg(test)]
     pub(crate) const ALL: [Kind; 10] = [
         Kind::HarnessAttachments,
         Kind::ShellOutput,
@@ -104,7 +105,8 @@ impl Kind {
 
     /// Position in `ALL` (the v1 per-session slot). Only kinds_version 1
     /// kinds have a slot; a kinds_version 2 kind is a bug (debug builds
-    /// panic, release builds use slot 0).
+    /// panic, release builds use slot 0). Test-only, like `ALL`.
+    #[cfg(test)]
     pub(crate) fn index(self) -> usize {
         let index = Kind::ALL.iter().position(|c| *c == self);
         debug_assert!(index.is_some(), "{self:?} has no kinds_version 1 slot");

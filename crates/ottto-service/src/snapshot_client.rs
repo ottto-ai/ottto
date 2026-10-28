@@ -2700,8 +2700,8 @@ impl SnapshotApiClient {
     /// agent_source scope. The body holds aggregates only; the backend rejects
     /// unknown fields and absolute paths with 422.
     ///
-    /// The composition upload from its serialized body, so the bytes the
-    /// run counts are the bytes sent (the same body `send_json` would send).
+    /// Sends the serialized body, so the bytes the run counts are the bytes
+    /// sent (identical to what `send_json` would send).
     pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
         match self
             .agent
