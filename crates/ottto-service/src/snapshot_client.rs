@@ -3425,21 +3425,22 @@ mod tests {
             assert_never_logged, install_host_logger, RedirectingBackend,
         };
         install_host_logger();
+        let token = "synthetic-private-relay";
         let body = json!({"machine_id":"machine-synthetic","source":"codex", "account_identifier_hash":"a".repeat(64), "organization_identifier_hash":"", "nickname":"כינוי 🚀", "base_revision":2});
         for status in ["302 Found", "307 Temporary Redirect", "401 Unauthorized"] {
             let backend = RedirectingBackend::start(status);
             let code = SnapshotApiClient::new(backend.base_url.clone())
-                .put_account_nickname("synthetic-private-relay", &body)
+                .put_account_nickname(token, &body)
                 .unwrap_err();
             assert_eq!(code.to_string(), &status[..3]);
             let request = backend.finish();
             assert!(request.starts_with("PUT /api/v1/agent-status/account-nickname "));
-            assert!(request.contains("Authorization: Bearer synthetic-private-relay"));
+            assert!(request.contains(&format!("Authorization: Bearer {token}")));
             assert!(!request.contains("X-Ottto-Device-Secret"));
             let sent: Value =
                 serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
             assert_eq!(sent, body);
-            assert_never_logged("synthetic-private-relay");
+            assert_never_logged(token);
             assert_never_logged("כינוי 🚀");
         }
     }
