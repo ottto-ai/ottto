@@ -863,7 +863,6 @@ pub(in crate::snapshots) enum GroupStep {
 
 /// Scan facts one group step needs.
 pub(in crate::snapshots) struct StepInputs<'a> {
-    pub(in crate::snapshots) index: &'a ScanIndex,
     pub(in crate::snapshots) metadata: &'a CodexTitleMetadata,
     pub(in crate::snapshots) attribution:
         Option<&'a crate::session_attribution::SessionAttributionContext>,

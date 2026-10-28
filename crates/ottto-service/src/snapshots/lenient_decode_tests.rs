@@ -4628,7 +4628,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
                     path: PathBuf::from(key),
                     size_bytes: entry.size_bytes,
                     modified_unix_seconds: entry.modified_unix_seconds,
-                    modified_unix_nanos: entry.modified_unix_nanos,
+                    modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
                     source_file_fingerprint: entry.source_file_fingerprint.clone(),
                     legacy_source_file_fingerprint: String::new(),
                     legacy_config_reconciliation_required: false,

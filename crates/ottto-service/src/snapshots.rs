@@ -27665,7 +27665,6 @@ impl OwnedSourceScan {
                     match codex_file_join::step_group(
                         &mut active,
                         &codex_file_join::StepInputs {
-                            index,
                             metadata: &codex_title_metadata,
                             attribution: attribution_context,
                             artifacts: artifacts_enabled,

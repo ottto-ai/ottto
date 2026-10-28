@@ -1614,7 +1614,6 @@ pub(super) mod tests {
         })?;
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
-            index,
             metadata: &metadata,
             attribution: None,
             artifacts: false,
@@ -3745,7 +3744,6 @@ pub(super) mod tests {
             .unwrap();
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
-            index: &previous,
             metadata: &metadata,
             attribution: Some(&context),
             artifacts: false,
