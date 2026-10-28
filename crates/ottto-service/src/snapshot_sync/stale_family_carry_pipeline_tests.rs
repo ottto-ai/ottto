@@ -1753,13 +1753,25 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 // runs BEFORE its ACK stamps revision 3, so settle it while
                 // F is still held: the target retry must owe only F, rather
                 // than correctly retain the latch for this unrelated file.
+                // Keep this warm-up incomplete: a complete fold retires G's
+                // stale pending (:9924), which the target retry must carry.
+                let invalid_path = c1a_invalid_path(&fixture);
+                let invalid_body = std::fs::read(&invalid_path).unwrap();
+                RearmFixture::append(&invalid_path, "not-json\n");
                 let (prepared, prepared_rows) =
                     source_latch_generation(&fixture, 25, RearmUpload::Accept, None);
-                assert!(prepared.last().unwrap().scan.census_complete);
+                assert!(!prepared.last().unwrap().scan.census_complete);
                 assert!(!rearm_parsed(&prepared).contains(REARM_SIBLING));
                 assert!(c1a_latch(&fixture).1, "held F still forbids clearing");
                 assert_eq!(source_latch_clear_count(&prepared_rows), 0);
                 let prepared_index = c1a_saved(&fixture);
+                assert_eq!(
+                    prepared_index["files"][&f_key]["effective_upload_body_witness_revision"],
+                    2
+                );
+                assert!(prepared_index["claude_usage_family_pending"]
+                    .get(REARM_SIBLING)
+                    .is_some());
                 for (key, entry) in prepared_index["files"].as_object().unwrap() {
                     assert_eq!(
                         entry["effective_upload_body_witness_revision"],
@@ -1772,6 +1784,7 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                     saved["claude_request_census"].get(&g_key),
                     "preparing the unrelated terminal gives G no new credit"
                 );
+                std::fs::write(invalid_path, invalid_body).unwrap();
                 if !keep_held {
                     fixture.local_holds.clear();
                 }
