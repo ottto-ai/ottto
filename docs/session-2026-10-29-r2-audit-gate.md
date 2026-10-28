@@ -66,3 +66,10 @@ negative regression control. The seal unit case fails before this fix at the
 overdue commit; the Codex integration case fails on audit Restart. The Claude
 control and exact-stamp proof refusal already pass before the fix and guard
 against widening. These native paths still need supported-layout CI evidence.
+
+The superseded Linux run exposed a bootstrap-only Serde assumption in the
+certificate fixture. It now round-trips through main's actual binary durable
+store writer/reader before exercising the same FD/read/debt assertions. Existing
+proof-horizon and rotating-cursor tests now distinguish ordinary acquisition
+from exact-stamp proof expiry: both rotating files must publish overdue Tails
+in a later generation without resetting verification or debt.

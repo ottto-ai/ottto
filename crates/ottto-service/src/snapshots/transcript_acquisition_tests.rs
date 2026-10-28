@@ -2023,13 +2023,14 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             let cold_index = index.clone();
             let mut published = None;
             for page in 1..=32 {
+                let collected_at = format!("2026-10-07T12:00:{page:02}Z");
                 let (next, result, modes, _) = production_scan_at(
                     &fixture,
                     source,
                     index,
                     Some(second.clone()),
                     &namespace.0,
-                    &format!("2026-10-07T12:00:{page:02}Z"),
+                    &collected_at,
                 );
                 index = next;
                 assert_eq!(modes.0, 0, "no forced Full");
@@ -2039,11 +2040,12 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
                     "never Restart for audit age"
                 );
                 if !result.snapshots.is_empty() {
-                    published = Some(result);
+                    published = Some((result, collected_at));
                     break;
                 }
             }
-            let published = published.expect("overdue Tail completes and publishes");
+            let (published, published_at) =
+                published.expect("overdue Tail completes and publishes");
             let counters = second.counters_for_test();
             if source == SnapshotSource::Codex {
                 assert_eq!(counters.jobs_started, 1);
@@ -2066,7 +2068,14 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             assert_eq!(checkpoint.sealed_offset(), length);
             assert_eq!(checkpoint.last_full_verified(), START);
             assert_eq!(checkpoint.audit_debt().unwrap().due_unix_seconds, due);
-            let (_, cold, _) = production_scan(&fixture, source, cold_index, None, &namespace.0);
+            let (_, cold, _, _) = production_scan_at(
+                &fixture,
+                source,
+                cold_index,
+                None,
+                &namespace.0,
+                &published_at,
+            );
             assert_eq!(
                 production_body(source, published),
                 production_body(source, cold)
@@ -2081,7 +2090,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             );
             let new_record = read_record();
             assert_ne!(
-                new_record.binding.entry, old_record.binding.entry,
+                new_record.record.binding.entry, old_record.record.binding.entry,
                 "disk binding replaced"
             );
             drop(second);

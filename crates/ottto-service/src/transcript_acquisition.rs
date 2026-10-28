@@ -1878,6 +1878,13 @@ mod tests {
     /// is dropped; actual FD reads below prove only the appended suffix runs.
     #[test]
     fn durable_checkpoint_ignores_audit_age_and_clock_without_full_credit() {
+        use crate::durable_tail_store as store;
+        struct StoreDir(PathBuf);
+        impl Drop for StoreDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
         for (now, due, append) in [
             (8_000, None, true),
             (8_000, Some(1_100), true),
@@ -1888,12 +1895,46 @@ mod tests {
             let f = Fixture::new(b"one\n");
             let mut cp = initial(&f, 1_000);
             cp.audit_debt = due.map(|due_unix_seconds| AuditDebt { due_unix_seconds });
-            let saved = serde_json::to_vec(&cp.durable_certificate(0).unwrap()).unwrap();
+            // Main persists this certificate in the binary store envelope;
+            // Serde derives exist only on the excluded bootstrap branch.
+            let state = StoreDir(f.0.with_extension("certificate-state"));
+            fs::create_dir_all(&state.0).unwrap();
+            let lock = crate::locked_state_dir::LockedStateDir::acquire(&state.0).unwrap();
+            crate::snapshots::ScanIndex::default()
+                .save(&state.0.join("index.json"))
+                .unwrap();
+            let source = store::DurableSource::Codex;
+            let key = store::key_digest(source, "certificate-roundtrip");
+            let allowlist = store::allowlist_digest(&["certificate-only-fixture"]);
+            let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
+            let saved = store::PendingRecord {
+                binding: store::Binding {
+                    source,
+                    key,
+                    context: store::context_digest("certificate-fixture", None),
+                    scope: store::scope_digest(&scope().0, &allowlist, "", ""),
+                    entry: store::entry_digest("certificate-fixture", None),
+                },
+                certificate: cp.durable_certificate(0).unwrap(),
+                body: Vec::new(),
+                allowlist,
+            };
+            assert_eq!(
+                disk.write_after_save(&lock, 1, vec![saved])
+                    .unwrap()
+                    .written,
+                1
+            );
+            drop(disk);
             drop(cp);
             if append {
                 f.append(b"two\n");
             }
-            let certificate: DurableCertificate = serde_json::from_slice(&saved).unwrap();
+            let mut disk = store::DurableTailStore::new(state.0.join("cache"), source);
+            let certificate = match disk.read(&key, &allowlist) {
+                store::ReadOutcome::Found(record) => record.record.certificate,
+                other => panic!("{other:?}"),
+            };
             let mut file = f.open();
             let (result, reads) = capture_sample_reads(|| certificate.restore(&mut file, scope()));
             let (restored, admission) = result.unwrap();
@@ -3035,7 +3076,7 @@ mod tests {
 
     /// U-T30: staged debt. A tail checkpoint's debt is carried by its seal;
     /// an outlived seal's one publication use has no debt yet and measures
-    /// the horizon from minting, and every later use refuses as `prepare` does.
+    /// the horizon from minting; later proof use retains its own expiry.
     /// A seal that is not outlived ignores `publication`, so it cannot push
     /// its deadline back.
     #[test]
@@ -3048,7 +3089,12 @@ mod tests {
         let seal = tail.seal(1100);
         assert!(seal.has_debt() && !seal.outlived());
         for now in [due - 1, due] {
-            let expected = prepared(&f, &tail, &scope(), now);
+            assert_eq!(prepared(&f, &tail, &scope(), now), Ok(0));
+            let expected = if now < due {
+                Ok(0)
+            } else {
+                Err(FullReason::AuditDue)
+            };
             for publication in [false, true] {
                 assert_eq!(
                     seal.admits(&mut f.open(), &scope(), now, publication),
@@ -3067,7 +3113,7 @@ mod tests {
         let horizon = 1000 + AUDIT_INTERVAL_SECONDS;
         assert_eq!(
             prepared(&f, &cp, &scope(), horizon),
-            Err(FullReason::AuditDue)
+            Ok(cp.samples.head.len() + cp.samples.boundary.len())
         );
         assert_eq!(
             late_minted.admits(&mut f.open(), &scope(), horizon, true),
