@@ -407,6 +407,26 @@ Recorded Claude account holds are included. It increments before the index
 save, so it does not count durable-save successes or unique pages; restarts
 reset it. See [counter scope and hold semantics](session-2026-10-22-terminal-bound-hold-settlement.md).
 
+## Prior Held Family Observation
+
+A `bounded_traversal_transition` row with `event: starting` includes
+`prior_held_family_roots` and `prior_held_family_set_digest`. For Claude, a
+known valid persisted `claude_full_rearm_progress.held_family_roots` scope
+reports its count and the first 16 lowercase hex characters of SHA-256 over
+its sorted, concatenated, fixed-width canonical root digests. Only those
+already-persisted digests are hashed; no raw root, identifier or path is read
+or emitted. Equal observations suggest the same held-family set, subject to
+truncated-hash collisions; they do not prove the same individual entity.
+Unknown, empty, malformed or over-cap scopes, and other sources, report count
+zero and a null digest. Null does not prove the absence of holds.
+
+This local diagnostic observation adds O(held roots) work per start, constant
+scratch space and no persisted state. Hold-reason observation below uses the
+existing classification/commit branches, without another index scan. Both
+observations stay local and never enter wire payloads or uploads. The reason
+counters are counts-only; the set digest is a content-free aggregate of
+canonical digests, not collected content.
+
 ## Claude Re-read Attribution Counters
 
 Schema 2's existing `native_collection_page` and `native_comparison_decision`
@@ -437,6 +457,20 @@ preparation/save events after work, without creating a comparison permit.
   an entity/head in the caller's local hold set; sibling means neither. Existing
   empty working debt and keys without a previous entry are excluded. A restored
   previous nonempty fingerprint can equal the working fingerprint.
+- `held_reason`: sparse counts under the closed labels
+  `authority_unbound_revision`, `authority_correction_pending`,
+  `account_hold_unrecorded`, `not_restorable`. The first three count held
+  snapshots in the existing progress-blocking classification: missing or
+  mismatched revision/witness evidence; a RetryPending record with a correction
+  grant; or an account deferral without its durable disclosure. The correction
+  label wins when that branch rejects the record before checking its witness or
+  member revision. Missing revision or record/witness pair is unbound.
+  `not_restorable` counts completed commit attempts whose non-progress-blocking
+  holds fail the existing restore check, once per attempt, not per file.
+  Bound authority holds and recorded account deferrals add no reason. These
+  counts sit beside the restore counters but are not a partition of them:
+  snapshots, file keys and commit attempts have different units. They change
+  no hold, selection, money, census, checkpoint or upload decision.
 - `sibling_exact_incidence_only`: subset of sibling restorations rejected by
   the early exact-entity incidence branch whose legacy head/equality fallback
   would have admitted them. This records the branch, not proof of settled body

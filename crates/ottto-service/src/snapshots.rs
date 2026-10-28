@@ -4979,6 +4979,11 @@ impl ClaudeUsageAuthorityDisposition {
                     .account_deferred_source_session_ids
                     .contains(&snapshot.source_session_id)
                 {
+                    if !account_holds_recorded {
+                        crate::local_resource_diagnostics::claude_reread::held_reason(
+                            crate::local_resource_diagnostics::claude_reread::HeldReason::AccountHoldUnrecorded,
+                        );
+                    }
                     return !account_holds_recorded;
                 }
                 !claude_authority_hold_is_bound(snapshot, index)
@@ -6720,11 +6725,14 @@ fn claude_family_carry_cancellation_admitted(
 /// bridge): its hold, quarantine and retry clock are unchanged, and its
 /// pending count keeps the census withheld. Every other shape still blocks.
 fn claude_authority_hold_is_bound(snapshot: &SnapshotItem, index: &ScanIndex) -> bool {
+    use crate::local_resource_diagnostics::claude_reread::{held_reason, HeldReason};
     let Some(revision) = snapshot.source_file_fingerprint.as_ref() else {
+        held_reason(HeldReason::AuthorityUnboundRevision);
         return false;
     };
+    let mut reason = HeldReason::AuthorityUnboundRevision;
     let root_session_id = claude_snapshot_family_root(snapshot);
-    index
+    let bound = index
         .claude_usage_authority_quarantine
         .get(&root_session_id)
         .zip(index.claude_usage_family_witnesses.get(&root_session_id))
@@ -6732,6 +6740,9 @@ fn claude_authority_hold_is_bound(snapshot: &SnapshotItem, index: &ScanIndex) ->
             let bounded_disposition = match record.disposition {
                 ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal => true,
                 ClaudeUsageAuthorityQuarantineDisposition::RetryPending => {
+                    if record.proof_correction.is_some() {
+                        reason = HeldReason::AuthorityCorrectionPending;
+                    }
                     record.proof_correction.is_none()
                 }
             };
@@ -6741,7 +6752,11 @@ fn claude_authority_hold_is_bound(snapshot: &SnapshotItem, index: &ScanIndex) ->
                     .member_source_file_fingerprints
                     .get(&snapshot.source_session_id)
                     == Some(revision)
-        })
+        });
+    if !bound {
+        held_reason(reason);
+    }
+    bound
 }
 
 fn claude_usage_authority_deadline_is_bounded(

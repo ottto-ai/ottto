@@ -677,17 +677,20 @@ fn commit_completed_with_local_holds(
     progress_blocking: bool,
     held_family_roots: Option<&BTreeSet<String>>,
 ) -> ScanIndex {
-    if !progress_blocking
-        && index.locally_held_keys_restorable(
+    if !progress_blocking {
+        if index.locally_held_keys_restorable(
             committed_index,
             locally_held_fingerprints,
             account_deferred_held_fingerprints,
-        )
-    {
-        return index.into_locally_held_keys_reverted(
-            committed_index,
-            locally_held_fingerprints,
-            account_deferred_held_fingerprints,
+        ) {
+            return index.into_locally_held_keys_reverted(
+                committed_index,
+                locally_held_fingerprints,
+                account_deferred_held_fingerprints,
+            );
+        }
+        crate::local_resource_diagnostics::claude_reread::held_reason(
+            crate::local_resource_diagnostics::claude_reread::HeldReason::NotRestorable,
         );
     }
     let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
@@ -19890,6 +19893,56 @@ mod tests {
             settled.ownership_incomplete_file_count,
             settled.terminal_ownership_incomplete_file_count
         );
+    }
+
+    #[test]
+    fn completed_hold_reason_names_only_the_actual_failed_restore_branch() {
+        use crate::local_resource_diagnostics::claude_reread::Scope;
+        let key = "/opaque/projects/family-root.jsonl";
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {key: {
+                "size_bytes": 1, "modified_unix_seconds": 2,
+                "source_file_fingerprint": "new-source",
+                "last_snapshot_fingerprint": "held",
+                "scan_identity_version": "semantic_sync:v2"
+            }},
+            "file_snapshot_fingerprints": {key: ["held"]},
+            "claude_usage_family_witnesses": {"family-root": {
+                "evidence_fingerprint": "e".repeat(64),
+                "member_request_id_fingerprints": {},
+                "member_occurrence_fingerprints": {},
+                "assigned_request_id_fingerprints": {}
+            }}
+        }));
+        let held = BTreeSet::from(["held".to_owned()]);
+        for (previous, blocking, expected) in [
+            (
+                ScanIndex::default(),
+                false,
+                serde_json::json!({"not_restorable": 1}),
+            ),
+            (ScanIndex::default(), true, serde_json::json!(null)),
+            (scanned.clone(), false, serde_json::json!(null)),
+        ] {
+            let scope = Scope::begin(true);
+            let committed = commit_completed_with_local_holds(
+                scanned.clone(),
+                &previous,
+                &test_upload_progress(),
+                &held,
+                &BTreeSet::new(),
+                blocking,
+                None,
+            );
+            assert_eq!(
+                committed.bounded_sweep_had_unsettled_upload(),
+                previous.files.is_empty()
+            );
+            assert_eq!(
+                serde_json::to_value(scope.finish()).unwrap()["claude_reread"]["held_reason"],
+                expected
+            );
+        }
     }
 
     /// A completed upload whose holds can still change in this traversal keeps
