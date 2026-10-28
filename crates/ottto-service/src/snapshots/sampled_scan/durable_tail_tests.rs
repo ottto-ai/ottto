@@ -1487,7 +1487,8 @@ fn known_corrupt_scan(
     namespace: &Scope,
     at: &str,
 ) -> (ScanIndex, SourceScanResult, [u64; 3]) {
-    let mut scan = OwnedSourceScan::new(
+    let capture = claude_request_identity::captures(source);
+    let mut scan = OwnedSourceScan::new_with_identity_capture(
         source,
         &[sessions.to_path_buf()],
         index,
@@ -1499,8 +1500,11 @@ fn known_corrupt_scan(
         &[],
         false,
         true,
+        capture,
     )
     .with_sampled_acquisition(cache.clone(), namespace.clone());
+    assert!(scan.sampling.as_ref().unwrap().audit_metadata_supported);
+    assert_eq!(scan.claude_request_identity_capture, capture);
     let mut reads = [0; 3];
     for _ in 0..100_000 {
         match scan.step(None) {
@@ -1535,6 +1539,34 @@ fn known_corrupt_scan(
     panic!("synthetic scan did not finish");
 }
 
+/// The fixture premise runs on Linux too, without requiring retained layout.
+#[test]
+fn known_corrupt_fixture_capture_and_audit_premises_match() {
+    let root = crate::test_scratch::private_dir("ottto-known-corrupt-premises");
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    native_fixture(&sessions.join("session.jsonl"));
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("known-corrupt-premises".into());
+    let cache = Arc::new(SharedCache::default());
+    cache.durable_begin_pass(
+        source,
+        &root.join("index.json"),
+        &namespace,
+        claude_request_identity::captures(source),
+    );
+    let (_, scan, _) = known_corrupt_scan(
+        source,
+        &sessions,
+        &cache,
+        ScanIndex::default(),
+        &namespace,
+        "2026-10-20T12:00:00Z",
+    );
+    assert!(scan.census_complete);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// B1: exercise the REAL scanner hold exit, retained Tail and eviction. A
 /// healthy peer publishes, and terminal census settlement retires an absent
 /// file despite the held key. The held key's accepted body is never replaced.
@@ -1553,6 +1585,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     let sessions = root.join("sessions");
     std::fs::create_dir(&sessions).unwrap();
     let source = SnapshotSource::ClaudeCode;
+    let capture = claude_request_identity::captures(source);
     let namespace = Scope("known-corrupt-census".into());
     let index_path = root.join("index.json");
     let [held, peer, gone] =
@@ -1614,7 +1647,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     *corrupt.last_mut().unwrap() ^= 1;
     std::fs::write(&record, &corrupt).unwrap();
     let mut cache = Arc::new(SharedCache::default());
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    cache.durable_begin_pass(source, &index_path, &namespace, capture);
     for entry in index.files.values_mut() {
         entry.source_file_fingerprint.clear();
     }
@@ -1679,7 +1712,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         .unwrap();
     };
     append(&held, "req-held-append");
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    cache.durable_begin_pass(source, &index_path, &namespace, capture);
     let (next, tailed, reads) = known_corrupt_scan(
         source,
         &sessions,
@@ -1689,7 +1722,13 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
         "2026-10-20T12:02:00Z",
     );
     index = next;
-    assert_eq!(reads[0], 0);
+    let (restore_counts, restore_store) = cache.durable_counters(source).unwrap();
+    assert_eq!(
+        reads[0],
+        0,
+        "failed_replacement={fail_replacement}: {}",
+        restore_counts.summary(source, &restore_store)
+    );
     assert!(reads[1] >= 1);
     assert!(tailed.census_complete);
     assert!(tailed
@@ -1717,6 +1756,10 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     if !fail_replacement {
         let (_, stats) = cache.durable_counters(source).unwrap();
         assert_eq!(
+            restore_counts.restored, 1,
+            "healthy replacement restored after restart"
+        );
+        assert_eq!(
             stats.t14_rebuild_full_started, 0,
             "restart restored the repaired record"
         );
@@ -1728,7 +1771,7 @@ fn known_corrupt_replacement_case(fail_replacement: bool) {
     append(&held, "req-held-after-eviction");
     append(&peer, "req-peer-progress");
     std::fs::remove_file(&gone).unwrap();
-    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    cache.durable_begin_pass(source, &index_path, &namespace, capture);
     let (index, held_scan, reads) = known_corrupt_scan(
         source,
         &sessions,
