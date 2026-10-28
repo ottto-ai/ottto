@@ -212,14 +212,11 @@ pub(in crate::snapshots) struct PageBudget {
     window_start: Option<Box<Counters>>,
     /// Stage 1 (E): a continuation page (`OwnedSourceScan::new_continuation`).
     /// It only resumes, never ticks the cursor page clock and never counts
-    /// toward E2. Inert until the continuation entry is enabled.
+    /// toward E2.
     continuation: bool,
     /// Stage 1 (§6): a continuation page's ordinary interval
     /// (StateMissing's input); `None` is unknown coverage.
     ordinary_equivalent: Option<InlineDuration>,
-    /// Stage 1 (EOF seam): a cursor attempt committed on this scan object
-    /// and its native finish succeeded (`cursor_published`).
-    committed: bool,
     /// Stage 1 (K6): a continuation page's cooperative deadline, on the pace
     /// clock. Past it the pause arm pauses the job as at an exhausted budget,
     /// but no ticket is minted (`continuation_ticket` still requires the
@@ -231,7 +228,7 @@ pub(in crate::snapshots) struct PageBudget {
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
     disabled_disclosed, page_noted, resume_claimed, proof_claimed, window_start, continuation,
-    ordinary_equivalent, committed, deadline, next_generation_hints);
+    ordinary_equivalent, deadline, next_generation_hints);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -387,18 +384,6 @@ impl PageBudget {
     pub(in crate::snapshots) fn ordinary_equivalent(&self) -> Option<std::time::Duration> {
         self.ordinary_equivalent
             .map(|InlineDuration(duration)| duration)
-    }
-
-    /// Stage 1 (EOF seam): a cursor attempt committed here and its native
-    /// finish succeeded.
-    pub(in crate::snapshots) fn note_committed(&mut self) {
-        self.committed = true;
-    }
-
-    /// Stage 1 (EOF seam): this continuation page committed its job: the
-    /// only page StateMissing may hand to `EofCompletion::new`.
-    pub(in crate::snapshots) fn continuation_committed(&self) -> bool {
-        self.continuation && self.committed
     }
 
     /// Advance the cursor page clock once per scan object (K7, K10). The
@@ -3343,6 +3328,8 @@ pub(in crate::snapshots) fn restart_in_place(job: &mut OwnedActiveFile) -> bool 
 /// completion steps.
 pub(in crate::snapshots) fn apply_eof_record(job: &mut OwnedActiveFile) {
     if eof_record_due(job) && job.parser.apply_sealed_fragment() {
+        #[cfg(test)]
+        tests::EOF_APPLIED.with(|v| v.set(v.get() + 1));
         mark_eof_applied(job);
     }
 }
@@ -5820,7 +5807,9 @@ pub(in crate::snapshots) fn resume_paused_job(
             // waits if the job pauses.
             for file in job_files(&job) {
                 identified_candidates.retain(|candidate| candidate.path != file.path);
-                requeue(index, context.flags, file);
+                if !context.continuation {
+                    requeue(index, context.flags, file);
+                }
             }
             return Resumed::Active(job, lease);
         }
@@ -6837,4 +6826,4 @@ pub(in crate::snapshots) fn disclose_terminal_codex_debt(
 
 #[cfg(test)]
 #[path = "codex_cursor_tests.rs"]
-mod tests;
+pub(in crate::snapshots) mod tests;

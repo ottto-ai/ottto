@@ -443,7 +443,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         checkpoint.as_deref(),
         false,
     ));
-    index.mark_context_curve_capability_disabled();
     let generation = cycle_replay_generation(source, false, &index, CONTINUATION_NAMESPACE);
     assert_eq!(prepared.replay_generation, generation);
     let now = reason_reoffer::now_unix_seconds();

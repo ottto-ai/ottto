@@ -174,7 +174,7 @@ use claude_response_records::{
 use codex_compressed_input::{refuse_compressed_codex, OpenedInput};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 // Stage 1 (N2): the cursor side of a continuation page, for StateMissing's
-// adapter in `snapshot_sync` (inert while continuation pages are disabled).
+// adapter in `snapshot_sync`.
 #[cfg(test)]
 pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
 #[allow(unused_imports)]
@@ -3219,12 +3219,37 @@ fn begin_codex_side_pass_of(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn take_continuation_read_ranges_for_test() -> Vec<std::ops::Range<u64>> {
+    sampled_scan::codex_cursor::tests::NATIVE_RANGES
+        .with(|v| v.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(test)]
+pub(crate) fn begin_continuation_read_ranges_for_test() {
+    sampled_scan::codex_cursor::tests::NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
+}
+
+/// Moved ordinary-page evidence; this complete inventory includes every ledger path.
+#[derive(Debug)]
+pub(crate) struct CodexContinuationEvidence {
+    inventory: codex_file_join::HeaderInventory,
+    ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    codex: CodexTitleMetadata,
+    traces: Option<Arc<CodexTurnTraceMap>>,
+}
+crate::heap_layout_bound::fields!(CodexContinuationEvidence; inventory, ledgers, codex, traces);
+impl CodexContinuationEvidence {
+    pub(crate) fn content_unchanged(&self) -> bool {
+        self.inventory.content_unchanged()
+    }
+}
+
 /// Stage 1 (§7 exclusions): the pass of a continuation page. C14 prunes and
 /// hydrates as on an ordinary page, but reads the gate without resetting it
-/// (C-1: the page charges nothing and saves only at EOF), and the kind
+/// (C-1: the page charges and saves nothing), and the kind
 /// excludes G7, side due, the proof hook (row 31, so no leftover is spent)
 /// and the sweep (row 32) through the `CodexSidePass` predicates.
-#[cfg_attr(not(test), allow(dead_code))] // Inert until Stage 1 enables it.
 pub(crate) fn begin_codex_continuation_side_pass(
     cache: &sampled_scan::SharedCache,
     index_path: &Path,
@@ -7315,7 +7340,20 @@ pub struct SnapshotSourceManifest {
     pub rolling_hash: String,
 }
 
-#[derive(Debug, Clone)]
+macro_rules! scan_result {
+    (pub struct $name:ident { pub source: SnapshotSource,
+        $($(#[$attr:meta])* $vis:vis $field:ident: $ty:ty,)*
+    }) => {
+        #[derive(Debug, Clone)]
+        pub struct $name { pub source: SnapshotSource, $($(#[$attr])* $vis $field: $ty,)* }
+        impl $name {
+            fn empty(source: SnapshotSource) -> Self {
+                Self { source, $($field: Default::default(),)* }
+            }
+        }
+    };
+}
+scan_result! {
 pub struct SourceScanResult {
     pub source: SnapshotSource,
     pub backfill_window_days: u64,
@@ -7383,10 +7421,10 @@ pub struct SourceScanResult {
     /// at this page's pause (`PauseEnd::Paused` only). None on every other
     /// end, and on an unaccelerated attempt.
     continuation_ticket: Option<sampled_scan::codex_cursor::CodexCursorTicket>,
-    /// Stage 1 (EOF seam): this continuation page committed its cursor job
-    /// and the native finish succeeded (`PageBudget::continuation_committed`).
-    continuation_committed: bool,
+    continuation_evidence: Option<Arc<Mutex<Option<CodexContinuationEvidence>>>>,
 }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CodexJoinValidator(codex_file_join::Validation);
 impl CodexJoinValidator {
@@ -7399,19 +7437,17 @@ impl CodexJoinValidator {
     }
 }
 impl SourceScanResult {
+    pub(crate) fn take_continuation_evidence(&mut self) -> Option<CodexContinuationEvidence> {
+        self.continuation_evidence.take()?.lock().ok()?.take()
+    }
+
     /// Stage 1 hunk A: the ticket `CodexCursorPort::ticket_for` reads.
-    #[cfg_attr(not(test), allow(dead_code))] // Read only by the inert port.
     pub(crate) fn continuation_ticket(
         &self,
     ) -> Option<&sampled_scan::codex_cursor::CodexCursorTicket> {
         self.continuation_ticket.as_ref()
     }
-    /// Stage 1 (EOF seam): whether this continuation page committed its job,
-    /// the only page StateMissing may build `EofCompletion::new` from.
-    #[cfg_attr(not(test), allow(dead_code))] // Read only by the inert port.
-    pub(crate) fn continuation_committed(&self) -> bool {
-        self.continuation_committed
-    }
+
     pub(crate) fn validate_codex_checkpoint(&self) -> Result<()> {
         if let Some(validation) = &self.codex_join_validation {
             validation.validate_all()?;
@@ -25973,20 +26009,11 @@ impl OwnedSourceScan {
             context_curve_enabled,
             claude_request_identity_capture,
             recovery_priority,
-            None,
         )
     }
 
-    /// Stage 1 hunk D: a Codex continuation page of the paused job whose
-    /// member index keys are `members` (`CodexCursorPort::members` of a
-    /// ready ticket). It selects only those pending paths, and nothing while
-    /// the bounded walk still has pending directories: no hints, audits,
-    /// replay or census fill, and the walk does not advance. Its step only
-    /// resumes the paused job; it never plans or starts an attempt, and
-    /// returns every other identified path to the queue untouched. The page
-    /// stands for `ordinary_equivalent` of the ordinary cadence (StateMissing's
-    /// input, §6); `None` is unknown and ends the attempt's acceleration.
-    #[cfg_attr(not(test), allow(dead_code))] // Inert until Stage 1 enables it.
+    /// Resume the held job with moved, certified ordinary-page evidence.
+    /// This frame performs no selection, inventory read or traversal update.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_continuation(
         roots: &[PathBuf],
@@ -25996,30 +26023,75 @@ impl OwnedSourceScan {
         file_limit: usize,
         artifacts_enabled: bool,
         context_curve_enabled: bool,
-        members: &BTreeSet<String>,
+        _members: &BTreeSet<String>,
         ordinary_equivalent: Option<std::time::Duration>,
+        mut evidence: Option<CodexContinuationEvidence>,
     ) -> Self {
-        let mut scan = Self::new_selecting(
-            SnapshotSource::Codex,
-            roots,
-            owned_index,
-            collected_at,
-            requested_backfill_window_days,
+        let codex_title_metadata = evidence
+            .as_mut()
+            .map(|e| std::mem::take(&mut e.codex))
+            .unwrap_or_default();
+        let codex_parent_identities =
+            CodexParentIdentities::new(SnapshotSource::Codex, owned_index.traversal.as_ref());
+        let census_window_end = owned_index
+            .traversal
+            .as_ref()
+            .map_or_else(|| collected_at.to_owned(), |t| t.census_window_end.clone());
+        let mut codex_page = sampled_scan::codex_cursor::PageBudget::default();
+        codex_page.set_continuation(ordinary_equivalent);
+        Self {
+            native_comparison: None,
+            resource_probe: crate::local_resource_diagnostics::Probe::start(),
+            sampling: None,
+            source: SnapshotSource::Codex,
+            roots: roots.to_vec(),
+            index: owned_index,
+            collected_at: collected_at.to_owned(),
+            backfill_window_days: effective_backfill_window_days(requested_backfill_window_days),
             file_limit,
             artifacts_enabled,
-            None,
-            &[],
-            false,
             context_curve_enabled,
-            // The ordinary Codex page never captures
-            // (`claude_request_identity::captures`), so neither does its
-            // continuation, in tests too (K5).
-            false,
-            &[],
-            Some(members),
-        );
-        scan.codex_page.set_continuation(ordinary_equivalent);
-        scan
+            claude_request_identity_capture: false,
+            claude_effort_support_dir: None,
+            claude_title_metadata: Default::default(),
+            state_census_complete: !codex_title_metadata.state_census_incomplete,
+            sidecar_census_complete: !codex_title_metadata.sidecar_census_incomplete,
+            codex_title_metadata,
+            codex_turn_traces: evidence.as_mut().and_then(|e| e.traces.take()),
+            codex_parent_identities,
+            codex_parent_ownership_ledgers: evidence.as_mut().and_then(|e| e.ledgers.take()),
+            census_window_end,
+            discovered_file_count: 0,
+            census_unix_seconds: rfc3339_unix_seconds(collected_at),
+            census: Default::default(),
+            snapshots: Vec::new(),
+            scanned_file_count: 0,
+            scanned_session_count: 0,
+            semantic_noop_count: 0,
+            history_upgrade: HistoryPage::with_twin_groups(Default::default()),
+            codex_state_only_blocked_session_ids: Default::default(),
+            codex_parent_resolution_retry_required: false,
+            residue_index_keys: Default::default(),
+            settled_residue_index_keys: Default::default(),
+            residue_blocked_session_ids: Default::default(),
+            pending_finalization: Vec::new(),
+            claude_authority_preflight: false,
+            forced_claude_family_reparses: Default::default(),
+            claude_twin_only_family_reparses: Default::default(),
+            identified_candidates: Default::default(),
+            active_file: Default::default(),
+            codex_join_inventory: evidence.map(|e| e.inventory),
+            codex_join_prepared: true,
+            codex_join_groups: Default::default(),
+            codex_join_active: None,
+            codex_join_completed: Vec::new(),
+            codex_legacy_join_baselines: Vec::new(),
+            codex_page,
+            codex_selected_flags: Default::default(),
+            codex_side_pass: None,
+            continuation_ticket: None,
+            line_delivery: None,
+        }
     }
 
     /// Stage 1 (K6): the cooperative deadline of a continuation page, on the
@@ -26045,12 +26117,10 @@ impl OwnedSourceScan {
         context_curve_enabled: bool,
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
-        continuation: Option<&BTreeSet<String>>,
     ) -> Self {
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             source == SnapshotSource::ClaudeCode,
         );
-        let continuation = continuation.filter(|_| source == SnapshotSource::Codex);
         let mut resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
         index.activate_quarantine_witness(source);
@@ -26120,14 +26190,12 @@ impl OwnedSourceScan {
             refresh_retained_codex_roster(source, traversal, backfill_window_days, &index.files);
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
-            if continuation.is_none() {
-                advance_bounded_directory_traversal(
-                    source,
-                    traversal,
-                    backfill_window_days,
-                    &index.files,
-                );
-            }
+            advance_bounded_directory_traversal(
+                source,
+                traversal,
+                backfill_window_days,
+                &index.files,
+            );
             release_codex_inventory_hold(source, traversal);
         }
         if source == SnapshotSource::Codex {
@@ -26161,21 +26229,18 @@ impl OwnedSourceScan {
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member && !candidate.watcher_hint);
-        let selection_limit = if (source == SnapshotSource::Codex
-            && !traversal.pending_directories.is_empty())
-            || continuation.is_some()
-        {
-            0
-        } else {
-            file_limit
-        };
+        let selection_limit =
+            if source == SnapshotSource::Codex && !traversal.pending_directories.is_empty() {
+                0
+            } else {
+                file_limit
+            };
         // Fresh data gets a bounded page of its own, at most every other
         // ordinary page. Mixing it behind 64 MiB of census revalidation
         // starves it; always putting it first can starve the census instead.
         // Continuations never select new work. A hint alone does not trigger
         // a read: all selected paths still pass the unchanged candidate gate.
         let freshness_page = source == SnapshotSource::Codex
-            && continuation.is_none()
             && selection_limit > 0
             && !traversal.codex_freshness_yield
             && traversal
@@ -26184,14 +26249,13 @@ impl OwnedSourceScan {
                 .any(|candidate| codex_fresh_data_pending(candidate, &index.files))
             && codex_selection_may_exhaust_page(traversal, selection_limit, &index.files);
         let census_page = source == SnapshotSource::Codex
-            && continuation.is_none()
             && selection_limit > 0
             && traversal.codex_freshness_yield
             && traversal
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member);
-        if source == SnapshotSource::Codex && continuation.is_none() && selection_limit > 0 {
+        if source == SnapshotSource::Codex && selection_limit > 0 {
             traversal.codex_freshness_yield = freshness_page;
         }
         if freshness_page || census_page {
@@ -26366,17 +26430,6 @@ impl OwnedSourceScan {
                 break;
             };
             pending_paths.push(candidate);
-        }
-        // Stage 1 hunk D: a continuation page selects only the paused job's
-        // pending paths, in queue order, and none during the walk.
-        if let Some(members) = continuation.filter(|_| traversal.pending_directories.is_empty()) {
-            let (selected, kept) = std::mem::take(&mut traversal.pending_candidates)
-                .into_iter()
-                .partition::<Vec<_>, _>(|candidate| {
-                    members.contains(&local_index_key(&candidate.path))
-                });
-            traversal.pending_candidates = kept.into();
-            pending_paths.extend(selected);
         }
         if source == SnapshotSource::Codex {
             // G1 (fix 2): the same selection, read census members first. The
@@ -26931,6 +26984,7 @@ impl OwnedSourceScan {
         // candidate is classified: apply the namespace's parent witnesses and
         // decide the restart budget.
         if source == SnapshotSource::Codex
+            && !codex_page.continuation()
             && !codex_parent_identities.parents_applied
             && index
                 .traversal
@@ -28067,6 +28121,15 @@ impl OwnedSourceScan {
                         census.record_unreadable(UnreadableCause::OpenRead, 1);
                         pending!();
                     }
+                    Ok(true) if codex_page.continuation() => {
+                        // Park at sealed X, exactly like a byte-budget pause. Only
+                        // an ordinary page may apply EOF, certify and emit.
+                        continuation_ticket = None;
+                        if let Some(lease) = codex_cursor_lease.take() {
+                            drop(lease.pause(active));
+                        }
+                        pending!();
+                    }
                     Ok(true) => {}
                 }
                 #[cfg(test)]
@@ -29016,9 +29079,7 @@ impl OwnedSourceScan {
                         .cache
                         .cursor_published(publication, parsed_file.is_ok());
                     // Stage 1 (EOF seam): the attempt committed and finished.
-                    if parsed_file.is_ok() {
-                        codex_page.note_committed();
-                    }
+                    if parsed_file.is_ok() {}
                 }
                 if let Ok(parsed) = &parsed_file {
                     if source == SnapshotSource::ClaudeCode && !comparison_target {
@@ -30156,6 +30217,26 @@ impl OwnedSourceScan {
                 pending!();
             }
             let Some(mut candidate) = identified_candidates.pop_front() else {
+                if codex_page.continuation() {
+                    let continuation_evidence = codex_join_inventory.map(|inventory| {
+                        Arc::new(Mutex::new(Some(CodexContinuationEvidence {
+                            inventory,
+                            ledgers: codex_parent_ownership_ledgers,
+                            codex: codex_title_metadata,
+                            traces: codex_turn_traces,
+                        })))
+                    });
+                    return Ok(OwnedSourceScanStep::Complete {
+                        index: index_storage,
+                        terminal_native_traversal: None,
+                        scan: SourceScanResult {
+                            continuation_ticket,
+                            continuation_evidence,
+                            ..SourceScanResult::empty(SnapshotSource::Codex)
+                        },
+                    });
+                }
+
                 // U1a-2a (row 31): the proof hook, once per page, after the
                 // page's candidates, on the singleton budget main left.
                 if codex_parent_proofs_enabled(source, sampling.as_ref())
@@ -30813,6 +30894,20 @@ impl OwnedSourceScan {
                             && !index.bounded_sweep_had_unsettled_upload,
                     );
                 }
+                let local_diagnostics = codex_title_metadata.local_diagnostics;
+                let continuation_evidence = if codex_join_completed.is_empty() {
+                    codex_join_inventory
+                        .take()
+                        .filter(|inventory| inventory.complete)
+                        .map(|inventory| CodexContinuationEvidence {
+                            inventory,
+                            ledgers: codex_parent_ownership_ledgers,
+                            codex: codex_title_metadata,
+                            traces: codex_turn_traces,
+                        })
+                } else {
+                    None
+                };
                 let scan = SourceScanResult {
                     source,
                     backfill_window_days,
@@ -30857,7 +30952,8 @@ impl OwnedSourceScan {
                     codex_legacy_join_baselines,
                     claude_request_census_shadow,
                     continuation_ticket,
-                    continuation_committed: codex_page.continuation_committed(),
+                    continuation_evidence: continuation_evidence
+                        .map(|e| Arc::new(Mutex::new(Some(e)))),
                     codex_join_validation: codex_join_inventory
                         .filter(|_| !codex_join_completed.is_empty())
                         .map(|inventory| codex_file_join::Validation {
@@ -30894,7 +30990,7 @@ impl OwnedSourceScan {
                                 clean_followup: needs_clean_followup,
                                 census_complete,
                             },
-                            ..codex_title_metadata.local_diagnostics
+                            ..local_diagnostics
                         },
                     ),
                 };
@@ -34401,6 +34497,12 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         acquisition.observe_record_fragment(&available[..offset + 1], true)?;
                     }
                     reader.consume(offset + 1);
+                    #[cfg(test)]
+                    sampled_scan::codex_cursor::tests::NATIVE_RANGES.with(|v| {
+                        if let Some(ranges) = v.borrow_mut().as_mut() {
+                            ranges.push(self.consumed..self.consumed + (offset + 1) as u64);
+                        }
+                    });
                     self.consumed += (offset + 1) as u64;
                     self.last_line_end = self.consumed;
                     line_complete = true;
@@ -34419,6 +34521,12 @@ impl<R: BufRead> BoundedJsonlReader<R> {
                         acquisition.observe_record_fragment(available, false)?;
                     }
                     reader.consume(len);
+                    #[cfg(test)]
+                    sampled_scan::codex_cursor::tests::NATIVE_RANGES.with(|v| {
+                        if let Some(ranges) = v.borrow_mut().as_mut() {
+                            ranges.push(self.consumed..self.consumed + len as u64);
+                        }
+                    });
                     self.consumed += len as u64;
                     if overflowed {
                         skipped_this_step = skipped_this_step.saturating_add(len);
