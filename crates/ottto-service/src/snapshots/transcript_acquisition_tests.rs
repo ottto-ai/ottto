@@ -505,7 +505,7 @@ fn sampled_native_cache_eviction_and_active_state_accounting() {
 }
 
 #[test]
-fn sampled_native_hidden_middle_edit_is_corrected_by_due_full_audit() {
+fn sampled_native_hidden_middle_edit_remains_an_accepted_sampled_residual() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -534,12 +534,11 @@ fn sampled_native_hidden_middle_edit_is_corrected_by_due_full_audit() {
             oracle(&fixture, source),
             "accepted sampled limitation must be visible"
         );
-        let (_, mode, _, corrected) = acquire(&fixture, source, tail, 3700);
-        assert_eq!(
-            mode,
-            ReadMode::Full(crate::transcript_acquisition::FullReason::AuditDue)
-        );
-        assert_eq!(corrected, oracle(&fixture, source));
+        let (_, mode, guards, later) = acquire(&fixture, source, tail, 3700);
+        assert_eq!(mode, ReadMode::Unchanged);
+        assert_eq!(guards, 0);
+        assert_eq!(later, interim);
+        assert_ne!(later, oracle(&fixture, source));
     }
 }
 #[test]
@@ -1650,6 +1649,203 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
         );
     }
 }
+/// Gate-only R2: use the existing production scanner/write/restore fixture,
+/// with real on-disk records and no surviving RAM cache. Native positive
+/// controls require the supported heap layout; Linux runs the ReadPlan cases.
+#[cfg(unix)]
+#[test]
+fn durable_restore_ignores_audit_age_slots_and_clock_but_keeps_real_edit_checks() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    struct ResetClock;
+    impl Drop for ResetClock {
+        fn drop(&mut self) {
+            sampled_scan::set_test_now(None);
+        }
+    }
+    let _clock = ResetClock;
+    const START: u64 = 1_800_000_000;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for (arm, pending) in [
+            ("old_append", 0),
+            ("due_append", 0),
+            ("due_quiet", 0),
+            ("slots_256", 256),
+            ("slots_300", 300),
+            ("clock_append", 0),
+            ("real_edit", 0),
+        ] {
+            sampled_scan::set_test_now(Some(START));
+            let fixture = ScanFixture::new(source);
+            fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+            let namespace = Scope("r2-audit-gate".into());
+            let state = fixture.dir.join("state");
+            fs::create_dir_all(&state).unwrap();
+            let lock = crate::locked_state_dir::test_locks::hold(&state);
+            let index_path = state.join("index.json");
+            let first = Arc::new(sampled_scan::SharedCache::default());
+            first.durable_begin_pass(
+                source,
+                &index_path,
+                &namespace,
+                claude_request_identity::capture_by_default(),
+            );
+            let (mut index, initial, modes) = production_scan(
+                &fixture,
+                source,
+                ScanIndex::default(),
+                Some(first.clone()),
+                &namespace.0,
+            );
+            assert_eq!(modes, (1, 0, 0), "{source:?}/{arm}");
+            assert!(!initial.snapshots.is_empty());
+            let key = local_index_key(&fixture.file.0);
+            if arm.starts_with("due_") || arm == "real_edit" {
+                let fingerprint = index.files[&key].source_file_fingerprint.clone();
+                assert!(index.stage_sampled_audit(
+                    &key,
+                    &fingerprint,
+                    crate::transcript_acquisition::AuditDebt {
+                        due_unix_seconds: START + 1
+                    }
+                ));
+            }
+            // These independent pending keys exist in the loaded index but
+            // are outside discovery. Their audit count must not gate this key.
+            for n in 0..pending {
+                let mut entry = index.files[&key].clone();
+                entry.set_unverified_deadline(START + 1);
+                index
+                    .files
+                    .insert(format!("/synthetic-pending-audits/{n}.jsonl"), entry);
+            }
+            assert_eq!(
+                index
+                    .files
+                    .values()
+                    .filter(|e| e.has_unverified_source())
+                    .count(),
+                pending + usize::from(arm.starts_with("due_") || arm == "real_edit")
+            );
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                first
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            assert_eq!(
+                first
+                    .take(&key)
+                    .unwrap()
+                    .retained
+                    .checkpoint
+                    .last_full_verified(),
+                START
+            );
+            drop(first);
+            let before = fs::metadata(&fixture.file.0).unwrap().len();
+            if arm == "real_edit" {
+                let original = fs::read_to_string(&fixture.file.0).unwrap();
+                let edited = original.replace("\"input_tokens\":100", "\"input_tokens\":900");
+                assert_ne!(original, edited);
+                assert_eq!(original.len(), edited.len());
+                let modified = fs::metadata(&fixture.file.0).unwrap().modified().unwrap();
+                fs::write(&fixture.file.0, edited).unwrap();
+                File::open(&fixture.file.0)
+                    .unwrap()
+                    .set_modified(modified + std::time::Duration::from_secs(1))
+                    .unwrap();
+            } else if arm != "due_quiet" {
+                fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+            }
+            let suffix_bytes = fs::metadata(&fixture.file.0).unwrap().len() - before;
+            sampled_scan::set_test_now(Some(if arm == "clock_append" {
+                START - 1
+            } else {
+                START + 7_200
+            }));
+            let loaded = ScanIndex::load(&index_path).unwrap();
+            let second = Arc::new(sampled_scan::SharedCache::default());
+            second.durable_begin_pass(
+                source,
+                &index_path,
+                &namespace,
+                claude_request_identity::capture_by_default(),
+            );
+            assert!(second.take(&key).is_none(), "restore must start cold");
+            let (warm, result, modes, bytes) = production_scan_at_with_setup(
+                &fixture,
+                source,
+                loaded.clone(),
+                Some(second.clone()),
+                &namespace.0,
+                NOW,
+                |scan| {
+                    let context = scan.sampling.as_ref().unwrap();
+                    if pending > 0 {
+                        assert_eq!(context.audit_slots, 0);
+                        assert_eq!(context.audit_metadata_supported, pending <= 256);
+                        let (budget, _) =
+                            sampled_scan::copy_budget_step(scan.sampling.as_ref(), None, false);
+                        assert!(
+                            budget > 0,
+                            "audit population cannot zero the bounded copy budget"
+                        );
+                    }
+                },
+            );
+            let counts = second.durable_counters(source).unwrap().0;
+            assert_eq!(counts.restore_attempts, 1, "{source:?}/{arm}");
+            assert_eq!(
+                counts.restored,
+                u64::from(arm != "real_edit"),
+                "{source:?}/{arm}"
+            );
+            if arm == "real_edit" {
+                assert_eq!(counts.certificate_refused.get("same_size_edit"), Some(&1));
+            }
+            assert_eq!(
+                modes,
+                if arm == "real_edit" {
+                    (1, 0, 0)
+                } else if arm == "due_quiet" {
+                    (0, 0, 1)
+                } else {
+                    (0, 1, 0)
+                },
+                "{source:?}/{arm}"
+            );
+            assert_eq!(
+                bytes.0,
+                if arm == "real_edit" {
+                    before
+                } else {
+                    suffix_bytes
+                },
+                "actual native extent: {source:?}/{arm}"
+            );
+            assert!(bytes.1 <= (2 * crate::transcript_acquisition::SAMPLE_BYTES) as u64);
+            if arm != "due_quiet" {
+                assert!(!result.snapshots.is_empty());
+            }
+            let (_, cold, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+            assert_eq!(
+                production_body(source, result),
+                production_body(source, cold),
+                "{source:?}/{arm}"
+            );
+            assert_eq!(
+                warm.files[&key].has_unverified_source(),
+                arm != "real_edit",
+                "only the actual edit Full verifies the source"
+            );
+        }
+    }
+}
+
 /// Review F1: more kept opaque records than the store's inventory bound
 /// never block the known key's replacement. Restore + Tail an append, save,
 /// restart: the next append Tails again (no Full) and matches the cold Full.
@@ -2540,10 +2736,11 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
         let (_, counts) = observe(|| scan.release_sampled_cache_for_copy_refusal());
         assert_eq!(counts.clear_full_resident_bound_unknown, 1, "{source:?}");
         assert_eq!(counts.clear_other_active, 0, "{source:?}");
-        // Unsupported audit metadata keeps its clear.
+        // Audit metadata cannot clear an otherwise bounded native resident.
         scan.sampling.as_mut().unwrap().audit_metadata_supported = false;
         let counts = release(&scan, measured);
-        assert_eq!(counts.clear_metadata_unsupported, 1, "{source:?}");
+        assert_eq!(counts.clear_metadata_unsupported, 0, "{source:?}");
+        assert_eq!(counts.clear_full_resident_bound_unknown, 0, "{source:?}");
         assert_eq!(counts.clear_other_active, 0, "{source:?}");
         drop(scan);
 

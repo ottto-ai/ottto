@@ -682,7 +682,12 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
         }
     ));
     let audited = raw_scan(&f, due, Some(cache), |_| {});
-    assert!(audited.reasons[FullReason::AuditDue.slot()] > 0);
+    assert_layout_mode(audited.modes, (0, 0, 1));
+    assert_eq!(
+        audited.reasons[FullReason::AuditDue.slot()],
+        usize::from(!crate::heap_layout_bound::layout_supported()),
+        "a usable checkpoint is not reread for audit age"
+    );
 }
 
 #[test]

@@ -808,7 +808,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
             for bypass in [
                 "ordinary",
                 "sampling_none",
-                "allow_sample_false",
+                "audit_metadata_unsupported",
                 "state_false",
                 "sidecar_false",
                 "owning_header_false",
@@ -954,7 +954,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 if bypass == "sampling_none" || bypass == "compressed" {
                     scan.sampling = None;
                 }
-                if bypass == "allow_sample_false" {
+                if bypass == "audit_metadata_unsupported" {
                     scan.sampling.as_mut().unwrap().audit_metadata_supported = false;
                 }
                 if bypass == "state_false" {
