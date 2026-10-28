@@ -669,7 +669,7 @@ fn only_dirty_records_are_written_in_bounded_batches() {
 }
 
 #[test]
-fn budget_refusal_writes_nothing_and_drops_the_stale_record() {
+fn budget_refusal_writes_nothing_and_keeps_v1_authority() {
     let scratch = Scratch::new();
     let lock = LockedStateDir::acquire(&scratch.root).unwrap();
     let transcript = scratch.transcript("t.jsonl", b"{}\n");
@@ -686,12 +686,11 @@ fn budget_refusal_writes_nothing_and_drops_the_stale_record() {
     big.body = vec![0; RECORD_BYTES];
     let receipt = store.write_after_save(&lock, 2, vec![big]).unwrap();
     assert_eq!((receipt.written, receipt.budget_refused), (0, 1));
-    assert_eq!(
-        store.read(&b.key, &placeholder_allowlist()),
-        ReadOutcome::Missing
-    );
+    let retained = found(store.read(&b.key, &placeholder_allowlist()));
+    assert_eq!(retained.record.binding, b);
+    assert_eq!(retained.record.body, placeholder_body(1, 7));
     assert_eq!(store.counters().budget_refused, 1);
-    assert_eq!(store.counters().disk_bytes, 0);
+    assert!(store.counters().disk_bytes > 0);
 }
 
 /// GC on an account or scope change, and on keys the save no longer keeps.
