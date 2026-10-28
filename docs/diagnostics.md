@@ -624,3 +624,11 @@ These refusals authorize neither discovery nor a decoder. A refusal publishes no
 empty or zero-cost replacement body: previous accepted output remains stale, or
 usage remains unknown. Raw bounded samples of compressed physical objects remain
 legal identity observations; they establish no decoded-offset certificate.
+
+A funded main-scan archive attempt emits `codex_zst_input` once when its decoder
+closes. Counts `codex_zst_compressed_bytes`, `codex_zst_decoded_bytes`, and
+`codex_zst_cpu_micros` measure decoder input consumed, output produced, and thread
+CPU spent decoding, including failed attempts. They contain no path, owner or
+content. Decoder credit is held through the shared cache admission; only one
+funded decoder may be live in the process. Physical offset certificates remain
+unsupported for archives.

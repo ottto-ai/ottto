@@ -109,7 +109,8 @@ impl ArchiveEvidence {
             .next()
             .ok_or_else(|| invalid("compressed rollout logical id unavailable"))?;
         Ok(Self {
-            stamp: crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?,
+            stamp: crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?
+                .content_only(),
             logical_id,
             owner: None,
             disposition: ArchiveDisposition::Pending,
@@ -650,6 +651,12 @@ mod tests {
                 );
             }
             scan.identified_candidates = VecDeque::from([f.candidate()]);
+            scan.census
+                .observed_index_keys
+                .insert(local_index_key(&f.0));
+            scan.census
+                .observed_index_keys
+                .insert(local_index_key(&f.0));
             scan.codex_join_prepared = true;
             scan.census_unix_seconds = None;
             for _ in 0..1000 {
@@ -745,10 +752,15 @@ mod tests {
         assert!(saved.files[&key].last_snapshot_fingerprint.is_none());
         assert!(saved.accepted_snapshot_fingerprints.is_empty());
         assert!(!saved.file_snapshot_fingerprints.contains_key(&key));
+        let expected_pending_money = serde_json::to_value(&result.snapshots).unwrap();
         for state in [index, saved] {
             let (_, result, rows, _) = archive_pass(&f, state, true, None);
             assert_eq!(decodes(&rows), 0);
-            assert!(result.snapshots.is_empty());
+            // Quiet acquisition must not strand a body whose ACK was lost.
+            assert_eq!(
+                serde_json::to_value(&result.snapshots).unwrap(),
+                expected_pending_money
+            );
         }
     }
     #[test]
@@ -791,6 +803,7 @@ mod tests {
         for bytes in [
             b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed-fixture\"}}\n".to_vec(),
             b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"wrong-owner\"}}\n".to_vec(),
+            [synthetic_rollout(), b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\"bad\"}}}}\n".to_vec()].concat(),
         ] {
             let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
             let (mut index, result, _, _) = archive_pass(&f, ScanIndex::default(), true, None);
@@ -830,5 +843,60 @@ mod tests {
             .unwrap()
             .close();
         assert_eq!(second.cursor_reserved(), 0);
+    }
+    #[test]
+    fn archive_uses_logical_sidecar_classification_and_blocks_ambiguous_names() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let mut metadata = CodexTitleMetadata::default();
+        metadata
+            .state_created_threads
+            .insert("compressed-fixture".into());
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut index = ScanIndex::default();
+        let mut parser = sampled_scan::new_source_parser(
+            File::open(&f.0).unwrap(),
+            &f.candidate(),
+            SnapshotSource::Codex,
+            &metadata,
+            None,
+            None,
+            false,
+            false,
+            false,
+            &mut index,
+            Some(&cache),
+        )
+        .unwrap();
+        while !parser.step().unwrap() {}
+        assert!(parser.accumulator.codex_created_thread_native_only);
+        assert!(!parser.accumulator.codex_usage_accounting_complete());
+        parser.reader.reader.close();
+        let modern =
+            f.0.with_file_name("rollout-2026-10-28T10-00-00-compressed-fixture.jsonl.zst");
+        fs::copy(&f.0, &modern).unwrap();
+        let candidate = super::super::codex_zst_refusal_tests::candidate(&modern);
+        let mut index = ScanIndex::default();
+        assert!(sampled_scan::new_source_parser(
+            File::open(&modern).unwrap(),
+            &candidate,
+            SnapshotSource::Codex,
+            &metadata,
+            None,
+            None,
+            false,
+            false,
+            false,
+            &mut index,
+            None
+        )
+        .is_err());
+        for id in [
+            "compressed-fixture",
+            "2026-10-28T10-00-00-compressed-fixture",
+        ] {
+            assert!(index.codex_state_only_blocked_session_ids.contains(id));
+        }
     }
 }

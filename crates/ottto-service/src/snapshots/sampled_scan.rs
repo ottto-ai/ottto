@@ -1975,37 +1975,38 @@ pub(super) fn new_source_parser(
     index: &mut ScanIndex,
     cache: Option<&Arc<SharedCache>>,
 ) -> Result<OwnedJsonlParser> {
-    let input = if source == SnapshotSource::Codex
-        && is_compressed_codex_rollout(Some(&candidate.path), None)
-    {
-        anyhow::ensure!(
-            !index
-                .files
-                .get(&local_index_key(&candidate.path))
-                .and_then(|entry| entry.archive.as_ref())
-                .is_some_and(|archive| archive.matches(&file)),
-            "compressed rollout already attempted"
-        );
-        let evidence = codex_compressed_input::ArchiveEvidence::begin(&file, &candidate.path)?;
-        let key = local_index_key(&candidate.path);
-        index
-            .codex_state_only_blocked_session_ids
-            .insert(evidence.logical_id.clone());
-        index.files.entry(key.clone()).or_default();
-        index.files.get_mut(&key).expect("archive entry").archive = Some(evidence);
-        match cache
-            .ok_or_else(|| anyhow::anyhow!("compressed rollout admission unavailable"))
-            .and_then(|cache| OpenedInput::funded(file, cache).map_err(Into::into))
+    let input =
+        if source == SnapshotSource::Codex
+            && is_compressed_codex_rollout(Some(&candidate.path), None)
         {
-            Ok(input) => input,
-            Err(error) => {
-                index.archive_refuse(&candidate.path, CodexZstCause::AdmissionRefused);
-                return Err(error);
+            anyhow::ensure!(
+                !index
+                    .files
+                    .get(&local_index_key(&candidate.path))
+                    .and_then(|entry| entry.archive.as_ref())
+                    .is_some_and(|archive| archive.matches(&file)),
+                "compressed rollout already attempted"
+            );
+            let evidence = codex_compressed_input::ArchiveEvidence::begin(&file, &candidate.path)?;
+            let key = local_index_key(&candidate.path);
+            index.codex_state_only_blocked_session_ids.extend(
+                codex_session_id_candidates_from_path(&candidate.path.with_extension("")),
+            );
+            index.files.entry(key.clone()).or_default();
+            index.files.get_mut(&key).expect("archive entry").archive = Some(evidence);
+            match cache
+                .ok_or_else(|| anyhow::anyhow!("compressed rollout admission unavailable"))
+                .and_then(|cache| OpenedInput::funded(file, cache).map_err(Into::into))
+            {
+                Ok(input) => input,
+                Err(error) => {
+                    index.archive_refuse(&candidate.path, CodexZstCause::AdmissionRefused);
+                    return Err(error);
+                }
             }
-        }
-    } else {
-        OpenedInput::plain(file)
-    };
+        } else {
+            OpenedInput::plain(file)
+        };
     let mut parser = OwnedJsonlParser::new_opened(
         input,
         &candidate.path,

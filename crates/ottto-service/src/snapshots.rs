@@ -29153,6 +29153,9 @@ impl OwnedSourceScan {
                         evidence.logical_id = owner.clone();
                     }
                     evidence.disposition = if !owned {
+                        crate::local_resource_diagnostics::codex_zst_refused(
+                            CodexZstCause::OwnerUnproven,
+                        );
                         codex_compressed_input::ArchiveDisposition::Refused {
                             cause: CodexZstCause::OwnerUnproven,
                         }
@@ -33127,7 +33130,18 @@ impl OwnedJsonlParser {
                     .get_ref()
                     .metadata()
                     .with_context(|| format!("read opened JSONL metadata {}", path.display()))?;
-                accumulator.seed_codex_sidecar_parent(path, &file_metadata, metadata);
+                let logical = path.with_extension("");
+                let classification_path =
+                    if reader.is_compressed() && is_compressed_codex_rollout(Some(path), None) {
+                        &logical
+                    } else {
+                        path
+                    };
+                accumulator.seed_codex_sidecar_parent(
+                    classification_path,
+                    &file_metadata,
+                    metadata,
+                );
             }
         }
         let mut claude_opened_birth = None;
