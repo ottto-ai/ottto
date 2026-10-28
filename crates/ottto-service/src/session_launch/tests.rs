@@ -2,6 +2,13 @@ use super::*;
 use ottto_core::{billing_identity_hash, session_launch::LaunchUser, ClaudeConfigDirSlot};
 use std::os::unix::fs::symlink;
 
+fn test_executable() -> PathBuf {
+    std::env::current_exe()
+        .expect("current test executable")
+        .canonicalize()
+        .expect("canonical test executable")
+}
+
 fn write_login(home: &Path) {
     fs::create_dir_all(home.join(".claude")).unwrap();
     fs::write(home.join(".claude/.credentials.json"), serde_json::to_vec(&serde_json::json!({"claudeAiOauth":{
@@ -42,13 +49,15 @@ fn fixture_entry(root: &Path) -> Entry {
     let cwd = root.join("project");
     fs::create_dir_all(&cwd).unwrap();
     let metadata = fs::metadata(&cwd).unwrap();
+    let program = test_executable();
+    let program_identity = program_identity(&program).expect("test executable identity");
     Entry {
         binding: fixture_binding(root),
         cwd,
         dev: metadata.dev(),
         ino: metadata.ino(),
-        program: PathBuf::from("/bin/false"),
-        program_identity: program_identity(Path::new("/bin/false")).unwrap(),
+        program,
+        program_identity,
         cli_version: "2.1.310".into(),
         path_env: "/usr/bin:/bin".into(),
         secret: Sha256::digest(b"secret").into(),
@@ -432,7 +441,7 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
                     path: Some(project.to_string_lossy().into_owned()),
                     recent_id: None,
                 },
-                Some(PathBuf::from("/bin/true")),
+                Some(test_executable()),
                 &support,
                 user.clone(),
             )
@@ -488,7 +497,7 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
             path: Some(root.join("missing").to_string_lossy().into_owned()),
             recent_id: None,
         },
-        Some(PathBuf::from("/bin/true")),
+        Some(test_executable()),
         &support,
         user.clone(),
     );
@@ -563,7 +572,9 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     }
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let scratch = crate::test_scratch::ScratchDir::new("codex-launch");
-    let root = scratch.as_ref();
+    // The credential reader refuses symlinked ancestors; macOS TMPDIR uses /var.
+    let canonical_root = scratch.canonicalize().expect("canonical scratch directory");
+    let root = canonical_root.as_path();
     let home = root.join("home");
     let codex = home.join(".codex");
     let support = root.join("support");
@@ -640,7 +651,7 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
                 path: Some(project.to_string_lossy().into_owned()),
                 recent_id: None,
             },
-            Some(PathBuf::from("/bin/true")),
+            Some(test_executable()),
             &support,
             user.clone(),
         )
