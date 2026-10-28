@@ -464,7 +464,10 @@ fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() 
                     })
                     .collect(),
             );
-            ack["session_ids"] = serde_json::json!(vec![""; 30_000]);
+            ack["session_ids"] = serde_json::json!([]);
+            let base_bytes = serde_json::to_vec(&ack).unwrap().len();
+            let count = (crate::snapshot_retry::RESPONSE_BYTES - 32 - base_bytes) / 3;
+            ack["session_ids"] = serde_json::json!(vec![""; count]);
             let ack = ack.to_string();
             assert!(ack.len() <= crate::snapshot_retry::RESPONSE_BYTES);
             let hint = br#"{"source":"pi","server_time":"2026-10-06T10:05:00Z","last_data_at":null,"record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":30,"recommended_scan_after":"2026-10-06T10:10:00Z"}"#;
@@ -561,7 +564,7 @@ fn bounded_retry_envelope_native_max_model_tls_ack_receipt_checkpoint_restart() 
             )
             .unwrap();
             assert!(scan.snapshots.is_empty());
-            eprintln!("native_envelope files={files} models={models} label_bytes_admitted={low} next_refused={high} ack_bytes={} item_json_bytes={} checkpoint_ack_restart=true", ack.len(), serde_json::to_vec(&f.items).unwrap().len());
+            eprintln!("native_envelope files={files} models={models} label_bytes_admitted={low} next_refused={high} ack_bytes={} ack_fill_ratio={:.6} item_json_bytes={} checkpoint_ack_restart=true", ack.len(), ack.len() as f64 / crate::snapshot_retry::RESPONSE_BYTES as f64, serde_json::to_vec(&f.items).unwrap().len());
             eprintln!(
             "native_envelope files={files} models={models} replay={replay} derived_peak={peak_bound} requested_peak={} usable_peak={} allocations={}",
             allocation.requested_peak_with_overlap, allocation.usable_peak_with_overlap, allocation.allocations

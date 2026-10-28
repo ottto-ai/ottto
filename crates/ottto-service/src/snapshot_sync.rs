@@ -11297,7 +11297,7 @@ fn ensure_snapshot_scan_authority(
         expected_device,
         &current,
         source,
-        client.matches_api_base(&snapshot_api_base_url()?),
+        client.matches_api_base(&snapshot_api_base_url().map_err(|_| rejected())?),
         expected_account,
         &account,
     )
@@ -11473,7 +11473,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ");
-    if text.contains("relay device") {
+    if text.contains("connection binding") {
+        "connection binding is unavailable or invalid; reconnect this device".to_string()
+    } else if text.contains("relay device") {
         "relay device credentials are unavailable".to_string()
     } else if text.contains("machine identity") {
         "machine identity is unavailable".to_string()
@@ -18269,6 +18271,44 @@ mod tests {
     fn local_health_heartbeat_cadence_is_not_bound_to_snapshot_scans() {
         assert!(LOCAL_HEALTH_PROJECTION_INTERVAL < SNAPSHOT_SYNC_INTERVAL);
         assert!(LOCAL_HEALTH_PROJECTION_INTERVAL <= Duration::from_secs(60));
+    }
+
+    #[test]
+    #[serial]
+    fn endpoint_load_failure_during_scan_is_local_state() {
+        let root = test_dir("scan-endpoint-load-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let device = LocalDeviceBinding {
+            sources: vec!["pi".into()],
+            ..bounded_native_device()
+        };
+        FileDeviceStore::default().save(&device).unwrap();
+        let daemon = test_daemon(&"a".repeat(64));
+        let account = daemon.snapshot_scan_account_witness().unwrap();
+        let client = SnapshotApiClient::new("https://synthetic.invalid");
+        for bytes in [b"invalid-json".to_vec(), vec![b' '; 64 * 1024 + 1]] {
+            std::fs::write(root.join("connection.json"), bytes).unwrap();
+            let load_error = snapshot_api_base_url().unwrap_err();
+            assert_eq!(
+                safe_error(&load_error),
+                "connection binding is unavailable or invalid; reconnect this device"
+            );
+            let error = ensure_snapshot_scan_authority(
+                &device,
+                SnapshotSource::Pi,
+                &client,
+                &account,
+                &daemon,
+            )
+            .unwrap_err();
+            assert_eq!(
+                snapshot_upload_error_class(&error),
+                Some(SnapshotUploadErrorClass::LocalState)
+            );
+            assert_eq!(safe_error(&error), "local snapshot state failed");
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

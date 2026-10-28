@@ -175,7 +175,8 @@ JSON, UTF-8 and missing-file failures do not increment this counter.
 `credential_file_cap_refused` is 1 for this event and
 `credential_file_cap_refused_total` is a saturating process-lifetime total for
 that kind. Count attempts, not distinct files. Totals include only those observed
-snapshot authority/destination loads, so `source` is `unknown`; other core
+snapshot authority/destination loads (including continuation authority), so
+`source` is `unknown`; other core
 callers are not counted. Never attribute totals to Pi alone or sum cumulative
 totals. The observation is a point with
 zero elapsed time and null CPU/RSS samples. These records contain no path,
@@ -186,6 +187,10 @@ file cap and remain in the shared ordinary-path resource domain. A connection
 binding read, parse or cap failure now stops endpoint resolution and propagates
 before creating a credential-bearing client. Environment/default endpoint
 fallback applies only when the binding is absent, never after a failed load.
+This applies to every source and composition/footprint/inventory harvest.
+The safe diagnostic names the connection binding and asks to reconnect; it
+contains no path or endpoint URL. During owned-scan authority revalidation,
+an endpoint load failure remains a local-state rejection.
 
 ## Line Delivery Counters
 

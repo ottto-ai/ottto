@@ -222,6 +222,51 @@ impl PiLiveFixture {
         )
         .unwrap()
     }
+    // Exercise production store reads while keeping every credential synthetic.
+    fn bind_turn(
+        &mut self,
+        client: &SnapshotApiClient,
+        endpoint: &str,
+        device: &LocalDeviceBinding,
+    ) -> [EnvVarGuard; 2] {
+        let secrets = self.support.join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let guards = [
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &self.support),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
+        ];
+        FileDeviceStore::default().save(device).unwrap();
+        std::fs::write(
+            secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "synthetic-secret",
+        )
+        .unwrap();
+        std::fs::write(
+            self.support.join("connection.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "setup_run_id":"synthetic", "setup_run_token_expires_at":"synthetic",
+                "machine_id":null, "api_base_url":endpoint
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        self.progress.destination_namespace_hash =
+            snapshot_upload_destination_namespace(device, "synthetic-secret");
+        self.progress.save(&self.progress_path).unwrap();
+        self.live = Some(
+            live_snapshot_retry::LiveAuthority::capture(
+                SnapshotSource::Pi,
+                &self.home.0,
+                &self.support,
+                &self.hint,
+                &self.progress.destination_namespace_hash,
+                &Default::default(),
+                client.api_base_seal(),
+            )
+            .unwrap(),
+        );
+        guards
+    }
     fn capture(&mut self, delay: Duration) -> live_snapshot_retry::LiveRetryOwner {
         self.try_capture(delay).expect("supported native fixture")
     }
@@ -577,6 +622,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
 
 #[test]
 // The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial]
 #[serial(client_report)]
 fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -596,11 +642,31 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
         "grant",
     ] {
         let mut f = PiLiveFixture::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let client = SnapshotApiClient::new(&endpoint).with_bounded_retry_loopback_http_for_test();
+        let device = LocalDeviceBinding {
+            sources: vec!["pi".into()],
+            ..bounded_native_device()
+        };
+        let _stores = f.bind_turn(&client, &endpoint, &device);
+        // Matching stores pass every production check before one fence changes.
+        f.live
+            .as_ref()
+            .unwrap()
+            .validate_turn(
+                &client,
+                &f.daemon,
+                (
+                    &device,
+                    SnapshotSource::Pi,
+                    &f.daemon.snapshot_scan_account_witness().unwrap(),
+                ),
+                &f.home.0,
+            )
+            .unwrap();
         let mut owner = f.capture(Duration::ZERO);
         let before = std::fs::read(&f.index_path).unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
-            .with_bounded_retry_loopback_http_for_test();
         let no_post = listener.try_clone().unwrap();
         let server = if change != "policy" {
             None
@@ -641,14 +707,23 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
             )
             .unwrap();
         }
-        let device = LocalDeviceBinding {
-            sources: if change == "grant" {
-                vec![]
-            } else {
-                vec!["pi".into()]
-            },
-            ..bounded_native_device()
-        };
+        if change == "destination" {
+            std::fs::write(
+                f.support
+                    .join("secrets")
+                    .join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+                "changed-secret",
+            )
+            .unwrap();
+        }
+        if change == "grant" {
+            FileDeviceStore::default()
+                .save(&LocalDeviceBinding {
+                    sources: vec![],
+                    ..device.clone()
+                })
+                .unwrap();
+        }
         let mut attempted = 0;
         owner.isolated_boundary(|page| {
             attempted += 1;
@@ -660,18 +735,12 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
                 "synthetic-secret",
                 live.policy(),
                 &mut || {
-                    anyhow::ensure!(daemon.snapshot_retry_running().unwrap(), "stopped");
-                    anyhow::ensure!(
-                        daemon.snapshot_scan_account_witness().unwrap() == expected_account,
-                        "account changed"
-                    );
-                    let destination = if change == "destination" {
-                        "changed"
-                    } else {
-                        &f.progress.destination_namespace_hash
-                    };
-                    anyhow::ensure!(live.destination() == destination, "destination changed");
-                    live.validate_inputs(&f.home.0)
+                    live.validate_turn(
+                        &client,
+                        daemon,
+                        (&device, SnapshotSource::Pi, &expected_account),
+                        &f.home.0,
+                    )
                 },
             );
             assert!(result.is_err());
@@ -930,6 +999,7 @@ fn pi_retry_checkpoint_comparison_accepts_both_native_encodings() {
 }
 
 #[test]
+#[serial]
 #[serial(client_report)]
 fn retained_endpoint_change_refuses_before_relay_token_or_post() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -941,34 +1011,49 @@ fn retained_endpoint_change_refuses_before_relay_token_or_post() {
         .unwrap_or_else(|p| p.into_inner());
     let mut f = PiLiveFixture::new();
     let original = SnapshotApiClient::new("https://original.invalid");
-    let live = live_snapshot_retry::LiveAuthority::capture(
-        SnapshotSource::Pi,
-        &f.home.0,
-        &f.support,
-        &f.hint,
-        &f.progress.destination_namespace_hash,
-        &Default::default(),
-        original.api_base_seal(),
-    )
-    .unwrap();
-    assert!(live.validate_endpoint(&original).is_ok());
-    f.live = Some(live);
+    let device = LocalDeviceBinding {
+        sources: vec!["pi".into()],
+        ..bounded_native_device()
+    };
+    let _stores = f.bind_turn(&original, "https://original.invalid", &device);
+    assert!(f
+        .live
+        .as_ref()
+        .unwrap()
+        .validate_turn(
+            &original,
+            &f.daemon,
+            (
+                &device,
+                SnapshotSource::Pi,
+                &f.daemon.snapshot_scan_account_witness().unwrap()
+            ),
+            &f.home.0
+        )
+        .is_ok());
     let mut owner = f.capture(Duration::ZERO);
     let before = std::fs::read(&f.index_path).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let changed = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
         .with_bounded_retry_loopback_http_for_test();
-    let device = bounded_native_device();
     let mut attempted = 0;
     owner.isolated_boundary(|page| {
         attempted += 1;
+        let authority = page.authority();
         let live = page.take_live_authority()?;
         let result = page.turn_live(
             &changed,
             &device,
             "synthetic-secret",
             live.policy(),
-            &mut || live.validate_endpoint(&changed),
+            &mut || {
+                live.validate_turn(
+                    &changed,
+                    &f.daemon,
+                    (&device, SnapshotSource::Pi, &authority),
+                    &f.home.0,
+                )
+            },
         );
         assert!(result.is_err());
         assert_eq!(page.budget.posts_left(), 3);

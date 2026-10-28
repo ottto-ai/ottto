@@ -22,13 +22,18 @@ impl CredentialFileCapRefused {
 }
 
 pub(crate) fn read(file: File, kind: CredentialFileCapRefused) -> io::Result<String> {
-    if file.metadata()?.len() > LIMIT {
+    let len = file.metadata()?.len();
+    if len > LIMIT {
         return Err(kind.refuse());
     }
-    read_body(file, kind)
+    read_body(file, kind, (len + 1) as usize)
 }
-fn read_body(reader: impl Read, kind: CredentialFileCapRefused) -> io::Result<String> {
-    let mut bytes = Vec::with_capacity((LIMIT + 1) as usize);
+fn read_body(
+    reader: impl Read,
+    kind: CredentialFileCapRefused,
+    capacity: usize,
+) -> io::Result<String> {
+    let mut bytes = Vec::with_capacity(capacity.min((LIMIT + 1) as usize));
     reader.take(LIMIT + 1).read_to_end(&mut bytes)?;
     if bytes.len() > LIMIT as usize {
         return Err(kind.refuse());
@@ -52,16 +57,19 @@ mod tests {
             CredentialFileCapRefused::PendingDeviceCredential,
         ] {
             let exact = vec![b'x'; LIMIT as usize];
-            assert_eq!(read_body(&exact[..], kind).unwrap().len(), LIMIT as usize);
+            assert_eq!(
+                read_body(&exact[..], kind, exact.len() + 1).unwrap().len(),
+                LIMIT as usize
+            );
             let error = read(File::open(&path).unwrap(), kind).unwrap_err();
             assert!(error.get_ref().unwrap().is::<CredentialFileCapRefused>());
             // Simulate growth after metadata admission, including invalid UTF-8.
             let mut grown = oversized.clone();
             grown[0] = 0xff;
-            let error = read_body(&grown[..], kind).unwrap_err();
+            let error = read_body(&grown[..], kind, 1).unwrap_err();
             assert!(error.to_string().contains("exceeds 64 KiB"));
             assert!(error.get_ref().unwrap().is::<CredentialFileCapRefused>());
-            let invalid = read_body(&[0xff][..], kind).unwrap_err();
+            let invalid = read_body(&[0xff][..], kind, 2).unwrap_err();
             assert!(!invalid.get_ref().unwrap().is::<CredentialFileCapRefused>());
         }
         std::fs::remove_file(path).unwrap();

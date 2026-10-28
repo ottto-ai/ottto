@@ -129,14 +129,7 @@ impl PreparedRetry {
         let cap = allowance
             .min(RETAINED_BUDGET)
             .min(crate::retry_retention_bound::HEAP_CAP);
-        let Some(page) = crate::retry_retention_bound::page_bound(items, cap) else {
-            #[cfg(test)]
-            eprintln!(
-                "pi_retry_capture_refused bound=page-requested-layout cap_bytes={cap} items={}",
-                items.len()
-            );
-            return None;
-        };
+        let page = crate::retry_retention_bound::page_bound(items, cap)?;
         // Count escaped JSON before any retained-body deep copy. The actual
         // wire serializer has its own cap including semantic envelopes.
         if !crate::snapshot_retry::json_fits(items, crate::snapshot_retry::REQUEST_BYTES / 2)
@@ -153,23 +146,11 @@ impl PreparedRetry {
             return None;
         }
         let mut counter = Counter::new(cap);
-        macro_rules! admit_heap {
-            ($value:expr, $stage:literal) => {{
-                let admitted = $value;
-                #[cfg(test)]
-                if admitted.is_none() {
-                    eprintln!("pi_retry_capture_refused bound={} stage={} cap_bytes={cap} used_bytes={} visits={}",
-                        if counter.visits_for_test() > 4096 { "heap-visits-4096" } else { "retained-requested-layout" },
-                        $stage, counter.bytes, counter.visits_for_test());
-                }
-                admitted?
-            }};
-        }
-        admit_heap!(counter.add(page), "page");
-        admit_heap!(counter.add(std::mem::size_of::<Self>()), "owner");
-        admit_heap!(working.heap_bound(&mut counter), "working-index");
-        admit_heap!(baseline.heap_bound(&mut counter), "baseline-index");
-        admit_heap!(progress.heap_bound(&mut counter), "progress");
+        counter.add(page)?;
+        counter.add(std::mem::size_of::<Self>())?;
+        working.heap_bound(&mut counter)?;
+        baseline.heap_bound(&mut counter)?;
+        progress.heap_bound(&mut counter)?;
         counter.add(index_path.as_os_str().len())?;
         counter.add(progress_path.as_os_str().len())?;
         counter.add(machine_id.len())?;

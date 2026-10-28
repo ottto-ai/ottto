@@ -130,12 +130,24 @@ impl LiveAuthority {
         Ok(())
     }
 
-    pub(super) fn validate_endpoint(&self, client: &SnapshotApiClient) -> Result<()> {
+    pub(super) fn validate_turn(
+        &self,
+        client: &SnapshotApiClient,
+        daemon: &LocalDaemon,
+        (device, source, authority): (&LocalDeviceBinding, SnapshotSource, &[u8; 32]),
+        home: &Path,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.endpoint == client.api_base_seal(),
             "optional snapshot endpoint changed"
         );
-        Ok(())
+        anyhow::ensure!(
+            daemon.snapshot_retry_running().unwrap_or(false),
+            "snapshot daemon stopped"
+        );
+        ensure_snapshot_scan_authority(device, source, client, authority, daemon)?;
+        ensure_snapshot_destination_current(self.destination())?;
+        self.validate_inputs(home)
     }
     pub(super) fn policy(&self) -> &[u8; 32] {
         &self.policy
@@ -283,16 +295,8 @@ impl LiveRetryOwner {
             let source = page.source();
             let authority = page.authority();
             let live = page.take_live_authority()?;
-            let mut validate = || {
-                live.validate_endpoint(&client)?;
-                anyhow::ensure!(
-                    daemon.snapshot_retry_running().unwrap_or(false),
-                    "snapshot daemon stopped"
-                );
-                ensure_snapshot_scan_authority(&device, source, &client, &authority, daemon)?;
-                ensure_snapshot_destination_current(live.destination())?;
-                live.validate_inputs(home)
-            };
+            let mut validate =
+                || live.validate_turn(&client, daemon, (&device, source, &authority), home);
             let result = page.turn_live(&client, &device, &secret, live.policy(), &mut validate);
             page.restore_live_authority(live);
             result
