@@ -2158,7 +2158,7 @@ fn production_finish_closure_mints_a_paused_accelerated_page_with_evidence() {
         )
         .with_sampled_acquisition(
             Arc::clone(&cache),
-            crate::snapshots::sampled_scan::Scope("mint-fixture".into()),
+            crate::transcript_acquisition::Scope("mint-fixture".into()),
         );
         let mut scan = loop {
             match owned.step(None) {
