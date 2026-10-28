@@ -6109,6 +6109,10 @@ fn prepare_sync_source_inner(
             cache_observations_enabled,
         );
     }
+    index.activate_archive_user_context(snapshot_upload_context_fingerprint(
+        upload_policy,
+        checkpoint_namespace.as_deref(),
+    ));
     index.activate_upload_context(cycle_upload_context(
         upload_policy,
         checkpoint_namespace.as_deref(),
@@ -6631,6 +6635,10 @@ fn prepare_continuation_source(
         .attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
+    index.activate_archive_user_context(snapshot_upload_context_fingerprint(
+        inputs.upload_policy,
+        checkpoint_namespace.as_deref(),
+    ));
     index.activate_upload_context(cycle_upload_context(
         inputs.upload_policy,
         checkpoint_namespace.as_deref(),
@@ -7568,7 +7576,25 @@ fn finish_sync_source(
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
     // Settle exact current bodies before selection can restore older file facts.
-    index.settle_archive_bodies(&upload_progress.accepted_body_witnesses);
+    index.settle_archive_outcome(
+        &upload_progress.accepted_body_witnesses,
+        matches!(
+            &upload_result,
+            Ok(ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. })
+        ),
+        Some(
+            &scan_result
+                .snapshots
+                .iter()
+                .map(|s| {
+                    (
+                        s.snapshot_fingerprint.clone(),
+                        snapshot_upload_body_witness(s),
+                    )
+                })
+                .collect(),
+        ),
+    );
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
