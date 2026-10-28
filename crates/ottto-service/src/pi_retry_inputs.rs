@@ -3,6 +3,7 @@
 //! enumerate or parse providers. Unsupported/larger trees stay ordinary work.
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+use crate::transcript_acquisition::FileStamp;
 
 const MAX_PATHS: usize = 128;
 const MAX_PATH_BYTES: usize = 32 * 1024;
@@ -14,13 +15,31 @@ pub(crate) struct PiRetryInputs {
 }
 struct Input {
     path: PathBuf,
-    stamp: [u8; 32],
-    is_file: bool,
+    stamp: InputStamp,
 }
 
-// FileStamp::same_content semantics, also applicable to directory membership.
-// A same-length rewrite that restores ns mtime is the accepted residual.
-fn content_stamp(metadata: &fs::Metadata) -> [u8; 32] {
+enum InputStamp {
+    File(FileStamp),
+    Directory([u8; 32]),
+}
+impl InputStamp {
+    fn capture(metadata: fs::Metadata) -> Option<Self> {
+        if metadata.is_dir() {
+            Some(Self::Directory(directory_membership_stamp(&metadata)))
+        } else {
+            FileStamp::capture(metadata).ok().map(Self::File)
+        }
+    }
+    fn same_content(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::File(a), Self::File(b)) => a.same_content(b),
+            (Self::Directory(a), Self::Directory(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+// Directory membership only; regular files use the acquisition owner's one rule.
+fn directory_membership_stamp(metadata: &fs::Metadata) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(metadata.len().to_be_bytes());
     #[cfg(unix)]
@@ -79,14 +98,11 @@ impl PiRetryInputs {
                 return None;
             }
             let after = fs::symlink_metadata(&path).ok()?;
-            if content_stamp(&before) != content_stamp(&after) {
+            let stamp = InputStamp::capture(after)?;
+            if !InputStamp::capture(before)?.same_content(&stamp) {
                 return None;
             }
-            result.paths.push(Input {
-                path,
-                stamp: content_stamp(&after),
-                is_file: after.is_file(),
-            });
+            result.paths.push(Input { path, stamp });
         }
         result.validate().ok()?;
         Some(result)
@@ -107,8 +123,8 @@ impl PiRetryInputs {
             let current = fs::symlink_metadata(&input.path)?;
             anyhow::ensure!(
                 !current.file_type().is_symlink()
-                    && current.is_file() == input.is_file
-                    && content_stamp(&current) == input.stamp,
+                    && InputStamp::capture(current)
+                        .is_some_and(|stamp| input.stamp.same_content(&stamp)),
                 "optional Pi dependency changed"
             );
         }
@@ -129,7 +145,7 @@ impl PiRetryInputs {
                 // Reuse the completed scan's path/fingerprint association.
                 // Never mint a second identity by opening a transcript here.
                 && item.source_file_fingerprint.as_ref().is_some_and(|fp| {
-                    !fp.is_empty() && self.paths.iter().filter(|input| input.is_file).any(|input| {
+                    !fp.is_empty() && self.paths.iter().filter(|input| matches!(&input.stamp, InputStamp::File(_))).any(|input| {
                         index.files.get(input.path.to_string_lossy().as_ref())
                             .is_some_and(|entry| &entry.source_file_fingerprint == fp)
                     })
@@ -143,11 +159,7 @@ impl HeapLayoutBound for PiRetryInputs {
         root.heap_bound(c)?;
         c.add(paths.capacity().checked_mul(std::mem::size_of::<Input>())?)?;
         for input in paths {
-            let Input {
-                path,
-                stamp: _,
-                is_file: _,
-            } = input;
+            let Input { path, stamp: _ } = input;
             path.heap_bound(c)?;
         }
         Some(())

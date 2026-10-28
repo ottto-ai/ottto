@@ -161,9 +161,11 @@ disclosed residue.
 ## Credential File Cap Refusals
 
 Schema 2 adds `credential_file_cap_refusal` point records on the same
-`ottto-service: local_resources` stderr carrier. The shared core device-binding
-and file-backed-secret loaders emit one record per read refused above 64 KiB,
-including ordinary sync and retained retry. Metadata rejection before body
+`ottto-service: local_resources` stderr carrier. Snapshot device-authority and
+destination loaders count typed device-binding and file-backed-secret cap
+errors through the service's existing diagnostic emitter before error detail
+is replaced. Both ordinary snapshot sync and retained retry use those loaders.
+Core returns typed errors and never emits or keeps counters itself. Metadata rejection before body
 allocation and growth past the cap during the bounded read both count once;
 oversize invalid UTF-8 counts as a cap refusal before decoding. Other I/O,
 JSON, UTF-8 and missing-file failures do not increment this counter.
@@ -171,9 +173,10 @@ JSON, UTF-8 and missing-file failures do not increment this counter.
 `counts.file_kind` is `device_binding` or `file_secret`;
 `credential_file_cap_refused` is 1 for this event and
 `credential_file_cap_refused_total` is a saturating process-lifetime total for
-that kind. Count attempts, not distinct files. Totals include all callers of
-these core loaders in the process, so `source` is `unknown`; never attribute
-them to Pi alone or sum cumulative totals. The observation is a point with
+that kind. Count attempts, not distinct files. Totals include only those observed
+snapshot authority/destination loads, so `source` is `unknown`; other core
+callers are not counted. Never attribute totals to Pi alone or sum cumulative
+totals. The observation is a point with
 zero elapsed time and null CPU/RSS samples. These records contain no path,
 account, secret or content, add no probes or reads, and use the same ignored
 stderr-write errors as other local resource records. They remain local and

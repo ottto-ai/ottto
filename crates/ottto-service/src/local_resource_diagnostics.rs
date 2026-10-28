@@ -162,6 +162,70 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
 
 const SCHEMA_VERSION: u8 = 2;
 
+#[cfg(not(test))]
+static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+thread_local! {
+    static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 2] = const { [const { AtomicU64::new(0) }; 2] };
+}
+/// Observe typed cap errors before snapshot callers replace their detail.
+/// Ordinary snapshot sync and retained retry use these same authority loads.
+pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    use ottto_core::{CredentialFileCapRefused, TokenStoreError};
+    let kind = result.as_ref().err().and_then(|error| {
+        error.chain().find_map(|cause| {
+            if matches!(
+                cause.downcast_ref::<TokenStoreError>(),
+                Some(TokenStoreError::OversizeRefused)
+            ) {
+                return Some(CredentialFileCapRefused::FileSecret);
+            }
+            cause
+                .downcast_ref::<CredentialFileCapRefused>()
+                .copied()
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<std::io::Error>()?
+                        .get_ref()?
+                        .downcast_ref::<CredentialFileCapRefused>()
+                        .copied()
+                })
+        })
+    });
+    if let Some(kind) = kind {
+        let (slot, file_kind) = match kind {
+            CredentialFileCapRefused::DeviceBinding => (0, "device_binding"),
+            CredentialFileCapRefused::FileSecret => (1, "file_secret"),
+        };
+        let increment = |counts: &[AtomicU64; 2]| {
+            counts[slot]
+                .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+                .unwrap_or(u64::MAX)
+                .saturating_add(1)
+        };
+        #[cfg(not(test))]
+        let total = increment(&CREDENTIAL_FILE_CAP_REFUSED);
+        #[cfg(test)]
+        let total = CREDENTIAL_FILE_CAP_REFUSED.with(increment);
+        #[derive(Serialize)]
+        struct Counts {
+            file_kind: &'static str,
+            credential_file_cap_refused: u64,
+            credential_file_cap_refused_total: u64,
+        }
+        traversal_point(
+            "credential_file_cap_refusal",
+            "unknown",
+            &Counts {
+                file_kind,
+                credential_file_cap_refused: 1,
+                credential_file_cap_refused_total: total,
+            },
+        );
+    }
+    result
+}
+
 /// Cumulative shared-process totals, NOT events attributed to the finishing
 /// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
 pub(crate) fn cache_lifecycle_totals() {
@@ -1270,6 +1334,56 @@ mod tests {
         counts.restored = 1;
         let json = serde_json::to_value(&probe.full_causes).unwrap();
         assert_eq!(json["restore_outcome"]["restored"], 1);
+    }
+
+    #[test]
+    fn typed_credential_cap_errors_use_existing_carrier_and_preserve_result() {
+        use ottto_core::{CredentialFileCapRefused, FileDeviceStore, TokenStoreError};
+        CREDENTIAL_FILE_CAP_REFUSED.with(|counts| counts.iter().for_each(|n| n.store(0, Relaxed)));
+        let path = std::env::temp_dir().join(format!("credential-carrier-{}", std::process::id()));
+        std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+        let store = FileDeviceStore::new(&path);
+        let (_, lines) = capture(|| {
+            let error = credential_file_read(store.load()).unwrap_err();
+            assert!(format!("{error:#}").contains("exceeds 64 KiB"));
+            assert!(credential_file_read(store.load_with_credential_generation()).is_err());
+            // The core secret store preserves this typed variant across its API.
+            let secret: anyhow::Result<()> = Err(TokenStoreError::OversizeRefused.into());
+            assert!(credential_file_read(secret)
+                .unwrap_err()
+                .is::<TokenStoreError>());
+            // Growth refusals carry the same typed inner error through io::Error.
+            let growth: anyhow::Result<()> = Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                CredentialFileCapRefused::FileSecret,
+            )
+            .into());
+            assert!(credential_file_read(growth).is_err());
+            assert_eq!(credential_file_read(Ok(7)).unwrap(), 7);
+            let other: anyhow::Result<()> = Err(anyhow::anyhow!("ordinary read failure"));
+            assert!(credential_file_read(other).is_err());
+        });
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(lines.len(), 4);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line["schema_version"], 2);
+            assert_eq!(line["stage"], "credential_file_cap_refusal");
+            assert_eq!(line["source"], "unknown");
+            assert_eq!(
+                line["counts"]["file_kind"],
+                if i < 2 {
+                    "device_binding"
+                } else {
+                    "file_secret"
+                }
+            );
+            assert_eq!(line["counts"]["credential_file_cap_refused"], 1);
+            assert_eq!(
+                line["counts"]["credential_file_cap_refused_total"],
+                i % 2 + 1
+            );
+            assert_eq!(line["counts"].as_object().unwrap().len(), 3);
+        }
     }
 
     #[test]

@@ -34,6 +34,8 @@ pub enum TokenStoreError {
     Store(String),
     #[error("control token is not valid UTF-8")]
     InvalidUtf8,
+    #[error("file-backed secret exceeds 64 KiB")]
+    OversizeRefused,
     /// A daemon owns local state but has not saved its control token yet.
     #[error("ottto-service is starting and has not created its control token yet")]
     DaemonNotReady,
@@ -741,7 +743,7 @@ fn load_file_secret(account: &str) -> Result<String, TokenStoreError> {
     let read = || {
         crate::credential_file::read(
             fs::File::open(file_secret_path(account))?,
-            crate::credential_file::Kind::FileSecret,
+            crate::CredentialFileCapRefused::FileSecret,
         )
     };
     match read() {
@@ -754,6 +756,13 @@ fn load_file_secret(account: &str) -> Result<String, TokenStoreError> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(TokenStoreError::Missing),
+        Err(error)
+            if error
+                .get_ref()
+                .is_some_and(|e| e.is::<crate::CredentialFileCapRefused>()) =>
+        {
+            Err(TokenStoreError::OversizeRefused)
+        }
         Err(error) => Err(TokenStoreError::Store(error.to_string())),
     }
 }
@@ -960,8 +969,9 @@ mod tests {
                 .write_all(b"s")
                 .unwrap();
         }
-        let error = load_file_secret(account).unwrap_err().to_string();
-        assert!(error.contains("exceeds 64 KiB"));
+        let error = load_file_secret(account).unwrap_err();
+        assert!(matches!(error, TokenStoreError::OversizeRefused));
+        assert!(error.to_string().contains("exceeds 64 KiB"));
         delete_file_secret(account).unwrap();
         assert!(matches!(
             load_file_secret(account),

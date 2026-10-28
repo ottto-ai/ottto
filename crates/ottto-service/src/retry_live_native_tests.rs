@@ -155,7 +155,7 @@ impl PiLiveFixture {
         let mut progress = test_upload_progress();
         progress.save(&progress_path).unwrap();
         // The real hook freezes inputs before the native parser starts.
-        let opens_before = crate::snapshots::retry_transcript_opens_for_test();
+        let opens_before = crate::snapshots::all_transcript_opens_for_test();
         let live = live_snapshot_retry::LiveAuthority::capture(
             SnapshotSource::Pi,
             &home.0,
@@ -166,7 +166,7 @@ impl PiLiveFixture {
         )
         .unwrap();
         assert_eq!(
-            crate::snapshots::retry_transcript_opens_for_test(),
+            crate::snapshots::all_transcript_opens_for_test(),
             opens_before
         );
         let mut working = baseline.clone();
@@ -187,12 +187,12 @@ impl PiLiveFixture {
         );
         finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut working);
         assert_eq!(scan.snapshots.len(), files);
-        assert!(crate::snapshots::retry_transcript_opens_for_test() > opens_before);
+        assert!(crate::snapshots::all_transcript_opens_for_test() > opens_before);
         let items = scan.snapshots;
-        let opens_after_scan = crate::snapshots::retry_transcript_opens_for_test();
+        let opens_after_scan = crate::snapshots::all_transcript_opens_for_test();
         live.validate_capture(&home.0, &items, &working).unwrap();
         assert_eq!(
-            crate::snapshots::retry_transcript_opens_for_test(),
+            crate::snapshots::all_transcript_opens_for_test(),
             opens_after_scan
         );
         Self {
@@ -236,7 +236,7 @@ impl PiLiveFixture {
         )
         .unwrap();
         let mut owner = live_snapshot_retry::LiveRetryOwner::isolated();
-        let opens_before = crate::snapshots::retry_transcript_opens_for_test();
+        let opens_before = crate::snapshots::all_transcript_opens_for_test();
         let admitted = owner.capture_after_shed(
             self.live.take().unwrap(),
             &self.home.0,
@@ -254,7 +254,7 @@ impl PiLiveFixture {
             delay,
         );
         assert_eq!(
-            crate::snapshots::retry_transcript_opens_for_test(),
+            crate::snapshots::all_transcript_opens_for_test(),
             opens_before
         );
         admitted.then_some(owner)
@@ -440,7 +440,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         assert_eq!(shed.downcast_ref::<UploadShed>().unwrap().status, 429);
         let mut owner = f.capture(Duration::from_millis(30));
         assert!(owner.enabled());
-        let opens_before_retry = crate::snapshots::retry_transcript_opens_for_test();
+        let opens_before_retry = crate::snapshots::all_transcript_opens_for_test();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
             .with_bounded_retry_loopback_http_for_test();
@@ -531,7 +531,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         let request: serde_json::Value = serde_json::from_str(request_body).unwrap();
         assert_eq!(request["snapshots"], ordinary_body);
         assert_eq!(
-            crate::snapshots::retry_transcript_opens_for_test(),
+            crate::snapshots::all_transcript_opens_for_test(),
             opens_before_retry
         );
         let durable = SnapshotUploadProgress::load(
@@ -807,13 +807,14 @@ fn bounded_retry_json_escape_admission_declines_before_retained_copy_and_wire_gr
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn pi_retry_stat_witness_ignores_chmod_but_refuses_append_and_mtime() {
     use std::os::unix::fs::PermissionsExt;
-    for change in ["chmod", "append", "mtime"] {
+    for change in ["chmod", "append", "mtime", "mtime_ns"] {
         let f = PiLiveFixture::new();
         let path = f.roots[0].join("one.jsonl");
-        let opens = crate::snapshots::retry_transcript_opens_for_test();
+        let opens = crate::snapshots::all_transcript_opens_for_test();
         match change {
             "chmod" => {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap()
@@ -826,6 +827,19 @@ fn pi_retry_stat_witness_ignores_chmod_but_refuses_append_and_mtime() {
                     .unwrap()
                     .write_all(b"\n")
                     .unwrap();
+            }
+            "mtime_ns" => {
+                use std::os::unix::fs::MetadataExt;
+                let before = std::fs::symlink_metadata(&path).unwrap();
+                let ns = (before.mtime_nsec() as u32 + 1) % 1_000_000_000;
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + Duration::new(before.mtime() as u64, ns),
+                ))
+                .unwrap();
+                let after = std::fs::symlink_metadata(&path).unwrap();
+                assert_eq!(after.mtime(), before.mtime());
+                assert_ne!(after.mtime_nsec(), before.mtime_nsec());
             }
             _ => {
                 let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -845,7 +859,7 @@ fn pi_retry_stat_witness_ignores_chmod_but_refuses_append_and_mtime() {
             change == "chmod",
             "{change}"
         );
-        assert_eq!(crate::snapshots::retry_transcript_opens_for_test(), opens);
+        assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
     }
 }
 

@@ -3214,12 +3214,15 @@ pub fn ensure_no_incomplete_device_credential_promotion() -> Result<()> {
 
 pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)> {
     ensure_no_incomplete_device_credential_promotion()?;
-    let device = FileDeviceStore::default()
-        .load()?
-        .ok_or_else(|| anyhow!("relay device binding is missing"))?;
-    let secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-        .load()
-        .map_err(|error| anyhow!("relay device secret is missing: {error}"))?;
+    let device =
+        crate::local_resource_diagnostics::credential_file_read(FileDeviceStore::default().load())?
+            .ok_or_else(|| anyhow!("relay device binding is missing"))?;
+    let secret = crate::local_resource_diagnostics::credential_file_read(
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .map_err(anyhow::Error::new),
+    )
+    .map_err(|error| anyhow!("relay device secret is missing: {error}"))?;
     Ok((device, secret))
 }
 

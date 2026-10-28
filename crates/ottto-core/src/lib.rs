@@ -14,6 +14,8 @@ pub mod state_dir_lock;
 pub mod status;
 pub mod token_store;
 
+pub use credential_file::CredentialFileCapRefused;
+
 pub use account_store::{
     default_account_path, default_connection_api_base_url, default_connection_path,
     default_device_path, default_machine_path, default_pending_device_credential_path,

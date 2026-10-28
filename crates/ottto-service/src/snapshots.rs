@@ -42128,11 +42128,11 @@ fn resolve_configured_scan_root(
 
 #[cfg(test)]
 thread_local! {
-    static RETRY_TRANSCRIPT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ALL_TRANSCRIPT_OPENS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
-pub(crate) fn retry_transcript_opens_for_test() -> usize {
-    RETRY_TRANSCRIPT_OPENS.with(std::cell::Cell::get)
+pub(crate) fn all_transcript_opens_for_test() -> usize {
+    ALL_TRANSCRIPT_OPENS_FOR_TEST.with(std::cell::Cell::get)
 }
 
 /// Open the exact transcript object without following a final-component
@@ -42172,7 +42172,7 @@ fn open_candidate_file_stat_retained(
     cache: Option<&sampled_scan::SharedCache>,
 ) -> std::io::Result<(File, Option<OpenedObjectStat>)> {
     #[cfg(test)]
-    RETRY_TRANSCRIPT_OPENS.with(|count| count.set(count.get() + 1));
+    ALL_TRANSCRIPT_OPENS_FOR_TEST.with(|count| count.set(count.get() + 1));
     let mut file = open_candidate_beneath_root(candidate)?;
     let retained = cache
         .filter(|_| source == SnapshotSource::Codex)

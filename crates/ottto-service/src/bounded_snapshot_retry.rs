@@ -64,7 +64,9 @@ pub(super) fn checkpoint_matches<T: Serialize>(
         return Ok(true);
     }
     // The native index writer uses pretty JSON when decode holds exist.
-    // Both encodings compare the same captured representation, without decode.
+    // On mismatch serialize a second time for that alternate native encoding.
+    // Both sequential passes compare against the same RESPONSE_BYTES-capped
+    // buffer, with no decode or serialized output copy; reserves are not doubled.
     compare.0 = &bytes;
     let result = if pretty {
         serde_json::to_writer(&mut compare, expected)

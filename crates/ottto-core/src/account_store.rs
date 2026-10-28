@@ -363,7 +363,7 @@ impl FileDeviceStore {
     fn read_bounded(&self) -> Result<String> {
         crate::credential_file::read(
             fs::File::open(&self.path)?,
-            crate::credential_file::Kind::DeviceBinding,
+            crate::CredentialFileCapRefused::DeviceBinding,
         )
         .map_err(Into::into)
     }

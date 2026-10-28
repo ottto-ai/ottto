@@ -11276,10 +11276,11 @@ fn ensure_snapshot_scan_authority(
             operation: "source authority changed during owned scan",
         })
     };
-    let current = ottto_core::FileDeviceStore::default()
-        .load()
-        .map_err(|_| rejected())?
-        .ok_or_else(rejected)?;
+    let current = crate::local_resource_diagnostics::credential_file_read(
+        ottto_core::FileDeviceStore::default().load(),
+    )
+    .map_err(|_| rejected())?
+    .ok_or_else(rejected)?;
     let account = daemon
         .snapshot_scan_account_witness()
         .map_err(|_| rejected())?;
