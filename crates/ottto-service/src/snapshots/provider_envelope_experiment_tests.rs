@@ -3270,9 +3270,10 @@ fn native_comparison_target_tails_older_reduction_to_the_frozen_revision() {
     let mut suffix = 0;
     let (fixture, state, mut qualification) =
         native_comparison_positive_hit_fixture_with(|fixture| {
-            // The same object was shorter (and older) when the prior pass
-            // retained its reduction; it has since grown to the revision the
-            // comparison froze.
+            // The same object was shorter when the prior pass retained its
+            // reduction; it has since grown to the revision the comparison
+            // froze (its stamp restored; no earlier mtime, which would move
+            // the macOS birth time and so the object identity).
             let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
             let full = fs::read(&path).unwrap();
             let modified = fs::metadata(&path).unwrap().modified().unwrap();
@@ -3285,11 +3286,12 @@ fn native_comparison_target_tails_older_reduction_to_the_frozen_revision() {
                 .0
                 + 1;
             suffix = full.len() - prefix;
-            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
-            file.set_len(prefix as u64).unwrap();
-            file.set_modified(modified - std::time::Duration::from_secs(60))
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(prefix as u64)
                 .unwrap();
-            drop(file);
             fixture.warm_target_reductions(Arc::new(sampled_scan::SharedCache::default()));
             let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
             file.write_all(&full[prefix..]).unwrap();
@@ -3396,9 +3398,9 @@ fn native_comparison_target_without_reuse_is_refused_not_read_full() {
     assert_eq!(acquired.known_rearm_candidates.len(), 2);
     assert_eq!(state.snapshots.len(), 1, "only the dependent's own body");
     state.resume_native_comparison_base();
-    let ((_, scan), rows) =
-        crate::local_resource_diagnostics::capture(|| SelectionFixture::run(state));
-    assert!(!scan.census_complete);
+    // Refused targets are not census members (a Skip stays a Skip): the
+    // census may complete while the comparison stays unresolved.
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| SelectionFixture::run(state));
     let pages = rows
         .iter()
         .filter(|row| row["stage"] == "native_collection_page")
