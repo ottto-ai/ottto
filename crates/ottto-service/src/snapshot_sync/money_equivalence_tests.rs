@@ -1787,9 +1787,9 @@ fn pi_acquisition_metadata_changes() {
         &scanner,
         &restart,
         [prior.clone(), prior.clone(), prior],
-        (0, 0, 1),
-        (0, 0, 1),
-        1,
+        (0, 0, 0),
+        (0, 0, 0),
+        0,
     );
     let next = disk.commit(&restart.cache, SnapshotSource::Pi, &mut restored);
     std::fs::File::options()
