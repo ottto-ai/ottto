@@ -455,22 +455,33 @@ impl HeaderInventory {
         // read_bytes is NOT reset: repeated real edits reach the existing bound.
         crate::local_resource_diagnostics::codex_zst_held(CodexZstCause::OwnerUnproven);
     }
-    pub(super) fn bound_owner_has_sibling(&self, path: &Path, owner: &str) -> bool {
-        self.first_read_archives.contains(&local_index_key(path))
-            && (self.headers.iter().any(|header| header.owner == owner)
-                || self
-                    .first_read_archives
-                    .iter()
-                    .chain(&self.held_archives)
-                    .chain(&self.deferred_archives)
-                    .any(|key| {
-                        Path::new(key) != path
-                            && codex_session_id_candidates_from_path(
-                                &Path::new(key).with_extension(""),
-                            )
-                            .iter()
-                            .any(|hint| hint == owner)
-                    }))
+    pub(super) fn defer_bound_siblings(&mut self) {
+        let mut owners = BTreeMap::<String, usize>::new();
+        for header in &self.headers {
+            *owners.entry(header.owner.clone()).or_default() += 1;
+        }
+        // Bound and deferred sets may share a physical member; count it once.
+        let paths = self
+            .first_read_archives
+            .iter()
+            .chain(&self.held_archives)
+            .chain(&self.deferred_archives)
+            .collect::<BTreeSet<_>>();
+        for key in paths {
+            for owner in codex_session_id_candidates_from_path(&Path::new(key).with_extension("")) {
+                *owners.entry(owner).or_default() += 1;
+            }
+        }
+        self.deferred_archives.extend(
+            self.first_read_archives
+                .iter()
+                .filter(|key| {
+                    codex_session_id_candidates_from_path(&Path::new(key).with_extension(""))
+                        .iter()
+                        .any(|owner| owners.get(owner).is_some_and(|count| *count > 1))
+                })
+                .cloned(),
+        );
     }
     pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
         self.complete

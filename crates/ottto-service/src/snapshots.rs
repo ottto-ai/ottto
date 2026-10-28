@@ -27600,19 +27600,7 @@ impl OwnedSourceScan {
                         }
                     }
 
-                    let siblings = inventory
-                        .first_read_archives
-                        .iter()
-                        .filter(|key| {
-                            codex_session_id_candidates_from_path(
-                                &Path::new(key).with_extension(""),
-                            )
-                            .iter()
-                            .any(|owner| inventory.bound_owner_has_sibling(Path::new(key), owner))
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    inventory.deferred_archives.extend(siblings);
+                    inventory.defer_bound_siblings();
                     let unresolved = &inventory.held_owners;
                     residue_blocked_session_ids.extend(unresolved.iter().cloned());
                     codex_state_only_blocked_session_ids.extend(unresolved.iter().cloned());

@@ -2437,3 +2437,35 @@ fn inventory_bound_marker_survives_normal_save_before_full_reservation() {
     }
     assert_eq!(cache.cursor_reserved(), 0);
 }
+
+#[test]
+fn sibling_inventory_at_population_cap_counts_shared_physical_keys_once() {
+    let paths = (0..codex_file_join::MAX_HEADER_FILES - 2)
+        .map(|n| format!("/synthetic/rollout-owner-{n:05}.jsonl.zst"))
+        .collect::<BTreeSet<_>>();
+    let mut inventory = codex_file_join::HeaderInventory::new(&[], &paths, None);
+    inventory.first_read_archives = paths.clone();
+    let shared = paths.last().unwrap().clone();
+    inventory.deferred_archives.insert(shared.clone());
+    inventory.defer_bound_siblings();
+    assert_eq!(
+        inventory.deferred_archives,
+        BTreeSet::from([shared.clone()]),
+        "distinct-owner bound archives never become siblings of themselves"
+    );
+    let held_peer = "/synthetic/elsewhere/rollout-owner-00001.jsonl.zst".to_owned();
+    let deferred_peer = "/synthetic/elsewhere/rollout-owner-00002.jsonl.zst".to_owned();
+    inventory.held_archives.insert(held_peer);
+    inventory.deferred_archives.insert(deferred_peer.clone());
+    assert_eq!(paths.len() + 2, codex_file_join::MAX_HEADER_FILES);
+    inventory.defer_bound_siblings();
+    assert_eq!(
+        inventory.deferred_archives,
+        BTreeSet::from([
+            shared,
+            deferred_peer,
+            "/synthetic/rollout-owner-00001.jsonl.zst".to_owned(),
+            "/synthetic/rollout-owner-00002.jsonl.zst".to_owned(),
+        ])
+    );
+}
