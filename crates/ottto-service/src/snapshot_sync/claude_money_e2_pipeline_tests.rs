@@ -2606,6 +2606,14 @@ mod money_equivalence_tests {
     mod durable_transition_tests {
         include!("../snapshots/sampled_scan/durable_transition_tests.rs");
     }
+    // E5-PI-FIXTURE: Pi rows of the shared transition matrix. The
+    // ottto_e5_pi_codec gate goes when the Pi PR lands its codec on 5c1b.
+    #[cfg(unix)]
+    #[allow(unexpected_cfgs)]
+    mod durable_transition_pi_tests {
+        #[cfg(all(test, ottto_e5_pi_codec))]
+        include!("../snapshots/sampled_scan/durable_transition_pi_tests.rs");
+    }
 }
 
 #[test]
