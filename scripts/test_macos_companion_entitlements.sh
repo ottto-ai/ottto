@@ -79,8 +79,10 @@ fi
     fail "macOS packaging must source the Companion entitlement policy"
   grep -Fq 'COMPANION_ENTITLEMENTS="$MAC_APP_ROOT/Companion.entitlements.plist"' "$PACKAGE_SCRIPT" ||
     fail "macOS packaging must read the shared Companion entitlements from the app subtree"
-  grep -Fq 'ls-files --error-unmatch -- "$MAC_APP_SOURCE_PATH/Companion.entitlements.plist"' "$PACKAGE_SCRIPT" ||
-    fail "macOS packaging must require the Companion entitlements to be tracked at the source commit"
+  if ! grep -Fq '"HEAD:$MAC_APP_SOURCE_PATH/Companion.entitlements.plist"' "$PACKAGE_SCRIPT" ||
+    ! grep -Fq 'hash-object -- "$COMPANION_ENTITLEMENTS"' "$PACKAGE_SCRIPT"; then
+    fail "macOS packaging must bind the Companion entitlements to the private source commit"
+  fi
   grep -Fq 'ottto_macos_check_companion_entitlements "$COMPANION_ENTITLEMENTS"' "$PACKAGE_SCRIPT" ||
     fail "macOS packaging must validate the Companion entitlements before building"
   [[ "$(grep -c -- '--entitlements "$COMPANION_ENTITLEMENTS"' "$PACKAGE_SCRIPT")" -eq 2 ]] ||
