@@ -807,7 +807,10 @@ Terminal archive holds/refusals use `archive_terminal_residue{cause}` instead of
 a sweep-wide unreadable count. `archive_terminal_residue_session_count` is the
 running distinct-session count for that page (not an additive counter). Affected
 sessions remain unknown for state-only, absence retirement and departed-owner
-release decisions; other files can complete census. Bodyless Pending remains
+release decisions; other files can complete census. The existing durable residue
+witness retains the affected keys/session blocks; terminal receipts disclose its
+cardinalities instead of clean success, without making this loss retryable.
+Bodyless Pending remains
 unreadable within its bounded recovery window. Admission uses unreadable until
 that archive's twelfth consecutive yield, then `admission_starved` residue.
 `codex_zst_admission_alarm.admission_starved_count` counts currently starved keys

@@ -451,6 +451,13 @@ fn terminal_session_block_survives_empty_final_census_page() {
         .residue
         .blocked_session_ids
         .insert("compressed-fixture".into());
+    scan.index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .residue
+        .index_keys
+        .insert(local_index_key(&f.0));
     scan.codex_join_prepared = true;
     scan.codex_join_inventory = None;
     scan.identified_candidates.clear(); // later page finishes only bounded reconciliation
@@ -469,6 +476,8 @@ fn terminal_session_block_survives_empty_final_census_page() {
             OwnedSourceScanStep::Pending(next) => next,
             OwnedSourceScanStep::Complete { scan: result, .. } => {
                 assert!(result.census_complete, "{result:#?}");
+                assert_eq!(result.census_residue_blocked_session_count, 1);
+                assert_eq!(result.census_residue_index_key_count, 1);
                 let owners = result
                     .snapshots
                     .iter()

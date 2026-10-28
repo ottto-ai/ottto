@@ -691,6 +691,8 @@ impl super::ScanCensus {
         archive: Option<&ArchiveEvidence>,
         cause: CodexZstCause,
     ) {
+        self.archive_terminal_index_keys
+            .insert(super::local_index_key(path));
         self.archive_terminal_sessions
             .extend(super::codex_session_id_candidates_from_path(
                 &path.with_extension(""),
