@@ -677,7 +677,7 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
         Ok(()) => eprintln!("serving mcp inventory harvest"),
         Err(error) => eprintln!("mcp inventory harvest unavailable: {error}"),
     }
-    match ottto_service::context_footprint::spawn_context_footprint_sync() {
+    match ottto_service::context_footprint::spawn_context_footprint_sync(&daemon) {
         Ok(()) => eprintln!("serving context footprint harvest"),
         Err(error) => eprintln!("context footprint harvest unavailable: {error}"),
     }

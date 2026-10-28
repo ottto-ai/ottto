@@ -158,6 +158,31 @@ after the existing decision, are drained by that source's next completed page,
 and count repeated decisions, not distinct files or bytes. They are recorded
 whether or not an observer is registered.
 
+## Context Footprint Discovery
+
+Context footprint opens no transcript. Its workspaces come from the cwds of
+the Claude lines snapshot sync's primary reads already delivered to the
+`footprint` line observer, kept in RAM only (no transcript path, nothing
+persisted). Coverage follows that read: after a daemon restart only files
+read since then count, and nothing is seen while reconciliation is off,
+Claude is disabled for the source, snapshot sync is down, or the org backfill
+window is shorter than footprint's 14 days (0 days: almost nothing).
+
+Each footprint cycle's `context_footprint_harvest_metrics` line adds counts
+since daemon start, with no paths or values:
+
+- `discovery_path_scopes`: workspaces this cycle scoped by their own path (no
+  repository, or a repository probe that failed).
+- `footprint_observer_passes`: snapshot-sync Claude passes that registered the
+  observer. 0 means no delivery reached footprint.
+- `footprint_observer_files`, `footprint_observer_bytes`: files and estimated
+  RAM bytes held now (at most 8 cwds per file, 4 MiB in all).
+- `footprint_observer_evicted_files`: files dropped at the 4 MiB cap, oldest
+  modification time first.
+- `footprint_observer_cwd_dropped`: cwd values over 4 KiB, not kept.
+- `footprint_observer_incomplete_files`: deliveries that ended before their
+  read completed; what was delivered is kept.
+
 ## Private Codex Census Outcomes
 
 The support-root `snapshots/codex-fenced-census-v1.json` file now uses schema
