@@ -142,7 +142,12 @@ fn cold_items(path: &Path, source: SnapshotSource) -> Value {
 /// Every encoded class and every content field, for exact equality.
 fn full_digest(reduction: &CachedJsonlReduction) -> [u8; 32] {
     let mut e = Enc::hash("durable-codec-test:full");
-    reduction.put(&mut e).expect("hash");
+    if reduction.accumulator.source == SnapshotSource::Pi {
+        e.with_pi_ledger(|e| reduction.put(e)).expect("hash");
+        PiSection::put_borrowed(&mut e, &reduction.accumulator.seen_pi_usage_keys).unwrap();
+    } else {
+        reduction.put(&mut e).expect("hash");
+    }
     e.finish_hash()
 }
 
@@ -1007,7 +1012,7 @@ fn edits_after_the_checkpoint_refuse_restore() {
 
 /// The allowlist digests, pinned: any field, class or type change in a
 /// persisted type moves them. Review the classes with SOURCE, then repin.
-const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
+const ALLOWLIST_PINS: [(SnapshotSource, &str); 3] = [
     (
         SnapshotSource::ClaudeCode,
         "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
@@ -1016,6 +1021,7 @@ const ALLOWLIST_PINS: [(SnapshotSource, &str); 2] = [
         SnapshotSource::Codex,
         "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
     ),
+    (SnapshotSource::Pi, "PI_PIN_FROM_CI"),
 ];
 
 fn hex(digest: [u8; 32]) -> String {
@@ -1123,6 +1129,22 @@ const H_AUDIT: &[(&str, &str)] = &[
     (
         "OwnedRequest.configuration_witness",
         "SnapshotAccumulator.cache_configuration_witness, copied",
+    ),
+    (
+        "PiSection.usage_keys",
+        "H keys: pi_usage_hash(ottto-pi-usage-key:v1, response id); D values: PiUsageDedupState",
+    ),
+    (
+        "PiUsageDedupState.message",
+        "H keys: pi_usage_hash(ottto-pi-usage-occurrence:v1, normalized usage); N counts",
+    ),
+    (
+        "PiUsageDedupState.message_end",
+        "H keys: pi_usage_hash(ottto-pi-usage-occurrence:v1, normalized usage); N counts",
+    ),
+    (
+        "PiUsageDedupState.paired_digests",
+        "pi_usage_hash(ottto-pi-usage-occurrence:v1, normalized usage), copied",
     ),
     (
         "Rederive.agent_label",
@@ -1284,10 +1306,10 @@ fn budget_bounds_hold() {
     // re-parse of at most 1 MiB and at most NAMED_LINES capped lines.
     assert_eq!(HEAD_BOUND, 1024 * 1024);
     assert_eq!(NAMED_LINES, 4);
-    // Beside the cache, outside its state budget: both stores' digest maps.
+    // Beside the cache, outside its state budget: three source stores' digest maps.
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        64 * 1024
+        96 * 1024
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);
@@ -1484,4 +1506,351 @@ fn structural_verifier_large_body_still_allocates_nothing() {
         verified_without_allocation(&body[..body.len() - 1]),
         Err(Corrupt)
     );
+}
+
+fn pi_record(shape: &str, id: Option<&str>, input: u64) -> Value {
+    let mut record = json!({"type":shape,"timestamp":"2026-10-20T10:00:01Z",
+        "message":{"role":"assistant","model":"fixture-model",
+            "timestamp":1792490401000_u64,
+            "usage":{"input":input,"output":3,"cost":{"total":0.001}}}});
+    if let Some(id) = id {
+        record["message"]["responseId"] = json!(id);
+    }
+    record
+}
+
+fn pi_reduction(records: &[Value]) -> CachedJsonlReduction {
+    let scratch = Scratch::new("pi-ledger");
+    let path = scratch.write(
+        "pi.jsonl",
+        &records.iter().map(Value::to_string).collect::<Vec<_>>(),
+    );
+    full_read(&path, SnapshotSource::Pi).0
+}
+
+#[test]
+fn pi_ledger_all_containers_round_trip_without_mutating_retained_state() {
+    let records = [
+        pi_record("message", Some("pair"), 10),
+        pi_record("message_end", Some("pair"), 10),
+        pi_record("message", Some("pair"), 20),
+        pi_record("message", Some("pair"), 20),
+        pi_record("message_end", Some("divergent"), 30),
+        pi_record("message", Some("divergent"), 40),
+    ];
+    let reduction = pi_reduction(&records);
+    let before = format!("{:?}", reduction.accumulator.seen_pi_usage_keys);
+    let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
+    assert_eq!(verified_without_allocation(&body), Ok(()));
+    let decoded = decode(&body, SnapshotSource::Pi).unwrap();
+    assert_eq!(
+        before,
+        format!("{:?}", decoded.reduction.accumulator.seen_pi_usage_keys)
+    );
+    assert_eq!(
+        before,
+        format!("{:?}", reduction.accumulator.seen_pi_usage_keys)
+    );
+    assert!(decoded
+        .reduction
+        .accumulator
+        .seen_pi_usage_keys
+        .values()
+        .any(PiUsageDedupState::has_cross_shape_conflict));
+    for end in 0..body.len() {
+        assert_eq!(verified_without_allocation(&body[..end]), Err(Corrupt));
+    }
+    let mut trailing = body.clone();
+    trailing.push(0);
+    assert!(decode(&trailing, SnapshotSource::Pi).is_err());
+    assert_eq!(verified_without_allocation(&trailing), Err(Corrupt));
+}
+
+#[test]
+fn pi_allowance_is_scoped_on_success_refusal_and_unwind() {
+    let reduction = pi_reduction(&[pi_record("message", Some("scoped"), 10)]);
+    for exit in 0..3 {
+        let mut e = Enc::bytes(1 << 20);
+        match exit {
+            0 => PiSection::put_record(&reduction, &Rederive::default(), &mut e).unwrap(),
+            1 => assert_eq!(
+                e.with_pi_ledger(|e| {
+                    reduction.put(e)?;
+                    Err::<(), _>(Refuse::TooLarge)
+                }),
+                Err(Refuse::TooLarge)
+            ),
+            _ => assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = e.with_pi_ledger::<()>(|e| {
+                    reduction.put(e)?;
+                    panic!("synthetic unwind")
+                });
+            }))
+            .is_err()),
+        }
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+            let mut other = reduction.clone();
+            other.accumulator.source = source;
+            assert_eq!(
+                other.put(&mut e),
+                Err(Refuse::NonEmpty("SnapshotAccumulator.seen_pi_usage_keys"))
+            );
+            assert_eq!(
+                encode(&other, 1 << 20, line_cap()),
+                Err(Refuse::NonEmpty("SnapshotAccumulator.seen_pi_usage_keys"))
+            );
+        }
+    }
+    let mut other_e = reduction;
+    other_e
+        .accumulator
+        .provider_skills
+        .insert("synthetic-skill".into());
+    assert_eq!(
+        encode(&other_e, 1 << 20, line_cap()),
+        Err(Refuse::NonEmpty("SnapshotAccumulator.provider_skills"))
+    );
+}
+
+#[test]
+fn pi_section_absent_or_not_refilled_is_corrupt_t14() {
+    let reduction = pi_reduction(&[pi_record("message", Some("required-section"), 10)]);
+    let mut e = Enc::bytes(1 << 20);
+    e.with_pi_ledger(|e| reduction.put(e)).unwrap();
+    Rederive::default().put(&mut e).unwrap();
+    let stripped = e.into_bytes();
+    assert!(decode(&stripped, SnapshotSource::Pi).is_err());
+    assert_eq!(verified_without_allocation(&stripped), Err(Corrupt));
+    let mut d = Dec::new(&stripped);
+    d.require_pi_section();
+    CachedJsonlReduction::take(&mut d).unwrap();
+    Rederive::take(&mut d).unwrap();
+    assert_eq!(
+        d.finish(),
+        Err(Corrupt),
+        "consuming bytes without refill is insufficient"
+    );
+    let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
+    let mut d = Dec::new(&body);
+    d.require_pi_section();
+    CachedJsonlReduction::take(&mut d).unwrap();
+    Rederive::take(&mut d).unwrap();
+    let mut section = PiSection::section(&mut d).unwrap();
+    PiSection::take(&mut section).unwrap();
+    section.finish().unwrap();
+    assert_eq!(
+        d.finish(),
+        Err(Corrupt),
+        "even taking the section requires explicit refill"
+    );
+}
+
+#[test]
+fn pi_ledger_entry_and_byte_caps_refuse_instead_of_truncating() {
+    let mut reduction = pi_reduction(&[pi_record("message", None, 10)]);
+    for n in 0..PI_LEDGER_MAX_KEYS {
+        reduction
+            .accumulator
+            .seen_pi_usage_keys
+            .insert(format!("{n:064x}"), PiUsageDedupState::default());
+    }
+    let body = encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        line_cap(),
+    )
+    .unwrap();
+    assert_eq!(verified_without_allocation(&body), Ok(()));
+    assert_eq!(
+        decode(&body, SnapshotSource::Pi)
+            .unwrap()
+            .reduction
+            .accumulator
+            .seen_pi_usage_keys
+            .len(),
+        PI_LEDGER_MAX_KEYS
+    );
+    reduction.accumulator.seen_pi_usage_keys.insert(
+        format!("{:064x}", PI_LEDGER_MAX_KEYS),
+        PiUsageDedupState::default(),
+    );
+    assert_eq!(
+        encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap()
+        ),
+        Err(Refuse::NonEmpty("pi_ledger_cap"))
+    );
+    reduction.accumulator.seen_pi_usage_keys.clear();
+    reduction.accumulator.source_session_id =
+        Some("x".repeat(crate::durable_tail_store::RECORD_BYTES));
+    assert_eq!(
+        encode(&reduction, usize::MAX, line_cap()),
+        Err(Refuse::TooLarge)
+    );
+}
+
+#[test]
+fn pi_h_keys_are_fixed_width_and_length_prefixes_are_unambiguous() {
+    use crate::durable_tail_codec::HDigest;
+    assert_ne!(
+        pi_usage_hash("a", &["b\0c", "d"]),
+        pi_usage_hash("a", &["b", "c\0d"])
+    );
+    assert_ne!(
+        pi_usage_hash("ottto-pi-usage-key:v1", &["id"]),
+        pi_usage_hash("ottto-pi-usage-occurrence:v1", &["id"])
+    );
+    let expected = "39a6642b7069325c0ccdae325cc81d5ca6c1b17827cc3ce53ac13c419c374a86";
+    assert_eq!(
+        pi_usage_dedup_key(&json!({"responseId":"fixture-response"})).as_deref(),
+        Some(expected)
+    );
+    assert!(pi_usage_dedup_key(&json!({})).is_none());
+    let value =
+        json!({"message":{"responseId":"first","response_id":"second"},"responseId":"third"});
+    assert_eq!(
+        pi_usage_dedup_key(&value),
+        Some(pi_usage_hash("ottto-pi-usage-key:v1", &["first"]))
+    );
+    for invalid in [
+        "id".to_string(),
+        "A".repeat(64),
+        "g".repeat(64),
+        "0".repeat(63),
+    ] {
+        let mut e = Enc::bytes(100);
+        let keys = BTreeMap::from([(invalid, 1_usize)]);
+        assert_eq!(
+            keys.put_h(&mut e, "test.digest"),
+            Err(Refuse::NotDigest("test.digest"))
+        );
+    }
+    let key = pi_usage_hash("ottto-pi-usage-key:v1", &["synthetic"]);
+    let keys = BTreeMap::from([(key, 2_usize)]);
+    let mut e = Enc::bytes(100);
+    keys.put_h(&mut e, "test.digest").unwrap();
+    let bytes = e.into_bytes();
+    assert_eq!(bytes.len(), 34);
+    assert_eq!(
+        BTreeMap::<String, usize>::take_h(&mut Dec::new(&bytes)).unwrap(),
+        keys
+    );
+    let duplicate = [vec![2], bytes[1..].to_vec(), bytes[1..].to_vec()].concat();
+    assert!(BTreeMap::<String, usize>::take_h(&mut Dec::new(&duplicate)).is_err());
+    assert_eq!(
+        BTreeMap::<String, usize>::verify_h(&mut Dec::new(&duplicate)),
+        Err(Corrupt)
+    );
+}
+
+/// The former reducer representation, kept only as an emitted-body oracle.
+fn legacy_pi_apply(value: &Value, acc: &mut SnapshotAccumulator) {
+    let shape = match value.get("type").and_then(Value::as_str) {
+        Some("message") if pi_message_role(value).as_deref() == Some("assistant") => {
+            PiUsageRecordShape::Message
+        }
+        Some("message_end") => PiUsageRecordShape::MessageEnd,
+        _ => {
+            apply_pi_line(value, acc);
+            return;
+        }
+    };
+    let timestamp = pi_usage_record_timestamp(value);
+    let model = string_at(value, &["message", "model"]);
+    acc.set_model(model.clone());
+    if let Some(usage) = pi_message_usage(value) {
+        let mut selector = acc.current_selector.clone();
+        selector.merge(pi_selector_from_usage_message(value));
+        let context = serde_json::to_string(&selector.context).unwrap_or_default();
+        let digest = sha256_hex(&[
+            model.as_deref().unwrap_or(""),
+            &timestamp
+                .as_deref()
+                .and_then(pi_usage_timestamp_identity)
+                .unwrap_or_default(),
+            &usage.input_tokens.to_string(),
+            &usage.output_tokens.to_string(),
+            &usage.cache_read_tokens.to_string(),
+            &usage.cache_creation_5m_tokens.to_string(),
+            &usage.cache_creation_1h_tokens.to_string(),
+            &usage.reasoning_output_tokens.to_string(),
+            &usage.unattributed_total_tokens.to_string(),
+            &usage.request_count.to_string(),
+            &usage.costs.observed.to_string(),
+            &usage.costs.reported.to_string(),
+            &format!("{:?}", usage.costs.total),
+            &format!("{:?}", usage.costs.input),
+            &format!("{:?}", usage.costs.output),
+            &format!("{:?}", usage.costs.cache_read),
+            &format!("{:?}", usage.costs.cache_creation),
+            &context,
+        ]);
+        let key = string_at(value, &["message", "responseId"])
+            .or_else(|| string_at(value, &["message", "response_id"]))
+            .or_else(|| string_at(value, &["responseId"]))
+            .or_else(|| string_at(value, &["response_id"]));
+        let is_new = key.map_or(true, |key| {
+            acc.seen_pi_usage_keys
+                .entry(key)
+                .or_default()
+                .record(shape, digest)
+        });
+        if is_new {
+            acc.add_usage_with_selector(model, usage, selector, timestamp.as_deref(), None);
+        }
+    }
+    acc.note_pi_time(timestamp);
+}
+
+#[test]
+fn pi_new_representation_preserves_legacy_emitted_bodies() {
+    let message = pi_record("message", Some("reused"), 10);
+    let end = pi_record("message_end", Some("reused"), 10);
+    for records in [
+        vec![message.clone(), message.clone()],
+        vec![message.clone(), end.clone()],
+        vec![end.clone(), message.clone()],
+        vec![
+            message.clone(),
+            end,
+            pi_record("message", Some("reused"), 20),
+        ],
+        vec![
+            pi_record("message", None, 10),
+            pi_record("message_end", None, 10),
+        ],
+        vec![message, pi_record("message_end", Some("reused"), 20)],
+    ] {
+        let scratch = Scratch::new("pi-neutral");
+        let mut lines = vec![json!({"type":"session","id":"fixture","version":3,"timestamp":"2026-10-20T10:00:00Z","cwd":"/synthetic/workspace"}).to_string(),
+            json!({"type":"custom","customType":"ottto-selector","data":{"selector_context":{"service_tier":"flex"}}}).to_string()];
+        lines.extend(records.iter().map(Value::to_string));
+        let path = scratch.write("pi.jsonl", &lines);
+        let mut outputs = Vec::new();
+        for apply in [
+            apply_pi_line as fn(&Value, &mut SnapshotAccumulator),
+            legacy_pi_apply,
+        ] {
+            let mut parser = OwnedJsonlParser::new(
+                File::open(&path).unwrap(),
+                &path,
+                SnapshotSource::Pi,
+                apply,
+                None,
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+            parser
+                .prepare_acquisition(None, &scope(), None, NOW)
+                .unwrap();
+            while !parser.step().unwrap() {}
+            outputs.push(items(parser, &path, SnapshotSource::Pi));
+        }
+        assert_eq!(outputs[0], outputs[1]);
+    }
 }

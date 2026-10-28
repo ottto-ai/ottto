@@ -229,7 +229,12 @@ pub(crate) fn encode(
     line_cap: u64,
 ) -> Result<Vec<u8>, Refuse> {
     let rederive = rederive_digests(&reduction.accumulator, line_cap)?;
-    let mut e = Enc::bytes(limit.min(crate::durable_tail_store::RECORD_BYTES));
+    let limit = if reduction.accumulator.source == SnapshotSource::Pi {
+        limit.min(crate::durable_tail_store::BODY_BYTES)
+    } else {
+        limit
+    };
+    let mut e = Enc::bytes(limit);
     PiSection::put_record(reduction, &rederive, &mut e)?;
     Ok(e.into_bytes())
 }
