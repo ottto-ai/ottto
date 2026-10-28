@@ -50,8 +50,7 @@ fn temp(name: &str) -> PathBuf {
 fn version_two_seeds_the_permit_mark_once_from_the_loaded_record() {
     let (three, two) = ("/p/three.jsonl", "/p/two.jsonl");
     let root = temp("migration");
-    let file = root.join("index.json");
-    for (record, seeded) in [
+    for (case, (record, seeded)) in [
         (Some(claude_request_identity::E2_GROUPING), false),
         (Some(CLAUDE_E2_IDENTITY_ADOPTION_PENDING), false),
         (Some(""), true),
@@ -62,7 +61,11 @@ fn version_two_seeds_the_permit_mark_once_from_the_loaded_record() {
         (None, true),
         (Some(claude_request_identity::COLLECTOR), true),
         (Some("unknown-contract"), true),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = root.join(format!("index-{case}.json"));
         let mut index = at_revision_three();
         index.files.insert(three.into(), entry(3, "three"));
         index.files.insert(two.into(), entry(2, "two"));
