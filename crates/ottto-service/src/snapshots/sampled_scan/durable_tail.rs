@@ -495,6 +495,14 @@ impl SharedCache {
         else {
             return false;
         };
+        // Completed joined jobs deliberately retain no per-file reduction.
+        // Their missing record is not upgrade loss; normal group gates own it.
+        if source == SnapshotSource::Codex
+            && (entry.codex_joined_member_set.is_some()
+                || entry.codex_captured_joined_member_set.is_some())
+        {
+            return false;
+        }
         if !slot.store.absent(&store::key_digest(ds, &key)) {
             return false;
         }

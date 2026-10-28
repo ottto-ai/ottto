@@ -1333,6 +1333,14 @@ fn paused_group_resumes_across_a_sealed_member_metadata_only_change() {
     use std::os::unix::fs::PermissionsExt;
     for change in ["chmod", "mtime"] {
         let root = paged_corpus(&format!("s3-sealed-{change}"));
+        for name in ["a", "b"] {
+            let entry =
+                &index.files[&local_index_key(&root.join(format!("sessions/{name}.jsonl")))];
+            assert!(
+                entry.codex_joined_member_set.is_some()
+                    || entry.codex_captured_joined_member_set.is_some()
+            );
+        }
         let sealed = root.join("sessions/a.jsonl");
         let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
         let cache = Arc::new(SharedCache::default());
@@ -2990,6 +2998,69 @@ fn two_missing_group_members_keep_both_tickets_until_the_group_can_acquire() {
     assert!(!result.snapshots.is_empty());
     let (counts, _) = cache.durable_counters(source).unwrap();
     assert_eq!(counts.upgrade_state_missing, 2);
+    assert_eq!(counts.durable_held.iter().sum::<u64>(), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A successful joined scan has no per-file durable reductions by design.
+/// Appending only the live member must still admit its unchanged sealed peer.
+#[cfg(unix)]
+#[test]
+fn completed_joined_members_are_not_missing_upgrade_state() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (root, _) = fixture();
+    let source = SnapshotSource::Codex;
+    let cache = Arc::new(SharedCache::default());
+    let namespace = Scope("group-fixture".into());
+    cache.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
+    let (mut index, first) = sampled(&root, ScanIndex::default(), 10, &cache);
+    assert!(!first.snapshots.is_empty());
+    for name in ["a", "b"] {
+        let entry = &index.files[&local_index_key(&root.join(format!("sessions/{name}.jsonl")))];
+        assert!(
+            entry.codex_joined_member_set.is_some()
+                || entry.codex_captured_joined_member_set.is_some()
+        );
+    }
+    let sealed = root.join("sessions/a.jsonl");
+    let before = fs::read(&sealed).unwrap();
+    append_rows(
+        &root.join("sessions/b.jsonl"),
+        &[
+            turn("66666666-aaaa-4aaa-8aaa-666666666666"),
+            native(OWNER, "new-response", 5, 305),
+        ],
+    );
+    let cold = Arc::new(SharedCache::default());
+    cold.durable_begin_pass(source, &root.join("index.json"), &namespace, false);
+    for n in 0..2 {
+        if n != 0 {
+            append_rows(
+                &root.join("sessions/b.jsonl"),
+                &[native(OWNER, "newer-response", 5, 310)],
+            );
+        }
+        let (next, scan) = sampled_at(
+            &root,
+            index,
+            10,
+            &cold,
+            if n == 0 {
+                "2026-10-07T23:00:00Z"
+            } else {
+                "2026-10-08T23:00:00Z"
+            },
+        );
+        assert!(scan.scanned_file_count >= 2, "joined updates must progress");
+        assert!(!scan.snapshots.is_empty());
+        assert!(!next.reread_guard.needs_save());
+        index = next;
+    }
+    assert_eq!(fs::read(sealed).unwrap(), before);
+    let (counts, _) = cold.durable_counters(source).unwrap();
+    assert_eq!(counts.upgrade_state_missing, 0);
     assert_eq!(counts.durable_held.iter().sum::<u64>(), 0);
     fs::remove_dir_all(root).unwrap();
 }

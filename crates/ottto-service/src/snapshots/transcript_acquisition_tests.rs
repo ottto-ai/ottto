@@ -1778,7 +1778,7 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     // The known key is replaced; the new key is deferred, counted.
     assert_eq!(store.records_written, u64::from(supported));
     assert_eq!(store.budget_refused, 0);
-    assert_eq!(store.store_write_skipped, [0, u64::from(supported), 0]);
+    assert_eq!(store.store_write_skipped, [0, u64::from(supported)]);
     if supported {
         assert_eq!(store.disk_records, bound as u64 + 2);
     }
