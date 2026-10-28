@@ -67,6 +67,116 @@ pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
     )
 }
 
+/// K10 (LD): one registered line observer's counts for a page. Inline only,
+/// so the probe stays heap-free; nonzero keys are serialized.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LineDeliveryCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) lines: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) observer_us: u64,
+    #[serde(skip_serializing_if = "LineDeliveryIncomplete::is_empty")]
+    pub(crate) incomplete: LineDeliveryIncomplete,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LineDeliveryIncomplete {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) held: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) read_failure: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) yielded: u64,
+}
+impl LineDeliveryIncomplete {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+/// Serialized as `{"<observer>": counts}`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LineDeliveryPage {
+    pub(crate) observer: &'static str,
+    pub(crate) counts: LineDeliveryCounts,
+}
+impl Serialize for LineDeliveryPage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(self.observer, &self.counts)?;
+        map.end()
+    }
+}
+fn no_line_delivery(page: &Option<LineDeliveryPage>) -> bool {
+    !matches!(page, Some(page) if page.counts != LineDeliveryCounts::default())
+}
+
+/// K10 (LD): why a discovery gate left a file unselected.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum UnselectedReason {
+    Age,
+    Size,
+}
+#[derive(Default, Serialize)]
+struct LineDeliveryUnselected {
+    #[serde(skip_serializing_if = "is_zero")]
+    age: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    size: u64,
+}
+impl LineDeliveryUnselected {
+    fn is_empty(&self) -> bool {
+        self.age == 0 && self.size == 0
+    }
+}
+/// Per source (Claude, Codex, Pi) and reason, drained by that source's page.
+#[cfg(not(test))]
+static LINE_UNSELECTED: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+#[cfg(test)]
+thread_local! {
+    static LINE_UNSELECTED: [std::sync::atomic::AtomicU64; 6] =
+        const { [const { std::sync::atomic::AtomicU64::new(0) }; 6] };
+}
+fn with_line_unselected<T>(f: impl FnOnce(&[std::sync::atomic::AtomicU64; 6]) -> T) -> T {
+    #[cfg(test)]
+    {
+        LINE_UNSELECTED.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&LINE_UNSELECTED)
+    }
+}
+fn line_unselected_slots(source: &str) -> Option<usize> {
+    match Source::from_slug(source) {
+        Source::ClaudeCode => Some(0),
+        Source::Codex => Some(2),
+        Source::Pi => Some(4),
+        Source::Unknown => None,
+    }
+}
+/// One skip decision, recorded after the gate decided; never a gate input.
+pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
+    if let Some(slot) = line_unselected_slots(source) {
+        with_line_unselected(|slots| {
+            slots[slot + reason as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+}
+fn take_line_delivery_unselected(source: &str) -> LineDeliveryUnselected {
+    let Some(slot) = line_unselected_slots(source) else {
+        return LineDeliveryUnselected::default();
+    };
+    with_line_unselected(|slots| {
+        let take = |slot: usize| slots[slot].swap(0, std::sync::atomic::Ordering::Relaxed);
+        LineDeliveryUnselected {
+            age: take(slot),
+            size: take(slot + 1),
+        }
+    })
+}
+
 const SCHEMA_VERSION: u8 = 2;
 
 /// Cumulative shared-process totals, NOT events attributed to the finishing
@@ -202,6 +312,8 @@ pub(crate) struct Probe {
     started: Instant,
     process: Option<ProcessSample>,
     pub(crate) page_events: claude_reread::Counts,
+    /// LD: the pass's observer counts, set before the page line.
+    pub(crate) line_delivery: Option<LineDeliveryPage>,
 }
 impl Probe {
     pub(crate) fn start() -> Self {
@@ -209,6 +321,7 @@ impl Probe {
             started: Instant::now(),
             process: process_sample(),
             page_events: Default::default(),
+            line_delivery: None,
         }
     }
     fn observation(&self) -> Observation {
@@ -242,9 +355,15 @@ impl Probe {
             identity: crate::snapshots::claude_request_identity::IdentityCounts,
             #[serde(flatten)]
             reread: claude_reread::Counts,
+            #[serde(skip_serializing_if = "no_line_delivery")]
+            line_delivery: Option<LineDeliveryPage>,
+            #[serde(skip_serializing_if = "LineDeliveryUnselected::is_empty")]
+            line_delivery_unselected: LineDeliveryUnselected,
         }
         let claude = source == "claude_code";
         let counts = Counts {
+            line_delivery: self.line_delivery,
+            line_delivery_unselected: take_line_delivery_unselected(source),
             reread: if claude {
                 self.page_events.with_current()
             } else {

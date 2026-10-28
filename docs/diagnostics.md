@@ -127,6 +127,39 @@ source/encoding settings and distinguish idle, ordinary changes, import and
 recovery. A containing release and matching installation are required before
 calling these measurements installed evidence.
 
+## Line Delivery Counters
+
+Schema 2's `native_collection_page` can add two sparse, counts-only objects.
+They add no wire fields, persisted state or transcript reads, and contain no
+paths, identifiers, hashes or line content. Missing keys mean zero in that
+observation; an absent object also means zero, or a page line that was not
+written. Counts saturate at `u64::MAX`.
+
+`counts.line_delivery` is keyed by the fixed name of the page's one registered
+line observer, for example `{"footprint": {...}}`. The observer receives the
+physical lines the page's primary reads already consumed; proof, parent, side,
+group, native-comparison and one-shot reads deliver nothing. All values are
+page events, not gauges, and are never summed across observers:
+
+- `lines`: newline-complete physical lines delivered, including blank,
+  malformed, invalid UTF-8 and overlong lines. An unterminated final record is
+  not a line until its newline arrives in a later read.
+- `bytes`: physical bytes of those lines, newline and skipped overlong bytes
+  included. These are bytes the read already consumed, never extra reads.
+- `observer_us`: synchronous time inside the observer's calls, including files
+  it skipped.
+- `incomplete`: files whose delivery ended early, by cause: `held` (removed
+  unfinished by a hold or refusal), `read_failure`, or `yielded` (a paged job
+  paused, or the page ended or was dropped mid-file). A file the observer
+  skipped is not counted. A later page can count the same file again.
+
+`counts.line_delivery_unselected` counts discovery skip decisions for the
+page's source: `age` (outside the backfill window and not held for
+verification) and `size` (over the source's file-size cap). They are recorded
+after the existing decision, are drained by that source's next completed page,
+and count repeated decisions, not distinct files or bytes. They are recorded
+whether or not an observer is registered.
+
 ## Private Codex Census Outcomes
 
 The support-root `snapshots/codex-fenced-census-v1.json` file now uses schema

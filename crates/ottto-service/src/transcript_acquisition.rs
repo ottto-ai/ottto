@@ -77,6 +77,40 @@ impl FileStamp {
     }
 }
 
+/// LD: an opened object's identity while its descriptor is held, from one
+/// fstat of that descriptor. RAM only: never a path, persisted field or proof
+/// authority. An inode reused after deletion can alias an old entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FileObject {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    /// Creation time in Unix seconds when the file system reports one.
+    pub(crate) birth: Option<u64>,
+}
+
+impl FileObject {
+    /// `None` off unix, where there is no stable object identity.
+    pub(crate) fn of(metadata: &Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            Some(Self {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                birth: metadata
+                    .created()
+                    .ok()
+                    .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|created| created.as_secs()),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            None
+        }
+    }
+}
+
 /// An opened object's identity and length, as one held-FD stamp sees it.
 pub(crate) trait StampIdentity: PartialEq {
     fn same_object(&self, other: &Self) -> bool;

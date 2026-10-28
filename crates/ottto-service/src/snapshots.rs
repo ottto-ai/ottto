@@ -112,6 +112,9 @@ pub(crate) use local_context_points::LocalContextPoint;
 use local_context_points::{local_context_points_recent, LocalContextPoints};
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
+pub(crate) mod line_delivery;
+#[cfg(test)]
+mod line_delivery_tests;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod sampled_audit;
@@ -25178,6 +25181,8 @@ pub(crate) struct OwnedSourceScan {
     /// Stage 1 hunk A: the ticket this page's pause minted, carried across
     /// `step` calls into the result.
     continuation_ticket: Option<sampled_scan::codex_cursor::CodexCursorTicket>,
+    /// LD: this pass's line observer, if one is registered.
+    line_delivery: Option<line_delivery::LineDelivery>,
 }
 struct OwnedActiveFile {
     comparison_target: bool,
@@ -26381,6 +26386,7 @@ impl OwnedSourceScan {
             codex_selected_flags,
             codex_side_pass: None,
             continuation_ticket: None,
+            line_delivery: None,
         }
     }
     /// U1a-2a: the pass's C14 namespace and gate (`None` for other sources).
@@ -26509,7 +26515,7 @@ impl OwnedSourceScan {
         }
         let Self {
             mut native_comparison,
-            resource_probe,
+            mut resource_probe,
             mut sampling,
             index: mut index_storage,
             source,
@@ -26558,6 +26564,7 @@ impl OwnedSourceScan {
             codex_selected_flags,
             codex_side_pass,
             mut continuation_ticket,
+            mut line_delivery,
         } = self;
         // Held while this scan object runs the shared cursor job.
         let (mut active_file, mut codex_cursor_lease) = active_frame.into_parts();
@@ -27486,6 +27493,9 @@ impl OwnedSourceScan {
                     index.note_reread_refusal(None);
                     pending!();
                 }
+                if let Some(delivery) = line_delivery.as_mut() {
+                    delivery.begin_armed(&active);
+                }
                 let mut group_end = None;
                 let stepped = if active.group.is_some() {
                     // A group job: one record of the current member, or one
@@ -27525,6 +27535,8 @@ impl OwnedSourceScan {
                             Ok(false)
                         }
                     }
+                } else if let Some(delivery) = line_delivery.as_mut() {
+                    delivery.step(&mut active.parser)
                 } else {
                     active.parser.step()
                 };
@@ -30533,6 +30545,12 @@ impl OwnedSourceScan {
                         source.api_slug(),
                     );
                 }
+                if let Some(delivery) = line_delivery.as_mut() {
+                    if active_file.is_none() {
+                        delivery.left_active();
+                    }
+                    resource_probe.line_delivery = Some(delivery.take_page());
+                }
                 resource_probe.collection_with_account_pending(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {
@@ -31910,8 +31928,16 @@ impl OwnedSourceScan {
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
             }
+            if let Some(delivery) = line_delivery.as_mut() {
+                delivery.arm();
+            }
             active_file = Some(active);
             pending!();
+        }
+        if active_file.is_none() {
+            if let Some(delivery) = line_delivery.as_mut() {
+                delivery.left_active();
+            }
         }
         Ok(OwnedSourceScanStep::Pending(Self {
             native_comparison,
@@ -31967,6 +31993,7 @@ impl OwnedSourceScan {
             codex_selected_flags,
             codex_side_pass,
             continuation_ticket,
+            line_delivery,
         }))
     }
 }
@@ -32814,16 +32841,27 @@ impl OwnedJsonlParser {
         })
     }
     fn step(&mut self) -> Result<bool> {
+        self.step_delivering(None)
+    }
+    /// `step`, lending each newline-complete physical line to `on_line` (LD).
+    fn step_delivering(&mut self, on_line: Option<line_delivery::LineTap<'_>>) -> Result<bool> {
         #[cfg(test)]
         if let Some(path) = self.source_read_probe.take() {
             terminal_contract_retry::record_source_acquisition(&path);
         }
-        self.step_with_observer(|_| {})
+        self.step_observed(|_| {}, on_line)
     }
     fn step_with_observer(&mut self, observe: impl FnMut(&Value)) -> Result<bool> {
+        self.step_observed(observe, None)
+    }
+    fn step_observed(
+        &mut self,
+        observe: impl FnMut(&Value),
+        on_line: Option<line_delivery::LineTap<'_>>,
+    ) -> Result<bool> {
         self.assert_reread_ticket();
         anyhow::ensure!(self.reread_read_allowed(), "reread ticket expired");
-        let step = self.with_line_sink(observe, |reader, sink| reader.step(sink))?;
+        let step = self.with_line_sink(observe, |reader, sink| reader.step_lines(sink, on_line))?;
         Ok(matches!(step, JsonlReaderStep::Complete(_)))
     }
 
@@ -33809,6 +33847,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             early,
             self.max_line_bytes,
             self.salvage_codex_envelope,
+            None,
             &mut on_value,
         );
         self.buf.clear();
@@ -33816,6 +33855,16 @@ impl<R: BufRead> BoundedJsonlReader<R> {
     }
 
     fn step(&mut self, on_value: impl FnMut(&Value)) -> std::io::Result<JsonlReaderStep> {
+        self.step_lines(on_value, None)
+    }
+
+    /// `step`, also lending a newline-complete physical line to `on_line`
+    /// (LD; offsets relative to this reader's start).
+    fn step_lines(
+        &mut self,
+        on_value: impl FnMut(&Value),
+        on_line: Option<line_delivery::LineTap<'_>>,
+    ) -> std::io::Result<JsonlReaderStep> {
         if let Some(kind) = self.failure {
             return Err(std::io::Error::new(
                 kind,
@@ -33834,7 +33883,7 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         if self.skipping.is_none() {
             self.buf.clear();
         }
-        let result = self.read_step(on_value);
+        let result = self.read_step(on_value, on_line);
         // Values have been consumed synchronously and dropped. Retain only the
         // existing buffer capacity; no logical raw row survives this return.
         // A paused overlong skip keeps no bytes (E4); a withheld final
@@ -33850,7 +33899,14 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         result
     }
 
-    fn read_step(&mut self, mut on_value: impl FnMut(&Value)) -> std::io::Result<JsonlReaderStep> {
+    fn read_step(
+        &mut self,
+        mut on_value: impl FnMut(&Value),
+        on_line: Option<line_delivery::LineTap<'_>>,
+    ) -> std::io::Result<JsonlReaderStep> {
+        // A line starts where the previous newline ended, even when its
+        // overlong skip paused across steps.
+        let line_start = self.last_line_end;
         let reader = &mut self.reader;
         let buf = &mut self.buf;
         let report = &mut self.report;
@@ -33970,6 +34026,10 @@ impl<R: BufRead> BoundedJsonlReader<R> {
             early,
             max_line_bytes,
             salvage_codex_envelope,
+            // An unterminated trailing line reaches money only, never LD.
+            on_line
+                .filter(|_| line_complete)
+                .map(|tap| (line_start, self.consumed, tap)),
             &mut on_value,
         );
         self.finished = reached_eof;
@@ -33978,7 +34038,9 @@ impl<R: BufRead> BoundedJsonlReader<R> {
 }
 
 /// Count and apply one physical line held in `buf` (newline-terminated, or a
-/// trailing line at EOF). Shared by every read path.
+/// trailing line at EOF). Shared by every read path. `deliver` (LD) borrows a
+/// newline-complete line `(start, end)` and its one parse before money's sink.
+#[allow(clippy::too_many_arguments)]
 fn apply_physical_line(
     buf: &mut Vec<u8>,
     report: &mut JsonlReadReport,
@@ -33986,11 +34048,22 @@ fn apply_physical_line(
     early: Option<EarlySalvage>,
     max_line_bytes: usize,
     salvage_codex_envelope: bool,
+    deliver: Option<(u64, u64, line_delivery::LineTap<'_>)>,
     on_value: &mut impl FnMut(&Value),
 ) {
     report.physical_line_count += 1;
     if overflowed {
         report.over_line_cap_count += 1;
+        if let Some((start, end, tap)) = deliver {
+            // Never the capped prefix or a salvaged envelope.
+            tap(&line_delivery::PhysicalLine {
+                start,
+                end,
+                bytes: &[],
+                value: None,
+                overlong: true,
+            });
+        }
         // Codex created-thread ownership requires a gap-free ordinal and
         // timestamp stream. Image-bearing response/compaction rows carry
         // that structural envelope before their huge payload. Preserve
@@ -34016,16 +34089,34 @@ fn apply_physical_line(
     if bytes.last() == Some(&b'\r') {
         bytes = &bytes[..bytes.len() - 1];
     }
-    match std::str::from_utf8(bytes) {
-        Ok(line) if line.trim().is_empty() => {}
+    let value = match std::str::from_utf8(bytes) {
+        Ok(line) if line.trim().is_empty() => None,
         Ok(line) => match serde_json::from_str::<Value>(line) {
             Ok(value) => {
                 report.parsed_json_line_count += 1;
-                on_value(&value);
+                Some(value)
             }
-            Err(_) => report.malformed_json_line_count += 1,
+            Err(_) => {
+                report.malformed_json_line_count += 1;
+                None
+            }
         },
-        Err(_) => report.invalid_utf8_line_count += 1,
+        Err(_) => {
+            report.invalid_utf8_line_count += 1;
+            None
+        }
+    };
+    if let Some((start, end, tap)) = deliver {
+        tap(&line_delivery::PhysicalLine {
+            start,
+            end,
+            bytes: buf.as_slice(),
+            value: value.as_ref(),
+            overlong: false,
+        });
+    }
+    if let Some(value) = value {
+        on_value(&value);
     }
 }
 
@@ -40940,6 +41031,10 @@ fn refresh_retained_codex_roster(
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
             {
+                crate::local_resource_diagnostics::line_delivery_unselected(
+                    source.api_slug(),
+                    crate::local_resource_diagnostics::UnselectedReason::Age,
+                );
                 continue;
             }
             traversal.counts.discovered_file_count += 1;
@@ -40951,6 +41046,10 @@ fn refresh_retained_codex_roster(
                     &scan_root,
                     &path,
                     &mut traversal.oversized_discovery,
+                );
+                crate::local_resource_diagnostics::line_delivery_unselected(
+                    source.api_slug(),
+                    crate::local_resource_diagnostics::UnselectedReason::Size,
                 );
                 continue;
             }
@@ -41273,6 +41372,10 @@ fn advance_bounded_directory_traversal_with_budget(
                     !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
                 })
             {
+                crate::local_resource_diagnostics::line_delivery_unselected(
+                    source.api_slug(),
+                    crate::local_resource_diagnostics::UnselectedReason::Age,
+                );
                 continue;
             }
             traversal.counts.discovered_file_count += 1;
@@ -41284,6 +41387,10 @@ fn advance_bounded_directory_traversal_with_budget(
                     &directory.scan_root,
                     &path,
                     &mut traversal.oversized_discovery,
+                );
+                crate::local_resource_diagnostics::line_delivery_unselected(
+                    source.api_slug(),
+                    crate::local_resource_diagnostics::UnselectedReason::Size,
                 );
                 continue;
             }
@@ -88448,7 +88555,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, reread_required, reread_ticket, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
