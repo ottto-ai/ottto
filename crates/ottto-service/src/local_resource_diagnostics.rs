@@ -1,7 +1,9 @@
 //! Content-free observations in the existing local service log, never wire data.
 //! CPU includes concurrent process work; maximum RSS is a lifetime high-water mark.
 use serde::{ser::SerializeMap, Serialize};
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod cache_lifecycle;
@@ -67,6 +69,48 @@ pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
         c.claude_money_record_cap_half_files,
         c.claude_money_record_cap_hits,
     )
+}
+
+/// K10 (LD): one line observer's counts for a page; nonzero keys only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LineDeliveryCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) lines: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) bytes: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) incomplete: u64,
+}
+
+/// K10 (LD): why a discovery gate left a file unselected.
+pub(crate) enum UnselectedReason {
+    Age,
+    Size,
+}
+/// Claude, Codex, Pi x (age, size), drained by that source's page line.
+#[cfg(not(test))]
+static LINE_UNSELECTED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+#[cfg(test)]
+thread_local! {
+    static LINE_UNSELECTED: [AtomicU64; 6] = const { [const { AtomicU64::new(0) }; 6] };
+}
+fn line_unselected(source: &str, reason: usize, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
+    let sources = ["claude_code", "codex", "pi"];
+    let Some(slot) = sources.iter().position(|s| *s == source) else {
+        return 0;
+    };
+    #[cfg(test)]
+    {
+        LINE_UNSELECTED.with(|slots| f(&slots[2 * slot + reason]))
+    }
+    #[cfg(not(test))]
+    {
+        f(&LINE_UNSELECTED[2 * slot + reason])
+    }
+}
+/// One skip decision, recorded after the gate decided; never a gate input.
+pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
+    line_unselected(source, reason as usize, |slot| slot.fetch_add(1, Relaxed));
 }
 
 const SCHEMA_VERSION: u8 = 2;
@@ -204,6 +248,7 @@ pub(crate) struct Probe {
     started: Instant,
     process: Option<ProcessSample>,
     pub(crate) page_events: claude_reread::Counts,
+    pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
 }
 impl Probe {
     pub(crate) fn start() -> Self {
@@ -211,6 +256,7 @@ impl Probe {
             started: Instant::now(),
             process: process_sample(),
             page_events: Default::default(),
+            line_delivery: None,
         }
     }
     fn observation(&self) -> Observation {
@@ -244,9 +290,22 @@ impl Probe {
             identity: crate::snapshots::claude_request_identity::IdentityCounts,
             #[serde(flatten)]
             reread: claude_reread::Counts,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            line_delivery: Option<BTreeMap<&'static str, LineDeliveryCounts>>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            line_delivery_unselected: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
+            line_delivery: self
+                .line_delivery
+                .filter(|(_, counts)| *counts != LineDeliveryCounts::default())
+                .map(|(observer, counts)| BTreeMap::from([(observer, counts)])),
+            line_delivery_unselected: [("age", 0), ("size", 1)]
+                .into_iter()
+                .map(|(key, reason)| (key, line_unselected(source, reason, |n| n.swap(0, Relaxed))))
+                .filter(|(_, count)| *count > 0)
+                .collect(),
             reread: if claude {
                 self.page_events.with_current()
             } else {

@@ -143,6 +143,73 @@ source/encoding settings and distinguish idle, ordinary changes, import and
 recovery. A containing release and matching installation are required before
 calling these measurements installed evidence.
 
+## Line Delivery Counters
+
+Schema 2's `native_collection_page` can add two sparse, counts-only objects.
+They add no wire fields, persisted state or transcript reads, and contain no
+paths, identifiers, hashes or line content. Missing keys mean zero in that
+observation; an absent object also means zero, or a page line that was not
+written. Counts saturate at `u64::MAX`.
+
+`counts.line_delivery` is keyed by the fixed name of the page's one registered
+line observer, for example `{"footprint": {...}}`. The observer receives the
+physical lines the page's primary reads already consumed; proof, parent, side,
+group, native-comparison and one-shot reads deliver nothing. All values are
+page events, not gauges, and are never summed across observers:
+
+- `lines`: newline-complete physical lines delivered, including blank,
+  malformed, invalid UTF-8 and overlong lines. An unterminated final record is
+  not a line until its newline arrives in a later read.
+- `bytes`: physical bytes of those lines, newline and skipped overlong bytes
+  included. These are bytes the read already consumed, never extra reads.
+- `incomplete`: files whose delivery ended before their read completed: removed
+  unfinished by a hold or refusal, a read failure, a paged job pausing, or the
+  page ending or being dropped mid-file. A file the observer skipped is not
+  counted. A later page can count the same file again.
+
+`counts.line_delivery_unselected` counts discovery skip decisions for the
+page's source: `age` (outside the backfill window and not held for
+verification) and `size` (over the source's file-size cap). They are recorded
+after the existing decision, are drained by that source's next completed page,
+and count repeated decisions, not distinct files or bytes. They are recorded
+whether or not an observer is registered.
+
+## Context Footprint Discovery
+
+Context footprint opens no transcript. Its workspaces come from the cwds of
+the Claude lines snapshot sync's primary reads already delivered to the
+`footprint` line observer, kept in RAM only (no transcript path, nothing
+persisted). Coverage follows that read:
+
+- After a daemon restart, only files read since then are known; a workspace
+  idle since the restart is not proposed until it is used again.
+- An org backfill window of 1-13 days narrows footprint's 14 days to that
+  window; 0 days leaves almost no history.
+- While reconciliation is off, Claude is disabled for the source or snapshot
+  sync is down, nothing new is delivered; files already known stay usable
+  until they age out of the 14 days or are evicted.
+- Claude files over 256 MiB are never delivered, and a cwd only on a line
+  over 16 MiB is not seen.
+
+Each footprint cycle's `context_footprint_harvest_metrics` line adds these
+counts, with no paths or values:
+
+- `discovery_path_scopes` (this cycle): workspaces scoped by their own path
+  (no repository, or a repository probe that failed).
+- `footprint_observer_files`, `footprint_observer_bytes` (now): files held and
+  their charged RAM (cwd allocations plus a fixed per-file slot), capped at
+  4 MiB with at most 8 cwds per file.
+- Since daemon start:
+  - `footprint_observer_passes`: snapshot-sync Claude passes that registered
+    the observer. 0 means no delivery reached footprint.
+  - `footprint_observer_evicted_files`: files dropped at the cap, oldest
+    modification time first.
+  - `footprint_observer_cwd_dropped`: cwd values over 4 KiB, not kept.
+  - `footprint_observer_incomplete_files`: deliveries that ended before their
+    read completed, or appended or unchanged reads of a file whose earlier
+    lines this process never saw (restart, durable restore or eviction),
+    counted once per file. What was delivered is kept.
+
 ## Private Codex Census Outcomes
 
 The support-root `snapshots/codex-fenced-census-v1.json` file now uses schema

@@ -6312,6 +6312,9 @@ fn prepare_sync_source_inner(
     .with_reread_persistence()
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
     .with_codex_side_pass(codex_side_pass);
+    if source == SnapshotSource::ClaudeCode {
+        scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
+    }
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
     }
