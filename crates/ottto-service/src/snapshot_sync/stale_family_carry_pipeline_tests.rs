@@ -1739,14 +1739,18 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 let g_fp = invariant_g["snapshot_fingerprint"].as_str().unwrap();
                 assert!(saved["claude_request_census"].get(&g_key).is_some());
                 assert!(migrated.iter().any(|page| page.uploaded.contains(g_fp)));
+                // An id-less companion settles its own revision but cannot
+                // carry under contract debt: G must be the only such family.
                 std::fs::write(
                     c1b_terminal_path(&fixture),
-                    rearm_transcript_line(
-                        REARM_TERMINAL,
-                        None,
-                        &format!("req_{REARM_TERMINAL}"),
-                        0,
-                    ),
+                    serde_json::json!({
+                        "timestamp":"2026-08-02T07:00:00Z", "type":"assistant",
+                        "sessionId":REARM_TERMINAL,
+                        "message":{"model":"claude-haiku-4-5",
+                            "usage":{"input_tokens":10,"output_tokens":10}},
+                    })
+                    .to_string()
+                        + "\n",
                 )
                 .unwrap();
                 // The repaired terminal also owes B's revision. Its fold
@@ -1772,6 +1776,17 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 assert!(prepared_index["claude_usage_family_pending"]
                     .get(REARM_SIBLING)
                     .is_some());
+                assert_eq!(
+                    prepared_index["claude_usage_family_pending"][REARM_TERMINAL]["invalid"], true,
+                    "the paid companion must remain ineligible for contract-debt carry"
+                );
+                for path in [c1a_invalid_path(&fixture), c1b_terminal_path(&fixture)] {
+                    assert_eq!(
+                        prepared_index["files"][path.to_string_lossy().as_ref()]
+                            ["effective_upload_body_witness_revision"],
+                        3
+                    );
+                }
                 for (key, entry) in prepared_index["files"].as_object().unwrap() {
                     assert_eq!(
                         entry["effective_upload_body_witness_revision"],
