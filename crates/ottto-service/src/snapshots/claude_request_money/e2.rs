@@ -565,7 +565,7 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
     store.set_money_rule_version(current);
 }
 
-/// Pure accumulation consumed by the #699 literal emitter. No census, claims,
+/// Pure accumulation consumed by the request-owned literal emitter. No census, claims,
 /// custody, maturity or alternate response classifier participates here.
 #[derive(Debug, Clone)]
 pub(crate) struct ClaudeEntityBody {
@@ -1817,9 +1817,9 @@ fn live_key(
     (bucket, model.to_owned(), context)
 }
 
-/// Matched and side-call grains keep today's reported-rebuild enrichment
-/// (`reported_live_key`): OTEL speed joins the selector, an OTEL effort tier
-/// fills a missing transcript effort (now kept in the context, #699 parity),
+/// Matched and side-call grains keep reported enrichment:
+/// OTEL speed joins the selector, an OTEL effort tier
+/// fills a missing transcript effort (kept in the context),
 /// the transcript's model and clock win, and the API row's clock and model
 /// are the fallbacks. Placed through [`grain_key`].
 fn reported_key(

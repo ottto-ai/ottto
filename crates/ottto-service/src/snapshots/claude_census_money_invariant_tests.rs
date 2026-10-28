@@ -1,0 +1,672 @@
+// Live census, persisted-format and opened-birth invariants retained from
+// the retired P1 suite. Run with E2 on; no shadow or ledger writer exists.
+use super::*;
+use crate::snapshots::claude_request_census::{
+    claude_census_disjointness_complete, claude_census_member_status, decode_ledger_shard,
+    is_ledger_key, message_key, telemetry_key, ClaudeCensusMemberStatus, ClaudeFamilyMemo,
+    ClaudeLedgerSweep, ClaudeRequestBirth, ClaudeRequestCensus, ClaudeRequestCensusInsert,
+    ClaudeRequestCensusRecord, ClaudeRequestCensusShape, ClaudeTelemetryAudit,
+    ClaudeTelemetryTailState, MAX_CLAUDE_REQUEST_CENSUS_HASHES,
+    MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES, TELEMETRY_KEY_PREFIX,
+};
+const MONEY_WINDOW: &str = "2026-08-02T09:00:00Z";
+
+fn money_fingerprint(seed: char) -> String {
+    seed.to_string().repeat(64)
+}
+
+fn money_record(seed: char, hashes: Vec<u64>) -> ClaudeRequestCensusRecord {
+    ClaudeRequestCensusRecord::synthetic_for_test(
+        &money_fingerprint(seed),
+        7,
+        if hashes.is_empty() {
+            ClaudeRequestCensusShape::Empty
+        } else {
+            ClaudeRequestCensusShape::Exact
+        },
+        hashes,
+    )
+}
+
+fn money_census_round_trip(census: &ClaudeRequestCensus) -> ClaudeRequestCensus {
+    let mut index = ScanIndex::default();
+    *index.claude_request_census_mut_for_test() = census.clone();
+    let scratch = crate::test_scratch::ScratchDir::new("money-census-round-trip");
+    let path = scratch.join("index.json");
+    index.save(&path).expect("save index");
+    ScanIndex::load(&path)
+        .expect("load index")
+        .claude_request_census_for_test()
+        .clone()
+}
+
+fn money_decode_one(record: serde_json::Value) -> Option<ClaudeRequestCensusRecord> {
+    let mut index = serde_json::to_value(ScanIndex::default()).expect("index json");
+    index["claude_request_census"] = serde_json::json!({ "/money/projects/a.jsonl": record });
+    let scratch = crate::test_scratch::ScratchDir::new("money-census-decode");
+    let path = scratch.join("index.json");
+    std::fs::write(&path, serde_json::to_vec(&index).expect("json")).expect("write");
+    ScanIndex::load(&path)
+        .expect("a bad record never quarantines the index")
+        .claude_request_census_for_test()
+        .get("/money/projects/a.jsonl")
+        .cloned()
+}
+
+fn money_facts(session: &str, count: usize) -> Box<[u8]> {
+    crate::snapshots::claude_request_money::facts::fixture::facts(session, count)
+}
+
+#[test]
+fn money_birth_is_carried_only_for_the_same_object() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let key = "/money/projects/a.jsonl";
+    let first = ClaudeRequestBirth {
+        unix_seconds: 100,
+        device: 1,
+        inode: 10,
+    };
+    let reread = ClaudeRequestBirth {
+        unix_seconds: 500,
+        device: 1,
+        inode: 10,
+    };
+    let replaced = ClaudeRequestBirth {
+        unix_seconds: 900,
+        device: 1,
+        inode: 11,
+    };
+    let mut census = ClaudeRequestCensus::default();
+    census.insert_for_test(
+        key,
+        money_record('a', vec![1]).with_birth_for_test(Some(first)),
+    );
+    assert_eq!(
+        census.carried_birth_for_test(key, Some(reread)),
+        Some(first)
+    );
+    assert_eq!(
+        census.carried_birth_for_test(key, Some(replaced)),
+        Some(replaced)
+    );
+    assert_eq!(census.carried_birth_for_test(key, None), None);
+    // #588 restore / failed finish: the record is replaced IN PLACE by a
+    // stub (no new key) that keeps the birth for the same object only; every
+    // reader skips it.
+    let totals = census.totals_for_test();
+    census.invalidate_keeping_birth_for_test(key);
+    assert!(census.get(key).is_none());
+    assert!(census
+        .record_for_test(key)
+        .unwrap()
+        .is_birth_stub_for_test());
+    assert_eq!(census.len_for_test(), 0);
+    assert!(
+        census.totals_for_test().0 < totals.0,
+        "the hashes are freed"
+    );
+    assert_eq!(census.totals_for_test(), census.recounted_for_test());
+    assert_eq!(
+        census.carried_birth_for_test(key, Some(reread)),
+        Some(first)
+    );
+    assert_eq!(
+        census.carried_birth_for_test(key, Some(replaced)),
+        Some(replaced)
+    );
+    // A record without birth is simply removed.
+    census.insert_for_test(key, money_record('a', vec![1]));
+    census.invalidate_keeping_birth_for_test(key);
+    assert!(census.record_for_test(key).is_none());
+}
+
+#[test]
+fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let dir = temp_dir("money-birth-open-read");
+    let path = dir.join("d0000000-0000-4000-8000-00000000000d.jsonl");
+    fs::write(&path, "{}\n").expect("write transcript fixture");
+    let file = File::open(&path).expect("open transcript fixture");
+    let expected = file.metadata().expect("opened metadata");
+    let parser = OwnedJsonlParser::new(
+        file,
+        &path,
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        None,
+        None,
+        None,
+        false,
+        false,
+    )
+    .expect("claude parser");
+    fs::remove_file(&path).expect("remove transcript fixture");
+    let birth = parser
+        .claude_opened_birth
+        .expect("the test file system must report file birth");
+    assert!(parser
+        .accumulator
+        .claude_file_birth
+        .is_root_with_birth_for_test());
+    let created = expected
+        .created()
+        .expect("created")
+        .duration_since(UNIX_EPOCH)
+        .expect("after the epoch");
+    assert_eq!(birth.unix_seconds, created.as_secs());
+    #[cfg(unix)]
+    assert_eq!(
+        (birth.device, birth.inode),
+        (expected.dev(), expected.ino())
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn money_birth_floor_makes_placeholder_births_unknown() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    for placeholder in [0, 1, 86_400, 1_577_836_800] {
+        assert_eq!(crate::snapshots::claude_birth_seconds(placeholder), None);
+    }
+    assert_eq!(
+        crate::snapshots::claude_birth_seconds(1_577_836_801),
+        Some(1_577_836_801)
+    );
+    assert_eq!(
+        crate::snapshots::claude_birth_seconds(1_790_000_000),
+        Some(1_790_000_000)
+    );
+}
+
+#[test]
+fn money_ledger_records_are_invisible_to_d1() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let root = "a1111111-1111-4111-8111-111111111111";
+    let otel = telemetry_key(root);
+    assert!(otel.starts_with(TELEMETRY_KEY_PREFIX));
+    assert!(!otel.starts_with('/'));
+    assert_eq!(otel.len(), TELEMETRY_KEY_PREFIX.len() + 64);
+    assert!(is_ledger_key(&otel) && !is_ledger_key("/x/otel:y.jsonl"));
+    let key = format!("/money/projects/-repo/{root}.jsonl");
+    let mut index = ScanIndex::default();
+    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
+    let mut entry = manifest_index_entry(Some("body"));
+    entry.source_file_fingerprint = money_fingerprint('a');
+    // Modified in this window: not due for transcript retirement.
+    entry.modified_unix_seconds = window;
+    index.files.insert(key.clone(), entry);
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, money_record('a', vec![1, 2]));
+    let before = (
+        claude_census_disjointness_complete(&index, MONEY_WINDOW, true),
+        claude_census_member_status(&index, &key, MONEY_WINDOW, true),
+    );
+    assert_eq!(before.1, ClaudeCensusMemberStatus::Disjoint);
+    // A telemetry record holding the same ids, and a birth stub.
+    index.claude_request_census_mut_for_test().insert_for_test(
+        &otel,
+        ClaudeRequestCensusRecord::telemetry(
+            vec![1, 2],
+            money_facts(root, 2),
+            ClaudeTelemetryTailState::default(),
+            window,
+        ),
+    );
+    let stub_key = "/money/projects/-repo/stub.jsonl";
+    index.claude_request_census_mut_for_test().insert_for_test(
+        stub_key,
+        money_record('b', vec![3]).with_birth_for_test(Some(ClaudeRequestBirth {
+            unix_seconds: 1,
+            device: 1,
+            inode: 1,
+        })),
+    );
+    index
+        .claude_request_census_mut_for_test()
+        .invalidate_keeping_birth_for_test(stub_key);
+    // Ledger records live in the ledger's own store: an index holding one
+    // (a pre-release build) drops it on load, so D1 never sees it.
+    let scratch = crate::test_scratch::ScratchDir::new("money-d1-ledger-key");
+    let path = scratch.join("index.json");
+    index.save(&path).expect("save index");
+    let mut loaded = ScanIndex::load(&path).expect("load index");
+    assert!(loaded
+        .claude_request_census_for_test()
+        .record_for_test(&otel)
+        .is_none());
+    assert_eq!(
+        (
+            claude_census_disjointness_complete(&loaded, MONEY_WINDOW, true),
+            claude_census_member_status(&loaded, &key, MONEY_WINDOW, true),
+        ),
+        before
+    );
+    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+        &mut loaded,
+        &BTreeSet::from([key.clone()]),
+        &BTreeSet::new(),
+        MONEY_WINDOW,
+    );
+    assert_eq!(counts.records, 1);
+    assert_eq!(counts.hashes, 2);
+    assert_eq!(counts.duplicate_hashes, 0);
+    assert!(
+        loaded
+            .claude_request_census_for_test()
+            .record_for_test(stub_key)
+            .is_none(),
+        "an unindexed stub is pruned"
+    );
+    // The terminal prune drops one held in memory too.
+    crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &BTreeSet::from([key.clone()]),
+        &BTreeSet::new(),
+        MONEY_WINDOW,
+    );
+    assert!(index
+        .claude_request_census_for_test()
+        .record_for_test(&otel)
+        .is_none());
+}
+
+#[test]
+fn money_transcript_records_retire_after_35_days() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
+    let mut index = ScanIndex::default();
+    // (name, record mtime age, entry mtime age, seed, record seed)
+    for (name, record_age, entry_age, seed, record_seed) in [
+        ("old", Some(36), 1, 'a', 'a'),
+        ("young", Some(34), 40, 'b', 'b'),
+        ("dirty", Some(40), 40, 'c', 'd'),
+        // #664-era records have no `m`: the clean entry's mtime stands in.
+        ("legacy", None, 40, 'e', 'e'),
+        ("legacy_young", None, 30, 'f', 'f'),
+    ] {
+        let key = format!("/money/projects/{name}.jsonl");
+        let mut entry = manifest_index_entry(Some("body"));
+        entry.source_file_fingerprint = money_fingerprint(seed);
+        // The entry's mtime is deliberately the opposite of the record's.
+        entry.modified_unix_seconds = window - entry_age * 86_400;
+        index.files.insert(key.clone(), entry);
+        index.claude_request_census_mut_for_test().insert_for_test(
+            &key,
+            money_record(record_seed, vec![1, 2, 3])
+                .with_modified_for_test(record_age.map(|age: u64| window - age * 86_400)),
+        );
+    }
+    let keys = index.files.keys().cloned().collect::<BTreeSet<_>>();
+    let (aged_before, _) = crate::snapshots::claude_request_census::transcript_retirements();
+    crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+        &mut index,
+        &keys,
+        &BTreeSet::new(),
+        MONEY_WINDOW,
+    );
+    let (aged_after, _) = crate::snapshots::claude_request_census::transcript_retirements();
+    assert!(aged_after > aged_before);
+    let census = index.claude_request_census_for_test();
+    assert_eq!(census.totals_for_test(), census.recounted_for_test());
+    let census = money_census_round_trip(census);
+    for name in ["old", "legacy"] {
+        let record = census
+            .record_for_test(&format!("/money/projects/{name}.jsonl"))
+            .unwrap();
+        assert_eq!(record.retired_for_test(), Some(3), "{name}");
+        assert!(record.request_hashes_for_test().is_empty(), "{name}");
+    }
+    for name in ["young", "dirty", "legacy_young"] {
+        let record = census
+            .record_for_test(&format!("/money/projects/{name}.jsonl"))
+            .unwrap();
+        assert_eq!(record.retired_for_test(), None, "{name}");
+        assert_eq!(record.request_hashes_for_test(), &[1, 2, 3], "{name}");
+    }
+    assert_eq!(census.hash_total_for_test(), 9);
+}
+
+#[test]
+fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let mut census = ClaudeRequestCensus::default();
+    let birth = ClaudeRequestBirth {
+        unix_seconds: 1_700_000_000,
+        device: u64::MAX,
+        inode: 42,
+    };
+    census.insert_for_test(
+        "/money/projects/a.jsonl",
+        money_record('a', vec![1, 5, u64::MAX]).with_birth_for_test(Some(birth)),
+    );
+    let mut retired = money_record('b', vec![8, 9]);
+    retired.retire();
+    census.insert_for_test("/money/projects/b.jsonl", retired);
+    let modified = money_record('c', vec![4]).with_modified_for_test(Some(1_700_000_200));
+    census.insert_for_test("/money/projects/c.jsonl", modified.clone());
+    assert_eq!(census.totals_for_test(), census.recounted_for_test());
+    let loaded = money_census_round_trip(&census);
+    assert_eq!(loaded, census);
+    assert_eq!(
+        loaded
+            .record_for_test("/money/projects/b.jsonl")
+            .unwrap()
+            .retired_for_test(),
+        Some(2)
+    );
+    assert_eq!(
+        loaded
+            .record_for_test("/money/projects/c.jsonl")
+            .unwrap()
+            .modified(),
+        Some(1_700_000_200)
+    );
+
+    let mut ledger = ClaudeRequestCensus::default();
+    let tail = ClaudeTelemetryTailState {
+        device: 3,
+        inode: 4,
+        offset: 900,
+        anchor: u64::MAX,
+        line_sum: 77,
+        last_append_unix: 1_700_000_100,
+        audited_offset: 450,
+        audited_unix: 1_700_000_050,
+        missing_sweeps: 0,
+        first_event_unix: 1_699_999_000,
+        skip_bytes: 12,
+        audit: Some(ClaudeTelemetryAudit {
+            target_offset: 900,
+            target_sum: 5,
+            position: 300,
+            partial_sum: 3,
+            skip_bytes: 7,
+        }),
+    };
+    let otel = telemetry_key("root");
+    ledger.insert_for_test(
+        &otel,
+        ClaudeRequestCensusRecord::telemetry(
+            vec![2, 3],
+            money_facts("root", 2),
+            tail,
+            1_700_000_000,
+        ),
+    );
+    ledger.insert_for_test(
+        &message_key("/money/projects/c.jsonl"),
+        ClaudeRequestCensusRecord::message_record(&modified, vec![6, 7]),
+    );
+    ledger.insert_for_test(
+        "sweep:tail",
+        ClaudeRequestCensusRecord::sweep_record(
+            [9; 32],
+            1_700_000_300,
+            ClaudeLedgerSweep {
+                complete_through: 1_700_000_000,
+                debt: 1,
+            },
+        ),
+    );
+    ledger.insert_for_test(
+        "fam:x",
+        ClaudeRequestCensusRecord::family_record(
+            [8; 32],
+            1_700_000_400,
+            ClaudeFamilyMemo {
+                removed_requests: 3,
+                removed_tokens: 900,
+                snapshot: 5,
+                published: None,
+            },
+        ),
+    );
+    assert_eq!(ledger.totals_for_test(), ledger.recounted_for_test());
+    assert_eq!(
+        ledger.serialized_total_for_test(),
+        ledger.exact_serialized_len_for_test().saturating_sub(1),
+        "pairs plus separators; the map braces are the only uncharged bytes"
+    );
+    let loaded = decode_ledger_shard(&serde_json::to_vec(&ledger).unwrap()).expect("shard");
+    assert_eq!(loaded, ledger);
+    let telemetry = loaded.record_for_test(&otel).unwrap();
+    assert_eq!(telemetry.tail().copied(), Some(tail));
+    assert_eq!(telemetry.facts(), Some(&money_facts("root", 2)[..]));
+    let sweep = loaded
+        .record_for_test("sweep:tail")
+        .unwrap()
+        .sweep()
+        .unwrap();
+    assert_eq!(
+        (*sweep.0, sweep.1, sweep.2.debt),
+        ([9; 32], 1_700_000_300, 1)
+    );
+    let memo = loaded
+        .record_for_test("fam:x")
+        .unwrap()
+        .family_memo()
+        .unwrap();
+    assert_eq!((memo.1.removed_tokens, memo.1.snapshot), (900, 5));
+    let messages = loaded
+        .record_for_test(&message_key("/money/projects/c.jsonl"))
+        .unwrap();
+    assert_eq!(messages.request_hashes(), &[6, 7]);
+    assert!(messages.same_fingerprint(&modified));
+    assert_eq!(loaded.totals_for_test(), loaded.recounted_for_test());
+
+    // The index never keeps a ledger record (a pre-release index that holds
+    // one drops it on load), and a ledger shard holding a file record is
+    // damaged, never partly trusted.
+    let mut mixed = census.clone();
+    mixed.insert_for_test(&otel, ledger.record_for_test(&otel).unwrap().clone());
+    assert_eq!(money_census_round_trip(&mixed), census);
+    assert!(decode_ledger_shard(&serde_json::to_vec(&mixed).unwrap()).is_none());
+}
+
+#[test]
+fn money_census_decoder_refuses_hostile_ledger_fields() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    use base64::Engine as _;
+    let base = || {
+        serde_json::json!({
+            "v": crate::snapshots::claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,
+            "fp": money_fingerprint('a'),
+            "w": 7,
+            "s": "exact",
+            "b": base64::engine::general_purpose::STANDARD
+                .encode([1_u64, 2].iter().flat_map(|hash| hash.to_be_bytes()).collect::<Vec<_>>()),
+        })
+    };
+    let good = money_decode_one(base()).expect("control decodes");
+    assert_eq!(good.request_hashes_for_test(), &[1, 2]);
+    // The legacy hex spelling still decodes to the same record.
+    let mut legacy = base();
+    legacy.as_object_mut().unwrap().remove("b");
+    legacy["h"] = serde_json::json!(format!("{:016x}{:016x}", 1, 2));
+    assert_eq!(money_decode_one(legacy), Some(good.clone()));
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let mut cases = Vec::<(&str, serde_json::Value)>::new();
+    let mut with = |name, field: &str, value: serde_json::Value| {
+        let mut record = base();
+        record[field] = value;
+        cases.push((name, record));
+    };
+    with("b-not-base64", "b", serde_json::json!("!!!!"));
+    with("b-ragged", "b", serde_json::json!(encode(&[0, 1, 2, 3, 4])));
+    with(
+        "b-descending",
+        "b",
+        serde_json::json!(encode(
+            &[2_u64, 1]
+                .iter()
+                .flat_map(|h| h.to_be_bytes())
+                .collect::<Vec<_>>()
+        )),
+    );
+    with(
+        "b-repeated",
+        "b",
+        serde_json::json!(encode(
+            &[1_u64, 1]
+                .iter()
+                .flat_map(|h| h.to_be_bytes())
+                .collect::<Vec<_>>()
+        )),
+    );
+    with("b-wrong-type", "b", serde_json::json!([1, 2]));
+    // Facts belong to a telemetry record (with a tail).
+    with(
+        "f-without-tail",
+        "f",
+        serde_json::json!(encode(&money_facts("r", 2)[..])),
+    );
+    with("f-not-base64", "f", serde_json::json!("!!!!"));
+    with("bi-negative", "bi", serde_json::json!(-1));
+    with("bi-string", "bi", serde_json::json!("1"));
+    with("r-float", "r", serde_json::json!(1.5));
+    with("ur-only", "ur", serde_json::json!(3));
+    with("to-only", "to", serde_json::json!(3));
+    with("audit-without-tail", "xa", serde_json::json!(3));
+    with("sweep-partial", "sk", serde_json::json!(1));
+    with("family-partial", "fr", serde_json::json!(1));
+    with("m-string", "m", serde_json::json!("1"));
+    // h and b together are one field twice.
+    with("h-and-b", "h", serde_json::json!(format!("{:016x}", 1)));
+    for (name, record) in cases {
+        assert_eq!(money_decode_one(record), None, "{name}");
+    }
+    // Overflowing numbers are written raw, as a hostile file would.
+    let raw = serde_json::to_string(&base()).unwrap();
+    for field in ["bi", "r", "ur", "to"] {
+        let record = raw.replacen('{', &format!("{{\"{field}\":1e400,"), 1);
+        let mut index = serde_json::to_value(ScanIndex::default()).unwrap();
+        index["claude_request_census"] =
+            serde_json::json!({ "/money/projects/a.jsonl": "RECORD-PLACEHOLDER" });
+        let text = serde_json::to_string(&index)
+            .unwrap()
+            .replace("\"RECORD-PLACEHOLDER\"", &record);
+        let scratch = crate::test_scratch::ScratchDir::new("money-census-overflow");
+        let path = scratch.join("index.json");
+        std::fs::write(&path, text).unwrap();
+        let loaded = ScanIndex::load(&path).expect("never quarantined");
+        assert!(
+            loaded.claude_request_census_for_test().is_empty(),
+            "{field}: 1e400 is malformed"
+        );
+    }
+    // Partial groups and an audit past the offset.
+    let mut partial_birth = base();
+    partial_birth["bi"] = serde_json::json!(1);
+    partial_birth["bd"] = serde_json::json!(1);
+    assert_eq!(money_decode_one(partial_birth), None);
+    let mut tail = base();
+    for (field, value) in [
+        ("to", 10),
+        ("td", 1),
+        ("tn", 1),
+        ("ta", 1),
+        ("tc", 1),
+        ("tl", 1),
+        ("tv", 11),
+        ("tw2", 1),
+        ("tm", 0),
+        ("te", 0),
+        ("tk", 0),
+    ] {
+        tail[field] = serde_json::json!(value);
+    }
+    assert_eq!(money_decode_one(tail.clone()), None, "audited past offset");
+    tail["tv"] = serde_json::json!(10);
+    assert!(money_decode_one(tail.clone()).is_some());
+    // An audit past the record's offset is malformed.
+    for (field, value) in [("xa", 11), ("xs", 0), ("xp", 0), ("xq", 0), ("xk", 0)] {
+        tail[field] = serde_json::json!(value);
+    }
+    assert_eq!(
+        money_decode_one(tail.clone()),
+        None,
+        "audit target past offset"
+    );
+    tail["xa"] = serde_json::json!(10);
+    assert!(money_decode_one(tail.clone()).is_some());
+    // Facts must hold exactly one fact per hash.
+    let ledger_shard = |record: &serde_json::Value| {
+        let mut shard = serde_json::Map::new();
+        shard.insert(telemetry_key("r"), record.clone());
+        decode_ledger_shard(&serde_json::to_vec(&shard).unwrap())
+    };
+    tail["f"] = serde_json::json!(encode(&money_facts("r", 2)[..]));
+    assert!(ledger_shard(&tail).is_some());
+    tail["f"] = serde_json::json!(encode(&money_facts("r", 1)[..]));
+    assert!(ledger_shard(&tail).is_none(), "one fact short");
+    tail["f"] = serde_json::json!(encode(&money_facts("r", 3)[..]));
+    assert!(ledger_shard(&tail).is_none(), "one fact over");
+}
+
+#[test]
+fn money_serialized_budget_keeps_a_tombstone_reserve() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let mut census = ClaudeRequestCensus::default();
+    // Long keys spend the serialized budget without spending hashes.
+    let key = |number: usize| format!("/{number:03}{}", "k".repeat(1024 * 1024 - 4096));
+    let mut outcomes = Vec::new();
+    for number in 0..60 {
+        let outcome = census.insert_for_test(&key(number), money_record('a', vec![number as u64]));
+        outcomes.push(outcome);
+        if outcome == ClaudeRequestCensusInsert::Refused {
+            assert!(census.record_for_test(&key(number)).is_none());
+            break;
+        }
+    }
+    let stored = outcomes
+        .iter()
+        .take_while(|outcome| **outcome == ClaudeRequestCensusInsert::Stored)
+        .count();
+    assert!(stored >= 40, "{outcomes:?}");
+    assert_eq!(
+        &outcomes[stored..],
+        &[
+            ClaudeRequestCensusInsert::Tombstone,
+            ClaudeRequestCensusInsert::Refused
+        ],
+        "{outcomes:?}"
+    );
+    let tombstone = census.record_for_test(&key(stored)).unwrap();
+    assert_eq!(
+        tombstone.shape_for_test(),
+        ClaudeRequestCensusShape::OverBudget
+    );
+    assert!(census.serialized_total_for_test() <= MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES);
+    assert_eq!(
+        census.serialized_total_for_test(),
+        census.exact_serialized_len_for_test() - 1
+    );
+}
+
+#[test]
+fn money_census_round_trips_at_the_hash_cap() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let mut census = ClaudeRequestCensus::default();
+    assert_eq!(
+        census.insert_for_test(
+            "/money/projects/full.jsonl",
+            money_record('a', (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect()),
+        ),
+        ClaudeRequestCensusInsert::Stored
+    );
+    let bytes = census.exact_serialized_len_for_test();
+    assert!(
+        bytes < MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES / 2,
+        "{bytes}"
+    );
+    eprintln!(
+        "MONEY_FULL_CENSUS hashes={MAX_CLAUDE_REQUEST_CENSUS_HASHES} serialized_bytes={bytes}"
+    );
+    let loaded = money_census_round_trip(&census);
+    assert_eq!(
+        loaded.hash_total_for_test(),
+        MAX_CLAUDE_REQUEST_CENSUS_HASHES
+    );
+    assert_eq!(loaded, census);
+}

@@ -28,7 +28,6 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub(crate) mod support_health;
 
 mod bounded_read;
-pub(crate) mod telemetry_tail;
 
 pub(crate) const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";

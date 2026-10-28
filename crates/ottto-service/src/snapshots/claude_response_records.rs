@@ -53,22 +53,6 @@ impl ClaudeResponseBook {
         self.responses.iter()
     }
 
-    /// (response sequence, message id) of every response whose key carries a
-    /// message id (`claude_code_usage_dedup_key`'s `m` and `p` keys). Read
-    /// only by the P1 money shadow's armed capture; allocates nothing.
-    pub(super) fn message_keys(&self) -> impl Iterator<Item = (u64, &str)> + Clone + '_ {
-        self.index.iter().filter_map(|(key, slot)| {
-            let mut parts = key.split('\u{1f}');
-            match (parts.next(), parts.next()) {
-                (Some("m" | "p"), Some(message_id)) if !message_id.is_empty() => self
-                    .responses
-                    .get(*slot as usize)
-                    .map(|response| (response.sequence, message_id)),
-                _ => None,
-            }
-        })
-    }
-
     pub(super) fn get_mut(
         &mut self,
         key: &str,
@@ -162,7 +146,7 @@ impl ClaudeResponseBook {
 pub(super) struct CompletionBounds {
     /// `decode_peak_bound`'s value.
     pub(super) peak: usize,
-    /// What `finalize_claude_responses_captured` and `into_items` build from
+    /// What `finalize_claude_responses_e2` and `into_items` build from
     /// these responses, with their finalize scratch; `None` when it cannot
     /// be bounded.
     pub(super) output: Option<usize>,
@@ -205,7 +189,7 @@ pub(super) const ROW_COPIES: usize = 5;
 pub(super) const RFC3339_TEXT_BYTES: usize = 128;
 /// `build_row_identity`'s `selector_hash`: 16 hex digits, or "base".
 const ROW_SELECTOR_HASH_BYTES: usize = 16;
-/// The `context_bucket` selector `finalize_claude_responses_captured` may
+/// The `context_bucket` selector `finalize_claude_responses_e2` may
 /// insert: its key in both maps, "long" or "short", and its source text.
 const CONTEXT_BUCKET_BYTES: usize =
     2 * "context_bucket".len() + "short".len() + "derived_from_effective_input_volume".len();
@@ -300,7 +284,7 @@ struct BookOutput {
 }
 
 impl BookOutput {
-    /// Adds one resolved response: what `finalize_claude_responses_captured`
+    /// Adds one resolved response: what `finalize_claude_responses_e2`
     /// builds from it (cache request, request-id set entry, occurrence with
     /// its selector `Arc`, the `shared_selectors` entry, a usage row and
     /// bucket, tool names) and what `into_items` clones from that row. A
@@ -323,7 +307,7 @@ impl BookOutput {
         if records == 0 {
             return Some(self);
         }
-        // `finalize_claude_responses_captured` may insert `context_bucket`.
+        // `finalize_claude_responses_e2` may insert `context_bucket`.
         let selector = selector_bytes.checked_add(CONTEXT_BUCKET_BYTES)?;
         let entries = selector_entries.checked_add(2)?;
         let row_copy = effort
