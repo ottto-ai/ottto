@@ -40186,16 +40186,10 @@ fn ensure_bounded_traversal(
         index.claude_full_rearm_progress.full_rearm_window_next = false;
         // Validate retained provenance before refund or candidate selection.
         // Old decoders omit it; corrupt progress cannot keep a Fix 2 carry.
-        let mut retained = std::mem::take(&mut index.claude_stale_family_carry);
+        let retained = std::mem::take(&mut index.claude_stale_family_carry);
         // A completed checkpoint already takes the ordinary fresh-start
         // stale-pending re-arm below; only an active walk needs rewinding.
         if !recompute_terminal_carry && !retained.is_empty() && index.traversal.is_some() {
-            // This consumed buffer is used only for fingerprint clears below.
-            // Sort it in place for bounded key lookup, without changing any
-            // live selection/replay order or allocating another key set.
-            retained
-                .replay
-                .sort_unstable_by(|a, b| a.path.to_string_lossy().cmp(&b.path.to_string_lossy()));
             for (key, entry) in &mut index.files {
                 if claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
                     retained.roots.contains(member.root)

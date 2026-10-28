@@ -179,8 +179,6 @@ impl OwnedJsonlParser {
             now,
         )?;
         let mode = plan.mode();
-        if matches!(mode, ReadMode::Full(_)) {
-        }
         if matches!(mode, ReadMode::Full(_)) && self.source == SnapshotSource::Codex {
             self.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
         }
