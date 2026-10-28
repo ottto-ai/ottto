@@ -8,7 +8,7 @@ use super::reader::{LineEvent, LineReader};
 use super::upload::safe_file_name;
 use super::{claude, codex};
 use crate::composition_kinds::{
-    self as kinds, Agent, Author, CallClass, CellShare, GitRootCache, Kind, KindsVersion, LineCtx,
+    self as kinds, Author, CallClass, CellShare, GitRootCache, Kind, KindsVersion, LineCtx,
     Request1,
 };
 use std::fs::File;
@@ -102,15 +102,13 @@ impl LineSink<'_> {
     pub(super) fn ctx<'p>(
         &self,
         state: &ParseState,
-        agent: Agent,
         cwd: Option<&'p Path>,
         file_has_rendered: bool,
         author: Author,
     ) -> LineCtx<'p> {
         match self.kinds {
-            KindsVersion::V1 => LineCtx::v1(agent),
+            KindsVersion::V1 => LineCtx::v1(),
             KindsVersion::V2 => LineCtx::v2(
-                agent,
                 if state.request1_closed {
                     Request1::No
                 } else if state.start_measured {

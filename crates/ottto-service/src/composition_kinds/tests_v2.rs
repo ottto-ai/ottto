@@ -11,22 +11,16 @@ use std::path::Path;
 
 const WORKSPACE: &str = "/w/repo";
 
-fn ctx(agent: Agent) -> LineCtx<'static> {
-    LineCtx::v2(
-        agent,
-        Request1::No,
-        Some(Path::new(WORKSPACE)),
-        true,
-        Author::You,
-    )
+fn ctx() -> LineCtx<'static> {
+    LineCtx::v2(Request1::No, Some(Path::new(WORKSPACE)), true, Author::You)
 }
 
 fn claude() -> LineCtx<'static> {
-    ctx(Agent::Claude)
+    ctx()
 }
 
 fn codex() -> LineCtx<'static> {
-    ctx(Agent::Codex)
+    ctx()
 }
 
 fn with_request_1(mut ctx: LineCtx<'static>, request_1: Request1) -> LineCtx<'static> {
@@ -940,7 +934,7 @@ fn claude_user_text_authors_and_reports() {
     );
     // kinds_version 1 measures no user text.
     assert_eq!(
-        claude_user_text(&LineCtx::v1(Agent::Claude), &prompt),
+        claude_user_text(&LineCtx::v1(), &prompt),
         Verdict::Skip(SkipReason::NotMeasured)
     );
 }
