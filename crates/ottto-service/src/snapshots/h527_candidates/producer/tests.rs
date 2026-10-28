@@ -1019,12 +1019,12 @@ fn source_r4_unrelated_target_proceeds_and_copy_lineage_is_transitive() {
     assert!(same_lineage(
         left,
         right,
-        &[
+        &BTreeSet::from([
             ("root-a".into(), "middle".into()),
             ("middle".into(), "root-b".into())
-        ]
+        ])
     ));
-    assert!(!same_lineage(left, right, &[]));
+    assert!(!same_lineage(left, right, &BTreeSet::new()));
     fs::remove_dir_all(fixture.root).unwrap();
 }
 
@@ -1096,4 +1096,59 @@ fn source_r4_missing_evidence_counted_and_exact_tuple_copy_excluded() {
         assert!(report["missing_evidence_counted"]["usd"].is_null());
         fs::remove_dir_all(fixture.root).unwrap();
     }
+}
+
+#[test]
+fn source_r4_tuple_guard_drops_whole_progressive_response() {
+    let fixture = fixture();
+    let target = &fixture.input.targets[17];
+    let mut final_line = assistant_line(
+        &target.source_session_id,
+        4,
+        ("missing-progressive", 123, 7, 456),
+    );
+    final_line.as_object_mut().unwrap().remove("requestId");
+    let mut early = final_line.clone();
+    early["timestamp"] = json!("2026-09-02T06:04:00Z");
+    early["message"]["usage"]["output_tokens"] = json!(1);
+    let mut lines = transcript_lines(&target.source_session_id, &[("req-t18-a", 25, 2, 100)]);
+    lines.extend([early, final_line.clone()]);
+    write_lines(&target.transcript_path, &lines);
+    final_line["sessionId"] = json!(session_id(902));
+    write_lines(
+        &fixture.input.peer_roots[0]
+            .path
+            .join("proj-a")
+            .join(format!("{}.jsonl", session_id(902))),
+        &[final_line],
+    );
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    let report = target_report(&artifact, 18);
+    assert_eq!(
+        report["candidate_status"], "computed_unqualified",
+        "{report}"
+    );
+    assert_eq!(report["missing_evidence_matched_by_tuple"]["lines"], 1);
+    assert_eq!(report["body"]["item_totals"]["input_tokens"], 25);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_all_idless_usage_stays_counted() {
+    let fixture = fixture();
+    let target = &fixture.input.targets[17];
+    let mut line = assistant_line(&target.source_session_id, 5, ("only-missing", 123, 7, 456));
+    line.as_object_mut().unwrap().remove("requestId");
+    write_lines(&target.transcript_path, &[line]);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    let report = target_report(&artifact, 18);
+    assert_eq!(
+        report["candidate_status"], "computed_unqualified",
+        "{report}"
+    );
+    assert_eq!(report["missing_evidence_counted"]["lines"], 1);
+    assert_eq!(report["body"]["item_totals"]["input_tokens"], 123);
+    fs::remove_dir_all(fixture.root).unwrap();
 }

@@ -119,6 +119,7 @@ const MAX_CENSUS_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone)]
 struct MissingUsage {
+    response_key: Option<String>,
     tuple: Option<String>,
     dims: Dims,
 }
@@ -157,18 +158,39 @@ fn line_usage_tuple(value: &Value) -> Option<String> {
     )
 }
 thread_local! {
+    static MISSING_RESPONSE_KEYS: RefCell<BTreeMap<u64, String>> = const { RefCell::new(BTreeMap::new()) };
+    static EXCLUDED_RESPONSE_KEYS: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     static EXCLUDED_TUPLES: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
 }
-struct TupleExclusionGuard(BTreeSet<String>);
+struct ResponseKeyCapture(BTreeMap<u64, String>);
+impl ResponseKeyCapture {
+    fn install() -> Self {
+        Self(MISSING_RESPONSE_KEYS.with(|cell| cell.take()))
+    }
+}
+impl Drop for ResponseKeyCapture {
+    fn drop(&mut self) {
+        MISSING_RESPONSE_KEYS.with(|cell| {
+            cell.replace(std::mem::take(&mut self.0));
+        });
+    }
+}
+struct TupleExclusionGuard(BTreeSet<String>, BTreeSet<String>);
 impl TupleExclusionGuard {
-    fn install(tuples: BTreeSet<String>) -> Self {
-        Self(EXCLUDED_TUPLES.with(|cell| cell.replace(tuples)))
+    fn install(tuples: BTreeSet<String>, keys: BTreeSet<String>) -> Self {
+        Self(
+            EXCLUDED_TUPLES.with(|cell| cell.replace(tuples)),
+            EXCLUDED_RESPONSE_KEYS.with(|cell| cell.replace(keys)),
+        )
     }
 }
 impl Drop for TupleExclusionGuard {
     fn drop(&mut self) {
         EXCLUDED_TUPLES.with(|cell| {
             cell.replace(std::mem::take(&mut self.0));
+        });
+        EXCLUDED_RESPONSE_KEYS.with(|cell| {
+            cell.replace(std::mem::take(&mut self.1));
         });
     }
 }
@@ -247,7 +269,7 @@ fn project_name(path: &Path) -> Option<&std::ffi::OsStr> {
 fn root_id(session: &str) -> &str {
     session.split("_agent-").next().unwrap_or(session)
 }
-fn same_lineage(left: &Path, right: &Path, edges: &[(String, String)]) -> bool {
+fn same_lineage(left: &Path, right: &Path, edges: &BTreeSet<(String, String)>) -> bool {
     let (Some(left_root), Some(right_root)) = (family_root(left), family_root(right)) else {
         // An unclassifiable vanished path cannot prove non-lineage.
         return true;
@@ -302,7 +324,7 @@ fn resolve_vanished(
                         PeerHit {
                             path_sha256: witness.clone(),
                             owner_session_sha256: None,
-                            line_count: 1,
+                            line_count: 0,
                             inherited_from_absent_source: false,
                         },
                     );
@@ -677,10 +699,19 @@ fn line_request_id(value: &Value) -> Option<String> {
 /// the session exactly as a fork-copied line does. Fork-marked lines always
 /// reach the ordinary step unchanged, so their own provenance handling holds.
 fn apply_claude_code_line_excluding(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    let response_key = line_request_id(value)
+        .is_none()
+        .then(|| crate::snapshots::claude_code_usage_dedup_key(value))
+        .flatten();
+    let excluded_key = response_key.as_ref().is_some_and(|key| {
+        EXCLUDED_RESPONSE_KEYS.with(|cell| cell.borrow().contains(&sha256_hex(key.as_bytes())))
+    });
     let excluded = claude_fork_line_provenance(value) == ClaudeForkLineProvenance::None
-        && (line_request_id(value).is_none()
-            && line_usage_tuple(value)
-                .is_some_and(|tuple| EXCLUDED_TUPLES.with(|cell| cell.borrow().contains(&tuple)))
+        && (excluded_key
+            || line_request_id(value).is_none()
+                && line_usage_tuple(value).is_some_and(|tuple| {
+                    EXCLUDED_TUPLES.with(|cell| cell.borrow().contains(&tuple))
+                })
             || line_request_id(value).is_some_and(|request_id| {
                 EXCLUDED_REQUEST_IDS.with(|cell| {
                     cell.borrow()
@@ -698,11 +729,19 @@ fn apply_claude_code_line_excluding(value: &Value, accumulator: &mut SnapshotAcc
         return;
     }
     apply_claude_code_line(value, accumulator);
+    if let Some(key) = response_key {
+        if let Some(response) = accumulator.claude_responses.get_mut(&key) {
+            MISSING_RESPONSE_KEYS.with(|cell| {
+                cell.borrow_mut()
+                    .insert(response.sequence, sha256_hex(key.as_bytes()));
+            });
+        }
+    }
 }
 
 struct ParsedTarget {
     missing: Vec<MissingUsage>,
-    lineage_edges: Vec<(String, String)>,
+    lineage_edges: BTreeSet<(String, String)>,
     complete: bool,
     snapshots: Vec<SnapshotItem>,
 }
@@ -722,6 +761,7 @@ fn parse_target_transcript(
     context_curve_enabled: bool,
     excluded: Option<BTreeSet<String>>,
 ) -> Result<ParsedTarget, String> {
+    let _capture = ResponseKeyCapture::install();
     let source = SnapshotSource::ClaudeCode;
     let mut file = File::open(path).map_err(|error| format!("open: {error}"))?;
     let opened =
@@ -775,6 +815,8 @@ fn parse_target_transcript(
         {
             if response.request_id.is_none() {
                 missing.push(MissingUsage {
+                    response_key: MISSING_RESPONSE_KEYS
+                        .with(|cell| cell.borrow().get(&response.sequence).cloned()),
                     tuple: usage_tuple(
                         response.terminal_timestamp.as_deref(),
                         response.model.as_deref(),
@@ -790,7 +832,7 @@ fn parse_target_transcript(
         .claude_fork_parent
         .as_ref()
         .zip(parser.accumulator.source_session_id.as_ref())
-        .map(|(parent, child)| vec![(parent.clone(), child.clone())])
+        .map(|(parent, child)| BTreeSet::from([(parent.clone(), child.clone())]))
         .unwrap_or_default();
     let parsed = parser
         .finish_with_repository_identity(
@@ -853,7 +895,7 @@ struct TargetParse {
 
 struct OriginalTarget {
     missing: Vec<MissingUsage>,
-    lineage_edges: Vec<(String, String)>,
+    lineage_edges: BTreeSet<(String, String)>,
     item: SnapshotItem,
     request_ids: BTreeSet<String>,
     totals: Dims,
@@ -960,7 +1002,7 @@ struct PeerScan {
     vanished_census_used: u64,
     vanished_no_census: u64,
     lineage_held: BTreeSet<usize>,
-    lineage_edges: Vec<(String, String)>,
+    lineage_edges: BTreeSet<(String, String)>,
     tuple_hits: Vec<BTreeSet<String>>,
 }
 
@@ -1229,7 +1271,7 @@ pub(crate) fn produce(
         "scope_session_keys": members.iter().map(|member| member.session_key_sha256.as_str()).collect::<Vec<_>>(),
         "input_manifest": input_manifest,
         "global_coverage": {
-            "complete": coverage.complete(),
+            "complete": coverage.complete() && peers.lineage_held.is_empty(),
             "unknown": coverage.unknown,
             "cap_overflow": coverage.cap_overflow,
         },
@@ -1319,7 +1361,7 @@ pub(crate) fn produce(
         "candidate_bundle_sha256": candidate_bundle_sha256,
         "disclosures_sha256": disclosures_json.as_deref().map(|json| sha256_hex(json.as_bytes())),
         "input_bundle_sha256": input_sha256,
-        "global_coverage_complete": coverage.complete(),
+        "global_coverage_complete": coverage.complete() && peers.lineage_held.is_empty(),
         "computed_unqualified_candidates": computed_count,
         "held_packet_members": target_count,
         "held_reason_counts": reason_counts,
@@ -2025,7 +2067,7 @@ struct TargetCopies {
     content_sha256: String,
     /// (request id, the source session the copy names)
     copies: Vec<(String, Option<String>)>,
-    lineage_edges: Vec<(String, String)>,
+    lineage_edges: BTreeSet<(String, String)>,
 }
 
 /// Stream one target transcript for its fork-copied lines carrying a request
@@ -2040,7 +2082,7 @@ fn read_target_copies(
     let mut total = 0_u64;
     let mut line = Vec::new();
     let mut copies = Vec::new();
-    let mut lineage_edges = Vec::new();
+    let mut lineage_edges = BTreeSet::new();
     loop {
         line.clear();
         let read = (&mut reader)
@@ -2060,7 +2102,7 @@ fn read_target_copies(
             continue;
         };
         if let Some((owner, parent)) = line_session_id(&value).zip(forked_from_session(&value)) {
-            lineage_edges.push((owner, parent));
+            lineage_edges.insert((owner, parent));
         }
         if claude_fork_line_provenance(&value) != ClaudeForkLineProvenance::Inherited
             || claude_code_delta_usage(&value).is_none()
@@ -2279,7 +2321,7 @@ fn scan_peer_file(
         .flatten()
         {
             if let Some(owner) = owner {
-                scan.lineage_edges.push((owner.clone(), parent));
+                scan.lineage_edges.insert((owner.clone(), parent));
             }
         }
         // Retain only tuples that a target's already-resolved id-less response
@@ -2545,6 +2587,7 @@ fn build_target(
         "b2_first_ack_order": target.b2_first_ack_order,
         "cross_session_conservation": Conservation::Unknown.as_str(),
         "same_session_peer_line_count": peers.same_session_line_count[index],
+        "lineage_coverage_complete": coverage.complete() && !peers.lineage_held.contains(&index),
     });
     let hold = |mut report: Value, hold: TargetHold| {
         report["candidate_status"] = json!("held");
@@ -2565,6 +2608,8 @@ fn build_target(
         "request_set_fingerprint": request_set_fingerprint(&original.request_ids),
         "totals": original.totals.json(),
     });
+    let initial_residual = sum_missing(&original.missing).expect("validated missing sum");
+    report["missing_evidence_counted"] = json!({"lines": initial_residual.request_count, "totals": initial_residual.json(), "usd": Value::Null, "usd_basis": "admission_catalog_required"});
     if let Some(reason) = coverage.held_reason().or_else(|| {
         peers
             .lineage_held
@@ -2676,7 +2721,14 @@ fn build_target(
                 });
                 witness["peer_path_sha256"] = json!(hit.path_sha256);
                 witness["peer_owner_session_sha256"] = json!(hit.owner_session_sha256);
-                witness["peer_line_count"] = json!(hit.line_count);
+                witness["peer_line_count"] = if hit.line_count == 0 {
+                    Value::Null
+                } else {
+                    json!(hit.line_count)
+                };
+                if hit.line_count == 0 {
+                    witness["evidence_basis"] = json!("vanished_census_used");
+                }
             }
             Keeper::Target(keeper) => {
                 witness["cause"] = json!("b2_other_target");
@@ -2713,7 +2765,16 @@ fn build_target(
     }
 
     // Rebuild through the same parser, then reconcile exactly.
-    let _tuple_guard = TupleExclusionGuard::install(matched_tuples.clone());
+    let matched_keys = matched
+        .iter()
+        .filter_map(|missing| missing.response_key.clone())
+        .collect();
+    let keyless_tuples = matched
+        .iter()
+        .filter(|missing| missing.response_key.is_none())
+        .filter_map(|missing| missing.tuple.clone())
+        .collect();
+    let _tuple_guard = TupleExclusionGuard::install(keyless_tuples, matched_keys);
     let mut item = if excluded_ids.is_empty() && matched_tuples.is_empty() {
         original.item.clone()
     } else {
