@@ -461,8 +461,10 @@ preparation/save events after work, without creating a comparison permit.
   `authority_unbound_revision`, `authority_correction_pending`,
   `account_hold_unrecorded`, `not_restorable`. The first three count held
   snapshots in the existing progress-blocking classification: missing or
-  mismatched revision/witness evidence; a RetryPending record with a correction
-  grant; or an account deferral without its durable disclosure. The correction
+  mismatched revision/witness evidence or an invalid/unbounded authority record
+  (including failed contract, fingerprint-shape, failure-count or deadline
+  checks); a RetryPending record with a correction grant; or an account deferral
+  without its durable disclosure. The correction
   label wins when that branch rejects the record before checking its witness or
   member revision. Missing revision or record/witness pair is unbound.
   `not_restorable` counts completed commit attempts whose non-progress-blocking
