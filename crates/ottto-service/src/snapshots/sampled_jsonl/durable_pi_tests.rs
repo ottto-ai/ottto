@@ -18,6 +18,8 @@ const CANARY_SYSTEM: &str = "CANARY_SYSTEM_pi_private";
 const CANARY_SUMMARY: &str = "CANARY_SUMMARY_pi_private";
 const CANARY_CHECKPOINT: &str = "CANARY_CHECKPOINT_pi_private";
 const CANARY_PARENT: &str = "/tmp/CANARY_PARENT_pi_private/session.jsonl";
+const CANARY_SELECTOR: &str = "/tmp/selector_canary_pi_uploaded/context";
+const CANARY_WITHHELD: &str = "/tmp/selector_canary_pi_withheld/context";
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -106,6 +108,10 @@ fn full_digest(reduction: &CachedJsonlReduction) -> [u8; 32] {
 }
 
 fn items(parser: OwnedJsonlParser, path: &Path) -> Value {
+    serde_json::to_value(snapshots(parser, path)).unwrap()
+}
+
+fn snapshots(parser: OwnedJsonlParser, path: &Path) -> Vec<SnapshotItem> {
     let identity =
         opened_object_identity(SnapshotSource::Pi, &mut File::open(path).unwrap()).unwrap();
     let parsed = parser
@@ -124,7 +130,25 @@ fn items(parser: OwnedJsonlParser, path: &Path) -> Value {
     assert_eq!(parsed.recognized_usage_drop_count, 0);
     assert_eq!(parsed.dropped_usage_record_count, 0);
     assert!(!parsed.zero_snapshot_usage_evidence);
-    serde_json::to_value(parsed.snapshots).unwrap()
+    parsed.snapshots
+}
+
+fn upload_body(path: &Path) -> Value {
+    let mut cold = parser(path);
+    while !cold.step().unwrap() {}
+    let mut snapshots = snapshots(cold, path);
+    let policy = SnapshotUploadPolicy::default();
+    apply_upload_policy(SnapshotSource::Pi, &mut snapshots, policy);
+    serde_json::to_value(SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: SnapshotSource::Pi.api_slug().into(),
+        machine_id: "synthetic-pi-machine".into(),
+        collector_version: None,
+        snapshots,
+        upload_policy: policy,
+        client_report: crate::client_report::ClientReport::empty(),
+    })
+    .unwrap()
 }
 
 fn usage(shape: &str, response: Option<&str>) -> String {
@@ -153,6 +177,8 @@ fn privacy_lines() -> Vec<String> {
         json!({"type":"message","timestamp":AT,"message":{"role":"system","content":system}}).to_string(),
         json!({"type":"message","timestamp":AT,"message":{"role":"user","content":[
             {"type":"text","text":CANARY_PROMPT}]}}).to_string(),
+        json!({"type":"custom","customType":"ottto-selector","timestamp":AT,
+            "data":{"selector_context":{"region_mode":CANARY_SELECTOR}}}).to_string(),
         usage("message", Some(CANARY_RESPONSE)),
         json!({"type":"compaction","id":"compact-fixture","timestamp":AT,
             "firstKeptEntryId":"entry-fixture","tokensBefore":100,
@@ -162,15 +188,22 @@ fn privacy_lines() -> Vec<String> {
 }
 
 fn assert_private(bytes: &[u8]) {
+    assert_excludes(
+        bytes,
+        &[
+            CANARY_RESPONSE,
+            CANARY_PROMPT,
+            CANARY_SYSTEM,
+            CANARY_SUMMARY,
+            CANARY_CHECKPOINT,
+            CANARY_PARENT,
+        ],
+    );
+}
+
+fn assert_excludes(bytes: &[u8], canaries: &[&str]) {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-    for canary in [
-        CANARY_RESPONSE,
-        CANARY_PROMPT,
-        CANARY_SYSTEM,
-        CANARY_SUMMARY,
-        CANARY_CHECKPOINT,
-        CANARY_PARENT,
-    ] {
+    for &canary in canaries {
         let hex = canary
             .as_bytes()
             .iter()
@@ -209,6 +242,37 @@ fn pi_record_and_store_diagnostics_exclude_private_canaries() {
     assert_eq!(reduction.accumulator.seen_pi_usage_keys.len(), 1);
     let encoded = body(&reduction);
     assert_private(&encoded);
+    let uploaded = upload_body(&path);
+    assert_eq!(uploaded["snapshots"].as_array().unwrap().len(), 1);
+    let uploaded = &uploaded["snapshots"][0];
+    let rows = uploaded["usage_buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|bucket| bucket["model_usage"].as_array().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!rows.is_empty());
+    assert!(!uploaded["model_usage"].as_array().unwrap().is_empty());
+    for row in rows
+        .iter()
+        .copied()
+        .chain(uploaded["model_usage"].as_array().unwrap())
+    {
+        assert_eq!(row["selector_context"]["region_mode"], CANARY_SELECTOR);
+    }
+    assert_eq!(
+        reduction.accumulator.current_selector.context["region_mode"],
+        CANARY_SELECTOR
+    );
+    // Clear copies belong only to uploaded bucket row contexts and the
+    // running selector carrying that same normalized value.
+    assert_eq!(
+        encoded
+            .windows(CANARY_SELECTOR.len())
+            .filter(|bytes| *bytes == CANARY_SELECTOR.as_bytes())
+            .count(),
+        1 + rows.len()
+    );
     verify(&encoded).expect("Pi structural verification");
     let (restored, receipt) = restore(&path, &encoded);
     assert_eq!(full_digest(&restored), full_digest(&reduction));
@@ -237,7 +301,6 @@ fn pi_record_and_store_diagnostics_exclude_private_canaries() {
     };
     let written = disk.write_after_save(&lock, 1, vec![pending]).unwrap();
     assert_eq!(written.written, 1);
-    assert_private(format!("{written:?}").as_bytes());
     drop(disk);
     let mut disk = store::DurableTailStore::new(dir.clone(), DurableSource::Pi);
     let found = match disk.read(&key, &allowlist) {
@@ -260,8 +323,40 @@ fn pi_record_and_store_diagnostics_exclude_private_canaries() {
         rederive_line_bytes: receipt.line_bytes,
         ..Counters::default()
     };
-    assert_private(counts.summary(SnapshotSource::Pi, &store_counts).as_bytes());
-    assert_private(format!("{counts:?} {store_counts:?}").as_bytes());
+    for output in [
+        format!("{written:?}"),
+        counts.summary(SnapshotSource::Pi, &store_counts),
+        format!("{counts:?} {store_counts:?}"),
+        serde_json::to_string(&crate::local_resource_diagnostics::cache_lifecycle::snapshot())
+            .unwrap(),
+    ] {
+        assert_private(output.as_bytes());
+        assert_excludes(output.as_bytes(), &[CANARY_SELECTOR]);
+    }
+}
+
+#[test]
+#[ignore = "pending SOURCE ruling on withheld selector keys"]
+fn pi_withheld_selector_canary_is_absent_from_record_bytes() {
+    let scratch = Scratch::new();
+    let path = scratch.write(&[
+        header(),
+        json!({"type":"custom","customType":"ottto-selector","timestamp":AT,
+            "data":{"selector_context":{"plan_window_bucket":CANARY_WITHHELD}}})
+        .to_string(),
+        usage("message", Some("withheld-selector-fixture")),
+    ]);
+    let (reduction, _) = full_read(&path);
+    assert_eq!(
+        reduction.accumulator.current_selector.context["plan_window_bucket"],
+        CANARY_WITHHELD
+    );
+    assert_excludes(
+        &serde_json::to_vec(&upload_body(&path)).unwrap(),
+        &[CANARY_WITHHELD],
+    );
+    // Expected to fail until SOURCE/E1 resolve the shared put-time gap.
+    assert_excludes(&body(&reduction), &[CANARY_WITHHELD]);
 }
 
 fn ledger_lines() -> (Vec<String>, Vec<String>) {
