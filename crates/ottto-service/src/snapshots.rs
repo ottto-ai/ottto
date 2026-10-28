@@ -33661,7 +33661,7 @@ fn recognized_usage_shape_was_dropped(source: SnapshotSource, value: &Value) -> 
         }
         SnapshotSource::Pi => {
             pi_usage_event(value)
-                && value.pointer("/message/usage").is_some()
+                && pi_usage_value(value).is_some()
                 && pi_message_usage(value).is_none()
         }
     }
@@ -37385,8 +37385,41 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                 .set_model(string_at(value, &["modelId"]).or_else(|| string_at(value, &["model"])));
             accumulator.note_pi_time(pi_timestamp_field(value));
         }
+        // Pi 0.81.0+ bills summary generation on these entries and 0.86.0+
+        // writes `usage` entries (e.g. cache warming); Pi's session totals add
+        // each exactly once and no assistant message repeats them.
+        Some("compaction" | "branch_summary" | "usage") => {
+            apply_pi_entry_usage(value, accumulator);
+            accumulator.note_pi_time(pi_timestamp_field(value));
+        }
         _ => {}
     }
+}
+
+/// Usage carried on a Pi entry rather than an assistant message. It has no
+/// response id, so every occurrence counts and the dedup ledger is untouched.
+/// `usage` entries name their model; summaries run on the session's current
+/// model, which `place_usage` falls back to when `model` is None.
+fn apply_pi_entry_usage(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    let Some(usage) = pi_message_usage(value) else {
+        return;
+    };
+    let timestamp = pi_timestamp_value(value.get("timestamp"));
+    if timestamp.is_none() && value.get("timestamp").is_some() {
+        if !usage.is_zero() {
+            accumulator.note_dropped_usage();
+        }
+        return;
+    }
+    let mut selector = accumulator.current_selector.clone();
+    selector.merge(pi_selector_from_usage_message(value));
+    accumulator.add_usage_with_selector(
+        string_at(value, &["model"]),
+        usage,
+        selector,
+        timestamp.as_deref(),
+        None,
+    );
 }
 
 fn pi_message_role(value: &Value) -> Option<String> {
@@ -37395,8 +37428,24 @@ fn pi_message_role(value: &Value) -> Option<String> {
 
 fn pi_usage_event(value: &Value) -> bool {
     string_eq_at(value, &["type"], "message_end")
+        || pi_entry_carries_usage(value)
         || (string_eq_at(value, &["type"], "message")
             && pi_message_role(value).as_deref() == Some("assistant"))
+}
+
+fn pi_entry_carries_usage(value: &Value) -> bool {
+    matches!(
+        string_at(value, &["type"]).as_deref(),
+        Some("compaction" | "branch_summary" | "usage")
+    )
+}
+
+fn pi_usage_value(value: &Value) -> Option<&Value> {
+    if pi_entry_carries_usage(value) {
+        value.get("usage")
+    } else {
+        value.pointer("/message/usage")
+    }
 }
 
 fn pi_usage_dedup_key(value: &Value) -> Option<String> {
@@ -37640,7 +37689,7 @@ fn activity_bucket_from_timestamp(value: &str) -> Option<(String, String)> {
 }
 
 fn pi_message_usage(value: &Value) -> Option<UsageTotals> {
-    let usage = value.pointer("/message/usage")?;
+    let usage = pi_usage_value(value)?;
     if !usage_object_has_numeric_field(
         usage,
         &[
@@ -77882,6 +77931,198 @@ mod tests {
         aggregate.add(&invalid);
         assert!(!aggregate.reported);
         assert_eq!(aggregate.snapshot_cost(), None);
+    }
+
+    #[test]
+    fn pi_summary_usage_adds_once_after_assistant_in_the_envelope_hour() {
+        for entry_type in ["compaction", "branch_summary"] {
+            let path = temp_file(&format!("pi-{entry_type}-usage"));
+            let summary = serde_json::json!({
+                "type": entry_type, "timestamp": "2026-07-22T09:00:01Z",
+                "usage": {"input": 20, "output": 5, "cost": {"total": 0.002}}
+            });
+            fs::write(
+                &path,
+                format!(
+                    "{}\n{}\n{}\n",
+                    serde_json::json!({"type": "session", "id": "fixture-session",
+                    "timestamp": "2026-07-22T08:00:00Z"}),
+                    serde_json::json!({"type": "message", "message": {
+                    "role": "assistant", "model": "gpt-5.4", "provider": "openai",
+                    "responseId": "fixture-response", "timestamp": "2026-07-22T08:59:59Z",
+                    "usage": {"input": 12, "output": 4, "cost": {"total": 0.001}}}}),
+                    summary,
+                ),
+            )
+            .expect("write summary fixture");
+            let item = parse_pi_jsonl_file(&path, "2026-07-22T09:02:00Z", "fp".into())
+                .expect("parse")
+                .remove(0);
+            assert_eq!(item.request_count, 2);
+            assert_eq!(item.input_tokens, 32);
+            assert_eq!(item.output_tokens, 9);
+            assert_eq!(
+                item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                Some("0.003")
+            );
+            assert_eq!(item.usage_buckets.len(), 2);
+            let bucket = item
+                .usage_buckets
+                .iter()
+                .find(|b| b.bucket_start == "2026-07-22T09:00:00Z")
+                .unwrap();
+            assert_eq!(bucket.model_usage.len(), 1);
+            let row = &bucket.model_usage[0];
+            assert_eq!(row.model, "gpt-5.4");
+            assert_eq!(row.request_count, 1);
+            assert_eq!(row.input_tokens, 20);
+            assert_eq!(row.cost_usd.as_deref(), Some("0.002"));
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn pi_usage_entries_use_own_model_provider_and_count_every_kind_and_occurrence() {
+        let path = temp_file("pi-usage-entry-kinds");
+        let mut fixture = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "model_change", "modelId": "gemini-2.5-pro"
+            })
+        );
+        for kind in ["cache_warm", "future_kind", "cache_warm"] {
+            let entry = serde_json::json!({
+                "type": "usage", "kind": kind, "id": "fixture-entry",
+                "responseId": "fixture-response", "provider": "openai", "model": "gpt-5.4",
+                "timestamp": "2026-07-22T09:00:01Z",
+                "usage": {"input": 10, "output": 2, "cacheRead": 3, "cacheWrite": 4,
+                    "cost": {"total": 0.001}}
+            });
+            fixture.push_str(&format!("{entry}\n"));
+        }
+        fs::write(&path, &fixture).expect("write usage entry fixture");
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T09:02:00Z", "fp".into())
+            .expect("parse")
+            .remove(0);
+        assert_eq!(item.request_count, 3);
+        assert_eq!(item.model_usage.len(), 1);
+        let row = &item.model_usage[0];
+        assert_eq!(row.model, "gpt-5.4");
+        assert_eq!(row.model_provider.as_deref(), Some("openai"));
+        assert_eq!(row.input_tokens, 30);
+        assert_eq!(row.output_tokens, 6);
+        assert_eq!(row.cache_read_tokens, 9);
+        assert_eq!(row.cache_creation_5m_tokens, 12);
+        assert_eq!(row.cost_usd.as_deref(), Some("0.003"));
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Pi);
+        for line in fixture.lines() {
+            apply_pi_line(&serde_json::from_str(line).unwrap(), &mut accumulator);
+        }
+        assert!(accumulator.seen_pi_usage_keys.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_entry_only_files_have_usage_coverage_without_false_drops() {
+        for entry_type in ["compaction", "branch_summary", "usage"] {
+            let root = temp_dir(&format!("pi-{entry_type}-only"));
+            fs::write(
+                root.join("session.jsonl"),
+                format!(
+                    "{}\n{}\n{}\n",
+                    serde_json::json!({"type": "session", "id": "fixture-session",
+                    "timestamp": "2026-07-22T08:00:00Z"}),
+                    serde_json::json!({"type": "model_change", "modelId": "gpt-5.4"}),
+                    serde_json::json!({"type": entry_type, "timestamp": "2026-07-22T08:01:00Z",
+                    "usage": {"input": 20, "output": 5}}),
+                ),
+            )
+            .expect("write entry-only fixture");
+            let scan = scan_source_roots(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut ScanIndex::default(),
+                "2026-07-22T08:02:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("scan entry-only fixture");
+            assert_eq!(scan.snapshots.len(), 1);
+            assert_eq!(scan.snapshots[0].request_count, 1);
+            assert_eq!(scan.snapshots[0].model_usage[0].model, "gpt-5.4");
+            assert_eq!(scan.dropped_usage_record_count, 0);
+            assert_eq!(scan.zero_snapshot_usage_evidence_count, 0);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn pi_entry_usage_invalid_time_and_malformed_usage_are_counted_as_drops() {
+        for entry_type in ["compaction", "branch_summary", "usage"] {
+            for (timestamp, usage) in [
+                ("invalid", serde_json::json!({"input": 20})),
+                (
+                    "2026-07-22T08:01:00Z",
+                    serde_json::json!({"input": "invalid"}),
+                ),
+            ] {
+                let root = temp_dir(&format!("pi-{entry_type}-drop"));
+                fs::write(root.join("session.jsonl"), format!("{}\n{}\n",
+                    serde_json::json!({"type": "session", "id": "fixture-session",
+                        "timestamp": "2026-07-22T08:00:00Z"}),
+                    serde_json::json!({"type": entry_type, "timestamp": timestamp, "usage": usage}),
+                )).expect("write dropped entry fixture");
+                let scan = scan_source_roots(
+                    SnapshotSource::Pi,
+                    std::slice::from_ref(&root),
+                    &mut ScanIndex::default(),
+                    "2026-07-22T08:02:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                )
+                .expect("scan dropped entry fixture");
+                assert!(scan.snapshots.is_empty());
+                assert_eq!(scan.dropped_usage_record_count, 1);
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[test]
+    fn pi_summary_without_usage_and_error_turn_keep_existing_request_counts() {
+        let path = temp_file("pi-summary-without-usage-error-turn");
+        let mut fixture = String::new();
+        for entry in [
+            serde_json::json!({"type": "session", "id": "fixture-session",
+                "timestamp": "2026-07-22T08:00:00Z"}),
+            serde_json::json!({"type": "model_change", "modelId": "gpt-5.4"}),
+            serde_json::json!({"type": "message", "message": {"role": "assistant",
+                "model": "gpt-5.4", "timestamp": "2026-07-22T08:00:01Z",
+                "usage": {"input": 12, "output": 4, "cost": {"total": 0.001}}}}),
+            serde_json::json!({"type": "compaction", "timestamp": "2026-07-22T08:01:00Z"}),
+            serde_json::json!({"type": "branch_summary", "timestamp": "2026-07-22T08:01:01Z"}),
+            serde_json::json!({"type": "message", "message": {"role": "assistant",
+                "model": "gpt-5.4", "stopReason": "error", "timestamp": "2026-07-22T08:01:02Z",
+                "usage": {"input": 0, "output": 0, "cost": {"total": 0}}}}),
+        ] {
+            assert!(!recognized_usage_shape_was_dropped(
+                SnapshotSource::Pi,
+                &entry
+            ));
+            fixture.push_str(&format!("{entry}\n"));
+        }
+        fs::write(&path, fixture).expect("write error turn fixture");
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".into())
+            .expect("parse")
+            .remove(0);
+        assert_eq!(item.request_count, 1);
+        // The all-zero error usage is parsed with request_count=1, but the
+        // existing zero-token placement gate does not add it to the snapshot.
+        assert_eq!(item.input_tokens, 12);
+        assert_eq!(item.output_tokens, 4);
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.001")
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]
