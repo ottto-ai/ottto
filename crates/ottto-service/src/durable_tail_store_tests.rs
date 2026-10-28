@@ -193,7 +193,9 @@ fn envelope_round_trips_and_carries_no_path_or_raw_bytes() {
         );
     }
     let read = found(store.read(&key, &placeholder_allowlist()));
-    assert_eq!(read.record, record);
+    let mut mapped = record;
+    mapped.metadata.ack_owner = ack_owner(&mapped.binding.key, &mapped.certificate);
+    assert_eq!(read.record, mapped);
     assert_eq!(read.index_generation, 1);
     let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&record_file(&store, &key)), 0o600);
