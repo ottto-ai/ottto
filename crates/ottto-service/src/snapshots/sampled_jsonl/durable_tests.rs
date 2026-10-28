@@ -1273,13 +1273,13 @@ fn fallback_classes_over_the_synthetic_corpus() {
 /// Budget receipt (static): the bounds every restore and write is held to.
 #[test]
 fn budget_bounds_hold() {
-    use crate::durable_tail_store::{MAX_BATCH, MAX_RECORDS, RECORD_BYTES, STORE_BYTES};
+    use crate::durable_tail_store::{INVENTORY_BOUND, MAX_BATCH, MAX_RECORDS, RECORD_BYTES};
     // A restored copy is charged to the 31 MiB state budget like any
     // retained copy; one record never exceeds one cache entry.
     assert_eq!(RECORD_BYTES, crate::transcript_cache::ENTRY_BYTES);
     assert_eq!(MAX_RECORDS, crate::transcript_cache::CACHE_ENTRIES);
-    // Disk: at most 32 MiB per source store.
-    assert_eq!(STORE_BYTES, 32 * 1024 * 1024);
+    // Disk admission is independent of memo precision; the old writer inventories 512 keys.
+    assert_eq!(INVENTORY_BOUND, 512);
     // Per restore: one record read, two 4 KiB sample windows, a head
     // re-parse of at most 1 MiB and at most NAMED_LINES capped lines.
     assert_eq!(HEAD_BOUND, 1024 * 1024);
@@ -1287,7 +1287,7 @@ fn budget_bounds_hold() {
     // Beside the cache, outside its state budget: both stores' digest maps.
     assert_eq!(
         crate::snapshots::sampled_scan::durable_tail::STORES_RESIDENT_BOUND,
-        64 * 1024
+        128 * 1024 + 2 * (MAX_BATCH + 1) * 4096
     );
     // Per write pass: at most MAX_BATCH records of at most RECORD_BYTES.
     assert_eq!(MAX_BATCH, 32);

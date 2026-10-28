@@ -7,6 +7,172 @@ use std::io::Read;
 const INDEX_KEYS: usize = 20_000;
 
 #[test]
+fn admissible_codex_records_survive_above_the_retired_aggregate_disk_cap() {
+    let root = crate::test_scratch::ScratchDir::new("dt-aggregate-disk");
+    let lock = crate::locked_state_dir::LockedStateDir::acquire(&root).unwrap();
+    let path = root.join("source.jsonl");
+    codex_budget_fixture(
+        &path,
+        "019fa111-2222-7333-8444-555555555555",
+        Some(1024 * 1024),
+    );
+    let scope = Scope("aggregate-file".into());
+    let (reduction, _) = native_record_of(&path, &scope, SnapshotSource::Codex);
+    let body = codec::encode(&reduction, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap();
+    assert!(
+        body.len() >= 1024 * 1024,
+        "the real open-call id is retained"
+    );
+    assert!(body.len() <= store::BODY_BYTES);
+    let ds = DurableSource::Codex;
+    let allowlist = codec::allowlist_digest(SnapshotSource::Codex);
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&root.join("index.json")), ds);
+    let mut keys = Vec::new();
+    for n in 0..40 {
+        let key = store::key_digest(ds, &format!("session-{n}"));
+        let pending = PendingRecord {
+            binding: Binding {
+                source: ds,
+                key,
+                context: store::context_digest("aggregate", None),
+                scope: store::scope_digest(&scope.0, &allowlist, "identity", "v2"),
+                entry: store::entry_digest("fp", None),
+            },
+            certificate: certificate(&path, &scope),
+            body: body.clone(),
+            allowlist,
+        };
+        assert_eq!(
+            disk.write_after_save(&lock, 1, 0, vec![pending])
+                .unwrap()
+                .written,
+            1
+        );
+        keys.push(key);
+    }
+    assert_eq!(disk.counters().disk_records, 40);
+    assert!(disk.counters().disk_bytes > 32 * 1024 * 1024);
+    assert_eq!(disk.counters().budget_refused, 0);
+    let mut cold = DurableTailStore::new(disk.dir().to_owned(), ds);
+    for key in keys {
+        let record = store::tests::found(cold.read(&key, &allowlist));
+        assert_eq!(record.record.body, body);
+    }
+}
+
+#[test]
+fn receipt_pending_guard_keeps_accepted_witness_and_census_without_unreadable() {
+    use std::os::unix::fs::MetadataExt;
+    let root = crate::test_scratch::ScratchDir::new("dt-pending-census");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let path = root.join("source.jsonl");
+    native_fixture(&path);
+    let mut census = ScanCensus::default();
+    let mut candidate = candidate_from_traversal_path(
+        source,
+        ScanTraversalPath {
+            scan_root: root.to_path_buf(),
+            path: path.clone(),
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut census,
+        None,
+        365,
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    candidate.source_file_fingerprint = "b".repeat(64); // Synthetic committed version.
+    let key = local_index_key(&path);
+    let modified = candidate.modified_unix_seconds;
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":candidate.size_bytes,"modified_unix_seconds":modified,
+            "source_file_fingerprint":candidate.source_file_fingerprint,
+        "last_upload_body_witness":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }))
+        .unwrap(),
+    );
+    let metadata = std::fs::metadata(&path).unwrap();
+    candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);
+    let census_record = claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+        &candidate.source_file_fingerprint,
+        1_800_000_000,
+        claude_request_census::ClaudeRequestCensusShape::Exact,
+        vec![11, 22],
+    )
+    .with_modified_for_test(Some(modified))
+    .with_birth_for_test(Some(claude_request_census::ClaudeRequestBirth {
+        unix_seconds: 1,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }));
+    index
+        .claude_request_census
+        .insert(key.clone(), census_record.clone());
+    assert!(claude_request_census::retain_held(&mut index, &candidate));
+    let before = serde_json::to_value(&index).unwrap();
+    let cache = SharedCache::default();
+    let index_path = root.join("index.json");
+    cache.durable_begin_pass(source, &index_path, &Scope("pending".into()), false);
+    let mut b = store::tests::binding("account", "scope", ("fp-a", None));
+    b.key = store::key_digest(DurableSource::ClaudeCode, &key);
+    {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(DurableSource::ClaudeCode).as_mut().unwrap();
+        let cert = store::tests::certificate(&path);
+        slot.store
+            .write_after_save(
+                lock,
+                1,
+                0,
+                vec![store::tests::pending(b.clone(), cert.clone(), 1)],
+            )
+            .unwrap();
+        store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+            Err(std::io::Error::other("rename EIO"))
+        })));
+        store::test_hooks::set_before_unlink(Some(Box::new(|_| {
+            Err(std::io::Error::other("unlink EIO"))
+        })));
+        slot.store
+            .write_after_save(lock, 2, 0, vec![store::tests::pending(b, cert, 2)])
+            .unwrap();
+        store::test_hooks::set_before_rename(None);
+        assert!(slot.store.has_pending());
+    }
+    let reason = cache.durable_guard(source, &candidate, &mut index).unwrap();
+    store::test_hooks::set_before_unlink(None);
+    assert_eq!(reason, store::Refusal::ReceiptPending);
+    cache.durable_hold_exit(source, reason, &mut index, &candidate, &mut census);
+    assert_eq!(census.unreadable_path_count, 0);
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+    assert_eq!(index.claude_request_census.get(&key), Some(&census_record));
+    let (counts, disk) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.durable_held.len(), 7);
+    assert_eq!(store::Refusal::ReceiptPending as usize, 6);
+    assert_eq!(counts.durable_held[6], 1);
+    assert_eq!(counts.held_census, [1, 0]);
+    assert_eq!(counts.restored, 0);
+    assert_eq!(disk.receipt_pending_records, 1);
+    // Switching store namespaces cannot discard an unresolved obligation.
+    cache.durable_begin_pass(
+        source,
+        &root.join("other-index.json"),
+        &Scope("other".into()),
+        false,
+    );
+    let mut stores = cache.durable().unwrap();
+    let slot = stores.slot(DurableSource::ClaudeCode).as_mut().unwrap();
+    assert_eq!(slot.index_path, index_path);
+    assert!(slot.store.has_pending());
+    assert_eq!(slot.store.disabled(), Some("namespace_pending"));
+}
+
+#[test]
 fn oversized_active_request_refuses_without_waiting_or_opening_a_store() {
     let cache = SharedCache::default();
     let (result, events) = crate::local_resource_diagnostics::capture(|| {
@@ -83,7 +249,18 @@ fn existing_m1_writer_uses_and_releases_active_credit_on_success_and_io_error() 
             });
             store::test_hooks::set_before_rename(None);
             assert_eq!(reached.load(AtomicOrdering::SeqCst), fail);
-            assert_eq!(receipt.is_none(), fail);
+            assert!(receipt.is_some());
+            if fail {
+                assert_eq!(receipt.as_ref().unwrap().written, 0);
+                assert_eq!(
+                    cache
+                        .durable_counters(source)
+                        .unwrap()
+                        .1
+                        .durable_write_failed_published,
+                    1
+                );
+            }
             if !fail {
                 assert_eq!(receipt.unwrap().written, 1);
                 let ds = durable_source(source).unwrap();
@@ -189,7 +366,7 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
             allowlist,
         })
         .collect();
-    store.write_after_save(lock, 1, pending).unwrap();
+    store.write_after_save(lock, 1, 0, pending).unwrap();
 
     cache.durable_gc(lock, source, &index).unwrap();
     let (counters, stats) = cache.durable_counters(source).unwrap();
@@ -408,6 +585,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             .write_after_save(
                 lock,
                 index.generation,
+                0,
                 vec![PendingRecord {
                     binding,
                     certificate: certificate(&path, &scope),
@@ -559,6 +737,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             .write_after_save(
                 lock,
                 index.generation,
+                0,
                 vec![PendingRecord {
                     binding: binding.clone(),
                     certificate: certificate(&path, &scope),
@@ -979,7 +1158,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
                     allowlist: codec::allowlist_digest(source),
                 };
-                disk.write_after_save(lock, 1, vec![record(store_key), record(absent_key)])
+                disk.write_after_save(lock, 1, 0, vec![record(store_key), record(absent_key)])
                     .unwrap();
                 let hex = |key: store::Digest32| {
                     key.iter().map(|b| format!("{b:02x}")).collect::<String>()
@@ -1221,7 +1400,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 } else {
-                    assert_eq!(counts.durable_held, [0; 6]);
+                    assert_eq!(counts.durable_held, [0; 7]);
                 }
                 assert_eq!(counts.restored, 0);
                 let _ = std::fs::remove_dir_all(root);
@@ -1263,7 +1442,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
         body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
         allowlist: codec::allowlist_digest(source),
     };
-    disk.write_after_save(lock, 1, vec![pending]).unwrap();
+    disk.write_after_save(lock, 1, 0, vec![pending]).unwrap();
     let record_path = std::fs::read_dir(disk.dir())
         .unwrap()
         .next()
@@ -1331,7 +1510,10 @@ fn save_without_per_pass_setup_keeps_valid_records() {
             allowlist: codec::allowlist_digest(source),
         })
         .collect();
-    assert_eq!(disk.write_after_save(lock, 1, pending).unwrap().written, 2);
+    assert_eq!(
+        disk.write_after_save(lock, 1, 0, pending).unwrap().written,
+        2
+    );
     let path = |key: &str| {
         let hex = store::key_digest(ds, key)
             .iter()
@@ -1500,9 +1682,14 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                     .unwrap()
                     .binding;
                 let mut disk_store = DurableTailStore::new(dir.clone(), ds);
-                assert!(disk_store
-                    .write_after_save(lock, index.generation, vec![v2])
-                    .is_err());
+                let receipt = disk_store
+                    .write_after_save(lock, index.generation, 0, vec![v2])
+                    .unwrap();
+                assert_eq!(
+                    receipt.written, 1,
+                    "the byte-identical survivor is a reconciled receipt"
+                );
+                assert_eq!(disk_store.counters().receipt_reconciled, 1);
                 store::test_hooks::set_before_rename(None);
                 cache.durable_note_scope(source, &key, &scope);
                 cache.durable_gc(lock, source, &index).unwrap();
@@ -1515,7 +1702,7 @@ fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites(
                     .binding;
                 over_budget.body.resize(store::RECORD_BYTES, 0);
                 let receipt = disk_store
-                    .write_after_save(lock, index.generation, vec![over_budget])
+                    .write_after_save(lock, index.generation, 0, vec![over_budget])
                     .unwrap();
                 assert_eq!(receipt.budget_refused, 1);
                 assert_eq!(receipt.written, 0);
@@ -1804,7 +1991,7 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
         store::store_dir_for_index(&index_path),
         DurableSource::Codex,
     );
-    disk.write_after_save(lock, 1, vec![record.record.clone()])
+    disk.write_after_save(lock, 1, 0, vec![record.record.clone()])
         .unwrap();
     let record_path = disk.dir().join(format!(
         "{}.rec",
