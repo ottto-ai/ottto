@@ -455,8 +455,7 @@ Collection counters cover initialization and all cooperative steps of one page,
 including steps before a pause or a move to another worker thread. Comparison
 counters cover preparation (including load normalization) and post-collection
 finalization/save. These are disjoint event intervals: sum their events for the
-page; apart from `stamped_without_permit`, neither object is a gauge or a count
-of distinct files across pages.
+page; neither object is a gauge or a count of distinct files across pages.
 Nested operations, other sources and other threads cannot contribute to the
 active interval. Abandoned collection pages have no completed collection line.
 With comparison disabled, the existing `disabled_before_lease` decision still
@@ -503,23 +502,20 @@ preparation/save events after work, without creating a comparison permit.
 - `authority_normalization_cleared`: nonempty-to-empty transitions while dropping
   unbound authority records on working load/save. Discarded CAS probes are
   excluded, matching the existing authority-drop totals.
-- `stamped_without_permit`: the one **gauge** in this object, read from the
-  local mark count at every Claude collection page end
-  (`native_collection_page`, whether or not finalization follows) and at Claude
-  finalization: indexed Claude files whose revision-3 body was stamped in a
-  cycle without the identity permit (local money mark `STAMPED_WITHOUT_PERMIT`,
-  seeded once by money-rule version 2 unless the loaded contract record was the
-  adopted E2 one). The key is sparse like the others: absent = 0 on a Claude
-  page. Merging two observations keeps the larger value. A late identity
-  permit re-reads none of these files, and an identity-contract latch clear
-  keeps their marks; only a permitted restamp clears one. User effect:
-  sessions read while the identity permission was off may show no subscription until re-read.
 - `history_permitted_not_stamped_not_accepted`, `_telemetry_unread`, `_held`,
   `_other`: upgrades the history gate permitted on this page that did not stamp
   the active revision. `not_accepted` stamped but a partial save kept the
   committed entry; `telemetry_unread` and `held` were held after the permit
   (unread telemetry; the stop latch); `other` finalized below the active
   revision for any other reason (incomplete parse, decode or local hold).
+  These concern the history-upgrade gate, not request identity.
+- Removed with the identity permit (contract 5 always on): the gauge
+  `stamped_without_permit`. The local money mark it counted
+  (`STAMPED_WITHOUT_PERMIT`, 64) is no longer set or cleared; stores that carry
+  it keep decoding it, and nothing reads or replays it. Files stamped while the
+  permit was off are not re-read for identity: they gain identity tags on their
+  next real content change. User effect: such sessions may show no
+  subscription until then.
 
 `retained_cache_page_events` reuses the existing cache lifecycle event keys and
 sites: `take_*`, `insert_*`, `cursor_reservation_entries_evicted`,
@@ -605,16 +601,23 @@ if the final combined cancellation funding refuses them.
 ### Claude Contract Debt Counters (schema 2 additive)
 
 The existing `native_collection_page` / `native_comparison_decision` carrier
-also includes sparse, counts-only `request_identity_permit` (`permitted`,
-`denied`, `fetch_failed`, `hint_failed`), `identity_contract_transition`
+also includes sparse, counts-only `identity_contract_transition`
 (`from_empty`, `to_empty`, `collector_e2_grouping`, `mid_traversal_placeholder`)
 and `identity_contract_latch` (`set`, `cleared`). The existing synchronous
 preparation, collection and finish scopes own these deltas: merge disjoint
-scopes, never sum a repeated scope twice. Permits are counted once at the first
-Claude prepare observation, not again by scanning or emission. Null and unknown
-tokens remain denials. Relay-token and activity-hint errors retain the last
-contract and reach the existing early decision/unwind carrier, including when
-no page is collected. There is no new event stream or wire check-in payload.
+scopes, never sum a repeated scope twice. Relay-token and activity-hint errors
+retain the last contract and reach the existing early decision/unwind carrier,
+including when no page is collected. There is no new event stream or wire
+check-in payload.
+
+Contract 5 is always on for Claude Code: every Claude cycle captures markers
+and builds identity evidence, and the activity hint's
+`session_request_identity_contract` token is decoded but never read. The
+per-cycle `request_identity_permit` counters (`permitted`, `denied`,
+`fetch_failed`, `hint_failed`) are removed with the permit. A Claude cycle
+always records the full contract, so `to_empty` no longer occurs; `from_empty`
+counts the one transition of an install that ran without the permit. That
+transition sets the latch but re-owes no history.
 
 Transitions count observed state changes, not repeated observations of the same
 placeholder. `mid_traversal_placeholder` counts entry into and exit from a
@@ -645,10 +648,7 @@ values or body contents are emitted.
 The deferral count includes newly classified storage-only singleton deferrals;
 those retain custody without granting carry or proof. Under contract debt the
 existing stale-carry `contract` rejection bucket also includes member-evidence
-refusals. With no comparison lease, per-cycle permit counts use the existing
-prepare decision line once per attempted Claude cycle. A malformed hint window
-counts as `hint_failed`, before any contract observation. While a placeholder
-is stored, permit flaps remain visible in permit outcomes but cannot be
+refusals. While a placeholder is stored, a contract change cannot be
 classified into `from_empty`, `to_empty` or `collector_e2_grouping` from that
 unknown prior contract.
 

@@ -533,7 +533,6 @@ impl ApcFixture {
                 &mut scan,
                 &mut index,
                 None,
-                None,
                 native_completion.as_mut(),
                 None,
             )
@@ -589,7 +588,6 @@ impl ApcFixture {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
-            true,
             |snapshot| {
                 effective_snapshot_upload_body_witness(
                     snapshot,

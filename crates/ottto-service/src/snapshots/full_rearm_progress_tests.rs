@@ -1181,18 +1181,8 @@ fn pipeline_new_auxiliary_bad_clock_keeps_the_due_rearm_enabled() {
         scan.snapshots = items.clone();
         scan.census_complete = true;
         index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-        let permit = claude_request_identity::emission_permit(
-            SnapshotSource::ClaudeCode,
-            Some(claude_request_identity::COHORT_HINT_TOKEN),
-        )
-        .unwrap();
         let (disposition, _, stats) =
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
-                &support,
-                &mut scan,
-                index,
-                Some(permit),
-            );
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, index);
         assert_eq!(stats.api_incomplete_root_count, 0);
         assert_eq!(stats.trace_incomplete_root_count, 0);
         assert_eq!(stats.exact_request_set_root_count, 1);

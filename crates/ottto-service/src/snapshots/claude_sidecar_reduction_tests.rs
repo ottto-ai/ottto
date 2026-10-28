@@ -131,8 +131,9 @@ fn raw_scan(
 ) -> Run {
     raw_scan_capturing(fixture, index, cache, capture_by_default(), after_start)
 }
+/// Outside a sync cycle every scan captures.
 fn capture_by_default() -> bool {
-    crate::snapshots::claude_request_identity::capture_by_default()
+    true
 }
 fn raw_scan_capturing(
     fixture: &Fixture,
@@ -320,7 +321,6 @@ fn settle(mut run: Run) -> ScanIndex {
         SOURCE,
         &mut run.result,
         &mut run.index,
-        true,
         snapshot_upload_body_witness,
     );
     // Validate the ordinary per-entity/body ACK before recording acceptance.
@@ -500,7 +500,6 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
         SOURCE,
         &mut next.result,
         &mut next.index,
-        true,
         snapshot_upload_body_witness,
     );
     assert!(
@@ -565,7 +564,6 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
         SOURCE,
         &mut cached.result,
         &mut cached.index,
-        true,
         snapshot_upload_body_witness,
     );
     assert!(cached.result.snapshots.is_empty());
@@ -916,7 +914,6 @@ mod durable_restart {
             SOURCE,
             &mut run.result,
             &mut run.index,
-            true,
             snapshot_upload_body_witness,
         );
         let entity = format!(
@@ -1121,16 +1118,10 @@ mod durable_restart {
     /// A nonempty E2 literal and reported price prevent vacuous equality of
     /// held pages or pre-finalization accumulators.
     fn enriched_e2(f: &Fixture, mut run: Run) -> Run {
-        let permit = claude_request_identity::emission_permit(
-            SOURCE,
-            Some(claude_request_identity::COHORT_HINT_TOKEN),
-        )
-        .unwrap();
-        crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan(
             &f.support,
             &mut run.result,
             &mut run.index,
-            Some(permit),
         );
         apply_upload_policy(
             SOURCE,

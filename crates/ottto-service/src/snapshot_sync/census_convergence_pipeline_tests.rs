@@ -220,7 +220,6 @@ impl PipelineFixture {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
-            true,
             |snapshot| {
                 effective_snapshot_upload_body_witness(
                     snapshot,

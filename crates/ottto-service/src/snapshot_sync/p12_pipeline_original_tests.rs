@@ -567,7 +567,6 @@ impl RearmFixture {
                 &self.support,
                 &mut scan,
                 &mut index,
-                cycle_request_identity_permit(SnapshotSource::ClaudeCode, &frame.activity_hint),
                 frame.prepared_claude_evidence.take(),
                 comparison_completion.as_mut(),
                 frame.native_comparison_lease.as_ref(),
@@ -624,7 +623,6 @@ impl RearmFixture {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut index,
-            true,
             |snapshot| {
                 let witness = effective_snapshot_upload_body_witness(
                     snapshot,

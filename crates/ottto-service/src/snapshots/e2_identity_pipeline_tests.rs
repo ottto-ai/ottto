@@ -60,9 +60,8 @@ fn e2_page(
     dirs: &[PathBuf],
     support: &Path,
     index: &mut ScanIndex,
-    permitted: bool,
 ) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition, bool) {
-    let (items, disposition, failed, _) = e2_page_counted(dirs, support, index, permitted);
+    let (items, disposition, failed, _) = e2_page_counted(dirs, support, index);
     (items, disposition, failed)
 }
 
@@ -72,7 +71,6 @@ fn e2_page_counted(
     dirs: &[PathBuf],
     support: &Path,
     index: &mut ScanIndex,
-    permitted: bool,
 ) -> (
     Vec<SnapshotItem>,
     ClaudeUsageAuthorityDisposition,
@@ -90,17 +88,6 @@ fn e2_page_counted(
             false,
         )
         .unwrap();
-        let permit = permitted
-            .then(|| {
-                claude_request_identity::permit_when(
-                    true,
-                    SnapshotSource::ClaudeCode,
-                    Some(claude_request_identity::COHORT_HINT_TOKEN),
-                )
-                .ok()
-            })
-            .flatten();
-        assert_eq!(permit.is_some(), permitted);
         claude_request_identity::retain_root_accounts(
             &mut scan.snapshots,
             index,
@@ -108,9 +95,7 @@ fn e2_page_counted(
         );
         let ((disposition, _, stats), counts) =
             claude_request_money::e2::pipeline_test_observer::capture_identity_counts(|| {
-                crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
-                    support, &mut scan, index, permit,
-                )
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index)
             });
         (
             scan.snapshots,
@@ -165,10 +150,10 @@ fn e2_pipeline_tags_the_final_root_and_agent_rows() {
         &root,
         &trace,
     );
-    for permitted in [true, false] {
+    {
         let mut index = ScanIndex::default();
         let (items, disposition, read_failed) =
-            e2_page(std::slice::from_ref(&dir), &support, &mut index, permitted);
+            e2_page(std::slice::from_ref(&dir), &support, &mut index);
         assert!(!read_failed);
         let root_item = items
             .iter()
@@ -180,18 +165,12 @@ fn e2_pipeline_tags_the_final_root_and_agent_rows() {
             .expect("child body");
         for (item, requests, label) in [(root_item, 4, "root"), (child, 1, "agent")] {
             // Tagging after emission: an item tagged first would be refused.
-            assert!(e2_is_literal(item), "{label} (permitted={permitted})");
+            assert!(e2_is_literal(item), "{label}");
             assert_eq!(item.request_count, requests, "{label}: own requests only");
             e2_assert_identity_consistent(item, label);
-            if !permitted {
-                assert!(
-                    item.request_evidence.is_empty(),
-                    "no cohort permit, no contract-5 evidence"
-                );
-            }
             assert!(
                 e2_rows(item).all(|row| row.account_identifier_hash == Some(e2_account())),
-                "{label}: the one proven login tags every final row (permitted={permitted})"
+                "{label}: the one proven login tags every final row"
             );
         }
         assert_eq!(disposition.quarantined_entity_count(), 0);
@@ -238,7 +217,7 @@ fn e2_pipeline_tags_a_copied_transcript_once() {
     let dirs = [dir.clone(), copy_dir.clone()];
     let mut index = ScanIndex::default();
     // The first page may meet the twins in either order (disclosed residual).
-    e2_page(&dirs, &support, &mut index, true);
+    e2_page(&dirs, &support, &mut index);
     // The copy continues on its own (one known writer): the twin family is
     // re-read together and the copied history is skipped.
     let mut own: serde_json::Value =
@@ -253,7 +232,7 @@ fn e2_pipeline_tags_a_copied_transcript_once() {
     let mut file = fs::OpenOptions::new().append(true).open(&copy).unwrap();
     writeln!(file, "{own}").unwrap();
     drop(file);
-    let (items, disposition, _) = e2_page(&dirs, &support, &mut index, true);
+    let (items, disposition, _) = e2_page(&dirs, &support, &mut index);
     let roots = items
         .iter()
         .filter(|item| item.source_session_id == root)
@@ -299,7 +278,7 @@ fn e2_pipeline_telemetry_read_failure_is_never_complete_and_withholds_nothing() 
     .unwrap();
     let mut index = ScanIndex::default();
     let (items, disposition, read_failed) =
-        e2_page(std::slice::from_ref(&dir), &support, &mut index, true);
+        e2_page(std::slice::from_ref(&dir), &support, &mut index);
     assert!(read_failed, "the fixture really fails the telemetry read");
     let literal = items.iter().filter(|item| e2_is_literal(item)).count();
     assert_eq!(literal, 2, "live bodies still emit, as estimates");
@@ -371,7 +350,6 @@ fn e2_pipeline_root_and_child_keep_independent_own_telemetry_logins() {
         std::slice::from_ref(&dir),
         &support,
         &mut ScanIndex::default(),
-        true,
     );
     assert!(!failed);
     assert_eq!(items.len(), 2);
@@ -422,7 +400,7 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
             );
         }
         let (items, disposition, failed, counts) =
-            e2_page_counted(std::slice::from_ref(&dir), &support, &mut index, true);
+            e2_page_counted(std::slice::from_ref(&dir), &support, &mut index);
         assert!(!failed);
         let item = items
             .iter()
@@ -491,7 +469,6 @@ fn e2_pipeline_exact_telemetry_over_cap_uses_the_existing_counted_start_fallback
         std::slice::from_ref(&dir),
         &support,
         &mut ScanIndex::default(),
-        true,
     );
     assert!(!failed);
     assert_eq!(items.len(), 1);

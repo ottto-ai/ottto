@@ -5657,20 +5657,6 @@ fn try_collect_native_preparation_with_rotation_observed(
     }
     owner.completed.context("owned source completion")
 }
-/// This cycle's contract-5 permit, from its authenticated hint only. Never
-/// cached across cycles, so a revoked token takes effect on the next fetch;
-/// prepare (capture) and finish (emission) both derive it here.
-fn cycle_request_identity_permit(
-    source: SnapshotSource,
-    activity_hint: &crate::snapshot_client::ActivityHintResponse,
-) -> Option<crate::snapshots::claude_request_identity::EmissionPermit> {
-    crate::snapshots::claude_request_identity::emission_permit(
-        source,
-        activity_hint.session_request_identity_contract.as_deref(),
-    )
-    .ok()
-}
-
 /// The upload-context fingerprint a cycle activates on its index (pure; the
 /// ordinary prepare and a Stage 1 continuation page share it).
 fn cycle_upload_context(
@@ -5832,47 +5818,22 @@ fn prepare_sync_source_inner(
         diagnostic.emit();
     }
     let scan_started_at = current_rfc3339();
-    let count_failure = |error, fetch| {
-        if source == SnapshotSource::ClaudeCode {
-            claude_contract::note(|counts| {
-                let permit = &mut counts.request_identity_permit;
-                if fetch {
-                    permit.fetch_failed += 1;
-                } else {
-                    permit.hint_failed += 1;
-                }
-            });
-        }
-        error
-    };
-    let relay_token = client
-        .issue_relay_token(device, device_secret, source)
-        .map_err(|error| count_failure(error, true))?;
-    let mut activity_hint = client
-        .get_activity_hint(&relay_token)
-        .map_err(|error| count_failure(error, false))?;
+    let relay_token = client.issue_relay_token(device, device_secret, source)?;
+    let mut activity_hint = client.get_activity_hint(&relay_token)?;
     // Treat the activity hint as the only authority for the semantic evidence
     // window. Missing/malformed hints already fail JSON decoding; future
     // out-of-contract widths fail here before any scan or receipt can
     // manufacture a fallback policy. Zero is an explicit tombstone control.
-    let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)
-        .map_err(|error| count_failure(error, false))?;
+    let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)?;
     let context_curve_enabled = source != SnapshotSource::Pi
         && activity_hint.session_context_curve_contract.as_deref()
             == Some(CONTEXT_CURVE_CONTRACT_VERSION);
     let cache_observations_enabled = source != SnapshotSource::Pi
         && activity_hint.session_cache_observations_contract.as_deref()
             == Some("session_cache_observations:v1");
-    // Contract-5 marker capture and the Desktop census witness are local work
-    // only an emitting cycle uses, so they follow this cycle's permit, not the
-    // compiled switch alone. Finish recomputes the permit from the same hint.
-    let request_identity_capture = cycle_request_identity_permit(source, &activity_hint).is_some();
-    if source == SnapshotSource::ClaudeCode {
-        claude_contract::note(|counts| {
-            counts.request_identity_permit.permitted += u64::from(request_identity_capture);
-            counts.request_identity_permit.denied += u64::from(!request_identity_capture);
-        });
-    }
+    // Contract 5 is always on: every Claude cycle captures markers and keeps
+    // the Desktop census witness; the hint's identity token is never read.
+    let request_identity_capture = crate::snapshots::claude_request_identity::captures(source);
     // The server's scan directive was parsed and discarded before this. It is a
     // cost lever, so it may only lengthen the local cadence (see
     // `negotiated_wait`), never shorten it.
@@ -6229,12 +6190,9 @@ fn prepare_sync_source_inner(
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
-        // Identity adoption lowers paced revision debt. Capture it BEFORE
-        // the committed baseline, so an unaccepted/shed page cannot restore
-        // revision 3 while retaining the newly observed identity contract.
-        index.observe_claude_request_identity_contract(
-            cycle_request_identity_permit(source, &activity_hint).is_some(),
-        );
+        // Observe the always-on contract BEFORE the committed baseline, so an
+        // unaccepted/shed page keeps it and its latch. It re-owes no history.
+        index.observe_claude_request_identity_contract(true);
     }
     let committed_index = index.clone();
     let reoffer_paths =
@@ -6963,7 +6921,6 @@ fn finish_sync_source(
             support_dir,
             &mut scan_result,
             &mut index,
-            cycle_request_identity_permit(source, &activity_hint),
             prepared_claude_evidence,
             comparison_completion.as_mut(),
             native_comparison_lease.as_ref(),
@@ -7129,7 +7086,6 @@ fn finish_sync_source(
         source,
         &mut scan_result,
         &mut index,
-        cycle_request_identity_permit(source, &activity_hint).is_some(),
         |snapshot| {
             let witness = effective_snapshot_upload_body_witness(
                 snapshot,
@@ -8807,28 +8763,13 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
-    apply_claude_local_evidence_to_scan_with_permit(support_dir, scan_result, index, None)
-}
-
-/// Contract-5 evidence is built only under this cycle's emission permit.
-pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
-    support_dir: &Path,
-    scan_result: &mut crate::snapshots::SourceScanResult,
-    index: &mut ScanIndex,
-    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
-) -> (
-    crate::snapshots::ClaudeUsageAuthorityDisposition,
-    bool,
-    ClaudeLocalEvidenceStats,
-) {
-    apply_claude_local_evidence_to_scan_with_prepared(support_dir, scan_result, index, permit, None)
+    apply_claude_local_evidence_to_scan_with_prepared(support_dir, scan_result, index, None)
 }
 
 fn apply_claude_local_evidence_to_scan_with_prepared(
     support_dir: &Path,
     scan_result: &mut crate::snapshots::SourceScanResult,
     index: &mut ScanIndex,
-    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     prepared: Option<PreparedClaudeLocalEvidence>,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -8839,7 +8780,6 @@ fn apply_claude_local_evidence_to_scan_with_prepared(
         support_dir,
         scan_result,
         index,
-        permit,
         prepared,
         None,
         None,
@@ -8850,7 +8790,6 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
-    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     prepared: Option<PreparedClaudeLocalEvidence>,
     comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
@@ -8863,7 +8802,6 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         support_dir,
         scan_result,
         index,
-        permit,
         prepared,
         comparison,
         lease,
@@ -8885,7 +8823,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
-    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     mut prepared: Option<PreparedClaudeLocalEvidence>,
     mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
@@ -8910,7 +8847,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     {
         fallback.withhold(scan_result);
     }
-    let emission_permitted = permit.is_some();
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.
@@ -9018,9 +8954,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
                 full_rearm_evidence_complete = false;
-                if emission_permitted || request_owned(session_id) {
-                    identity_unhealthy_roots.insert(session_id.clone());
-                }
+                identity_unhealthy_roots.insert(session_id.clone());
             }
             paired
         })
@@ -9074,9 +9008,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
-            if emission_permitted || request_owned(&root_session_id) {
-                identity_unhealthy_roots.insert(root_session_id);
-            }
+            identity_unhealthy_roots.insert(root_session_id);
             continue;
         }
         stats.complete_sidecar_root_count += 1;
@@ -9131,9 +9063,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // families: the same seam keeps their owed history for a later page.
         index.hold_claude_history_for_unhealthy_telemetry_roots(&side_calls_unresolved);
     }
-    // Contract-5 evidence exists only under this cycle's permit; the reported
-    // rebuild then classifies and groups each request as it places it.
-    let identity_evidence = emission_permitted.then(|| {
+    // Contract-5 evidence is always built; the reported rebuild then
+    // classifies and groups each request as it places it.
+    let identity_evidence = Some(
         crate::snapshots::claude_request_identity::ScanEvidence::new(
             &api_report,
             &trace_report,
@@ -9141,8 +9073,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_identity::desktop_census(index),
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
-        .with_native_originals(&originals)
-    });
+        .with_native_originals(&originals),
+    );
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
     }
@@ -9282,12 +9214,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         }
     }
     disposition.mixed_uploads = qualification.mixed;
-    if emission_permitted {
-        // Request identity is not the session owner: admit only this scan's
-        // exact contract-5 bodies, never rewriting a retained owner.
-        for item in &scan_result.snapshots {
-            disposition.mixed_uploads.admit_request_identity(item);
-        }
+    // Request identity is not the session owner: admit only this scan's
+    // exact contract-5 bodies, never rewriting a retained owner.
+    for item in &scan_result.snapshots {
+        disposition.mixed_uploads.admit_request_identity(item);
     }
     stats.identity_complete_session_count = scan_result
         .snapshots
@@ -11674,7 +11604,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .unwrap();
         let owner = std::sync::Arc::new(lifecycle::Lifecycle::default());
@@ -11688,7 +11617,6 @@ mod tests {
                 &support,
                 &mut scan,
                 &mut index,
-                None,
                 None,
                 completion.as_mut(),
                 Some(&lease),
@@ -12927,7 +12855,6 @@ mod tests {
                 SnapshotSource::Codex,
                 &mut effective_scan,
                 &mut effective_index,
-                true,
                 |item| {
                     effective_snapshot_upload_body_witness(
                         item,
@@ -13067,7 +12994,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut off,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13165,7 +13091,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut on,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13235,7 +13160,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut enriched,
             &mut loaded,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13350,7 +13274,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut next,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13425,7 +13348,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut retry,
             &mut retry_index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13546,7 +13468,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut off,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item, &progress, false, false, &legacy, &held,
@@ -13618,7 +13539,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut on,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
             },
@@ -13745,7 +13665,6 @@ mod tests {
             SnapshotSource::Codex,
             &mut repeated,
             &mut index,
-            true,
             |item| {
                 effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
             },

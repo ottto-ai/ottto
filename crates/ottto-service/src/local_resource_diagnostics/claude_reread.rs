@@ -83,9 +83,6 @@ pub(crate) struct Rearm {
     pub(crate) retry_admission_cleared: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) authority_normalization_cleared: u64,
-    /// Gauge, not an event: Claude files carrying `STAMPED_WITHOUT_PERMIT`.
-    #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) stamped_without_permit: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) history_permitted_not_stamped_not_accepted: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -119,9 +116,6 @@ impl Rearm {
             history_permitted_not_stamped_other
         );
         self.held_reason.merge(other.held_reason);
-        self.stamped_without_permit = self
-            .stamped_without_permit
-            .max(other.stamped_without_permit);
     }
     fn is_empty(&self) -> bool {
         *self == Self::default()
@@ -325,9 +319,6 @@ pub(crate) fn clear(site: ClearSite, nonempty: bool) {
         *calls = calls.saturating_add(u64::from(count_call));
         *cleared = cleared.saturating_add(u64::from(nonempty));
     });
-}
-pub(crate) fn stamped_without_permit(files: u64) {
-    update(|counts| counts.claude_reread.stamped_without_permit = files);
 }
 /// Why an upgrade the history gate permitted this page did not stamp.
 pub(crate) enum NotStamped {

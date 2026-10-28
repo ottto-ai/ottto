@@ -16,12 +16,6 @@ macro_rules! counters {
         }
     };
 }
-counters!(Permit {
-    permitted,
-    denied,
-    fetch_failed,
-    hint_failed
-});
 counters!(Transition {
     from_empty,
     to_empty,
@@ -41,8 +35,6 @@ counters!(ContextChange {
 });
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {
-    #[serde(skip_serializing_if = "Permit::is_empty")]
-    pub(crate) request_identity_permit: Permit,
     #[serde(skip_serializing_if = "Transition::is_empty")]
     pub(crate) identity_contract_transition: Transition,
     #[serde(skip_serializing_if = "Latch::is_empty")]
@@ -56,8 +48,6 @@ pub(crate) struct Counts {
 }
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
-        self.request_identity_permit
-            .merge(other.request_identity_permit);
         self.identity_contract_transition
             .merge(other.identity_contract_transition);
         self.identity_contract_latch
