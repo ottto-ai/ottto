@@ -1623,7 +1623,8 @@ fn a_contract_change_rearms_at_most_once_then_skips() {
 /// Lead A ruling (a), gate off (collector contract, revision below 3), where
 /// the latch's own re-arm clears every family file. A never-permitted index
 /// (recorded `""`, structural baseline built without evidence) observes the
-/// always-on contract: the first complete terminal re-arms the family once,
+/// always-on contract: an opening fence leaves the cutover owed, and the
+/// first complete terminal behind a closed fence re-arms the family once,
 /// counted with its files and bytes as `contract_cutover_rearm`, and keeps
 /// the structural baseline (no whole-index re-arm). While an unsettled sweep
 /// holds the latch, later terminals, a restart, an incomplete census and an
@@ -1650,9 +1651,21 @@ fn a_never_permitted_cutover_rearms_once_and_is_counted() {
                     "{skipped:?} {state}"
                 );
             }
-            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
             index.observe_claude_request_identity_contract(true);
             assert!(index.claude_request_identity_contract_changed);
+            // An opening fence runs none of the latch's re-arm causes, so the
+            // cutover stays owed (Claude review, round 3).
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            index.bounded_sweep_had_unsettled_upload = true;
+            index.claude_duplicate_request_witness_overflowed = false;
+            let (opening, _, state) = always_on_terminal(&rearm, &support, &mut index);
+            assert_eq!(
+                index.claude_full_rearm_progress.contract_cutover, CLAUDE_CONTRACT_CUTOVER_OWED,
+                "{opening:?} {state}"
+            );
+            assert_eq!(scope.finish().contract.contract_cutover_rearm.runs, 0);
+            index.claude_duplicate_request_witness_overflowed = true;
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
             index.bounded_sweep_had_unsettled_upload = true;
             let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
             assert!(

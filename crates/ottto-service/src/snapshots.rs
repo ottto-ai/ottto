@@ -10051,7 +10051,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 rearm.suppressed = rearm.suppressed.saturating_add(1);
             }
         }
-        if cutover_terminal {
+        // Spent only where the latch's re-arm causes ran (a closed fence).
+        if cutover_terminal && fence_stays_closed {
             index.claude_full_rearm_progress.contract_cutover = CLAUDE_CONTRACT_CUTOVER_SPENT;
             claude_contract::note(|counts| {
                 let cutover = &mut counts.contract_cutover_rearm;

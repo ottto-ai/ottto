@@ -618,7 +618,8 @@ per-cycle `request_identity_permit` counters (`permitted`, `denied`,
 always records the full contract, so `to_empty` no longer occurs; `from_empty`
 counts the one transition of an install that ran without the permit. That
 transition sets the latch but re-owes no history. Its latch re-arms at one
-complete census terminal only (persisted as the full-rearm progress's
+complete census terminal only (the first one under the recorded contract
+behind a fence that stays closed; persisted as the full-rearm progress's
 `contract_cutover` state; census, evidence-gap or restart flips never repeat
 it), and that terminal's structural record carries over to the new contract,
 so the cutover forces no whole-index re-arm. `contract_cutover_rearm` (`runs`,
