@@ -647,13 +647,15 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
     });
 }
 
-/// Comparison bodies actually withheld and unresolved source debt at this
-/// boundary. The latter is a gauge, not coverage or a settlement receipt.
-pub(crate) fn native_comparison_restore_unavailable(bodies: usize, pending: usize) {
+/// Comparison bodies actually withheld, sources held and target files whose
+/// restore was refused or unavailable, all for THIS pass only (#799). Gauges,
+/// not coverage, a settlement receipt, or debt carried to a later pass.
+pub(crate) fn native_comparison_restore_unavailable(bodies: usize, pending: usize, targets: usize) {
     #[derive(Serialize)]
     struct Counts {
         native_comparison_disclosed_restore_unavailable: usize,
         native_comparison_pending_debt: usize,
+        native_comparison_refused_targets: usize,
     }
     traversal_point(
         "native_comparison_restore_unavailable",
@@ -661,6 +663,7 @@ pub(crate) fn native_comparison_restore_unavailable(bodies: usize, pending: usiz
         &Counts {
             native_comparison_disclosed_restore_unavailable: bodies,
             native_comparison_pending_debt: pending,
+            native_comparison_refused_targets: targets,
         },
     );
 }

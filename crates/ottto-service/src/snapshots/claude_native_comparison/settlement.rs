@@ -925,7 +925,7 @@ impl Controller {
             });
         }
         // A debt-free comparison boundary resets the pending-debt gauge.
-        crate::local_resource_diagnostics::native_comparison_restore_unavailable(0, 0);
+        crate::local_resource_diagnostics::native_comparison_restore_unavailable(0, 0, 0);
         // Only fallback restoration needs the full graph. Retire it before
         // allocating plans/window metadata, moving its existing window string.
         let native_terminal = terminal.map(TerminalTraversal::into_native_census);
@@ -1213,6 +1213,7 @@ impl SelectedFallback {
         crate::local_resource_diagnostics::native_comparison_restore_unavailable(
             before - scan.snapshots.len(),
             self.withheld_sources.len(),
+            self.targets.len(),
         );
     }
 
@@ -1235,9 +1236,10 @@ impl SelectedFallback {
         index.mark_bounded_sweep_held_by_families(Some(&roots));
     }
 
-    /// Restore only selected B/C facts. Queue known A first and B/C after A in
-    /// the SAME traversal. A terminal traversal is moved, never reconstructed
-    /// from a scratch index or duplicated into SourceScanResult::clone.
+    /// Restore only selected B/C facts and requeue only B/C in the SAME
+    /// traversal; targets A keep their stamps and are never requeued (O1). A
+    /// terminal traversal is moved, never reconstructed from a scratch index
+    /// or duplicated into SourceScanResult::clone.
     pub(crate) fn restore_selected(
         &mut self,
         index: &mut ScanIndex,

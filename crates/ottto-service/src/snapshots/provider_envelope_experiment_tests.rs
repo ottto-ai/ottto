@@ -3006,8 +3006,9 @@ impl TargetReads {
     }
 }
 
-/// Run the NEXT BASE restore jobs through E1's acquisition seam. Selection
-/// itself queues no in-pass targets; E3 owns scheduling these deferred jobs.
+/// Run the frozen restore jobs through E1's acquisition seam. The logical
+/// (unpaid) selection queues none; the paid selection queues them in the hit
+/// pass (`native_comparison_paid_hit`). Neither defers them to a later pass.
 fn queue_deferred_restores(
     state: &mut OwnedSourceScan,
     qualification: &mut claude_native_comparison::Qualification,
@@ -3475,6 +3476,7 @@ fn native_comparison_exact_page_bodies_cover_plan_without_target_jobs() {
         .find(|row| row["stage"] == "native_comparison_restore_unavailable")
         .unwrap()["counts"];
     assert_eq!(counts["native_comparison_pending_debt"], 0);
+    assert_eq!(counts["native_comparison_refused_targets"], 0);
     assert_eq!(
         index.accepted_snapshot_fingerprints, fixture.index.accepted_snapshot_fingerprints,
         "native readiness alone is never ACK credit"
@@ -4180,9 +4182,9 @@ fn native_comparison_selected_fallback_fixture() -> (
 }
 
 #[test]
-fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_before_copies() {
+fn native_comparison_selected_fallback_preserves_prior_body_and_requeues_only_held_copies() {
     if !native_positive_layout_for_test(
-        "native_comparison_selected_fallback_preserves_prior_body_and_queues_native_before_copies",
+        "native_comparison_selected_fallback_preserves_prior_body_and_requeues_only_held_copies",
     ) {
         return;
     }
@@ -4202,11 +4204,24 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
         .iter()
         .map(|p| local_index_key(&p.path))
         .collect::<Vec<_>>();
-    assert_eq!(queued.len(), 4);
-    assert!(queued[..2]
+    // O1 (E3): only the held B/C are requeued. Targets A are never queued
+    // for a later Full and keep their object stamps (no fingerprint clear).
+    assert_eq!(queued.len(), 2);
+    assert!(queued
         .iter()
-        .all(|key| claude_index_path_family_member(Path::new(key)).unwrap().0 == fixture.parent));
-    assert!(queued[2..].iter().any(|k| k == &key));
+        .all(|key| claude_index_path_family_member(Path::new(key))
+            .is_some_and(|(root, _)| root != fixture.parent)));
+    assert!(queued.iter().any(|k| k == &key));
+    for (target, entry) in previous.files.iter().filter(|(target, _)| {
+        claude_index_path_family_member(Path::new(target))
+            .is_some_and(|(root, _)| root == fixture.parent)
+    }) {
+        assert!(!entry.source_file_fingerprint.is_empty());
+        assert_eq!(
+            index.files[target].source_file_fingerprint, entry.source_file_fingerprint,
+            "a target keeps its stamp, so the next walk sees a plain Skip"
+        );
+    }
     assert!(index.bounded_sweep_had_unsettled_upload());
     index.save(&path).unwrap();
     let restored = ScanIndex::load(&path).unwrap();
@@ -4215,7 +4230,7 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
         .snapshots
         .iter()
         .all(|item| item.source_session_id == FALLBACK_HEALTHY));
-    writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: actual_native_copy_peer_observed=true healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: actual_native_copy_peer_observed=true healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true targets_not_requeued_stamps_kept=true normal_save_reload=true parked_schema=false").unwrap();
 }
 
 #[test]
@@ -4232,6 +4247,8 @@ fn native_comparison_unavailable_holds_money_and_counts_debt() {
         .unwrap()["counts"];
     assert_eq!(counts["native_comparison_disclosed_restore_unavailable"], 2);
     assert_eq!(counts["native_comparison_pending_debt"], 2);
+    // #799: this pass's refused or unavailable target files (both frozen A).
+    assert_eq!(counts["native_comparison_refused_targets"], 2);
     assert!(scan
         .snapshots
         .iter()
@@ -4256,21 +4273,36 @@ fn native_comparison_unavailable_holds_money_and_counts_debt() {
     );
 }
 
-/// Diagnostics only: the comparison fallback's fold and its selected restore
-/// each mark the sweep without naming a path, so both name `unattributed`,
-/// also beside a named page cause and across a reload.
+/// O1 (E3, D-COMPARISON): the comparison fallback's fold and its selected
+/// restore each mark only the held families (`completed_blocking_holds`
+/// scoped to their root digests), never the whole sweep; an independent
+/// family in the same pass keeps its body and its proof skip. The cause
+/// survives beside a named page cause and across a reload.
 #[test]
-fn native_comparison_fallback_marks_name_unattributed() {
-    if !native_positive_layout_for_test("native_comparison_fallback_marks_name_unattributed") {
+fn native_comparison_fallback_marks_only_held_families() {
+    if !native_positive_layout_for_test("native_comparison_fallback_marks_only_held_families") {
         return;
     }
-    let (_fixture, mut index, _scan, mut fallback, previous, path) =
+    let (_fixture, mut index, scan, mut fallback, previous, path) =
         native_comparison_selected_fallback_fixture();
+    let held = BTreeSet::from([
+        claude_full_rearm_root_digest(FALLBACK_COPY),
+        claude_full_rearm_root_digest(FALLBACK_PEER),
+    ]);
     assert!(index.bounded_sweep_had_unsettled_upload());
     assert_eq!(
         index.bounded_sweep_unsettled_cause_names(),
-        ["unattributed"]
+        ["completed_blocking_holds"]
     );
+    assert_eq!(
+        index.unchanged_proof_unsettled_families(),
+        Some(held.clone())
+    );
+    assert!(!held.contains(&claude_full_rearm_root_digest(FALLBACK_HEALTHY)));
+    assert!(scan
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == FALLBACK_HEALTHY));
     // Isolate the restore's own mark.
     index.bounded_sweep_had_unsettled_upload = false;
     index.bounded_sweep_unsettled_causes = 0;
@@ -4278,14 +4310,15 @@ fn native_comparison_fallback_marks_name_unattributed() {
     assert!(index.bounded_sweep_had_unsettled_upload());
     assert_eq!(
         index.bounded_sweep_unsettled_cause_names(),
-        ["unattributed"]
+        ["completed_blocking_holds"]
     );
+    assert_eq!(index.unchanged_proof_unsettled_families(), Some(held));
     index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
     index.save(&path).unwrap();
     let restored = ScanIndex::load(&path).unwrap();
     assert_eq!(
         restored.bounded_sweep_unsettled_cause_names(),
-        ["shed", "unattributed"]
+        ["shed", "completed_blocking_holds"]
     );
 }
 
@@ -4325,9 +4358,9 @@ fn native_comparison_selected_restore_removes_the_withheld_census_record() {
 }
 
 #[test]
-fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt() {
+fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_only_held_copies() {
     if !native_positive_layout_for_test(
-        "native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt",
+        "native_comparison_selected_fallback_partial_locked_save_and_restart_keep_only_held_copies",
     ) {
         return;
     }
@@ -4363,10 +4396,11 @@ fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exac
             .unwrap()
             .pending_candidates
             .len(),
-        4
+        2,
+        "only the held copies; no target is carried to the restarted process"
     );
     assert!(!claude_native_comparison::lifecycle::Lifecycle::default().retained_valid_for_test());
-    writeln!(std::io::stderr().lock(), "native_comparison_partial_fallback: actual_progress_lock_selected_restore_CAS_save=true old_accepted_body_preserved=true new_copy_uncommitted=true no_empty_or_fake_hold=true native_priority_survives_reload=true restart_base=true").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_partial_fallback: actual_progress_lock_selected_restore_CAS_save=true old_accepted_body_preserved=true new_copy_uncommitted=true no_empty_or_fake_hold=true held_copy_requeue_survives_reload=true no_target_carry=true restart_base=true").unwrap();
 }
 
 #[test]
@@ -4388,6 +4422,314 @@ fn native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit() 
     assert!(fallback.restore_selected(&mut index, &previous).is_err());
     assert_eq!(fs::read(&path).unwrap(), durable);
     writeln!(std::io::stderr().lock(), "native_comparison_fallback_failure: actual_index_CAS_loser_preserves_winner=true wrong_window_refused=true no_checkpoint_or_offer_success=true").unwrap();
+}
+
+/// The production paid selection on one hit that page bodies do not cover
+/// (O1, E3): the first advance queues the frozen plain Skips restore-only in
+/// THIS pass; the next advance takes them. Nothing is deferred to, or carried
+/// into, a later pass.
+struct PaidHit {
+    state: OwnedSourceScan,
+    controller: claude_native_comparison::Controller,
+    queued: usize,
+    healthy: bool,
+    reads: TargetReads,
+}
+fn native_comparison_paid_hit(
+    fixture: &NativePreparationFixture,
+    mut state: OwnedSourceScan,
+    qualification: claude_native_comparison::Qualification,
+) -> PaidHit {
+    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut lease = owner.begin();
+    lease.bind("paid-in-pass-restore".into());
+    let bytes = crate::heap_layout_bound::completed_bound(&qualification, usize::MAX).unwrap()
+        - std::mem::size_of_val(&qualification);
+    let mut credit = crate::source_rotation::PaidReservation::from_remainder(
+        Some(crate::source_rotation::PARKED_BUDGET),
+        bytes,
+        bytes,
+    );
+    let mut controller = claude_native_comparison::Controller::new_paid(
+        qualification,
+        state.snapshots.len(),
+        &mut credit,
+    )
+    .unwrap();
+    let before = TargetReads::of(&state);
+    let mut healthy = controller
+        .advance_paid(&mut state, true, &fixture.index, &mut credit, &mut lease)
+        .unwrap();
+    let queued = state.identified_candidates.len();
+    if healthy && queued > 0 {
+        state = pause_native_comparison(state);
+        healthy = controller
+            .advance_paid(&mut state, true, &fixture.index, &mut credit, &mut lease)
+            .unwrap();
+    }
+    let reads = TargetReads::of(&state).since(before);
+    PaidHit {
+        state,
+        controller,
+        queued,
+        healthy,
+        reads,
+    }
+}
+
+const PAID_HIT_COPY: &str = "c3333333-3333-4333-8333-333333333333";
+
+/// Run an unrestorable paid hit to its selected fallback: the dependent is
+/// withheld for this pass and the hold is disclosed on #799.
+fn native_comparison_paid_hold(
+    fixture: &NativePreparationFixture,
+    state: OwnedSourceScan,
+    qualification: claude_native_comparison::Qualification,
+) -> (
+    ScanIndex,
+    SourceScanResult,
+    claude_native_comparison::SelectedFallback,
+    serde_json::Value,
+) {
+    let hit = native_comparison_paid_hit(fixture, state, qualification);
+    // DoD 20: before E3 the paid selection deferred this hit (queued 0) and
+    // its selected restore cleared A's stamps for a later Full.
+    assert_eq!(
+        hit.queued, 2,
+        "the frozen targets are attempted in THIS pass"
+    );
+    assert!(!hit.healthy);
+    assert_eq!(
+        hit.reads,
+        TargetReads {
+            refused: 2,
+            ..TargetReads::default()
+        },
+        "restore-only: refused and counted, never a Full"
+    );
+    let (mut index, mut scan, terminal) = complete_native_with_terminal_owner(hit.state);
+    let completion = hit.controller.complete(&scan, terminal, true).unwrap();
+    let mut fallback = completion.fallback.expect("an uncovered plan is held");
+    let ((), rows) = crate::local_resource_diagnostics::capture(|| fallback.withhold(&mut scan));
+    let counts = rows
+        .iter()
+        .find(|row| row["stage"] == "native_comparison_restore_unavailable")
+        .unwrap()["counts"]
+        .clone();
+    fallback.after_native_fold(&mut scan, &mut index);
+    (index, scan, fallback, counts)
+}
+
+#[test]
+fn native_comparison_paid_hit_restores_targets_in_pass_and_money_equals_full() {
+    if !native_positive_layout_for_test(
+        "native_comparison_paid_hit_restores_targets_in_pass_and_money_equals_full",
+    ) {
+        return;
+    }
+    let (fixture, state, qualification) = native_comparison_positive_hit_fixture();
+    let hit = native_comparison_paid_hit(&fixture, state, qualification);
+    // DoD 20: before E3 this hit was deferred (queued 0, unresolved {C}).
+    assert_eq!(
+        hit.queued, 2,
+        "the frozen plain Skips are queued in THIS pass"
+    );
+    assert!(
+        hit.healthy,
+        "restored targets cover the plan; nothing is held"
+    );
+    assert_eq!(
+        hit.reads,
+        TargetReads {
+            unchanged: 2,
+            ..TargetReads::default()
+        },
+        "served from RAM, zero bytes re-read, never Full"
+    );
+    let (receipt, _) = hit.controller.receipt_for_test();
+    assert_eq!(
+        receipt.acquired_roots,
+        BTreeSet::from([fixture.parent.clone()])
+    );
+    assert!(receipt.unresolved_sources.is_empty());
+    // Condition 2: the emitted bodies (dependent and targets) and the
+    // settlement are those of the fresh-Full route.
+    assert_eq!(
+        native_bodies(&hit.state.snapshots),
+        fixture.cold_full_bodies()
+    );
+    let mut cold_index = fixture.index.clone();
+    for entry in cold_index.files.values_mut() {
+        entry.source_file_fingerprint.clear();
+    }
+    let mut cold = fixture.paused_from(cold_index, None, 8);
+    cold.resume_native_comparison_base();
+    let (cold_index, cold_scan) = SelectionFixture::run(cold);
+    let (index, scan) = SelectionFixture::run(hit.state);
+    let mut completion = hit.controller.complete(&scan, None, true).unwrap();
+    assert!(completion.fallback.is_none(), "no hold and nothing carried");
+    // The hit family left the frozen proof set, so it has no native plan:
+    // a restored target mints no correction receipt (an optimization only;
+    // receipts feed rearm negatives, never a body or a settlement).
+    completion.prepare_native_corrections(&scan, &fixture.index, &Default::default());
+    assert_eq!(completion.pending_native_correction_count_for_test(), 0);
+    let (restored_wire, restored_settlement) = comparison_money_body(&fixture, index, scan);
+    let (full_wire, full_settlement) = comparison_money_body(&fixture, cold_index, cold_scan);
+    assert!(!restored_wire.is_empty());
+    assert_eq!(restored_wire, full_wire, "post-fold emitted envelopes");
+    assert_eq!(
+        restored_settlement, full_settlement,
+        "assigned hashes and accepted state"
+    );
+    println!("MONEY_EQUIVALENCE_NATIVE_COMPARISON_IN_PASS VERIFIED");
+}
+
+/// Condition 1 and B1: a target that cannot be restored in this pass holds
+/// its dependent for THIS pass only, keeps every prior accepted body and
+/// stamp, discloses the refused targets on #799 and scopes the unsettled
+/// mark to the held family.
+#[test]
+fn native_comparison_paid_hit_unrestorable_target_holds_copy_this_pass_only() {
+    if !native_positive_layout_for_test(
+        "native_comparison_paid_hit_unrestorable_target_holds_copy_this_pass_only",
+    ) {
+        return;
+    }
+    // Sampled, but nothing retained or stored: no validated reuse exists.
+    let (fixture, state, qualification) = native_comparison_positive_hit_fixture_with(|fixture| {
+        fixture.cache = Some(Arc::new(sampled_scan::SharedCache::default()));
+    });
+    let previous = fixture.index.clone();
+    let (mut index, scan, mut fallback, counts) =
+        native_comparison_paid_hold(&fixture, state, qualification);
+    assert_eq!(counts["native_comparison_disclosed_restore_unavailable"], 1);
+    assert_eq!(counts["native_comparison_pending_debt"], 1);
+    // Condition 3 (#799): the refused targets of THIS pass.
+    assert_eq!(counts["native_comparison_refused_targets"], 2);
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id != PAID_HIT_COPY));
+    assert!(!scan.census_complete);
+    // B1: scoped to the held family; never sweep-wide (no RU).
+    assert_eq!(
+        index.bounded_sweep_unsettled_cause_names(),
+        ["completed_blocking_holds"]
+    );
+    assert_eq!(
+        index.unchanged_proof_unsettled_families(),
+        Some(BTreeSet::from([claude_full_rearm_root_digest(
+            PAID_HIT_COPY
+        )]))
+    );
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    let copy = local_index_key(&fixture.dir.join(format!("{PAID_HIT_COPY}.jsonl")));
+    assert!(
+        !index.files.contains_key(&copy) && !index.confirmed_empty_files.contains(&copy),
+        "held, never a $0 or empty completion"
+    );
+    assert_eq!(
+        index.accepted_snapshot_fingerprints,
+        previous.accepted_snapshot_fingerprints
+    );
+    let queued = index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .iter()
+        .map(|candidate| local_index_key(&candidate.path))
+        .collect::<Vec<_>>();
+    assert_eq!(queued.first(), Some(&copy));
+    for (key, entry) in &previous.files {
+        if claude_index_path_family_member(Path::new(key))
+            .is_some_and(|(root, _)| root == fixture.parent)
+        {
+            assert!(
+                !queued.contains(key),
+                "no target is queued for a later Full"
+            );
+            assert_eq!(
+                index.files[key].source_file_fingerprint, entry.source_file_fingerprint,
+                "B2: a target keeps its stamp and stays a plain Skip"
+            );
+        }
+    }
+}
+
+/// Condition 1, restart, B2 and B3: nothing about the held comparison
+/// survives. A fresh process with no permit and empty RAM re-derives it on
+/// the next walk from the unchanged plain Skips and holds the dependent
+/// again; once a reduction is retained, the same walk serves it in-pass.
+#[test]
+fn native_comparison_restart_rederives_the_hold_and_retires_it_without_debt() {
+    if !native_positive_layout_for_test(
+        "native_comparison_restart_rederives_the_hold_and_retires_it_without_debt",
+    ) {
+        return;
+    }
+    let (mut fixture, state, qualification) =
+        native_comparison_positive_hit_fixture_with(|fixture| {
+            fixture.cache = Some(Arc::new(sampled_scan::SharedCache::default()));
+        });
+    let previous = fixture.index.clone();
+    let (mut index, _, mut fallback, _) =
+        native_comparison_paid_hold(&fixture, state, qualification);
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    // Restart: no permit, an empty RAM cache, and the next walk.
+    assert!(!claude_native_comparison::lifecycle::Lifecycle::default().retained_valid_for_test());
+    index.traversal = None;
+    let next_walk = |fixture: &NativePreparationFixture, index: ScanIndex| {
+        let mut state = fixture.paused_from(index, fixture.cache.as_ref(), 8);
+        // B2: the targets are still plain Skips; DoD 20: before E3 their
+        // cleared stamps made them a Parse and this walk read them Full.
+        assert_eq!(state.scanned_file_count, 1);
+        let healthy = BTreeSet::from([fixture.parent.clone()]);
+        let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+            api: &fixture.api.evidence,
+            trace: &fixture.trace.evidence,
+            healthy_roots: &healthy,
+        });
+        assert_eq!(qualification.certified_member_count(), 2);
+        (state, qualification)
+    };
+    fixture.cache = Some(Arc::new(sampled_scan::SharedCache::default()));
+    let (state, qualification) = next_walk(&fixture, index.clone());
+    let (_, scan, _, counts) = native_comparison_paid_hold(&fixture, state, qualification);
+    assert_eq!(
+        counts["native_comparison_disclosed_restore_unavailable"], 1,
+        "re-held: never published without its comparison"
+    );
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id != PAID_HIT_COPY));
+    // B3: retirement is automatic. A retained reduction serves the same
+    // re-derived comparison in-pass; no prior hold or debt is consulted.
+    fixture.warm_target_reductions(Arc::new(sampled_scan::SharedCache::default()));
+    let (state, qualification) = next_walk(&fixture, index);
+    let hit = native_comparison_paid_hit(&fixture, state, qualification);
+    assert_eq!(hit.queued, 2);
+    assert!(hit.healthy);
+    assert_eq!(
+        hit.reads,
+        TargetReads {
+            unchanged: 2,
+            ..TargetReads::default()
+        }
+    );
+    let (_, scan) = SelectionFixture::run(hit.state);
+    assert!(scan.census_complete);
+    assert!(scan
+        .snapshots
+        .iter()
+        .any(|item| item.source_session_id == PAID_HIT_COPY));
+    assert!(hit
+        .controller
+        .complete(&scan, None, true)
+        .unwrap()
+        .fallback
+        .is_none());
 }
 
 /// Complete only the remaining physical cursor before a SECOND component
