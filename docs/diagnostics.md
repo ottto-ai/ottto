@@ -727,6 +727,12 @@ not distinct sessions, decoded bytes or money. No path or session id is included
 | `CompressedHeaderUnfunded` | Temporary header inventory/dependency refusal |
 | `CompressedCompatibilityUnfunded` | Temporary compatibility/plain-parser refusal |
 | `CompressedAdmissionRefused` | Transient decoder reservation or singleton yield |
+| `CompressedDecodeFailed` | Invalid/truncated frame or checksum failure |
+| `CompressedOwnerUnproven` | Decoded owner does not prove logical rollout identity |
+| `CompressedOutputHeld` | Definitively incomplete native output |
+| `CompressedSettlementStuck` | Three failed or interrupted first-read attempts |
+| `CompressedConstructorUnfunded` | Plain-parser constructor backstop for an archive |
+| `CompressedDecodedOverLimit` | Decoded bytes exceed the existing 2 GiB cap |
 
 These refusals authorize neither discovery nor a decoder. A refusal publishes no
 empty or zero-cost replacement body: previous accepted output remains stale, or
@@ -749,3 +755,32 @@ counts. Callers close the decoder and explicitly release after Stores drops.
 Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
+
+Archive disposition stays `pending` until the final body is ACK-settled.
+Pending evidence carries a retry deadline: at most one first-read re-decode per
+six hours. Each retry increments `codex_zst_first_read_retry` on the same carrier;
+its decoded bytes are included above. Three failed settlements hold the archive
+with counted cause `CompressedSettlementStuck`; no empty or zero-cost body is
+substituted. Settled, empty, held and refused stamps remain quiet until content
+changes. Decoder safety-net release emits `codex_zst_owner.counts.leaked_release`;
+normal completion and error paths release explicitly after any Stores guard.
+
+Main-scan archive refusals and held results also increment the unreadable census,
+including unchanged stamps skipped without a decoder. Admission refusal is a
+transient yield: it consumes no attempt or retry counter and changes no evidence.
+Only frame/checksum/truncation, decoded-limit and owner failures are sticky.
+Read/identity I/O, expired launch evidence and parent-pending/deferred output stay
+pending under the same six-hour/three-attempt bound. Over-limit decoded bytes are
+reported by `codex_zst_decoded_bytes`; unknown/stuck money is never reported as $0.
+
+`codex_zst_input` and `codex_zst_first_read_retry` are the A1 FirstRead accounting
+for archives, including recovery reads, and are not generic Full rereads. A retry
+is counted only after funding succeeds. A changed same-content stamp resets to
+attempt 1; Stuck never retries without a stamp change. Pending(3) from an
+interrupted upload becomes Stuck at the next due admission without another
+decode or an invented ACK. LD observers see each admitted recovery delivery and
+must deduplicate their derived results by the opened object.
+
+Archive body decoding remains undiscovered until the activation slice. User-change
+(A3) and approved code-replay (A4) correction handling is a separate prerequisite
+to that activation; this completion/reservation slice grants neither authority.

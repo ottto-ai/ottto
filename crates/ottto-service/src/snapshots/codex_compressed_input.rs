@@ -4,6 +4,7 @@
 //! open site before it constructs `OpenedInput::compressed`.
 #![cfg_attr(not(test), allow(dead_code))]
 use crate::local_resource_diagnostics::{codex_zst_refused, CodexZstCause};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
@@ -85,6 +86,111 @@ fn thread_cpu_micros() -> u64 {
         .saturating_add(spec.tv_nsec as u64 / 1_000)
 }
 
+/// SOURCE Q3: no content, offsets, checkpoint or acceptance authority.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ArchiveEvidence {
+    pub(super) stamp: crate::transcript_acquisition::FileStamp,
+    pub(super) logical_id: String,
+    pub(super) owner: Option<String>,
+    pub(super) disposition: ArchiveDisposition,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ArchiveDisposition {
+    Acquired,
+    Empty,
+    Pending { attempts: u8, retry_after: u64 },
+    Held { cause: CodexZstCause },
+    Refused { cause: CodexZstCause },
+}
+impl ArchiveEvidence {
+    pub(super) fn begin(file: &File, path: &Path, previous: Option<&Self>) -> io::Result<Self> {
+        let logical = path.with_extension("");
+        let logical_id = super::codex_session_id_candidates_from_path(&logical)
+            .into_iter()
+            .next()
+            .ok_or_else(|| invalid("compressed rollout logical id unavailable"))?;
+        let now = super::sampled_scan::now_seconds();
+        let attempts = match previous
+            .filter(|old| old.matches(file))
+            .map(|old| &old.disposition)
+        {
+            Some(ArchiveDisposition::Pending { attempts, .. }) => attempts.saturating_add(1),
+            _ => 1,
+        };
+        if attempts > 1 {
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_zst_first_read_retry",
+                "codex",
+                &BTreeMap::from([("codex_zst_first_read_retry", 1_u64)]),
+            );
+        }
+        Ok(Self {
+            stamp: crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?
+                .content_only(),
+            logical_id,
+            owner: None,
+            disposition: ArchiveDisposition::Pending {
+                attempts,
+                retry_after: now.saturating_add(6 * 3600),
+            },
+        })
+    }
+    pub(super) fn finish(
+        &mut self,
+        owner: Option<String>,
+        path: &Path,
+        parsed: &super::ParsedJsonlFile,
+    ) -> bool {
+        use ArchiveDisposition::*;
+        let logical = path.with_extension("");
+        self.owner = owner
+            .filter(|owner| super::codex_session_id_candidates_from_path(&logical).contains(owner));
+        if let Some(owner) = &self.owner {
+            self.logical_id = owner.clone();
+        }
+        if self.owner.is_none() {
+            codex_zst_refused(CodexZstCause::OwnerUnproven);
+            self.disposition = Refused {
+                cause: CodexZstCause::OwnerUnproven,
+            };
+        } else if !parsed.complete()
+            && !parsed.codex_parent_resolution_pending
+            && !parsed
+                .codex_parent_unresolvable
+                .is_some_and(|c| c.deferred())
+        {
+            codex_zst_refused(CodexZstCause::OutputHeld);
+            self.disposition = Held {
+                cause: CodexZstCause::OutputHeld,
+            };
+        } else if parsed.complete() && parsed.snapshots.is_empty() {
+            self.disposition = Empty;
+        }
+        self.owner.is_some() && parsed.complete()
+    }
+    pub(super) fn quiet(&self, file: &File) -> bool {
+        self.matches(file)
+            && !matches!(self.disposition, ArchiveDisposition::Pending { retry_after, .. } if super::sampled_scan::now_seconds() >= retry_after)
+    }
+    pub(super) fn settle(&mut self, accepted: bool) {
+        if let ArchiveDisposition::Pending { attempts, .. } = self.disposition {
+            if accepted {
+                self.disposition = ArchiveDisposition::Acquired;
+            } else if attempts >= 3 {
+                self.disposition = ArchiveDisposition::Held {
+                    cause: CodexZstCause::SettlementStuck,
+                };
+                codex_zst_refused(CodexZstCause::SettlementStuck);
+            }
+        }
+    }
+    pub(super) fn matches(&self, file: &File) -> bool {
+        file.metadata()
+            .and_then(crate::transcript_acquisition::FileStamp::capture)
+            .is_ok_and(|stamp| self.stamp.same_content(&stamp))
+    }
+}
+
 /// Streaming decoder with sticky failure and an explicit decoded-byte budget.
 /// EOF is successful only after a complete frame (including checksum). Supports
 /// concatenated frames; a truncated last frame is never a successful prefix.
@@ -150,7 +256,9 @@ impl<R: Read> BoundedDecoder<R> {
             let hint = self
                 .context
                 .decompress_stream(&mut out, &mut input)
-                .map_err(|_| invalid("invalid compressed rollout frame"))?;
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, CodexZstCause::DecodeFailed)
+                })?;
             let consumed = input.pos;
             let produced = out.pos();
             self.compressed_bytes = self.compressed_bytes.saturating_add(consumed as u64);
@@ -162,7 +270,10 @@ impl<R: Read> BoundedDecoder<R> {
                 return Err(invalid("compressed rollout decoder exceeded its credit"));
             }
             if at_limit && produced != 0 {
-                return Err(invalid("compressed rollout decoded-byte limit"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    CodexZstCause::DecodedOverLimit,
+                ));
             }
             self.remaining -= produced as u64;
             if produced != 0 {
@@ -174,7 +285,7 @@ impl<R: Read> BoundedDecoder<R> {
                 } else {
                     io::ErrorKind::InvalidData
                 };
-                return Err(io::Error::new(kind, "incomplete compressed rollout"));
+                return Err(io::Error::new(kind, CodexZstCause::DecodeFailed));
             }
         }
     }
@@ -205,7 +316,7 @@ impl<R: Read> Drop for BoundedDecoder<R> {
         crate::local_resource_diagnostics::traversal_point(
             "codex_zst_input",
             "codex",
-            &std::collections::BTreeMap::from([
+            &BTreeMap::from([
                 ("codex_zst_compressed_bytes", self.compressed_bytes),
                 ("codex_zst_decoded_bytes", self.decoded_bytes),
                 ("codex_zst_cpu_micros", self.cpu_micros),
@@ -301,13 +412,13 @@ impl OpenedInput {
         }
     }
 
-    /// Funded decoder memory is charged by its outstanding SharedCache claim.
-    /// Unfunded synthetic input charges its box, buffer and full decoder credit;
-    /// plain input charges only its buffer.
+    /// Retained heap charge: funded input is already charged by SharedCache.
+    /// Unfunded test input charges its box, buffers and full decoder credit;
+    /// plain input charges exactly its buffer capacity.
     pub(super) fn capacity(&self) -> usize {
         match self {
             Self::Plain(reader) => reader.capacity(),
-            Self::Compressed(_, Some(_)) => 0, // existing outstanding cache reservation
+            Self::Compressed(_, Some(_)) => 0, // outstanding SharedCache claim owns this charge
             Self::Compressed(reader, _) => {
                 let boxed = size_of::<BufReader<BoundedDecoder<File>>>();
                 boxed
@@ -340,6 +451,52 @@ impl BufRead for OpenedInput {
             Self::Plain(reader) => reader.consume(amount),
             Self::Compressed(reader, _) => reader.consume(amount),
         }
+    }
+}
+
+impl super::ScanIndex {
+    pub(crate) fn settle_archive_bodies(&mut self, accepted: &BTreeMap<String, String>) {
+        for (key, entry) in &mut self.files {
+            if let Some(archive) = entry.archive.as_mut() {
+                let bodies = self
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .filter(|fps| !fps.is_empty())
+                    .and_then(|fps| {
+                        fps.iter()
+                            .map(|fp| accepted.get(fp))
+                            .collect::<Option<BTreeSet<_>>>()
+                    });
+                let settled = bodies
+                    .map(super::snapshot_file_upload_body_set_hex)
+                    .as_ref()
+                    .zip(entry.last_upload_body_witness.as_ref())
+                    .is_some_and(|(a, b)| a == b);
+                archive.settle(settled);
+            }
+        }
+    }
+    pub(super) fn archive_decode_error(&mut self, path: &Path, error: &anyhow::Error) {
+        let cause = error.chain().find_map(|e| {
+            e.downcast_ref::<io::Error>()
+                .and_then(io::Error::get_ref)
+                .and_then(|e| e.downcast_ref::<CodexZstCause>())
+        });
+        if let Some((archive, &cause)) = self
+            .files
+            .get_mut(&super::local_index_key(path))
+            .and_then(|entry| entry.archive.as_mut())
+            .zip(cause)
+        {
+            archive.disposition = ArchiveDisposition::Refused { cause };
+            codex_zst_refused(cause);
+        }
+    }
+}
+crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, disposition);
+impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
     }
 }
 
@@ -513,7 +670,530 @@ pub(in crate::snapshots) mod tests {
         // the stream fails instead of ending as a shorter complete body.
         let input = OpenedInput::compressed(file, plain.len() as u64 - 1, credit).unwrap();
         let error = parse(codex_parser(input, path), &expected, path).unwrap_err();
-        assert!(format!("{error:#}").contains("decoded-byte limit"));
+        assert!(format!("{error:#}").contains("DecodedOverLimit"));
+    }
+    pub(in crate::snapshots) use DECODER_TEST_LOCK as ARCHIVE_TEST_LOCK;
+    struct ArchiveFixture(PathBuf);
+    impl ArchiveFixture {
+        fn new(bytes: &[u8]) -> Self {
+            let root = crate::test_scratch::private_dir("codex-archive-completion");
+            let path = root.join("rollout-compressed-fixture.jsonl.zst");
+            fs::write(&path, bytes).unwrap();
+            Self(path)
+        }
+        fn candidate(&self) -> CandidateFile {
+            let mut candidate = super::super::codex_zst_refusal_tests::candidate(&self.0);
+            candidate.size_bytes = fs::metadata(&self.0).unwrap().len();
+            candidate
+        }
+    }
+    impl Drop for ArchiveFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+    #[derive(Clone, Default)]
+    struct Ends(Arc<Mutex<Vec<super::super::line_delivery::DeliveryEnd>>>);
+    impl super::super::line_delivery::LineObserver for Ends {
+        fn begin(
+            &mut self,
+            file: &super::super::line_delivery::FileView,
+        ) -> super::super::line_delivery::Want {
+            assert_eq!(file.mode, super::super::line_delivery::DeliveryMode::Full);
+            super::super::line_delivery::Want::Lines
+        }
+        fn line(
+            &mut self,
+            _: &super::super::line_delivery::FileView,
+            _: &super::super::line_delivery::PhysicalLine<'_>,
+        ) {
+        }
+        fn end(
+            &mut self,
+            _: &super::super::line_delivery::FileView,
+            end: &super::super::line_delivery::DeliveryEnd,
+        ) {
+            self.0.lock().unwrap().push(*end);
+        }
+    }
+    // Inject the candidate at the selection seam: discovery remains plain-only
+    // until 11b. Everything from secure open through LD/output is production.
+    fn archive_pass(
+        f: &ArchiveFixture,
+        index: ScanIndex,
+        paid: bool,
+        limit: Option<u64>,
+    ) -> (ScanIndex, SourceScanResult, Vec<Value>, Ends) {
+        archive_pass_with(f, index, paid, limit, &[], |_| {})
+    }
+    fn archive_pass_with(
+        f: &ArchiveFixture,
+        index: ScanIndex,
+        paid: bool,
+        limit: Option<u64>,
+        roots: &[PathBuf],
+        setup: impl FnOnce(&mut OwnedSourceScan),
+    ) -> (ScanIndex, SourceScanResult, Vec<Value>, Ends) {
+        let ends = Ends::default();
+        let ((index, result), diagnostics) = crate::local_resource_diagnostics::capture(|| {
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                roots,
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_line_observer("archive", Box::new(ends.clone()));
+            if paid {
+                scan = scan.with_sampled_acquisition(
+                    Arc::new(sampled_scan::SharedCache::default()),
+                    Scope("archive-test".into()),
+                );
+            }
+            scan.identified_candidates = VecDeque::from([f.candidate()]);
+            scan.census
+                .observed_index_keys
+                .insert(local_index_key(&f.0));
+            scan.codex_join_prepared = true;
+            scan.census_unix_seconds = None;
+            setup(&mut scan);
+            for _ in 0..1000 {
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(mut next) => {
+                        // Synthetic over-limit without allocating a 2GiB fixture.
+                        if let Some(limit) = limit {
+                            let (active, lease) = next.active_file.into_parts();
+                            let mut active = active;
+                            if let Some(active) = active.as_mut() {
+                                if active.charged_bytes == 0 {
+                                    if let OpenedInput::Compressed(reader, _) =
+                                        &mut active.parser.reader.reader
+                                    {
+                                        reader.get_mut().remaining = limit;
+                                    }
+                                }
+                            }
+                            next.active_file =
+                                sampled_scan::codex_cursor::ActiveFrame::new(active, lease);
+                        }
+                        scan = next;
+                    }
+                    OwnedSourceScanStep::Complete {
+                        mut index,
+                        mut scan,
+                        ..
+                    } => {
+                        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                        return (index, scan);
+                    }
+                }
+            }
+            panic!("archive scan did not complete");
+        });
+        (index, result, diagnostics, ends)
+    }
+    fn decodes(rows: &[Value]) -> usize {
+        rows.iter()
+            .filter(|row| row["stage"] == "codex_zst_input")
+            .count()
+    }
+    fn checkpoint(index: &ScanIndex) -> ScanIndex {
+        let partial = index.committable_subset_with_local_holds(
+            &ScanIndex::default(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        serde_json::from_slice(&serde_json::to_vec(&partial).unwrap()).unwrap()
+    }
+    #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "funded decoder needs validated heap layout"
+    )]
+    fn archive_acquisition_money_identity_ld_and_failure_checkpoint_are_quiet() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let bytes = synthetic_rollout();
+        let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
+        let (mut index, result, rows, ends) = archive_pass(&f, ScanIndex::default(), true, None);
+        assert_eq!(decodes(&rows), 1);
+        assert_eq!(
+            *ends.0.lock().unwrap(),
+            vec![super::super::line_delivery::DeliveryEnd::Complete]
+        );
+        assert_eq!(result.snapshots.len(), 1);
+        let plain = fixture(&bytes, ".jsonl");
+        let mut file = File::open(&plain.0).unwrap();
+        let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+        let oracle = parse(
+            codex_parser(OpenedInput::plain(file), &plain.0),
+            &identity,
+            &plain.0,
+        )
+        .unwrap();
+        let actual = serde_json::to_value(&result.snapshots[0]).unwrap();
+        for key in [
+            "source_session_id",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens",
+            "reasoning_output_tokens",
+            "unattributed_total_tokens",
+            "request_count",
+            "model_usage",
+            "usage_buckets",
+            "usage_accounting_contract",
+        ] {
+            assert_eq!(
+                actual[key], oracle["snapshots"][0][key],
+                "money field {key}"
+            );
+        }
+        assert_eq!(result.snapshots[0].source_session_id, "compressed-fixture");
+        let key = local_index_key(&f.0);
+        assert!(matches!(
+            index.files[&key].archive.as_ref().unwrap().disposition,
+            ArchiveDisposition::Pending { attempts: 1, .. }
+        ));
+        let saved = checkpoint(&index); // upload failure / lost ACK, then restart
+        assert!(saved.files[&key].last_snapshot_fingerprint.is_none());
+        assert!(saved.accepted_snapshot_fingerprints.is_empty());
+        assert!(!saved.file_snapshot_fingerprints.contains_key(&key));
+        let expected_pending_money = serde_json::to_value(&result.snapshots).unwrap();
+        // Neither an unsettled in-memory pass nor its durable checkpoint can
+        // consume another decode before six hours; neither fabricates a body.
+        for state in [index.clone(), saved] {
+            let (mut state, result, rows, _) = archive_pass(&f, state, true, None);
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.snapshots.is_empty());
+            retry_due(&mut state, &key);
+            let (mut state, offered, rows, _) = archive_pass(&f, state, true, None);
+            assert_eq!(decodes(&rows), 1);
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r["stage"] == "codex_zst_first_read_retry")
+                    .count(),
+                1
+            );
+            assert!(rows.iter().any(
+                |r| r["counts"]["codex_zst_decoded_bytes"].as_u64() == Some(bytes.len() as u64)
+            ));
+            assert_eq!(
+                serde_json::to_value(&offered.snapshots).unwrap(),
+                expected_pending_money
+            );
+            let accepted = offered
+                .snapshots
+                .iter()
+                .map(|s| {
+                    (
+                        s.snapshot_fingerprint.clone(),
+                        snapshot_upload_body_witness(s),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            // An ACK for an older body with the same semantic fp is insufficient.
+            state.settle_archive_bodies(
+                &accepted
+                    .keys()
+                    .map(|fp| (fp.clone(), "wrong-body".into()))
+                    .collect(),
+            );
+            assert!(matches!(
+                state.files[&key].archive.as_ref().unwrap().disposition,
+                ArchiveDisposition::Pending { .. }
+            ));
+            state.settle_archive_bodies(&accepted);
+            assert!(matches!(
+                state.files[&key].archive.as_ref().unwrap().disposition,
+                ArchiveDisposition::Acquired
+            ));
+            let mut replay = state.clone();
+            assert!(replay.prepare_historical_replay("explicit-replay".into()));
+            assert!(replay.accepted_snapshot_fingerprints.is_empty());
+            // SOURCE first-read-only: replay resets delivery facts but cannot
+            // authorize a second body read or manufacture an entity ACK.
+            for state in [state.clone(), checkpoint(&state), replay] {
+                let (_, result, rows, _) = archive_pass(&f, state, true, None);
+                assert_eq!(decodes(&rows), 0);
+                assert!(result.snapshots.is_empty());
+            }
+        }
+        // Terminal settlement precedes checkpoint selection; the subset never
+        // invents settlement from a semantic ACK alone.
+        index.settle_archive_bodies(
+            &result
+                .snapshots
+                .iter()
+                .map(|s| {
+                    (
+                        s.snapshot_fingerprint.clone(),
+                        snapshot_upload_body_witness(s),
+                    )
+                })
+                .collect(),
+        );
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect();
+        let partial = index.committable_subset_with_local_holds(
+            &ScanIndex::default(),
+            &accepted,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(matches!(
+            partial.files[&key].archive.as_ref().unwrap().disposition,
+            ArchiveDisposition::Acquired
+        ));
+    }
+    fn retry_due(index: &mut ScanIndex, key: &str) {
+        let ArchiveDisposition::Pending { retry_after, .. } = &mut index
+            .files
+            .get_mut(key)
+            .unwrap()
+            .archive
+            .as_mut()
+            .unwrap()
+            .disposition
+        else {
+            panic!("not pending")
+        };
+        *retry_after = 0; // synthetic passage of six hours, no process-wide clock
+    }
+    #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "funded decoder needs validated heap layout"
+    )]
+    fn archive_retry_six_hour_bound_and_three_failed_settlements_hold() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let key = local_index_key(&f.0);
+        let mut state = ScanIndex::default();
+        for attempt in 1..=3 {
+            let before = sampled_scan::now_seconds();
+            let (index, result, rows, _) = archive_pass(&f, state, true, None);
+            let after = sampled_scan::now_seconds();
+            assert_eq!(decodes(&rows), 1);
+            assert_eq!(result.snapshots.len(), 1);
+            let ArchiveDisposition::Pending {
+                attempts,
+                retry_after,
+            } = index.files[&key].archive.as_ref().unwrap().disposition
+            else {
+                panic!("not pending")
+            };
+            assert_eq!(attempts, attempt);
+            assert!((before + 6 * 3600..=after + 6 * 3600).contains(&retry_after));
+            // A mid-upload page checkpoint carries evidence without treating
+            // this still-live upload as another failed settlement.
+            assert!(matches!(
+                checkpoint(&index).files[&key]
+                    .archive
+                    .as_ref()
+                    .unwrap()
+                    .disposition,
+                ArchiveDisposition::Pending { .. }
+            ));
+            let (saved, rows) = crate::local_resource_diagnostics::capture(|| {
+                let mut failed = index;
+                failed.settle_archive_bodies(&BTreeMap::new());
+                checkpoint(&failed)
+            });
+            state = saved;
+            if attempt < 3 {
+                let (saved, result, rows, _) = archive_pass(&f, state, true, None);
+                assert_eq!(decodes(&rows), 0);
+                assert!(result.snapshots.is_empty());
+                state = checkpoint(&saved);
+                retry_due(&mut state, &key);
+            } else {
+                assert!(matches!(
+                    state.files[&key].archive.as_ref().unwrap().disposition,
+                    ArchiveDisposition::Held {
+                        cause: CodexZstCause::SettlementStuck
+                    }
+                ));
+                assert!(rows.iter().any(|r| r["counts"]["codex_zst_refused"]
+                    ["CompressedSettlementStuck"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0)));
+                for _ in 0..2 {
+                    let (saved, result, rows, _) = archive_pass(&f, checkpoint(&state), true, None);
+                    assert_eq!(decodes(&rows), 0);
+                    assert!(result.snapshots.is_empty());
+                    assert!(result.unreadable_path_count > 0);
+                    assert!(saved.codex_parent_ownership_ledgers.is_empty());
+                    assert!(saved.accepted_snapshot_fingerprints.is_empty());
+                    state = saved;
+                }
+            }
+        }
+    }
+    #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "funded decoder needs validated heap layout"
+    )]
+    fn archive_failed_attempts_never_publish_and_refusals_survive_restart() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let bytes = synthetic_rollout();
+        let valid = zstd::stream::encode_all(&bytes[..], 1).unwrap();
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.write_all(&bytes).unwrap();
+        let mut checksum = encoder.finish().unwrap();
+        *checksum.last_mut().unwrap() ^= 1;
+        for (encoded, paid, limit) in [
+            (b"corrupt".to_vec(), true, None),
+            (checksum, true, None),
+            (valid[..valid.len() - 1].to_vec(), true, None),
+            (valid.clone(), true, Some(1)),
+        ] {
+            let f = ArchiveFixture::new(&encoded);
+            let (index, result, rows, ends) = archive_pass(&f, ScanIndex::default(), paid, limit);
+            assert_eq!(decodes(&rows), usize::from(paid));
+            assert!(result.snapshots.is_empty());
+            assert!(index.codex_parent_ownership_ledgers.is_empty());
+            assert!(!ends
+                .0
+                .lock()
+                .unwrap()
+                .contains(&super::super::line_delivery::DeliveryEnd::Complete));
+            assert!(matches!(
+                index.files[&local_index_key(&f.0)]
+                    .archive
+                    .as_ref()
+                    .unwrap()
+                    .disposition,
+                ArchiveDisposition::Refused { .. }
+            ));
+            let cause = if limit.is_some() {
+                CodexZstCause::DecodedOverLimit
+            } else {
+                CodexZstCause::DecodeFailed
+            };
+            assert!(
+                matches!(index.files[&local_index_key(&f.0)].archive.as_ref().unwrap().disposition,
+                ArchiveDisposition::Refused { cause: actual } if actual == cause)
+            );
+            if limit.is_some() {
+                assert!(rows.iter().any(|r| r["counts"]["codex_zst_decoded_bytes"]
+                    .as_u64()
+                    .is_some_and(|n| n > limit.unwrap())));
+            }
+            let (_, result, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.snapshots.is_empty());
+            assert!(result.unreadable_path_count > 0);
+        }
+    }
+    #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "funded decoder needs validated heap layout"
+    )]
+    fn archive_empty_held_and_selected_held_restore_carry_only_evidence() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        for bytes in [
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed-fixture\"}}\n".to_vec(),
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"wrong-owner\"}}\n".to_vec(),
+            [synthetic_rollout(), b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\"bad\"}}}}\n".to_vec()].concat(),
+        ] {
+            let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
+            let (mut index, result, _, _) = archive_pass(&f, ScanIndex::default(), true, None);
+            assert!(result.snapshots.is_empty());
+            let key = local_index_key(&f.0);
+            index.files.get_mut(&key).unwrap().last_snapshot_fingerprint =
+                Some("unacknowledged".into());
+            let held = BTreeSet::from(["unacknowledged".into()]);
+            let previous = ScanIndex::default();
+            let oracle = index.with_locally_held_keys_reverted(&previous, &held, &held);
+            let mut restored = index.into_locally_held_keys_reverted(&previous, &held, &held);
+            assert_eq!(
+                serde_json::to_value(&restored.files).unwrap(),
+                serde_json::to_value(oracle.files).unwrap()
+            );
+            assert!(restored.files[&key].last_snapshot_fingerprint.is_none());
+            restored.migrate(f.candidate());
+            restored.record(f.candidate(), None, ScanParseOutcome::Unknown);
+            let unhealthy = matches!(restored.files[&key].archive.as_ref().unwrap().disposition, ArchiveDisposition::Held { .. } | ArchiveDisposition::Refused { .. });
+            let (_, result, rows, _) = archive_pass(&f, checkpoint(&restored), true, None);
+            assert_eq!(result.unreadable_path_count > 0, unhealthy);
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.snapshots.is_empty());
+        }
+    }
+    #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "funded decoder needs validated heap layout"
+    )]
+    fn archive_uses_logical_sidecar_classification_and_blocks_ambiguous_names() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let mut metadata = CodexTitleMetadata::default();
+        metadata
+            .state_created_threads
+            .insert("compressed-fixture".into());
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut index = ScanIndex::default();
+        let mut parser = sampled_scan::new_source_parser(
+            File::open(&f.0).unwrap(),
+            &f.candidate(),
+            SnapshotSource::Codex,
+            &metadata,
+            None,
+            None,
+            false,
+            false,
+            false,
+            &mut index,
+            Some(&cache),
+        )
+        .unwrap();
+        while !parser.step().unwrap() {}
+        assert!(parser.accumulator.codex_created_thread_native_only);
+        assert!(!parser.accumulator.codex_usage_accounting_complete());
+        parser.reader.reader.close();
+        let modern =
+            f.0.with_file_name("rollout-2026-10-28T10-00-00-compressed-fixture.jsonl.zst");
+        fs::copy(&f.0, &modern).unwrap();
+        let candidate = super::super::codex_zst_refusal_tests::candidate(&modern);
+        let mut index = ScanIndex::default();
+        assert!(sampled_scan::new_source_parser(
+            File::open(&modern).unwrap(),
+            &candidate,
+            SnapshotSource::Codex,
+            &metadata,
+            None,
+            None,
+            false,
+            false,
+            false,
+            &mut index,
+            None
+        )
+        .is_err());
+        for id in [
+            "compressed-fixture",
+            "2026-10-28T10-00-00-compressed-fixture",
+        ] {
+            assert!(index.codex_state_only_blocked_session_ids.contains(id));
+        }
     }
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
@@ -603,5 +1283,467 @@ pub(in crate::snapshots) mod tests {
             .unwrap()
             .close();
         assert_eq!(other.cursor_reserved(), 0);
+    }
+    fn factory(
+        f: &ArchiveFixture,
+        index: &mut ScanIndex,
+        cache: Option<&Arc<sampled_scan::SharedCache>>,
+    ) -> Result<OwnedJsonlParser> {
+        sampled_scan::new_source_parser(
+            File::open(&f.0).unwrap(),
+            &f.candidate(),
+            SnapshotSource::Codex,
+            &CodexTitleMetadata::default(),
+            None,
+            None,
+            false,
+            true,
+            false,
+            index,
+            cache,
+        )
+    }
+    fn assert_pending(index: &ScanIndex, path: &Path, expected: u8) {
+        assert!(
+            matches!(index.files[&local_index_key(path)].archive.as_ref().unwrap().disposition,
+            ArchiveDisposition::Pending { attempts, .. } if attempts == expected)
+        );
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn archive_admission_yields_without_consuming_evidence_or_a_retry() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let key = local_index_key(&f.0);
+        let (mut previous, _, _, _) = archive_pass(&f, ScanIndex::default(), true, None);
+        retry_due(&mut previous, &key);
+        for baseline in [ScanIndex::default(), checkpoint(&previous)] {
+            for why in 0..3 {
+                let mut index = baseline.clone();
+                let cache = Arc::new(sampled_scan::SharedCache::default());
+                let busy = (why == 1).then(|| {
+                    OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+                        .unwrap()
+                        .unwrap()
+                });
+                let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+                    if why == 2 {
+                        sampled_scan::codex_cursor::with_test_state_budget(0, || {
+                            factory(&f, &mut index, Some(&cache))
+                        })
+                    } else {
+                        factory(&f, &mut index, (why != 0).then_some(&cache))
+                    }
+                });
+                assert!(result.is_err());
+                assert_eq!(
+                    serde_json::to_value(&index.files).unwrap(),
+                    serde_json::to_value(&baseline.files).unwrap()
+                );
+                assert_eq!(decodes(&rows), 0);
+                assert!(!rows
+                    .iter()
+                    .any(|r| r["stage"] == "codex_zst_first_read_retry"));
+                assert!(rows.iter().any(|r| r["counts"]["codex_zst_refused"]
+                    ["CompressedAdmissionRefused"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0)));
+                if let Some(input) = busy {
+                    input.close();
+                }
+                let (_, result, rows, _) = archive_pass(&f, index, true, None);
+                assert_eq!(decodes(&rows), 1);
+                assert_eq!(result.snapshots.len(), 1);
+            }
+        }
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn archive_interrupted_third_attempt_sticks_and_content_change_resets_attempts() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let bytes = synthetic_rollout();
+        let encoded = zstd::stream::encode_all(&bytes[..], 1).unwrap();
+        let f = ArchiveFixture::new(&encoded);
+        let key = local_index_key(&f.0);
+        let (mut index, _, _, _) = archive_pass(&f, ScanIndex::default(), true, None);
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .archive
+            .as_mut()
+            .unwrap()
+            .disposition = ArchiveDisposition::Pending {
+            attempts: 3,
+            retry_after: 0,
+        };
+        let (held, result, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
+        assert_eq!(decodes(&rows), 0, "restart must not admit attempt four");
+        assert!(result.snapshots.is_empty());
+        assert!(held.accepted_snapshot_fingerprints.is_empty());
+        assert!(matches!(
+            held.files[&key].archive.as_ref().unwrap().disposition,
+            ArchiveDisposition::Held {
+                cause: CodexZstCause::SettlementStuck
+            }
+        ));
+        for (n, cause) in [CodexZstCause::SettlementStuck, CodexZstCause::DecodeFailed]
+            .into_iter()
+            .enumerate()
+        {
+            let mut state = held.clone();
+            state
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .archive
+                .as_mut()
+                .unwrap()
+                .stamp =
+                crate::transcript_acquisition::FileStamp::capture(fs::metadata(&f.0).unwrap())
+                    .unwrap()
+                    .content_only();
+            if cause == CodexZstCause::DecodeFailed {
+                state
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .archive
+                    .as_mut()
+                    .unwrap()
+                    .disposition = ArchiveDisposition::Refused { cause };
+            }
+            let (_, result, rows, _) = archive_pass(&f, checkpoint(&state), true, None);
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.snapshots.is_empty());
+            let mut changed = encoded.clone();
+            changed.extend(zstd::stream::encode_all(&vec![b'\n'; n + 1][..], 1).unwrap());
+            fs::write(&f.0, changed).unwrap();
+            let (fresh, result, rows, _) = archive_pass(&f, state, true, None);
+            assert_eq!(decodes(&rows), 1);
+            assert_eq!(result.snapshots.len(), 1);
+            assert_pending(&fresh, &f.0, 1);
+            assert!(!rows
+                .iter()
+                .any(|r| r["stage"] == "codex_zst_first_read_retry"));
+            fs::write(&f.0, &encoded).unwrap();
+        }
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn archive_identity_revalidation_failure_remains_pending_and_releases_owner() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let path = f.0.clone();
+        let (index, result, rows, ends) = with_after_reader_eof(
+            move |_| {
+                let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                file.write_all(&zstd::stream::encode_all(&b"\n"[..], 1).unwrap())
+                    .unwrap();
+            },
+            || archive_pass(&f, ScanIndex::default(), true, None),
+        );
+        assert_eq!(decodes(&rows), 1);
+        assert_pending(&index, &f.0, 1);
+        assert!(result.snapshots.is_empty());
+        assert!(!ends
+            .0
+            .lock()
+            .unwrap()
+            .contains(&super::super::line_delivery::DeliveryEnd::Complete));
+        assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_owner"));
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn archive_expired_launch_evidence_is_a_pending_finish_error() {
+        use base64::Engine;
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let bytes = String::from_utf8(synthetic_rollout())
+            .unwrap()
+            .replace("compressed-fixture", id);
+        let mut f = ArchiveFixture::new(&zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap());
+        let path = f.0.with_file_name(format!("rollout-{id}.jsonl.zst"));
+        fs::rename(&f.0, &path).unwrap();
+        f.0 = path;
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut index = ScanIndex::default();
+        let mut parser = factory(&f, &mut index, Some(&cache)).unwrap();
+        while !parser.step().unwrap() {}
+        let expected =
+            opened_object_identity(SnapshotSource::Codex, parser.reader.reader.get_mut()).unwrap();
+        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+            SnapshotSource::Codex,
+            f.0.parent().unwrap(),
+            true,
+            Some(&key),
+            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .unwrap();
+        let workers = vec![id.to_string()];
+        for _ in 0..10 {
+            if context.prepare_launch_step(&workers).unwrap() {
+                break;
+            }
+        }
+        assert!(context.launches_prepared(&workers));
+        context.expire_launch_lookup_for_test();
+        let error = parser
+            .finish(
+                &expected,
+                &f.0,
+                NOW,
+                "fixture".into(),
+                Some(&CodexTitleMetadata::default()),
+                None,
+                Some(&context),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("launch evidence lookup incomplete"));
+        index.archive_decode_error(&f.0, &error);
+        assert_pending(&index, &f.0, 1);
+        assert_eq!(cache.cursor_reserved(), 0);
+    }
+    #[test]
+    fn decoder_read_io_is_not_a_sticky_content_refusal() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("synthetic EIO"))
+            }
+        }
+        let mut decoder = BoundedDecoder::new(Broken, 1024).unwrap();
+        let error = decoder.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<CodexZstCause>())
+            .is_none());
+    }
+    #[test]
+    fn plain_entries_have_no_archive_allocation_and_stubs_grant_no_authority() {
+        use crate::heap_layout_bound::HeapLayoutBound;
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+            let entry = ScanIndexEntry::default();
+            assert!(entry.archive.is_none(), "{source:?}");
+            let mut counter = crate::heap_layout_bound::Counter::new(usize::MAX);
+            entry.heap_bound(&mut counter).unwrap();
+            assert_eq!(
+                counter.bytes, 0,
+                "{source:?} has no heap for archive metadata"
+            );
+        }
+        let f = ArchiveFixture::new(b"synthetic stamp only");
+        let evidence = ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap();
+        let key = local_index_key(&f.0);
+        let mut index = ScanIndex::default();
+        index.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
+        let saved = checkpoint(&index);
+        let stub = &saved.files[&key];
+        assert_eq!((stub.size_bytes, stub.modified_unix_seconds), (0, 0));
+        assert!(stub.source_file_fingerprint.is_empty() && stub.scan_identity_version.is_none());
+        assert!(
+            stub.last_snapshot_fingerprint.is_none() && stub.last_upload_body_witness.is_none()
+        );
+        assert!(saved.file_snapshot_fingerprints.is_empty());
+        assert!(saved.accepted_snapshot_fingerprints.is_empty());
+        assert!(saved.confirmed_empty_files.is_empty());
+        assert!(saved.traversal.is_none());
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn archive_priority_receipt_survives_trace_expiry_and_lost_ack() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let mut records: Vec<Value> = synthetic_rollout()
+            .split(|b| *b == b'\n')
+            .filter(|r| !r.is_empty())
+            .map(|r| serde_json::from_slice(r).unwrap())
+            .collect();
+        records.insert(
+            1,
+            json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-synthetic"}}),
+        );
+        let bytes = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect::<String>();
+        let f = ArchiveFixture::new(&zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap());
+        let (index, first, _, _) =
+            archive_pass_with(&f, ScanIndex::default(), true, None, &[], |scan| {
+                let mut traces = CodexTurnTraceMap::default();
+                traces.priority_turns.insert(turn.into());
+                scan.codex_turn_traces = Some(Arc::new(traces));
+            });
+        assert_eq!(first.snapshots.len(), 1);
+        assert!(first.snapshots[0].model_usage.iter().any(|r| r
+            .selector_context
+            .get("service_tier")
+            .map(String::as_str)
+            == Some("priority")));
+        let key = local_index_key(&f.0);
+        assert!(codex_file_join::receipt_state(index.files.get(&key))
+            .0
+            .is_some());
+        let mut saved = checkpoint(&index);
+        retry_due(&mut saved, &key);
+        let (_, recovered, rows, _) = archive_pass(&f, saved, true, None); // traces expired
+        assert_eq!(decodes(&rows), 1);
+        assert_eq!(
+            serde_json::to_value(&recovered.snapshots).unwrap(),
+            serde_json::to_value(&first.snapshots).unwrap()
+        );
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn archive_v2_and_legacy_ack_evidence_carry_with_settled_bodies() {
+        use super::super::codex_counting_version::AckEvidence;
+        let _cutover = super::super::codex_counting_version::TestCutover::set(0);
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let key = local_index_key(&f.0);
+        for v2 in [false, true] {
+            let mut prior = ScanIndex::default();
+            prior.files.insert(
+                key.clone(),
+                ScanIndexEntry {
+                    codex_counting_v2: v2,
+                    last_snapshot_fingerprint: Some("previous-ack".into()),
+                    ..Default::default()
+                },
+            );
+            let (mut index, result, rows, _) = archive_pass(&f, prior, true, None);
+            assert_eq!(decodes(&rows), 1);
+            assert_eq!(result.snapshots.len(), 1);
+            let bodies = result
+                .snapshots
+                .iter()
+                .map(|s| {
+                    (
+                        s.snapshot_fingerprint.clone(),
+                        snapshot_upload_body_witness(s),
+                    )
+                })
+                .collect();
+            index.settle_archive_bodies(&bodies);
+            let expected = if v2 {
+                AckEvidence::V2Marked
+            } else {
+                AckEvidence::LegacyAcked
+            };
+            assert_eq!(AckEvidence::of_view([&index.files[&key]]), expected);
+            for entry in [
+                index.files[&key].clone(),
+                serde_json::from_value(serde_json::to_value(&index.files[&key]).unwrap()).unwrap(),
+            ] {
+                assert_eq!(AckEvidence::of_view([&entry]), expected);
+                assert!(matches!(
+                    entry.archive.as_ref().unwrap().disposition,
+                    ArchiveDisposition::Acquired
+                ));
+            }
+            let (_, result, rows, _) = archive_pass(&f, index, true, None);
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.snapshots.is_empty());
+        }
+    }
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+    fn archive_fork_child_before_plain_parent_recovers_exclusive_money_on_bounded_retry() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let parent = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
+        let meta = |id: &str| json!({"timestamp":"2026-10-07T08:00:00Z","type":"session_meta","payload":{"id":id,"thread_source":"user"}});
+        let turn = |id: &str| json!({"timestamp":"2026-10-07T08:00:01Z","type":"turn_context","payload":{"turn_id":id,"model":"gpt-synthetic"}});
+        let usage = |input, cached, output, reasoning| json!({"timestamp":"2026-10-07T08:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-synthetic","total_token_usage":{"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output,"reasoning_output_tokens":reasoning}}}});
+        let jsonl = |rows: Vec<Value>| {
+            rows.iter()
+                .map(|r| serde_json::to_string(r).unwrap() + "\n")
+                .collect::<String>()
+        };
+        let inherited = vec![turn("parent-turn-1"), usage(100, 80, 10, 2)];
+        let mut header = meta("compressed-fixture");
+        header["payload"]["forked_from_id"] = json!(parent);
+        let child = jsonl(vec![
+            header,
+            inherited[0].clone(),
+            inherited[1].clone(),
+            turn("child-turn-1"),
+            usage(130, 100, 14, 3),
+        ]);
+        let f = ArchiveFixture::new(&zstd::stream::encode_all(child.as_bytes(), 1).unwrap());
+        let roots = vec![f.0.parent().unwrap().to_owned()];
+        let (index, result, rows, ends) =
+            archive_pass_with(&f, ScanIndex::default(), true, None, &roots, |_| {});
+        assert_eq!(decodes(&rows), 1);
+        assert!(result.snapshots.is_empty());
+        assert_pending(&index, &f.0, 1);
+        assert!(!ends
+            .0
+            .lock()
+            .unwrap()
+            .contains(&super::super::line_delivery::DeliveryEnd::Complete));
+        assert!(index.codex_parent_ownership_refs.contains(parent));
+        let mut index = checkpoint(&index);
+        let path = roots[0].join(format!("rollout-{parent}.jsonl"));
+        fs::write(
+            &path,
+            jsonl(vec![
+                meta(parent),
+                inherited[0].clone(),
+                inherited[1].clone(),
+                turn("parent-turn-2"),
+                usage(160, 125, 18, 4),
+            ]),
+        )
+        .unwrap();
+        for _ in 0..8 {
+            scan_source_roots(
+                SnapshotSource::Codex,
+                &roots,
+                &mut index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap();
+            if index.codex_parent_ownership_ledgers.contains_key(parent) {
+                break;
+            }
+        }
+        assert!(index.codex_parent_ownership_ledgers.contains_key(parent));
+        let key = local_index_key(&f.0);
+        let (saved, result, rows, _) = archive_pass_with(&f, index, true, None, &roots, |_| {});
+        assert_eq!(
+            decodes(&rows),
+            0,
+            "parent arrival does not bypass six hours"
+        );
+        assert!(!result
+            .snapshots
+            .iter()
+            .any(|s| s.source_session_id == "compressed-fixture"));
+        let mut saved = saved;
+        retry_due(&mut saved, &key);
+        let (after, result, rows, _) = archive_pass_with(&f, saved, true, None, &roots, |_| {});
+        assert_eq!(decodes(&rows), 1);
+        assert_pending(&after, &f.0, 2);
+        let child = result
+            .snapshots
+            .iter()
+            .find(|s| s.source_session_id == "compressed-fixture")
+            .expect("recovered child");
+        assert_eq!(
+            (
+                child.input_tokens,
+                child.cache_read_tokens,
+                child.output_tokens
+            ),
+            (10, 20, 4)
+        );
     }
 }
