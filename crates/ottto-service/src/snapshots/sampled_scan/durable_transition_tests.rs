@@ -422,11 +422,16 @@ fn shared_failed_rename_preserves_predecessor_and_retry_money() {
         })));
         let page = f.pages.get_mut(&Mode::DiskRestore).unwrap();
         page.index.save(&f.disk.index).unwrap();
+        let effects_before = fixture::native_effects(&page.index, &page.scan);
         let writer = crate::locked_state_dir::held_for(&f.disk.index).unwrap();
         assert!(page
             .cache
             .durable_write_after_save(writer, SOURCE, &page.index)
             .is_none());
+        assert_eq!(
+            fixture::native_effects(&page.index, &page.scan),
+            effects_before
+        );
         assert_eq!(f.disk.record_bytes(), f.old_bytes);
         crate::durable_tail_store::test_hooks::set_before_rename(None);
         // M1 still has its old binding and post-save crash gap. Same-process
