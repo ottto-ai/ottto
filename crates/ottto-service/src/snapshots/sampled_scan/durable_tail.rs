@@ -1041,7 +1041,7 @@ pub(crate) enum MissClass {
 impl MissClass {
     pub(crate) fn label(self) -> &'static str {
         // Restore's producers use this closed set of content-free suffixes.
-        // Unknown codec labels retain the existing static_label class.
+        // Refuse::UnknownLabel uses the existing static_label class.
         macro_rules! prefixed {
             ($prefix:literal, $suffix:expr, $($label:literal),+ $(,)?) => {
                 match $suffix {
@@ -1110,7 +1110,8 @@ impl MissClass {
                 "SnapshotAccumulator.workspace_path",
                 "SnapshotAccumulator.codex_agent_label",
                 "SessionStartState.content_end",
-                "SnapshotAccumulator.title"
+                "SnapshotAccumulator.title",
+                "CodexPrelude.skills_body"
             ),
         }
     }

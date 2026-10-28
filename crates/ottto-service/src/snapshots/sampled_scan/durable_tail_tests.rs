@@ -1410,6 +1410,14 @@ fn certificate_read_error_is_not_edit_evidence() {
     std::fs::write(&path, b"{\"n\":1}\n").unwrap();
     let scope = Scope("certificate-error".into());
     let certificate = certificate(&path, &scope);
+    // Preserve the nested codec's content-refusal field label as a static key.
+    assert_eq!(
+        MissClass::Failure(Failure::NotRederived(Refuse::NonEmpty(
+            "CodexPrelude.skills_body"
+        )))
+        .label(),
+        "not_rederived.CodexPrelude.skills_body"
+    );
     // Metadata succeeds; the first existing sample read fails on a write-only FD.
     let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     assert_eq!(
