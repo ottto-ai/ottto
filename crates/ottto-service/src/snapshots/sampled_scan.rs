@@ -1981,15 +1981,11 @@ pub(super) fn new_source_parser(
             && is_compressed_codex_rollout(Some(&candidate.path), None)
         {
             let key = local_index_key(&candidate.path);
-            anyhow::ensure!(
-                !index
-                    .files
-                    .get(&key)
-                    .and_then(|entry| entry.archive.as_ref())
-                    .is_some_and(|archive| archive.quiet(&file)),
-                "compressed rollout already attempted"
-            );
             if let Some(archive) = index.files.get_mut(&key).and_then(|e| e.archive.as_mut()) {
+                anyhow::ensure!(
+                    !archive.quiet(&file),
+                    "compressed rollout already attempted"
+                );
                 if matches!(
                     archive.disposition,
                     ArchiveDisposition::Pending { attempts: 3.., .. }
@@ -2012,14 +2008,23 @@ pub(super) fn new_source_parser(
                 }
             };
             let Some(input) = input else {
+                let yields = index.compressed_admission_yields.entry(key).or_default();
+                *yields = yields.saturating_add(1).min(13);
+                if *yields == 12 {
+                    crate::local_resource_diagnostics::traversal_point(
+                        "codex_zst_admission_alarm",
+                        "codex",
+                        &serde_json::json!({"consecutive_yields": 12}),
+                    );
+                }
                 anyhow::bail!("compressed rollout admission yielded");
             };
-            let evidence = codex_compressed_input::ArchiveEvidence::begin(
+            index.compressed_admission_yields.remove(&key);
+            let evidence = match codex_compressed_input::ArchiveEvidence::begin(
                 input.get_ref(),
                 &candidate.path,
                 index.files.get(&key).and_then(|e| e.archive.as_deref()),
-            );
-            let evidence = match evidence {
+            ) {
                 Ok(e) => e,
                 Err(e) => {
                     input.close();
@@ -2046,6 +2051,7 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
+    // S2: route archive decodes through the single Full gate.
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);
