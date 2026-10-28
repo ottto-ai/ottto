@@ -77892,7 +77892,7 @@ mod tests {
             });
             fixture.push_str(&format!("{entry}\n"));
         }
-        fs::write(&path, fixture).expect("write usage entry fixture");
+        fs::write(&path, &fixture).expect("write usage entry fixture");
         let item = parse_pi_jsonl_file(&path, "2026-07-22T09:02:00Z", "fp".into())
             .expect("parse")
             .remove(0);
@@ -77907,7 +77907,7 @@ mod tests {
         assert_eq!(row.cache_creation_5m_tokens, 12);
         assert_eq!(row.cost_usd.as_deref(), Some("0.003"));
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Pi);
-        for line in fs::read_to_string(&path).unwrap().lines() {
+        for line in fixture.lines() {
             apply_pi_line(&serde_json::from_str(line).unwrap(), &mut accumulator);
         }
         assert!(accumulator.seen_pi_usage_keys.is_empty());
@@ -77986,6 +77986,9 @@ mod tests {
             serde_json::json!({"type": "session", "id": "fixture-session",
                 "timestamp": "2026-07-22T08:00:00Z"}),
             serde_json::json!({"type": "model_change", "modelId": "gpt-5.4"}),
+            serde_json::json!({"type": "message", "message": {"role": "assistant",
+                "model": "gpt-5.4", "timestamp": "2026-07-22T08:00:01Z",
+                "usage": {"input": 12, "output": 4, "cost": {"total": 0.001}}}}),
             serde_json::json!({"type": "compaction", "timestamp": "2026-07-22T08:01:00Z"}),
             serde_json::json!({"type": "branch_summary", "timestamp": "2026-07-22T08:01:01Z"}),
             serde_json::json!({"type": "message", "message": {"role": "assistant",
@@ -78003,11 +78006,13 @@ mod tests {
             .expect("parse")
             .remove(0);
         assert_eq!(item.request_count, 1);
-        assert_eq!(item.input_tokens, 0);
-        assert_eq!(item.output_tokens, 0);
+        // The all-zero error usage is parsed with request_count=1, but the
+        // existing zero-token placement gate does not add it to the snapshot.
+        assert_eq!(item.input_tokens, 12);
+        assert_eq!(item.output_tokens, 4);
         assert_eq!(
             item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
-            Some("0")
+            Some("0.001")
         );
         let _ = fs::remove_file(path);
     }
