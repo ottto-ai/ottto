@@ -18,6 +18,11 @@ def output(args):
     return subprocess.check_output(args, text=True).strip()
 
 
+# Disk-only lifecycle fixtures (#806): a VERIFIED line each, no receipt file.
+DISK_FIXTURES = ("restart_between_pages", "upgrade_without_semantic_revision",
+                 "downgrade_then_reupgrade")
+
+
 def main():
     started = time.monotonic()
     repo = Path.cwd()
@@ -46,8 +51,8 @@ def main():
         base_sha = resolved.stdout.strip()
     head_sha = output(["git", "rev-parse", "HEAD"])
     manifest = {"base": base_sha, "head": head_sha, "base_ref": ref,
-                "arms": ["retained_ram_tail_or_unchanged", "cold_full"],
-                "disk_restore": "UNEXECUTED: E1/#806 not on main"}
+                "arms": ["retained_ram_tail_or_unchanged", "cold_full", "disk_restore"],
+                "disk_restore": "EXECUTED: " + ", ".join(DISK_FIXTURES)}
     (receipts / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     base = root / "base"
     command(["git", "worktree", "add", "--detach", str(base), base_sha])
@@ -90,6 +95,12 @@ def main():
             }
             if len(verified) != len(expected) or set(verified) != expected or "UNEXECUTED" in result.stdout:
                 raise RuntimeError(f"incomplete native coverage: {verified}")
+            # Every disk line must be VERIFIED, once per fixture: 10 + 3 receipts.
+            disk = re.findall(r"\bMONEY_EQUIVALENCE_DISK (\w+) (\w+)", result.stdout, re.M)
+            if sorted(disk) != sorted((name, "VERIFIED") for name in DISK_FIXTURES):
+                raise RuntimeError(f"incomplete disk-restore coverage: {disk}")
+            if len(verified) + len(disk) != len(expected) + len(DISK_FIXTURES):
+                raise RuntimeError(f"expected {len(expected)} + {len(DISK_FIXTURES)} receipts")
         left, right = receipts / "base", receipts / "head"
         names = sorted(p.name for p in left.glob("*.json") if not p.name.endswith(".cross-build.json"))
         if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")):
@@ -110,12 +121,14 @@ def main():
             a, b = (left / cross_name).read_bytes(), (right / cross_name).read_bytes()
             if a != b or hashlib.sha256(a).digest() != hashlib.sha256(b).digest():
                 raise RuntimeError(f"base/head cross-build emitted bytes or digest differ: {name}")
-        manifest.update(verdict="VERIFIED", fixtures=names, runtime_seconds=time.monotonic()-started)
+        manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
+                        runtime_seconds=time.monotonic()-started)
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
         with summary.open("a") as f:
-            f.write(f"Money equivalence VERIFIED: {len(names)} fixtures, base `{base_sha}`, head `{head_sha}`. "
-                    f"{manifest['runtime_seconds']:.1f}s. Disk restore/family vector/Pi remain ignored.\n")
+            f.write(f"Money equivalence VERIFIED: {len(names)} + {len(DISK_FIXTURES)} disk-restore fixtures, "
+                    f"base `{base_sha}`, head `{head_sha}`. "
+                    f"{manifest['runtime_seconds']:.1f}s. Family vector/Pi remain ignored.\n")
     finally:
         command(["git", "worktree", "remove", "--force", str(base)])
 
