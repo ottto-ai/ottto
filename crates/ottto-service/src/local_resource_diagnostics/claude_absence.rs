@@ -7,10 +7,11 @@ pub(crate) enum Parent {
     NotDirectory,
     MetadataError,
     Live,
+    OtherSource,
 }
 impl Parent {
     pub(crate) fn is_removal(self, path: &Path) -> bool {
-        if !matches!(self, Self::Live) {
+        if !matches!(self, Self::Live | Self::OtherSource) {
             super::claude_reread::update(|counts| {
                 let c = &mut counts.absence.0;
                 c[self as usize] = c[self as usize].saturating_add(1);

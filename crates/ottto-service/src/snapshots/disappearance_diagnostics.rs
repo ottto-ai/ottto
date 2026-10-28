@@ -1590,7 +1590,8 @@ mod absence_parent_counts_tests {
                 .and_then(|p| fs::symlink_metadata(p).ok())
                 .is_some_and(|p| p.is_dir() && !p.file_type().is_symlink());
             let scope = Scope::begin(true);
-            let result = claude_absence_parent(&path).is_removal(&path);
+            let result =
+                claude_absence_is_removal(SnapshotSource::ClaudeCode, &path).is_removal(&path);
             assert_eq!(result, original);
             assert_eq!(result, expected);
             let actual = counts(scope);

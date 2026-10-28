@@ -3,6 +3,7 @@ use crate::codex_scan_diagnostics::{
     ParentUnresolvableCauses, RecoveryLineage, StateRowFieldDiffs, UnreadableCause,
     UnreadableCauses, LINEAGE_SAMPLES,
 };
+use crate::local_resource_diagnostics::claude_absence::Parent;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
@@ -41161,8 +41162,10 @@ fn advance_bounded_directory_traversal_with_budget(
 /// so the census settles it as a removal, the same as a watcher remove hint.
 /// A missing, renamed or unmounted parent is not evidence of removal and keeps
 /// the NotFound as loss.
-fn claude_absence_parent(path: &Path) -> crate::local_resource_diagnostics::claude_absence::Parent {
-    use crate::local_resource_diagnostics::claude_absence::Parent;
+fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> Parent {
+    if source != SnapshotSource::ClaudeCode {
+        return Parent::OtherSource;
+    }
     #[cfg(test)]
     disappearance_diagnostics::before_absence_parent_probe();
     match path.parent().map(fs::symlink_metadata) {
@@ -41214,9 +41217,7 @@ fn candidate_from_traversal_path_at(
                     .removed_index_keys
                     .insert(local_index_key(&pending.path));
             } else if pending.census_member {
-                if source == SnapshotSource::ClaudeCode
-                    && claude_absence_parent(&pending.path).is_removal(&pending.path)
-                {
+                if claude_absence_is_removal(source, &pending.path).is_removal(&pending.path) {
                     // The same exact retirement as a remove hint, whichever
                     // order the hint and the queued member arrived in.
                     disappearance_diagnostics::not_found_removal(source, site);
@@ -41704,9 +41705,7 @@ fn open_and_identify_scan_candidate_with_rescue(
         match open_candidate_file_stat_retained(source, &mut candidate, cache) {
             Ok(opened) => opened,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if source == SnapshotSource::ClaudeCode
-                    && claude_absence_parent(&candidate.path).is_removal(&candidate.path)
-                {
+                if claude_absence_is_removal(source, &candidate.path).is_removal(&candidate.path) {
                     // Removed after its candidate stat. Drop this page's
                     // observation too, so the page merge retires the key.
                     disappearance_diagnostics::not_found_removal(
