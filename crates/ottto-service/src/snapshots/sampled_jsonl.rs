@@ -147,12 +147,10 @@ impl OwnedJsonlParser {
             "acquisition must begin before native parsing"
         );
         let old = old.filter(|old| {
+            // Capture is a function of the source (contract 5 always on,
+            // `claude_request_identity::captures`), so the same source keeps
+            // the capture mode its markers were built in.
             old.state.accumulator.source == self.source
-                // Marker state covers the whole file only in the capture mode
-                // it was built in: a non-capture prefix holds no markers, which
-                // is not the same as a prefix without markers.
-                && old.state.accumulator.claude_request_identity_capture
-                    == self.accumulator.claude_request_identity_capture
                 // A retained reduction continues only under the counting rule
                 // this parse's own evidence selects. Both unset while inactive.
                 && codex_counting_version::reusable(

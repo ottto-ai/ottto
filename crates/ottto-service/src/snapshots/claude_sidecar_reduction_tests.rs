@@ -767,76 +767,60 @@ fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse
     }
 }
 
-/// Retained native state is reused only in the capture mode it was built in.
-/// A prefix parsed without contract-5 capture holds no markers, so a capturing
-/// cycle under the same cache scope re-reads the file in full instead of
-/// tailing it as if the prefix had none; same-mode appends still tail.
+/// Contract 5 is always on, so capture is a function of the source and a
+/// retained reduction always continues in the capture mode its markers were
+/// built in (E1 S2: the retained capture-mode refusal is gone, not merely
+/// unreached). Appends tail, and the tailed body keeps the prefix's marker;
+/// `durable_restart` covers a restart.
 #[test]
-fn identity_capture_mode_change_rereads_instead_of_reusing_a_markerless_prefix() {
-    const ORG: &str = "11111111-1111-4111-8111-111111111111";
+fn constant_capture_tails_and_keeps_the_prefix_marker() {
+    let f = Fixture::new(1);
+    capture_marked(&f);
+    let cache = Arc::new(SharedCache::default());
+    let prior = settle(enriched(
+        &f,
+        raw_scan(&f, ScanIndex::default(), Some(cache.clone()), |_| {}),
+    ));
+    f.append_transcript(1);
+    let steady = raw_scan(&f, prior, Some(cache), |_| {});
+    assert_layout_mode(steady.modes, (0, 1, 0));
+    if crate::heap_layout_bound::layout_supported() {
+        assert_eq!(steady.reasons[FullReason::StateMissing.slot()], 0);
+    }
+    assert!(capture_markers_trusted(&steady, &f));
+}
+
+const CAPTURE_ORG: &str = "11111111-1111-4111-8111-111111111111";
+
+/// Prepends a `credential_org` marker to the fixture transcript.
+fn capture_marked(f: &Fixture) {
+    let first: Value = serde_json::from_str(&f.lines[0]).unwrap();
+    let marker = json!({"timestamp": first["timestamp"], "type": "attachment",
+        "sessionId": f.session, "attachment": {"type": "credential_org", "organizationUuid": CAPTURE_ORG}});
+    fs::write(&f.path, format!("{marker}\n{}\n", f.lines[0])).unwrap();
+}
+
+/// Every owned request of the fixture session trusts the prefix's marker.
+fn capture_markers_trusted(run: &Run, f: &Fixture) -> bool {
     let org = ottto_core::billing_identity_hash(
         "anthropic",
         "organization",
-        &crate::claude_local_otel::canonical_uuid(ORG).unwrap(),
+        &crate::claude_local_otel::canonical_uuid(CAPTURE_ORG).unwrap(),
     )
     .unwrap();
-    let marked = |f: &Fixture| {
-        let first: Value = serde_json::from_str(&f.lines[0]).unwrap();
-        let marker = json!({"timestamp": first["timestamp"], "type": "attachment",
-            "sessionId": f.session, "attachment": {"type": "credential_org", "organizationUuid": ORG}});
-        fs::write(&f.path, format!("{marker}\n{}\n", f.lines[0])).unwrap();
-    };
-    let markers_trusted = |run: &Run, f: &Fixture| {
-        let item = run
-            .result
-            .snapshots
-            .iter()
-            .find(|item| item.source_session_id == f.session)
-            .unwrap();
-        assert!(item.claude_usage_occurrences.len() >= 2);
-        item.claude_usage_occurrences.values().all(|occurrence| {
-            item.claude_org_markers.as_deref().is_some_and(|markers| {
-                markers.verdict(occurrence.sequence, false)
-                    == crate::snapshots::claude_request_identity::MarkerVerdict::Trusted(&org)
-            })
+    let item = run
+        .result
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == f.session)
+        .unwrap();
+    assert!(item.claude_usage_occurrences.len() >= 2);
+    item.claude_usage_occurrences.values().all(|occurrence| {
+        item.claude_org_markers.as_deref().is_some_and(|markers| {
+            markers.verdict(occurrence.sequence, false)
+                == crate::snapshots::claude_request_identity::MarkerVerdict::Trusted(&org)
         })
-    };
-    let seed = |f: &Fixture, cache: &Arc<SharedCache>, capture: bool| {
-        settle(enriched(
-            f,
-            raw_scan_capturing(
-                f,
-                ScanIndex::default(),
-                Some(cache.clone()),
-                capture,
-                |_| {},
-            ),
-        ))
-    };
-
-    // A dark cycle seeds the cache; the next cycle holds a permit.
-    let f = Fixture::new(1);
-    marked(&f);
-    let cache = Arc::new(SharedCache::default());
-    let prior = seed(&f, &cache, false);
-    f.append_transcript(1);
-    let flipped = raw_scan_capturing(&f, prior, Some(cache), true, |_| {});
-    assert_eq!(flipped.modes, (1, 0, 0));
-    assert_eq!(flipped.reasons[FullReason::StateMissing.slot()], 1);
-    assert!(
-        markers_trusted(&flipped, &f),
-        "the full re-read captures the prefix's marker"
-    );
-
-    // Control: same capture mode on both cycles keeps tail reuse.
-    let g = Fixture::new(1);
-    marked(&g);
-    let cache = Arc::new(SharedCache::default());
-    let prior = seed(&g, &cache, true);
-    g.append_transcript(1);
-    let steady = raw_scan_capturing(&g, prior, Some(cache), true, |_| {});
-    assert_layout_mode(steady.modes, (0, 1, 0));
-    assert!(markers_trusted(&steady, &g));
+    })
 }
 
 /// M1: a restart (a new process cache) continues from the durable store
@@ -1087,6 +1071,33 @@ mod durable_restart {
         second.durable_write_after_save(state.lock, SOURCE, &saved);
         assert_selection_refused(&second, &state);
         assert_fresh_restart_reads_full(&f, &state, saved);
+    }
+
+    /// E1 S2: a restart under the same (constant) capture restores the
+    /// durable record and tails; nothing reads Full for a capture-mode
+    /// mismatch, and the tailed body keeps the prefix's marker.
+    #[test]
+    fn a_constant_capture_restart_reads_no_full() {
+        let f = Fixture::new(1);
+        capture_marked(&f);
+        let state = State::new(&f);
+        let prior = seed_and_persist(&f, &state);
+        let second = Arc::new(SharedCache::default());
+        state.begin(&second);
+        f.append_transcript(1);
+        let cached = enriched(
+            &f,
+            raw_scan(&f, prior.clone(), Some(second.clone()), |_| {}),
+        );
+        assert_layout_mode(cached.modes, (0, 1, 0));
+        if crate::heap_layout_bound::layout_supported() {
+            assert_eq!(cached.reasons[FullReason::StateMissing.slot()], 0);
+        }
+        assert_eq!(
+            restored(&second),
+            u64::from(crate::heap_layout_bound::layout_supported())
+        );
+        assert!(capture_markers_trusted(&cached, &f));
     }
 
     #[test]

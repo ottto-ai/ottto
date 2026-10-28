@@ -2317,6 +2317,9 @@ struct ClaudeFullRearmProgress {
     /// loads `None`, which keeps the sweep-wide unchanged-proof veto.
     #[serde(skip_serializing_if = "Option::is_none")]
     held_family_roots: Option<BTreeSet<String>>,
+    /// Lead A ruling (a): the `""` cutover's latch re-arms at one terminal.
+    #[serde(skip_serializing_if = "is_zero_u8")]
+    contract_cutover: u8,
 }
 
 impl ClaudeFullRearmProgress {
@@ -6816,6 +6819,10 @@ const CLAUDE_REQUEST_IDENTITY_CONTRACT_CHANGED_MID_TRAVERSAL: &str = "changed_wi
 // Existing contract field records that E2 already armed paced revision debt
 // during this traversal. It cannot clear the contract latch at its terminal.
 const CLAUDE_E2_IDENTITY_ADOPTION_PENDING: &str = "e2_identity_adoption_pending";
+// Lead A ruling (a) cutover states; spent keeps the cutover's latch inert.
+const CLAUDE_CONTRACT_CUTOVER_OWED: u8 = 1;
+const CLAUDE_CONTRACT_CUTOVER_SPENT: u8 = 2;
+const CLAUDE_CONTRACT_CUTOVER_REAL: u8 = 3;
 // Full duplicate-fence re-arms back off while the fence stays closed. This
 // bounds replay cost only; reopening still requires current-window coverage.
 const CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS: u64 = 3_600;
@@ -9696,6 +9703,19 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 .claude_full_rearm_progress
                 .first_proof_hold_since_full_rearm;
         let stays_closed = overflowed_before && index.claude_duplicate_request_witness_overflowed;
+        // Lead A ruling (a): the cutover's latch re-arms at one terminal under
+        // the recorded contract; its baseline carries over (no full re-arm).
+        let cutover = index.claude_full_rearm_progress.contract_cutover;
+        let contract = claude_request_identity::cycle_contract(identity.is_some());
+        let cutover_terminal = cutover == CLAUDE_CONTRACT_CUTOVER_OWED
+            && index.claude_request_identity_contract.as_deref() == Some(contract);
+        let latch_rearms = index.claude_request_identity_contract_changed
+            && cutover != CLAUDE_CONTRACT_CUTOVER_SPENT;
+        if let Some(record) = (index.claude_full_rearm_progress.structural_record.as_mut())
+            .filter(|record| cutover_terminal && record.basis == claude_full_rearm_record_basis(""))
+        {
+            record.basis = claude_full_rearm_record_basis(contract);
+        }
         let full_rearm_suppressed = claude_full_rearm_structural_terminal(
             index,
             census_window_end,
@@ -9714,7 +9734,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             && owners_within_bound
             && !disposition.context_file_birth.resource_withheld()
             && !first_proof_veto
-            && !index.claude_request_identity_contract_changed
+            && !latch_rearms
             && index.claude_request_identity_contract.as_deref()
                 == Some(claude_request_identity::cycle_contract(identity.is_some()))
             && !index.claude_full_rearm_progress.other_invalidation_observed;
@@ -9844,7 +9864,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     && entry.effective_upload_body_witness_revision < 3
                     && !index.claude_family_listed(key)
             });
-        let identity_contract_rearm = index.claude_request_identity_contract_changed
+        let identity_contract_rearm = latch_rearms
             && !e2_identity_upgrade
             && fence_stays_closed
             && census_complete
@@ -9870,7 +9890,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let unsettled_families = index.unchanged_proof_unsettled_families();
         let unchanged_proof_gate = fence_stays_closed
             && !full_rearm
-            && !index.claude_request_identity_contract_changed
+            && !latch_rearms
             && identity_contract_recorded
             && unsettled_families.is_some()
             && claude_accepted_ledger_is_current(index)
@@ -9881,6 +9901,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         if census_complete
             && (full_rearm
                 || identity_contract_rearm
+                || !latch_rearms
                 || fence_recovery_rearm
                 || (e2_identity_upgrade && !e2_identity_owed))
             && identity_contract_recorded
@@ -9934,6 +9955,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         if let Some(first_proof_hold) = first_proof_hold {
             disposition.first_proof_hold = first_proof_hold;
         }
+        let mut rearmed_bytes = 0_u64;
         let mut rearm = crate::local_resource_diagnostics::NativeRearm {
             negative_keys: negative_keys.len(),
             ..Default::default()
@@ -10024,9 +10046,19 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 // unbounded corrective replay loop.
                 rearm.clear_calls = rearm.clear_calls.saturating_add(1);
                 entry.source_file_fingerprint.clear();
+                rearmed_bytes = rearmed_bytes.saturating_add(entry.size_bytes);
             } else if proof_candidate && negative {
                 rearm.suppressed = rearm.suppressed.saturating_add(1);
             }
+        }
+        if cutover_terminal {
+            index.claude_full_rearm_progress.contract_cutover = CLAUDE_CONTRACT_CUTOVER_SPENT;
+            claude_contract::note(|counts| {
+                let cutover = &mut counts.contract_cutover_rearm;
+                cutover.runs += 1;
+                cutover.files += rearm.clear_calls as u64;
+                cutover.bytes = cutover.bytes.saturating_add(rearmed_bytes);
+            });
         }
         if let Some(diagnostic) = diagnostic {
             diagnostic.update(|d| d.terminal_rearm = Some(rearm));
@@ -17567,8 +17599,8 @@ impl SnapshotAccumulator {
             claude_response_record_count: 0,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
-            // Contract 5 is always on; a sync cycle sets its own mode.
-            claude_request_identity_capture: true,
+            // Contract 5 is always on: capture is a function of the source.
+            claude_request_identity_capture: claude_request_identity::captures(source),
             claude_org_markers: None,
             cache_observations: None,
             cache_requests: crate::owned_heap::OwnedVec::new(),
@@ -25713,7 +25745,7 @@ impl OwnedSourceScan {
             hinted_paths,
             watcher_overflowed,
             context_curve_enabled,
-            true,
+            claude_request_identity::captures(source),
         )
     }
 
@@ -44156,6 +44188,18 @@ impl ScanIndex {
             return;
         }
         use claude_request_identity::{COLLECTOR, E2_GROUPING};
+        // Lead A ruling (a): the first cutover from `""` owes one re-arm; once
+        // spent, only a real contract-to-contract change re-arms again.
+        let cutover = &mut self.claude_full_rearm_progress.contract_cutover;
+        *cutover = match (*cutover, self.claude_request_identity_contract.as_deref()) {
+            (0, Some("")) => CLAUDE_CONTRACT_CUTOVER_OWED,
+            (CLAUDE_CONTRACT_CUTOVER_OWED, _) if contract.is_empty() => 0,
+            (CLAUDE_CONTRACT_CUTOVER_REAL, Some("")) => CLAUDE_CONTRACT_CUTOVER_SPENT,
+            (CLAUDE_CONTRACT_CUTOVER_SPENT, Some(COLLECTOR | E2_GROUPING)) => {
+                CLAUDE_CONTRACT_CUTOVER_REAL
+            }
+            (state, _) => state,
+        };
         claude_contract::note(|counts| {
             counts.identity_contract_latch.set +=
                 u64::from(!self.claude_request_identity_contract_changed);
@@ -89132,7 +89176,7 @@ crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_mem
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; origin, roots, capped_roots, replay);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarryOrigin; context_fingerprint, process, full_rearm_window, admission);
 crate::heap_layout_bound::fields!(ClaudeRetryAdmission; after_root, upper_root, complete, roots_complete, progressed, served_before, due_through, due_after_path, due_upper_path, due_complete, oversized_root, oversized_after_path, storage_deferred);
-crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots);
+crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; rebuild_read_full, complete_rebuild_read, observed_window, structural_roots, other_invalidation_observed, structural_rearm_owed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm, held_family_roots, contract_cutover);
 crate::heap_layout_bound::fields!(ClaudeCompleteRebuildRead; origin, members_digest);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);
