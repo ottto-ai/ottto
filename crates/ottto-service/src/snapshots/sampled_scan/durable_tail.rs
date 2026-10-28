@@ -47,7 +47,7 @@ pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 128;
 
 /// Head re-parse bytes of restores, per source, for the process lifetime.
-/// The re-parse bypasses the reread guard (bounded at `HEAD_BOUND`, on a RAM
+/// Existing class-X re-derivation is bounded at `HEAD_BOUND`, on a RAM
 /// miss only), so the census pass line reports it beside the guard's own
 /// counters (SOURCE N1).
 static REDERIVE_HEAD_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
