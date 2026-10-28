@@ -1802,6 +1802,11 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                 std::fs::write(invalid_path, invalid_body).unwrap();
                 if !keep_held {
                     fixture.local_holds.clear();
+                } else {
+                    // An earlier-page hold withholds the effective census
+                    // (:30247). Put the held probe on one page so its fold
+                    // actually reaches the owed-revision terminal veto.
+                    fixture.native_file_limit = 64;
                 }
                 let (retry, rows) = source_latch_generation(&fixture, 30, upload, Some(REARM_ROOT));
                 let carried = rows
@@ -1880,8 +1885,13 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                     let cleared = source_latch_clear_count(&rows);
                     assert_eq!(cleared, 0, "partial-save OR cannot mask an in-memory clear");
                     fixture.local_holds.clear();
+                    // F's ACK must precede the terminal fold, which checks
+                    // owed revisions before this page's upload can stamp.
+                    fixture.native_file_limit = 1;
                     let (accepted, release_rows) =
                         source_latch_generation(&fixture, 40, RearmUpload::Accept, None);
+                    assert!(!accepted.first().unwrap().scan.census_complete);
+                    assert!(accepted.last().unwrap().scan.census_complete);
                     assert_eq!(
                         source_latch_clear_count(&release_rows),
                         1,
@@ -1890,6 +1900,7 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
                     let body = fixture.body_trace.borrow().finalizer_bodies[REARM_ROOT].clone();
                     let fp = body["snapshot_fingerprint"].as_str().unwrap();
                     assert_ne!(body["snapshot_fingerprint"], old_f["snapshot_fingerprint"]);
+                    assert!(accepted.first().unwrap().uploaded.contains(fp));
                     assert!(accepted.iter().any(|page| page.uploaded.contains(fp)));
                     assert!(
                         !c1a_latch(&fixture).1,
