@@ -40,6 +40,8 @@ macro_rules! counters {
     };
 }
 counters! {
+    selector_key_rejected_unknown: SelectorKeyRejectedUnknown,
+    selector_key_rejected_format: SelectorKeyRejectedFormat,
     take_hit: TakeHit,
     take_absent: TakeAbsent,
     take_poisoned_lock: TakePoisonedLock,

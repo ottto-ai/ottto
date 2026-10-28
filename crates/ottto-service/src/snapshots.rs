@@ -32,6 +32,8 @@ pub(crate) mod cache_observations;
 #[cfg(test)]
 mod cache_policy_tests;
 mod claude_context_file_birth;
+#[cfg(test)]
+mod selector_validation_tests;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
@@ -34567,8 +34569,75 @@ fn selector_source_path(path: &[&str]) -> String {
     path.join(".")
 }
 
+// Capture vocabulary only: this does not expand source aliases or change the codec.
+const SELECTOR_KEY_RULES: &[(&str, &str)] = &[
+    ("service_tier", "token"),
+    ("speed_mode", "token"),
+    ("batch_mode", "bool"),
+    ("cache_ttl", "ttl"),
+    ("region_mode", "token"),
+    ("platform", "token"),
+    ("context_bucket", "context"),
+    ("mode", "mode"),
+    ("billing_channel", "token"),
+    ("auth_mode", "token"),
+    ("gateway_provider", "token"),
+    ("subscription_product", "token"),
+    ("attribution_subagent", "token"),
+    ("attribution_skill", "token"),
+    ("attribution_plugin", "token"),
+    ("attribution_mcp_server", "token"),
+    ("attribution_mcp_tool", "token"),
+    ("billing_provider", "token"),
+    ("model_provider", "token"),
+    ("plan_window_bucket", "u64"),
+    ("agent_quota_primary_used_percent", "number"),
+    ("agent_quota_primary_window_minutes", "u64"),
+    ("agent_quota_primary_resets_at", "u64"),
+    ("agent_quota_secondary_used_percent", "number"),
+    ("agent_quota_secondary_window_minutes", "u64"),
+    ("agent_quota_secondary_resets_at", "u64"),
+    ("agent_quota_credits_has_credits", "bool"),
+    ("agent_quota_credits_unlimited", "bool"),
+    ("agent_quota_credits_balance", "number"),
+];
+
+fn selector_value_valid(rule: &str, raw: &Value, value: &str) -> bool {
+    let unsigned = |s: &str| {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u64>().is_ok()
+    };
+    match rule {
+        "bool" => matches!(value, "true" | "false"),
+        "mode" => matches!(value, "fast" | "standard" | "priority" | "flex"),
+        "context" => matches!(value, "short" | "long"),
+        "u64" => unsigned(value),
+        "number" => value
+            .parse::<f64>()
+            .is_ok_and(|n| n.is_finite() && n >= 0.0),
+        "ttl" => {
+            unsigned(value.trim_end_matches(['s', 'm', 'h', 'd']))
+                && value.bytes().filter(|b| !b.is_ascii_digit()).count() <= 1
+        }
+        "token" => {
+            raw.is_string()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.:".contains(&b))
+        }
+        _ => false,
+    }
+}
+
 fn insert_selector_raw(capture: &mut SelectorCapture, field: &str, source: &str, value: &Value) {
-    let Some(normalized) = normalize_selector_raw(field, value) else {
+    let rule = SELECTOR_KEY_RULES.iter().find(|(key, _)| *key == field);
+    if rule.is_some() && value.is_null() {
+        return;
+    } // Optional absence, including quota balance.
+    let Some(normalized) = normalize_selector_raw(field, value)
+        .filter(|v| rule.is_some_and(|(_, rule)| selector_value_valid(rule, value, v)))
+    else {
+        crate::local_resource_diagnostics::selector_key_rejected(rule.is_none());
         return;
     };
     capture.insert(field, normalized.clone(), source);
@@ -34676,6 +34745,25 @@ fn selector_from_object(value: &Value, source_prefix: &str) -> SelectorCapture {
             &["plan_window_bucket", "planWindowBucket"],
         ),
     ];
+    // Native objects also contain unrelated event fields. Inspect unknown keys only
+    // inside explicit selector maps (Pi custom data is itself a selector map).
+    if source_prefix == "data"
+        || matches!(
+            source_prefix.rsplit('.').next(),
+            Some("selector" | "selector_context")
+        )
+    {
+        for key in map.keys() {
+            if !matches!(key.as_str(), "selector" | "selector_context")
+                && !SELECTOR_KEY_RULES.iter().any(|(known, _)| *known == key)
+                && !aliases
+                    .iter()
+                    .any(|(_, names)| names.contains(&key.as_str()))
+            {
+                crate::local_resource_diagnostics::selector_key_rejected(true);
+            }
+        }
+    }
     for (field, field_aliases) in aliases {
         for alias in *field_aliases {
             let Some(raw) = map.get(*alias) else {

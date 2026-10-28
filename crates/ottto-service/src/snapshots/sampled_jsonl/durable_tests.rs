@@ -1485,3 +1485,85 @@ fn structural_verifier_large_body_still_allocates_nothing() {
         Err(Corrupt)
     );
 }
+
+include!("selector_compatibility_tests.rs");
+
+#[test]
+fn rejected_selector_candidates_never_save_and_restore_tail_equals_full() {
+    use crate::local_resource_diagnostics::cache_lifecycle;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let scratch = Scratch::new("selector-rejection");
+        let inject = |line: String| {
+            let mut value: Value = serde_json::from_str(&line).unwrap();
+            value["selector_context"] = json!({"service_tier":"priority", "plan_window_bucket":"/tmp/BUCKET_SAVE_CANARY",
+                "/tmp/KEY_SAVE_CANARY":"VALUE_SAVE_CANARY"});
+            value.to_string()
+        };
+        let lines = match source {
+            SnapshotSource::ClaudeCode => claude_lines(2, 2),
+            _ => codex_lines(),
+        };
+        let lines: Vec<_> = lines.into_iter().map(inject).collect();
+        let path = scratch.write("t.jsonl", &lines);
+        let ((reduction, checkpoint), counts) =
+            cache_lifecycle::observe(|| full_read(&path, source));
+        assert!(
+            counts.selector_key_rejected_unknown > 0 && counts.selector_key_rejected_format > 0
+        );
+        assert!(!reduction
+            .accumulator
+            .current_selector
+            .context
+            .contains_key("plan_window_bucket"));
+        let body = encode(
+            &reduction,
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
+        for secret in ["BUCKET_SAVE_CANARY", "KEY_SAVE_CANARY", "VALUE_SAVE_CANARY"] {
+            assert!(occurrences(&body, secret.as_bytes()).is_empty());
+        }
+        let birth = birth_unix_nanos(&fs::metadata(&path).unwrap());
+        let certificate = checkpoint.durable_certificate(birth).unwrap();
+        let suffix = match source {
+            SnapshotSource::ClaudeCode => vec![claude_append()],
+            _ => codex_append(),
+        };
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for line in suffix.into_iter().map(inject) {
+            writeln!(file, "{line}").unwrap();
+        }
+        drop(file);
+        let (checkpoint, _) = certificate
+            .restore(&mut File::open(&path).unwrap(), scope())
+            .unwrap();
+        let (restored, _) = restore(&path, &body, source).unwrap();
+        let mut continued = parser(&path, source);
+        assert_eq!(
+            continued
+                .prepare_acquisition(
+                    Some(Retained {
+                        checkpoint,
+                        state: restored
+                    }),
+                    &scope(),
+                    None,
+                    NOW
+                )
+                .unwrap(),
+            ReadMode::Tail
+        );
+        while !continued.step().unwrap() {}
+        let saved = encode(
+            &continued.reduction_copy(),
+            crate::durable_tail_store::RECORD_BYTES,
+            line_cap(),
+        )
+        .unwrap();
+        for secret in ["BUCKET_SAVE_CANARY", "KEY_SAVE_CANARY", "VALUE_SAVE_CANARY"] {
+            assert!(occurrences(&saved, secret.as_bytes()).is_empty());
+        }
+        assert_eq!(items(continued, &path, source), cold_items(&path, source));
+    }
+}

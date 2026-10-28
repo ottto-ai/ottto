@@ -66,6 +66,14 @@ def main():
         include = '\nmod money_equivalence_tests { include!("money_equivalence_tests.rs"); }\n'
         if "mod money_equivalence_tests" not in tests.read_text():
             tests.write_text(tests.read_text() + include)
+        # Valid selector fixtures are test-only overlays, never candidate production.
+        selector = Path("crates/ottto-service/src/snapshots/sampled_jsonl")
+        shutil.copy2(repo / selector / "selector_compatibility_tests.rs",
+                     base / selector / "selector_compatibility_tests.rs")
+        selector_tests = base / selector / "durable_tests.rs"
+        selector_include = '\ninclude!("selector_compatibility_tests.rs");\n'
+        if selector_include.strip() not in selector_tests.read_text():
+            selector_tests.write_text(selector_tests.read_text() + selector_include)
         for arm, tree in [("base", base), ("head", repo)]:
             env = dict(os.environ, CARGO_TARGET_DIR=str(root / f"{arm}-target"),
                        OTTTO_MONEY_EQUIVALENCE_ROOT=str(root / "inputs"),
@@ -86,6 +94,14 @@ def main():
             print(result.stdout, flush=True)
             (receipts / f"{arm}.log").write_text(result.stdout)
             result.check_returncode()
+            selector_result = subprocess.run(
+                [bins[0], "selector_compatibility_tests::", "--nocapture", "--test-threads=1"],
+                cwd=tree, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            print(selector_result.stdout, flush=True)
+            (receipts / f"{arm}-selector.log").write_text(selector_result.stdout)
+            selector_result.check_returncode()
+            if len(re.findall(r"^SELECTOR_COMPATIBILITY VERIFIED ", selector_result.stdout, re.M)) != 1:
+                raise RuntimeError("missing or duplicate selector compatibility receipt")
             verified = re.findall(r"\bMONEY_EQUIVALENCE (\w+) VERIFIED ", result.stdout, re.M)
             expected = {
                 "progressive_response", "duplicate_request_ids", "resolver_conflict",
@@ -102,6 +118,9 @@ def main():
             if len(verified) + len(disk) != len(expected) + len(DISK_FIXTURES):
                 raise RuntimeError(f"expected {len(expected)} + {len(DISK_FIXTURES)} receipts")
         left, right = receipts / "base", receipts / "head"
+        if ((left / "selector/compatibility.json").read_bytes() !=
+                (right / "selector/compatibility.json").read_bytes()):
+            raise RuntimeError("valid selector bodies, records, identity, tier key or plan fingerprint changed")
         names = sorted(p.name for p in left.glob("*.json") if not p.name.endswith(".cross-build.json"))
         if len(names) != 10 or names != sorted(p.name for p in right.glob("*.json") if not p.name.endswith(".cross-build.json")):
             raise RuntimeError("missing or extra fixture receipts")
@@ -121,7 +140,7 @@ def main():
             a, b = (left / cross_name).read_bytes(), (right / cross_name).read_bytes()
             if a != b or hashlib.sha256(a).digest() != hashlib.sha256(b).digest():
                 raise RuntimeError(f"base/head cross-build emitted bytes or digest differ: {name}")
-        manifest.update(verdict="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
+        manifest.update(verdict="VERIFIED", selector_compatibility="VERIFIED", fixtures=names, disk_fixtures=list(DISK_FIXTURES),
                         runtime_seconds=time.monotonic()-started)
         (receipts / "summary.json").write_text(json.dumps(manifest, indent=2) + "\n")
         summary = Path(os.environ["GITHUB_STEP_SUMMARY"])

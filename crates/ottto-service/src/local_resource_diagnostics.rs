@@ -115,13 +115,40 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
 
 const SCHEMA_VERSION: u8 = 2;
 
+/// Capture attempts, process-wide; fixed classes only, never key/value/source text.
+pub(crate) fn selector_key_rejected(unknown: bool) {
+    use cache_lifecycle::Event;
+    cache_lifecycle::record(if unknown {
+        Event::SelectorKeyRejectedUnknown
+    } else {
+        Event::SelectorKeyRejectedFormat
+    });
+}
+
 /// Cumulative shared-process totals, NOT events attributed to the finishing
 /// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
 pub(crate) fn cache_lifecycle_totals() {
+    #[derive(Serialize)]
+    struct Counts {
+        #[serde(flatten)]
+        cache: cache_lifecycle::Counts,
+        selector_key_rejected: BTreeMap<&'static str, u64>,
+    }
+    let cache = cache_lifecycle::snapshot();
+    let selector_key_rejected = [
+        ("unknown", cache.selector_key_rejected_unknown),
+        ("format", cache.selector_key_rejected_format),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 0)
+    .collect();
     traversal_point(
         "process_retained_cache_lifecycle_totals",
         "unknown",
-        &cache_lifecycle::snapshot(),
+        &Counts {
+            cache,
+            selector_key_rejected,
+        },
     );
 }
 
