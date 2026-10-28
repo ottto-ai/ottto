@@ -895,6 +895,8 @@ pub(crate) struct AcquisitionAdmission {
     pub(crate) audit_slot_available: AssessedBool,
     pub(crate) sampling_allowed: AssessedBool,
     pub(crate) retained_entry_rejected_by_eligibility: usize,
+    /// Native comparison targets with no validated reuse: refused, never Full.
+    pub(crate) full_refused_native_comparison_target: usize,
     pub(crate) prepare_started: usize,
     pub(crate) prepare_failed: usize,
 }
@@ -1180,6 +1182,7 @@ mod tests {
                 audit_slot_available: gate,
                 sampling_allowed: gate,
                 retained_entry_rejected_by_eligibility: usize::MAX,
+                full_refused_native_comparison_target: usize::MAX,
                 prepare_started: usize::MAX,
                 prepare_failed: usize::MAX,
             },
