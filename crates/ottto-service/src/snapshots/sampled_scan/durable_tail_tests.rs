@@ -50,7 +50,10 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
     for n in 0..INDEX_KEYS {
         index.files.insert(indexed_key(n), entry.clone());
     }
-    let mut store = DurableTailStore::new(store::store_dir_for_index(&index_path));
+    let mut store = DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        durable_source(source).unwrap(),
+    );
     let allowlist = codec::allowlist_digest(source);
     let context = store::context_digest(&namespace.0, None);
     let keys = [
@@ -70,7 +73,7 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
                 entry: store::entry_digest("fp", None),
             },
             certificate: certificate.clone(),
-            body: vec![0; 64],
+            body: crate::snapshots::durable_store_fixture_body(0, 0),
             allowlist,
         })
         .collect();
@@ -283,7 +286,10 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
         .binding;
         let (reduction, checkpoint) = native_record(&path, &scope);
         let body = codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
-        let mut store = DurableTailStore::new(store::store_dir_for_index(&index_path));
+        let mut store = DurableTailStore::new(
+            store::store_dir_for_index(&index_path),
+            durable_source(source).unwrap(),
+        );
         store
             .write_after_save(
                 lock,
@@ -304,15 +310,17 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
         assert_eq!(records(), 1, "a real usable record exists");
         let positive = SharedCache::default();
         positive.durable_begin_pass(source, &index_path, &namespace, false);
-        let restored = positive.durable_restore(
-            source,
-            &key,
-            &path,
-            &scope,
-            &mut File::open(&path).unwrap(),
-            &index,
-            &interpretation,
-        );
+        let restored = positive
+            .durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &interpretation,
+            )
+            .into_test_option();
         let supported = crate::heap_layout_bound::layout_supported();
         assert_eq!(restored.is_some(), supported);
         assert_eq!(
@@ -347,6 +355,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
                 &index,
                 &interpretation,
             )
+            .into_test_option()
             .is_none());
         let (counts, disk) = cache.durable_counters(source).unwrap();
         assert_eq!(counts.ineligible.get("history_owed"), Some(&1));
@@ -427,7 +436,10 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
         .unwrap()
         .binding;
         let (reduction, _) = native_record(&path, &scope);
-        let mut store = DurableTailStore::new(store::store_dir_for_index(&index_path));
+        let mut store = DurableTailStore::new(
+            store::store_dir_for_index(&index_path),
+            durable_source(source).unwrap(),
+        );
         store
             .write_after_save(
                 lock,
@@ -477,6 +489,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
                 &index,
                 &after
             )
+            .into_test_option()
             .is_none());
         let (counts, disk) = cache.durable_counters(source).unwrap();
         assert_eq!(counts.ineligible.get("scope"), Some(&1));
@@ -733,6 +746,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
                     &loaded,
                     &interpretation,
                 )
+                .into_test_option()
                 .unwrap_or_else(|| {
                     let (counts, disk) = restart.durable_counters(source).unwrap();
                     panic!("{arm}: restore: {}", counts.summary(source, &disk))
@@ -747,5 +761,189 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         println!("dt_budget {arm} restart: {}", counts.summary(source, &disk));
         assert_eq!(counts.restored, 3, "{arm}");
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+trait RestoreTestOutcome {
+    fn into_test_option(
+        self,
+    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>>;
+}
+impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
+    fn into_test_option(
+        self,
+    ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
+        match self {
+            Self::Restored(taken) => Some(taken),
+            Self::Miss => None,
+            Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
+        }
+    }
+}
+
+/// L23/F1: the production guard dominates all sampling, trust and dependency fallbacks.
+#[test]
+fn common_hold_precedes_outer_gates_and_full_acquisition() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for corrupt in [false, true] {
+            for bypass in [
+                "ordinary",
+                "sampling_none",
+                "allow_sample_false",
+                "state_false",
+                "sidecar_false",
+                "owning_header_false",
+                "dependencies_missing",
+                "fresh_index",
+                "cleared",
+                "owed",
+                "compressed",
+            ] {
+                let root = crate::test_scratch::private_dir("ottto-dt-common-hold");
+                let lock = test_locks::hold(&root);
+                let transcripts = root.join("sessions");
+                std::fs::create_dir(&transcripts).unwrap();
+                let path = transcripts.join("0199f7a0-0000-7000-8000-0000000d7a11.jsonl");
+                if source == SnapshotSource::Codex {
+                    codex_budget_fixture(&path, "0199f7a0-0000-7000-8000-0000000d7a11", None);
+                } else {
+                    native_fixture(&path);
+                }
+                if bypass == "compressed" {
+                    use std::io::Write;
+                    let text = std::fs::read(&path).unwrap();
+                    let mut zip =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    zip.write_all(&text).unwrap();
+                    std::fs::write(&path, zip.finish().unwrap()).unwrap();
+                }
+                let key = local_index_key(&path);
+                let namespace = Scope("common-hold".into());
+                let cache = Arc::new(SharedCache::default());
+                let index_path = root.join("index.json");
+                cache.durable_begin_pass(source, &index_path, &namespace, false);
+                let ds = durable_source(source).unwrap();
+                let store_key = store::key_digest(ds, &key);
+                let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+                // Certificate source is irrelevant for preservation; it is never restored.
+                let cert_path = root.join("certificate.jsonl");
+                std::fs::write(&cert_path, b"{}\n").unwrap();
+                disk.write_after_save(
+                    lock,
+                    1,
+                    vec![PendingRecord {
+                        binding: Binding {
+                            source: ds,
+                            key: store_key,
+                            context: [0; 32],
+                            scope: [0; 32],
+                            entry: [0; 32],
+                        },
+                        certificate: certificate(&cert_path, &namespace),
+                        body: crate::snapshots::durable_store_fixture_body(0, 0),
+                        allowlist: codec::allowlist_digest(source),
+                    }],
+                )
+                .unwrap();
+                let record_path = disk.dir().join(format!(
+                    "{}.rec",
+                    store_key
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                ));
+                let mut bytes = std::fs::read(&record_path).unwrap();
+                if corrupt {
+                    let end = bytes.len() - 1;
+                    bytes[end] ^= 1;
+                } else {
+                    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+                    let end = bytes.len() - 32;
+                    let trailer = Sha256::digest(&bytes[..end]);
+                    bytes[end..].copy_from_slice(&trailer);
+                }
+                std::fs::write(&record_path, &bytes).unwrap();
+                std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                // New store owner, no RAM verification or reduction from the writer.
+                drop(cache);
+                drop(disk);
+                let cache = Arc::new(SharedCache::default());
+                cache.durable_begin_pass(source, &index_path, &namespace, false);
+                let mut index = ScanIndex::default();
+                if bypass != "fresh_index" {
+                    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"","last_snapshot_fingerprint":"accepted-body"})).unwrap();
+                    index.files.insert(key.clone(), entry);
+                }
+                let mut scan = OwnedSourceScan::new(
+                    source,
+                    std::slice::from_ref(&transcripts),
+                    index,
+                    "2026-10-20T12:00:00Z",
+                    365,
+                    100,
+                    false,
+                    None,
+                    &[],
+                    false,
+                    true,
+                )
+                .with_sampled_acquisition(cache.clone(), namespace);
+                if bypass == "sampling_none" || bypass == "compressed" {
+                    scan.sampling = None;
+                }
+                if bypass == "allow_sample_false" {
+                    scan.sampling.as_mut().unwrap().audit_metadata_supported = false;
+                }
+                if bypass == "state_false" {
+                    scan.state_census_complete = false;
+                }
+                if bypass == "sidecar_false" || bypass == "dependencies_missing" {
+                    scan.sidecar_census_complete = false;
+                }
+                if bypass == "owning_header_false" {
+                    if let Some(inv) = scan.codex_join_inventory.as_mut() {
+                        inv.complete = false;
+                    }
+                }
+                let mut completed = false;
+                for _ in 0..10_000 {
+                    match scan.step(None) {
+                        OwnedSourceScanStep::Pending(next) => {
+                            assert!(
+                                next.active_file.is_none(),
+                                "{source:?}/{corrupt}/{bypass}: parser acquired"
+                            );
+                            if let Some(c) = next.sampling.as_ref() {
+                                assert_eq!(c.full_files, 0);
+                                assert_eq!(c.native_bytes, 0);
+                            }
+                            scan = next;
+                        }
+                        OwnedSourceScanStep::Complete { scan: result, .. } => {
+                            assert!(
+                                result.snapshots.is_empty(),
+                                "Held key produces no POST body"
+                            );
+                            completed = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(completed);
+                let (counts, _) = cache.durable_counters(source).unwrap();
+                let class = if corrupt { "known_corrupt" } else { "newer" };
+                assert_eq!(
+                    counts.durable_held.get(class),
+                    Some(&1),
+                    "{source:?}/{corrupt}/{bypass}"
+                );
+                assert_eq!(counts.restored, 0);
+                assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
     }
 }

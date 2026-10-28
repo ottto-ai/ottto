@@ -44,7 +44,7 @@ use sampled_jsonl::CachedJsonlReduction;
 pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper bound of both stores' resident digest maps (two sources).
-pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 128;
+pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MEMO_RESIDENT_BOUND;
 
 /// Head re-parse bytes of restores, per source, for the process lifetime.
 /// The re-parse bypasses the reread guard (bounded at `HEAD_BOUND`, on a RAM
@@ -66,6 +66,8 @@ pub(crate) struct Counters {
     pub(crate) restored: u64,
     pub(crate) missing: u64,
     pub(crate) refused_record: u64,
+    pub(crate) durable_held: BTreeMap<&'static str, u64>,
+    pub(crate) held_census: [u64; 2],
     pub(crate) ineligible: BTreeMap<&'static str, u64>,
     pub(crate) certificate_refused: BTreeMap<&'static str, u64>,
     pub(crate) corrupt_body: u64,
@@ -107,8 +109,9 @@ impl Counters {
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
-             bytes_read={} refused{{corrupt:{},newer:{},older:{},allowlist:{},unusable:{}}} \
-             unusable{{errno:{},mode:{},shape:{}}} \
+             bytes_read={} format_hold{{newer:{},unknown:{},undecodable:{},unbindable:{},known_corrupt:{}}} durable_held={{{}}} held_census{{kept:{},invalidated:{}}} \
+             guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
+             uninventoried_records={} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={}",
             source.api_slug(),
@@ -135,14 +138,19 @@ impl Counters {
             store.records_clean,
             store.budget_refused,
             store.bytes_read,
-            store.refused_corrupt,
-            store.refused_newer,
-            store.refused_older,
-            store.refused_allowlist,
-            store.refused_unusable,
-            store.unusable_errno,
-            store.unusable_mode,
-            store.unusable_shape,
+            store.format_hold[0],
+            store.format_hold[1],
+            store.format_hold[2],
+            store.format_hold[3],
+            store.format_hold[4],
+            classes(&self.durable_held),
+            self.held_census[0],
+            self.held_census[1],
+            store.guard_header_bytes,
+            store.guard_verify_bytes,
+            store.delete_verify_bytes,
+            store.overwrite_verify_bytes,
+            store.uninventoried_records,
             store.gc_records_deleted,
             store.gc_records_read,
             store.gc_bytes_read,
@@ -375,7 +383,7 @@ impl SharedCache {
             current.identity_capture = identity_capture;
         } else {
             *slot = Some(Slot {
-                store: DurableTailStore::new(dir.clone()),
+                store: DurableTailStore::new(dir.clone(), source),
                 dir,
                 decided: BTreeMap::new(),
                 namespace: namespace.clone(),
@@ -384,12 +392,75 @@ impl SharedCache {
         }
     }
 
+    /// Independent of index membership, sampling, trust and reduction dependencies.
+    pub(crate) fn durable_hold(
+        &self,
+        snapshot_source: SnapshotSource,
+        key: &str,
+    ) -> Option<store::Refusal> {
+        let source = durable_source(snapshot_source)?;
+        self.durable()?
+            .slot(source)
+            .as_mut()?
+            .store
+            .hold(&store::key_digest(source, key))
+    }
+
+    pub(super) fn durable_hold_exit(
+        &self,
+        source: SnapshotSource,
+        reason: store::Refusal,
+        index: &mut ScanIndex,
+        candidate: &CandidateFile,
+        census: &mut ScanCensus,
+    ) {
+        let kept = source == SnapshotSource::ClaudeCode
+            && claude_request_census::retain_held(index, candidate);
+        if let Some(mut stores) = self.durable() {
+            Counters::bump(&mut stores.counters.durable_held, reason.class());
+            if source == SnapshotSource::ClaudeCode {
+                stores.counters.held_census[usize::from(!kept)] += 1;
+            }
+        }
+        census.record_unreadable(UnreadableCause::Reduction, 1);
+    }
+
     /// Restores `key` from the durable store into the RAM cache and takes it,
     /// or `None` (the read is then Full, with nothing left behind). `held` is
     /// the parser's opened FD for `path`, not yet read; a duplicate of it
     /// serves the bounded re-derivation, and the read plan repositions it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn durable_restore(
+        &self,
+        snapshot_source: SnapshotSource,
+        key: &str,
+        path: &Path,
+        scope: &Scope,
+        held: &mut File,
+        index: &ScanIndex,
+        interpretation: &Interpretation<'_>,
+    ) -> RestoreOutcome {
+        if let Some(reason) = self.durable_hold(snapshot_source, key) {
+            return RestoreOutcome::Held(reason);
+        }
+        match self.durable_restore_known(
+            snapshot_source,
+            key,
+            path,
+            scope,
+            held,
+            index,
+            interpretation,
+        ) {
+            Some(taken) => RestoreOutcome::Restored(taken),
+            None => self
+                .durable_hold(snapshot_source, key)
+                .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn durable_restore_known(
         &self,
         snapshot_source: SnapshotSource,
         key: &str,
@@ -759,7 +830,7 @@ impl SharedCache {
         slot.store.gc(writer, &context, &allowlist, &keep)
     }
 
-    /// Index reset or uninstall: the store goes with the index.
+    /// Fresh-index cleanup uses the same verified, bounded GC; U/T14 survive.
     pub(crate) fn durable_remove<W: SingleWriter>(
         &self,
         writer: &W,
@@ -772,7 +843,12 @@ impl SharedCache {
             return Ok(());
         };
         match stores.slot(source).as_mut() {
-            Some(slot) => slot.store.remove_all(writer),
+            Some(slot) => slot.store.gc(
+                writer,
+                &[0; 32],
+                &codec::allowlist_digest(snapshot_source),
+                &BTreeMap::new(),
+            ),
             None => Ok(()),
         }
     }
@@ -802,6 +878,12 @@ impl SharedCache {
         let store = stores.slot(source).as_ref()?.store.counters();
         Some((counters, store))
     }
+}
+
+pub(crate) enum RestoreOutcome {
+    Restored(Taken<CachedJsonlReduction>),
+    Miss,
+    Held(store::Refusal),
 }
 
 enum Failure {

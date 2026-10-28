@@ -2729,6 +2729,24 @@ pub(crate) fn record_claude_request_census(
     }
 }
 
+/// A Held key preserves copy proof only while its recorded opened-object stamp agrees.
+pub(super) fn retain_held(index: &mut ScanIndex, candidate: &super::CandidateFile) -> bool {
+    let kept = index
+        .claude_request_census
+        .get(&super::local_index_key(&candidate.path))
+        .is_some_and(|record| {
+            record.birth.is_some_and(|birth| {
+                candidate.physical_identity == Some([birth.device, birth.inode])
+            }) && record.modified == Some(candidate.modified_unix_seconds)
+                && decode_fingerprint(&candidate.source_file_fingerprint)
+                    == Some(record.source_file_fingerprint)
+        });
+    if !kept {
+        invalidate_claude_request_census(index, &candidate.path);
+    }
+    kept
+}
+
 /// A parse that reaches no record (a failed finish, or a native comparison
 /// target whose record allocation is not prepaid) leaves the key without
 /// one, never with an older revision's. A virtual recovery audit retains its

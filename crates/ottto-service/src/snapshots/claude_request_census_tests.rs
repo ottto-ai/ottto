@@ -2297,3 +2297,101 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
         "refusal never quarantines"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn held_original_keeps_dependent_copy_proof_only_for_unchanged_stamp() {
+    use std::os::unix::fs::MetadataExt;
+    let scratch = crate::test_scratch::ScratchDir::new("held-census-copy");
+    let root = scratch.join("projects");
+    for name in ["held-original", "dependent-copy"] {
+        census_write(
+            &root,
+            &format!("{name}.jsonl"),
+            &[census_response(
+                name,
+                Some("req_held_shared"),
+                "msg_held_shared",
+                1,
+                100,
+            )],
+        );
+    }
+    let mut index = ScanIndex::default();
+    let scan = census_scan(&root, &mut index, FIRST_WINDOW);
+    let original = census_key(&index, &root, "held-original.jsonl");
+    let copy = census_key(&index, &root, "dependent-copy.jsonl");
+    let path = PathBuf::from(&original);
+    let metadata = std::fs::metadata(&path).unwrap();
+    let record = index
+        .claude_request_census
+        .get(&original)
+        .unwrap()
+        .clone()
+        .with_birth_for_test(Some(ClaudeRequestBirth {
+            unix_seconds: 1,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }));
+    index
+        .claude_request_census
+        .insert(original.clone(), record.clone());
+    let mut candidate = candidate_from_traversal_path(
+        SnapshotSource::ClaudeCode,
+        ScanTraversalPath {
+            scan_root: root.clone(),
+            path: path.clone(),
+            census_member: true,
+            watcher_hint: false,
+        },
+        &mut ScanCensus::default(),
+        None,
+        365,
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    candidate.physical_identity = Some([metadata.dev(), metadata.ino()]);
+    candidate.source_file_fingerprint = record.fingerprint_hex_for_test();
+    assert!(claude_request_census::retain_held(&mut index, &candidate));
+    assert_eq!(index.claude_request_census.get(&original), Some(&record));
+    assert_eq!(
+        claude_census_member_status(&index, &copy, &scan.census_window_end, true),
+        ClaudeCensusMemberStatus::SharesHash
+    );
+    for change in [
+        "size_or_fingerprint",
+        "mtime",
+        "replaced_inode",
+        "unknown_birth",
+    ] {
+        let mut control = index.clone();
+        let mut changed = candidate.clone();
+        match change {
+            "size_or_fingerprint" => changed.source_file_fingerprint = "a".repeat(64),
+            "mtime" => changed.modified_unix_seconds += 1,
+            "replaced_inode" => {
+                changed.physical_identity = Some([metadata.dev(), metadata.ino().wrapping_add(1)])
+            }
+            _ => {
+                control
+                    .claude_request_census
+                    .insert(original.clone(), record.clone().with_birth_for_test(None));
+            }
+        }
+        assert!(
+            !claude_request_census::retain_held(&mut control, &changed),
+            "{change}"
+        );
+        assert!(
+            control
+                .claude_request_census
+                .get(&original)
+                .map_or(true, |r| r.is_birth_stub_for_test()),
+            "{change}"
+        );
+        assert_ne!(
+            claude_census_member_status(&control, &copy, &scan.census_window_end, true),
+            ClaudeCensusMemberStatus::SharesHash
+        );
+    }
+}

@@ -44,3 +44,10 @@ self/other eviction, cursor-room eviction, clear, poisoned locks, native body an
 audit-debt parity, and paused-cursor preservation. Existing native full/tail,
 selected-save, ACK and resource guards remain relevant. CI supplies execution;
 no installed-performance benefit or root-cause attribution is claimed here.
+
+Unknown durable representations and known corrupt records hold acquisition. The
+`durable_tail` diagnostics count holds by class, retained or invalidated census
+records, verification bytes and records beyond the bounded inventory. Held files
+keep their last accepted output as stale; no zero-usage replacement is emitted.
+A rollback holds newer-format files until re-upgrade. Beyond 24 hours the operator
+chooses continued hold or an explicitly counted reread; default: hold.

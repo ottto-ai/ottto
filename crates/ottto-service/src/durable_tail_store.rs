@@ -17,8 +17,7 @@
 //!   only when its generation is at or below the loaded index's committed
 //!   generation and the index entry it was written for is still the
 //!   committed one. Anything else is Full; nothing is partially applied.
-//! - A newer format is ignored and kept (downgrade ignores); an older format
-//!   or a changed field allowlist is refused and garbage collected.
+//! - Unknown representations and known corruption hold acquisition and survive every mutation.
 //! - No local path, transcript text, raw sample or raw identifier enters a
 //!   record envelope: the index key and the entry selection are digests, and
 //!   the certificate is content-free (`DurableCertificate`). Nothing here is
@@ -32,7 +31,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Envelope format. Bump on any envelope or certificate layout change.
@@ -129,8 +128,7 @@ fn digest(domain: &str, parts: &[&[u8]]) -> Digest32 {
     hasher.finalize().into()
 }
 
-/// The SHA-256 of a codec's compiled field list, in order. A changed list
-/// refuses every older record (`Refusal::AllowlistChanged`).
+/// The SHA-256 of a codec's compiled field list, in order.
 pub(crate) fn allowlist_digest(fields: &[&str]) -> Digest32 {
     let parts = fields
         .iter()
@@ -268,19 +266,25 @@ pub(crate) struct DurableRecord {
     pub(crate) index_generation: u64,
 }
 
-/// Why a stored record cannot be used at all, before any binding check.
+/// Preservation classes: unknown representations (U) precede known corruption (T14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    /// Short, torn, bad magic, bad trailer or undecodable: GC deletes it.
-    Corrupt,
-    /// Written by a newer binary. Ignored and kept (downgrade ignores).
     NewerFormat,
-    /// Written by an older binary: dropped.
-    OlderFormat,
-    /// Written under another codec field list: dropped.
-    AllowlistChanged,
-    /// Over `RECORD_BYTES`, not a regular file, or not owner-only.
-    Unusable,
+    Unknown,
+    Undecodable,
+    Unbindable,
+    Corrupt,
+}
+impl Refusal {
+    pub(crate) fn class(self) -> &'static str {
+        match self {
+            Self::NewerFormat => "newer",
+            Self::Unknown => "unknown",
+            Self::Undecodable => "undecodable",
+            Self::Unbindable => "unbindable",
+            Self::Corrupt => "known_corrupt",
+        }
+    }
 }
 
 /// The outcome of reading one key.
@@ -364,16 +368,12 @@ pub(crate) struct StoreCounters {
     pub(crate) bytes_read: u64,
     pub(crate) records_read: u64,
     pub(crate) missing: u64,
-    pub(crate) refused_corrupt: u64,
-    pub(crate) refused_newer: u64,
-    pub(crate) refused_older: u64,
-    pub(crate) refused_allowlist: u64,
-    pub(crate) refused_unusable: u64,
-    /// Why records were unusable: the last OS error number (0 when none),
-    /// group or other access bits set, or not a regular file or over size.
-    pub(crate) unusable_errno: u64,
-    pub(crate) unusable_mode: u64,
-    pub(crate) unusable_shape: u64,
+    pub(crate) format_hold: [u64; 5],
+    pub(crate) guard_header_bytes: u64,
+    pub(crate) guard_verify_bytes: u64,
+    pub(crate) delete_verify_bytes: u64,
+    pub(crate) overwrite_verify_bytes: u64,
+    pub(crate) uninventoried_records: u64,
     /// GC deletions: records and stale temp files.
     pub(crate) gc_records_deleted: u64,
     pub(crate) gc_temps_deleted: u64,
@@ -403,25 +403,25 @@ pub(crate) struct BatchReceipt {
 /// decides dirtiness, so a clean record is never rewritten.
 pub(crate) struct DurableTailStore {
     dir: PathBuf,
-    durable: BTreeMap<Digest32, Digest32>,
-    /// Records a full read refused (corrupt, older format, other allowlist):
-    /// GC deletes them without reading their bodies again. At most
-    /// `INVENTORY_BOUND` keys.
-    condemned: BTreeSet<Digest32>,
+    source: DurableSource,
+    // Exact-predecessor verification memo and optional content digest, in the existing slot.
+    durable: BTreeMap<Digest32, (Option<Digest32>, Stamp)>,
     counters: StoreCounters,
 }
 
 /// The most record files one GC or inventory pass looks at. Twice the
 /// admission cap, so a full store plus its replacements always fits; any
-/// file past it is not kept.
+/// file past it is left untouched and counted.
 pub(crate) const INVENTORY_BOUND: usize = 2 * MAX_RECORDS;
+pub(crate) const MEMO_RESIDENT_BOUND: usize =
+    2 * MAX_RECORDS * std::mem::size_of::<(Digest32, (Option<Digest32>, Stamp))>();
 
 impl DurableTailStore {
-    pub(crate) fn new(dir: PathBuf) -> Self {
+    pub(crate) fn new(dir: PathBuf, source: DurableSource) -> Self {
         Self {
             dir,
             durable: BTreeMap::new(),
-            condemned: BTreeSet::new(),
+            source,
             counters: StoreCounters::default(),
         }
     }
@@ -450,57 +450,91 @@ impl DurableTailStore {
         self.dir.join(format!("{}{RECORD_SUFFIX}", hex(key)))
     }
 
-    /// Read one key. A refused record is reported, never repaired here; GC
-    /// owns deletion.
-    pub(crate) fn read(&mut self, key: &Digest32, allowlist: &Digest32) -> ReadOutcome {
+    /// One bounded classifier for acquisition, reads and every mutation seam.
+    /// Header dispatch precedes size/mode checks. Only a verified known record licenses mutation.
+    fn classify(&mut self, key: &Digest32, work: &str) -> Result<Option<Binding>, Refusal> {
         let path = self.record_path(key);
-        let bytes = match read_private(&path) {
-            Ok(Some(bytes)) => bytes,
+        let result = (|| {
+            let mut file = match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(Refusal::Undecodable),
+            };
+            let mut header = Vec::with_capacity(HEADER_BYTES);
+            Read::by_ref(&mut file)
+                .take(HEADER_BYTES as u64)
+                .read_to_end(&mut header)
+                .map_err(|_| Refusal::Undecodable)?;
+            let n = header.len();
+            self.counters.guard_header_bytes += n as u64;
+            let binding = decode_header(&header, key, self.source)?;
+            let metadata = file.metadata().map_err(|_| Refusal::Corrupt)?;
+            let stamp = Stamp::of(&metadata);
+            if !metadata.is_file()
+                || metadata.permissions().mode() & 0o077 != 0
+                || metadata.len() > (RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES) as u64
+            {
+                return Err(Refusal::Corrupt);
+            }
+            if self.durable.get(key).is_some_and(|(_, old)| *old == stamp) {
+                return Ok(Some(binding));
+            }
+            let mut bytes = header;
+            file.take((RECORD_BYTES + TRAILER_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|_| Refusal::Corrupt)?;
+            let read = bytes.len().saturating_sub(n) as u64;
+            match work {
+                "delete" => self.counters.delete_verify_bytes += read,
+                "overwrite" => self.counters.overwrite_verify_bytes += read,
+                _ => self.counters.guard_verify_bytes += read,
+            }
+            self.note_codec(bytes.capacity());
+            verify(&bytes)?;
+            if self.durable.len() < MAX_RECORDS || self.durable.contains_key(key) {
+                self.durable.insert(*key, (None, stamp));
+            }
+            Ok(Some(binding))
+        })();
+        if let Err(reason) = result {
+            self.durable.remove(key);
+            self.counters.format_hold[reason as usize] += 1;
+        }
+        result
+    }
+
+    pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
+        self.classify(key, "guard").err()
+    }
+
+    pub(crate) fn read(&mut self, key: &Digest32, allowlist: &Digest32) -> ReadOutcome {
+        match self.classify(key, "guard") {
+            Err(reason) => return ReadOutcome::Refused(reason),
             Ok(None) => {
                 self.counters.missing += 1;
                 return ReadOutcome::Missing;
             }
-            Err(error) => {
-                self.counters.refused_unusable += 1;
-                match error.raw_os_error() {
-                    Some(errno) => self.counters.unusable_errno = errno.unsigned_abs() as u64,
-                    None if error.kind() == io::ErrorKind::PermissionDenied => {
-                        self.counters.unusable_mode += 1
-                    }
-                    None => self.counters.unusable_shape += 1,
-                }
-                return ReadOutcome::Refused(Refusal::Unusable);
-            }
+            Ok(Some(_)) => {}
+        }
+        let bytes = match read_private(&self.record_path(key)) {
+            Ok(Some(bytes)) => bytes,
+            _ => return ReadOutcome::Refused(Refusal::Corrupt),
         };
         self.counters.records_read += 1;
         self.counters.bytes_read += bytes.len() as u64;
-        self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
-        // Live together while decoding: the record and its body copy.
         self.note_codec(bytes.capacity() + bytes.len().saturating_sub(HEADER_BYTES));
         match decode(&bytes, allowlist) {
-            Ok(record) if record.record.binding.key == *key => {
-                // A valid record on disk is the durable content for its key.
-                self.durable.insert(*key, content_digest(&record.record));
+            Ok(record) => {
+                if let Some((content, _)) = self.durable.get_mut(key) {
+                    *content = Some(content_digest(&record.record));
+                }
                 ReadOutcome::Found(Box::new(record))
             }
-            Ok(_) => {
-                self.counters.refused_corrupt += 1;
-                self.condemn(*key);
-                ReadOutcome::Refused(Refusal::Corrupt)
-            }
-            Err(refusal) => {
-                if refusal != Refusal::NewerFormat {
-                    self.condemn(*key);
-                }
-                match refusal {
-                    Refusal::Corrupt => self.counters.refused_corrupt += 1,
-                    Refusal::NewerFormat => self.counters.refused_newer += 1,
-                    Refusal::OlderFormat => self.counters.refused_older += 1,
-                    Refusal::AllowlistChanged => self.counters.refused_allowlist += 1,
-                    Refusal::Unusable => self.counters.refused_unusable += 1,
-                }
-                ReadOutcome::Refused(refusal)
-            }
+            Err(reason) => ReadOutcome::Refused(reason),
         }
     }
 
@@ -524,8 +558,15 @@ impl DurableTailStore {
             .map(|record| record.body.len())
             .sum::<usize>();
         for record in pending {
+            if self.classify(&record.binding.key, "overwrite").is_err() {
+                continue;
+            }
             let content = content_digest(&record);
-            if self.durable.get(&record.binding.key) == Some(&content) {
+            if self
+                .durable
+                .get(&record.binding.key)
+                .is_some_and(|(old, _)| *old == Some(content))
+            {
                 receipt.clean += 1;
             } else {
                 dirty.push((record, content));
@@ -576,7 +617,10 @@ impl DurableTailStore {
             write_atomic(&self.dir, &path, &bytes)?;
             changed = true;
             on_disk.insert(key, bytes.len() as u64);
-            self.durable.insert(key, content);
+            let stamp = Stamp::of(&fs::symlink_metadata(&path)?);
+            if self.durable.len() < MAX_RECORDS || self.durable.contains_key(&key) {
+                self.durable.insert(key, (Some(content), stamp));
+            }
             receipt.written += 1;
             receipt.bytes_written += bytes.len() as u64;
             self.counters.max_record_bytes = self.counters.max_record_bytes.max(bytes.len() as u64);
@@ -595,7 +639,7 @@ impl DurableTailStore {
     }
 
     /// Garbage collection after a successful save: delete stale temp files,
-    /// corrupt, older-format and other-allowlist records, records from
+    /// verified known records from
     /// another context (account or namespace change) and records whose key
     /// is not kept or whose scope is not the kept one. A key kept with an
     /// unknown scope (`None`: its file was not decided this pass) keeps its
@@ -605,7 +649,7 @@ impl DurableTailStore {
         &mut self,
         writer: &W,
         live_context: &Digest32,
-        allowlist: &Digest32,
+        _allowlist: &Digest32,
         keep: &BTreeMap<Digest32, Option<Digest32>>,
     ) -> io::Result<()> {
         self.check_writer(writer)?;
@@ -613,7 +657,6 @@ impl DurableTailStore {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.durable.clear();
-                self.condemned.clear();
                 self.set_disk_level(&BTreeMap::new());
                 return Ok(());
             }
@@ -621,7 +664,7 @@ impl DurableTailStore {
         };
         let mut deleted = false;
         let mut on_disk = BTreeMap::new();
-        let mut header = Vec::with_capacity(HEADER_BYTES);
+        self.counters.uninventoried_records = 0;
         let mut seen = 0_usize;
         for entry in entries {
             let entry = entry?;
@@ -630,7 +673,7 @@ impl DurableTailStore {
                 continue;
             };
             let path = entry.path();
-            if name.starts_with('.') && name.ends_with(TEMP_SUFFIX) {
+            if dead_temp(name) && entry.file_type()?.is_file() {
                 remove_if_present(&path)?;
                 self.counters.gc_temps_deleted += 1;
                 deleted = true;
@@ -640,33 +683,25 @@ impl DurableTailStore {
                 continue;
             };
             seen += 1;
-            // Header only: the binding decides; a body a full read refused
-            // is already condemned.
-            let verdict = if seen > INVENTORY_BOUND || self.condemned.contains(&key) {
-                None
-            } else {
-                match read_private_header(&path, &mut header) {
-                    Ok(Some(len)) => {
-                        self.counters.gc_records_read += 1;
-                        self.counters.gc_bytes_read += header.len() as u64;
-                        match decode_header(&header, len, allowlist) {
-                            Ok(binding) => {
-                                let live = binding.key == key
-                                    && binding.context == *live_context
-                                    && match keep.get(&key) {
-                                        Some(Some(scope)) => *scope == binding.scope,
-                                        Some(None) => true,
-                                        None => false,
-                                    };
-                                live.then_some(len)
-                            }
-                            Err(Refusal::NewerFormat) => Some(len),
-                            Err(_) => None,
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(_) => None,
+            if seen > INVENTORY_BOUND {
+                self.counters.uninventoried_records += 1;
+                continue;
+            }
+            self.counters.gc_records_read += 1;
+            self.counters.gc_bytes_read += HEADER_BYTES as u64;
+            let len = entry.metadata().map_or(0, |m| m.len());
+            let verdict = match self.classify(&key, "delete") {
+                Ok(Some(binding)) => {
+                    let live = binding.context == *live_context
+                        && match keep.get(&key) {
+                            Some(Some(scope)) => *scope == binding.scope,
+                            Some(None) => true,
+                            None => false,
+                        };
+                    live.then_some(len)
                 }
+                Ok(None) => continue,
+                Err(_) => Some(len),
             };
             match verdict {
                 Some(len) => {
@@ -680,8 +715,6 @@ impl DurableTailStore {
                 }
             }
         }
-        self.note_codec(header.capacity());
-        self.condemned.clear();
         self.durable.retain(|key, _| on_disk.contains_key(key));
         if deleted {
             sync_dir(&self.dir)?;
@@ -726,7 +759,7 @@ impl DurableTailStore {
         let mut removed = 0;
         for key in keys {
             let path = self.record_path(key);
-            if fs::symlink_metadata(&path).is_ok() {
+            if matches!(self.classify(key, "delete"), Ok(Some(_))) {
                 remove_if_present(&path)?;
                 removed += 1;
             }
@@ -739,25 +772,6 @@ impl DurableTailStore {
             self.set_disk_level(&on_disk);
         }
         Ok(removed)
-    }
-
-    fn condemn(&mut self, key: Digest32) {
-        if self.condemned.len() < INVENTORY_BOUND {
-            self.condemned.insert(key);
-        }
-    }
-
-    /// Index reset or uninstall: remove the whole store.
-    pub(crate) fn remove_all<W: SingleWriter>(&mut self, writer: &W) -> io::Result<()> {
-        self.check_writer(writer)?;
-        match fs::remove_dir_all(&self.dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        self.durable.clear();
-        self.set_disk_level(&BTreeMap::new());
-        Ok(())
     }
 
     fn check_writer<W: SingleWriter>(&self, writer: &W) -> io::Result<()> {
@@ -784,10 +798,14 @@ impl DurableTailStore {
             else {
                 continue;
             };
-            let metadata = entry.metadata()?;
-            if metadata.is_file() {
-                on_disk.insert(key, metadata.len());
+            if on_disk.len() >= INVENTORY_BOUND {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable inventory bound",
+                ));
             }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            on_disk.insert(key, metadata.len());
         }
         Ok(on_disk)
     }
@@ -877,74 +895,103 @@ fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-/// `read_private`'s checks, then only the first `HEADER_BYTES` into
-/// `header` (reused across records). Returns the file length.
-fn read_private_header(path: &Path, header: &mut Vec<u8>) -> io::Result<Option<u64>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let metadata = file.metadata()?;
-    if metadata.permissions().mode() & 0o077 != 0
-        || !metadata.is_file()
-        || metadata.len() > (RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES) as u64
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unusable durable store record",
-        ));
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp(u64, u64, u64, i64, i64, i64, i64);
+impl Stamp {
+    fn of(m: &fs::Metadata) -> Self {
+        Self(
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
     }
-    header.clear();
-    file.take(HEADER_BYTES as u64).read_to_end(header)?;
-    Ok(Some(metadata.len()))
 }
 
-/// The binding from a record header alone, for GC: format, allowlist,
-/// source and digests, and a body length consistent with the file length.
-/// The body and trailer are checked by a full read (`decode`) only.
-fn decode_header(header: &[u8], file_len: u64, allowlist: &Digest32) -> Result<Binding, Refusal> {
-    let mut cursor = Cursor(header);
-    if cursor.array::<8>() != Some(MAGIC) {
-        return Err(Refusal::Corrupt);
+fn dead_temp(name: &str) -> bool {
+    let Some((record, pid)) = name
+        .strip_prefix('.')
+        .and_then(|n| n.strip_suffix(TEMP_SUFFIX))
+        .and_then(|n| n.rsplit_once('.'))
+    else {
+        return false;
+    };
+    record
+        .strip_suffix(RECORD_SUFFIX)
+        .and_then(parse_hex_digest)
+        .is_some()
+        && pid
+            .parse::<i32>()
+            .ok()
+            .filter(|pid| *pid > 0)
+            .is_some_and(|pid| {
+                // SAFETY: signal zero only probes the process; it sends no signal.
+                (unsafe { libc::kill(pid, 0) }) == -1
+                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            })
+}
+
+fn decode_header(header: &[u8], key: &Digest32, source: DurableSource) -> Result<Binding, Refusal> {
+    let mut c = Cursor(header);
+    if c.array::<8>() != Some(MAGIC) {
+        return Err(Refusal::Undecodable);
     }
-    let version = cursor.u16().ok_or(Refusal::Corrupt)?;
+    let version = c.u16().ok_or(Refusal::Undecodable)?;
     if version > FORMAT_VERSION {
         return Err(Refusal::NewerFormat);
     }
-    if version < FORMAT_VERSION {
-        return Err(Refusal::OlderFormat);
+    if version != FORMAT_VERSION {
+        return Err(Refusal::Unknown);
     }
-    if header.len() != HEADER_BYTES {
-        return Err(Refusal::Corrupt);
+    let allowlist = c.array::<32>().ok_or(Refusal::Undecodable)?;
+    let tag = c.u8().ok_or(Refusal::Undecodable)?;
+    // Both pinned v1 writers (72205c6c and 4f143c16/ffc6c846) have these same lists.
+    let pin = match tag {
+        1 => "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
+        2 => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
+        _ => return Err(Refusal::Unknown),
+    };
+    if Some(allowlist) != parse_hex_digest(pin) {
+        return Err(Refusal::Unknown);
     }
-    let record_allowlist = cursor.array::<32>().ok_or(Refusal::Corrupt)?;
     let binding = (|| {
         Some(Binding {
-            source: DurableSource::from_tag(cursor.u8()?)?,
-            key: cursor.array()?,
-            context: cursor.array()?,
-            scope: cursor.array()?,
-            entry: cursor.array()?,
+            source: DurableSource::from_tag(tag)?,
+            key: c.array()?,
+            context: c.array()?,
+            scope: c.array()?,
+            entry: c.array()?,
         })
     })()
-    .ok_or(Refusal::Corrupt)?;
-    let body_len = u32::from_le_bytes(
-        header[HEADER_BYTES - 4..]
-            .try_into()
-            .map_err(|_| Refusal::Corrupt)?,
-    ) as u64;
-    if file_len != (HEADER_BYTES + TRAILER_BYTES) as u64 + body_len {
-        return Err(Refusal::Corrupt);
-    }
-    if record_allowlist != *allowlist {
-        return Err(Refusal::AllowlistChanged);
+    .ok_or(Refusal::Undecodable)?;
+    if binding.key != *key || binding.source != source {
+        return Err(Refusal::Unbindable);
     }
     Ok(binding)
+}
+
+fn verify(bytes: &[u8]) -> Result<(), Refusal> {
+    let bad = Refusal::Corrupt;
+    if bytes.len() < HEADER_BYTES + TRAILER_BYTES {
+        return Err(bad);
+    }
+    let end = bytes.len() - TRAILER_BYTES;
+    // Trailer FIRST: structural duplicate checks on unsorted maps/sets can be quadratic.
+    if bytes[end..] != Sha256::digest(&bytes[..end])[..] {
+        return Err(bad);
+    }
+    let mut c = Cursor(&bytes[HEADER_BYTES - 4..HEADER_BYTES]);
+    if c.u32().map(|n| n as usize) != Some(end - HEADER_BYTES) {
+        return Err(bad);
+    }
+    let debt = HEADER_BYTES - 4 - 9;
+    if !matches!(bytes[debt], 0 | 1) || (bytes[debt] == 0 && bytes[debt + 1..debt + 9] != [0; 8]) {
+        return Err(bad);
+    }
+    crate::snapshots::verify_durable_body(&bytes[HEADER_BYTES..end]).map_err(|_| bad)
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
@@ -1078,26 +1125,17 @@ impl<'a> Cursor<'a> {
 /// The version is checked before the trailer: a newer layout is not ours to
 /// judge. Everything else must pass the trailer and decode exactly.
 fn decode(bytes: &[u8], allowlist: &Digest32) -> Result<DurableRecord, Refusal> {
-    let mut cursor = Cursor(bytes);
-    if cursor.array::<8>() != Some(MAGIC) {
-        return Err(Refusal::Corrupt);
-    }
-    let version = cursor.u16().ok_or(Refusal::Corrupt)?;
-    if version > FORMAT_VERSION {
-        return Err(Refusal::NewerFormat);
-    }
-    if version < FORMAT_VERSION {
-        return Err(Refusal::OlderFormat);
-    }
-    let body_end = bytes
-        .len()
-        .checked_sub(TRAILER_BYTES)
-        .filter(|end| *end >= MAGIC.len() + 2)
-        .ok_or(Refusal::Corrupt)?;
-    let trailer: Digest32 = Sha256::digest(&bytes[..body_end]).into();
-    if bytes[body_end..] != trailer {
-        return Err(Refusal::Corrupt);
-    }
+    let source = bytes
+        .get(42)
+        .and_then(|tag| DurableSource::from_tag(*tag))
+        .ok_or(Refusal::Undecodable)?;
+    let key: Digest32 = bytes
+        .get(43..75)
+        .and_then(|b| b.try_into().ok())
+        .ok_or(Refusal::Undecodable)?;
+    decode_header(bytes, &key, source)?;
+    verify(bytes)?;
+    let body_end = bytes.len() - TRAILER_BYTES;
     let mut cursor = Cursor(&bytes[10..body_end]);
     let record_allowlist = cursor.array::<32>().ok_or(Refusal::Corrupt)?;
     let decoded = (|| {
@@ -1145,7 +1183,7 @@ fn decode(bytes: &[u8], allowlist: &Digest32) -> Result<DurableRecord, Refusal> 
     })();
     let record = decoded.ok_or(Refusal::Corrupt)?;
     if record_allowlist != *allowlist {
-        return Err(Refusal::AllowlistChanged);
+        return Err(Refusal::Unknown);
     }
     Ok(record)
 }

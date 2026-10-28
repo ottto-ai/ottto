@@ -504,6 +504,7 @@ impl OwnedSourceScan {
         cache: Arc<SharedCache>,
         namespace: Scope,
     ) -> Self {
+        self.durable_guard = Some(Arc::downgrade(&cache));
         if matches!(
             self.source,
             SnapshotSource::ClaudeCode | SnapshotSource::Codex
@@ -2076,5 +2077,13 @@ mod cache_lifecycle_tests {
         assert_eq!(counts.take_hit, 0);
         assert_eq!(counts.clear_poisoned_lock, 1);
         assert_eq!(counts.clear_entries_released, 0);
+    }
+}
+
+// The daemon owns this cache; the guard is a non-owning alias beside Context.cache.
+impl HeapLayoutBound for std::sync::Weak<SharedCache> {
+    const INLINE_ONLY: bool = true;
+    fn heap_bound(&self, _: &mut Counter) -> Option<()> {
+        Some(())
     }
 }

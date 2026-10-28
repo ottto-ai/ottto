@@ -373,3 +373,20 @@ pub(crate) fn rederive_parser(
 #[cfg(test)]
 #[path = "durable_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn store_fixture_body(count: u64, sum: u64) -> Vec<u8> {
+    let reduction = CachedJsonlReduction {
+        accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
+        report: JsonlReadReport::default(),
+        recognized_usage_drop_count: count as usize,
+        positive_recognized_usage_count: sum as usize,
+        positive_usage_evidence: false,
+    };
+    encode(
+        &reduction,
+        crate::durable_tail_store::RECORD_BYTES,
+        1024 * 1024,
+    )
+    .unwrap()
+}
