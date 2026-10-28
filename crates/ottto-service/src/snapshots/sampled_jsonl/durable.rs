@@ -375,9 +375,9 @@ pub(crate) fn rederive_parser(
 mod tests;
 
 #[cfg(test)]
-pub(crate) fn store_fixture_body(count: u64, sum: u64) -> Vec<u8> {
+pub(crate) fn store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
     let reduction = CachedJsonlReduction {
-        accumulator: SnapshotAccumulator::new(SnapshotSource::ClaudeCode),
+        accumulator: SnapshotAccumulator::new(source),
         report: JsonlReadReport::default(),
         recognized_usage_drop_count: count as usize,
         positive_recognized_usage_count: sum as usize,

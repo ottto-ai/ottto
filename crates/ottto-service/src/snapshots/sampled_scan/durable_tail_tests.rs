@@ -73,7 +73,7 @@ fn gc_on_a_large_index_looks_up_only_the_store_inventory() {
                 entry: store::entry_digest("fp", None),
             },
             certificate: certificate.clone(),
-            body: crate::snapshots::durable_store_fixture_body(0, 0),
+            body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
             allowlist,
         })
         .collect();
@@ -849,7 +849,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                             entry: [0; 32],
                         },
                         certificate: certificate(&cert_path, &namespace),
-                        body: crate::snapshots::durable_store_fixture_body(0, 0),
+                        body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
                         allowlist: codec::allowlist_digest(source),
                     }],
                 )
@@ -989,8 +989,13 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 .iter()
                 .position(|class| *class == kind)
                 .unwrap();
+                // An incomplete Codex join inventory withholds every candidate as
+                // residue before selection: nothing is acquired, so nothing is held.
+                let selected =
+                    !(source == SnapshotSource::Codex && bypass == "owning_header_false");
                 assert_eq!(
-                    counts.durable_held[class], 1,
+                    counts.durable_held[class],
+                    u64::from(selected),
                     "{source:?}/{corrupt}/{bypass}"
                 );
                 assert_eq!(counts.restored, 0);

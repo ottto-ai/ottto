@@ -130,8 +130,8 @@ pub(crate) fn verify_durable_body(
         && sampled_jsonl::durable::verify(body).is_ok()
 }
 #[cfg(all(test, unix))]
-pub(crate) fn durable_store_fixture_body(count: u64, sum: u64) -> Vec<u8> {
-    sampled_jsonl::durable::store_fixture_body(count, sum)
+pub(crate) fn durable_store_fixture_body(source: SnapshotSource, count: u64, sum: u64) -> Vec<u8> {
+    sampled_jsonl::durable::store_fixture_body(source, count, sum)
 }
 
 pub(crate) mod sampled_scan;

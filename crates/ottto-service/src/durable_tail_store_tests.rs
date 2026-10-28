@@ -13,7 +13,11 @@ fn placeholder_allowlist() -> Digest32 {
     parse_hex_digest("8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c").unwrap()
 }
 fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
-    crate::snapshots::durable_store_fixture_body(count, sum)
+    crate::snapshots::durable_store_fixture_body(
+        crate::snapshots::SnapshotSource::ClaudeCode,
+        count,
+        sum,
+    )
 }
 
 /// #801's real lock: `StateDirLock` on the scratch state directory.
@@ -638,7 +642,7 @@ fn only_dirty_records_are_written_in_bounded_batches() {
     let per_record = fourth.bytes_written;
     assert_eq!(
         per_record as usize,
-        HEADER_BYTES + placeholder_body(0, 0).len() + TRAILER_BYTES
+        HEADER_BYTES + placeholder_body(99, 99 * 7).len() + TRAILER_BYTES
     );
     let counters = store.counters();
     assert_eq!(counters.disk_records, 40);
@@ -1354,9 +1358,8 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
         }),
     );
     fs::set_permissions(&unsafe_path, fs::Permissions::from_mode(0o644)).unwrap();
-    let live = store
-        .dir()
-        .join(format!(".{}.rec.{}.tmp", hex(&b.key), std::process::id()));
+    // pid 1 is always alive and never this writer.
+    let live = store.dir().join(format!(".{}.rec.1.tmp", hex(&b.key)));
     let dead = store
         .dir()
         .join(format!(".{}.rec.2147483647.tmp", hex(&b.key)));

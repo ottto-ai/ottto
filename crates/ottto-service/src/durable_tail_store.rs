@@ -909,10 +909,13 @@ fn dead_temp(name: &str) -> bool {
     let named = record
         .strip_suffix(RECORD_SUFFIX)
         .and_then(parse_hex_digest);
+    // This process's temps are orphans too: GC holds the store exclusively.
+    let ours = pid.is_some_and(|pid| pid.unsigned_abs() == std::process::id());
     // SAFETY: signal zero only probes the process; it sends no signal.
     named.is_some()
-        && pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1)
-        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        && (ours
+            || pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1)
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
 }
 
 fn decode_header(header: &[u8], key: &Digest32, source: DurableSource) -> Result<Binding, Refusal> {
