@@ -59,6 +59,37 @@ pub(crate) fn stage_pending_audits(
         index.files.insert(key, entry);
     }
 }
+// E5-PI-FIXTURE: reframe hook (E1 takes it into r2-fixture-ext). Source
+// generic: a row edits a record body and only the body's own checks refuse it.
+/// The codec section with one-byte varint `tag` that closes `body` (tag, u64
+/// LE payload length, payload), outermost first; `None` if none closes it.
+#[allow(dead_code)]
+pub(crate) fn trailing_section(body: &[u8], tag: u8) -> Option<std::ops::Range<usize>> {
+    (0..body.len().saturating_sub(8)).rev().find_map(|len| {
+        let payload = body.len() - len;
+        let start = payload.checked_sub(9)?;
+        (body[start] == tag && body[start + 1..payload] == (len as u64).to_le_bytes())
+            .then_some(start..body.len())
+    })
+}
+/// Rewrites the record at `path` after `edit` changes its body, with the
+/// envelope's body length and SHA-256 trailer recomputed, so framing passes.
+#[allow(dead_code)]
+pub(crate) fn reframe_record(path: &Path, edit: impl FnOnce(&mut Vec<u8>)) {
+    use sha2::{Digest, Sha256};
+    const TRAILER_BYTES: usize = 32;
+    let header = crate::durable_tail_store::HEADER_BYTES;
+    let bytes = std::fs::read(path).unwrap();
+    let mut body = bytes[header..bytes.len() - TRAILER_BYTES].to_vec();
+    edit(&mut body);
+    // The body length closes the header (see `durable_tail_store::encode`).
+    let mut out = bytes[..header].to_vec();
+    out[header - 4..].copy_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&body);
+    let trailer = Sha256::digest(&out);
+    out.extend_from_slice(&trailer);
+    std::fs::write(path, out).unwrap();
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Mode {
