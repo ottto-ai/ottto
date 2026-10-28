@@ -96,6 +96,15 @@ impl OwnedSourceScan {
         self
     }
 }
+impl OwnedActiveFile {
+    /// Shared primary-reader role gate for borrowed consumers.
+    pub(super) fn is_primary_for(&self, source: SnapshotSource) -> bool {
+        self.parser.source == source
+            && self.side_origin.is_none()
+            && !self.comparison_target
+            && self.group.is_none()
+    }
+}
 impl LineDelivery {
     /// A fresh primary read of the active file: opened, or replaced in place.
     pub(super) fn arm(&mut self) {
@@ -104,11 +113,7 @@ impl LineDelivery {
     }
     /// The single begin site: the common step dispatch, roles final.
     pub(super) fn begin_armed(&mut self, active: &OwnedActiveFile, roots: &[std::path::PathBuf]) {
-        if !std::mem::take(&mut self.armed)
-            || active.side_origin.is_some()
-            || active.comparison_target
-            || active.group.is_some()
-        {
+        if !std::mem::take(&mut self.armed) || !active.is_primary_for(active.parser.source) {
             return;
         }
         let reader = &active.parser.reader;
