@@ -1,4 +1,3 @@
-//! First acquisition only. Encoding moves keep their old carrier until 11b-2.
 use super::*;
 use codex_compressed_input::ArchiveEvidence;
 
@@ -46,7 +45,6 @@ impl Pass {
     }
 }
 
-// Filename hints preserve evidence only; they never establish equivalence.
 pub(super) fn archive_ids(roster: &BTreeSet<String>) -> BTreeSet<String> {
     roster
         .iter()
@@ -66,7 +64,6 @@ pub(super) fn adjacent_archive(path: &Path) -> bool {
             .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
 
-// Header bytes only; pread leaves the held descriptor's stream position alone.
 fn frame_length(file: &File) -> Option<u64> {
     #[cfg(unix)]
     {
@@ -85,7 +82,6 @@ fn frame_length(file: &File) -> Option<u64> {
 }
 
 impl ScanIndex {
-    /// False means deferred, held or already attempted: never parse it.
     pub(super) fn classify_archive(
         &mut self,
         candidate: &CandidateFile,
@@ -116,24 +112,26 @@ impl ScanIndex {
             }
             return false;
         }
-        if self
+        let previous = self
             .files
             .get(&key)
             .and_then(|e| e.archive.as_ref())
-            .is_some_and(|a| {
-                a.matches(&file) && !matches!(a.disposition, ArchiveDisposition::HeaderValidated)
-            })
-        {
+            .filter(|a| a.matches(&file));
+        if previous.is_some_and(|a| a.quiet(&file)) {
             return false;
         }
+        let retry =
+            previous.is_some_and(|a| matches!(a.disposition, ArchiveDisposition::Pending { .. }));
         // Any old evidence is a move/ambiguity, including tombstone-only state.
         // HOLD before a header decode; preserve every old fact, body and ACK.
-        if ids.iter().any(|id| {
-            pass.seen.contains(id)
-                || self
-                    .codex_counting_tombstones
-                    .contains_key(&codex_protected_owner(id))
-        }) {
+        if !retry
+            && ids.iter().any(|id| {
+                pass.seen.contains(id)
+                    || self
+                        .codex_counting_tombstones
+                        .contains_key(&codex_protected_owner(id))
+            })
+        {
             self.hold_archive(candidate, &file, CodexZstCause::ArchiveEquivalenceUnproven);
             return false;
         }

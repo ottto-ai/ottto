@@ -66,10 +66,7 @@ pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     CODEX_ZST_REFUSED.with(|c| *c.borrow_mut().entry(cause).or_default() += 1);
 }
 pub(crate) fn codex_zst_classified(name: &'static str) {
-    CODEX_ZST_CLASSIFICATIONS.with(|c| {
-        let mut c = c.borrow_mut();
-        *c.entry(name).or_default() += 1;
-    });
+    CODEX_ZST_CLASSIFICATIONS.with(|c| *c.borrow_mut().entry(name).or_default() += 1);
 }
 pub(crate) fn flush_codex_zst_refusals() {
     let counts = CODEX_ZST_REFUSED.with(|c| std::mem::take(&mut *c.borrow_mut()));

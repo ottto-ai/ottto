@@ -636,10 +636,12 @@ funded decoder may be live in the process. Physical offset certificates remain
 unsupported for archives.
 
 Archive disposition stays `pending` until the final body is ACK-settled.
-The acquisition API retains its bounded settlement-recovery deadline, but ordinary
-archive discovery does not use that deadline to authorize another read. An
-unchanged attempted archive stays quiet, including pending and failed outputs;
-no empty or zero-cost body is substituted. Settled, empty, held and refused stamps remain quiet until content
+Pending evidence carries a recovery deadline: at most one first-read re-decode
+per six hours, under the same power, CPU and decoded-byte budget. Each recovery
+increments `codex_zst_first_read_retry`, rather than `codex_zst_first_read`;
+its decoded bytes are included above. Three failed settlements hold the archive
+with counted cause `CompressedSettlementStuck`; no empty or zero-cost body is
+substituted. Settled, empty, held and refused stamps remain quiet until content
 changes. Decoder safety-net release emits `codex_zst_owner.counts.leaked_release`;
 normal completion and error paths release explicitly after any Stores guard.
 

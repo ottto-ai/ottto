@@ -438,21 +438,63 @@ fn compressed_parent_is_no_ledger_and_real_second_owner_stays_duplicate() {
     not(target_os = "macos"),
     ignore = "funded decoder needs validated heap layout"
 )]
-fn pending_deadline_never_rearms_an_unchanged_discovered_archive() {
+fn pending_checkpoint_recovers_only_when_due_and_paced_then_settlement_stuck_is_quiet() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
     let f = ArchiveFixture::new(&zstd::bulk::compress(&synthetic_rollout(), 1).unwrap());
     let (mut state, first, rows) = scan(&f, ScanIndex::default(), true, 0);
     assert_eq!(first.snapshots.len(), 1);
     assert_eq!(class(&rows, "codex_zst_first_read"), 1);
     let key = local_index_key(&f.0);
-    retry_due(&mut state, &key);
-    let (next, result, rows) = scan(&f, persist(&state), true, 0);
-    assert!(result.snapshots.is_empty());
-    assert_eq!(decodes(&rows), 0);
-    assert_eq!(
-        next.files[&key].last_snapshot_fingerprint,
-        state.files[&key].last_snapshot_fingerprint
-    );
+    let expected = serde_json::to_value(&first.snapshots).unwrap();
+    for attempt in 1..=3 {
+        state.settle_archive_bodies(&BTreeMap::new()); // failed upload, no fabricated ACK
+        state = checkpoint(&state); // committable subset sheds the unaccepted body
+        assert!(state.files[&key].last_snapshot_fingerprint.is_none());
+        assert!(!state.file_snapshot_fingerprints.contains_key(&key));
+        let (next, result, rows) = scan(&f, state, true, 0);
+        assert!(result.snapshots.is_empty());
+        assert_eq!(decodes(&rows), 0);
+        state = next;
+        if attempt == 3 {
+            held(&state, &f.0, CodexZstCause::SettlementStuck);
+            break;
+        }
+        retry_due(&mut state, &key); // fake six-hour deadline, no global clock
+        for (power, cpu) in [(false, 0), (true, 30_000_000)] {
+            let (next, result, rows) = scan(&f, persist(&state), power, cpu);
+            assert!(result.snapshots.is_empty());
+            assert_eq!(decodes(&rows), 0);
+            assert!(
+                matches!(next.files[&key].archive.as_ref().unwrap().disposition,
+                ArchiveDisposition::Pending { attempts, retry_after: 0 } if attempts == attempt)
+            );
+            state = next;
+        }
+        let before = sampled_scan::now_seconds();
+        let (next, offered, rows) = scan(&f, persist(&state), true, 0);
+        assert_eq!(decodes(&rows), 1); // validated header reused, one body decoder
+        assert_eq!(class(&rows, "codex_zst_first_read"), 0);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["stage"] == "codex_zst_first_read_retry")
+                .count(),
+            1
+        );
+        assert_eq!(serde_json::to_value(&offered.snapshots).unwrap(), expected);
+        assert!(
+            matches!(next.files[&key].archive.as_ref().unwrap().disposition,
+            ArchiveDisposition::Pending { attempts, retry_after }
+            if attempts == attempt + 1 && retry_after >= before + 6 * 3600)
+        );
+        state = next;
+    }
+    for _ in 0..3 {
+        let (next, result, rows) = scan(&f, persist(&state), true, 0);
+        assert!(result.snapshots.is_empty());
+        assert_eq!(decodes(&rows), 0);
+        held(&next, &f.0, CodexZstCause::SettlementStuck);
+        state = next;
+    }
 }
 
 #[test]
