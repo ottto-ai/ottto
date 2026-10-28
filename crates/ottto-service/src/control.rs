@@ -11373,7 +11373,7 @@ struct InstallSessionApiResponse {
     install_session_token: String,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Deserialize)]
 struct TelemetryDeviceRegisterApiResponse {
     device: TelemetryDeviceApiResponse,
@@ -23753,6 +23753,8 @@ for line in sys.stdin:
             r#"{"device":{"id":"device","machine_id":"machine","sources":["codex"]},"device_secret":"secret"}"#,
         )
         .expect("old backend response");
+        assert_eq!(old.device.id, "device");
+        assert_eq!(old.device_secret, "secret");
         validate_registration_continuity_response(url, &old, Some(&prior))
             .expect("additive response fields stay optional");
 

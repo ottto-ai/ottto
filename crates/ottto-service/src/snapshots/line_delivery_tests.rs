@@ -875,6 +875,7 @@ fn unselected_page(source: &str) -> Value {
                 scanned_files: 0,
                 semantic_noops: 0,
                 sampled_acquisition: None,
+                full_causes: Default::default(),
             },
         )
     });

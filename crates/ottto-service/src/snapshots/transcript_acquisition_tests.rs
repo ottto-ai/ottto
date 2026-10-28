@@ -1337,7 +1337,7 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
     let source = SnapshotSource::Codex;
     let supported = crate::heap_layout_bound::layout_supported();
     let _cutover = codex_counting_version::TestCutover::set(0);
-    let capture = claude_request_identity::capture_by_default();
+    let capture = true; // Outside a sync cycle every scan captures.
     let namespace = Scope("durable-codex".into());
     let arms = [
         "restore",
@@ -1662,7 +1662,7 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     let source = SnapshotSource::Codex;
     let supported = crate::heap_layout_bound::layout_supported();
     let _cutover = codex_counting_version::TestCutover::set(0);
-    let capture = claude_request_identity::capture_by_default();
+    let capture = true; // Preserve this test's pre-cutover parser binding.
     let namespace = Scope("durable-overflow".into());
     let fixture = ScanFixture::new(source);
     fixture.file.append(
@@ -3594,4 +3594,73 @@ fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
             "split {split}"
         );
     }
+}
+
+fn codex_cache_break_lines(index: usize) -> [Value; 2] {
+    let timestamp = format!("2026-10-07T10:{:02}:{:02}Z", index / 60, index % 60);
+    let read = if index % 2 == 0 { 90_000 } else { 0 };
+    let warm = (index / 2 + 1) as u64 * 90_000;
+    let requests = index as u64 + 1;
+    [
+        json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_{index}"),
+            "usage":{"input_tokens":100_000,"cached_input_tokens":read,"cache_write_input_tokens":0,"output_tokens":1}}}),
+        json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{
+            "total_token_usage":{"input_tokens":100_000 * requests,"cached_input_tokens":warm,"output_tokens":requests},
+            "last_token_usage":{"input_tokens":100_000,"cached_input_tokens":read,"output_tokens":1}}}}),
+    ]
+}
+
+fn uploaded_cache_breaks(body: &Value) -> (Vec<String>, &Value) {
+    let wire = &body[0]["cache_observations"];
+    assert_eq!(wire["coverage"], json!("partial"));
+    let refs = wire["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operation| {
+            assert_eq!(operation["op"], json!("upsert"));
+            operation["observation"]["affected_request_ref"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    (refs, &wire["omitted_observation_count"])
+}
+
+/// A Codex session past the cache-observation cap keeps tailing with full-read
+/// parity, and every pass uploads the same first breaks with an exact count of the rest.
+#[test]
+fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = Fixture::new(source);
+    fixture.append(&json!({"type":"turn_context","payload":{"model":"gpt-test","effort":"high","current_date":"2026-10-07"}}));
+    for index in 0..130 {
+        for line in codex_cache_break_lines(index) {
+            fixture.append(&line);
+        }
+    }
+    let first = (0..64)
+        .map(|n| format!("resp_{}", 2 * n + 1))
+        .collect::<Vec<_>>();
+    let (retained, mode, _, body) = acquire(&fixture, source, None, 100);
+    assert_eq!(
+        mode,
+        ReadMode::Full(crate::transcript_acquisition::FullReason::StateMissing)
+    );
+    assert_eq!(body, oracle(&fixture, source));
+    assert_eq!(uploaded_cache_breaks(&body), (first.clone(), &json!(1)));
+    assert!(retained.is_some(), "the over-cap session is retained");
+    for index in 130..140 {
+        for line in codex_cache_break_lines(index) {
+            fixture.append(&line);
+        }
+    }
+    let (_, mode, _, body) = acquire(&fixture, source, retained, 101);
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(body, oracle(&fixture, source));
+    assert_eq!(uploaded_cache_breaks(&body), (first, &json!(6)));
 }

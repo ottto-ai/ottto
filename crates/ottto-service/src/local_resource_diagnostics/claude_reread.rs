@@ -5,12 +5,64 @@ use super::cache_lifecycle;
 use serde::Serialize;
 use std::cell::Cell;
 
+/// Closed labels for the existing progress-blocking / restore branches.
+#[derive(Clone, Copy)]
+pub(crate) enum HeldReason {
+    AuthorityUnboundRevision,
+    AuthorityCorrectionPending,
+    AccountHoldUnrecorded,
+    NotRestorable,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct HeldReasons {
+    #[serde(skip_serializing_if = "super::is_zero")]
+    authority_unbound_revision: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    authority_correction_pending: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    account_hold_unrecorded: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    not_restorable: u64,
+}
+impl HeldReasons {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    fn merge(&mut self, other: Self) {
+        self.authority_unbound_revision = self
+            .authority_unbound_revision
+            .saturating_add(other.authority_unbound_revision);
+        self.authority_correction_pending = self
+            .authority_correction_pending
+            .saturating_add(other.authority_correction_pending);
+        self.account_hold_unrecorded = self
+            .account_hold_unrecorded
+            .saturating_add(other.account_hold_unrecorded);
+        self.not_restorable = self.not_restorable.saturating_add(other.not_restorable);
+    }
+}
+pub(crate) fn held_reason(reason: HeldReason) {
+    update(|counts| {
+        let reasons = &mut counts.claude_reread.held_reason;
+        let counter = match reason {
+            HeldReason::AuthorityUnboundRevision => &mut reasons.authority_unbound_revision,
+            HeldReason::AuthorityCorrectionPending => &mut reasons.authority_correction_pending,
+            HeldReason::AccountHoldUnrecorded => &mut reasons.account_hold_unrecorded,
+            HeldReason::NotRestorable => &mut reasons.not_restorable,
+        };
+        *counter = counter.saturating_add(1);
+    });
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Rearm {
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) restored_empty_held: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) restored_nonempty_held: u64,
+    #[serde(skip_serializing_if = "HeldReasons::is_empty")]
+    pub(crate) held_reason: HeldReasons,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) restored_empty_sibling: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -31,9 +83,6 @@ pub(crate) struct Rearm {
     pub(crate) retry_admission_cleared: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) authority_normalization_cleared: u64,
-    /// Gauge, not an event: Claude files carrying `STAMPED_WITHOUT_PERMIT`.
-    #[serde(skip_serializing_if = "super::is_zero")]
-    pub(crate) stamped_without_permit: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) history_permitted_not_stamped_not_accepted: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -66,9 +115,7 @@ impl Rearm {
             history_permitted_not_stamped_held,
             history_permitted_not_stamped_other
         );
-        self.stamped_without_permit = self
-            .stamped_without_permit
-            .max(other.stamped_without_permit);
+        self.held_reason.merge(other.held_reason);
     }
     fn is_empty(&self) -> bool {
         *self == Self::default()
@@ -273,9 +320,6 @@ pub(crate) fn clear(site: ClearSite, nonempty: bool) {
         *cleared = cleared.saturating_add(u64::from(nonempty));
     });
 }
-pub(crate) fn stamped_without_permit(files: u64) {
-    update(|counts| counts.claude_reread.stamped_without_permit = files);
-}
 /// Why an upgrade the history gate permitted this page did not stamp.
 pub(crate) enum NotStamped {
     NotAccepted,
@@ -334,6 +378,26 @@ impl crate::heap_layout_bound::HeapLayoutBound for Reinsertion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn held_reasons_are_sparse_saturating_and_merged_across_scopes() {
+        let scope = Scope::begin(true);
+        held_reason(HeldReason::AuthorityUnboundRevision);
+        held_reason(HeldReason::AuthorityCorrectionPending);
+        let mut counts = scope.finish();
+        counts.claude_reread.held_reason.not_restorable = u64::MAX;
+        let scope = Scope::begin(true);
+        held_reason(HeldReason::AccountHoldUnrecorded);
+        held_reason(HeldReason::NotRestorable);
+        counts.merge(scope.finish());
+        assert_eq!(
+            serde_json::to_value(counts).unwrap()["claude_reread"]["held_reason"],
+            serde_json::json!({
+                "authority_unbound_revision": 1, "authority_correction_pending": 1,
+                "account_hold_unrecorded": 1, "not_restorable": u64::MAX,
+            })
+        );
+    }
+
     #[test]
     fn page_scope_isolates_sources_nested_work_threads_and_resumption() {
         let scope = Scope::begin(true);

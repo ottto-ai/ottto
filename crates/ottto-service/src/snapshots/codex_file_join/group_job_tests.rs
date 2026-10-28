@@ -1539,7 +1539,6 @@ fn group_with_legacy_tee_is_byte_charged() {
         }
     }
     let metadata = CodexTitleMetadata::default();
-    boot.admit_for_test(&previous);
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
@@ -1553,7 +1552,6 @@ fn group_with_legacy_tee_is_byte_charged() {
     assert!(job.group.as_ref().unwrap().tee.is_some());
     let no_scope = |_: &CandidateFile| None;
     let inputs = StepInputs {
-        index: &previous,
         metadata: &metadata,
         attribution: None,
         artifacts: false,
@@ -1691,7 +1689,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         }
     }
     let metadata = CodexTitleMetadata::default();
-    boot.admit_for_test(&previous);
     let mut job = boot
         .into_job(JobInputs {
             metadata: &metadata,
@@ -1704,7 +1701,6 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
         .unwrap();
     let no_scope = |_: &CandidateFile| None;
     let inputs = StepInputs {
-        index: &previous,
         metadata: &metadata,
         attribution: None,
         artifacts: false,
@@ -3059,4 +3055,109 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         scanned[1] + 2 <= scanned[0],
         "control acquires both members; the held group acquires neither: {scanned:?}"
     );
+}
+
+#[test]
+fn compressed_group_probe_initial_swap_and_legacy_tee_never_read() {
+    use codex_zst_refusal_tests::assert_refused;
+    let (root, inventory) = fixture();
+    let index = ScanIndex::default();
+    let group = inventory.groups().into_values().next().unwrap();
+    let mut boot = GroupBoot::new(group.clone(), &index);
+    let plain = group.members[0].clone();
+    let mut compressed = plain.clone();
+    compressed.path.set_extension("jsonl.zst");
+    fs::copy(&plain.path, &compressed.path).unwrap();
+    boot.group.members[0] = compressed.clone();
+    assert_refused(CodexZstCause::GroupProbeUnsupported, || {
+        assert!(matches!(boot.probe(0), Boot::Strict));
+        assert_eq!(boot.charge, 0);
+    });
+    let metadata = CodexTitleMetadata::default();
+    assert_refused(CodexZstCause::GroupReadUnsupported, || {
+        assert!(open_member_file(&mut compressed).is_err());
+        assert!(new_group_parser(
+            File::open(&compressed.path).unwrap(),
+            &compressed,
+            &metadata,
+            None,
+            None,
+            false,
+            false,
+            codex_counting_version::AckEvidence::None
+        )
+        .is_err());
+        let expected =
+            BTreeMap::from([(local_index_key(&compressed.path), "accepted-body".into())]);
+        assert!(legacy_tee(
+            &expected,
+            &compressed,
+            &File::open(&compressed.path).unwrap(),
+            &metadata,
+            None,
+            None,
+            false,
+            false
+        )
+        .is_err());
+    });
+    let mut boot = GroupBoot::new(group, &index);
+    loop {
+        match boot.step(None, &index) {
+            Boot::Pending => {}
+            Boot::Ready => break,
+            _ => panic!("plain group boots"),
+        }
+    }
+    let mut active = boot
+        .into_job(JobInputs {
+            metadata: &metadata,
+            traces: None,
+            ledgers: None,
+            artifacts: false,
+            context_curve: false,
+            index: &index,
+        })
+        .unwrap();
+    let before = active.parser.reader.consumed_bytes();
+    let group = active.group.as_deref_mut().unwrap();
+    group.current = 1;
+    group.members[1] = compressed;
+    let join = active
+        .parser
+        .accumulator
+        .codex_tier_replay
+        .as_mut()
+        .unwrap()
+        .join
+        .take()
+        .unwrap();
+    let no_scope = |_: &CandidateFile| None;
+    let inputs = StepInputs {
+        metadata: &metadata,
+        attribution: None,
+        artifacts: false,
+        context_curve: false,
+        live_scope: &no_scope,
+    };
+    assert_refused(CodexZstCause::GroupReadUnsupported, || {
+        assert!(matches!(
+            open_member(&mut active, join, &inputs),
+            Err(GroupEnd::Strict)
+        ));
+        assert_eq!(
+            active.parser.reader.consumed_bytes(),
+            before,
+            "swap never reset the reader"
+        );
+    });
+    active.candidate.path.set_extension("jsonl.zst");
+    let cache = Arc::new(SharedCache::default());
+    assert_refused(CodexZstCause::PhysicalOffsetUnsupported, || {
+        assert!(matches!(
+            cache.cursor_start(&mut active, &Scope("zst".into()), None, None, true, &index),
+            Err(cursor::StartRefusal::Unstartable)
+        ));
+    });
+    fs::remove_dir_all(root).unwrap();
 }

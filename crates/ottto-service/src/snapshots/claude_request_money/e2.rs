@@ -390,18 +390,19 @@ pub(crate) mod money_mark {
     pub(crate) const CONFLICT: u8 = 16;
     /// This file was kept on ordinary money by the local list.
     pub(crate) const LEGACY: u8 = 32;
-    /// Not a money rule (E3, B17): this file's revision-3 body was stamped in
-    /// a cycle without the identity permit, so it carries no identity markers.
-    pub(crate) const STAMPED_WITHOUT_PERMIT: u8 = 64;
+    /// #825's `STAMPED_WITHOUT_PERMIT`, retired with the identity permit
+    /// (contract 5 always on). Stores may still carry it: it is decoded and
+    /// carried through every restamp as stored (durable entry digests bind
+    /// the raw byte), but never set, cleared, acted on or replayed.
+    pub(crate) const RETIRED_PERMIT: u8 = 64;
 }
 /// Money-rule versions and the marks each one re-reads. Version 1 is the
 /// switch-on, whose revision 3 already re-reads every file. A later money
 /// fix appends a row naming the marks it changes, so only those files are
 /// re-owed (once, under the history budget); never a revision bump, which
-/// re-reads the whole history. Version 2 re-owes nothing: it seeds
-/// `STAMPED_WITHOUT_PERMIT` once (`PERMIT_MARK_RULE`).
+/// re-reads the whole history. Version 2 re-owes nothing (#825 seeded its
+/// retired permit mark there); it stays so stored versions keep their meaning.
 const MONEY_RULES: &[(u16, u8)] = &[(1, 0), (2, 0)];
-const PERMIT_MARK_RULE: u16 = 2;
 #[cfg(test)]
 thread_local! {
     static TEST_MONEY_RULES: std::cell::Cell<Option<&'static [(u16, u8)]>> =
@@ -549,32 +550,15 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
     let to = index
         .active_effective_upload_body_witness_revision
         .saturating_sub(1);
-    // Seeded once, from the record loaded before any observation: only an
-    // adopted record (E2, or adoption pending) proves the old adoption
-    // re-owed every file stamped without the permit. Anything else counts
-    // as "" and marks every revision-3 file.
-    let seed = stored < PERMIT_MARK_RULE
-        && current >= PERMIT_MARK_RULE
-        && !matches!(
-            index.claude_request_identity_contract.as_deref(),
-            Some(
-                claude_request_identity::E2_GROUPING
-                    | super::super::CLAUDE_E2_IDENTITY_ADOPTION_PENDING
-            )
-        );
     let mut live = Vec::new();
     let mut owed = Vec::new();
-    let mut seeded = Vec::new();
-    for (key, entry) in &index.files {
+    for key in index.files.keys() {
         if claude_index_path_member_ref(Path::new(key)).is_none() {
             continue;
         }
         let location = location_key(key);
         if index.claude_money_birth_store.money_marks(location) & mask != 0 {
             owed.push(key.clone());
-        }
-        if seed && entry.effective_upload_body_witness_revision == 3 {
-            seeded.push(key.clone());
         }
         live.push(location);
     }
@@ -583,9 +567,6 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
     }
     live.sort_unstable();
     let store = &mut index.claude_money_birth_store;
-    for key in seeded {
-        store.set_money_mark(&key, money_mark::STAMPED_WITHOUT_PERMIT, true);
-    }
     store.retain_money_marks(&live);
     store.set_money_rule_version(current);
 }

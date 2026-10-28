@@ -792,7 +792,7 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
     ) -> Option<crate::transcript_cache::Taken<sampled_jsonl::CachedJsonlReduction>> {
         match self {
             Self::Restored(taken) => Some(*taken),
-            Self::Miss => None,
+            Self::Miss(_) => None,
             Self::Held(reason) => panic!("ordinary restore unexpectedly Held: {reason:?}"),
         }
     }
@@ -1900,4 +1900,559 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     let (_, disk_counters) = cache.durable_counters(source).unwrap();
     assert_eq!(disk_counters.gc_records_deleted, 1);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn restore_scope_attribution_is_typed_and_preserves_binding_formula() {
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("diagnostic-namespace".into());
+    let scope = Scope("diagnostic-scope".into());
+    let mut index = ScanIndex {
+        active_effective_upload_body_witness_revision: 3,
+        ..ScanIndex::default()
+    };
+    index.claude_money_birth_store.set_money_rule_version(2);
+    let interpretation = Interpretation::of(source, "fixture", &index, false, &namespace);
+    let base = replay_scope(source, &scope, &index, &interpretation, None);
+    let prior_formula = store::replay_scope_digest(
+        &store::scope_digest(
+            &scope.0,
+            &codec::allowlist_digest(source),
+            &interpretation.identity_contract,
+            &interpretation.counting_view,
+        ),
+        crate::snapshot_sync::effective_upload_body_witness_revision(source),
+        index.active_effective_upload_body_witness_revision,
+        index.claude_money_birth_store.money_rule_version(),
+        claude_request_money::e2::enabled(),
+    );
+    assert_eq!(
+        base, prior_formula,
+        "existing persisted binding is unchanged"
+    );
+    assert_eq!(
+        unregistered_scope(source, &scope, &index, &interpretation, base),
+        None
+    );
+    index.active_effective_upload_body_witness_revision = 4;
+    let body = Obligation {
+        kind: ObligationKind::BodyWitness,
+        revision: 4,
+    };
+    assert_eq!(
+        unregistered_scope(source, &scope, &index, &interpretation, base),
+        Some(body)
+    );
+    assert_eq!(
+        MissClass::Unregistered(body).label(),
+        "unregistered_replay.body_witness"
+    );
+    assert_eq!(
+        unregistered_scope(
+            source,
+            &Scope("other".into()),
+            &index,
+            &interpretation,
+            base
+        ),
+        None
+    );
+    index.active_effective_upload_body_witness_revision = 3;
+    index.claude_money_birth_store.set_money_rule_version(3);
+    let money = Obligation {
+        kind: ObligationKind::MoneyRule,
+        revision: 3,
+    };
+    assert_eq!(
+        unregistered_scope(source, &scope, &index, &interpretation, base),
+        Some(money)
+    );
+    assert_eq!(
+        MissClass::Unregistered(money).label(),
+        "unregistered_replay.money_rule"
+    );
+    // Codex has no money-rule scope input, even when the store knows a rule.
+    let codex = SnapshotSource::Codex;
+    let codex_scope = replay_scope(codex, &scope, &index, &interpretation, None);
+    assert_eq!(
+        unregistered_scope(codex, &scope, &index, &interpretation, codex_scope),
+        None
+    );
+}
+
+#[test]
+fn restore_reports_each_early_exit_without_changing_old_totals() {
+    let root = crate::test_scratch::private_dir("ottto-restore-provenance");
+    let _lock = test_locks::hold(&root);
+    let path = root.join("fixture.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("restore-outcome".into());
+    let scope = Scope("restore-file".into());
+    let index_path = root.join("index.json");
+    let cache = SharedCache::default();
+    let mut index = ScanIndex::default();
+    let attempt = |index: &ScanIndex| {
+        let interpretation = Interpretation::of(source, &key, index, false, &namespace);
+        cache.durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            index,
+            &interpretation,
+        )
+    };
+    let label = |outcome: RestoreOutcome| match outcome {
+        RestoreOutcome::Miss(class) => class.label(),
+        _ => panic!("expected a typed miss"),
+    };
+    assert_eq!(label(attempt(&index)), "no_entry");
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp",
+            "effective_upload_body_witness_revision":3
+        }))
+        .unwrap(),
+    );
+    index.active_effective_upload_body_witness_revision = 3;
+    assert_eq!(label(attempt(&index)), "unavailable");
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    assert_eq!(label(attempt(&index)), "missing");
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    assert_eq!(label(attempt(&index)), "ineligible.selection_cleared");
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = "fp".into();
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .effective_upload_body_witness_revision = 2;
+    assert_eq!(label(attempt(&index)), "ineligible.history_owed");
+    let (old, disk) = cache.durable_counters(source).unwrap();
+    assert_eq!((old.restore_attempts, old.missing, old.restored), (4, 1, 0));
+    assert_eq!(old.ineligible["selection_cleared"], 1);
+    assert_eq!(old.ineligible["history_owed"], 1);
+    assert_eq!(old.durable_held, [0; 5]);
+    let text = old.summary(source, &disk);
+    assert!(!text.contains("restore_attempts="));
+    assert!(text.contains("disk_records="));
+    assert!(text.contains("not_persisted="));
+    // No new record or recovery operation is performed by these diagnostics.
+    assert_eq!(disk.records_read, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn certificate_read_error_is_not_edit_evidence() {
+    let root = crate::test_scratch::private_dir("ottto-certificate-read-error");
+    let path = root.join("fixture.jsonl");
+    std::fs::write(&path, b"{\"n\":1}\n").unwrap();
+    let scope = Scope("certificate-error".into());
+    let certificate = certificate(&path, &scope);
+    // Preserve the nested codec's content-refusal field label as a static key.
+    assert_eq!(
+        MissClass::Failure(Failure::NotRederived(Refuse::NonEmpty(
+            "CodexPrelude.skills_body"
+        )))
+        .label(),
+        "not_rederived.CodexPrelude.skills_body"
+    );
+    // Metadata succeeds; the first existing sample read fails on a write-only FD.
+    let mut held = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    assert_eq!(
+        certificate.restore(&mut held, scope.clone()).err(),
+        Some(CertificateRefusal::ReadError)
+    );
+    assert_eq!(
+        MissClass::Failure(Failure::Certificate(CertificateRefusal::ReadError)).label(),
+        "certificate_refused.read_error"
+    );
+    let mut invalid = certificate.clone();
+    invalid.sample_len += 1;
+    assert_eq!(
+        invalid
+            .restore(&mut File::open(&path).unwrap(), scope.clone())
+            .err(),
+        Some(CertificateRefusal::Changed(FullReason::InvalidCheckpoint))
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(1)
+        .unwrap();
+    assert_eq!(
+        certificate
+            .restore(&mut File::open(&path).unwrap(), scope)
+            .err(),
+        Some(CertificateRefusal::Changed(FullReason::Shrunk))
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Fixture (e): crossing T14's breaker disables the store; later attempts
+/// report unavailable rather than conflating the disable with a missing record.
+#[test]
+fn store_unavailable_after_t14_breaker_is_not_missing() {
+    let root = crate::test_scratch::private_dir("ottto-restore-store-unavailable");
+    let lock = test_locks::hold(&root);
+    let path = root.join("fixture.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let source = SnapshotSource::ClaudeCode;
+    let ds = durable_source(source).unwrap();
+    let namespace = Scope("breaker-outcome".into());
+    let scope = Scope("breaker-file".into());
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let attempt = || {
+        cache.durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &index,
+            &interpretation,
+        )
+    };
+    assert!(matches!(
+        attempt(),
+        RestoreOutcome::Miss(MissClass::Missing)
+    ));
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let keys: Vec<_> = (0..=store::T14_BREAKER)
+        .map(|n| store::key_digest(ds, &format!("/synthetic/corrupt-{n}.jsonl")))
+        .collect();
+    let allowlist = codec::allowlist_digest(source);
+    let certificate = certificate(&path, &scope);
+    disk.write_after_save(
+        lock,
+        1,
+        keys.iter()
+            .map(|key| PendingRecord {
+                binding: Binding {
+                    source: ds,
+                    key: *key,
+                    context: [0; 32],
+                    scope: [0; 32],
+                    entry: [0; 32],
+                },
+                certificate: certificate.clone(),
+                body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+                allowlist,
+            })
+            .collect(),
+    )
+    .unwrap();
+    for key in &keys {
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        let record = disk.dir().join(format!("{hex}.rec"));
+        let mut bytes = std::fs::read(&record).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&record, bytes).unwrap();
+    }
+    {
+        let mut stores = cache.durable().unwrap();
+        let slot = stores.slot(ds).as_mut().unwrap();
+        for key in &keys {
+            assert_eq!(slot.store.hold(key), None);
+        }
+        assert_eq!(slot.store.disabled(), Some("t14_breaker"));
+    }
+    let outcome = attempt();
+    assert!(matches!(
+        outcome,
+        RestoreOutcome::Miss(MissClass::Unavailable)
+    ));
+    let mut page = crate::local_resource_diagnostics::RestoreCounts::default();
+    page.record(&outcome);
+    let json = serde_json::to_value(page).unwrap();
+    assert_eq!(json["miss"]["unavailable"], 1);
+    assert!(json["miss"].get("missing").is_none());
+    let (old, disk) = cache.durable_counters(source).unwrap();
+    assert_eq!((old.restore_attempts, old.missing), (2, 2));
+    assert_eq!(disk.t14_rebuild, store::T14_BREAKER);
+    assert_eq!(disk.records_read, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn certificate_sample_truncation_is_shrunk_for_both_windows() {
+    use crate::transcript_acquisition::set_between_guards;
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            set_between_guards(None);
+        }
+    }
+    let root = crate::test_scratch::private_dir("ottto-certificate-sample-truncation");
+    let path = root.join("fixture.jsonl");
+    let scope = Scope("sample-truncation".into());
+    for target in [1, 2] {
+        std::fs::write(&path, b"{}\n".repeat(10_000)).unwrap();
+        let certificate = certificate(&path, &scope);
+        let shrink_to = if target == 1 {
+            u64::from(certificate.sample_len) - 1
+        } else {
+            certificate.sealed_offset - 1
+        };
+        let truncate = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = calls.clone();
+        let _clear = ClearHook;
+        set_between_guards(Some(Box::new(move || {
+            observed.set(observed.get() + 1);
+            if observed.get() == target {
+                truncate.set_len(shrink_to).unwrap();
+            }
+        })));
+        // Opening metadata still matches; the selected existing sample read
+        // consumes a partial window then hits UnexpectedEof after truncation.
+        assert_eq!(
+            certificate
+                .restore(&mut File::open(&path).unwrap(), scope.clone())
+                .err(),
+            Some(CertificateRefusal::Changed(FullReason::Shrunk))
+        );
+        assert_eq!(calls.get(), target);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
+    let root = crate::test_scratch::private_dir("zst-record-refusal");
+    let plain = root.join("plain.jsonl");
+    std::fs::write(&plain, b"{\"n\":1}\n").unwrap();
+    let scope = Scope("fixture".into());
+    let compressed = root.join("rollout.jsonl.zst");
+    let key = local_index_key(&compressed);
+    let binding = Binding {
+        source: DurableSource::Codex,
+        key: store::key_digest(DurableSource::Codex, &key),
+        context: [0; 32],
+        scope: [0; 32],
+        entry: [0; 32],
+    };
+    let expected = Expected {
+        binding: binding.clone(),
+        committed_generation: 1,
+    };
+    let record = store::DurableRecord {
+        record: PendingRecord {
+            binding,
+            certificate: certificate(&plain, &scope),
+            body: Vec::new(),
+            allowlist: [0; 32],
+        },
+        index_generation: 1,
+    };
+    let mut held = File::open(&plain).unwrap();
+    codex_zst_refusal_tests::assert_refused(CodexZstCause::DurableTailUnsupported, || {
+        assert!(matches!(
+            SharedCache::default().durable_restore_record(
+                SnapshotSource::Codex,
+                &record,
+                &expected,
+                &compressed,
+                &scope,
+                &mut held
+            ),
+            Err(Failure::NotRederived(_))
+        ));
+    });
+    // #830's wrapper rechecks holds on a restore miss. The compressed
+    // refusal must precede that record IO too, not just restore_known.
+    let lock = test_locks::hold(&root);
+    let index_path = root.join("index.json");
+    let mut disk = DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        DurableSource::Codex,
+    );
+    disk.write_after_save(lock, 1, vec![record.record.clone()])
+        .unwrap();
+    let record_path = disk.dir().join(format!(
+        "{}.rec",
+        expected
+            .binding
+            .key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ));
+    let before_bytes = std::fs::read(&record_path).unwrap();
+    let cache = SharedCache::default();
+    let source = SnapshotSource::Codex;
+    cache.durable_begin_pass(source, &index_path, &scope, false);
+    let index = ScanIndex::default();
+    let interpretation = Interpretation::of(source, "fixture", &index, false, &scope);
+    let before_counters = cache.durable_counters(source).unwrap();
+    let before_offset = std::io::Seek::stream_position(&mut held).unwrap();
+    codex_zst_refusal_tests::assert_refused(CodexZstCause::DurableTailUnsupported, || {
+        assert!(matches!(
+            cache.durable_restore(
+                source,
+                &key,
+                &compressed,
+                &scope,
+                &mut held,
+                &index,
+                &interpretation
+            ),
+            RestoreOutcome::Miss(MissClass::Failure(Failure::NotRederived(
+                Refuse::NotRederivable("compressed")
+            )))
+        ));
+    });
+    assert_eq!(cache.durable_counters(source).unwrap(), before_counters);
+    assert_eq!(
+        std::io::Seek::stream_position(&mut held).unwrap(),
+        before_offset
+    );
+    assert_eq!(std::fs::read(record_path).unwrap(), before_bytes);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Contract-5 cutover (Lead B, byte-stable keys): a record a permit-era
+/// permitted Claude cycle wrote (capture on, the E2 contract recorded)
+/// keeps its identity interpretation byte for byte under the always-on
+/// capture, so it binds and restores; nothing is refused. Codex never
+/// captured and still does not.
+///
+/// This is a same-binary round trip: no record bytes written by the
+/// previous binary are replayed. Its cross-version claim rests on the
+/// pinned literal interpretation below and on the
+/// sampled-scope goldens (`the_always_on_sampled_scope_keeps_the_permit_era_bytes`).
+/// A restore reads only its bounded certificate and re-derivation bytes,
+/// never the transcript in Full; an unsupported heap layout cannot restore
+/// and says so.
+#[test]
+fn a_permit_era_record_restores_under_the_always_on_capture() {
+    let root = crate::test_scratch::private_dir("ottto-dt-contract5");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let namespace = Scope("contract5-test".into());
+    let scope = Scope("contract5-file".into());
+    let index_path = root.join("index.json");
+    let path = root.join("11111111-2222-4333-8444-555555555555.jsonl");
+    native_fixture(&path);
+    let key = local_index_key(&path);
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":std::fs::metadata(&path).unwrap().len(),
+            "modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    index.claude_request_identity_contract = Some(claude_request_identity::E2_GROUPING.to_owned());
+    index.save(&index_path).unwrap();
+    // The permit-era permitted cycle: capture followed the permit.
+    let before = Interpretation::of(source, &key, &index, true, &namespace);
+    assert_eq!(
+        before.identity_contract,
+        format!(
+            "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1|changed=false|capture=true|attr={}",
+            claude_attribution_capture_enabled()
+        ),
+        "the pre-cutover interpretation bytes"
+    );
+    let capture = claude_request_identity::captures(source);
+    let after = Interpretation::of(source, &key, &index, capture, &namespace);
+    assert_eq!(after.identity_contract, before.identity_contract);
+    let codex = SnapshotSource::Codex;
+    assert_eq!(
+        Interpretation::of(codex, &key, &index, false, &namespace).identity_contract,
+        Interpretation::of(
+            codex,
+            &key,
+            &index,
+            claude_request_identity::captures(codex),
+            &namespace
+        )
+        .identity_contract
+    );
+    let binding = expected(
+        DurableSource::ClaudeCode,
+        source,
+        &key,
+        &scope,
+        &index,
+        &before,
+    )
+    .unwrap()
+    .binding;
+    let (reduction, _) = native_record(&path, &scope);
+    let mut store = DurableTailStore::new(
+        store::store_dir_for_index(&index_path),
+        DurableSource::ClaudeCode,
+    );
+    store
+        .write_after_save(
+            lock,
+            index.generation,
+            vec![PendingRecord {
+                binding,
+                certificate: certificate(&path, &scope),
+                body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
+                    .unwrap(),
+                allowlist: codec::allowlist_digest(source),
+            }],
+        )
+        .unwrap();
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, capture);
+    let restored = cache
+        .durable_restore(
+            source,
+            &key,
+            &path,
+            &scope,
+            &mut File::open(&path).unwrap(),
+            &index,
+            &after,
+        )
+        .into_test_option();
+    let supported = crate::heap_layout_bound::layout_supported();
+    assert_eq!(restored.is_some(), supported);
+    let (counts, disk) = cache.durable_counters(source).unwrap();
+    if supported {
+        assert!(counts.ineligible.is_empty(), "{:?}", counts.ineligible);
+        assert_eq!(counts.refused_record, 0);
+        // No Full read: re-derivation reads less than the transcript.
+        let transcript = std::fs::metadata(&path).unwrap().len();
+        let read = counts.rederive_head_bytes + counts.rederive_line_bytes;
+        assert!(read < transcript, "re-derived {read} of {transcript} bytes");
+    } else {
+        std::io::Write::write_all(
+            &mut std::io::stderr().lock(),
+            b"a_permit_era_record_restores_under_the_always_on_capture: UNEXECUTED \
+              (heap layout unsupported; restore not exercised)\n",
+        )
+        .unwrap();
+    }
+    assert_eq!(counts.restored, u64::from(supported));
+    assert_eq!(disk.records_read, 1);
+    drop(restored);
+    let _ = std::fs::remove_dir_all(root);
 }

@@ -1206,21 +1206,13 @@ fn carry_resumed_index(base: bool, passed: bool) -> ScanIndex {
     carry_reload(index)
 }
 
-/// Exercise the refund observer even where native carry funding is unavailable.
+/// Exercise refund even where native carry funding is unavailable.
 #[test]
-fn unfunded_replay_refreshes_the_plan_before_clearing_on_every_platform() {
+fn unfunded_replay_clears_fingerprints_on_every_platform() {
     let mut fix = carry_index();
     fix.claude_stale_family_carry
         .roots
         .insert(CARRY_ROOT.to_owned());
-    let context = fix.traversal.as_ref().unwrap().context_fingerprint.clone();
-    fix.reread_plan_for_rearms(
-        SnapshotSource::ClaudeCode,
-        CARRY_FAILED,
-        &context,
-        false,
-        |_| false,
-    );
     let mut base = fix.clone();
     for key in carry_family_keys() {
         base.files
@@ -1230,29 +1222,11 @@ fn unfunded_replay_refreshes_the_plan_before_clearing_on_every_platform() {
             .clear();
     }
     base.claude_stale_family_carry.roots.clear();
-    base.reread_plan_for_rearms(
-        SnapshotSource::ClaudeCode,
-        CARRY_FAILED,
-        &context,
-        false,
-        |_| false,
-    );
     {
         let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
-        assert!(refund_claude_stale_family_carry(
-            &mut fix,
-            SnapshotSource::ClaudeCode,
-            CARRY_FAILED,
-            &context,
-            false,
-        ));
+        assert!(refund_claude_stale_family_carry(&mut fix));
     }
     let fix_value = serde_json::to_value(&fix).unwrap();
-    assert_eq!(
-        fix_value["reread_guard"]["tripwire"]["cause_counts"]
-            [CandidateParseReason::Rearmed as usize],
-        2
-    );
     assert_eq!(fix_value, serde_json::to_value(&base).unwrap());
 }
 
@@ -3296,9 +3270,8 @@ fn scoped_unhealthy_retry_preserves_member_protection_and_scratch_refusal() {
 }
 
 #[test]
-fn scoped_retry_observer_counts_actual_rearms_and_preserves_selection() {
-    // Portable CI exercises BASE fallback too; macOS exercises the funded
-    // carry and proves 320 healthy families spend no planned re-arm count.
+fn scoped_retry_preserves_actual_rearms_and_selection() {
+    // Portable CI exercises BASE fallback; macOS exercises the funded carry.
     let supported = crate::heap_layout_bound::layout_supported();
     let mut fixture = scoped_retry_fixture(3, 320, true);
     for root in fixture.roots.iter().take(3) {
@@ -3312,7 +3285,6 @@ fn scoped_retry_observer_counts_actual_rearms_and_preserves_selection() {
     let before = serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap();
     let mut unobserved = fixture.index.clone();
     {
-        let _off = reread_guard::TestObservations::enabled(false);
         carry_start(&mut unobserved, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
     }
     let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
@@ -3323,10 +3295,6 @@ fn scoped_retry_observer_counts_actual_rearms_and_preserves_selection() {
         .filter(|(_, entry)| entry.source_file_fingerprint.is_empty())
         .map(|(key, _)| key.clone())
         .collect::<BTreeSet<_>>();
-    assert_eq!(
-        reread_guard::planned_for_test(&fixture.index),
-        actual.len() as u64
-    );
     assert_eq!(
         row["rearmed_index_files"].as_u64(),
         Some(actual.len() as u64)
@@ -3386,7 +3354,6 @@ fn scoped_retry_observer_counts_actual_rearms_and_preserves_selection() {
             )));
         let mut unobserved = fixture.index.clone();
         {
-            let _off = reread_guard::TestObservations::enabled(false);
             carry_start(&mut unobserved, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
         }
         carry_start(&mut fixture.index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
@@ -3396,24 +3363,10 @@ fn scoped_retry_observer_counts_actual_rearms_and_preserves_selection() {
             .values()
             .all(|entry| entry.source_file_fingerprint.is_empty()));
         assert_eq!(
-            reread_guard::planned_for_test(&fixture.index),
-            fixture.index.files.len() as u64
-        );
-        assert_eq!(
             serde_json::to_value(&fixture.index.files).unwrap(),
             serde_json::to_value(&unobserved.files).unwrap()
         );
     }
-    assert_eq!(
-        fixture
-            .index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .counts
-            .reread_budget_refused,
-        0
-    );
 }
 
 #[test]
@@ -4349,11 +4302,6 @@ fn contract_observation_counts_empty_transitions_without_prepare_scan_duplicates
     index.observe_claude_request_identity_contract(false);
     index.observe_claude_request_identity_contract(false);
     let counts = scope.finish().contract;
-    assert_eq!(
-        counts.request_identity_permit,
-        Default::default(),
-        "permit is prepare-only"
-    );
     assert_eq!(counts.identity_contract_transition.from_empty, 1);
     assert_eq!(counts.identity_contract_transition.to_empty, 1);
     assert_eq!(counts.identity_contract_latch.set, 1);

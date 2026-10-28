@@ -99,12 +99,12 @@ struct IdentityPipelineCycle {
     snapshots: Vec<SnapshotItem>,
     /// The scan index before finish's evidence stage.
     scanned_index: ScanIndex,
-    /// The same cycle's pre-flip shape: no capture, no permit.
+    /// The same cycle on the ordinary path, without early prepared evidence.
     dark_oracle: Vec<u8>,
 }
 
 /// Runs one real preparation under `hint_extra`, steps its scan to completion,
-/// then applies finish's Claude evidence stage with the permit finish derives.
+/// then applies finish's Claude evidence stage (contract 5 always on).
 fn identity_pipeline_cycle(
     fixture: &IdentityPipelineHome,
     name: &str,
@@ -165,7 +165,7 @@ fn identity_pipeline_cycle(
         &[],
         false,
         preparation.context_curve_enabled,
-        false,
+        crate::snapshots::claude_request_identity::captures(source),
     );
     let (mut oracle_index, mut oracle_scan) = loop {
         match oracle.step(None) {
@@ -175,12 +175,7 @@ fn identity_pipeline_cycle(
             }
         }
     };
-    apply_claude_local_evidence_to_scan_with_permit(
-        &support,
-        &mut oracle_scan,
-        &mut oracle_index,
-        None,
-    );
+    apply_claude_local_evidence_to_scan(&support, &mut oracle_scan, &mut oracle_index);
     let (preparation, mut index, mut scan) =
         collect_native_preparation_with_rotation(preparation, false);
     let scanned_index = index.clone();
@@ -189,7 +184,6 @@ fn identity_pipeline_cycle(
         &support,
         &mut scan,
         &mut index,
-        cycle_request_identity_permit(source, &preparation.activity_hint),
         preparation.prepared_claude_evidence,
     );
     Ok(IdentityPipelineCycle {
@@ -233,10 +227,15 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
     writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: real_source_preparation=true missing_pairs_base=true reuse_activated=false").unwrap();
 }
 
+/// Contract 5 is always on: with the old cohort token, without it, or with
+/// any other value, a real Claude cycle captures markers and the Desktop
+/// census witness and emits the same contract-5 body. Was
+/// `master_on_emits_contract5_only_under_the_cycles_exact_hint_token`, whose
+/// non-exact tokens kept the pre-flip bytes with no capture.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
-fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
+fn always_on_emits_contract5_whatever_the_hint_token() {
     // Contract-5 transcript/reported classification; E2 allocates final grains before tagging.
     let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
     use crate::snapshots::claude_request_identity as identity;
@@ -249,34 +248,14 @@ fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
             .expect("the synthetic session is scanned")
             .clone()
     };
-
-    // The exact token: contract-5 output, with markers and the Desktop census
-    // witness captured for it.
-    let permitted = identity_pipeline_cycle(
-        &fixture,
-        "token",
-        r#","session_request_identity_contract":"own_request_identity_rows:v1""#,
-    )
-    .expect("permitted cycle");
-    let item = session(&permitted);
-    assert_eq!(item.provenance.collector, identity::COLLECTOR);
-    assert!(item.claude_org_markers.is_some(), "markers are captured");
-    assert!(identity::desktop_census(&permitted.scanned_index).is_some());
-    // Even a settled pass withdraws marker-only tags. Nothing is refused
-    // and usage is unchanged.
-    assert!(item.request_evidence.is_empty());
-    assert_eq!(item.request_identity_refusals, 0);
-    assert_eq!(
-        (item.request_count, item.input_tokens, item.output_tokens),
-        (2, 30, 3)
-    );
-    assert_ne!(permitted.body, permitted.dark_oracle);
-
-    // No token, null, another version, a prefixed token, or the collector
-    // name: today's body bytes, no marker or census capture.
+    let mut bodies = BTreeSet::new();
     for (name, extra) in [
         ("absent", ""),
         ("null", r#","session_request_identity_contract":null"#),
+        (
+            "token",
+            r#","session_request_identity_contract":"own_request_identity_rows:v1""#,
+        ),
         (
             "other",
             r#","session_request_identity_contract":"own_request_identity_rows:v2""#,
@@ -290,26 +269,39 @@ fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
             r#","session_request_identity_contract":"claude_code_jsonl:own_request_identity_rows:v1""#,
         ),
     ] {
-        let dark = identity_pipeline_cycle(&fixture, name, extra).expect("dark cycle");
-        assert_eq!(dark.body, dark.dark_oracle, "{name}: pre-flip body bytes");
-        let item = session(&dark);
-        assert_ne!(item.provenance.collector, identity::COLLECTOR, "{name}");
+        let cycle = identity_pipeline_cycle(&fixture, name, extra).expect("cycle");
+        let item = session(&cycle);
+        assert_eq!(item.provenance.collector, identity::COLLECTOR, "{name}");
+        assert!(
+            item.claude_org_markers.is_some(),
+            "{name}: markers captured"
+        );
+        assert!(
+            identity::desktop_census(&cycle.scanned_index).is_some(),
+            "{name}: census witness"
+        );
+        // Even a settled pass withdraws marker-only tags. Nothing is refused
+        // and usage is unchanged.
         assert!(item.request_evidence.is_empty(), "{name}");
-        assert!(
-            dark.snapshots
-                .iter()
-                .all(|item| item.claude_org_markers.is_none()),
-            "{name}: no marker capture"
-        );
-        assert!(
-            identity::desktop_census(&dark.scanned_index).is_none(),
-            "{name}: no census witness"
-        );
+        assert_eq!(item.request_identity_refusals, 0, "{name}");
         assert_eq!(
             (item.request_count, item.input_tokens, item.output_tokens),
             (2, 30, 3)
         );
+        // Each cycle scans at its own wall time, so compare what the hint
+        // could change: the contract and every tagged row.
+        bodies.insert(
+            serde_json::to_vec(&(
+                &item.provenance.collector,
+                &item.request_evidence,
+                item.request_identity_refusals,
+                &item.model_usage,
+                &item.usage_buckets,
+            ))
+            .expect("serialize identity projection"),
+        );
     }
+    assert_eq!(bodies.len(), 1, "the hint token changes no identity or usage");
 
     // A hint that cannot be read aborts the cycle: no scan, no fallback body.
     let support = fixture.base.join("support-unreadable");
@@ -901,44 +893,7 @@ fn preparation_error_preserves_normalization_counts_with_and_without_a_lease() {
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
-fn identity_permit_counts_each_success_and_denial_once_through_real_prepare() {
-    for leased in [false, true] {
-        let _enabled = leased.then(crate::snapshots::claude_native_comparison::enable_for_test);
-        let fixture = IdentityPipelineHome::new();
-        for (name, extra, outcome) in [
-            (
-                "count-permitted",
-                r#","session_request_identity_contract":"own_request_identity_rows:v1""#,
-                "permitted",
-            ),
-            (
-                "count-null",
-                r#","session_request_identity_contract":null"#,
-                "denied",
-            ),
-            (
-                "count-unknown",
-                r#","session_request_identity_contract":"unknown""#,
-                "denied",
-            ),
-        ] {
-            let (result, rows) = crate::local_resource_diagnostics::capture(|| {
-                identity_pipeline_cycle(&fixture, name, extra)
-            });
-            result.unwrap();
-            let counts = rows
-                .iter()
-                .filter_map(|row| row["counts"]["request_identity_permit"][outcome].as_u64())
-                .collect::<Vec<_>>();
-            assert_eq!(counts, [1], "leased={leased}/{name}: {rows:?}");
-        }
-    }
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-fn identity_permit_transport_errors_reach_existing_carrier_without_contract_observation() {
+fn transport_errors_keep_the_contract_without_observation() {
     for leased in [false, true] {
         let _enabled = leased.then(crate::snapshots::claude_native_comparison::enable_for_test);
         for failure in ["fetch", "hint", "invalid_hint"] {
@@ -1009,21 +964,12 @@ fn identity_permit_transport_errors_reach_existing_carrier_without_contract_obse
                 bytes,
                 "error preserves last contract and latch"
             );
-            let field = if fetch { "fetch_failed" } else { "hint_failed" };
-            let events = rows
-                .iter()
-                .filter(|row| {
-                    row["counts"]["request_identity_permit"][field]
-                        .as_u64()
-                        .is_some()
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(events.len(), 1, "leased={leased}/{field}: {rows:?}");
-            assert_eq!(events[0]["stage"], "native_comparison_decision");
-            assert_eq!(events[0]["counts"]["request_identity_permit"][field], 1);
-            assert!(events[0]["counts"]
-                .get("identity_contract_transition")
-                .is_none());
+            // The retired permit counters are gone; nothing observes a
+            // contract on a failed preparation.
+            for row in &rows {
+                assert!(row["counts"].get("request_identity_permit").is_none());
+                assert!(row["counts"].get("identity_contract_transition").is_none());
+            }
             assert!(!crate::local_resource_diagnostics::claude_reread::active());
         }
     }

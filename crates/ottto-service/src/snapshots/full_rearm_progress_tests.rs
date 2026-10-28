@@ -450,8 +450,11 @@ fn non_structural_invalidation_rearms() {
     );
 }
 
-/// F1a: a set contract-5 latch, or an unrecorded contract, never skips; the
-/// full re-arm runs and clears the latch as before, and the skip resumes.
+/// F1a: an unrecorded contract never skips. A set contract-5 latch still
+/// re-reads every family file once through its identity contract re-arm,
+/// which clears the latch; since the contract-5 cutover (Lead B) the latch
+/// alone no longer also takes the due liveness re-arm, so the same terminal
+/// counts as a skip.
 #[test]
 fn identity_contract_latch_or_unrecorded_contract_rearms() {
     let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
@@ -467,8 +470,11 @@ fn identity_contract_latch_or_unrecorded_contract_rearms() {
 
     index.claude_request_identity_contract_changed = true;
     let latched = rearm.terminal(&mut index, &rearm.items);
-    assert!(latched.counts.full_rearm, "{latched:?}");
-    assert_eq!(latched.rearmed_files, 2);
+    // Was `latched.counts.full_rearm`: the record names this contract, so
+    // only the latch's own re-arm re-reads the family.
+    assert!(!latched.counts.full_rearm, "{latched:?}");
+    assert!(latched.suppression.full_rearm_suppressed, "{latched:?}");
+    assert_eq!(latched.rearmed_files, 2, "the identity contract re-arm");
     assert!(!index.claude_request_identity_contract_changed);
     let skipped = rearm.terminal(&mut index, &rearm.items);
     assert!(skipped.suppression.full_rearm_suppressed, "{skipped:?}");
@@ -958,6 +964,8 @@ fn occurrence_key_mismatch_in_an_already_invalid_family_still_vetoes() {
 /// Those reports must not erase the suppression veto, even without a permit.
 #[test]
 fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
+    // Subject: the legacy account path contract 5 now leaves to untagged bodies.
+    let _legacy = crate::snapshots::claude_request_identity::PreCutoverEvidenceForTest::enter();
     let rearm = Rearm::new();
     let mut baseline = rearm.index();
     rearm.establish(&mut baseline, &rearm.items);
@@ -1106,6 +1114,632 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
     }
 }
 
+/// One always-on terminal: the real sync evidence stage over the fixture
+/// family with `support`'s sidecars, then the next walk's re-read. Returns
+/// the parent body as it would upload and the terminal's veto state.
+fn always_on_terminal(
+    rearm: &Rearm,
+    support: &Path,
+    index: &mut ScanIndex,
+) -> (Terminal, SnapshotItem, String) {
+    always_on_terminal_at(rearm, support, index, 1, true)
+}
+
+/// `always_on_terminal` with the full re-arm deadline at `due_at` (due when
+/// not after the census clock) and the given census completeness.
+fn always_on_terminal_at(
+    rearm: &Rearm,
+    support: &Path,
+    index: &mut ScanIndex,
+    due_at: u64,
+    census_complete: bool,
+) -> (Terminal, SnapshotItem, String) {
+    let mut scan = scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode,
+        &[],
+        &mut ScanIndex::default(),
+        WINDOW,
+        7,
+        100,
+        false,
+    )
+    .unwrap();
+    scan.snapshots = rearm.items.clone();
+    scan.census_complete = census_complete;
+    index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(due_at);
+    let (disposition, _, _) =
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan(support, &mut scan, index);
+    let parent = scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == rearm.parent)
+        .unwrap()
+        .clone();
+    let state = always_on_veto_state(rearm, index, &scan.snapshots);
+    (rearm.reread(index, &disposition), parent, state)
+}
+
+/// The family root's paired sidecars for `req_1`: a dark row, or one with
+/// complete request identity (login and organization). `account_checked`
+/// keeps the legacy account check on the row; covering one of the parent's
+/// four requests, it withholds the session account for incomplete request
+/// evidence. Unchecked, the account stays unknown and contract 5 does not
+/// tag the body (`valid_login`).
+fn write_parent_sidecars(rearm: &Rearm, support: &Path, identity: bool, account_checked: bool) {
+    write_sidecar_rows(
+        rearm,
+        support,
+        identity,
+        &[("req_1", "", 10, account_checked)],
+    );
+}
+
+/// Paired rows for each `(request, agent, output tokens, account checked)`,
+/// with the fixture's own token counts; otherwise as `write_parent_sidecars`.
+fn write_sidecar_rows(
+    rearm: &Rearm,
+    support: &Path,
+    identity: bool,
+    requests: &[(&str, &str, u64, bool)],
+) {
+    let (mut api_rows, mut trace_rows) = (String::new(), String::new());
+    for (sequence, &(request, agent, output_tokens, account_checked)) in requests.iter().enumerate()
+    {
+        let mut api = complete_api_row(
+            &rearm.parent,
+            request,
+            sequence as u64,
+            10,
+            output_tokens,
+            0,
+        );
+        if identity {
+            api.request_identity = Some(
+                serde_json::from_value(serde_json::json!({
+                    "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
+                    "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":"a".repeat(64)},
+                    "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":"d".repeat(64)},
+                }))
+                .unwrap(),
+            );
+        }
+        if !account_checked {
+            api.account_identity_checked = false;
+            api.account_identifier_hash = None;
+        }
+        api.fingerprint.clear();
+        api.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&api).unwrap())
+        );
+        let trace = complete_trace_row(&rearm.parent, request, agent);
+        api_rows.push_str(&format!("{}\n", serde_json::to_string(&api).unwrap()));
+        trace_rows.push_str(&format!("{}\n", serde_json::to_string(&trace).unwrap()));
+    }
+    let digest = format!("{:x}", Sha256::digest(rearm.parent.as_bytes()));
+    for (kind, rows) in [
+        ("claude-code-effort", api_rows),
+        ("claude-code-trace-ownership", trace_rows),
+    ] {
+        let path = support
+            .join("local-otel")
+            .join(kind)
+            .join(format!("{digest}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, rows).unwrap();
+    }
+}
+
+/// Why a terminal could not skip: the window's non-structural observation
+/// and each folded item's own vetoes.
+fn always_on_veto_state(rearm: &Rearm, index: &ScanIndex, items: &[SnapshotItem]) -> String {
+    let progress = &index.claude_full_rearm_progress;
+    let items = items
+        .iter()
+        .map(|item| {
+            format!(
+                "{}: structural={} refusals={} withheld={:?} clocks_complete={}",
+                item.source_session_id,
+                claude_member_invalidity_is_structural(item),
+                item.request_identity_refusals,
+                item.claude_account_withheld_reason,
+                item.claude_usage_occurrences
+                    .values()
+                    .all(|occurrence| occurrence.event_clock_complete),
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "parent={} observed_window={:?} other={} structural_roots={} owed={} record={} items={items:?}",
+        rearm.parent,
+        progress.observed_window,
+        progress.other_invalidation_observed,
+        progress.structural_roots.len(),
+        progress.structural_rearm_owed,
+        progress.structural_record.is_some(),
+    )
+}
+
+/// Contract-5 cutover (E1 seam, Lead B condition D): on a permitted Mac
+/// (contract recorded, latch clear) every terminal builds contract-5
+/// evidence and emits contract-5 bodies. With the family's sidecars absent,
+/// matched, or matched with request identity but no account check, the
+/// first due terminal records the structural baseline and every later due
+/// terminal with no contract change skips: no fingerprint is cleared, so
+/// nothing reads Full. Under the released E2 contract (gate on); the
+/// gate-off (pre-flip) collector only with absent sidecars, since there a
+/// dark row is refused as invalid evidence, a non-structural veto.
+#[test]
+fn always_on_terminals_keep_the_structural_suppression() {
+    for (contract, gate, causes) in [
+        (
+            claude_request_identity::E2_GROUPING,
+            true,
+            &["absent", "matched", "matched-identity"][..],
+        ),
+        (claude_request_identity::COLLECTOR, false, &["absent"][..]),
+    ] {
+        let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(gate);
+        claude_request_identity::with_cycle_contract_for_test(contract, || {
+            for &cause in causes {
+                let arm = format!("{contract} {cause}");
+                let rearm = Rearm::new();
+                let support = temp_dir("full-rearm-always-on");
+                if cause != "absent" {
+                    write_parent_sidecars(&rearm, &support, cause == "matched-identity", false);
+                }
+                let mut index = rearm.index();
+                index.claude_request_identity_contract = Some(contract.to_string());
+                let mut runs = Vec::new();
+                for _ in 0..3 {
+                    let (run, parent, state) = always_on_terminal(&rearm, &support, &mut index);
+                    let tagged_rows = parent
+                        .model_usage
+                        .iter()
+                        .chain(
+                            parent
+                                .usage_buckets
+                                .iter()
+                                .flat_map(|bucket| &bucket.model_usage),
+                        )
+                        .filter(|row| row.evidence_ref.is_some() || row.identity_parts.is_some())
+                        .count();
+                    let body = format!(
+                        "collector={} evidence={} tagged_rows={tagged_rows} refusals={} {state}",
+                        parent.provenance.collector,
+                        parent.request_evidence.len(),
+                        parent.request_identity_refusals
+                    );
+                    assert_eq!(parent.provenance.collector, contract, "{arm}: {body}");
+                    assert_eq!(parent.request_identity_refusals, 0, "{arm}: {body}");
+                    // Request identity without D1's account-checked login never
+                    // tags (`valid_login`); a tagged body is the control below.
+                    assert_eq!(tagged_rows, 0, "{arm}: {body}");
+                    assert_eq!(
+                        index.claude_request_identity_contract.as_deref(),
+                        Some(contract),
+                        "{arm}"
+                    );
+                    assert!(!index.claude_request_identity_contract_changed, "{arm}");
+                    runs.push((run, body));
+                }
+                let (first, body) = &runs[0];
+                assert!(first.counts.full_rearm, "{arm}: {first:?} {body}");
+                assert_eq!(first.rearmed_files, 2, "{arm}");
+                assert!(
+                    index.claude_full_rearm_progress.structural_record.is_some(),
+                    "{arm}: the baseline is recorded: {body}"
+                );
+                for (run, body) in &runs[1..] {
+                    assert!(
+                        run.counts.fence_before && run.counts.fence_after,
+                        "{arm}: {run:?} {body}"
+                    );
+                    assert!(
+                        run.suppression.full_rearm_suppressed,
+                        "{arm}: no contract change keeps the skip: {run:?} {body}"
+                    );
+                    assert!(!run.counts.full_rearm, "{arm}");
+                    assert_eq!(
+                        run.rearmed_files, 0,
+                        "{arm}: no fingerprint cleared, no Full"
+                    );
+                }
+                let _ = fs::remove_dir_all(support);
+            }
+        });
+    }
+}
+
+/// SOURCE condition (2026-10-28 review of #840): the permitted shape with
+/// real tagged bodies. The index records E2 and the structural baseline is
+/// built with evidence. Every request of the family has a paired row with
+/// complete request identity; `req_1`'s also carries D1's account-checked
+/// login, so contract 5 tags the parent's body, and the other rows are
+/// unchecked, so the legacy account path neither binds nor withholds the
+/// session account (full checked coverage binds it and keeps the legacy
+/// body; partial checked coverage alone withholds it, the control below).
+/// The census identity is kept (request-id hashes only: the one structural
+/// child invalidation, nothing more), and every due terminal after the
+/// first skips: no fingerprint is cleared, nothing reads Full.
+#[test]
+fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(true);
+    let contract = claude_request_identity::E2_GROUPING;
+    claude_request_identity::with_cycle_contract_for_test(contract, || {
+        let rearm = Rearm::new();
+        let support = temp_dir("full-rearm-tagged-permitted");
+        write_sidecar_rows(
+            &rearm,
+            &support,
+            true,
+            &[
+                ("req_1", "", 10, true),
+                ("req_2", "", 10, false),
+                ("req_3", "", 10, false),
+                ("req_4", "", 10, false),
+                ("req_5", "a4d1585d310070d0f", 1, false),
+            ],
+        );
+        let mut index = rearm.index();
+        index.claude_request_identity_contract = Some(contract.to_string());
+        let mut runs = Vec::new();
+        for _ in 0..3 {
+            let (run, parent, state) = always_on_terminal(&rearm, &support, &mut index);
+            let tagged = parent
+                .model_usage
+                .iter()
+                .chain(
+                    parent
+                        .usage_buckets
+                        .iter()
+                        .flat_map(|bucket| &bucket.model_usage),
+                )
+                .any(|row| row.evidence_ref.is_some() || row.identity_parts.is_some());
+            assert!(tagged, "a real tagged contract-5 body: {state}");
+            assert_eq!(parent.provenance.collector, contract, "{state}");
+            assert_eq!(parent.claude_account_withheld_reason, None, "{state}");
+            assert_eq!(parent.request_identity_refusals, 0, "{state}");
+            assert_eq!(
+                run.counts.page_invalidated_identity_count, 1,
+                "census identity kept: only the structural child: {run:?} {state}"
+            );
+            assert_eq!(
+                index.claude_request_identity_contract.as_deref(),
+                Some(contract)
+            );
+            assert!(!index.claude_request_identity_contract_changed);
+            runs.push((run, state));
+        }
+        let (first, state) = &runs[0];
+        assert!(first.counts.full_rearm, "the baseline: {first:?} {state}");
+        assert!(index.claude_full_rearm_progress.structural_record.is_some());
+        for (run, state) in &runs[1..] {
+            assert!(
+                run.counts.fence_before && run.counts.fence_after,
+                "{run:?} {state}"
+            );
+            assert!(
+                run.suppression.full_rearm_suppressed,
+                "the re-arm stays suppressed: {run:?} {state}"
+            );
+            assert!(!run.counts.full_rearm);
+            assert_eq!(run.rearmed_files, 0, "no fingerprint cleared: {state}");
+        }
+        let _ = fs::remove_dir_all(support);
+    });
+}
+
+/// Control for the structural suppression (Lead B condition D): contract 5
+/// tags only from D1's account-checked login, and a family whose one
+/// checked row covers one of the parent's four requests also withholds the
+/// session account for incomplete request evidence (legacy account path,
+/// `apply_claude_account_evidence`). `observe_page` counts that withheld
+/// member as non-structural, so every due terminal re-arms. The veto does
+/// not depend on the contract: the always-on build (tagged contract-5 body)
+/// and a pre-cutover build without evidence re-arm the same terminals.
+#[test]
+fn a_withheld_account_rearms_the_same_before_and_after_the_cutover() {
+    claude_request_identity::with_cycle_contract_for_test(
+        claude_request_identity::E2_GROUPING,
+        || {
+            let runs = [false, true].map(|always_on| {
+                let rearm = Rearm::new();
+                let support = temp_dir("full-rearm-withheld-account");
+                write_parent_sidecars(&rearm, &support, true, true);
+                let mut index = rearm.index();
+                let _pre_cutover =
+                    (!always_on).then(claude_request_identity::PreCutoverEvidenceForTest::enter);
+                index.claude_request_identity_contract =
+                    Some(claude_request_identity::cycle_contract(always_on).to_string());
+                let runs = (0..3)
+                    .map(|_| {
+                        let (run, parent, state) = always_on_terminal(&rearm, &support, &mut index);
+                        assert!(
+                            parent.claude_account_withheld_reason.is_some(),
+                            "always_on={always_on}: {state}"
+                        );
+                        assert_eq!(parent.request_identity_refusals, 0, "{state}");
+                        if always_on {
+                            let tagged = parent
+                                .model_usage
+                                .iter()
+                                .chain(
+                                    parent
+                                        .usage_buckets
+                                        .iter()
+                                        .flat_map(|bucket| &bucket.model_usage),
+                                )
+                                .any(|row| {
+                                    row.evidence_ref.is_some() || row.identity_parts.is_some()
+                                });
+                            assert!(tagged, "a tagged contract-5 body: {state}");
+                            assert_eq!(
+                                parent.provenance.collector,
+                                claude_request_identity::E2_GROUPING
+                            );
+                        }
+                        (
+                            run.counts.full_rearm,
+                            run.suppression.full_rearm_suppressed,
+                            run.rearmed_files,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let _ = fs::remove_dir_all(support);
+                runs
+            });
+            assert_eq!(runs[0], runs[1], "the cutover adds no re-arm");
+            assert_eq!(
+                runs[1],
+                vec![(true, false, 2); 3],
+                "a liveness re-arm at each due terminal"
+            );
+        },
+    );
+}
+
+/// Lead B condition D with Lead A ruling (a). A never-permitted install
+/// recorded `""` and its structural baseline under it (no evidence); the
+/// always-on build observes its contract. That cutover's latch re-arms at
+/// the first complete terminal only (`contract_cutover_rearm`), and its
+/// baseline carries over to the new contract, so no terminal re-arms the
+/// whole index for it. A real contract-to-contract change (a recorded
+/// collector baseline) still re-arms every family file once and records the
+/// new contract. Every later due terminal skips, also while an unsettled
+/// sweep holds the latch. The index is a released E2 Mac's (active revision
+/// 3, every file stamped 3), where the latch's own re-read is E2's paced
+/// debt; below revision 3 see `a_never_permitted_cutover_rearms_once_and_is_counted`.
+#[test]
+fn a_contract_change_rearms_at_most_once_then_skips() {
+    for (from, held) in [
+        ("", false),
+        ("", true),
+        (claude_request_identity::COLLECTOR, false),
+        (claude_request_identity::COLLECTOR, true),
+    ] {
+        claude_request_identity::with_cycle_contract_for_test(
+            claude_request_identity::E2_GROUPING,
+            || {
+                let arm = format!("from {from:?}, latch held {held}");
+                let rearm = Rearm::new();
+                let support = temp_dir("full-rearm-contract-change");
+                let mut index = rearm.index();
+                index.active_effective_upload_body_witness_revision = 3;
+                for entry in index.files.values_mut() {
+                    entry.effective_upload_body_witness_revision = 3;
+                }
+                assert_eq!(index.claude_request_identity_contract.as_deref(), Some(""));
+                {
+                    let _pre_cutover = claude_request_identity::PreCutoverEvidenceForTest::enter();
+                    let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                    assert!(first.counts.full_rearm, "{arm}: {first:?} {state}");
+                    let (skipped, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                    assert!(
+                        skipped.suppression.full_rearm_suppressed,
+                        "{arm}: {skipped:?} {state}"
+                    );
+                }
+                if !from.is_empty() {
+                    // A permitted gate-off install's baseline.
+                    index.claude_request_identity_contract = Some(from.to_string());
+                    index
+                        .claude_full_rearm_progress
+                        .structural_record
+                        .as_mut()
+                        .unwrap()
+                        .basis = claude_full_rearm_record_basis(from);
+                }
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                index.observe_claude_request_identity_contract(true);
+                assert_eq!(
+                    index.claude_request_identity_contract.as_deref(),
+                    Some(claude_request_identity::E2_GROUPING)
+                );
+                assert!(index.claude_request_identity_contract_changed);
+                let mut runs = Vec::new();
+                for _ in 0..3 {
+                    if held {
+                        index.bounded_sweep_had_unsettled_upload = true;
+                    }
+                    let (run, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                    runs.push((run, state));
+                }
+                let cutover = scope.finish().contract.contract_cutover_rearm;
+                let (first, state) = &runs[0];
+                if from.is_empty() {
+                    assert!(
+                        !first.counts.full_rearm && first.suppression.full_rearm_suppressed,
+                        "{arm}: the cutover keeps the baseline: {first:?} {state}"
+                    );
+                    assert_eq!(first.rearmed_files, 0, "{arm}: {state}");
+                    assert_eq!(
+                        (cutover.runs, cutover.files, cutover.bytes),
+                        (1, 0, 0),
+                        "{arm}"
+                    );
+                } else {
+                    assert!(
+                        first.counts.full_rearm,
+                        "{arm}: the change re-arms once: {first:?} {state}"
+                    );
+                    assert_eq!(first.rearmed_files, 2, "{arm}");
+                    assert_eq!(cutover.runs, 0, "{arm}: not a cutover");
+                }
+                assert_eq!(
+                    index
+                        .claude_full_rearm_progress
+                        .structural_record
+                        .as_ref()
+                        .map(|record| record.basis.clone()),
+                    Some(claude_full_rearm_record_basis(
+                        claude_request_identity::E2_GROUPING
+                    )),
+                    "{arm}: the baseline names the new contract"
+                );
+                for (run, state) in &runs[1..] {
+                    assert!(
+                        run.suppression.full_rearm_suppressed,
+                        "{arm}: never again: {run:?} {state}"
+                    );
+                    assert!(!run.counts.full_rearm, "{arm}");
+                    assert_eq!(
+                        run.rearmed_files, 0,
+                        "{arm}: no fingerprint cleared: {state}"
+                    );
+                }
+                if held {
+                    assert!(
+                        index.claude_request_identity_contract_changed,
+                        "{arm}: the unsettled sweep keeps the latch"
+                    );
+                }
+                let _ = fs::remove_dir_all(support);
+            },
+        );
+    }
+}
+
+/// Lead A ruling (a), gate off (collector contract, revision below 3), where
+/// the latch's own re-arm clears every family file. A never-permitted index
+/// (recorded `""`, structural baseline built without evidence) observes the
+/// always-on contract: an opening fence leaves the cutover owed, and the
+/// first complete terminal behind a closed fence re-arms the family once,
+/// counted with its files and bytes as `contract_cutover_rearm`, and keeps
+/// the structural baseline (no whole-index re-arm). While an unsettled sweep
+/// holds the latch, later terminals, a restart, an incomplete census and an
+/// evidence-gap veto re-arm nothing more; the next settled terminal clears
+/// the latch.
+#[test]
+fn a_never_permitted_cutover_rearms_once_and_is_counted() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    claude_request_identity::with_cycle_contract_for_test(
+        claude_request_identity::COLLECTOR,
+        || {
+            let rearm = Rearm::new();
+            let support = temp_dir("full-rearm-cutover");
+            let path = support.join("index.json");
+            let mut index = rearm.index();
+            assert_eq!(index.claude_request_identity_contract.as_deref(), Some(""));
+            {
+                let _pre_cutover = claude_request_identity::PreCutoverEvidenceForTest::enter();
+                let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                assert!(first.counts.full_rearm, "{first:?} {state}");
+                let (skipped, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                assert!(
+                    skipped.suppression.full_rearm_suppressed,
+                    "{skipped:?} {state}"
+                );
+            }
+            index.observe_claude_request_identity_contract(true);
+            assert!(index.claude_request_identity_contract_changed);
+            // An opening fence runs none of the latch's re-arm causes, so the
+            // cutover stays owed (Claude review, round 3).
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            index.bounded_sweep_had_unsettled_upload = true;
+            index.claude_duplicate_request_witness_overflowed = false;
+            let (opening, _, state) = always_on_terminal(&rearm, &support, &mut index);
+            assert_eq!(
+                index.claude_full_rearm_progress.contract_cutover, CLAUDE_CONTRACT_CUTOVER_OWED,
+                "{opening:?} {state}"
+            );
+            assert_eq!(scope.finish().contract.contract_cutover_rearm.runs, 0);
+            index.claude_duplicate_request_witness_overflowed = true;
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            index.bounded_sweep_had_unsettled_upload = true;
+            let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
+            assert!(
+                !first.counts.full_rearm,
+                "no whole-index re-arm: {first:?} {state}"
+            );
+            assert!(first.suppression.full_rearm_suppressed, "{first:?} {state}");
+            assert_eq!(
+                first.rearmed_files, 2,
+                "the latch re-arms the family once: {state}"
+            );
+            let cutover = scope.finish().contract.contract_cutover_rearm;
+            assert_eq!(
+                (cutover.runs, cutover.files, cutover.bytes),
+                (1, 2, first.rearmed_bytes),
+                "counted with its files and bytes"
+            );
+            assert!(first.rearmed_bytes > 0);
+            assert!(index.claude_request_identity_contract_changed, "held latch");
+
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            for step in [
+                "later",
+                "later again",
+                "restart",
+                "incomplete census",
+                "complete again",
+                "evidence gap",
+            ] {
+                if step == "restart" {
+                    index.save(&path).unwrap();
+                    index = ScanIndex::load(&path).unwrap();
+                    assert!(index.claude_request_identity_contract_changed, "{step}");
+                }
+                index.bounded_sweep_had_unsettled_upload = true;
+                if step == "evidence gap" {
+                    index.note_claude_full_rearm_evidence_gap(WINDOW);
+                }
+                // The evidence gap vetoes the structural skip, so its terminal is
+                // not due: only the latch could re-arm there.
+                let due_at = if step == "evidence gap" {
+                    CENSUS_CLOCK + 3_600
+                } else {
+                    1
+                };
+                let (run, _, state) = always_on_terminal_at(
+                    &rearm,
+                    &support,
+                    &mut index,
+                    due_at,
+                    step != "incomplete census",
+                );
+                assert!(!run.counts.full_rearm, "{step}: {run:?} {state}");
+                assert_eq!(run.rearmed_files, 0, "{step}: never again: {state}");
+            }
+            assert!(index.claude_request_identity_contract_changed, "still held");
+            index.bounded_sweep_had_unsettled_upload = false;
+            let (settled, _, state) =
+                always_on_terminal_at(&rearm, &support, &mut index, CENSUS_CLOCK + 3_600, true);
+            assert_eq!(settled.rearmed_files, 0, "{state}");
+            assert!(
+                !index.claude_request_identity_contract_changed,
+                "a settled terminal clears the spent latch: {state}"
+            );
+            assert_eq!(
+                scope.finish().contract.contract_cutover_rearm.runs,
+                0,
+                "the cutover is spent for good"
+            );
+            let _ = fs::remove_dir_all(support);
+        },
+    );
+}
+
 /// The real rebuild produces BadClock for an auxiliary row in this pass,
 /// before final identity application installs its refusal counter on the item.
 #[test]
@@ -1181,18 +1815,8 @@ fn pipeline_new_auxiliary_bad_clock_keeps_the_due_rearm_enabled() {
         scan.snapshots = items.clone();
         scan.census_complete = true;
         index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-        let permit = claude_request_identity::emission_permit(
-            SnapshotSource::ClaudeCode,
-            Some(claude_request_identity::COHORT_HINT_TOKEN),
-        )
-        .unwrap();
         let (disposition, _, stats) =
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
-                &support,
-                &mut scan,
-                index,
-                Some(permit),
-            );
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, &mut scan, index);
         assert_eq!(stats.api_incomplete_root_count, 0);
         assert_eq!(stats.trace_incomplete_root_count, 0);
         assert_eq!(stats.exact_request_set_root_count, 1);

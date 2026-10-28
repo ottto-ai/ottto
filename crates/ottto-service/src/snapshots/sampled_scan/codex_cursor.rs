@@ -3756,6 +3756,58 @@ impl Drop for CursorCredit {
     }
 }
 
+// Reserve under retained -> cursor BEFORE taking durable Stores; carry only
+// the owner across I/O. Drop Stores before release, including unwind/early exits.
+// Never account from encode/write. Free room only: no primary/proof eviction.
+static DECODER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(in crate::snapshots) struct DecoderOwner(Option<CursorCredit>);
+impl DecoderOwner {
+    pub(in crate::snapshots) fn acquire(cache: &Arc<SharedCache>, bytes: usize) -> Option<Self> {
+        debug_assert!(!super::durable_tail::stores_held(), "reserve before Stores");
+        use std::sync::atomic::Ordering::SeqCst;
+        if DECODER_LIVE.swap(true, SeqCst) {
+            return None;
+        }
+        match cache.cursor_claim(bytes, true) {
+            Some(credit) => Some(Self(Some(credit))),
+            None => {
+                DECODER_LIVE.store(false, SeqCst);
+                None
+            }
+        }
+    }
+    // Normal completion/error calls this after destroying the decoder.
+    pub(in crate::snapshots) fn release(mut self) {
+        debug_assert!(!super::durable_tail::stores_held(), "release after Stores");
+        self.refund();
+    }
+    fn refund(&mut self) {
+        if let Some(credit) = self.0.take() {
+            credit.refund();
+            DECODER_LIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+impl Drop for DecoderOwner {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_zst_owner",
+                "codex",
+                &BTreeMap::from([("leaked_release", 1_u64)]),
+            );
+        }
+        if cursor_held() {
+            // Strand the charged claim and singleton; never re-lock during Drop.
+            if let Some(mut credit) = self.0.take() {
+                credit.settled = true;
+            }
+            return;
+        }
+        self.refund(); // cancellation/unwind safety net, observable as a leak
+    }
+}
+
 /// Checked: a claim that is not outstanding on this state is corrupt
 /// accounting. Fail closed: the state measures unbounded from then on.
 fn settle_claim(cursor: &mut CursorState, id: u64, bytes: usize) {
@@ -4051,10 +4103,20 @@ impl SharedCache {
     /// later measurement (`cursor_resident`, another admission, a retained
     /// insert) sees it until the credit is settled. None: nothing claimed.
     fn cursor_reserve(self: &Arc<Self>, charge: usize) -> Option<CursorCredit> {
+        self.cursor_claim(charge, false)
+    }
+    fn cursor_claim(self: &Arc<Self>, charge: usize, free_only: bool) -> Option<CursorCredit> {
         let mut retained = self.retained().ok()?;
         let claimed = self
             .with_cursor(|cursor| {
-                if !admit_locked(&mut retained, cursor, charge, true, Admitter::Main) {
+                let admitted = if free_only {
+                    charge
+                        .checked_add(super::ENTRY_BYTES + super::side_ledger::SIDE_LEDGER_BYTES)
+                        .is_some_and(|with_floor| proof_free_room(&retained, cursor, with_floor))
+                } else {
+                    admit_locked(&mut retained, cursor, charge, true, Admitter::Main)
+                };
+                if !admitted {
                     return None;
                 }
                 cursor.reserved = cursor.reserved.checked_add(charge)?;
@@ -5125,6 +5187,15 @@ impl SharedCache {
         // length `PageBudget::plan` compares with B. Refuse it explicitly
         // (never a cursor job); the activation names the compressed > B plan
         // and sizes it by decoded bytes.
+        if refuse_compressed_codex(
+            Some(&job.candidate.path),
+            Some(&job.parser.reader.reader),
+            CodexZstCause::PhysicalOffsetUnsupported,
+        )
+        .is_err()
+        {
+            return Err(refuse(StartRefusal::Unstartable));
+        }
         if job.parser.reader.reader.is_compressed() {
             return Err(refuse(StartRefusal::Unstartable));
         }
@@ -6143,7 +6214,8 @@ pub(in crate::snapshots) struct LiveWitness {
 crate::heap_layout_bound::fields!(LiveWitness; dev, ino, offset, head, boundary);
 
 impl LiveWitness {
-    pub(in crate::snapshots) fn read(file: &File, offset: u64) -> Option<Self> {
+    pub(in crate::snapshots) fn read(path: &Path, file: &File, offset: u64) -> Option<Self> {
+        refuse_compressed_codex(Some(path), None, CodexZstCause::PhysicalOffsetUnsupported).ok()?;
         let stamp = OpenStamp::capture(file).ok()?;
         if offset == 0 || stamp.extent < offset {
             return None;
@@ -6386,6 +6458,7 @@ impl MemoEntry {
     /// Every wake dependency except the stamp holds.
     fn dependencies_hold(
         &self,
+        path: &Path,
         digest: &str,
         file: &File,
         parent_now: Option<&ParentNow>,
@@ -6404,7 +6477,7 @@ impl MemoEntry {
                 .as_deref()
                 .map_or(true, |sidecar| sidecar == sidecar_now)
             && self.live.as_ref().map_or(true, |live| {
-                LiveWitness::read(file, live.offset).as_ref() == Some(live)
+                LiveWitness::read(path, file, live.offset).as_ref() == Some(live)
             })
     }
 
@@ -6414,17 +6487,19 @@ impl MemoEntry {
     #[cfg(test)]
     pub(in crate::snapshots) fn matches(
         &self,
+        path: &Path,
         digest: &str,
         file: &File,
         parent_now: Option<&ParentNow>,
         sidecar_now: &str,
     ) -> Option<OpenStamp> {
         let now = OpenStamp::capture(file).ok()?;
-        self.matches_stamp(digest, file, parent_now, sidecar_now, now)
+        self.matches_stamp(path, digest, file, parent_now, sidecar_now, now)
     }
 
     pub(in crate::snapshots) fn matches_stamp(
         &self,
+        path: &Path,
         digest: &str,
         file: &File,
         parent_now: Option<&ParentNow>,
@@ -6436,7 +6511,7 @@ impl MemoEntry {
         } else {
             self.stamp.wake_compatible(&now)
         };
-        (stamp_holds && self.dependencies_hold(digest, file, parent_now, sidecar_now))
+        (stamp_holds && self.dependencies_hold(path, digest, file, parent_now, sidecar_now))
             .then_some(now)
     }
 
@@ -6444,6 +6519,7 @@ impl MemoEntry {
     /// held (the re-read a counted tail would save): the current extent.
     pub(in crate::snapshots) fn grew_past_exact(
         &self,
+        path: &Path,
         digest: &str,
         file: &File,
         parent_now: Option<&ParentNow>,
@@ -6453,7 +6529,7 @@ impl MemoEntry {
         (self.exact_stamp
             && now.extent > self.stamp.extent
             && self.stamp.wake_compatible(&now)
-            && self.dependencies_hold(digest, file, parent_now, sidecar_now))
+            && self.dependencies_hold(path, digest, file, parent_now, sidecar_now))
         .then(|| now.extent())
     }
 }

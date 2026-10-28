@@ -1926,6 +1926,30 @@ fn failed_read_counts_nothing_and_keeps_the_rest_of_the_scope() {
 }
 
 #[test]
+fn codex_archive_never_read_while_plain_is_counted_unpinned() {
+    let env = Env::new("composition-v2-archive-unpinned");
+    let now = base_now();
+    // Not zstd, so a decode would fail; the zero read and failure counts
+    // show no counted read touched it.
+    let compressed = env
+        .root
+        .join("archived_sessions/rollout-2026-10-01T00-00-00-zzz.jsonl.zst");
+    fs::create_dir_all(compressed.parent().unwrap()).unwrap();
+    fs::write(&compressed, b"not zstd").unwrap();
+    let stats = env.run(Source::Codex, now, None);
+    assert_eq!(
+        (
+            stats.archived,
+            stats.archived_unpinned,
+            stats.bytes_new + stats.bytes_repair + stats.bytes_head,
+            stats.files_failed
+        ),
+        (0, 1, 0, 0)
+    );
+    env.cleanup();
+}
+
+#[test]
 fn codex_archive_move_and_compression_never_read_again() {
     let env = Env::new("composition-v2-archive");
     let now = base_now();
@@ -1959,8 +1983,12 @@ fn codex_archive_move_and_compression_never_read_again() {
     fs::remove_file(&archived).unwrap();
     let stats = env.run(Source::Codex, now + time::Duration::days(2), None);
     assert_eq!(
-        (stats.archived, stats.bytes_new + stats.bytes_repair),
-        (1, 0)
+        (
+            stats.archived,
+            stats.archived_unpinned,
+            stats.bytes_new + stats.bytes_repair
+        ),
+        (1, 0, 0)
     );
     // The scope's next commit marks its checkpoint done, so pins rebuilt
     // from the scope never read it again.

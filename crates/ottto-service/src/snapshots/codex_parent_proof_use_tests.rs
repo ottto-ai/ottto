@@ -2518,7 +2518,7 @@ fn held_memo(cache: &sampled_scan::SharedCache, key: &str, file: &Path) -> Strin
     let file = File::open(file).unwrap();
     let entry = MemoEntry::new(
         "digest".into(),
-        LiveWitness::read(&file, 8).unwrap(),
+        LiveWitness::read(Path::new("fixture.jsonl"), &file, 8).unwrap(),
         OpenStamp::capture(&file).unwrap(),
         None,
         None,

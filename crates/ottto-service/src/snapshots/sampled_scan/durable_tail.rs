@@ -17,7 +17,6 @@
 //! The stores live beside the RAM cache for the process lifetime and are not
 //! part of its state budget: each holds at most `MAX_RECORDS` digest and
 //! verification-stamp entries (`STORES_RESIDENT_BOUND`).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -33,7 +32,7 @@ use crate::durable_tail_store::{
     SingleWriter,
 };
 use crate::transcript_acquisition::{
-    birth_unix_nanos, Checkpoint, DurableCertificate, FullReason, Scope,
+    birth_unix_nanos, CertificateRefusal, Checkpoint, DurableCertificate, FullReason, Scope,
 };
 use crate::transcript_cache::Taken;
 use sampled_jsonl::durable as codec;
@@ -44,6 +43,7 @@ use sampled_jsonl::CachedJsonlReduction;
 pub(crate) const WRITE_PASS_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper bound of both stores' resident digest maps (two sources).
+#[cfg(test)]
 pub(crate) const STORES_RESIDENT_BOUND: usize = 2 * store::MAX_RECORDS * 128;
 
 /// Head re-parse bytes of restores, per source, for the process lifetime.
@@ -103,9 +103,7 @@ impl Counters {
                 .join(",")
         };
         format!(
-            "ottto-service: durable_tail source={} restore_attempts={} restored={} missing={} \
-             refused_record={} ineligible={{{}}} certificate_refused={{{}}} corrupt_body={} \
-             not_rederived={{{}}} budget_refused={} rederive_head_bytes={} \
+            "ottto-service: durable_tail source={} rederive_head_bytes={} \
              rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
@@ -115,15 +113,6 @@ impl Counters {
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={} t14_rebuild_full_started={}",
             source.api_slug(),
-            self.restore_attempts,
-            self.restored,
-            self.missing,
-            self.refused_record,
-            classes(&self.ineligible),
-            classes(&self.certificate_refused),
-            self.corrupt_body,
-            classes(&self.not_rederived),
-            self.budget_refused,
             self.rederive_head_bytes,
             self.rederive_named_lines,
             self.rederive_line_bytes,
@@ -265,7 +254,6 @@ fn expected(
     interpretation: &Interpretation<'_>,
 ) -> Option<Expected> {
     let entry = index.files.get(key)?;
-    let allowlist = codec::allowlist_digest(snapshot_source);
     Some(Expected {
         binding: Binding {
             source,
@@ -274,22 +262,7 @@ fn expected(
                 &interpretation.namespace.0,
                 index.active_upload_context_fingerprint.as_deref(),
             ),
-            scope: store::replay_scope_digest(
-                &store::scope_digest(
-                    &scope.0,
-                    &allowlist,
-                    &interpretation.identity_contract,
-                    &interpretation.counting_view,
-                ),
-                crate::snapshot_sync::effective_upload_body_witness_revision(snapshot_source),
-                index.active_effective_upload_body_witness_revision,
-                if source == DurableSource::ClaudeCode {
-                    index.claude_money_birth_store.money_rule_version()
-                } else {
-                    0
-                },
-                source == DurableSource::ClaudeCode && claude_request_money::e2::enabled(),
-            ),
+            scope: replay_scope(snapshot_source, scope, index, interpretation, None),
             entry: store::replay_entry_digest(
                 &store::entry_digest(
                     &entry.source_file_fingerprint,
@@ -306,6 +279,99 @@ fn expected(
             ),
         },
         committed_generation: index.generation,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObligationKind {
+    BodyWitness,
+    MoneyRule,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Obligation {
+    kind: ObligationKind,
+    revision: u64,
+}
+// SPENT audit rows: body witness r3 (Ron, #805); money v1/v2 (Lead A C2,
+// #825), both with mask 0. These diagnostic rows grant no new replay.
+const REPLAY_REGISTRY: &[Obligation] = &[
+    Obligation {
+        kind: ObligationKind::BodyWitness,
+        revision: 3,
+    },
+    Obligation {
+        kind: ObligationKind::MoneyRule,
+        revision: 1,
+    },
+    Obligation {
+        kind: ObligationKind::MoneyRule,
+        revision: 2,
+    },
+];
+fn registered(obligation: Obligation) -> bool {
+    REPLAY_REGISTRY.contains(&obligation)
+}
+
+/// Reuse the existing binding formula verbatim; overrides are RAM-only probes.
+fn replay_scope(
+    source: SnapshotSource,
+    scope: &Scope,
+    index: &ScanIndex,
+    interpretation: &Interpretation<'_>,
+    replay: Option<Obligation>,
+) -> store::Digest32 {
+    let body_revision = replay.filter(|row| row.kind == ObligationKind::BodyWitness);
+    let money_rule = replay.filter(|row| row.kind == ObligationKind::MoneyRule);
+    store::replay_scope_digest(
+        &store::scope_digest(
+            &scope.0,
+            &codec::allowlist_digest(source),
+            &interpretation.identity_contract,
+            &interpretation.counting_view,
+        ),
+        body_revision.map_or_else(
+            || crate::snapshot_sync::effective_upload_body_witness_revision(source),
+            |row| row.revision,
+        ),
+        body_revision.map_or(index.active_effective_upload_body_witness_revision, |row| {
+            row.revision
+        }),
+        if source == SnapshotSource::ClaudeCode {
+            money_rule.map_or(index.claude_money_birth_store.money_rule_version(), |row| {
+                row.revision as u16
+            })
+        } else {
+            0
+        },
+        source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled(),
+    )
+}
+
+fn unregistered_scope(
+    source: SnapshotSource,
+    scope: &Scope,
+    index: &ScanIndex,
+    interpretation: &Interpretation<'_>,
+    recorded: store::Digest32,
+) -> Option<Obligation> {
+    let current = [
+        Obligation {
+            kind: ObligationKind::BodyWitness,
+            revision: index.active_effective_upload_body_witness_revision,
+        },
+        Obligation {
+            kind: ObligationKind::MoneyRule,
+            revision: u64::from(index.claude_money_birth_store.money_rule_version()),
+        },
+    ];
+    current.into_iter().find(|obligation| {
+        !registered(*obligation)
+            && (obligation.kind != ObligationKind::MoneyRule
+                || source == SnapshotSource::ClaudeCode)
+            && REPLAY_REGISTRY.iter().any(|row| {
+                row.kind == obligation.kind
+                    && replay_scope(source, scope, index, interpretation, Some(*row)) == recorded
+            })
     })
 }
 
@@ -357,9 +423,35 @@ fn refuse_class(refuse: Refuse) -> &'static str {
     }
 }
 
+// Stores is a leaf lock; decoder admission/accounting must stay outside it.
+thread_local! { static STORES_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+pub(super) fn stores_held() -> bool {
+    STORES_HELD.with(std::cell::Cell::get)
+}
+pub(super) struct StoresGuard<'a>(std::sync::MutexGuard<'a, Stores>);
+impl std::ops::Deref for StoresGuard<'_> {
+    type Target = Stores;
+    fn deref(&self) -> &Stores {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for StoresGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Stores {
+        &mut self.0
+    }
+}
+impl Drop for StoresGuard<'_> {
+    fn drop(&mut self) {
+        STORES_HELD.with(|held| held.set(false));
+    }
+}
+
 impl SharedCache {
-    fn durable(&self) -> Option<std::sync::MutexGuard<'_, Stores>> {
-        self.durable.lock().ok()
+    pub(super) fn durable(&self) -> Option<StoresGuard<'_>> {
+        debug_assert!(!stores_held(), "Stores cannot be nested");
+        let guard = self.durable.lock().ok()?;
+        STORES_HELD.with(|held| held.set(true));
+        Some(StoresGuard(guard))
     }
 
     /// Selects `source`'s store for this pass, the sibling of `index_path`,
@@ -487,6 +579,14 @@ impl SharedCache {
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
     ) -> RestoreOutcome {
+        if snapshot_source == SnapshotSource::Codex
+            && refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
+                .is_err()
+        {
+            return RestoreOutcome::Miss(MissClass::Failure(Failure::NotRederived(
+                Refuse::NotRederivable("compressed"),
+            )));
+        }
         // The common guard held U/T14 before acquisition; this sees class changes since.
         match self.restore_known(
             snapshot_source,
@@ -497,10 +597,10 @@ impl SharedCache {
             index,
             interpretation,
         ) {
-            Some(taken) => RestoreOutcome::Restored(Box::new(taken)),
-            None => self
+            Ok(taken) => RestoreOutcome::Restored(Box::new(taken)),
+            Err(class) => self
                 .durable_guard(snapshot_source, key, true)
-                .map_or(RestoreOutcome::Miss, RestoreOutcome::Held),
+                .map_or(RestoreOutcome::Miss(class), RestoreOutcome::Held),
         }
     }
 
@@ -514,12 +614,13 @@ impl SharedCache {
         held: &mut File,
         index: &ScanIndex,
         interpretation: &Interpretation<'_>,
-    ) -> Option<Taken<CachedJsonlReduction>> {
-        let source = durable_source(snapshot_source)?;
-        let expected = expected(source, snapshot_source, key, scope, index, interpretation)?;
+    ) -> Result<Taken<CachedJsonlReduction>, MissClass> {
+        let source = durable_source(snapshot_source).ok_or(MissClass::Unavailable)?;
+        let expected = expected(source, snapshot_source, key, scope, index, interpretation)
+            .ok_or(MissClass::NoEntry)?;
         let allowlist = codec::allowlist_digest(snapshot_source);
         let record = {
-            let mut stores = self.durable()?;
+            let mut stores = self.durable().ok_or(MissClass::Unavailable)?;
             stores.counters.restore_attempts += 1;
             // A cleared fingerprint is reparse debt (a held or reverted
             // selection): it always reads Full.
@@ -529,34 +630,53 @@ impl SharedCache {
                 .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
             {
                 Counters::bump(&mut stores.counters.ineligible, "selection_cleared");
-                return None;
+                return Err(MissClass::SelectionCleared);
             }
             // Revision adoption and money-rule replay both use this debt.
             // Check before disk I/O: an owed raw replay may never be served
             // by an otherwise valid pre-replay reduction plus Tail.
             if index.effective_upload_body_witness_revision_requires_adoption(key) {
                 Counters::bump(&mut stores.counters.ineligible, "history_owed");
-                return None;
+                return Err(MissClass::HistoryOwed);
             }
-            let outcome = match stores.slot(source).as_mut() {
-                Some(slot) => slot.store.read(&expected.binding.key, &allowlist),
-                None => return None,
+            let (outcome, disabled) = match stores.slot(source).as_mut() {
+                Some(slot) => (
+                    slot.store.read(&expected.binding.key, &allowlist),
+                    slot.store.disabled().is_some(),
+                ),
+                None => return Err(MissClass::Unavailable),
             };
             match outcome {
                 ReadOutcome::Found(record) => record,
                 ReadOutcome::Missing => {
                     stores.counters.missing += 1;
-                    return None;
+                    return Err(if disabled {
+                        MissClass::Unavailable
+                    } else {
+                        MissClass::Missing
+                    });
                 }
-                ReadOutcome::Refused(_) => {
+                ReadOutcome::Refused(reason) => {
                     stores.counters.refused_record += 1;
-                    return None;
+                    return Err(MissClass::Record(reason));
                 }
             }
         };
         let restored =
             self.durable_restore_record(snapshot_source, &record, &expected, path, scope, held);
-        let mut stores = self.durable()?;
+        // Registry probes include allowlist hashing; keep them outside Stores.
+        let owed = if matches!(restored, Err(Failure::Ineligible(store::Ineligible::Scope))) {
+            unregistered_scope(
+                snapshot_source,
+                scope,
+                index,
+                interpretation,
+                record.record.binding.scope,
+            )
+        } else {
+            None
+        };
+        let mut stores = self.durable().ok_or(MissClass::Unavailable)?;
         let (checkpoint, reduction, receipt) = match restored {
             Ok(restored) => restored,
             Err(class) => {
@@ -565,15 +685,22 @@ impl SharedCache {
                     Failure::Ineligible(reason) => {
                         Counters::bump(&mut counters.ineligible, ineligible_class(reason))
                     }
-                    Failure::Certificate(reason) => {
-                        Counters::bump(&mut counters.certificate_refused, full_reason_class(reason))
-                    }
+                    Failure::Certificate(reason) => Counters::bump(
+                        &mut counters.certificate_refused,
+                        match reason {
+                            CertificateRefusal::Changed(reason) => full_reason_class(reason),
+                            CertificateRefusal::ReadError => "read_error",
+                        },
+                    ),
                     Failure::Corrupt => counters.corrupt_body += 1,
                     Failure::NotRederived(refuse) => {
                         Counters::bump(&mut counters.not_rederived, refuse_class(refuse))
                     }
                 }
-                return None;
+                if let Some(owed) = owed {
+                    return Err(MissClass::Unregistered(owed));
+                }
+                return Err(MissClass::Failure(class));
             }
         };
         stores.counters.rederive_head_bytes += receipt.head_bytes;
@@ -593,14 +720,14 @@ impl SharedCache {
             },
             0,
         );
-        let mut stores = self.durable()?;
+        let mut stores = self.durable().ok_or(MissClass::Unavailable)?;
         if !admitted {
             stores.counters.budget_refused += 1;
-            return None;
+            return Err(MissClass::BudgetRefused);
         }
         stores.counters.restored += 1;
         drop(stores);
-        self.take(key)
+        self.take(key).ok_or(MissClass::TakeLost)
     }
 
     fn durable_restore_record(
@@ -612,6 +739,10 @@ impl SharedCache {
         scope: &Scope,
         held: &mut File,
     ) -> Result<(Checkpoint, CachedJsonlReduction, codec::RederiveReceipt), Failure> {
+        if source == SnapshotSource::Codex {
+            refuse_compressed_codex(Some(path), None, CodexZstCause::DurableTailUnsupported)
+                .map_err(|_| Failure::NotRederived(Refuse::NotRederivable("compressed")))?;
+        }
         record.eligible(expected).map_err(Failure::Ineligible)?;
         let (checkpoint, _) = record
             .record
@@ -973,15 +1104,111 @@ impl SharedCache {
     }
 }
 
+/// The class returned by the attempted restore, never reconstructed from totals.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MissClass {
+    Unavailable,
+    NoEntry,
+    SelectionCleared,
+    HistoryOwed,
+    Missing,
+    Record(store::Refusal),
+    Failure(Failure),
+    BudgetRefused,
+    TakeLost,
+    Unregistered(Obligation),
+}
+
+impl MissClass {
+    pub(crate) fn label(self) -> &'static str {
+        // Restore's producers use this closed set of content-free suffixes.
+        // Refuse::UnknownLabel uses the existing static_label class.
+        macro_rules! prefixed {
+            ($prefix:literal, $suffix:expr, $($label:literal),+ $(,)?) => {
+                match $suffix {
+                    $($label => concat!($prefix, $label),)+
+                    _ => concat!($prefix, "static_label"),
+                }
+            };
+        }
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::NoEntry => "no_entry",
+            Self::SelectionCleared => "ineligible.selection_cleared",
+            Self::HistoryOwed => "ineligible.history_owed",
+            Self::Missing => "missing",
+            Self::BudgetRefused => "budget_refused",
+            Self::TakeLost => "restore_take_lost",
+            Self::Unregistered(owed) => match owed.kind {
+                ObligationKind::BodyWitness => "unregistered_replay.body_witness",
+                ObligationKind::MoneyRule => "unregistered_replay.money_rule",
+            },
+            Self::Record(reason) => match reason {
+                store::Refusal::NewerFormat => "refused_record.newer",
+                store::Refusal::Unknown => "refused_record.unknown",
+                store::Refusal::Undecodable => "refused_record.undecodable",
+                store::Refusal::Unbindable => "refused_record.unbindable",
+                store::Refusal::Corrupt => "refused_record.corrupt",
+            },
+            Self::Failure(Failure::Corrupt) => "corrupt_body",
+            Self::Failure(Failure::Ineligible(reason)) => prefixed!(
+                "ineligible.",
+                ineligible_class(reason),
+                "source",
+                "key",
+                "context",
+                "scope",
+                "generation_ahead",
+                "entry_changed"
+            ),
+            Self::Failure(Failure::Certificate(reason)) => prefixed!(
+                "certificate_refused.",
+                match reason {
+                    CertificateRefusal::Changed(reason) => full_reason_class(reason),
+                    CertificateRefusal::ReadError => "read_error",
+                },
+                "state_missing",
+                "audit_due",
+                "clock_changed",
+                "scope_changed",
+                "invalid_checkpoint",
+                "replaced",
+                "shrunk",
+                "same_size_edit",
+                "head_changed",
+                "boundary_changed",
+                "unsupported_identity",
+                "read_error"
+            ),
+            Self::Failure(Failure::NotRederived(refuse)) => prefixed!(
+                "not_rederived.",
+                refuse_class(refuse),
+                "descriptor",
+                "parser",
+                "head",
+                "compressed",
+                "record_bytes",
+                "SnapshotAccumulator.first_prompt_material",
+                "SnapshotAccumulator.workspace_path",
+                "SnapshotAccumulator.codex_agent_label",
+                "SessionStartState.content_end",
+                "SnapshotAccumulator.title",
+                "CodexPrelude.skills_body"
+            ),
+        }
+    }
+}
+
 pub(crate) enum RestoreOutcome {
     Restored(Box<Taken<CachedJsonlReduction>>),
-    Miss,
+    Miss(MissClass),
     Held(store::Refusal),
 }
 
-enum Failure {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Failure {
     Ineligible(store::Ineligible),
-    Certificate(FullReason),
+    Certificate(CertificateRefusal),
     Corrupt,
     NotRederived(Refuse),
 }
