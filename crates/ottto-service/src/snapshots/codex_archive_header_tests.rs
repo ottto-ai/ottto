@@ -275,3 +275,25 @@ fn header_limits_and_failures_do_not_redecode_same_stamp() {
         assert!(state.accepted_snapshot_fingerprints.is_empty());
     }
 }
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn refused_header_admission_does_not_spend_a_decode_attempt() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let occupied = OpenedInput::funded(File::open(&f.0).unwrap(), &cache).unwrap();
+    let mut state = ScanIndex::default();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        assert!(state
+            .inventory_archive_header(&f.candidate(), Some(&cache))
+            .is_err());
+    });
+    assert_eq!(decodes(&rows), 0);
+    assert!(!state.files.contains_key(&local_index_key(&f.0)));
+    occupied.close();
+    assert_eq!(decodes(&header_inventory(&f, &mut state, &cache)), 1);
+}

@@ -55,6 +55,7 @@ pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedHeaderInvalid")]
     HeaderInvalid,
     #[doc(hidden)]
+    #[serde(skip)]
     __Count,
 }
 impl std::fmt::Display for CodexZstCause {

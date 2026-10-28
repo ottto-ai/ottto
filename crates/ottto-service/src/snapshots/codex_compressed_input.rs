@@ -581,7 +581,7 @@ impl BufRead for OpenedInput {
 }
 
 impl super::ScanIndex {
-    pub(crate) fn codex_archive_cli_version(&self, path: &Path) -> Option<&str> {
+    pub fn codex_archive_cli_version(&self, path: &Path) -> Option<&str> {
         self.archive_header(path)?.cli_version()
     }
     pub(super) fn archive_header(&self, path: &Path) -> Option<&ValidatedHeader> {
@@ -618,11 +618,15 @@ impl super::ScanIndex {
         );
         let mut evidence = ArchiveEvidence::begin(&file, &candidate.path, old)?;
         evidence.disposition = ArchiveDisposition::HeaderValidated;
+        let mut input = match cache.and_then(|cache| OpenedInput::funded(file, cache).ok()) {
+            Some(input) => input.header_only(),
+            None => {
+                codex_zst_refused(CodexZstCause::AdmissionRefused);
+                anyhow::bail!("archive header admission unavailable");
+            }
+        };
         evidence.header_attempted = true;
         self.files.entry(key.clone()).or_default().archive = Some(evidence);
-        let mut input =
-            OpenedInput::funded(file, cache.context("archive header admission unavailable")?)?
-                .header_only();
         let mut bytes = Vec::new();
         let result = (|| -> Result<ValidatedHeader> {
             (&mut input)

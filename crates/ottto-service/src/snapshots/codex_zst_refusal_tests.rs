@@ -241,3 +241,34 @@ fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal()
     });
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn compressed_refusal_cardinality_has_unique_pinned_indices() {
+    use CodexZstCause::*;
+    const ALL: [CodexZstCause; 17] = [
+        ReplayNotAuthorized,
+        ProofParentUnsupported,
+        ProofChildUnsupported,
+        ParentSideUnsupported,
+        DurableTailUnsupported,
+        GroupProbeUnsupported,
+        GroupReadUnsupported,
+        ParentLedgerUnbound,
+        PhysicalOffsetUnsupported,
+        CompatibilityUnsupported,
+        AdmissionRefused,
+        DecodeFailed,
+        OwnerUnproven,
+        OutputHeld,
+        SettlementStuck,
+        ParserStateRequired,
+        HeaderInvalid,
+    ];
+    const _: [(); ALL.len()] = [(); CodexZstCause::__Count as usize];
+    let indices = ALL
+        .map(|cause| cause as usize)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(indices, (0..CodexZstCause::__Count as usize).collect());
+    assert!(serde_json::from_str::<CodexZstCause>("\"__Count\"").is_err());
+}
