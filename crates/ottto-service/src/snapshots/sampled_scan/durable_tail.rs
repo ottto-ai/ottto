@@ -58,6 +58,33 @@ pub(crate) fn rederive_head_bytes_total(source: SnapshotSource) -> u64 {
     })
 }
 
+// Pi-only split of the existing retention-bound refusal; test totals stay local.
+#[cfg(not(test))]
+static PI_RETENTION_BOUND: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+thread_local! {
+    static PI_RETENTION_BOUND: [AtomicU64; 2] = const { [const { AtomicU64::new(0) }; 2] };
+}
+fn pi_retention_bound<T>(f: impl FnOnce(&[AtomicU64; 2]) -> T) -> T {
+    #[cfg(test)]
+    {
+        PI_RETENTION_BOUND.with(f)
+    }
+    #[cfg(not(test))]
+    {
+        f(&PI_RETENTION_BOUND)
+    }
+}
+pub(in crate::snapshots) fn record_pi_retention_bound(bytes: usize) {
+    pi_retention_bound(|totals| {
+        for (total, amount) in totals.iter().zip([1, bytes as u64]) {
+            let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(amount))
+            });
+        }
+    });
+}
+
 /// Content-free outcome counts, by class. Field paths are static names; no
 /// id, path or value is ever counted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -105,9 +132,16 @@ impl Counters {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let mut not_persisted = self.not_persisted.clone();
         let pi = if source == SnapshotSource::Pi {
+            let [count, bytes] = pi_retention_bound(|totals| {
+                std::array::from_fn(|i| totals[i].load(Ordering::Relaxed))
+            });
+            if count != 0 {
+                *not_persisted.entry("retention_bound").or_default() += count;
+            }
             format!(
-                " retained_refused_pi_ledger_cap={}",
+                " retained_refused_pi_ledger_cap={} not_persisted_bytes={{retention_bound:{bytes}}}",
                 self.retained_refused_pi_ledger_cap
             )
         } else {
@@ -138,7 +172,7 @@ impl Counters {
             self.rederive_head_bytes,
             self.rederive_named_lines,
             self.rederive_line_bytes,
-            classes(&self.not_persisted),
+            classes(&not_persisted),
             self.write_deferred,
             self.write_unlocked,
             self.peak_body_bytes,

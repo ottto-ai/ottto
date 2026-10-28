@@ -55,6 +55,16 @@ impl CachedJsonlReduction {
     }
 }
 impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
+    fn is_pi(&self) -> bool {
+        self.accumulator.source == SnapshotSource::Pi
+    }
+    fn record_evicted_by_pi(&self) {
+        match self.accumulator.source {
+            SnapshotSource::ClaudeCode => record(Event::CacheEvictedByPiClaudeCode),
+            SnapshotSource::Codex => record(Event::CacheEvictedByPiCodex),
+            SnapshotSource::Pi => {}
+        }
+    }
     fn supports_frozen_charge(&self) -> bool {
         // retain_reduction removes these live, shared inputs from the copy.
         // Refuse frozen accounting if an adapter ever forgets that boundary.
@@ -244,6 +254,23 @@ impl OwnedJsonlParser {
         bound
     }
 
+    fn record_retention_bound_refusal(&self) {
+        record(Event::RetentionBoundRefused);
+        #[cfg(unix)]
+        if self.source == SnapshotSource::Pi {
+            // Completion-only measure: a large ledger may exhaust the ordinary
+            // visit cap even with an unlimited byte budget. No copy is made.
+            let bytes = crate::heap_layout_bound::completed_bound(&self.accumulator, usize::MAX)
+                .and_then(|n| {
+                    n.checked_add(
+                        std::mem::size_of::<CachedJsonlReduction>()
+                            - std::mem::size_of::<SnapshotAccumulator>(),
+                    )
+                });
+            sampled_scan::durable_tail::record_pi_retention_bound(bytes.unwrap_or(0));
+        }
+    }
+
     /// Take the acquisition certificate only after EOF. This does not authorize
     /// publication/index clearing: the host must also complete native finish,
     /// ownership/loss/source/dependency validation and its existing CAS boundary.
@@ -292,7 +319,7 @@ impl OwnedJsonlParser {
         {
             true
         } else {
-            record(Event::RetentionBoundRefused);
+            self.record_retention_bound_refusal();
             #[cfg(test)]
             {
                 let charge = self.retention_bound(usize::MAX);
@@ -429,7 +456,7 @@ impl OwnedJsonlParser {
         }
         let limit = budget_after.min(release.entry_limit);
         if self.certified_charge(&checkpoint, limit).is_none() {
-            record(Event::RetentionBoundRefused);
+            self.record_retention_bound_refusal();
             #[cfg(test)]
             {
                 let charge = self.certified_charge(&checkpoint, usize::MAX);
@@ -456,7 +483,7 @@ impl OwnedJsonlParser {
         let rank = release.rank;
         let outcome = release.execute();
         if outcome != sampled_scan::ReleaseOutcome::Released {
-            record(Event::RetentionBoundRefused);
+            self.record_retention_bound_refusal();
             #[cfg(test)]
             sampled_scan::test_hooks::record_bucket(classify_refusal(
                 RefusalView::deferred(budget_after, entry_limit),

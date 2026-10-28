@@ -53,3 +53,6 @@ above 8 MiB refuses persistence without truncation, so a missing retained copy
 reads Full. `retained_refused_pi_ledger_cap` counts a Pi record over either cap
 in the content-free `durable_tail source=pi` summary. The resident store-map bound is 96 KiB:
 one slot per source, three sources.
+
+The `durable_tail source=pi` summary splits `not_persisted{retention_bound}` for Pi and reports its refused retained-reduction layout bytes under `not_persisted_bytes{retention_bound}` (zero bytes when the layout cannot be measured); these copies produce no new durable record and read Full on the next change.
+The existing cache lifecycle diagnostics report `cache_evicted_by_pi_claude_code` and `cache_evicted_by_pi_codex` for RAM entries removed by Pi insertion under count or byte pressure, with the maximum-width lifecycle record bounded below 2,304 bytes.

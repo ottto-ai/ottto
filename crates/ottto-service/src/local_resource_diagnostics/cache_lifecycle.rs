@@ -54,6 +54,8 @@ counters! {
     insert_no_victim_refused: InsertNoVictimRefused,
     insert_poisoned_lock: InsertPoisonedLock,
     insert_entries_evicted: InsertEntriesEvicted,
+    cache_evicted_by_pi_claude_code: CacheEvictedByPiClaudeCode,
+    cache_evicted_by_pi_codex: CacheEvictedByPiCodex,
     cursor_reservation_entries_evicted: CursorReservationEntriesEvicted,
     // M1 copy refusals. `entries_evicted` and `admission_evicted` count
     // entries; `bytes_released` their stored charge, for both causes.

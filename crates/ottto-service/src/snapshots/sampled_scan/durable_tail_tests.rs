@@ -1502,3 +1502,133 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     assert_eq!(disk_counters.gc_records_deleted, 1);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A copy above the ordinary RAM entry bound never reaches the durable writer.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_retention_bound_refusal_counts_bytes_without_a_record() {
+    let root = crate::test_scratch::private_dir("ottto-dt-pi-retention");
+    let lock = test_locks::hold(&root);
+    let path = root.join("pi.jsonl");
+    std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
+    let source = SnapshotSource::Pi;
+    let scope = Scope("pi-retention".into());
+    let mut parser = OwnedJsonlParser::new(
+        File::open(&path).unwrap(),
+        &path,
+        source,
+        apply_pi_line,
+        None,
+        None,
+        None,
+        false,
+        true,
+    )
+    .unwrap();
+    parser
+        .prepare_acquisition(None, &scope, None, 1_800_000_000)
+        .unwrap();
+    while !parser.step().unwrap() {}
+    for n in 0..8_000 {
+        parser
+            .accumulator
+            .seen_pi_usage_keys
+            .insert(format!("{n:064x}"), PiUsageDedupState::default());
+    }
+    let charge = crate::heap_layout_bound::completed_bound(&parser.accumulator, usize::MAX)
+        .unwrap()
+        + std::mem::size_of::<CachedJsonlReduction>()
+        - std::mem::size_of::<SnapshotAccumulator>();
+    assert!(parser
+        .retention_bound(crate::transcript_cache::ENTRY_BYTES)
+        .is_none());
+    assert!(charge > crate::transcript_cache::ENTRY_BYTES);
+    let before: [u64; 2] =
+        pi_retention_bound(|totals| std::array::from_fn(|i| totals[i].load(Ordering::Relaxed)));
+    let completed = parser
+        .retain_reduction(
+            &scope,
+            1_800_000_000,
+            sampled_scan::RetainBudget::granted_unclassified(usize::MAX),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(completed.reduction.is_none());
+    let after: [u64; 2] =
+        pi_retention_bound(|totals| std::array::from_fn(|i| totals[i].load(Ordering::Relaxed)));
+    assert_eq!(after, [before[0] + 1, before[1] + charge as u64]);
+    assert!(after[1] > 0);
+    let cache = SharedCache::default();
+    let index_path = root.join("index.json");
+    cache.durable_begin_pass(source, &index_path, &scope, false);
+    assert!(!cache.insert_admitted(local_index_key(&path), completed, 0));
+    let mut index = ScanIndex::default();
+    index.save(&index_path).unwrap();
+    let receipt = cache
+        .durable_write_after_save(lock, source, &index)
+        .unwrap();
+    let (counts, disk) = cache.durable_counters(source).unwrap();
+    assert_eq!((receipt.written, disk.disk_records), (0, 0));
+    let summary = counts.summary(source, &disk);
+    assert!(summary.contains(&format!("not_persisted={{retention_bound:{}}}", after[0])));
+    assert!(summary.contains(&format!(
+        "not_persisted_bytes={{retention_bound:{}}}",
+        after[1]
+    )));
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        assert!(!counts.summary(source, &disk).contains("retention_bound"));
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_insertion_counts_claude_and_codex_cache_victims_only() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let root = crate::test_scratch::private_dir("ottto-pi-cache-victims");
+    let path = root.join("fixture.jsonl");
+    std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
+    let scope = Scope("pi-cache-victims".into());
+    let states = [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ]
+    .map(|source| native_record_of(&path, &scope, source));
+    let insert = |cache: &SharedCache, key: String, source: usize, rank| {
+        let (state, checkpoint) = &states[source];
+        cache.insert_admitted(
+            key,
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: checkpoint.clone(),
+                reduction: Some(state.clone()),
+                released: Some((rank, 0)),
+                unsealed: false,
+            },
+            0,
+        )
+    };
+    let cache = SharedCache::default();
+    for n in 0..crate::transcript_cache::CACHE_ENTRIES {
+        assert!(insert(&cache, format!("resident-{n}"), n % 2, 1));
+    }
+    let (_, counts) = observe(|| {
+        assert!(insert(&cache, "pi-first".into(), 2, 2));
+        assert!(insert(&cache, "pi-second".into(), 2, 2));
+        assert!(cache.take("resident-0").is_none());
+        assert!(cache.take("resident-1").is_none());
+        assert!(insert(&cache, "claude-control".into(), 0, 3));
+    });
+    assert_eq!(counts.insert_entries_evicted, 3);
+    assert_eq!(counts.cache_evicted_by_pi_claude_code, 1);
+    assert_eq!(counts.cache_evicted_by_pi_codex, 1);
+    cache.clear();
+    for n in 0..crate::transcript_cache::CACHE_ENTRIES {
+        assert!(insert(&cache, format!("pi-resident-{n}"), 2, 1));
+    }
+    let (_, counts) = observe(|| assert!(insert(&cache, "pi-control".into(), 2, 2)));
+    assert_eq!(counts.insert_entries_evicted, 1);
+    assert_eq!(counts.cache_evicted_by_pi_claude_code, 0);
+    assert_eq!(counts.cache_evicted_by_pi_codex, 0);
+    let _ = std::fs::remove_dir_all(root);
+}
