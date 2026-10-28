@@ -1721,6 +1721,14 @@ fn source_t2_carried_g_cannot_clear_owed_f_before_new_body_ack() {
             crate::snapshots::claude_request_identity::E2_GROUPING,
             || {
                 fixture.local_holds.insert(REARM_ROOT.to_owned());
+                // #825 (card G (b)): A -> B itself re-owes nothing now. Owe
+                // every file as its removed adoption loop did; another re-owe
+                // path (path B, a money rule) leaves the same owed state.
+                let mut owed = ScanIndex::load(&fixture.index_path).unwrap();
+                for key in owed.files.keys().cloned().collect::<Vec<_>>() {
+                    owed.re_owe_effective_upload_body_witness_revision(&key, 2);
+                }
+                owed.save(&fixture.index_path).unwrap();
                 let migrated = latch_contract_generation(&fixture, 20);
                 assert!(c1a_latch(&fixture).1, "F is still owed after A -> B");
                 let saved = c1a_saved(&fixture);

@@ -47,6 +47,8 @@ pub(crate) use claude_history_upgrade::{
 mod claude_history_upgrade_tests;
 mod claude_reemission_exclusions;
 #[cfg(test)]
+mod permit_mark_tests;
+#[cfg(test)]
 pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
@@ -7737,6 +7739,7 @@ pub fn finalize_scan_after_policy(
         source,
         result,
         index,
+        claude_request_identity::capture_by_default(),
         snapshot_upload_body_witness,
     );
 }
@@ -7817,10 +7820,14 @@ pub(crate) fn prepare_codex_recovery_diagnostics(
 /// The witness function sees recomputed semantic fingerprints and must return
 /// a stable witness for both file no-op suppression and quarantine retries.
 /// It does not modify the local snapshot items or semantic entity identity.
+/// `claude_request_identity_permitted` is this cycle's runtime identity
+/// permit (never the recorded contract): a Claude revision-3 stamp without
+/// it carries `STAMPED_WITHOUT_PERMIT`, and one with it clears that bit.
 pub fn finalize_scan_after_policy_with_body_witness(
     source: SnapshotSource,
     result: &mut SourceScanResult,
     index: &mut ScanIndex,
+    claude_request_identity_permitted: bool,
     mut body_witness: impl FnMut(&SnapshotItem) -> String,
 ) {
     // Backstop of the one emission seam: no held history body is finalized.
@@ -7959,13 +7966,24 @@ pub fn finalize_scan_after_policy_with_body_witness(
                         == Some(pending.source_file_fingerprint.as_str())
                 })
                 .peekable();
+            let store = &mut index.claude_money_birth_store;
+            let permit_mark = claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT;
+            let kept = store
+                .money_marks(claude_money_birth_store::location_key(&pending.index_key))
+                & permit_mark;
             if items.peek().is_some() {
-                let marks = items.fold(0, |marks, item| {
+                let marks = items.fold(kept, |marks, item| {
                     marks | claude_request_money::e2::money_marks(item)
                 });
-                index
-                    .claude_money_birth_store
-                    .set_money_marks(&pending.index_key, marks);
+                store.set_money_marks(&pending.index_key, marks);
+            }
+            // Every revision-3 stamp, also with no items: the permit bit.
+            if pending.effective_upload_body_witness_revision == 3 {
+                store.set_money_mark(
+                    &pending.index_key,
+                    permit_mark,
+                    !claude_request_identity_permitted,
+                );
             }
         }
         if let Some(diagnostic) = result.local_codex_diagnostics.as_mut() {
@@ -8037,6 +8055,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .semantic_noop_count
                 .saturating_add(pending.parsed_snapshot_count);
         }
+    }
+    if source == SnapshotSource::ClaudeCode {
+        index.note_claude_permit_debt();
     }
     result.snapshots.retain(|snapshot| {
         !carried_noop_entities.contains(&snapshot.snapshot_fingerprint)
@@ -30701,6 +30722,9 @@ impl OwnedSourceScan {
                         codex_cursor: context.cache.cursor_diagnostics(&codex_page),
                     }
                 });
+                if source == SnapshotSource::ClaudeCode {
+                    index.note_claude_permit_gauge();
+                }
                 if sampled_acquisition.is_some() {
                     crate::local_resource_diagnostics::cache_lifecycle_totals();
                     crate::local_resource_diagnostics::codex_memo_lifecycle_totals(
@@ -43704,6 +43728,7 @@ impl ScanIndex {
             .or_insert_with(|| claude_history_upgrade::GatedHistory {
                 index_key: key,
                 held: None,
+                permitted: hold.is_none(),
                 literal_denied: false,
                 previous,
                 local: BTreeSet::new(),
@@ -43724,6 +43749,7 @@ impl ScanIndex {
             .get_mut(&candidate.source_file_fingerprint)
         {
             gated.literal_denied = true;
+            gated.permitted = false;
         }
     }
 
@@ -43983,12 +44009,87 @@ impl ScanIndex {
         })
     }
 
+    /// E3 gauge (#799 page carrier, SOURCE C2): Claude files carrying
+    /// `STAMPED_WITHOUT_PERMIT`, read from the store at every collection page
+    /// end and at finalization.
+    fn note_claude_permit_gauge(&self) {
+        crate::local_resource_diagnostics::claude_reread::stamped_without_permit(
+            self.claude_money_birth_store
+                .money_mark_count(claude_request_money::e2::money_mark::STAMPED_WITHOUT_PERMIT),
+        );
+    }
+
+    /// E3 counts only (#799 page carrier): the permit-bit gauge, and each
+    /// upgrade the gate permitted this page that finalized below the active
+    /// revision, by its hold.
+    fn note_claude_permit_debt(&self) {
+        use crate::local_resource_diagnostics::claude_reread::{self, NotStamped};
+        if !claude_reread::active() {
+            return;
+        }
+        self.note_claude_permit_gauge();
+        let active = self.active_effective_upload_body_witness_revision;
+        for gated in self.claude_history_emission.files.values() {
+            if !gated.permitted
+                || self
+                    .files
+                    .get(&gated.index_key)
+                    .map_or(0, |entry| entry.effective_upload_body_witness_revision)
+                    >= active
+            {
+                continue;
+            }
+            claude_reread::history_permitted_not_stamped(match gated.held {
+                Some(HistoryHold::TelemetryUnread) => NotStamped::TelemetryUnread,
+                Some(_) => NotStamped::Held,
+                None => NotStamped::Other,
+            });
+        }
+    }
+
+    /// E3: a partial save keeps the committed entry of each `restored` key.
+    /// The permit bit follows the kept entry, and an upgrade the gate
+    /// permitted that stamped on this page but does not commit counts as
+    /// not accepted.
+    fn restore_committed_claude_permit_marks<'a>(
+        &self,
+        previous: &ScanIndex,
+        store: &mut claude_money_birth_store::BirthStore,
+        restored: impl IntoIterator<Item = &'a String>,
+    ) {
+        let active = self.active_effective_upload_body_witness_revision;
+        let revision = |index: &ScanIndex, key: &String| {
+            index
+                .files
+                .get(key)
+                .map_or(0, |entry| entry.effective_upload_body_witness_revision)
+        };
+        for key in restored {
+            store.restore_permit_mark(key, &previous.claude_money_birth_store);
+            if revision(self, key) >= active
+                && revision(previous, key) < active
+                && self.files.get(key).is_some_and(|entry| {
+                    self.claude_history_emission
+                        .files
+                        .get(&entry.source_file_fingerprint)
+                        .is_some_and(|gated| gated.permitted)
+                })
+            {
+                crate::local_resource_diagnostics::claude_reread::history_permitted_not_stamped(
+                    crate::local_resource_diagnostics::claude_reread::NotStamped::NotAccepted,
+                );
+            }
+        }
+    }
+
     /// Record the contract-5 contract a prepared Claude cycle builds bodies
     /// under. Any difference from the record, including an unknown record,
     /// sets the contract latch. A difference seen while a traversal is under
     /// way records a placeholder that matches no contract, so that traversal's
     /// terminal cannot clear the latch; the next traversal start records the
-    /// contract it runs under.
+    /// contract it runs under. Files stamped revision 3 without the permit
+    /// carry `STAMPED_WITHOUT_PERMIT` (Ron's routine re-read rule, card G):
+    /// a late permit re-owes none of them; the page gauge discloses them.
     pub(crate) fn observe_claude_request_identity_contract(&mut self, permitted: bool) {
         let contract = claude_request_identity::cycle_contract(permitted);
         if self.claude_request_identity_contract.as_deref() == Some(contract) {
@@ -44012,27 +44113,6 @@ impl ScanIndex {
         let e2_adoption = claude_request_money::e2::enabled()
             && contract == claude_request_identity::E2_GROUPING
             && self.active_effective_upload_body_witness_revision == 3;
-        if e2_adoption
-            && self.claude_request_identity_contract.as_deref()
-                != Some(CLAUDE_E2_IDENTITY_ADOPTION_PENDING)
-        {
-            // A late cohort permit may arrive AFTER revision 3. Reuse its
-            // paced debt rather than clearing fingerprints at the terminal.
-            // At the normal flip these files already owe revision 3, so this
-            // adds no read. A mid-traversal marker prevents re-owing twice.
-            let exclusions = &self.claude_reemission_exclusions;
-            for (key, entry) in &mut self.files {
-                if claude_index_path_member_ref(Path::new(key))
-                    .is_some_and(|member| !exclusions.excludes(member.root, member.subagent_stem))
-                {
-                    claude_history_upgrade::re_owe(
-                        &mut entry.effective_upload_body_witness_revision,
-                        2,
-                        3,
-                    );
-                }
-            }
-        }
         let recorded = if self.traversal.is_none() {
             contract
         } else if e2_adoption {
@@ -46967,6 +47047,11 @@ impl ScanIndex {
         result
             .claude_money_birth_store
             .preserve_missing_from(&previous.claude_money_birth_store);
+        self.restore_committed_claude_permit_marks(
+            previous,
+            &mut result.claude_money_birth_store,
+            &held_keys,
+        );
         for key in &held_keys {
             let reparse = self
                 .files
@@ -47089,6 +47174,9 @@ impl ScanIndex {
             .preserve_missing_from(&previous.claude_money_birth_store);
         let empty_advances = self.claude_empty_map_advances(previous);
         let held_keys = self.locally_held_keys(held);
+        let mut store = std::mem::take(&mut self.claude_money_birth_store);
+        self.restore_committed_claude_permit_marks(previous, &mut store, &held_keys);
+        self.claude_money_birth_store = store;
         let placeholders =
             self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
         for key in &held_keys {
@@ -47425,6 +47513,19 @@ impl ScanIndex {
         }
         let mut claude_money_birth_store = self.claude_money_birth_store.clone();
         claude_money_birth_store.preserve_missing_from(&previous.claude_money_birth_store);
+        self.restore_committed_claude_permit_marks(
+            previous,
+            &mut claude_money_birth_store,
+            self.files
+                .keys()
+                .filter(|key| !safe_keys.contains(*key))
+                .chain(
+                    previous
+                        .files
+                        .keys()
+                        .filter(|key| !self.files.contains_key(*key)),
+                ),
+        );
         let mut result = ScanIndex {
             claude_money_birth_store,
             codex_counting_moved_evidence: self.codex_counting_moved_evidence.clone(),
@@ -73399,6 +73500,7 @@ mod tests {
             SnapshotSource::Codex,
             &mut scan,
             &mut index,
+            true,
             snapshot_upload_body_witness,
         );
         assert_eq!((scan.snapshots.len(), scan.semantic_noop_count), (143, 0));
@@ -73551,6 +73653,7 @@ mod tests {
                 SnapshotSource::Codex,
                 &mut scan,
                 &mut index,
+                true,
                 snapshot_upload_body_witness,
             );
             assert_eq!(scan.snapshots.len(), if mixed { 3 } else { 2 });
@@ -74449,6 +74552,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
                 &mut explicit,
                 &mut explicit_index,
+                true,
                 snapshot_upload_body_witness,
             );
             assert_eq!(wrapped.snapshots.len(), expected_count);
@@ -74479,6 +74583,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &mut first,
             &mut index,
+            true,
             curve_omitted_body_witness,
         );
         assert_eq!(serde_json::to_vec(&first.snapshots[0]).unwrap(), raw_bytes);
@@ -74495,6 +74600,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
                 &mut scan,
                 &mut index,
+                true,
                 |item| {
                     if omitted {
                         curve_omitted_body_witness(item)
@@ -74524,6 +74630,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &mut first,
             &mut index,
+            true,
             curve_omitted_body_witness,
         );
         let item = &first.snapshots[0];
@@ -74545,6 +74652,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
                 &mut retry,
                 &mut retry_index,
+                true,
                 |item| {
                     calls.set(calls.get() + 1);
                     curve_omitted_body_witness(item)

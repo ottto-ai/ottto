@@ -418,7 +418,8 @@ Collection counters cover initialization and all cooperative steps of one page,
 including steps before a pause or a move to another worker thread. Comparison
 counters cover preparation (including load normalization) and post-collection
 finalization/save. These are disjoint event intervals: sum their events for the
-page; neither object is a gauge or a count of distinct files across pages.
+page; apart from `stamped_without_permit`, neither object is a gauge or a count
+of distinct files across pages.
 Nested operations, other sources and other threads cannot contribute to the
 active interval. Abandoned collection pages have no completed collection line.
 With comparison disabled, the existing `disabled_before_lease` decision still
@@ -449,6 +450,23 @@ preparation/save events after work, without creating a comparison permit.
 - `authority_normalization_cleared`: nonempty-to-empty transitions while dropping
   unbound authority records on working load/save. Discarded CAS probes are
   excluded, matching the existing authority-drop totals.
+- `stamped_without_permit`: the one **gauge** in this object, read from the
+  local mark count at every Claude collection page end
+  (`native_collection_page`, whether or not finalization follows) and at Claude
+  finalization: indexed Claude files whose revision-3 body was stamped in a
+  cycle without the identity permit (local money mark `STAMPED_WITHOUT_PERMIT`,
+  seeded once by money-rule version 2 unless the loaded contract record was the
+  adopted E2 one). The key is sparse like the others: absent = 0 on a Claude
+  page. Merging two observations keeps the larger value. A late identity
+  permit re-reads none of these files, and an identity-contract latch clear
+  keeps their marks; only a permitted restamp clears one. User effect:
+  sessions read while the identity permission was off may show no subscription until re-read.
+- `history_permitted_not_stamped_not_accepted`, `_telemetry_unread`, `_held`,
+  `_other`: upgrades the history gate permitted on this page that did not stamp
+  the active revision. `not_accepted` stamped but a partial save kept the
+  committed entry; `telemetry_unread` and `held` were held after the permit
+  (unread telemetry; the stop latch); `other` finalized below the active
+  revision for any other reason (incomplete parse, decode or local hold).
 
 `retained_cache_page_events` reuses the existing cache lifecycle event keys and
 sites: `take_*`, `insert_*`, `cursor_reservation_entries_evicted`,

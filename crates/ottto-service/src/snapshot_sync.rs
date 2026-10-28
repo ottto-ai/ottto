@@ -7138,6 +7138,7 @@ fn finish_sync_source(
         source,
         &mut scan_result,
         &mut index,
+        cycle_request_identity_permit(source, &activity_hint).is_some(),
         |snapshot| {
             let witness = effective_snapshot_upload_body_witness(
                 snapshot,
@@ -12935,6 +12936,7 @@ mod tests {
                 SnapshotSource::Codex,
                 &mut effective_scan,
                 &mut effective_index,
+                true,
                 |item| {
                     effective_snapshot_upload_body_witness(
                         item,
@@ -13074,6 +13076,7 @@ mod tests {
             SnapshotSource::Codex,
             &mut off,
             &mut index,
+            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13171,6 +13174,7 @@ mod tests {
             SnapshotSource::Codex,
             &mut on,
             &mut index,
+            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13240,6 +13244,7 @@ mod tests {
             SnapshotSource::Codex,
             &mut enriched,
             &mut loaded,
+            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13354,6 +13359,7 @@ mod tests {
             SnapshotSource::Codex,
             &mut next,
             &mut index,
+            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13428,6 +13434,7 @@ mod tests {
             SnapshotSource::Codex,
             &mut retry,
             &mut retry_index,
+            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item,
@@ -13548,6 +13555,7 @@ mod tests {
             SnapshotSource::Codex,
             &mut off,
             &mut index,
+            true,
             |item| {
                 effective_snapshot_upload_body_witness(
                     item, &progress, false, false, &legacy, &held,
@@ -13619,6 +13627,7 @@ mod tests {
             SnapshotSource::Codex,
             &mut on,
             &mut index,
+            true,
             |item| {
                 effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
             },
@@ -13745,6 +13754,7 @@ mod tests {
             SnapshotSource::Codex,
             &mut repeated,
             &mut index,
+            true,
             |item| {
                 effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
             },

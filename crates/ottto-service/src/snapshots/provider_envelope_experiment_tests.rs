@@ -4092,6 +4092,7 @@ fn native_comparison_corrected_native_receipt_fixture(
         SnapshotSource::ClaudeCode,
         &mut baseline_scan,
         &mut baseline_index,
+        true,
         |snapshot| {
             baseline_projections += 1;
             snapshot_upload_body_witness(snapshot)
@@ -4102,6 +4103,7 @@ fn native_comparison_corrected_native_receipt_fixture(
         SnapshotSource::ClaudeCode,
         &mut scan,
         &mut index,
+        true,
         |snapshot| {
             observed_projections += 1;
             let witness = snapshot_upload_body_witness(snapshot);

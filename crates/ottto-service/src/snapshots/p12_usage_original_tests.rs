@@ -249,6 +249,7 @@ impl Family {
             SnapshotSource::ClaudeCode,
             &mut scan,
             &mut self.index,
+            true,
             snapshot_upload_body_witness,
         );
         let request = SnapshotBatchRequest {
