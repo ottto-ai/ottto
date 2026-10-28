@@ -122,7 +122,7 @@ ottto-service h527-produce --input <bundle.json> --out-dir <new private dir>
 
 It changes no daemon, discovery, scan-index, upload or runtime path. It reads only the files the bundle names and writes only into a new `0700` output directory. It does not follow symlinks while walking peer roots. Each target `transcript_path` must already be canonical, so the parser and the unchanged-file checks read the same path.
 
-Input `h527_producer_input:v1` (strict, unknown fields refused, at most 4 MiB):
+Input `h527_producer_input:v2` (strict, unknown fields refused, at most 4 MiB):
 
 ```
 {contract_version, scope:{operation_id,user_id,organization_id,device_id,machine_id,producer_revision},
@@ -130,7 +130,7 @@ Input `h527_producer_input:v1` (strict, unknown fields refused, at most 4 MiB):
  targets:[18 x {source_session_id, session_key_sha256, prior_refusal_body_witness,
                 transcript_path, b2_first_ack_order|null}],
  peer_roots:[{class: projects|slot|held|archive|quarantine|other, path}],
- bounds:{max_peer_files, max_peer_total_bytes, max_peer_file_bytes, max_line_bytes},
+ bounds:{max_walk_entries, max_peer_files, max_peer_total_bytes, max_peer_file_bytes, max_line_bytes},
  catalog_prices?:{publication:{source,revision,sha256},
                   rates_usd_per_mtok:{"<model>|<context_bucket>":{input,output,cache_read,
                                        cache_creation_5m,cache_creation_1h}}}}
@@ -139,12 +139,13 @@ Input `h527_producer_input:v1` (strict, unknown fields refused, at most 4 MiB):
 Steps:
 
 1. Each target is parsed with the unchanged Claude parser. A target is held unless the parse is complete, it yields exactly one item, every counted request carries a native id, and totals equal the sum of its per-request usage. A held target's request ids still take part in step 3.
-2. Every `.jsonl` file under the peer roots is streamed once. Native request ids are compared exactly, in memory, against all targets. A subagent transcript belongs to its path identity; any other file belongs to its first named session, as in the parser.
-   - A fork-copied line is never counted in its own file, so it is not evidence that anyone counts the id. Each one is resolved after the whole census is read:
-     - If the session it names is a target, or owns a scanned peer transcript, the copy is ignored and counted.
-     - If the named source is absent, the copy is conservative peer evidence. It is disclosed as `inherited_from_absent_source`.
+2. The peer walk is planned from metadata alone first. Every directory entry counts against `max_walk_entries`; every peer transcript is sized against `max_peer_file_bytes`; the planned file count and bytes must fit `max_peer_files` and `max_peer_total_bytes`. Any overrun, and every over-cap peer, is counted and disclosed, and then no peer content is read and every target is held (`cap_overflow`): never a partial census. Peers are streamed line by line, so their cap (ceiling 1 GiB) does not follow the parser's file cap; targets keep a pinned 256 MiB cap, so a later parser-cap raise does not change which targets are read.
+   Every planned `.jsonl` file is then streamed once, as of its size when opened: a peer that grows during the read is read as that snapshot (like a file created after the walk) and counted, and an unparseable id-bearing final line of a grown peer is a record still being written, counted and skipped. A peer that shrinks or is rewritten at the same size leaves coverage unknown. Native request ids are compared exactly, in memory, against all targets. A subagent transcript belongs to its path identity; any other file belongs to its first named session, as in the parser.
+   - A fork-copied line is never counted in its own file, so it is not evidence that anyone counts the id. Copies are collected from peer files and from the targets' own transcripts (which the parser skips), and each one is resolved per line after the whole census is read:
+     - If the session it names counts that request (a target whose request set holds it, or an owned line in a scanned peer file), the copy is ignored and counted. Otherwise, if that session's own file holds a copy of the same request, the session that copy names is checked the same way, recursively.
+     - If no named source counts it (deleted, never scanned, or present but without the request), the copy is conservative peer evidence. It is disclosed as `inherited_from_absent_source`, witnessed by the file holding the copy: a peer file, or another target's transcript. A deleted middle session of a fork chain still gives this conservative exclusion.
    - The census must include a `projects` root, and every target must lie under a scanned root; otherwise coverage is unknown.
-   - These leave coverage unknown, and every target is then held without a body: a cap overflow, a file changed during the read, an unreadable file, a compressed transcript, an unparseable line carrying a request id key, an invalid fork marker, or a symlink leaving the roots.
+   - These leave coverage unknown, and every target is then held without a body: a file shrunk or rewritten during the read, a target changed before its fork copies were read, an unreadable file, a compressed transcript, an unparseable line carrying a request id key, an invalid fork marker, or a symlink leaving the roots.
    - A target's own replica (owned lines, not fork copies) that carries an id the target lacks is held as an unknown owner.
    - A target's own replica that repeats an id the target counts is not peer evidence. When other targets share that id, the share stays between targets, and B2 allocates it.
    - Bytes are charged as they are read, so a failed or growing file still spends the cumulative byte budget.
@@ -153,11 +154,11 @@ Steps:
    - An id shared only by targets is kept by the lowest `b2_first_ack_order`, else by the smaller `session_key_sha256`.
    - The allocation digest is recorded. B2 is counting only; it is not ownership.
 4. Each target is re-parsed with the same parser, dropping only the lines of its excluded ids. The producer then checks exactly: kept ids, per-request usage, item totals = original − excluded, and usage rows. It also checks that account evidence, titles, workspace and repository identity, and origin are unchanged. The ordinary daemon serializer writes the one-item body. Any mismatch holds the target.
-5. A receipt is written for each kept shared request: the keeping root, `untagged`, and its starting subscription unchanged. The producer applies no Contract-5 permit. A body that carries request evidence is held as unsupported, and allocation-driven name changes must be zero.
+5. A receipt is written for each kept shared request: the keeping root, `untagged`, and its starting subscription unchanged. The producer is pinned untagged: it never applies a Contract-5 request-identity permit, whatever the ordinary pipeline does. A parsed, rebuilt or serialized body that carries request evidence, identity refusals or a usage row with an evidence reference or identity parts is held as unsupported, and allocation-driven name changes must be zero. The receipt's body identity counts are measured on the serialized bytes.
 
 Outputs (`0600`, created new):
 
-- `artifact.json` (`h527_producer_diagnostic:v1`, `local_only`, `admission_authority: none`)
+- `artifact.json` (`h527_producer_diagnostic:v2`, `local_only`, `admission_authority: none`)
   - input and file manifest, coverage census, B2 allocation, per-target partitions and reconciliation
   - unqualified bodies and their hashes, SI receipts
   - qualification gaps, and the pipeline stages not reproduced
@@ -168,3 +169,5 @@ Outputs (`0600`, created new):
 Not reproduced, and disclosed in each artifact: Contract-5 local evidence and permit, account binding, desktop title metadata, attribution context, backfill cutoff, and cache-head identity. These bodies are therefore identity-less and untagged. If SOURCE or SI need pipeline-identical overlays, the dependency is the pre-upload phase of the sync pipeline, not this producer.
 
 Tests: `producer/tests.rs` drives 18 synthetic targets and peer roots. They cover a peer exclusion, a B2 first-ACK keeper, a hash keeper, a held-root peer, a target replica, a fork child, a two-hop fork chain, a copy from an absent source, and a fast-mode request left unpriced. They check that each body equals the parse of a transcript with the excluded line physically removed. Further checks cover the receipt, the held packet, the estimate, determinism, refusing an existing output directory, and holds on a compressed peer, a census with no projects root, or a capped census. They also check that a failed read is charged to the byte budget.
+
+October 28 refresh (v2, Path A): merged current main; planned metadata walk with counted entry, file and byte budgets (an overrun reads nothing); per-line fork-copy resolution that also consults copies inside target files; pinned target and peer caps; untagged pinned on the serialized body. New tests cover a copy naming a present peer that never counted the request, a copy naming a target that does not count it, a copy inside a target's own transcript naming an absent source, a resolution through a target's own copy, walk-entry, planned-byte and over-cap holds that read no peer byte, an identity-free artifact, a refused tagged body, and the cap validation. This producer stays on a draft PR that never merges; the run uses a CI-built binary from the PR head.

@@ -1,5 +1,5 @@
 //! Offline producer of h527 diagnostic candidates from one explicit input
-//! bundle (`h527_producer_input:v1`).
+//! bundle (`h527_producer_input:v2`).
 //!
 //! It reads only the files the bundle names: the 18 target transcripts and
 //! every `.jsonl` file under the named peer roots. It never touches a scan
@@ -11,23 +11,31 @@
 //! 1. Parse each target with the unchanged Claude parser. A target needs a
 //!    complete parse, exactly one item, a native id on every counted request
 //!    and totals equal to the sum of its per-request usage.
-//! 2. Stream every peer file once and compare native request ids exactly, in
-//!    memory, against all 18 targets. Fork-copied lines belong to the session
-//!    they name. A cap, a changed or unreadable file, a compressed transcript or
-//!    an unparseable id-bearing line leaves coverage unknown, and then every
+//! 2. Plan the peer walk from metadata alone, within explicit entry, file and
+//!    byte budgets. Any budget overrun or over-cap peer is counted and holds
+//!    every target before a single peer byte is read: never a partial census.
+//!    Then stream every planned peer file once, as of its size when opened, and
+//!    compare native request ids exactly, in memory, against all 18 targets. A
+//!    shrunk, rewritten or unreadable file, a compressed transcript or an
+//!    unparseable id-bearing line leaves coverage unknown, and then every
 //!    target is held without a body.
-//! 3. Fix the counting allocation (B2) for the whole batch before any body or
+//! 3. Resolve every fork-copied line, in peer and target files alike, per line:
+//!    it belongs to the session it names only if that session (or the source
+//!    its own copy names, recursively) counts the request. Otherwise its source
+//!    is absent and the copy is conservative peer evidence.
+//! 4. Fix the counting allocation (B2) for the whole batch before any body or
 //!    money exists: an id seen in any peer is excluded from every target; an
 //!    id shared only by targets is kept by the first-ACKed target, else the
 //!    smaller session key hash. B2 is counting only. It is not ownership.
-//! 4. Re-parse each target with the same parser, dropping only the lines of
+//! 5. Re-parse each target with the same parser, dropping only the lines of
 //!    its excluded request ids, and reconcile kept ids, per-request usage, item
 //!    totals and usage rows exactly. The ordinary daemon serializer then writes
 //!    the one-item batch body.
-//! 5. Record, for every kept shared request, the keeping root and its tag
-//!    state. This producer has no Contract-5 permit, so every request stays
-//!    untagged under its starting subscription; a body carrying request
-//!    evidence is held as unsupported.
+//! 6. Record, for every kept shared request, the keeping root and its tag
+//!    state. This producer never applies a Contract-5 request-identity permit
+//!    (pinned here, whatever the ordinary pipeline does), so every request
+//!    stays untagged under its starting subscription; a parsed, rebuilt or
+//!    serialized body carrying request identity is held as unsupported.
 //!
 //! Bodies go only into the unqualified diagnostic artifact. The operator
 //! packet for the same run keeps every member held without a body.
@@ -56,8 +64,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub(crate) const PRODUCER_INPUT_CONTRACT_VERSION: &str = "h527_producer_input:v1";
-pub(crate) const PRODUCER_ARTIFACT_CONTRACT_VERSION: &str = "h527_producer_diagnostic:v1";
+pub(crate) const PRODUCER_INPUT_CONTRACT_VERSION: &str = "h527_producer_input:v2";
+pub(crate) const PRODUCER_ARTIFACT_CONTRACT_VERSION: &str = "h527_producer_diagnostic:v2";
 const PRODUCER_SUMMARY_CONTRACT_VERSION: &str = "h527_producer_summary:v1";
 const PRODUCER_DISCLOSURES_CONTRACT_VERSION: &str = "h527_producer_disclosures:v1";
 const B2_ALLOCATION_RULE: &str =
@@ -69,6 +77,16 @@ const ESTIMATE_LABEL: &str =
 const COPY_SCREEN_NOT_RUN_REASON: &str =
     "server copy screen was not run by the local producer; no screen artifact exists";
 const MAX_INPUT_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+/// Targets go through the ordinary parser. Their cap is pinned at 256 MiB so a
+/// later raise of the parser's own cap does not silently change which targets
+/// this producer reads; a larger target is unreadable and held.
+const TARGET_FILE_BYTES_CAP: u64 = 256 * 1024 * 1024;
+const _: () = assert!(TARGET_FILE_BYTES_CAP <= MAX_JSONL_FILE_BYTES);
+/// Peers are streamed line by line and never parsed whole, so their cap does
+/// not follow the parser's file cap; memory stays bounded by `max_line_bytes`.
+/// A peer over the run's `max_peer_file_bytes` is counted and holds every
+/// target.
+const PEER_FILE_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
 /// Exact decimal rates are stored as integers of 1e-12 USD per million tokens.
 const RATE_FRACTION_DIGITS: usize = 12;
 /// Tokens x (1e-12 USD per 1e6 tokens) => 1e-18 USD units.
@@ -161,6 +179,8 @@ pub(crate) struct InputPeerRoot {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InputBounds {
+    /// Directory entries the metadata walk may examine across all peer roots.
+    pub(crate) max_walk_entries: u64,
     pub(crate) max_peer_files: u64,
     pub(crate) max_peer_total_bytes: u64,
     pub(crate) max_peer_file_bytes: u64,
@@ -577,21 +597,34 @@ impl GlobalCoverage {
 
 #[derive(Debug, Clone)]
 struct PeerHit {
-    peer_file_index: usize,
+    /// Path witness of the file holding the first evidence: a peer file or,
+    /// for a fork copy inside another target, that target's transcript.
+    path_sha256: String,
     owner_session_sha256: Option<String>,
     line_count: u64,
-    /// The only evidence is a fork-copied line whose named source session has
-    /// no transcript in the census.
+    /// The only evidence is a fork-copied line whose named source session
+    /// does not count the request anywhere in the census.
     inherited_from_absent_source: bool,
 }
 
-/// A fork-copied line carrying a request some target counts. The parser never
-/// counts it in its own file, so it is not evidence that any session counts
-/// the id; it is resolved after the whole census is read.
-struct InheritedCopy {
+/// A fork-copied line, in a peer or a target file, carrying a request some
+/// target counts. The parser never counts it in its own file, so it is not
+/// evidence that any session counts the id; it is resolved per line after the
+/// whole census is read.
+struct CopyClaim {
     request_id: String,
+    /// The direct source session its `forkedFrom` names.
     named_session: Option<String>,
-    peer_file_index: usize,
+    /// The session that owns the file holding the copy.
+    holder_session: Option<String>,
+    path_sha256: String,
+}
+
+/// One peer transcript the metadata walk planned to read.
+struct PlannedPeer {
+    root_index: usize,
+    path: PathBuf,
+    size_bytes: u64,
 }
 
 #[derive(Default)]
@@ -600,6 +633,19 @@ struct PeerScan {
     files: Vec<Value>,
     file_count: u64,
     total_bytes: u64,
+    /// Breadth of the metadata walk: every directory entry examined, and the
+    /// directories listed.
+    walk_entry_count: u64,
+    walk_directory_count: u64,
+    planned_file_count: u64,
+    planned_bytes: u64,
+    over_cap_file_count: u64,
+    /// Peers that grew while read. Each is read as of its size when opened,
+    /// the same snapshot as a file created after the walk.
+    grown_during_read_count: u64,
+    /// Unparseable id-bearing final lines of grown peers: a record still being
+    /// written when the file was opened.
+    in_flight_tail_line_count: u64,
     ignored_file_count: u64,
     duplicate_path_count: u64,
     covered_symlink_count: u64,
@@ -616,9 +662,11 @@ struct PeerScan {
     /// Per target: owned (not fork-copied) id-bearing usage lines naming the
     /// target's own session whose id the target does not count.
     replica_divergent_ids: Vec<BTreeSet<String>>,
-    inherited: Vec<InheritedCopy>,
-    /// Sessions that own at least one scanned peer transcript.
-    owning_sessions: BTreeSet<String>,
+    copies: Vec<CopyClaim>,
+    /// Session -> target-held request ids it owns (not fork-copied) in a
+    /// scanned peer file.
+    owned_held_ids: BTreeMap<String, BTreeSet<String>>,
+    target_inherited_copy_line_count: u64,
     inherited_resolved_line_count: u64,
     inherited_absent_source_line_count: u64,
 }
@@ -842,6 +890,7 @@ pub(crate) fn produce(
         "scope_session_keys": members.iter().map(|member| member.session_key_sha256.as_str()).collect::<Vec<_>>(),
         "input_manifest": {
             "bounds": {
+                "max_walk_entries": input.bounds.max_walk_entries,
                 "max_peer_files": input.bounds.max_peer_files,
                 "max_peer_total_bytes": input.bounds.max_peer_total_bytes,
                 "max_peer_file_bytes": input.bounds.max_peer_file_bytes,
@@ -855,14 +904,22 @@ pub(crate) fn produce(
             })).collect::<Vec<_>>(),
             "peer_roots": peers.roots,
             "peer_files": peers.files,
+            "walk_entry_count": peers.walk_entry_count,
+            "walk_directory_count": peers.walk_directory_count,
+            "planned_peer_file_count": peers.planned_file_count,
+            "planned_peer_bytes": peers.planned_bytes,
+            "over_cap_peer_file_count": peers.over_cap_file_count,
             "peer_file_count": peers.file_count,
             "cumulative_peer_bytes_read": peers.total_bytes,
+            "peer_grown_during_read_count": peers.grown_during_read_count,
+            "peer_in_flight_tail_line_count": peers.in_flight_tail_line_count,
             "ignored_non_transcript_file_count": peers.ignored_file_count,
             "duplicate_path_count": peers.duplicate_path_count,
             "covered_symlink_count": peers.covered_symlink_count,
             "target_file_occurrences_under_peer_roots": peers.target_file_occurrences,
             "peer_unidentified_usage_line_count": peers.unidentified_usage_line_count,
             "shared_target_replica_line_count": peers.shared_target_replica_line_count,
+            "target_inherited_copy_line_count": peers.target_inherited_copy_line_count,
             "inherited_copy_resolved_line_count": peers.inherited_resolved_line_count,
             "inherited_copy_absent_source_line_count": peers.inherited_absent_source_line_count,
             "peer_unidentified_usage_note": "usage lines without a native request id cannot be compared; disclosed, not excluded",
@@ -978,17 +1035,20 @@ pub(crate) fn produce(
 }
 
 fn validate_bounds(bounds: &InputBounds) -> Result<(), String> {
-    if bounds.max_peer_files == 0
+    if bounds.max_walk_entries == 0
+        || bounds.max_peer_files == 0
         || bounds.max_peer_total_bytes == 0
         || bounds.max_peer_file_bytes == 0
         || bounds.max_line_bytes == 0
     {
         return Err("every bound must be positive".to_string());
     }
-    if bounds.max_peer_file_bytes > MAX_JSONL_FILE_BYTES
+    if bounds.max_peer_file_bytes > PEER_FILE_BYTES_CEILING
         || bounds.max_line_bytes > MAX_JSONL_LINE_BYTES as u64
     {
-        return Err("bounds may not exceed the parser's own file and line caps".to_string());
+        return Err(
+            "bounds may not exceed the peer file ceiling or the parser's line cap".to_string(),
+        );
     }
     Ok(())
 }
@@ -1076,7 +1136,7 @@ fn target_file(path: &Path) -> TargetFile {
         Ok(_) => return unreadable("not a regular file".to_string()),
         Err(error) => return unreadable(error.to_string()),
     };
-    match hash_file(&canonical_path, MAX_JSONL_FILE_BYTES) {
+    match hash_file(&canonical_path, TARGET_FILE_BYTES_CAP) {
         Ok((size_bytes, content_sha256)) => TargetFile {
             path_sha256: path_sha256(&canonical_path),
             canonical_path: Some(canonical_path),
@@ -1269,23 +1329,117 @@ fn scan_peers(
                 .push(format!("peer root {} unreadable", path_sha256(&root.path))),
         }
     }
+
+    // Plan from metadata alone; no peer content is read unless the whole plan
+    // fits every budget.
+    let planned = plan_peer_walk(
+        input.bounds,
+        &canonical_roots,
+        &target_paths,
+        &mut scan,
+        coverage,
+    );
+    let mut root_totals = vec![(0_u64, 0_u64); canonical_roots.len()];
+    if coverage.cap_overflow.is_empty() {
+        for peer in &planned {
+            if scan.total_bytes.saturating_add(peer.size_bytes) > input.bounds.max_peer_total_bytes
+            {
+                coverage
+                    .cap_overflow
+                    .push("max_peer_total_bytes reached while reading".to_string());
+                break;
+            }
+            let bytes_before = scan.total_bytes;
+            let outcome = scan_peer_file(
+                &peer.path,
+                input.bounds,
+                &holders,
+                &session_index,
+                originals,
+                &mut scan,
+            );
+            scan.file_count += 1;
+            root_totals[peer.root_index].0 += 1;
+            root_totals[peer.root_index].1 += scan.total_bytes - bytes_before;
+            let class = canonical_roots[peer.root_index].0;
+            match outcome {
+                Ok((bytes, content_sha256)) => {
+                    scan.files.push(json!({
+                        "class": class,
+                        "path_sha256": path_sha256(&peer.path),
+                        "size_bytes": bytes,
+                        "content_sha256": content_sha256,
+                    }));
+                }
+                Err(detail) => {
+                    scan.files.push(json!({
+                        "class": class,
+                        "path_sha256": path_sha256(&peer.path),
+                        "unknown": detail,
+                    }));
+                    coverage
+                        .unknown
+                        .push(format!("peer file {}: {detail}", path_sha256(&peer.path)));
+                }
+            }
+        }
+    }
+    for ((class, root), (files, bytes)) in canonical_roots.iter().zip(root_totals) {
+        scan.roots.push(json!({
+            "class": class,
+            "path_sha256": path_sha256(root),
+            "transcript_file_count": files,
+            "bytes_read": bytes,
+        }));
+    }
+    // A census that never read a target's own tree cannot see its peers.
+    if !canonical_roots
+        .iter()
+        .any(|(class, _)| *class == "projects")
+    {
+        coverage
+            .unknown
+            .push("no projects root was scanned".to_string());
+    }
+    for file in targets {
+        if let Some(path) = &file.canonical_path {
+            if !canonical_roots
+                .iter()
+                .any(|(_, root)| path.starts_with(root))
+            {
+                coverage.unknown.push(format!(
+                    "target {} is under no scanned peer root",
+                    file.path_sha256
+                ));
+            }
+        }
+    }
+    scan_target_copies(input, targets, originals, &holders, &mut scan, coverage);
+    resolve_fork_copies(&mut scan, &holders, &session_index, originals);
+    scan
+}
+
+/// The metadata walk: every entry under every root is counted against
+/// `max_walk_entries`, and every peer transcript is sized against the file
+/// cap. The plan's file count and bytes must fit the run's budgets. Any
+/// overrun is recorded as a cap overflow, and then nothing is read.
+fn plan_peer_walk(
+    bounds: InputBounds,
+    canonical_roots: &[(&str, PathBuf)],
+    target_paths: &BTreeSet<PathBuf>,
+    scan: &mut PeerScan,
+    coverage: &mut GlobalCoverage,
+) -> Vec<PlannedPeer> {
+    let mut planned = Vec::new();
     let mut visited = BTreeSet::new();
-    for (class, root) in &canonical_roots {
-        let mut root_files = 0_u64;
-        let mut root_bytes = 0_u64;
+    'roots: for (root_index, (_, root)) in canonical_roots.iter().enumerate() {
         let mut stack = vec![root.clone()];
         while let Some(directory) = stack.pop() {
-            let mut entries = match fs::read_dir(&directory) {
-                Ok(entries) => match entries.collect::<Result<Vec<_>, _>>() {
-                    Ok(entries) => entries,
-                    Err(_) => {
-                        coverage.unknown.push(format!(
-                            "peer directory {} unreadable",
-                            path_sha256(&directory)
-                        ));
-                        continue;
-                    }
-                },
+            scan.walk_directory_count += 1;
+            let mut entries = match fs::read_dir(&directory)
+                .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+            {
+                Ok(entries) => entries,
                 Err(_) => {
                     coverage.unknown.push(format!(
                         "peer directory {} unreadable",
@@ -1297,6 +1451,13 @@ fn scan_peers(
             entries.sort_by_key(|entry| entry.file_name());
             let mut subdirectories = Vec::new();
             for entry in entries {
+                scan.walk_entry_count += 1;
+                if scan.walk_entry_count > bounds.max_walk_entries {
+                    coverage
+                        .cap_overflow
+                        .push("max_walk_entries reached".to_string());
+                    break 'roots;
+                }
                 let path = entry.path();
                 let Ok(metadata) = fs::symlink_metadata(&path) else {
                     coverage
@@ -1353,115 +1514,209 @@ fn scan_peers(
                     scan.target_file_occurrences += 1;
                     continue;
                 }
-                if !coverage.cap_overflow.is_empty() {
-                    continue;
-                }
-                if scan.file_count >= input.bounds.max_peer_files {
-                    coverage
-                        .cap_overflow
-                        .push("max_peer_files reached".to_string());
-                    continue;
-                }
-                if metadata.len() > input.bounds.max_peer_file_bytes {
+                if metadata.len() > bounds.max_peer_file_bytes {
+                    scan.over_cap_file_count += 1;
                     coverage.cap_overflow.push(format!(
                         "peer file {} over max_peer_file_bytes",
                         path_sha256(&path)
                     ));
                     continue;
                 }
-                if scan.total_bytes.saturating_add(metadata.len())
-                    > input.bounds.max_peer_total_bytes
-                {
-                    coverage
-                        .cap_overflow
-                        .push("max_peer_total_bytes reached".to_string());
-                    continue;
-                }
-                let file_index = scan.files.len();
-                let bytes_before = scan.total_bytes;
-                let outcome = scan_peer_file(
-                    &path,
-                    file_index,
-                    input.bounds,
-                    &holders,
-                    &session_index,
-                    originals,
-                    &mut scan,
-                );
-                scan.file_count += 1;
-                root_files += 1;
-                root_bytes += scan.total_bytes - bytes_before;
-                match outcome {
-                    Ok((bytes, content_sha256)) => {
-                        scan.files.push(json!({
-                            "class": class,
-                            "path_sha256": path_sha256(&path),
-                            "size_bytes": bytes,
-                            "content_sha256": content_sha256,
-                        }));
-                    }
-                    Err(detail) => {
-                        scan.files.push(json!({
-                            "class": class,
-                            "path_sha256": path_sha256(&path),
-                            "unknown": detail,
-                        }));
-                        coverage
-                            .unknown
-                            .push(format!("peer file {}: {detail}", path_sha256(&path)));
-                    }
-                }
+                scan.planned_file_count += 1;
+                scan.planned_bytes = scan.planned_bytes.saturating_add(metadata.len());
+                planned.push(PlannedPeer {
+                    root_index,
+                    path,
+                    size_bytes: metadata.len(),
+                });
             }
             // Reversed so the stack visits directory names in ascending order.
             stack.extend(subdirectories.into_iter().rev());
         }
-        scan.roots.push(json!({
-            "class": class,
-            "path_sha256": path_sha256(root),
-            "transcript_file_count": root_files,
-            "bytes_read": root_bytes,
-        }));
     }
-    // A census that never read a target's own tree cannot see its peers.
-    if !canonical_roots
-        .iter()
-        .any(|(class, _)| *class == "projects")
-    {
-        coverage
-            .unknown
-            .push("no projects root was scanned".to_string());
+    if scan.planned_file_count > bounds.max_peer_files {
+        coverage.cap_overflow.push(format!(
+            "max_peer_files exceeded: {} planned",
+            scan.planned_file_count
+        ));
     }
-    for file in targets {
-        if let Some(path) = &file.canonical_path {
-            if !canonical_roots
-                .iter()
-                .any(|(_, root)| path.starts_with(root))
+    if scan.planned_bytes > bounds.max_peer_total_bytes {
+        coverage.cap_overflow.push(format!(
+            "max_peer_total_bytes exceeded: {} planned",
+            scan.planned_bytes
+        ));
+    }
+    planned
+}
+
+/// Fork-copied lines inside the targets' own transcripts. The parser skips
+/// them, so only this pass sees them. The file must still be the bytes the
+/// target was parsed from.
+fn scan_target_copies(
+    input: &ProducerInput,
+    targets: &[TargetFile],
+    originals: &[TargetParse],
+    holders: &BTreeMap<&str, Vec<usize>>,
+    scan: &mut PeerScan,
+    coverage: &mut GlobalCoverage,
+) {
+    for (index, file) in targets.iter().enumerate() {
+        let Some(path) = &file.canonical_path else {
+            continue;
+        };
+        if originals[index].request_ids.is_none() {
+            continue;
+        }
+        let holder = input.targets[index].source_session_id.clone();
+        match read_target_copies(path, holders) {
+            Ok((size, sha, copies))
+                if Some(size) == file.size_bytes && Some(&sha) == file.content_sha256.as_ref() =>
             {
-                coverage.unknown.push(format!(
-                    "target {} is under no scanned peer root",
-                    file.path_sha256
-                ));
+                scan.target_inherited_copy_line_count += copies.len() as u64;
+                scan.copies
+                    .extend(
+                        copies
+                            .into_iter()
+                            .map(|(request_id, named_session)| CopyClaim {
+                                request_id,
+                                named_session,
+                                holder_session: Some(holder.clone()),
+                                path_sha256: file.path_sha256.clone(),
+                            }),
+                    );
+            }
+            Ok(_) => coverage.unknown.push(format!(
+                "target {} changed before its fork copies were read",
+                file.path_sha256
+            )),
+            Err(error) => coverage.unknown.push(format!(
+                "target {} fork copies unreadable: {error}",
+                file.path_sha256
+            )),
+        }
+    }
+}
+
+/// Stream one target transcript for its fork-copied lines carrying a request
+/// some target counts. Returns its byte count and content hash with them.
+fn read_target_copies(
+    path: &Path,
+    holders: &BTreeMap<&str, Vec<usize>>,
+) -> Result<(u64, String, Vec<(String, Option<String>)>), String> {
+    let file = File::open(path).map_err(|error| format!("open: {error}"))?;
+    let mut reader = BufReader::new(file.take(TARGET_FILE_BYTES_CAP + 1));
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut line = Vec::new();
+    let mut copies = Vec::new();
+    loop {
+        line.clear();
+        let read = (&mut reader)
+            .take(MAX_JSONL_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("read: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        digest.update(&line);
+        let text = line.strip_suffix(b"\n").unwrap_or(&line);
+        if !contains(text, b"\"forkedFrom\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(text) else {
+            continue;
+        };
+        if claude_fork_line_provenance(&value) != ClaudeForkLineProvenance::Inherited
+            || claude_code_delta_usage(&value).is_none()
+        {
+            continue;
+        }
+        if let Some(request_id) = line_request_id(&value) {
+            if holders.contains_key(request_id.as_str()) {
+                copies.push((request_id, forked_from_session(&value)));
             }
         }
     }
-    resolve_inherited_copies(&mut scan, &holders, &session_index);
-    scan
+    Ok((total, format!("{:x}", digest.finalize()), copies))
 }
 
-/// A fork-copied line names its direct source session. When that session's
-/// transcript is in the census (a target or a scanned peer), the copy adds
-/// nothing: the owned line, if any, already produced its evidence. Only a
-/// copy whose named source is absent is kept, as conservative peer evidence.
-fn resolve_inherited_copies(
+fn forked_from_session(value: &Value) -> Option<String> {
+    value
+        .get("forkedFrom")
+        .and_then(|forked| forked.get("sessionId").or_else(|| forked.get("session_id")))
+        .and_then(Value::as_str)
+        .map(|session| session.trim().to_string())
+        .filter(|session| !session.is_empty())
+}
+
+/// A fork-copied line names its direct source session. The copy adds nothing
+/// when that source counts the request itself: a target whose request set
+/// holds it, or a session owning it in a scanned peer file (that owned line
+/// already produced its own evidence). Otherwise the source's own copy of the
+/// same request, if any, is followed to the session it names, and so on. A
+/// copy with no such counting source anywhere in the census (deleted, never
+/// scanned, or present but not holding the request) is kept as conservative
+/// peer evidence: an undercount, never a double count.
+fn resolve_fork_copies(
     scan: &mut PeerScan,
     holders: &BTreeMap<&str, Vec<usize>>,
     session_index: &BTreeMap<&str, usize>,
+    originals: &[TargetParse],
 ) {
-    for copy in std::mem::take(&mut scan.inherited) {
-        let present = copy.named_session.as_deref().is_some_and(|session| {
-            session_index.contains_key(session) || scan.owning_sessions.contains(session)
-        });
-        if present {
+    let copies = std::mem::take(&mut scan.copies);
+    let accounted = {
+        let mut copies_by_holder = BTreeMap::<(&str, &str), Vec<&str>>::new();
+        for copy in &copies {
+            if let (Some(holder), Some(named)) = (&copy.holder_session, &copy.named_session) {
+                copies_by_holder
+                    .entry((holder.as_str(), copy.request_id.as_str()))
+                    .or_default()
+                    .push(named.as_str());
+            }
+        }
+        let owned_held_ids = &scan.owned_held_ids;
+        let counts = |session: &str, request_id: &str| {
+            session_index.get(session).is_some_and(|index| {
+                originals[*index]
+                    .request_ids
+                    .as_ref()
+                    .is_some_and(|request_ids| request_ids.contains(request_id))
+            }) || owned_held_ids
+                .get(session)
+                .is_some_and(|request_ids| request_ids.contains(request_id))
+        };
+        copies
+            .iter()
+            .map(|copy| {
+                let request_id = copy.request_id.as_str();
+                let mut visited = BTreeSet::new();
+                let mut pending = copy
+                    .named_session
+                    .as_deref()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                while let Some(session) = pending.pop() {
+                    if !visited.insert(session) {
+                        continue;
+                    }
+                    if counts(session, request_id) {
+                        return true;
+                    }
+                    pending.extend(
+                        copies_by_holder
+                            .get(&(session, request_id))
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    );
+                }
+                false
+            })
+            .collect::<Vec<_>>()
+    };
+    for (copy, accounted) in copies.into_iter().zip(accounted) {
+        if accounted {
             scan.inherited_resolved_line_count += 1;
             continue;
         }
@@ -1470,7 +1725,7 @@ fn resolve_inherited_copies(
             scan.hits[target]
                 .entry(copy.request_id.clone())
                 .or_insert_with(|| PeerHit {
-                    peer_file_index: copy.peer_file_index,
+                    path_sha256: copy.path_sha256.clone(),
                     owner_session_sha256: copy
                         .named_session
                         .as_deref()
@@ -1483,11 +1738,10 @@ fn resolve_inherited_copies(
     }
 }
 
-/// Stream one peer transcript. Returns its byte count and content hash;
-/// an error leaves coverage unknown.
+/// Stream one peer transcript as of its size when opened. Returns its byte
+/// count and content hash; an error leaves coverage unknown.
 fn scan_peer_file(
     path: &Path,
-    file_index: usize,
     bounds: InputBounds,
     holders: &BTreeMap<&str, Vec<usize>>,
     session_index: &BTreeMap<&str, usize>,
@@ -1496,14 +1750,20 @@ fn scan_peer_file(
 ) -> Result<(u64, String), String> {
     let file = File::open(path).map_err(|error| format!("open: {error}"))?;
     let before = file.metadata().map_err(|error| format!("stat: {error}"))?;
-    let mut reader = BufReader::new(file);
+    let opened_len = before.len();
+    if opened_len > bounds.max_peer_file_bytes {
+        return Err("over max_peer_file_bytes when opened".to_string());
+    }
+    let mut reader = BufReader::new(file.take(opened_len));
     let mut digest = Sha256::new();
     let mut total = 0_u64;
     let mut line = Vec::new();
+    let path_witness = path_sha256(path);
     // A subagent transcript is keyed by its path, like the parser does.
     let subagent_session =
         claude_subagent_identity(path).map(|identity| identity.source_session_id());
     let mut file_session = None::<String>;
+    let mut copies = Vec::new();
     loop {
         line.clear();
         let read = (&mut reader)
@@ -1520,7 +1780,8 @@ fn scan_peer_file(
             return Err("read past the peer byte bounds".to_string());
         }
         digest.update(&line);
-        if read as u64 > bounds.max_line_bytes && line.last() != Some(&b'\n') {
+        let terminated = line.last() == Some(&b'\n');
+        if read as u64 > bounds.max_line_bytes && !terminated {
             return Err("line over max_line_bytes".to_string());
         }
         let text = line.strip_suffix(b"\n").unwrap_or(&line);
@@ -1538,6 +1799,19 @@ fn scan_peer_file(
         }
         let Ok(value) = serde_json::from_slice::<Value>(text) else {
             if has_id_key {
+                // The unterminated last line of a file that has grown since it
+                // was opened is a record still being written: not yet history.
+                let in_flight = !terminated
+                    && total == opened_len
+                    && reader
+                        .get_ref()
+                        .get_ref()
+                        .metadata()
+                        .is_ok_and(|now| now.len() > opened_len);
+                if in_flight {
+                    scan.in_flight_tail_line_count += 1;
+                    continue;
+                }
                 return Err("unparseable line with a request id key".to_string());
             }
             continue;
@@ -1559,18 +1833,7 @@ fn scan_peer_file(
         let owner = match provenance {
             ClaudeForkLineProvenance::Inherited => {
                 if holders.contains_key(request_id.as_str()) {
-                    scan.inherited.push(InheritedCopy {
-                        request_id,
-                        named_session: value
-                            .get("forkedFrom")
-                            .and_then(|forked| {
-                                forked.get("sessionId").or_else(|| forked.get("session_id"))
-                            })
-                            .and_then(Value::as_str)
-                            .map(|session| session.trim().to_string())
-                            .filter(|session| !session.is_empty()),
-                        peer_file_index: file_index,
-                    });
+                    copies.push((request_id, forked_from_session(&value)));
                 }
                 continue;
             }
@@ -1598,6 +1861,12 @@ fn scan_peer_file(
         let Some(target_indexes) = holders.get(request_id.as_str()) else {
             continue;
         };
+        if let Some(owner) = &owner {
+            scan.owned_held_ids
+                .entry(owner.clone())
+                .or_default()
+                .insert(request_id.clone());
+        }
         if owner_counts_it {
             // A replica of a target that counts this id: its own line for the
             // owner, a target-to-target share for the rest, which B2 allocates.
@@ -1614,7 +1883,7 @@ fn scan_peer_file(
             scan.hits[target]
                 .entry(request_id.clone())
                 .or_insert_with(|| PeerHit {
-                    peer_file_index: file_index,
+                    path_sha256: path_witness.clone(),
                     owner_session_sha256: owner
                         .as_deref()
                         .map(|owner| sha256_hex(owner.as_bytes())),
@@ -1624,19 +1893,32 @@ fn scan_peer_file(
                 .line_count += 1;
         }
     }
-    if let Some(owner) = subagent_session.or(file_session) {
-        scan.owning_sessions.insert(owner);
-    }
     let after = reader
+        .get_ref()
         .get_ref()
         .metadata()
         .map_err(|error| format!("stat: {error}"))?;
-    if before.len() != total
-        || after.len() != total
-        || before.modified().ok() != after.modified().ok()
+    // Shrunk, or rewritten at the same size: the bytes read are not a snapshot.
+    if total != opened_len
+        || after.len() < opened_len
+        || (after.len() == opened_len && before.modified().ok() != after.modified().ok())
     {
         return Err("file changed while read".to_string());
     }
+    if after.len() > opened_len {
+        scan.grown_during_read_count += 1;
+    }
+    let holder_session = subagent_session.or(file_session);
+    scan.copies.extend(
+        copies
+            .into_iter()
+            .map(|(request_id, named_session)| CopyClaim {
+                request_id,
+                named_session,
+                holder_session: holder_session.clone(),
+                path_sha256: path_witness.clone(),
+            }),
+    );
     Ok((total, format!("{:x}", digest.finalize())))
 }
 
@@ -1865,12 +2147,7 @@ fn build_target(
         });
         match keeper {
             Keeper::Peer(witness_target) => {
-                let Some((hit, peer_path_sha256)) =
-                    peers.hits[*witness_target].get(request_id).and_then(|hit| {
-                        let path = peers.files.get(hit.peer_file_index)?.get("path_sha256")?;
-                        Some((hit, path.clone()))
-                    })
-                else {
+                let Some(hit) = peers.hits[*witness_target].get(request_id) else {
                     return hold(
                         report,
                         TargetHold::new(
@@ -1884,7 +2161,7 @@ fn build_target(
                 } else {
                     "peer_overlap"
                 });
-                witness["peer_path_sha256"] = peer_path_sha256;
+                witness["peer_path_sha256"] = json!(hit.path_sha256);
                 witness["peer_owner_session_sha256"] = json!(hit.owner_session_sha256);
                 witness["peer_line_count"] = json!(hit.line_count);
             }
@@ -1979,10 +2256,25 @@ fn build_target(
         Ok(body) => body,
         Err(error) => return hold(report, TargetHold::new(HeldReason::MissingEvidence, error)),
     };
+    // Pinned untagged: checked on the exact bytes, not inferred from the
+    // pipeline stages this producer happens to skip.
+    let body_identity = match serialized_request_identity(&body) {
+        Ok(identity) if identity.untagged() => identity,
+        Ok(_) => {
+            return hold(
+                report,
+                TargetHold::new(
+                    HeldReason::MissingEvidence,
+                    "unsupported: serialized body carries request identity; this producer is untagged only",
+                ),
+            )
+        }
+        Err(error) => return hold(report, TargetHold::new(HeldReason::MissingEvidence, error)),
+    };
     let unchanged = file
         .canonical_path
         .as_ref()
-        .and_then(|path| hash_file(path, MAX_JSONL_FILE_BYTES).ok())
+        .and_then(|path| hash_file(path, TARGET_FILE_BYTES_CAP).ok())
         .is_some_and(|(size, sha)| {
             Some(size) == file.size_bytes && Some(&sha) == file.content_sha256.as_ref()
         });
@@ -2039,8 +2331,8 @@ fn build_target(
         "untagged_count": receipt_entries.len(),
         "group_sha256": receipt_group_sha256,
         "entries": receipt_entries,
-        "body_request_evidence_count": item.request_evidence.len(),
-        "body_rows_with_identity": 0,
+        "body_request_evidence_count": body_identity.request_evidence,
+        "body_rows_with_identity": body_identity.rows_with_identity,
         "body_session_account_evidence_present": item.session_account_evidence.is_some(),
         "allocation_identity_changes": identity_changes,
         "note": "no Contract-5 permit in this producer: every kept request is untagged under its starting subscription; an identity-less body cannot authorize replacing an existing name",
@@ -2071,6 +2363,65 @@ fn build_target(
         report,
         estimate: estimate.ok().map(|dollars| (excluded_dims, dollars)),
     }
+}
+
+/// Request identity found in a serialized ordinary batch body.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BodyIdentity {
+    request_evidence: u64,
+    request_identity_refusals: u64,
+    rows_with_identity: u64,
+}
+
+impl BodyIdentity {
+    fn untagged(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// This producer never applies a Contract-5 request-identity permit, whatever
+/// the ordinary pipeline does at the time, so a body it emits must carry no
+/// request evidence, no identity refusals and no usage row with an evidence
+/// reference or identity parts.
+fn serialized_request_identity(body: &str) -> Result<BodyIdentity, String> {
+    let body: Value =
+        serde_json::from_str(body).map_err(|error| format!("body identity check: {error}"))?;
+    let snapshots = body
+        .get("snapshots")
+        .and_then(Value::as_array)
+        .ok_or("body identity check: no snapshots")?;
+    let mut identity = BodyIdentity::default();
+    for item in snapshots {
+        identity.request_evidence += item
+            .get("request_evidence")
+            .and_then(Value::as_array)
+            .map_or(0, |evidence| evidence.len() as u64);
+        identity.request_identity_refusals += item
+            .get("request_identity_refusals")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let bucket_rows = item
+            .get("usage_buckets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|bucket| bucket.get("model_usage").and_then(Value::as_array))
+            .flatten();
+        let item_rows = item
+            .get("model_usage")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        identity.rows_with_identity += item_rows
+            .chain(bucket_rows)
+            .filter(|row| {
+                ["evidence_ref", "identity_parts"]
+                    .iter()
+                    .any(|key| row.get(*key).is_some_and(|value| !value.is_null()))
+            })
+            .count() as u64;
+    }
+    Ok(identity)
 }
 
 fn request_set_fingerprint(request_ids: &BTreeSet<String>) -> String {

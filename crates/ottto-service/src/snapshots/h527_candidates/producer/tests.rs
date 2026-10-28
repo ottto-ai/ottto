@@ -69,6 +69,10 @@ fn write_lines(path: &Path, lines: &[Value]) {
 }
 
 fn write_transcript(path: &Path, session: &str, requests: &[Request<'_>]) {
+    write_lines(path, &transcript_lines(session, requests));
+}
+
+fn transcript_lines(session: &str, requests: &[Request<'_>]) -> Vec<Value> {
     let mut lines = vec![json!({
         "timestamp": "2026-09-02T06:00:00Z",
         "type": "user",
@@ -78,7 +82,15 @@ fn write_transcript(path: &Path, session: &str, requests: &[Request<'_>]) {
     for (minute, request) in requests.iter().enumerate() {
         lines.push(assistant_line(session, minute, *request));
     }
-    write_lines(path, &lines);
+    lines
+}
+
+/// A provider fork copy: the holder's own session id, the source it names.
+fn fork_copy(session: &str, named: &str, request: Request<'_>, uuid: &str) -> Value {
+    let mut line = assistant_line(session, 0, request);
+    line["forkedFrom"] = json!({"sessionId": named, "messageUuid": format!("src-{uuid}")});
+    line["uuid"] = json!(uuid);
+    line
 }
 
 /// Requests per target ordinal. Overlaps:
@@ -91,7 +103,15 @@ fn write_transcript(path: &Path, session: &str, requests: &[Request<'_>]) {
 /// - a two-hop fork chain re-copies target 8's `req-t08-a` (no exclusion);
 /// - a fork copy of target 9 carries a non-target id (no hold);
 /// - a fork copy names an absent source for target 10's `req-t10-a`, the
-///   conservative exclusion.
+///   conservative exclusion;
+/// - a copy names a present peer that never counted target 11's `req-t11-a`
+///   (excluded: presence is per line, not per file);
+/// - target 12's own transcript holds a copy of target 13's `req-t13-a`
+///   naming an absent source (excluded: target files are consulted);
+/// - a copy names target 14, which does not count target 15's `req-t15-a`
+///   (excluded);
+/// - a copy names target 16, whose own copy of target 17's `req-t17-a` names
+///   target 17 (resolved through the target file, no exclusion).
 fn target_requests(ordinal: u64) -> Vec<(String, u64, u64, u64)> {
     let own = |suffix: &str, input: u64| (format!("req-t{ordinal:02}-{suffix}"), input, 2, 100);
     match ordinal {
@@ -128,7 +148,26 @@ fn fixture() -> Fixture {
             .iter()
             .map(|(id, input, output, cache)| (id.as_str(), *input, *output, *cache))
             .collect::<Vec<_>>();
-        write_transcript(&path, &session, &borrowed);
+        // Provider fork copies sit before a session's own records.
+        let prefix = match ordinal {
+            12 => vec![fork_copy(
+                &session,
+                ABSENT_SESSION,
+                ("req-t13-a", 20, 2, 100),
+                "target-12-copy",
+            )],
+            16 => vec![fork_copy(
+                &session,
+                &session_id(17),
+                ("req-t17-a", 24, 2, 100),
+                "target-16-copy",
+            )],
+            _ => Vec::new(),
+        };
+        write_lines(
+            &path,
+            &[prefix, transcript_lines(&session, &borrowed)].concat(),
+        );
         targets.push(InputTarget {
             source_session_id: session.clone(),
             session_key_sha256: key(&session),
@@ -169,12 +208,6 @@ fn fixture() -> Fixture {
         &[("req-t02-a", 20, 2, 100), ("req-b2-ack", 300, 30, 0)],
     );
     // Target 8 -> middle -> tail: the tail's copy names the middle session.
-    fn fork_copy(session: &str, named: &str, request: Request<'_>, uuid: &str) -> Value {
-        let mut line = assistant_line(session, 0, request);
-        line["forkedFrom"] = json!({"sessionId": named, "messageUuid": format!("src-{uuid}")});
-        line["uuid"] = json!(uuid);
-        line
-    }
     for (session, named) in [
         (CHAIN_MIDDLE_SESSION, session_id(8)),
         (CHAIN_TAIL_SESSION, CHAIN_MIDDLE_SESSION.to_string()),
@@ -204,6 +237,24 @@ fn fixture() -> Fixture {
                 ABSENT_SESSION,
                 ("req-t10-a", 17, 2, 100),
                 "copy-absent",
+            ),
+            fork_copy(
+                COPY_HOLDER_SESSION,
+                PEER_SESSION,
+                ("req-t11-a", 18, 2, 100),
+                "copy-present-peer",
+            ),
+            fork_copy(
+                COPY_HOLDER_SESSION,
+                &session_id(14),
+                ("req-t15-a", 22, 2, 100),
+                "copy-target-14",
+            ),
+            fork_copy(
+                COPY_HOLDER_SESSION,
+                &session_id(16),
+                ("req-t17-a", 24, 2, 100),
+                "copy-target-16",
             ),
         ],
     );
@@ -248,6 +299,7 @@ fn fixture() -> Fixture {
             },
         ],
         bounds: InputBounds {
+            max_walk_entries: 1000,
             max_peer_files: 100,
             max_peer_total_bytes: 1 << 20,
             max_peer_file_bytes: 1 << 20,
@@ -363,17 +415,55 @@ fn producer_excludes_each_overlap_once_and_reconciles_ordinary_bodies() {
         );
         total_excluded += excluded(report).len();
     }
-    assert_eq!(total_excluded, 5);
+    assert_eq!(total_excluded, 8);
     let manifest = &artifact["input_manifest"];
-    // Target 6's fork child and both chain copies. The copy naming target 9
-    // carries no target's id, so it never enters the census.
-    assert_eq!(manifest["inherited_copy_resolved_line_count"], 3);
+    // Target 6's fork child, both chain copies, the copy naming target 16 and
+    // target 16's own copy naming target 17. The copy naming target 9 carries
+    // no target's id, so it never enters the census.
+    assert_eq!(manifest["inherited_copy_resolved_line_count"], 5);
+    assert_eq!(manifest["target_inherited_copy_line_count"], 2);
     assert_eq!(
         target_report(&artifact, 9)["candidate_status"],
         "computed_unqualified"
     );
-    assert_eq!(manifest["inherited_copy_absent_source_line_count"], 1);
+    assert_eq!(manifest["inherited_copy_absent_source_line_count"], 4);
     assert!(excluded(target_report(&artifact, 8)).is_empty());
+    assert!(excluded(target_report(&artifact, 17)).is_empty());
+    // N1: the named peer is present but never counted the request.
+    let [witness] = excluded(target_report(&artifact, 11)).as_slice() else {
+        panic!("one exclusion")
+    };
+    assert_eq!(witness["cause"], "inherited_from_absent_source");
+    assert_eq!(
+        witness["peer_owner_session_sha256"],
+        sha256_hex(PEER_SESSION.as_bytes())
+    );
+    // N1: a named target that does not count the request is no source either.
+    let [witness] = excluded(target_report(&artifact, 15)).as_slice() else {
+        panic!("one exclusion")
+    };
+    assert_eq!(witness["cause"], "inherited_from_absent_source");
+    // N2: a copy inside target 12's own transcript, witnessed by that file.
+    let [witness] = excluded(target_report(&artifact, 13)).as_slice() else {
+        panic!("one exclusion")
+    };
+    assert_eq!(witness["cause"], "inherited_from_absent_source");
+    assert_eq!(
+        witness["peer_path_sha256"],
+        target_report(&artifact, 12)["transcript_path_sha256"]
+    );
+    // Target 12's copy is skipped by its own parse: its body is untouched.
+    assert!(excluded(target_report(&artifact, 12)).is_empty());
+    // Walk breadth is counted; the whole plan was read.
+    assert_eq!(manifest["over_cap_peer_file_count"], 0);
+    assert_eq!(manifest["planned_peer_file_count"], 7);
+    assert_eq!(manifest["peer_file_count"], 7);
+    assert_eq!(
+        manifest["planned_peer_bytes"],
+        manifest["cumulative_peer_bytes_read"]
+    );
+    assert!(manifest["walk_entry_count"].as_u64().expect("entries") > 7);
+    assert_eq!(manifest["peer_grown_during_read_count"], 0);
     let [witness] = excluded(target_report(&artifact, 10)).as_slice() else {
         panic!("one exclusion")
     };
@@ -538,6 +628,12 @@ fn producer_holds_every_target_without_a_body_on_unknown_or_capped_peers() {
     });
     let mut capped = fixture.input.clone();
     capped.bounds.max_peer_files = 1;
+    let mut narrow = fixture.input.clone();
+    narrow.bounds.max_walk_entries = 3;
+    let mut over_budget = fixture.input.clone();
+    over_budget.bounds.max_peer_total_bytes = 10;
+    let mut over_cap = fixture.input.clone();
+    over_cap.bounds.max_peer_file_bytes = 1;
     // A failed read still spends the byte budget.
     let broken = fixture.root.join("broken");
     fs::create_dir_all(&broken).expect("mkdir");
@@ -596,10 +692,22 @@ fn producer_holds_every_target_without_a_body_on_unknown_or_capped_peers() {
         (unknown, "incomplete_census"),
         (unrooted, "incomplete_census"),
         (capped, "cap_overflow"),
+        (narrow, "cap_overflow"),
+        (over_budget, "cap_overflow"),
+        (over_cap, "cap_overflow"),
     ] {
         let output = produce(&input, &"0".repeat(64), &fixture_build()).expect("produce");
         let artifact: Value = serde_json::from_str(&output.artifact_json).expect("artifact");
         assert_eq!(artifact["global_coverage"]["complete"], false);
+        if reason == "cap_overflow" {
+            // A budget overrun is found by the metadata walk: never a partial read.
+            assert_eq!(artifact["input_manifest"]["cumulative_peer_bytes_read"], 0);
+            assert_eq!(artifact["input_manifest"]["peer_file_count"], 0);
+            if artifact["input_manifest"]["bounds"]["max_peer_file_bytes"] == 1 {
+                // Every over-cap peer is counted, not only the first.
+                assert_eq!(artifact["input_manifest"]["over_cap_peer_file_count"], 7);
+            }
+        }
         assert_eq!(output.summary["computed_unqualified_candidates"], 0);
         for ordinal in 1..=18 {
             let report = target_report(&artifact, ordinal);
@@ -612,4 +720,118 @@ fn producer_holds_every_target_without_a_body_on_unknown_or_capped_peers() {
             .contains("unqualified_batch_request_json"));
     }
     let _ = fs::remove_dir_all(&fixture.root);
+}
+
+/// Request-identity keys a body of this producer must never carry.
+const IDENTITY_KEYS: [&str; 4] = [
+    "evidence_ref",
+    "identity_parts",
+    "request_evidence",
+    "request_identity_refusals",
+];
+
+/// Every identity key anywhere in `value`, including inside embedded JSON
+/// text such as the body bytes, is null, empty or zero.
+fn assert_identity_free(value: &Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if IDENTITY_KEYS.contains(&key.as_str()) {
+                    assert!(
+                        value.is_null()
+                            || value.as_array().is_some_and(Vec::is_empty)
+                            || value.as_u64() == Some(0),
+                        "{key} carries identity"
+                    );
+                }
+                assert_identity_free(value);
+            }
+        }
+        Value::Array(values) => values.iter().for_each(assert_identity_free),
+        Value::String(text) if text.starts_with('{') => {
+            if let Ok(embedded) = serde_json::from_str::<Value>(text) {
+                assert_identity_free(&embedded);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn producer_bodies_stay_untagged_and_identity_never_reaches_the_artifact() {
+    let fixture = fixture();
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).expect("produce");
+    let artifact: Value = serde_json::from_str(&output.artifact_json).expect("artifact");
+    assert_eq!(output.summary["computed_unqualified_candidates"], 18);
+    assert_identity_free(&artifact);
+    for ordinal in 1..=18 {
+        let report = target_report(&artifact, ordinal);
+        let body = report["body"]["unqualified_batch_request_json"]
+            .as_str()
+            .expect("body");
+        assert!(serialized_request_identity(body)
+            .expect("identity check")
+            .untagged());
+        let receipt = &report["identity_receipt"];
+        assert_eq!(receipt["tagged_count"], 0);
+        assert_eq!(receipt["body_request_evidence_count"], 0);
+        assert_eq!(receipt["body_rows_with_identity"], 0);
+        for entry in receipt["entries"].as_array().expect("entries") {
+            assert_eq!(entry["tag_state"], "untagged");
+        }
+    }
+    // A tagged body is refused, whatever produced it.
+    let tagged = json!({"snapshots": [{
+        "request_evidence": [{"evidence": "e"}],
+        "request_identity_refusals": 1,
+        "model_usage": [{"evidence_ref": 0}],
+        "usage_buckets": [{"model_usage": [{"identity_parts": {"a": 1}}, {}]}],
+    }]})
+    .to_string();
+    let identity = serialized_request_identity(&tagged).expect("identity check");
+    assert!(!identity.untagged());
+    assert_eq!(
+        identity,
+        BodyIdentity {
+            request_evidence: 1,
+            request_identity_refusals: 1,
+            rows_with_identity: 2,
+        }
+    );
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn producer_caps_are_pinned_apart_from_the_parser_cap() {
+    let bounds = InputBounds {
+        max_walk_entries: 1,
+        max_peer_files: 1,
+        max_peer_total_bytes: 1,
+        max_peer_file_bytes: PEER_FILE_BYTES_CEILING,
+        max_line_bytes: MAX_JSONL_LINE_BYTES as u64,
+    };
+    assert!(validate_bounds(&bounds).is_ok());
+    // Peers stream line by line, so a peer over the parser's file cap is read.
+    assert!(validate_bounds(&InputBounds {
+        max_peer_file_bytes: MAX_JSONL_FILE_BYTES + 1,
+        ..bounds
+    })
+    .is_ok());
+    for invalid in [
+        InputBounds {
+            max_peer_file_bytes: PEER_FILE_BYTES_CEILING + 1,
+            ..bounds
+        },
+        InputBounds {
+            max_line_bytes: MAX_JSONL_LINE_BYTES as u64 + 1,
+            ..bounds
+        },
+        InputBounds {
+            max_walk_entries: 0,
+            ..bounds
+        },
+    ] {
+        assert!(validate_bounds(&invalid).is_err());
+    }
+    assert_eq!(TARGET_FILE_BYTES_CAP, 256 * 1024 * 1024);
 }
