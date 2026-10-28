@@ -1352,6 +1352,15 @@ fn compressed_record_refuses_before_certificate_restore_or_body_decode() {
 /// keeps its identity interpretation byte for byte under the always-on
 /// capture, so it binds and restores; nothing is refused. Codex never
 /// captured and still does not.
+///
+/// This is a same-binary round trip: no record bytes written by the
+/// previous binary are replayed. Its cross-version claim rests on the
+/// pinned literal interpretation below, on `durable_tail.rs`, its store and
+/// codec being unchanged from the permit-era base (7997fe740), and on the
+/// sampled-scope goldens (`the_always_on_sampled_scope_keeps_the_permit_era_bytes`).
+/// A restore reads only its bounded certificate and re-derivation bytes,
+/// never the transcript in Full; an unsupported heap layout cannot restore
+/// and says so.
 #[test]
 fn a_permit_era_record_restores_under_the_always_on_capture() {
     let root = crate::test_scratch::private_dir("ottto-dt-contract5");
@@ -1441,6 +1450,17 @@ fn a_permit_era_record_restores_under_the_always_on_capture() {
     if supported {
         assert!(counts.ineligible.is_empty(), "{:?}", counts.ineligible);
         assert_eq!(counts.refused_record, 0);
+        // No Full read: re-derivation reads less than the transcript.
+        let transcript = std::fs::metadata(&path).unwrap().len();
+        let read = counts.rederive_head_bytes + counts.rederive_line_bytes;
+        assert!(read < transcript, "re-derived {read} of {transcript} bytes");
+    } else {
+        std::io::Write::write_all(
+            &mut std::io::stderr().lock(),
+            b"a_permit_era_record_restores_under_the_always_on_capture: UNEXECUTED \
+              (heap layout unsupported; restore not exercised)\n",
+        )
+        .unwrap();
     }
     assert_eq!(counts.restored, u64::from(supported));
     assert_eq!(disk.records_read, 1);

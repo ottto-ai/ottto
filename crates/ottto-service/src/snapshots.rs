@@ -10468,8 +10468,12 @@ fn claude_family_members_unobserved_where(
 /// families records them, digested with their members' fingerprints. A due
 /// re-arm is skipped only when that record exists under the same basis (D1
 /// derivation, scan identity, record version, identity contract), the
-/// contract-5 latch is clear, every recorded family is still indexed with
-/// unchanged member fingerprints, and no other structural family appeared.
+/// recorded contract is this cycle's, every recorded family is still indexed
+/// with unchanged member fingerprints, and no other structural family
+/// appeared. The basis names the contract, so a real contract change
+/// re-arms once and records the new baseline; the contract-5 latch alone
+/// never repeats a due re-arm (its re-read is the identity contract re-arm
+/// or E2's paced debt), and a mid-traversal placeholder matches no contract.
 /// Then re-reading every file reproduces each recorded family's invalidity,
 /// so the next census is invalid again and the fence cannot open. Any change
 /// re-arms once; that window records the new set. A census closed only by
@@ -10521,8 +10525,8 @@ fn claude_full_rearm_structural_terminal(
         return false;
     }
     let basis = claude_full_rearm_record_basis(identity_contract);
-    let contract_settled = !index.claude_request_identity_contract_changed
-        && index.claude_request_identity_contract.as_deref() == Some(identity_contract);
+    let contract_current =
+        index.claude_request_identity_contract.as_deref() == Some(identity_contract);
     let mut roots = current.clone();
     if let Some(record) = progress.structural_record.as_ref() {
         roots.extend(record.families.keys().cloned());
@@ -10561,7 +10565,7 @@ fn claude_full_rearm_structural_terminal(
     });
     let suppressed = full_rearm_due
         && !first_proof_veto
-        && contract_settled
+        && contract_current
         && coverage_explained
         && baseline_matches
         && !progress.structural_rearm_owed;
@@ -10570,7 +10574,7 @@ fn claude_full_rearm_structural_terminal(
     // Observations may dirty a baseline at any terminal, but only a real
     // due whole-index re-arm can promote the candidate and settle the debt.
     if let Some(families) =
-        observed_families.filter(|_| contract_settled && full_rearm_due && !suppressed)
+        observed_families.filter(|_| contract_current && full_rearm_due && !suppressed)
     {
         let same = progress
             .structural_record
