@@ -2890,11 +2890,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 case == "grown",
             );
             index = next;
-            let reason = if case == "due marker" {
-                FullReason::AuditDue
-            } else {
-                FullReason::StateMissing
-            };
+            let reason = FullReason::StateMissing;
             assert_eq!(reasons[reason.slot()], 1, "{case}: {reasons:?}");
             assert!(
                 committed >= opened + interval,
@@ -2913,7 +2909,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                 );
                 // Keep AD-1's stable Full-completion control distinct from
                 // R2's valid-checkpoint Tail case below. No RAM state survives
-                // this explicit eviction; the legacy no-state audit remains.
+                // this explicit eviction; missing state determines the reason.
                 cache.clear();
                 assert!(cache.retained_checkpoint(&key).is_none());
                 let (next, opened, committed, reasons) = certify_job(
@@ -2926,9 +2922,9 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
                     false,
                 );
                 index = next;
-                // The due marker selects a stable `Full(AuditDue)` read.
+                // Selection is due, but checkpoint absence is the Full cause.
                 assert_eq!(
-                    reasons[FullReason::AuditDue.slot()],
+                    reasons[FullReason::StateMissing.slot()],
                     1,
                     "{case}: {reasons:?}"
                 );

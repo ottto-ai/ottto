@@ -685,8 +685,8 @@ fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
     assert_layout_mode(audited.modes, (0, 0, 1));
     assert_eq!(
         audited.reasons[FullReason::AuditDue.slot()],
-        usize::from(!crate::heap_layout_bound::layout_supported()),
-        "a usable checkpoint is not reread for audit age"
+        0,
+        "audit age never labels a native Full, even without a checkpoint"
     );
 }
 

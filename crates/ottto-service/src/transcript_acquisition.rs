@@ -610,7 +610,20 @@ fn read_sample(file: &mut File, offset: u64, len: usize, count: &mut usize) -> i
     let mut bytes = vec![0; len];
     let mut read = 0;
     while read < bytes.len() {
-        let n = file.read(&mut bytes[read..])?;
+        #[cfg(test)]
+        let read_offset = file.stream_position().map_err(|error| error.kind());
+        let result = file.read(&mut bytes[read..]);
+        #[cfg(test)]
+        SAMPLE_READS.with(|reads| {
+            if let Some(reads) = reads.borrow_mut().as_mut() {
+                reads.push(SampleRead {
+                    offset: read_offset,
+                    requested: bytes.len() - read,
+                    result: result.as_ref().copied().map_err(io::Error::kind),
+                });
+            }
+        });
+        let n = result?;
         *count += n;
         if n == 0 {
             return Err(io::Error::new(
@@ -687,20 +700,20 @@ fn select_mode(
 ) -> io::Result<ReadMode> {
     // Only PrefixSeal uses the exact-stamp view. Its proof horizon stays
     // intact until S1; acquisition checkpoints reuse by content checks,
-    // regardless of the audit clock or a carried deadline. Without a
-    // checkpoint, existing audit/recovery behavior is outside this cut.
-    let legacy_audit = old.as_ref().map_or(true, |old| old.exact_stamp);
+    // regardless of the audit clock or a carried deadline. A missing
+    // checkpoint is StateMissing; debt never supplies Full authority.
+    let proof_horizon = old.as_ref().is_some_and(|old| old.exact_stamp);
     let clock_changed = old
         .as_ref()
         .is_some_and(|old| old.exact_stamp && now < old.verified)
-        || (legacy_audit
+        || (proof_horizon
             && debt.is_some_and(|d| {
                 now.checked_add(AUDIT_INTERVAL_SECONDS)
                     .is_some_and(|latest| d.due_unix_seconds > latest)
             }));
     Ok(if clock_changed {
         ReadMode::Full(FullReason::ClockChanged)
-    } else if legacy_audit && debt.is_some_and(|d| now >= d.due_unix_seconds) {
+    } else if proof_horizon && debt.is_some_and(|d| now >= d.due_unix_seconds) {
         ReadMode::Full(FullReason::AuditDue)
     } else if let Some(old) = old {
         if !old.samples_valid {
@@ -1625,6 +1638,43 @@ pub(crate) fn samples_match_calls() -> u64 {
     SAMPLES_MATCH_CALLS.with(|calls| calls.replace(0))
 }
 
+/// Test-only observations at the actual File::read call in read_sample.
+/// They include short/failed reads, not inferred completed-plan metrics.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SampleRead {
+    pub(crate) offset: Result<u64, io::ErrorKind>,
+    pub(crate) requested: usize,
+    pub(crate) result: Result<usize, io::ErrorKind>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAMPLE_READS: std::cell::RefCell<Option<Vec<SampleRead>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn capture_sample_reads<T>(read: impl FnOnce() -> T) -> (T, Vec<SampleRead>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SAMPLE_READS.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    SAMPLE_READS.with(|slot| {
+        assert!(slot.borrow().is_none(), "sample capture cannot nest");
+        *slot.borrow_mut() = Some(Vec::new());
+    });
+    let _reset = Reset;
+    let value = read();
+    let reads = SAMPLE_READS.with(|slot| slot.borrow_mut().take().unwrap());
+    (value, reads)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1756,7 +1806,7 @@ mod tests {
         assert_eq!(idle.audit_debt(), persisted_debt);
         assert_eq!(
             run(&f, None, persisted_debt, 3610).0,
-            ReadMode::Full(FullReason::AuditDue)
+            ReadMode::Full(FullReason::StateMissing)
         );
         let (_, verified, _) = run(&f, None, persisted_debt, 3610);
         assert_eq!(verified.audit_debt(), None);
@@ -1794,6 +1844,7 @@ mod tests {
             (8_000, None, true),
             (8_000, Some(1_100), true),
             (8_000, Some(1_100), false),
+            (181_000, Some(1_100), true),
             (900, Some(u64::MAX), true),
         ] {
             let f = Fixture::new(b"one\n");
@@ -1806,7 +1857,27 @@ mod tests {
             }
             let certificate: DurableCertificate = serde_json::from_slice(&saved).unwrap();
             let mut file = f.open();
-            let (restored, _) = certificate.restore(&mut file, scope()).unwrap();
+            let (result, reads) = capture_sample_reads(|| certificate.restore(&mut file, scope()));
+            let (restored, admission) = result.unwrap();
+            assert_eq!(
+                reads,
+                vec![
+                    SampleRead {
+                        offset: Ok(0),
+                        requested: 4,
+                        result: Ok(4)
+                    },
+                    SampleRead {
+                        offset: Ok(0),
+                        requested: 4,
+                        result: Ok(4)
+                    },
+                ]
+            );
+            assert_eq!(
+                admission.sample_bytes_read, 8,
+                "quiet restore is not zero I/O"
+            );
             assert_eq!(restored.last_full_verified(), 1_000);
             let mut plan =
                 ReadPlan::prepare(&mut file, Some(&restored), &scope(), None, now).unwrap();
@@ -1842,6 +1913,71 @@ mod tests {
                 due.unwrap_or(4_600)
                     .min(if append { 4_600 } else { u64::MAX })
             );
+        }
+    }
+
+    #[test]
+    fn certificate_sample_observer_records_disjoint_windows_and_short_reads() {
+        let bytes = wide_rows("observed");
+        let f = Fixture::new(&bytes);
+        let certificate = initial(&f, 100).durable_certificate(0).unwrap();
+        let (result, reads) = capture_sample_reads(|| certificate.restore(&mut f.open(), scope()));
+        let (_, admission) = result.unwrap();
+        assert_eq!(
+            reads,
+            vec![
+                SampleRead {
+                    offset: Ok(0),
+                    requested: SAMPLE_BYTES,
+                    result: Ok(SAMPLE_BYTES)
+                },
+                SampleRead {
+                    offset: Ok(bytes.len() as u64 - SAMPLE_BYTES as u64),
+                    requested: SAMPLE_BYTES,
+                    result: Ok(SAMPLE_BYTES)
+                },
+            ]
+        );
+        assert_eq!(admission.sample_bytes_read, 2 * SAMPLE_BYTES);
+        // The same read primitive records physical short reads and EOF even
+        // when there is no successful certificate/completed context metric.
+        let mut actual = 0;
+        let (result, reads) = capture_sample_reads(|| {
+            read_sample(&mut f.open(), bytes.len() as u64 - 2, 4, &mut actual)
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(actual, 2);
+        assert_eq!(
+            reads,
+            vec![
+                SampleRead {
+                    offset: Ok(bytes.len() as u64 - 2),
+                    requested: 4,
+                    result: Ok(2)
+                },
+                SampleRead {
+                    offset: Ok(bytes.len() as u64),
+                    requested: 2,
+                    result: Ok(0)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn no_checkpoint_debt_never_supplies_an_audit_or_clock_full_cause() {
+        let f = Fixture::new(b"one\n");
+        for due_unix_seconds in [0, 500, u64::MAX] {
+            for now in [1_000, 181_000] {
+                let debt = Some(AuditDebt { due_unix_seconds });
+                let plan = ReadPlan::prepare(&mut f.open(), None, &scope(), debt, now).unwrap();
+                assert_eq!(plan.mode(), ReadMode::Full(FullReason::StateMissing));
+                assert_eq!(
+                    plan.audit_obligation(),
+                    debt,
+                    "no false debt credit before completion"
+                );
+            }
         }
     }
 
@@ -2118,7 +2254,7 @@ mod tests {
             }),
             100,
         );
-        assert_eq!(mode, ReadMode::Full(FullReason::ClockChanged));
+        assert_eq!(mode, ReadMode::Full(FullReason::StateMissing));
         // AD-T3: a multi-page read whose clock stepped back keeps its start
         // even on an unchanged object, without authorizing another read.
         let stable = Fixture::new(b"one\n");

@@ -716,7 +716,10 @@ fn fe_claude_sp5_residual_sample_preserving_rewrite_after_read_is_accepted() {
     let ((_, next, audit), diagnostics) = crate::local_resource_diagnostics::capture(|| {
         plain(&base.fixture, CLAUDE, index, &base.cache)
     });
-    assert_eq!(audit.full_reasons[AUDIT_DUE], 1, "FE2: quiet Full audit");
+    assert_eq!(
+        audit.full_reasons[STATE_MISSING], 1,
+        "FE2: prefix has no checkpoint, so Full is StateMissing"
+    );
     assert_eq!(audit.unreadable, 0, "FE2: audit completes");
     assert_eq!(
         content(production_body(CLAUDE, next)),
@@ -1836,12 +1839,12 @@ fn fe_n1_held_tail_save_reload_reaches_due_full_and_reproves() {
         CLAUDE,
         loaded,
         &cache,
-        |mode| mode == ReadMode::Full(FullReason::AuditDue),
+        |mode| mode == ReadMode::Full(FullReason::StateMissing),
         |_| {},
     );
-    assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
     assert_eq!(seen.modes, (1, 0, 0));
-    assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+    assert_eq!(seen.full_reasons[STATE_MISSING], 1);
     assert_eq!(seen.unreadable, 0);
     assert!(!audited.files[&key].has_unverified_source());
     let record = audited.claude_request_census_for_test().get(&key).unwrap();
@@ -1952,7 +1955,8 @@ fn restore_dated(index: &mut ScanIndex, due: u64) -> usize {
 /// Option B (SOURCE rule 3): after a marker-erasing downgrade, nothing reads
 /// the unchanged held file again. A sampled scan re-derives its deadline from
 /// the persisted hold without reading, one interval out and once. The
-/// restored deadline survives save/reload, comes due as Full(AuditDue), and
+/// restored deadline survives save/reload and selects the missing-checkpoint
+/// Full(StateMissing), never a Full caused by audit age, and
 /// the verified source lets the saved witness re-prove.
 #[test]
 fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
@@ -2016,12 +2020,12 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
         CLAUDE,
         loaded,
         &hold.cache,
-        |mode| mode == ReadMode::Full(FullReason::AuditDue),
+        |mode| mode == ReadMode::Full(FullReason::StateMissing),
         |_| {},
     );
-    assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
     assert_eq!(seen.modes, (1, 0, 0));
-    assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+    assert_eq!(seen.full_reasons[STATE_MISSING], 1);
     assert_eq!(seen.unreadable, 0);
     assert!(!audited.files[&key].has_unverified_source());
     let record = audited.claude_request_census_for_test().get(&key).unwrap();
@@ -2134,10 +2138,10 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
         CLAUDE,
         loaded,
         &hold.cache,
-        |mode| mode == ReadMode::Full(FullReason::AuditDue),
+        |mode| mode == ReadMode::Full(FullReason::StateMissing),
         |_| {},
     );
-    assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
     assert_eq!(seen.modes, (1, 0, 0));
     assert_eq!(seen.unreadable, 0);
     assert!(
@@ -2253,7 +2257,7 @@ fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reloa
         sampled_scan::set_test_now(Some(due));
         let (mut index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
         assert_eq!(seen.modes, (1, 0, 0));
-        assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+        assert_eq!(seen.full_reasons[STATE_MISSING], 1);
         assert_eq!(seen.unreadable, 0);
         assert!(!index
             .claude_request_census_for_test()
@@ -2371,7 +2375,7 @@ fn fe_n1_option_b_saturated_non_draining_debts_do_not_starve_many_readable_holds
         });
         index = next;
         assert!(seen.modes.0 <= 1, "one recovery Full per page");
-        assert_eq!(seen.modes.0, seen.full_reasons[AUDIT_DUE]);
+        assert_eq!(seen.modes.0, seen.full_reasons[STATE_MISSING]);
         fulls += seen.modes.0;
         for key in &readable {
             if index
@@ -2459,7 +2463,7 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
         sampled_scan::set_test_now(Some(due - 3 * INTERVAL));
         let mut index = if failure != 0 {
             let (index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
-            assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+            assert_eq!(seen.full_reasons[STATE_MISSING], 1);
             if failure == 1 {
                 assert!(result.over_line_cap_count > 0);
             } else {
@@ -2477,13 +2481,13 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
                 CLAUDE,
                 index,
                 &hold.cache,
-                |mode| mode == ReadMode::Full(FullReason::AuditDue),
+                |mode| mode == ReadMode::Full(FullReason::StateMissing),
                 |_| {
                     fs::rename(&path, &parked).unwrap();
                     std::os::unix::fs::symlink("missing-target", &path).unwrap();
                 },
             );
-            assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+            assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
             assert!(seen.unreadable > 0, "completion re-open must fail");
             fs::remove_file(&path).unwrap();
             fs::rename(&parked, &path).unwrap();
@@ -2519,7 +2523,7 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
         let index = ScanIndex::load(&hold.index_path).unwrap();
         sampled_scan::set_test_now(Some(due - INTERVAL));
         let (mut index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
-        assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+        assert_eq!(seen.full_reasons[STATE_MISSING], 1);
         assert_eq!(seen.unreadable, 0);
         assert!(!index
             .claude_request_census_for_test()
