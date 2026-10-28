@@ -1271,14 +1271,18 @@ mod durable_restart {
             let mut old = serde_json::to_value(&prior).unwrap();
             old["claude_request_census_shadow"] = json!({"o":true,"f":7,"d":9});
             if array {
-                old = Value::Array(
-                    lenient_decode::FIELDS
-                        .iter()
-                        .map(|name| old[*name].clone())
-                        .collect(),
-                );
+                old = crate::snapshots::lenient_decode_tests::old_census_shadow_array(&prior);
             }
-            fs::write(&state.index_path, serde_json::to_vec(&old).unwrap()).unwrap();
+            let bytes = serde_json::to_vec(&old).unwrap();
+            let native: ScanIndex = serde_json::from_slice(&bytes)
+                .expect("legacy map/array has every slot's native type");
+            let strict = lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed")
+                .expect("old shadow loads through strict field decoding");
+            for decoded in [native, strict] {
+                assert!(decoded.decode_holds.is_empty());
+                assert_eq!(serde_json::to_vec(&decoded).unwrap(), expected);
+            }
+            fs::write(&state.index_path, bytes).unwrap();
             let mut upgraded = ScanIndex::load(&state.index_path).unwrap();
             assert!(upgraded.decode_holds.is_empty());
             assert_eq!(serde_json::to_vec(&upgraded).unwrap(), expected);

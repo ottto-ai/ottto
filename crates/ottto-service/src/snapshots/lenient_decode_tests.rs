@@ -4719,6 +4719,165 @@ fn retired_reread_new_writer_keeps_previous_default_contract() {
     );
 }
 
+/// A positional record carries native values even where the map writer
+/// omits defaults. Indexing an omitted map key would fabricate invalid nulls.
+pub(super) fn old_census_shadow_array(index: &ScanIndex) -> Value {
+    let mut fields = serde_json::Map::new();
+    macro_rules! native_fields {
+        ($($name:ident),+ $(,)?) => {$(
+            fields.insert(stringify!($name).into(), serde_json::to_value(&index.$name).unwrap());
+        )+};
+    }
+    native_fields!(
+        schema_version,
+        generation,
+        upload_context_fingerprint,
+        files,
+        session_account_bindings,
+        terminal_jsonl_dispositions,
+        known_configured_scan_roots,
+        legacy_unresolved_root_file_witnesses,
+        codex_state_only_snapshot_fingerprints,
+        codex_state_only_blocked_session_ids,
+        codex_state_only_blocked_by_file,
+        codex_state_only_blocked_unattributed,
+        codex_state_only_blocked_legacy,
+        codex_state_only_blocked_attributed,
+        codex_parent_ownership_refs,
+        codex_parent_ownership_ledgers,
+        codex_parent_side_requests,
+        codex_parent_side,
+        codex_parent_side_generation,
+        codex_parent_proof_wrap_epoch,
+        codex_parent_prefix_proofs,
+        codex_parent_proof_cursor,
+        codex_parent_side_cursor,
+        codex_parent_proof_seq,
+        codex_proof_index_incarnation,
+        claude_desktop_title_files,
+        claude_account_family_witnesses,
+        claude_account_family_pending,
+        claude_usage_family_witnesses,
+        claude_usage_family_pending,
+        claude_request_census,
+        claude_usage_authority_quarantine,
+        claude_retired_family_tombstones,
+        claude_retired_family_tombstones_initialized,
+        claude_retired_family_tombstones_uncertain,
+        claude_duplicate_request_owners,
+        claude_duplicate_request_witness_overflowed,
+        claude_owned_start_census,
+        claude_account_deferred_holds,
+        claude_duplicate_fence_rearm_attempt,
+        claude_duplicate_fence_next_full_rearm_unix_seconds,
+        claude_full_rearm_progress,
+        claude_request_identity_contract,
+        claude_request_identity_contract_changed,
+        claude_desktop_store_cursor,
+        claude_desktop_store_upper_bound,
+        claude_desktop_store_sweep_had_errors,
+        claude_desktop_identity_census_complete,
+        claude_desktop_lineage_census_complete,
+        claude_desktop_census_witness,
+        claude_desktop_store_retry_attempt,
+        claude_desktop_store_retry_not_before_unix_seconds,
+        resume_after_path,
+        resume_upper_bound_path,
+        resume_census_window_end,
+        bounded_sweep_had_unsettled_upload,
+        bounded_sweep_unsettled_causes,
+        traversal,
+        claude_stale_family_carry,
+        scan_residue_witness,
+        historical_replay_generation,
+        context_curve_capability_enabled,
+        context_curve_replay_epoch,
+        completed_context_curve_replay_generation,
+        confirmed_empty_files,
+        file_snapshot_fingerprints,
+        snapshot_activity_at,
+        accepted_snapshot_fingerprints,
+        accepted_snapshot_fingerprint_ledger_version,
+        legacy_settlement_reconcile_after_fingerprint,
+        quarantined_snapshot_fingerprints,
+        claude_history_cutoff_unix_seconds,
+        claude_history_gate_loaded,
+        claude_history_move_not_full,
+        claude_history_move_released,
+        accepted_incidence_pending_census,
+        accepted_rebuild_incidence,
+        accepted_rebuild_pending_since_unix_seconds,
+        accepted_rebuild_last_alarm_unix_seconds,
+        codex_counting_tombstones,
+        codex_counting_evicted_legacy,
+        upload_ack_retirement_handoff,
+        held_audit_progress,
+        claude_money_birth_store,
+    );
+    fields.insert("reread_guard".into(), serde_json::json!({"closed":true,"observed_reads":41}));
+    fields.insert(
+        "claude_request_census_shadow".into(),
+        serde_json::json!({"o":true,"f":7,"d":9}),
+    );
+    assert_eq!(
+        fields.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        lenient_decode::FIELDS.iter().copied().collect()
+    );
+    Value::Array(
+        lenient_decode::FIELDS
+            .iter()
+            .map(|name| fields[*name].clone())
+            .collect(),
+    )
+}
+
+#[test]
+fn retired_shadow_sparse_array_uses_native_defaults_instead_of_missing_key_nulls() {
+    let index = ScanIndex::default();
+    let mut map = serde_json::to_value(&index).unwrap();
+    map["claude_request_census_shadow"] = serde_json::json!({"o":true,"f":7,"d":9});
+    assert!(map.get("session_account_bindings").is_none());
+    let malformed = Value::Array(
+        lenient_decode::FIELDS
+            .iter()
+            .map(|name| map[*name].clone())
+            .collect(),
+    );
+    let slot = lenient_decode::FIELDS
+        .iter()
+        .position(|name| *name == "session_account_bindings")
+        .unwrap();
+    assert!(
+        malformed[slot].is_null(),
+        "the former fixture fabricated null for a map"
+    );
+    let bytes = serde_json::to_vec(&malformed).unwrap();
+    assert!(matches!(
+        lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed"),
+        Err(lenient_decode::Error::Refused("record type"))
+    ));
+    let array = old_census_shadow_array(&index);
+    assert_eq!(array[slot], serde_json::json!({}));
+    let shadow = lenient_decode::FIELDS
+        .iter()
+        .position(|name| *name == "claude_request_census_shadow")
+        .unwrap();
+    assert_eq!(array[shadow], serde_json::json!({"o":true,"f":7,"d":9}));
+    for form in [map, array] {
+        let bytes = serde_json::to_vec(&form).unwrap();
+        let native: ScanIndex = serde_json::from_slice(&bytes).expect("valid legacy typed shape");
+        let strict = lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed")
+            .expect("valid legacy shape through the production strict field path");
+        for decoded in [native, strict] {
+            assert!(decoded.decode_holds.is_empty());
+            assert_eq!(
+                serde_json::to_vec(&decoded).unwrap(),
+                serde_json::to_vec(&index).unwrap()
+            );
+        }
+    }
+}
+
 /// F1/F2: an old slot is consumed, including on the full positional schema.
 /// Every other field is non-default so a shift or reset cannot pass silently.
 #[test]
@@ -4729,12 +4888,7 @@ fn retired_census_shadow_keeps_old_map_and_array_custody() {
     let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
     let mut old = expected.clone();
     old["claude_request_census_shadow"] = serde_json::json!({"o":true,"f":7,"d":9});
-    let array = Value::Array(
-        lenient_decode::FIELDS
-            .iter()
-            .map(|name| old[*name].clone())
-            .collect(),
-    );
+    let array = old_census_shadow_array(&seed);
     let escaped = "claude_request_census_shadow"
         .chars()
         .map(|ch| format!("\\u{:04x}", ch as u32))
