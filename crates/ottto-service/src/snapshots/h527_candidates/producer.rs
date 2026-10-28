@@ -192,7 +192,8 @@ pub(crate) struct InputBounds {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CatalogPrices {
     pub(crate) publication: CatalogPublication,
-    /// Keyed `<model>|<context_bucket>`, the parser's own selector bucket.
+    /// Keyed `<model>|<context_bucket>`, the parser's own selector bucket, or
+    /// `<model>|none` for a request the parser stamped with no bucket.
     pub(crate) rates_usd_per_mtok: BTreeMap<String, CatalogRates>,
 }
 
@@ -2575,11 +2576,15 @@ fn estimate_dollars(
             }
         }
         let model = occurrence.model.as_deref().ok_or("unpriced_model")?;
+        // The parser stamps a context bucket only for models with a provider
+        // price line. A request without one is keyed `<model>|none`, a rate
+        // the table supplies only for a model whose price does not depend on
+        // prompt length.
         let bucket = occurrence
             .selector
             .context
             .get("context_bucket")
-            .ok_or("unpriced_model")?;
+            .map_or("none", String::as_str);
         let rates = prices
             .rates_usd_per_mtok
             .get(&format!("{model}|{bucket}"))

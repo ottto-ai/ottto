@@ -312,8 +312,10 @@ fn fixture() -> Fixture {
                 revision: "fixture-1".to_string(),
                 sha256: sha256_hex(b"fixture catalog"),
             },
+            // The fixture model has no provider price line, so the parser
+            // stamps no context bucket.
             rates_usd_per_mtok: BTreeMap::from([(
-                format!("{MODEL}|short"),
+                format!("{MODEL}|none"),
                 CatalogRates {
                     input: "15".to_string(),
                     output: "75".to_string(),
