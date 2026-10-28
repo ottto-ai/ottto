@@ -31616,6 +31616,182 @@ X-API-Key = "otel_redacted"
 
     #[test]
     #[serial]
+    #[cfg(unix)]
+    fn rebind_retries_busy_approved_port_instead_of_old_or_default_port() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let ports = startup_relay_candidates();
+        write_startup_relay_settings(
+            &root,
+            &crate::otlp_relay::local_relay_base_url_for_port(ports[1]),
+        );
+        let settings = root.join(".claude/settings.json");
+        let before = fs::read(&settings).unwrap();
+        let mut busy = Some(std::net::TcpListener::bind(("127.0.0.1", ports[1])).unwrap());
+        let mut attempts = 0;
+        let listener = crate::otlp_relay::rebind_relay_listener(ports[0], &mut |old_port| {
+            attempts += 1;
+            let result = crate::otlp_relay::bind_replacement_local_relay_listener(old_port);
+            if attempts == 1 {
+                assert!(
+                    result.is_err(),
+                    "must retry approved port even while default is free"
+                );
+                drop(busy.take());
+            }
+            result
+        });
+        assert_eq!(attempts, 2);
+        assert_eq!(listener.local_addr().unwrap().port(), ports[1]);
+        assert_eq!(fs::read(settings).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn rebind_without_approval_keeps_old_default_and_fallback_chain() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "test".into(),
+                machine_id: None,
+                sources: vec!["codex".into()],
+            })
+            .unwrap();
+        let ports = startup_relay_candidates();
+        let bind = || crate::otlp_relay::bind_replacement_local_relay_listener(ports[1]).unwrap();
+        let old = bind();
+        assert_eq!(old.local_addr().unwrap().port(), ports[1]);
+        let default = bind();
+        assert_eq!(default.local_addr().unwrap().port(), ports[0]);
+        let fallback = bind();
+        assert_eq!(fallback.local_addr().unwrap().port(), ports[2]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn rebind_ignores_approved_port_outside_candidate_list() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        // The fixture's approved 48123 endpoint is outside every uid's list.
+        let ports = startup_relay_candidates();
+        let _busy_old = std::net::TcpListener::bind(("127.0.0.1", ports[1])).unwrap();
+        let listener = crate::otlp_relay::bind_replacement_local_relay_listener(ports[1]).unwrap();
+        assert_eq!(listener.local_addr().unwrap().port(), ports[0]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn relay_endpoint_mismatch_is_response_only_and_clears_with_settings_or_consent() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let daemon = daemon().with_account(connected_account());
+        let saved_account = daemon.account_for_trusted_client().unwrap();
+        let live = ottto_protocol::RelayState {
+            state: ottto_protocol::RelayRuntimeState::Connected,
+            endpoint: Some("http://127.0.0.1:43119".into()),
+            last_connected_at: None,
+            last_error: None,
+        };
+        daemon
+            .set_relay_state_for_trusted_client(live.clone())
+            .unwrap();
+        let settings = root.join(".claude/settings.json");
+        let before = fs::read(&settings).unwrap();
+        let finding = daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .unwrap();
+        assert_eq!(finding.code, "claude_relay_endpoint_mismatch");
+        assert_eq!(
+            finding.text,
+            "Relay connected (127.0.0.1:43119) but Claude settings point at 127.0.0.1:48123."
+        );
+        let diagnostics = crate::claude_local_otel::support_health::diagnostics_items(
+            &root.join("support"),
+            &live,
+        );
+        assert_eq!(
+            diagnostics[&finding.code],
+            ottto_protocol::RedactedValue::String(finding.text.clone())
+        );
+        // Doctor and status share this command. Both retry postures expose it.
+        for retry in [false, true] {
+            let response = handle_request(
+                &daemon,
+                LocalControlRequest {
+                    request_id: "relay-health".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    token: Some("token".into()),
+                    client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
+                    command: LocalControlCommand::Status {
+                        refresh_agent_status: false,
+                        retry_relay_authorization: retry,
+                    },
+                },
+            );
+            assert!(response.ok, "{response:?}");
+            let payload = response.payload.unwrap();
+            assert_eq!(payload["relay"]["state"], "connected");
+            assert_eq!(payload["relay"]["last_error"]["text"], finding.text);
+        }
+        assert_eq!(daemon.account_for_trusted_client().unwrap(), saved_account);
+        assert_eq!(fs::read(&settings).unwrap(), before);
+        assert_eq!(daemon.state().unwrap().relay, live);
+
+        write_startup_relay_settings(&root, "http://127.0.0.1:43119");
+        assert!(daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .is_none());
+        assert!(
+            !crate::claude_local_otel::support_health::diagnostics_items(
+                &root.join("support"),
+                &live
+            )
+            .contains_key(&finding.code)
+        );
+        write_startup_relay_settings(&root, "http://127.0.0.1:48123");
+        let disabled = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "1");
+        assert!(daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .is_none());
+        drop(disabled);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "test".into(),
+                machine_id: None,
+                sources: vec!["codex".into()],
+            })
+            .unwrap();
+        assert!(daemon
+            .status_for_trusted_client()
+            .unwrap()
+            .relay
+            .last_error
+            .is_none());
+        assert!(
+            !crate::claude_local_otel::support_health::diagnostics_items(
+                &root.join("support"),
+                &live
+            )
+            .contains_key(&finding.code)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
     fn managed_claude_relay_creation_reconnect_and_existing_registry_repair() {
         let (root, _guards) = managed_claude_relay_fixture();
         let store = FileClaudeConfigSlotSettingsStore::default();

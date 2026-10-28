@@ -425,8 +425,14 @@ fn health_items(h: Health) -> RedactedValue {
     );
     RedactedValue::Object(fields)
 }
-pub(crate) fn diagnostics_items(support: &Path) -> BTreeMap<String, RedactedValue> {
+pub(crate) fn diagnostics_items(
+    support: &Path,
+    relay: &ottto_protocol::RelayState,
+) -> BTreeMap<String, RedactedValue> {
     let mut fields = BTreeMap::new();
+    if let Some(finding) = crate::otlp_relay::approved_endpoint_mismatch(relay) {
+        fields.insert(finding.code, RedactedValue::String(finding.text));
+    }
     fields.insert(
         "complete_capture_authority".into(),
         RedactedValue::Bool(false),
@@ -465,6 +471,14 @@ pub(crate) fn diagnostics_items(support: &Path) -> BTreeMap<String, RedactedValu
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn unknown_relay() -> ottto_protocol::RelayState {
+        ottto_protocol::RelayState {
+            state: ottto_protocol::RelayRuntimeState::Unknown,
+            endpoint: None,
+            last_connected_at: None,
+            last_error: None,
+        }
+    }
     fn scratch() -> PathBuf {
         crate::test_scratch::private_dir("claude-support-health")
     }
@@ -711,7 +725,7 @@ mod tests {
         append_evidence(&dir, &row).unwrap();
         append_trace_ownership_evidence(&dir, &trace("private-request")).unwrap();
         let before = fs::read(evidence_path(&dir, &row.session_id)).unwrap();
-        let fields = diagnostics_items(&dir);
+        let fields = diagnostics_items(&dir, &unknown_relay());
         assert_eq!(
             fields["complete_capture_authority"],
             RedactedValue::Bool(false)
@@ -738,7 +752,7 @@ mod tests {
         let outside = dir.join("outside");
         fs::write(&outside, &before).unwrap();
         std::os::unix::fs::symlink(&outside, &file).unwrap();
-        let fields = diagnostics_items(&dir);
+        let fields = diagnostics_items(&dir, &unknown_relay());
         match &fields["api"] {
             RedactedValue::Object(api) => {
                 assert_eq!(api["unreadable_files"], RedactedValue::Number(1))
@@ -773,7 +787,7 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         fs::create_dir(dir.join("local-otel")).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("local-otel/claude-code-effort")).unwrap();
-        let fields = diagnostics_items(&dir);
+        let fields = diagnostics_items(&dir, &unknown_relay());
         match &fields["api"] {
             RedactedValue::Object(api) => {
                 assert_eq!(api["files"], RedactedValue::Number(0));
@@ -798,7 +812,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_EVIDENCE_FILE_BYTES)
             .unwrap();
-        let fields = diagnostics_items(&dir);
+        let fields = diagnostics_items(&dir, &unknown_relay());
         match &fields["api"] {
             RedactedValue::Object(api) => {
                 assert_eq!(api["oversized_files"], RedactedValue::Number(1));
@@ -825,7 +839,7 @@ mod tests {
             sign_api(&mut row);
             append_evidence(&dir, &row).unwrap();
         }
-        let fields = diagnostics_items(&dir);
+        let fields = diagnostics_items(&dir, &unknown_relay());
         match &fields["api"] {
             RedactedValue::Object(api) => {
                 assert_eq!(

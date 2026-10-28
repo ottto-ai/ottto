@@ -162,7 +162,7 @@ fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<Soc
         .spawn(move || {
             supervise_relay_listener(
                 listener,
-                |port| bind_local_relay_listener(Some(port)),
+                bind_replacement_local_relay_listener,
                 |state| {
                     let _ = state_daemon.set_relay_state_for_trusted_client(state);
                 },
@@ -409,7 +409,7 @@ fn relay_accept_backoff(failures_in_a_row: u32) -> Duration {
 
 /// Binds a replacement listener, retrying with a bounded backoff for as long
 /// as it takes. The relay reads `Failed` in the meantime.
-fn rebind_relay_listener(
+pub(crate) fn rebind_relay_listener(
     port: u16,
     rebind: &mut impl FnMut(u16) -> Result<TcpListener>,
 ) -> TcpListener {
@@ -513,7 +513,7 @@ fn relay_listener_failed_state(bound_addr: Option<SocketAddr>) -> RelayState {
     }
 }
 
-pub(crate) fn bind_startup_local_relay_listener() -> Result<TcpListener> {
+fn approved_candidate_relay_port() -> Option<u16> {
     let endpoint =
         crate::control::approved_managed_claude_relay_endpoint().unwrap_or_else(|error| {
             relay_log!("could not read approved Claude relay endpoint: {error}");
@@ -521,12 +521,45 @@ pub(crate) fn bind_startup_local_relay_listener() -> Result<TcpListener> {
         });
     // Existing exporters keep their startup endpoint across daemon restarts.
     // Only reuse an address the daemon itself could have selected for this user.
-    let preferred_port = endpoint
+    endpoint
         .as_deref()
         .filter(|endpoint| endpoint.starts_with("http://127.0.0.1:"))
         .and_then(local_relay_port_from_endpoint)
-        .filter(|port| candidate_relay_ports(current_uid()).contains(port));
-    bind_local_relay_listener(preferred_port)
+        .filter(|port| candidate_relay_ports(current_uid()).contains(port))
+}
+
+pub(crate) fn bind_startup_local_relay_listener() -> Result<TcpListener> {
+    bind_local_relay_listener(approved_candidate_relay_port())
+}
+
+pub(crate) fn bind_replacement_local_relay_listener(old_port: u16) -> Result<TcpListener> {
+    if let Some(port) = approved_candidate_relay_port() {
+        // Do not strand exporters when the approved port is briefly busy.
+        // Return the error to the supervisor's existing backoff loop, which
+        // re-reads consent/settings on every attempt.
+        return TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .context("rebind approved local OTLP relay port");
+    }
+    bind_local_relay_listener(Some(old_port))
+}
+
+pub(crate) fn approved_endpoint_mismatch(relay: &RelayState) -> Option<StableMessage> {
+    if relay.state != RelayRuntimeState::Connected {
+        return None;
+    }
+    // A default inferred from missing state is not a live listener address.
+    let live_port = relay
+        .endpoint
+        .as_deref()
+        .and_then(local_relay_port_from_endpoint)?;
+    let approved_port = crate::control::approved_managed_claude_relay_endpoint().ok()??;
+    let approved_port = local_relay_port_from_endpoint(&approved_port)?;
+    (approved_port != live_port).then(|| StableMessage {
+        code: "claude_relay_endpoint_mismatch".to_string(),
+        text: format!(
+            "Relay connected (127.0.0.1:{live_port}) but Claude settings point at 127.0.0.1:{approved_port}."
+        ),
+    })
 }
 
 /// Binds the relay listener. `preferred_port` (from approved settings or a

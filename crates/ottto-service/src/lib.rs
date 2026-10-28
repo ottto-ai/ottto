@@ -629,6 +629,11 @@ impl LocalDaemon {
         if snapshots::claude_native_comparison::enabled() {
             status.native_comparison = Some(self.native_comparison.status());
         }
+        // Response-only finding: never alter saved relay/account state or
+        // perform settings I/O while holding the daemon state lock.
+        if status.relay.last_error.is_none() {
+            status.relay.last_error = otlp_relay::approved_endpoint_mismatch(&status.relay);
+        }
         Ok(status)
     }
 
@@ -1966,7 +1971,10 @@ impl LocalDaemon {
                 #[cfg(unix)]
                 diagnostics_section(
                     "claude_local_evidence",
-                    claude_local_otel::support_health::diagnostics_items(&default_support_dir()),
+                    claude_local_otel::support_health::diagnostics_items(
+                        &default_support_dir(),
+                        &status.relay,
+                    ),
                 ),
             ],
         })

@@ -2560,7 +2560,15 @@ fn human_summary(payload: &serde_json::Value) -> String {
         return sanitize_for_terminal(message);
     }
     if let Some(daemon) = payload.get("daemon").and_then(|value| value.as_str()) {
-        return format!("Ottto local daemon: {}", sanitize_for_terminal(daemon));
+        let mut summary = format!("Ottto local daemon: {}", sanitize_for_terminal(daemon));
+        if payload["relay"]["last_error"]["code"].as_str() == Some("claude_relay_endpoint_mismatch")
+        {
+            if let Some(message) = payload["relay"]["last_error"]["text"].as_str() {
+                summary.push('\n');
+                summary.push_str(&sanitize_for_terminal(message));
+            }
+        }
+        return summary;
     }
     if let Some(source) = payload.get("source").and_then(|value| value.as_str()) {
         return format!(
@@ -3194,6 +3202,20 @@ mod tests {
         .expect("fixture parses");
         assert_eq!(actual, expected);
         assert!(!output.contains("Ottto local daemon"));
+    }
+
+    #[test]
+    fn doctor_human_summary_shows_relay_endpoint_mismatch_only_when_present() {
+        let mut payload = status_response().payload.unwrap();
+        let normal = human_summary(&payload);
+        let message =
+            "Relay connected (127.0.0.1:43119) but Claude settings point at 127.0.0.1:44621.";
+        payload["relay"]["last_error"] = serde_json::json!({
+            "code": "claude_relay_endpoint_mismatch", "text": message,
+        });
+        assert_eq!(human_summary(&payload), format!("{normal}\n{message}"));
+        payload["relay"]["last_error"] = serde_json::Value::Null;
+        assert_eq!(human_summary(&payload), normal);
     }
 
     #[test]

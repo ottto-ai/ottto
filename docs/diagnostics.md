@@ -318,6 +318,26 @@ directory at most 32 MiB; a day that reaches its bound ends with one
 `log_full` line and the summary marks it. Logging is best effort: it never
 fails a provider call, and a line it cannot write promptly is dropped.
 
+## Claude Relay Endpoint Mismatch
+
+When the relay is connected but approved Claude telemetry settings name a
+different loopback port, `ottto doctor` reports both ports. `ottto status --json`
+and `ottto doctor --json` expose `relay.last_error.code` as
+`claude_relay_endpoint_mismatch`; `relay.state` remains `connected`. The
+`claude_local_evidence` diagnostics section includes the same finding.
+
+This compares current approved settings with the daemon's listener state; it
+does not probe exporters or prove that a running Claude process reloaded its
+settings. It clears when ports agree or Claude telemetry approval is absent
+or disabled. It does not rewrite settings or change account identity.
+
+After a listener failure, the relay re-reads approved settings on each retry
+and waits for an approved candidate port using its existing capped backoff.
+While that port is busy, the relay reports `failed`. Without an approved
+candidate, the old-port, default-port and per-user fallback order still applies.
+Startup retains its existing behavior of falling back if the approved port is
+busy.
+
 ## Common Diagnostics Flow
 
 ```bash
