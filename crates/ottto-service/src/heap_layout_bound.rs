@@ -97,7 +97,6 @@ macro_rules! scalar { ($($t:ty),*) => { $(impl HeapLayoutBound for $t {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> { c.add(0) }
 })* }; }
 scalar!(
-    crate::transcript_acquisition::FileStamp,
     bool,
     u8,
     u16,

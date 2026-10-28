@@ -1163,7 +1163,9 @@ fn carried(root: &Path) -> Option<crate::snapshots::CodexContinuationEvidence> {
 }
 fn parked_eof(cache: &SharedCache) -> bool {
     cache
-        .with_cursor(|cursor| matches!(&cursor.slot, Slot::Job(job) if job.parser.reader.finished))
+        .with_cursor(
+            |cursor| matches!(&cursor.slot, Slot::Paused(job) if job.parser.reader.finished),
+        )
         .unwrap_or(false)
 }
 

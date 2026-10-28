@@ -27798,6 +27798,7 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_ref().filter(|_| {
                     !codex_page.cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
                         && codex_join_inventory.is_some()
+                        && (!codex_page.continuation() || codex_parent_identities.census_valid())
                         && codex_page.claim_resume()
                 }) {
                     // Continuing the paused job is the highest scheduling class.

@@ -7,7 +7,7 @@ int ottto_power_state(void) {
         CFTypeRef info = IOPSCopyPowerSourcesInfo();
         if (info == NULL) return -1;
         CFStringRef source = IOPSGetProvidingPowerSourceType(info);
-        int ac = source == NULL ? -1 : (CFEqual(source, kIOPMACPowerKey) ? 1 : 0);
+        int ac = source == NULL ? -1 : (CFEqual(source, CFSTR(kIOPMACPowerKey)) ? 1 : 0);
         CFRelease(info); // source is borrowed (Get); info is owned (Copy).
         NSProcessInfo *process = NSProcessInfo.processInfo;
         if (![process respondsToSelector:@selector(isLowPowerModeEnabled)]) return -1;
