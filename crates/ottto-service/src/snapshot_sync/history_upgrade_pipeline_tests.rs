@@ -3240,26 +3240,74 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
                         );
                     }
                 }
-                // A real content change re-reads and restamps the marked
-                // file; the retired bit is carried as stored.
-                fixture.append(HISTORY_SESSIONS[0], "req_0_2");
-                let page = fixture.cycle("2026-08-02T15:00:00Z", cycle);
-                assert!(page.uploaded.contains(HISTORY_SESSIONS[0]), "the change re-emits");
-                assert_ne!(
-                    page.index.files[&marked].last_upload_body_witness,
-                    stamped[&marked].1,
-                    "the marked file is restamped"
-                );
-                assert_eq!(
-                    page.index
-                        .claude_money_birth_store
-                        .money_marks(location_key(&marked))
-                        & RETIRED_PERMIT_MARK,
-                    RETIRED_PERMIT_MARK,
-                    "a restamp keeps the retired bit"
-                );
             })
         });
         assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed);
+    });
+}
+
+/// Contract 5: a real content change restamps a file's money marks from its
+/// new body. #825's retired bit is carried as stored through that restamp
+/// (durable entry digests bind the raw byte), never cleared or set.
+#[test]
+fn e2_restamp_carries_the_retired_permit_bit() {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::claude_request_identity::{with_cycle_contract_for_test, E2_GROUPING};
+    const RETIRED_PERMIT_MARK: u8 = 64;
+    let fixture = HistoryFixture::new("e2-restamp-retired-bit");
+    fixture.baseline();
+    with_e2_history(&fixture, || {
+        with_cycle_contract_for_test(E2_GROUPING, || {
+            let cycle = HistoryCycle {
+                request_identity: true,
+                ..E2_HISTORY_UPGRADE
+            };
+            for at in ["08:30", "08:40", "08:50"] {
+                fixture.cycle(&format!("2026-08-02T{at}:00Z"), cycle);
+            }
+            let mut old = ScanIndex::load(&fixture.index_path).unwrap();
+            let marked = HistoryFixture::key(&old, HISTORY_SESSIONS[0]);
+            assert_eq!(old.files[&marked].effective_upload_body_witness_revision, 3);
+            let kept = old
+                .claude_money_birth_store
+                .money_marks(location_key(&marked));
+            assert_eq!(
+                kept & RETIRED_PERMIT_MARK,
+                0,
+                "the always-on build never sets it"
+            );
+            old.claude_money_birth_store
+                .set_money_marks(&marked, kept | RETIRED_PERMIT_MARK);
+            old.save(&fixture.index_path).unwrap();
+            let before = old.files[&marked].clone();
+            fixture.append(HISTORY_SESSIONS[0], "req_0_2");
+            let page = fixture.cycle("2026-08-02T09:00:00Z", cycle);
+            let after = &page.index.files[&marked];
+            let marks = page
+                .index
+                .claude_money_birth_store
+                .money_marks(location_key(&marked));
+            let state = format!(
+                "uploaded={:?} read={} before=({}, {:?}) after=({}, {:?}, rev {}) marks {kept}->{marks}",
+                page.uploaded,
+                page.scan.scanned_file_count,
+                before.source_file_fingerprint,
+                before.last_upload_body_witness,
+                after.source_file_fingerprint,
+                after.last_upload_body_witness,
+                after.effective_upload_body_witness_revision,
+            );
+            assert!(page.uploaded.contains(HISTORY_SESSIONS[0]), "{state}");
+            assert_ne!(
+                after.last_upload_body_witness, before.last_upload_body_witness,
+                "the marked file is restamped: {state}"
+            );
+            assert_eq!(after.effective_upload_body_witness_revision, 3, "{state}");
+            assert_eq!(
+                marks & RETIRED_PERMIT_MARK,
+                RETIRED_PERMIT_MARK,
+                "the restamp keeps the retired bit: {state}"
+            );
+        })
     });
 }
