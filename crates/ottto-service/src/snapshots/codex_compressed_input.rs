@@ -934,6 +934,10 @@ impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
 pub(in crate::snapshots) mod tests {
     include!("codex_archive_header_tests.rs");
     include!("codex_archive_correction_tests.rs");
+    mod money_equivalence_tests {
+        use super::*;
+        include!("codex_archive_money_equivalence_tests.rs");
+    }
     use super::super::*;
     use super::*;
     use crate::transcript_acquisition::Scope;
@@ -1191,6 +1195,7 @@ pub(in crate::snapshots) mod tests {
                     Scope("archive-test".into()),
                 );
             }
+            scan.index.archive_pass.power = true; // synthetic pacing permission
             scan.identified_candidates = VecDeque::from([f.candidate()]);
             scan.census
                 .observed_index_keys
@@ -2169,6 +2174,7 @@ pub(in crate::snapshots) mod tests {
             true,
         )
         .with_sampled_acquisition(cache, Scope("archive-test".into()));
+        scan.index.archive_pass.power = true; // synthetic pacing permission
         scan.identified_candidates = VecDeque::from([f.candidate()]);
         scan.census
             .observed_index_keys
