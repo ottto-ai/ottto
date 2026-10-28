@@ -27671,9 +27671,26 @@ impl OwnedSourceScan {
                     // Grouped members bypass the per-candidate guard: one held member holds the group.
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                        if let Some((member, reason)) = group.members.iter().find_map(|member| {
-                            Some((member, cache.durable_guard(source, member, None, index)?))
-                        }) {
+                        if let Some((member, reason)) = group
+                            .members
+                            .iter()
+                            .find_map(|member| {
+                                Some((
+                                    member,
+                                    cache.durable_guard(source, member, None, index, false)?,
+                                ))
+                            })
+                            .or_else(|| {
+                                group.members.iter().find_map(|member| {
+                                    cache
+                                        .durable_upgrade_missing(source, member, index, true)
+                                        .then_some((
+                                            member,
+                                            crate::durable_tail_store::Refusal::UpgradeMissing,
+                                        ))
+                                })
+                            })
+                        {
                             if index.reread_guard.needs_save() {
                                 codex_join_groups.push_front(group);
                             } else {
@@ -31264,7 +31281,7 @@ impl OwnedSourceScan {
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
                     if let Some(reason) =
-                        cache.durable_guard(source, &candidate, Some(&opened_file), index)
+                        cache.durable_guard(source, &candidate, Some(&opened_file), index, true)
                     {
                         if index.reread_guard.needs_save() {
                             identified_candidates.push_front(candidate);

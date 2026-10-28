@@ -290,7 +290,7 @@ impl State {
     }
     /// O3: use the existing durable replay ledger and pre-read reservation
     /// receipt. Restart loses the unused ticket, never the spent release/key.
-    pub(super) fn upgrade_missing(&mut self, key: &str) -> bool {
+    pub(super) fn upgrade_missing(&mut self, key: &str, consume: bool) -> bool {
         if self.closed {
             return false;
         }
@@ -300,7 +300,7 @@ impl State {
             .get_mut(&id)
             .filter(|r| r.upgrade && r.saved && !r.claimed)
         {
-            r.claimed = true;
+            r.claimed = consume;
             return true;
         }
         let keys = self

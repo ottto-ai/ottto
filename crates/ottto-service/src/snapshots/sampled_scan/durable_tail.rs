@@ -467,10 +467,11 @@ impl SharedCache {
         candidate: &CandidateFile,
         opened: Option<&File>,
         index: &mut ScanIndex,
+        consume: bool,
     ) -> Option<store::Refusal> {
         self.durable_hold(source, &local_index_key(&candidate.path), opened, index)
             .or_else(|| {
-                self.durable_upgrade_missing(source, candidate, index)
+                self.durable_upgrade_missing(source, candidate, index, consume)
                     .then_some(store::Refusal::UpgradeMissing)
             })
     }
@@ -480,6 +481,7 @@ impl SharedCache {
         source: SnapshotSource,
         candidate: &CandidateFile,
         index: &mut ScanIndex,
+        consume: bool,
     ) -> bool {
         if !crate::heap_layout_bound::layout_supported() {
             return false;
@@ -511,11 +513,11 @@ impl SharedCache {
             return false;
         }
         if reread_guard::byte_unchanged(entry, candidate)
-            || !index.reread_guard.upgrade_missing(&key)
+            || !index.reread_guard.upgrade_missing(&key, consume)
         {
             return true;
         }
-        stores.counters.upgrade_state_missing += 1;
+        stores.counters.upgrade_state_missing += u64::from(consume);
         false
     }
 

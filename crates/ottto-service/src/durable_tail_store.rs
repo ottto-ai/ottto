@@ -646,13 +646,18 @@ impl DurableTailStore {
             if work == "delete" && binding.record.metadata.mark == 2 {
                 return Err(Refusal::SpentCarrier);
             }
+            let corrupt = if binding.record.metadata.mark == 2 {
+                Refusal::SpentCarrier
+            } else {
+                Refusal::Corrupt
+            };
             // After any repair: its ctime moved.
-            let metadata = file.metadata().map_err(|_| Refusal::Corrupt)?;
+            let metadata = file.metadata().map_err(|_| corrupt)?;
             let stamp = Stamp::of(&metadata);
             if !metadata.is_file()
                 || metadata.len() > (RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES) as u64
             {
-                return Err(Refusal::Corrupt);
+                return Err(corrupt);
             }
             if self.durable.get(key).is_some_and(|(_, old)| *old == stamp) {
                 return Ok(Some(binding));
@@ -660,7 +665,7 @@ impl DurableTailStore {
             let mut bytes = header;
             file.take((RECORD_BYTES + TRAILER_BYTES + 1) as u64)
                 .read_to_end(&mut bytes)
-                .map_err(|_| Refusal::Corrupt)?;
+                .map_err(|_| corrupt)?;
             let read = bytes.len().saturating_sub(n) as u64;
             match work {
                 "delete" => self.counters.delete_verify_bytes += read,
@@ -668,13 +673,7 @@ impl DurableTailStore {
                 _ => self.counters.guard_verify_bytes += read,
             }
             self.note_codec(bytes.capacity());
-            verify(&bytes, self.source).map_err(|reason| {
-                if binding.record.metadata.mark == 2 {
-                    Refusal::SpentCarrier
-                } else {
-                    reason
-                }
-            })?;
+            verify(&bytes, self.source).map_err(|_| corrupt)?;
             if self.durable.len() < MAX_RECORDS || self.durable.contains_key(key) {
                 self.durable.insert(*key, (None, stamp));
             }

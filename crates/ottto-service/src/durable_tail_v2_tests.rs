@@ -6,7 +6,8 @@ use super::*;
 fn v2_markers_precede_every_ordinary_mutation_even_without_a_warm_memo() {
     for mark in [0, 1, 2] {
         for seam in ["read", "gc", "budget", "overwrite", "invalidate", "fresh"] {
-            for damaged in [false, true] {
+            for damage in 0..3 {
+                let damaged = damage != 0;
                 let scratch = Scratch::new();
                 let lock = crate::locked_state_dir::LockedStateDir::acquire(&scratch.root).unwrap();
                 let path = scratch.transcript("t.jsonl", b"{}\n");
@@ -23,7 +24,10 @@ fn v2_markers_precede_every_ordinary_mutation_even_without_a_warm_memo() {
                     .unwrap();
                 let disk = record_file(&scratch.store(), &b.key);
                 let mut bytes = fs::read(&disk).unwrap();
-                if damaged {
+                if damage == 2 {
+                    bytes.resize(RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES + 1, 0);
+                    put_record(&disk, &bytes);
+                } else if damaged {
                     let end = bytes.len() - 1;
                     bytes[end] ^= 1;
                     put_record(&disk, &bytes);
