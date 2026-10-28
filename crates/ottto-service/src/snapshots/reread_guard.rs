@@ -305,7 +305,10 @@ impl State {
         }
         let keys = self
             .replayed
-            .entry(concat!("upgrade_state_missing:", env!("CARGO_PKG_VERSION")).into())
+            .entry(format!(
+                "upgrade_state_missing:{}",
+                ottto_core::compiled_release_version()
+            ))
             .or_default();
         if keys.len() >= MAX_TRACKED_KEYS || !keys.insert(id) {
             return false;
