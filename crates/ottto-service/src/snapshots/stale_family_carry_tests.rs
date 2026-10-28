@@ -4185,9 +4185,10 @@ fn contract_start_status_preserves_resume_placeholder_and_reowes_only_once() {
                     watcher_hint: false,
                 });
             fixture.index.observe_claude_request_identity_contract(true);
+            // #825 (card G (b)): a late permit re-owes nothing (was 2).
             assert_eq!(
                 fixture.index.files[&key].effective_upload_body_witness_revision,
-                2
+                3
             );
             fixture
                 .index
