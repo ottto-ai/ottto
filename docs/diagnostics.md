@@ -769,9 +769,11 @@ AC/utility-QoS permission and fold that CPU into its shared catch-up accumulator
 permission defaults to denied. This slice does not activate discovery/catch-up.
 
 `CompressedHeaderInvalid` is a counted per-archive hold when no projection can be
-used. That member is excluded without making other owners' inventory incomplete.
+used. That member is excluded without making unrelated owners' inventory incomplete.
 Full acquisition can capture a complete first line up to the JSONL line cap;
-64 KiB is only the inventory bound. Inventory never writes the acquisition owner.
+64 KiB is only the inventory bound. An inventory-bound failure remains held
+until a separately authorized full acquisition establishes its projection and
+owner membership. Inventory never writes the acquisition owner.
 These are validation/selection effects; there is no money formula change.
 Archive identity requires `payload.id` plus a matching filename candidate;
 double-UUID names outside that set receive counted `CompressedOwnerUnproven`

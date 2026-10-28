@@ -569,6 +569,7 @@ fn double_uuid_archive_has_named_owner_hold_no_replacement_or_redecode() {
         .map(|row| serde_json::from_slice(row).unwrap())
         .collect();
     lines[0]["payload"]["id"] = json!(owner);
+    lines[0]["payload"]["cli_version"] = json!("unbound-version");
     let mut bytes = Vec::new();
     for line in lines {
         serde_json::to_writer(&mut bytes, &line).unwrap();
@@ -579,7 +580,7 @@ fn double_uuid_archive_has_named_owner_hold_no_replacement_or_redecode() {
         f.0.with_file_name(format!("rollout-{other}-{owner}.jsonl.zst"));
     fs::rename(&f.0, &double).unwrap();
     f.0 = double;
-    let (state, result, rows, _) = archive_pass(&f, ScanIndex::default(), true, None);
+    let (mut state, result, rows, _) = archive_pass(&f, ScanIndex::default(), true, None);
     assert_eq!(decodes(&rows), 1);
     assert!(result.snapshots.is_empty());
     assert!(matches!(
@@ -594,6 +595,23 @@ fn double_uuid_archive_has_named_owner_hold_no_replacement_or_redecode() {
     ));
     assert!(rows.iter().any(
         |r| r["counts"]["codex_zst_refused"]["CompressedOwnerUnproven"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    ));
+    assert!(
+        state.codex_archive_cli_version(&f.0).is_none(),
+        "unbound full header is not shared metadata"
+    );
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (_, reuse) = crate::local_resource_diagnostics::capture(|| {
+        assert!(state
+            .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
+            .is_err());
+    });
+    assert_eq!(decodes(&reuse), 0);
+    assert!(reuse.iter().any(
+        |r| r["counts"]["codex_zst_refused"]["CompressedHeaderInvalid"]
             .as_u64()
             .unwrap_or(0)
             > 0
@@ -659,4 +677,97 @@ fn inventory_step_charges_actual_decoded_bytes_to_page_budget() {
         }
     }
     panic!("inventory budget test did not reach its step");
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "funded decoder needs validated heap layout"
+)]
+fn unreadable_segment_holds_its_filename_owner_but_not_unrelated_plain() {
+    let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+    let f = ArchiveFixture::new(b"corrupt archive segment");
+    let root = f.0.parent().unwrap().to_owned();
+    let related = root.join("rollout-compressed-fixture.jsonl");
+    let unrelated = root.join("rollout-unrelated.jsonl");
+    fs::write(&related, synthetic_rollout()).unwrap();
+    let mut bytes = Vec::new();
+    for row in synthetic_rollout()
+        .split(|b| *b == b'\n')
+        .filter(|r| !r.is_empty())
+    {
+        let mut value: Value = serde_json::from_slice(row).unwrap();
+        if value["type"] == "session_meta" {
+            value["payload"]["id"] = json!("unrelated");
+        }
+        serde_json::to_writer(&mut bytes, &value).unwrap();
+        bytes.push(b'\n');
+    }
+    fs::write(&unrelated, bytes).unwrap();
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut state = ScanIndex::default();
+    assert!(state
+        .inventory_archive_header(&f.candidate(), Some(&cache), &mut funded_header_work())
+        .is_err());
+    let mut dirs = codex_file_join::DirectoryCensus::new();
+    dirs.observe(&root, &fs::metadata(&root).unwrap());
+    let paths = BTreeSet::from([
+        local_index_key(&f.0),
+        local_index_key(&related),
+        local_index_key(&unrelated),
+    ]);
+    let inventory = codex_file_join::HeaderInventory::new(&[root], &paths, Some(&dirs));
+    let candidates = [f.0.clone(), related, unrelated].map(|path| {
+        let mut candidate = super::super::codex_zst_refusal_tests::candidate(&path);
+        candidate.size_bytes = fs::metadata(&path).unwrap().len();
+        candidate
+    });
+    let ((_, result), rows) = crate::local_resource_diagnostics::capture(|| {
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[],
+            checkpoint(&state),
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(cache, Scope("unresolved-family-test".into()));
+        scan.identified_candidates = VecDeque::from(candidates);
+        scan.census.observed_index_keys.extend(paths);
+        scan.codex_join_inventory = Some(inventory);
+        scan.codex_join_prepared = false;
+        scan.census_unix_seconds = None;
+        for _ in 0..1000 {
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete {
+                    mut index,
+                    mut scan,
+                    ..
+                } => {
+                    finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                    return (index, scan);
+                }
+            }
+        }
+        panic!("unresolved family did not complete");
+    });
+    assert_eq!(decodes(&rows), 0);
+    assert_eq!(result.scanned_file_count, 1);
+    assert!(result
+        .snapshots
+        .iter()
+        .any(|s| s.source_session_id == "unrelated"));
+    assert!(
+        !result
+            .snapshots
+            .iter()
+            .any(|s| s.source_session_id == "compressed-fixture"),
+        "unresolved segment cannot certify a partial singleton body"
+    );
 }

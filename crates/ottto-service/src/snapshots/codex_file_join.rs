@@ -385,7 +385,7 @@ impl HeaderInventory {
                     .files
                     .get(&key)
                     .and_then(|e| e.archive.as_ref())
-                    .is_some_and(|a| a.invalid_header(&stat));
+                    .is_some_and(|a| a.invalid_header(&candidate.path, &stat));
                 self.read_bytes = self
                     .read_bytes
                     .saturating_add((self.archive_work.physical_bytes - before) as usize);

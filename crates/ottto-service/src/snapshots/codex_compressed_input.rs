@@ -1,4 +1,4 @@
-//! Paid archive input and stamp-bound metadata; no physical checkpoints.
+//! Bounded `.jsonl.zst` rollout input behind the one opened-object parser seam.
 //! Discovery/twin binding is enabled separately by 11b.
 use crate::local_resource_diagnostics::{codex_zst_refused, CodexZstCause};
 use std::collections::{BTreeMap, BTreeSet};
@@ -203,6 +203,9 @@ impl ValidatedHeader {
                 .map(str::to_owned),
         })
     }
+    fn filename_matches(&self, path: &Path) -> bool {
+        super::codex_session_id_candidates_from_path(&path.with_extension("")).contains(&self.owner)
+    }
     fn bounded_version(s: &str) -> bool {
         s.len() <= 64 && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
     }
@@ -214,16 +217,21 @@ impl ValidatedHeader {
 }
 crate::heap_layout_bound::fields!(ValidatedHeader; owner, digest, created_unix_ms, cli_version);
 impl ArchiveEvidence {
+    fn header_for(&self, path: &Path) -> Option<&ValidatedHeader> {
+        self.header_validated
+            .as_ref()
+            .filter(|h| h.filename_matches(path))
+    }
     pub(super) fn begin(file: &File, path: &Path, previous: Option<&Self>) -> io::Result<Self> {
-        let logical_id = super::codex_session_id_candidates_from_path(&path.with_extension(""))
+        let stamp = crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?;
+        let previous = previous.filter(|old| old.stamp.same_content(&stamp));
+        let logical = path.with_extension("");
+        let logical_id = super::codex_session_id_candidates_from_path(&logical)
             .into_iter()
             .next()
             .ok_or_else(|| invalid("compressed rollout logical id unavailable"))?;
         let logical_id = previous.map_or(logical_id, |old| old.logical_id.clone());
-        let attempts = match previous
-            .filter(|old| old.matches(file))
-            .map(|old| &old.disposition)
-        {
+        let attempts = match previous.map(|old| &old.disposition) {
             Some(ArchiveDisposition::Pending { attempts, .. }) => attempts.saturating_add(1),
             _ => 1,
         };
@@ -235,18 +243,13 @@ impl ArchiveEvidence {
             );
         }
         Ok(Self {
-            stamp: crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?
-                .content_only(),
+            stamp: stamp.content_only(),
             logical_id,
             owner: None,
             body_witness: None,
             reservation_saved: false,
-            header_attempted: previous
-                .filter(|a| a.matches(file))
-                .is_some_and(|a| a.header_attempted),
-            header_validated: previous
-                .filter(|a| a.matches(file))
-                .and_then(|a| a.header_validated.clone()),
+            header_attempted: previous.is_some_and(|a| a.header_attempted),
+            header_validated: previous.and_then(|a| a.header_validated.clone()),
             disposition: ArchiveDisposition::Pending {
                 attempts,
                 retry_after: super::sampled_scan::now_seconds().saturating_add(6 * 3600),
@@ -260,14 +263,8 @@ impl ArchiveEvidence {
         parsed: &super::ParsedJsonlFile,
     ) -> bool {
         use ArchiveDisposition::*;
-        let logical = path.with_extension("");
-        self.owner = owner
-            .filter(|owner| {
-                self.header_validated
-                    .as_ref()
-                    .is_some_and(|h| h.owner == *owner)
-            })
-            .filter(|owner| super::codex_session_id_candidates_from_path(&logical).contains(owner));
+        let header = self.header_for(path);
+        self.owner = owner.filter(|o| header.is_some_and(|h| h.owner == *o));
         if let Some(owner) = &self.owner {
             self.logical_id = owner.clone();
         }
@@ -308,9 +305,11 @@ impl ArchiveEvidence {
             }
         }
     }
-    pub(super) fn invalid_header(&self, metadata: &std::fs::Metadata) -> bool {
-        (self.header_attempted || !matches!(self.disposition, ArchiveDisposition::HeaderValidated))
-            && self.header_validated.is_none()
+    pub(super) fn invalid_header(&self, path: &Path, metadata: &std::fs::Metadata) -> bool {
+        let bound = self.header_for(path).is_some();
+        !bound
+            && (self.header_attempted
+                || !matches!(self.disposition, ArchiveDisposition::HeaderValidated))
             && crate::transcript_acquisition::FileStamp::capture(metadata.clone())
                 .is_ok_and(|stamp| self.stamp.same_content(&stamp))
     }
@@ -509,20 +508,14 @@ impl OpenedInput {
         }
         input.map(Some)
     }
-    fn header_only(self) -> Self {
-        match self {
-            Self::Compressed(reader, owner) => {
-                let mut decoder = reader.into_inner();
-                decoder.remaining = super::codex_file_join::MAX_HEADER_BYTES as u64;
-                decoder.physical_limit = 2 * super::codex_file_join::MAX_HEADER_BYTES as u64;
-                decoder.input.get_mut().set_limit(decoder.physical_limit);
-                Self::Compressed(
-                    Box::new(BufReader::with_capacity(BUFFER_BYTES, decoder)),
-                    owner,
-                )
-            }
-            plain => plain,
+    fn header_only(mut self) -> Self {
+        if let Self::Compressed(reader, _) = &mut self {
+            let decoder = reader.get_mut();
+            decoder.remaining = super::codex_file_join::MAX_HEADER_BYTES as u64;
+            decoder.physical_limit = 2 * super::codex_file_join::MAX_HEADER_BYTES as u64;
+            decoder.input.get_mut().set_limit(decoder.physical_limit);
         }
+        self
     }
     pub(super) fn close(self) {
         if let Self::Compressed(reader, owner) = self {
@@ -624,7 +617,7 @@ impl super::ScanIndex {
         let meta = std::fs::symlink_metadata(path).ok()?;
         let stamp = crate::transcript_acquisition::FileStamp::capture(meta).ok()?;
         archive.stamp.same_content(&stamp).then_some(())?;
-        archive.header_validated.as_ref()
+        archive.header_for(path)
     }
     pub(super) fn inventory_archive_header(
         &mut self,
@@ -640,7 +633,7 @@ impl super::ScanIndex {
             .get(&key)
             .and_then(|e| e.archive.as_ref())
             .filter(|a| a.matches(&file));
-        if let Some(header) = old.and_then(|a| a.header_validated.as_ref()) {
+        if let Some(header) = old.and_then(|a| a.header_for(&candidate.path)) {
             return Ok((header.clone(), 0));
         }
         if old.is_some_and(|a| {
@@ -679,8 +672,7 @@ impl super::ScanIndex {
                 "archive changed during header read"
             );
             anyhow::ensure!(
-                codex_session_id_candidates_from_path(&candidate.path.with_extension(""))
-                    .contains(&header.owner),
+                header.filename_matches(&candidate.path),
                 "archive header owner mismatch"
             );
             Ok(header)

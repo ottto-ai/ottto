@@ -26795,9 +26795,21 @@ impl OwnedSourceScan {
                     if !done {
                         pending!();
                     }
+                    let unresolved = inventory
+                        .held_archives
+                        .iter()
+                        .flat_map(|k| {
+                            codex_session_id_candidates_from_path(&Path::new(k).with_extension(""))
+                        })
+                        .collect::<BTreeSet<_>>();
+                    residue_blocked_session_ids.extend(unresolved.iter().cloned());
+                    codex_state_only_blocked_session_ids.extend(unresolved.iter().cloned());
                     identified_candidates.retain(|candidate| {
                         let key = local_index_key(&candidate.path);
-                        if !inventory.held_archives.contains(&key) {
+                        let owner = inventory.owner_for_path(&candidate.path);
+                        if !inventory.held_archives.contains(&key)
+                            && !owner.is_some_and(|o| unresolved.contains(o))
+                        {
                             return true;
                         }
                         census.record_unreadable(UnreadableCause::Reduction, 1);
