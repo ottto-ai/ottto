@@ -65,6 +65,35 @@ impl E2ScanFixture {
         claude_history_upgrade::with_staged_births_for_test(staged, || self.drive(scan, births))
     }
 
+    /// Same retained reader seam for sources without Claude evidence.
+    pub(crate) fn scan_other(
+        &self,
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        support: &Path,
+        index: ScanIndex,
+        sampled: bool,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        let mut scan = OwnedSourceScan::new(
+            source,
+            roots,
+            index,
+            "2026-10-27T08:00:00Z",
+            183,
+            100,
+            false,
+            Some(support),
+            &[],
+            false,
+            true,
+        );
+        if sampled {
+            scan = scan
+                .with_sampled_acquisition(self.cache.clone(), Scope("money-equivalence".into()));
+        }
+        self.drive(scan, &BTreeMap::new())
+    }
+
     fn drive(
         &self,
         mut scan: OwnedSourceScan,
