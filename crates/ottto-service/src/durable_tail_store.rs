@@ -69,6 +69,8 @@ const CERTIFICATE_BYTES: usize = 8 * 3 // device, inode, length
     + 1 // debt flag
     + 8; // debt
 const TRAILER_BYTES: usize = 32;
+/// The store cap includes the envelope and trailer, not only the body.
+pub(crate) const BODY_BYTES: usize = RECORD_BYTES - HEADER_BYTES - TRAILER_BYTES;
 
 /// Every 32-byte digest in the envelope (outside the codec body), as
 /// `Type.field`. Each is a domain-separated SHA-256; the H audit

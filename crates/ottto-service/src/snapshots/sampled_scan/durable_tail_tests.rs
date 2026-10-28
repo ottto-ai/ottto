@@ -187,7 +187,8 @@ fn native_record_of(
 ) -> (CachedJsonlReduction, Checkpoint) {
     let apply = match source {
         SnapshotSource::Codex => apply_codex_line,
-        _ => apply_claude_code_line,
+        SnapshotSource::ClaudeCode => apply_claude_code_line,
+        SnapshotSource::Pi => apply_pi_line,
     };
     let mut parser = OwnedJsonlParser::new(
         File::open(path).unwrap(),
@@ -748,4 +749,174 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         assert_eq!(counts.restored, 3, "{arm}");
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn pi_stripped_section_refuses_restore_and_holds_the_record() {
+    use crate::durable_tail_codec::{Dec, Durable};
+    let root = crate::test_scratch::private_dir("ottto-dt-pi-held");
+    let lock = test_locks::hold(&root);
+    let path = root.join("pi.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            "{\"type\":\"message\",\"timestamp\":\"2026-10-20T10:00:00Z\",",
+            "\"message\":{\"role\":\"assistant\",\"responseId\":\"fixture-response\",",
+            "\"model\":\"fixture-model\",\"usage\":{\"input\":10,\"output\":3}}}\n"
+        ),
+    )
+    .unwrap();
+    let source = SnapshotSource::Pi;
+    let namespace = Scope("pi-held".into());
+    let scope = Scope("pi-held-file".into());
+    let key = local_index_key(&path);
+    let index_path = root.join("index.json");
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":std::fs::metadata(&path).unwrap().len(),
+            "modified_unix_seconds":1,"source_file_fingerprint":"fp"
+        }))
+        .unwrap(),
+    );
+    index.save(&index_path).unwrap();
+    let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+    let binding = expected(
+        DurableSource::Pi,
+        source,
+        &key,
+        &scope,
+        &index,
+        &interpretation,
+    )
+    .unwrap()
+    .binding;
+    let (reduction, _) = native_record_of(&path, &scope, source);
+    let body = codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
+    let mut d = Dec::new(&body);
+    CachedJsonlReduction::take(&mut d).unwrap();
+    codec::Rederive::take(&mut d).unwrap();
+    let prefix = body.len() - d.remaining();
+    let mut store = DurableTailStore::new(store::store_dir_for_index(&index_path));
+    store
+        .write_after_save(
+            lock,
+            index.generation,
+            vec![PendingRecord {
+                binding: binding.clone(),
+                certificate: certificate(&path, &scope),
+                body: body[..prefix].to_vec(),
+                allowlist: codec::allowlist_digest(source),
+            }],
+        )
+        .unwrap();
+    for _ in 0..2 {
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        assert!(cache
+            .durable_restore(
+                source,
+                &key,
+                &path,
+                &scope,
+                &mut File::open(&path).unwrap(),
+                &index,
+                &interpretation
+            )
+            .is_none());
+        let (counts, disk) = cache.durable_counters(source).unwrap();
+        assert_eq!(counts.corrupt_body, 1);
+        assert_eq!(disk.records_read, 1);
+        assert_eq!(disk.records_invalidated, 0);
+        assert!(
+            matches!(
+                store.read(&binding.key, &codec::allowlist_digest(source)),
+                ReadOutcome::Found(_)
+            ),
+            "T14 is held, never deleted"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pi_uses_shared_content_only_ctime_adoption_and_store_slots() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = crate::test_scratch::private_dir("ottto-pi-ctime");
+    let path = root.join("pi.jsonl");
+    std::fs::write(&path, b"{\"type\":\"session\",\"id\":\"fixture\"}\n").unwrap();
+    let candidate = || CandidateFile {
+        physical_identity: None,
+        scan_root: root.clone(),
+        path: path.clone(),
+        size_bytes: 0,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        source_file_fingerprint: String::new(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
+    };
+    let source = SnapshotSource::Pi;
+    let mut first = candidate();
+    let (_, stat) = open_candidate_file_stat(source, &mut first).unwrap();
+    assert_eq!(
+        first.fingerprint_changed_nanos,
+        stat.unwrap().changed_unix_nanos()
+    );
+    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({
+        "size_bytes": first.size_bytes, "modified_unix_seconds": first.modified_unix_seconds,
+        "modified_unix_nanos": first.modified_unix_nanos,
+        "opened_changed_nanos":first.fingerprint_changed_nanos,
+        "opened_birth_nanos":first.fingerprint_birth_nanos,
+        "source_file_fingerprint":"fp"
+    }))
+    .unwrap();
+    let files = BTreeMap::from([(local_index_key(&path), entry)]);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let mut after = candidate();
+    let (mut file, stat) = open_candidate_file_stat(source, &mut after).unwrap();
+    assert_eq!(after.size_bytes, first.size_bytes);
+    assert_eq!(after.modified_unix_nanos, first.modified_unix_nanos);
+    let adopted = adopt_stored_changed_time(source, &mut after, &files, stat, &mut file).unwrap();
+    if first.fingerprint_birth_nanos != 0
+        && stat.unwrap().changed_unix_nanos() != first.fingerprint_changed_nanos
+    {
+        assert_eq!(
+            adopted.as_deref(),
+            Some(first.opened_object_identity.as_str())
+        );
+        assert_eq!(
+            after.fingerprint_changed_nanos,
+            first.fingerprint_changed_nanos
+        );
+    }
+    // A changed mtime remains a reread input on exactly the same path.
+    let mut moved = after.clone();
+    moved.modified_unix_nanos += 1;
+    assert!(
+        adopt_stored_changed_time(source, &mut moved, &files, stat, &mut file)
+            .unwrap()
+            .is_none()
+    );
+    let cache = SharedCache::default();
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        cache.durable_begin_pass(
+            source,
+            &root.join(format!("{}.json", source.api_slug())),
+            &Scope("slots".into()),
+            false,
+        );
+        assert!(cache.durable_counters(source).is_some());
+        let _ = rederive_head_bytes_total(source);
+    }
+    let _ = std::fs::remove_dir_all(root);
 }

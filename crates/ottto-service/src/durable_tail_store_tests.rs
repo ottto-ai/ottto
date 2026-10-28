@@ -1151,3 +1151,22 @@ fn store_budget_receipt() {
     assert_eq!(read_pass.bytes_read, write_pass.disk_bytes);
     assert!(write_pass.disk_bytes <= STORE_BYTES);
 }
+
+#[test]
+fn pi_wire_tag_and_dense_counter_slot_are_independent() {
+    assert_eq!(DurableSource::Pi.tag(), 3);
+    assert_eq!(DurableSource::from_tag(3), Some(DurableSource::Pi));
+    for (slot, source) in [
+        DurableSource::ClaudeCode,
+        DurableSource::Codex,
+        DurableSource::Pi,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(source.slot(), slot);
+        assert_eq!(DurableSource::from_tag(source.tag()), Some(source));
+    }
+    assert_eq!(DurableSource::from_tag(0), None);
+    assert_eq!(DurableSource::from_tag(4), None);
+}
