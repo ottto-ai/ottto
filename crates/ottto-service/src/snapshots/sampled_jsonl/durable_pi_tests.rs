@@ -218,7 +218,7 @@ fn pi_record_and_store_diagnostics_exclude_private_canaries() {
     // Exercise the real store write/read and its public counter formatter.
     let lock = crate::locked_state_dir::LockedStateDir::acquire(&scratch.0).unwrap();
     let dir = store::store_dir_for_index(&scratch.0.join("index.json"));
-    let mut disk = store::DurableTailStore::new(dir.clone());
+    let mut disk = store::DurableTailStore::new(dir.clone(), DurableSource::Pi);
     let key = store::key_digest(DurableSource::Pi, "synthetic-pi-index-key");
     let allowlist = allowlist_digest(SnapshotSource::Pi);
     let pending = PendingRecord {
@@ -239,7 +239,7 @@ fn pi_record_and_store_diagnostics_exclude_private_canaries() {
     assert_eq!(written.written, 1);
     assert_private(format!("{written:?}").as_bytes());
     drop(disk);
-    let mut disk = store::DurableTailStore::new(dir.clone());
+    let mut disk = store::DurableTailStore::new(dir.clone(), DurableSource::Pi);
     let found = match disk.read(&key, &allowlist) {
         ReadOutcome::Found(found) => found,
         outcome => panic!("Pi store did not restore: {outcome:?}"),
