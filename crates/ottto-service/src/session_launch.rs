@@ -562,6 +562,7 @@ fn supported_version(
     command
         .arg("--version")
         .current_dir(cwd)
+        .env("PWD", cwd)
         .envs(set)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

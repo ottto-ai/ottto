@@ -17593,8 +17593,8 @@ pub(crate) fn session_launch_claude_identity(
     ))
 }
 
-/// Explicit or persisted API authentication must not inherit stale OAuth
-/// tokens from the same auth file. Unknown non-null modes are inert too.
+/// Match Codex's explicit-mode precedence. ChatGPT login can retain an
+/// exchanged API key; explicit API/unknown modes cannot inherit stale OAuth.
 pub(crate) fn session_launch_codex_api_key_route(home: &Path, trust: CodexHomeTrust) -> bool {
     let Some(value) = ottto_core::read_codex_auth_file_secure(home, trust)
         .ok()
@@ -17603,13 +17603,18 @@ pub(crate) fn session_launch_codex_api_key_route(home: &Path, trust: CodexHomeTr
     else {
         return false;
     };
-    value
-        .get("auth_mode")
-        .filter(|mode| !mode.is_null())
-        .is_some_and(|mode| mode.as_str() != Some("chatgpt"))
-        || value
-            .get("OPENAI_API_KEY")
-            .is_some_and(|key| !key.is_null() && key.as_str() != Some(""))
+    if let Some(mode) = value.get("auth_mode").filter(|mode| !mode.is_null()) {
+        return mode.as_str() != Some("chatgpt");
+    }
+    // Legacy inference is used only without an explicit mode.
+    [
+        "OPENAI_API_KEY",
+        "personal_access_token",
+        "bedrock_api_key",
+        "bedrock_access_keys",
+    ]
+    .iter()
+    .any(|key| value.get(key).is_some_and(|value| !value.is_null()))
 }
 
 pub(crate) fn session_launch_codex_identity(

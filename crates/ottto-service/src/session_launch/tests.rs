@@ -583,7 +583,7 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
         URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
-    fs::write(codex.join("auth.json"), serde_json::to_vec(&serde_json::json!({"auth_mode":"chatgpt","tokens":{"account_id":"workspace-one","access_token":token}})).unwrap()).unwrap();
+    fs::write(codex.join("auth.json"), serde_json::to_vec(&serde_json::json!({"auth_mode":"chatgpt","OPENAI_API_KEY":"synthetic-exchanged-key","tokens":{"account_id":"workspace-one","access_token":token}})).unwrap()).unwrap();
     fs::set_permissions(codex.join("auth.json"), fs::Permissions::from_mode(0o600)).unwrap();
     let account = billing_identity_hash("openai", "account", "user-one").unwrap();
     let org = billing_identity_hash("openai", "workspace", "workspace-one").unwrap();
@@ -659,6 +659,13 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     );
     let mut auth: serde_json::Value =
         serde_json::from_slice(&fs::read(codex.join("auth.json")).unwrap()).unwrap();
+    auth.as_object_mut().unwrap().remove("auth_mode");
+    fs::write(codex.join("auth.json"), serde_json::to_vec(&auth).unwrap()).unwrap();
+    assert_eq!(
+        prepare(&mut registry).err().unwrap().reason,
+        Reason::CodexApiKeyLogin
+    );
+    assert!(!nickname_target_is_current_for_user(&pair, user.clone()));
     auth["auth_mode"] = serde_json::json!("apikey");
     auth["OPENAI_API_KEY"] = serde_json::json!("synthetic-api-key");
     fs::write(codex.join("auth.json"), serde_json::to_vec(&auth).unwrap()).unwrap();
