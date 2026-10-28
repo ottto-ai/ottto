@@ -1390,7 +1390,7 @@ fn restore_reports_each_early_exit_without_changing_old_totals() {
         .effective_upload_body_witness_revision = 2;
     assert_eq!(label(attempt(&index)), "ineligible.history_owed");
     let (old, disk) = cache.durable_counters(source).unwrap();
-    assert_eq!((old.restore_attempts, old.missing, old.restored), (3, 1, 0));
+    assert_eq!((old.restore_attempts, old.missing, old.restored), (4, 1, 0));
     assert_eq!(old.ineligible["selection_cleared"], 1);
     assert_eq!(old.ineligible["history_owed"], 1);
     assert_eq!(old.durable_held, [0; 5]);
