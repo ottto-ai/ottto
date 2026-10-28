@@ -493,11 +493,10 @@ impl SharedCache {
         else {
             return false;
         };
-        // Completed joined jobs deliberately retain no per-file reduction.
-        // Their missing record is not upgrade loss; normal group gates own it.
+        // Completed joined jobs and pending pre-POST captures deliberately
+        // lack a per-file record. Their existing admission owns recovery.
         if source == SnapshotSource::Codex
-            && (entry.codex_joined_member_set.is_some()
-                || entry.codex_captured_joined_member_set.is_some())
+            && (entry.codex_joined_member_set.is_some() || entry.codex_recovery_is_pending())
         {
             return false;
         }

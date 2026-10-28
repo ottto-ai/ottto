@@ -14,7 +14,8 @@ including changed content, until the approved cause gate can durably bind the
 one permitted A5 recovery. Held misses are observable as `durable_held` class
 `upgrade_missing`; `upgrade_state_missing` counts admitted A5 reads and remains
 zero while that admission is unavailable. Completed joined Codex jobs retain no
-per-file reduction by design and use their existing group admission. Durable
+per-file reduction by design. Pending pre-POST captures also keep their
+existing recovery admission; neither absence is an upgrade loss. Durable
 record holds still precede this exemption.
 
 No feature flags, new source tags or representation reinterpretation. Broader

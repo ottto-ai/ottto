@@ -3857,3 +3857,100 @@ fn missing_upgrade_state_stays_held_across_idle_passes_restart_and_growth() {
         assert_eq!(held_counts[5], 1);
     }
 }
+
+/// A pre-POST capture has custody, not acceptance or a migration-loss grant.
+#[cfg(unix)]
+#[test]
+fn pending_singleton_capture_keeps_its_existing_admission_after_restart() {
+    use crate::durable_tail_store as store;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = ScanFixture::new(source);
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let namespace = Scope("singleton-capture".into());
+    let (mut working, scan, modes) =
+        production_scan(&fixture, source, ScanIndex::default(), None, &namespace.0);
+    assert_eq!(modes.0, 0, "no sampled context in the cold capture setup");
+    assert!(!scan.snapshots.is_empty());
+    let key = local_index_key(&fixture.file.0);
+    // A typed bounded pricing receipt is the input to the production capture
+    // boundary. Pricing interpretation itself remains its owner's fixture.
+    working
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .codex_applied_tier_receipt = Some(
+        serde_json::from_value(json!({
+            "version":1,"derivation":source.parser_version(),"scope":"fixture","records":2,
+            "prefix_digest":"a".repeat(64),"tiers":BTreeMap::from([("b".repeat(64), "derived_from_logs_2")])
+        }))
+        .unwrap(),
+    );
+    let (mut captured, changed, held) =
+        working.stage_codex_recovery_capture(&ScanIndex::default(), &scan.snapshots);
+    assert_eq!(changed.len(), 1);
+    assert!(held.is_empty());
+    let state = fixture.dir.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let _lock = crate::locked_state_dir::test_locks::hold(&state);
+    let index_path = state.join("index.json");
+    captured.save(&index_path).unwrap();
+    let mut loaded = ScanIndex::load(&index_path).unwrap();
+    let entry = &loaded.files[&key];
+    assert!(entry.codex_captured_uncommitted);
+    assert!(entry.codex_captured_tier_receipt.is_some());
+    assert!(entry.codex_joined_member_set.is_none());
+    assert!(entry.codex_captured_joined_member_set.is_none());
+    assert!(entry.last_snapshot_fingerprint.is_none());
+    assert!(!entry.source_file_fingerprint.is_empty());
+    let candidate = CandidateFile {
+        scan_root: fixture.root.clone(),
+        path: fixture.file.0.clone(),
+        physical_identity: None,
+        size_bytes: entry.size_bytes,
+        modified_unix_seconds: entry.modified_unix_seconds,
+        modified_unix_nanos: entry.modified_unix_nanos.unwrap_or(0),
+        source_file_fingerprint: entry.source_file_fingerprint.clone(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+        fingerprint_changed_nanos: 0,
+        fingerprint_birth_nanos: 0,
+    };
+    let cache = sampled_scan::SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    assert!(!store::store_dir_for_index(&index_path).exists());
+    assert_eq!(cache.durable_guard(source, &candidate, &mut loaded), None);
+    // Without pending capture or joined custody the same absence still holds.
+    let entry = loaded.files.get_mut(&key).unwrap();
+    entry.codex_captured_uncommitted = false;
+    entry.codex_captured_tier_receipt = None;
+    entry.codex_captured_tier_receipt_required = false;
+    assert_eq!(
+        cache.durable_guard(source, &candidate, &mut loaded),
+        Some(store::Refusal::UpgradeMissing)
+    );
+    // Pending capture cannot bypass a protected record's earlier hold.
+    loaded
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .codex_captured_uncommitted = true;
+    let dir = store::store_dir_for_index(&index_path);
+    fs::create_dir_all(&dir).unwrap();
+    let name = store::key_digest(store::DurableSource::Codex, &key)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    fs::write(
+        dir.join(format!("{name}.rec")),
+        [b"ottto-dt".as_slice(), &3_u16.to_le_bytes()].concat(),
+    )
+    .unwrap();
+    assert_eq!(
+        cache.durable_guard(source, &candidate, &mut loaded),
+        Some(store::Refusal::NewerFormat)
+    );
+}
