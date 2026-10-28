@@ -2251,9 +2251,8 @@ struct PendingComparison {
 
 // Only this pass's one unambiguous, loss-free native completion is evidence.
 fn completed_reduction(candidate: &CandidateFile, pending: &[PendingIndexFinalization]) -> bool {
-    // Same canonical key as local_index_key, borrowed for UTF-8 paths.
-    let key = candidate.path.to_string_lossy();
-    let mut reads = pending.iter().filter(|read| read.index_key == key.as_ref());
+    let key = local_index_key(&candidate.path);
+    let mut reads = pending.iter().filter(|read| read.index_key == key);
     let Some(read) = reads.next() else {
         return false;
     };
