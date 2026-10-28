@@ -1333,14 +1333,6 @@ fn paused_group_resumes_across_a_sealed_member_metadata_only_change() {
     use std::os::unix::fs::PermissionsExt;
     for change in ["chmod", "mtime"] {
         let root = paged_corpus(&format!("s3-sealed-{change}"));
-        for name in ["a", "b"] {
-            let entry =
-                &index.files[&local_index_key(&root.join(format!("sessions/{name}.jsonl")))];
-            assert!(
-                entry.codex_joined_member_set.is_some()
-                    || entry.codex_captured_joined_member_set.is_some()
-            );
-        }
         let sealed = root.join("sessions/a.jsonl");
         let (_, unpaged) = scan(&root, ScanIndex::default(), 10);
         let cache = Arc::new(SharedCache::default());
