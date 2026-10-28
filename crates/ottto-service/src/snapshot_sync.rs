@@ -6311,7 +6311,6 @@ impl ContinuationInputs {
     }
 }
 
-/// Ordinary finish closure: move evidence and admit all retained inputs.
 fn continuation_finish_inputs<'a>(
     preparation: &'a mut SourcePreparation,
     scan: &'a mut SourceScanResult,

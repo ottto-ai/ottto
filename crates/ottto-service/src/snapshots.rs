@@ -26028,6 +26028,7 @@ impl OwnedSourceScan {
             native_comparison: None,
             resource_probe: crate::local_resource_diagnostics::Probe::start(),
             sampling: None,
+            durable_guard: None,
             source: SnapshotSource::Codex,
             roots: roots.to_vec(),
             index: owned_index,
