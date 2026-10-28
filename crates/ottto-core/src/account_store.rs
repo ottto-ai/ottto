@@ -659,6 +659,7 @@ mod tests {
     #[test]
     fn connection_and_pending_credential_loads_enforce_64_kib_boundary() {
         let path = temp_path("retry-other-authority-size-bound");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         for pending in [false, true] {
             let load = || {
                 if pending {
@@ -686,6 +687,7 @@ mod tests {
             fs::remove_file(&path).unwrap();
             assert!(load().unwrap());
         }
+        fs::remove_dir(path.parent().unwrap()).unwrap();
     }
 
     #[test]
