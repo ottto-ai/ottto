@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/macos_sparkle_bundle_version.sh"
 # shellcheck source=scripts/macos_bundle_url_scheme.sh
 source "$SCRIPT_DIR/macos_bundle_url_scheme.sh"
+# shellcheck source=scripts/macos_companion_entitlements.sh
+source "$SCRIPT_DIR/macos_companion_entitlements.sh"
 ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$ROOT" ]]; then
   ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -223,6 +225,10 @@ if [[ "$MAC_APP_SOURCE_COMMIT" != "$MAC_APP_REMOTE_MASTER" ]]; then
   exit 2
 fi
 MAC_APP_SOURCE_TREE="$(git -C "$MAC_APP_GIT_ROOT" rev-parse "HEAD:$MAC_APP_SOURCE_PATH")"
+COMPANION_ENTITLEMENTS="$MAC_APP_ROOT/Companion.entitlements.plist"
+if ! ottto_macos_check_companion_entitlements "$COMPANION_ENTITLEMENTS"; then
+  exit 2
+fi
 MAC_APP_SOURCE_REPOSITORY="ottto-ai/coding-agents-observability"
 BUNDLE_VERSION="$(ottto_sparkle_bundle_version "$VERSION")"
 MIN_PROTOCOL_VERSION="${OTTTO_MIN_PROTOCOL_VERSION:-$(sed -n 's/.*PROTOCOL_VERSION: u16 = \([0-9][0-9]*\).*/\1/p' "$ROOT/crates/ottto-protocol/src/lib.rs" | head -n1)}"
@@ -384,6 +390,8 @@ ${OTTTO_URL_TYPES_PLIST}
   <true/>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>${OTTTO_MACOS_APPLE_EVENTS_USAGE}</string>
 ${SPARKLE_INFO_PLIST_KEYS}
 </dict>
 </plist>
@@ -453,6 +461,9 @@ if [[ -n "$SIGN_IDENTITY" ]]; then
   sign_code() {
     codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$1"
   }
+  sign_companion() {
+    codesign --force --options runtime --timestamp --entitlements "$COMPANION_ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$1"
+  }
   sign_container() {
     codesign --force --timestamp --sign "$SIGN_IDENTITY" "$1"
   }
@@ -460,6 +471,9 @@ if [[ -n "$SIGN_IDENTITY" ]]; then
 else
   sign_code() {
     codesign --force --sign - "$1"
+  }
+  sign_companion() {
+    codesign --force --entitlements "$COMPANION_ENTITLEMENTS" --sign - "$1"
   }
   sign_container() {
     codesign --force --sign - "$1"
@@ -498,11 +512,22 @@ fi
 
 sign_code "$APP_HELPERS/ottto"
 sign_code "$APP_HELPERS/ottto-service"
-sign_code "$APP_MACOS/Ottto"
+sign_companion "$APP_MACOS/Ottto"
 sign_code "$OUTPUT_DIR/ottto"
 sign_code "$OUTPUT_DIR/ottto-service"
 sign_sparkle "$APP_FRAMEWORKS/Sparkle.framework"
-sign_code "$APP_BUNDLE"
+sign_companion "$APP_BUNDLE"
+expected_companion_entitlements="[\"$OTTTO_MACOS_COMPANION_ENTITLEMENT_KEY\"]"
+if [[ "$(ottto_macos_signed_entitlement_keys "$APP_BUNDLE")" != "$expected_companion_entitlements" ]]; then
+  echo "Signed Ottto.app must carry only the Companion Apple Events entitlement" >&2
+  exit 1
+fi
+for helper in "$APP_HELPERS/ottto" "$APP_HELPERS/ottto-service" "$OUTPUT_DIR/ottto" "$OUTPUT_DIR/ottto-service"; do
+  if [[ "$(ottto_macos_signed_entitlement_keys "$helper")" != "[]" ]]; then
+    echo "Bundled helpers must not carry entitlements: $helper" >&2
+    exit 1
+  fi
+done
 
 LAUNCH_SMOKE_EVIDENCE="$OUTPUT_DIR/packaged-app-launch-smoke.json"
 "$ROOT/scripts/macos_launch_smoke.sh" \
