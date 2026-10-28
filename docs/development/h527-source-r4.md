@@ -24,20 +24,20 @@ There is no automatic retry and no daemon stop/restart. A daemon may keep runnin
 but a concurrent index publication is not accepted. The operator must disclose
 this rule before the separately authorized corpus run.
 
-A usable census record is current, verified, not a path twin, not retired or
+A complete census record has the current derivation, is verified, not a path twin, not retired or
 over budget, and has an Exact/Empty shape. Its request hash prefixes count as
 present. Matching target IDs are excluded and the peer is classified
-`vanished_census_used`. Prefix collisions can cause conservative exclusion;
+`vanished_census_used`. Prefix collisions have negligible probability but can undercount money;
 these are not newly recovered exact IDs, line counts, ACKs or dollar proof.
-Unavailable/incomplete/retired records use the no-census fallback.
+Available positive IDs from incomplete records are still used; their unknown remainder additionally uses the lineage hold. Retired/over-budget/stale-derivation records have no usable IDs and use the no-census fallback. A same-session target replica is the target's own counter, so its IDs stay in B2, as for a live replica. The snapshot records historical observed IDs, not necessarily the vanished file's latest revision.
 
 With no usable record the producer re-stats the peer once, at the end of the
-peer scan. A still-absent peer holds only related targets, disclosed as
+run after target rebuilds. A still-absent peer holds only related targets, disclosed as
 `vanished_no_census { peers, held_targets }`. Related means the existing path
 family root, the same project-directory identity across named roots, or a
-transitive copy/fork edge read from existing target/peer data. An unclassifiable
+transitive closure over project, family, copy/fork edges and native-ID shared-target links read from existing target/peer data. An unclassifiable
 path conservatively relates to every target. A reappeared peer or refused
-re-stat retains the global unknown-coverage hold. Other unknown/cap/creator
+re-stat refuses publication of the entire run. Other unknown/cap/creator
 gates are preserved.
 
 ## Missing native request IDs
@@ -53,7 +53,7 @@ supply those dollars; null never means zero.
 An exact provider timestamp, model and full eight-dimension usage tuple already
 seen in a same-lineage peer proves a copy, disclosed as
 `missing_evidence_matched_by_tuple { lines, totals }`. Missing timestamp/model
-never matches. Matching uses hashes of typed tuples in RAM. For progressive
+never matches. Same-session replicas never count as an independent peer. Matching uses hashes of typed tuples in RAM. For progressive
 responses, the whole matched response is removed by the ordinary dedup key;
 rebuilding must still reconcile exactly. Target-to-target residual copies use
 the existing first-ACK/session-key order, preserving one keeper. A native-ID

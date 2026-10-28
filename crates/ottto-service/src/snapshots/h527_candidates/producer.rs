@@ -112,6 +112,7 @@ const NOT_REPRODUCED_STAGES: [&str; 6] = [
 use crate::snapshots::claude_request_census::{claude_request_hash, ClaudeRequestCensus};
 #[cfg(test)]
 thread_local! {
+    static AFTER_BUILDS_FOR_TEST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static AFTER_PLAN_FOR_TEST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
 const VANISHED_ON_OPEN: &str = "vanished_on_open";
@@ -267,7 +268,19 @@ fn project_name(path: &Path) -> Option<&std::ffi::OsStr> {
     }
 }
 fn root_id(session: &str) -> &str {
-    session.split("_agent-").next().unwrap_or(session)
+    if session.starts_with("\u{1f}project:") {
+        session
+    } else {
+        session.split("_agent-").next().unwrap_or(session)
+    }
+}
+fn register_path_lineage(path: &Path, edges: &mut BTreeSet<(String, String)>) {
+    if let Some((root, project)) = family_root(path).zip(project_name(path)) {
+        edges.insert((
+            root.to_string(),
+            format!("\u{1f}project:{}", project.to_string_lossy()),
+        ));
+    }
 }
 fn same_lineage(left: &Path, right: &Path, edges: &BTreeSet<(String, String)>) -> bool {
     let (Some(left_root), Some(right_root)) = (family_root(left), family_root(right)) else {
@@ -309,48 +322,66 @@ fn resolve_vanished(
 ) {
     let record = census
         .and_then(|snapshot| snapshot.records.get(&peer.path.to_string_lossy()))
-        .filter(|record| {
-            record.proves_scan()
-                && !record.unverified_or_twin()
-                && record.can_bind_recomposed_body()
-        });
+        .filter(|record| record.proves_scan());
     let witness = path_sha256(&peer.path);
+    let owner_index = claude_index_path_member_ref(&peer.path)
+        .map(|member| member.into_owned().1)
+        .and_then(|owner| {
+            input
+                .targets
+                .iter()
+                .position(|target| target.source_session_id == owner)
+        });
     if let Some(record) = record {
         for (index, original) in originals.iter().enumerate() {
             for request_id in original.request_ids.iter().flatten() {
                 if record.holds_hash(claude_request_hash(request_id)) {
-                    scan.hits[index].insert(
-                        request_id.clone(),
-                        PeerHit {
+                    // Same-session replicas are the target's own counter. Their
+                    // shared native IDs remain in B2, exactly as for live peers.
+                    if owner_index.is_some_and(|owner| {
+                        originals[owner]
+                            .request_ids
+                            .as_ref()
+                            .is_some_and(|ids| ids.contains(request_id))
+                    }) {
+                        continue;
+                    }
+                    scan.hits[index]
+                        .entry(request_id.clone())
+                        .or_insert_with(|| PeerHit {
                             path_sha256: witness.clone(),
                             owner_session_sha256: None,
                             line_count: 0,
                             inherited_from_absent_source: false,
-                        },
-                    );
+                        });
                 }
             }
         }
         scan.vanished_census_used += 1;
-        scan.files.push(json!({"class": input.peer_roots[peer.root_index].class, "path_sha256": witness, "classification": "vanished_census_used", "census_hash_scheme": "sha256_prefix_64bit", "collision_policy": "conservative_exclusion"}));
-        return;
-    }
-    match fs::symlink_metadata(&peer.path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            scan.vanished_no_census += 1;
-            let mut held = Vec::new();
-            for (index, target) in input.targets.iter().enumerate() {
-                if same_lineage(&target.transcript_path, &peer.path, &scan.lineage_edges) {
-                    scan.lineage_held.insert(index);
-                    held.push(target.session_key_sha256.clone());
-                }
-            }
-            scan.files.push(json!({"class": input.peer_roots[peer.root_index].class, "path_sha256": witness, "classification": "vanished_no_census", "held_targets": held}));
+        scan.files.push(json!({"class": input.peer_roots[peer.root_index].class, "path_sha256": witness, "classification": "vanished_census_used", "census_hash_scheme": "sha256_prefix_64bit", "collision_policy": "possible_money_under_count_on_hash_collision"}));
+        if !record.unverified_or_twin() && record.can_bind_recomposed_body() {
+            return;
         }
-        _ => coverage.unknown.push(format!(
-            "vanished peer {witness} reappeared or restat refused"
-        )),
+        // Positive IDs survive even an incomplete census. Its negative claims
+        // are unavailable, so additionally hold only its lineage.
     }
+    scan.vanished_no_census += 1;
+    scan.vanished_no_census_paths.push(peer.path.clone());
+    let mut held = Vec::new();
+    for (index, target) in input.targets.iter().enumerate() {
+        if same_lineage(&target.transcript_path, &peer.path, &scan.lineage_edges) {
+            scan.lineage_held.insert(index);
+            held.push(target.session_key_sha256.clone());
+        }
+    }
+    if record.is_some() {
+        if let Some(row) = scan.files.last_mut() {
+            row["incomplete_census_lineage_hold"] = json!(held);
+        }
+    } else {
+        scan.files.push(json!({"class": input.peer_roots[peer.root_index].class, "path_sha256": witness, "classification": "vanished_no_census", "held_targets": held}));
+    }
+    let _ = coverage; // Other coverage failures retain their existing gate.
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,9 +1032,11 @@ struct PeerScan {
     inherited_absent_source_line_count: u64,
     vanished_census_used: u64,
     vanished_no_census: u64,
+    vanished_no_census_paths: Vec<PathBuf>,
     lineage_held: BTreeSet<usize>,
     lineage_edges: BTreeSet<(String, String)>,
     tuple_hits: Vec<BTreeSet<String>>,
+    target_ranks: Vec<(Option<u64>, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1139,6 +1172,25 @@ pub(crate) fn produce(
         packet_reasons.push(built.reason);
         estimates.push(built.estimate);
         target_reports.push(built.report);
+    }
+
+    #[cfg(test)]
+    AFTER_BUILDS_FOR_TEST.with(|cell| {
+        if let Some(run) = cell.borrow_mut().take() {
+            run();
+        }
+    });
+    // SOURCE requires the one no-census re-stat at the end of the run, after
+    // rebuilds. The lineage holds above were provisional; a reappeared peer or
+    // failed stat refuses publication of the entire run, with no partial body.
+    for path in &peers.vanished_no_census_paths {
+        if !fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(
+                "vanished peer reappeared or end-of-run stat refused; no output published".into(),
+            );
+        }
     }
 
     // Held operator packet, each member bound to its content-free report.
@@ -1665,6 +1717,11 @@ fn scan_peers(
     let mut scan = PeerScan {
         hits: vec![BTreeMap::new(); target_count],
         tuple_hits: vec![BTreeSet::new(); target_count],
+        target_ranks: input
+            .targets
+            .iter()
+            .map(|target| (target.b2_first_ack_order, target.session_key_sha256.clone()))
+            .collect(),
         same_session_line_count: vec![0; target_count],
         shared_target_replica_line_count: 0,
         replica_divergent_ids: vec![BTreeSet::new(); target_count],
@@ -1745,6 +1802,20 @@ fn scan_peers(
         &mut scan,
         coverage,
     );
+    for target in &input.targets {
+        register_path_lineage(&target.transcript_path, &mut scan.lineage_edges);
+    }
+    for peer in &planned {
+        register_path_lineage(&peer.path, &mut scan.lineage_edges);
+    }
+    for indexes in holders.values() {
+        for pair in indexes.windows(2) {
+            scan.lineage_edges.insert((
+                root_id(&input.targets[pair[0]].source_session_id).to_string(),
+                root_id(&input.targets[pair[1]].source_session_id).to_string(),
+            ));
+        }
+    }
     #[cfg(test)]
     AFTER_PLAN_FOR_TEST.with(|cell| {
         if let Some(run) = cell.borrow_mut().take() {
@@ -1849,8 +1920,8 @@ fn scan_peers(
         scan.lineage_edges
             .extend(original.lineage_edges.iter().cloned());
     }
-    // Re-stat exactly once at the end. Reappeared/unknown peers keep the old
-    // global hold; still absent peers without usable census hold only lineage.
+    // Compute provisional lineage holds. Their single re-stat is deferred until
+    // after target rebuilds, before any run output is published.
     for peer in vanished {
         resolve_vanished(peer, input, originals, census, &mut scan, coverage);
     }
@@ -2328,6 +2399,40 @@ fn scan_peer_file(
         // needs. Same-lineage check is repeated after the full graph is known.
         if let Some(tuple) = line_usage_tuple(&value) {
             for (index, original) in originals.iter().enumerate() {
+                let owner_index = owner
+                    .and_then(|owner| session_index.get(owner.as_str()))
+                    .copied();
+                if owner_index == Some(index) {
+                    continue;
+                }
+                if let Some(other_index) = owner_index {
+                    let Ok(other) = &originals[other_index].original else {
+                        continue;
+                    };
+                    let rank = |i: usize| {
+                        (
+                            scan.target_ranks[i].0.unwrap_or(u64::MAX),
+                            &scan.target_ranks[i].1,
+                        )
+                    };
+                    let native_match = other.item.claude_usage_occurrences.values().any(|usage| {
+                        usage_tuple(
+                            usage.timestamp.as_deref(),
+                            usage.model.as_deref(),
+                            &usage.usage,
+                        )
+                        .as_ref()
+                            == Some(&tuple)
+                    });
+                    let residual_match = rank(other_index) < rank(index)
+                        && other
+                            .missing
+                            .iter()
+                            .any(|missing| missing.tuple.as_ref() == Some(&tuple));
+                    if !native_match && !residual_match {
+                        continue;
+                    }
+                }
                 if original.original.as_ref().is_ok_and(|original| {
                     original
                         .missing
@@ -2620,7 +2725,7 @@ fn build_target(
             report,
             TargetHold::new(
                 reason,
-                "global peer coverage incomplete; no partition or body",
+                "peer coverage incomplete for this target; no partition or body",
             ),
         );
     }

@@ -1152,3 +1152,190 @@ fn source_r4_all_idless_usage_stays_counted() {
     assert_eq!(report["body"]["item_totals"]["input_tokens"], 123);
     fs::remove_dir_all(fixture.root).unwrap();
 }
+
+#[test]
+fn source_r4_vanished_target_replica_preserves_b2_money() {
+    use crate::snapshots::claude_request_census::claude_request_census_record;
+    let mut fixture = fixture();
+    let replica = fixture.input.peer_roots[1]
+        .path
+        .join("replica")
+        .join(format!("{}.jsonl", session_id(2)));
+    let parsed =
+        parse_target_transcript(&replica, &fixture.input.collected_at, false, false, None).unwrap();
+    let record = claude_request_census_record(
+        &(session_id(2), session_id(2)),
+        &parsed.snapshots,
+        vec![],
+        &"a".repeat(64),
+        1,
+        true,
+        false,
+        false,
+    )
+    .unwrap();
+    let mut census = ClaudeRequestCensus::default();
+    census.insert_for_test(replica.to_str().unwrap(), record);
+    let path = fixture.root.join("index.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({"generation":1,"claude_request_census":census})).unwrap(),
+    )
+    .unwrap();
+    fixture.input.census_index_path = Some(path);
+    vanish_after_plan(replica);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    assert_eq!(
+        target_report(&artifact, 2)["body"]["item_totals"]["input_tokens"],
+        20
+    );
+    assert_eq!(
+        target_report(&artifact, 3)["body"]["item_totals"]["input_tokens"],
+        330
+    );
+    assert_eq!(
+        target_report(&artifact, 3)["partition"]["excluded"]["request_count"],
+        0
+    );
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_live_idless_target_replica_is_own_counter() {
+    let fixture = fixture();
+    let target = &fixture.input.targets[17];
+    let mut missing = assistant_line(
+        &target.source_session_id,
+        5,
+        ("idless-replica", 123, 7, 456),
+    );
+    missing.as_object_mut().unwrap().remove("requestId");
+    let mut lines = transcript_lines(&target.source_session_id, &[("req-t18-a", 25, 2, 100)]);
+    lines.push(missing);
+    write_lines(&target.transcript_path, &lines);
+    let replica = fixture.input.peer_roots[1]
+        .path
+        .join("replica")
+        .join(format!("{}.jsonl", session_id(18)));
+    write_lines(&replica, &lines);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    let report = target_report(&artifact, 18);
+    assert_eq!(
+        report["candidate_status"], "computed_unqualified",
+        "{report}"
+    );
+    assert_eq!(report["missing_evidence_counted"]["lines"], 1);
+    assert_eq!(report["missing_evidence_matched_by_tuple"]["lines"], 0);
+    assert_eq!(report["body"]["item_totals"]["input_tokens"], 148);
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_mixed_project_fork_lineage_holds_transitively() {
+    let fixture = fixture();
+    let peer = add_vanishing_peer(&fixture.input, "proj-vanished");
+    // Q shares a project with all targets, but names P in a different project.
+    let q = fixture.input.peer_roots[0]
+        .path
+        .join("proj-a")
+        .join(format!("{}.jsonl", session_id(903)));
+    write_lines(
+        &q,
+        &[fork_copy(
+            &session_id(903),
+            &session_id(900),
+            ("not-target", 1, 1, 0),
+            "mixed-edge",
+        )],
+    );
+    vanish_after_plan(peer);
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    assert_eq!(
+        artifact["input_manifest"]["vanished_no_census"]["held_targets"],
+        18
+    );
+    assert_eq!(
+        target_report(&artifact, 18)["held_reason"],
+        "incomplete_census"
+    );
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_reappeared_peer_at_run_end_refuses_publication() {
+    let fixture = fixture();
+    let peer = add_vanishing_peer(&fixture.input, "proj-unrelated");
+    vanish_after_plan(peer.clone());
+    AFTER_BUILDS_FOR_TEST.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(move || {
+            fs::write(peer, "reappeared").unwrap();
+        }))
+    });
+    let error = produce(&fixture.input, &"0".repeat(64), &fixture_build())
+        .err()
+        .unwrap();
+    assert!(error.contains("end-of-run stat"), "{error}");
+    fs::remove_dir_all(fixture.root).unwrap();
+}
+
+#[test]
+fn source_r4_target_tuple_copy_keeps_one_b2_counter() {
+    let fixture = fixture();
+    let mut line = assistant_line(&session_id(17), 6, ("target-copy", 123, 7, 456));
+    line.as_object_mut().unwrap().remove("requestId");
+    for index in [16, 17] {
+        let target = &fixture.input.targets[index];
+        let requests = target_requests((index + 1) as u64);
+        let borrowed = requests
+            .iter()
+            .map(|(id, a, b, c)| (id.as_str(), *a, *b, *c))
+            .collect::<Vec<_>>();
+        let mut lines = transcript_lines(&target.source_session_id, &borrowed);
+        line["sessionId"] = json!(target.source_session_id);
+        lines.push(line.clone());
+        write_lines(&target.transcript_path, &lines);
+        // A live replica of the losing target must not override B2.
+        if index == 17 {
+            write_lines(
+                &fixture.input.peer_roots[1]
+                    .path
+                    .join("replica")
+                    .join(format!("{}.jsonl", session_id(18))),
+                &lines,
+            );
+        }
+    }
+    let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
+    let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
+    let reports = [target_report(&artifact, 17), target_report(&artifact, 18)];
+    assert!(
+        reports
+            .iter()
+            .all(|report| report["candidate_status"] == "computed_unqualified"),
+        "{reports:?}"
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report["missing_evidence_counted"]["lines"]
+                .as_u64()
+                .unwrap())
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .map(
+                |report| report["missing_evidence_matched_by_tuple"]["lines"]
+                    .as_u64()
+                    .unwrap()
+            )
+            .sum::<u64>(),
+        1
+    );
+    fs::remove_dir_all(fixture.root).unwrap();
+}
