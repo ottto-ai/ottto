@@ -250,6 +250,7 @@ impl Checkpoint {
     fn view(&self) -> CertificateView<'_> {
         CertificateView {
             stamp: &self.stamp,
+            exact_stamp: false,
             scope: &self.scope.0,
             sealed_offset: self.samples.sealed_offset,
             samples_valid: self.samples.valid_for(self.stamp.length),
@@ -373,6 +374,9 @@ impl PrefixSeal {
     /// only one such use is the caller's rule.
     ///
     /// Differences from `prepare` on the same checkpoint:
+    /// - Refusal-only, E1 S3 (C1): the stamp compares exactly, ctime
+    ///   included (`CertificateView::exact_stamp`), so a ctime-only change
+    ///   refuses as `SameSizeEdit` or `Replaced` where `prepare` admits it.
     /// - Refusal-only: a short or failed sample read refuses as
     ///   `HeadChanged`/`BoundaryChanged` (`prepare` returns `Err`); a failed
     ///   stamp capture or a change during the guards refuses as `Replaced`;
@@ -382,8 +386,9 @@ impl PrefixSeal {
     ///   `Checkpoint::seal_as`), so an equal-length edit at the checkpoint's
     ///   length, or a shrink into `(s, length)`, is admitted where `prepare`
     ///   returns `SameSizeEdit`/`Shrunk`. A caller that relies on the parsed
-    ///   length must also require `append_compatible(parsed, now)` against
-    ///   the unnormalized stamp it parsed (U1a-2's `side.parsed` guard).
+    ///   length must also require the exact-stamp append rule
+    ///   (`OpenStamp::wake_compatible`) against the unnormalized stamp it
+    ///   parsed (U1a-2's `side.parsed` guard).
     pub(crate) fn admits(
         &self,
         file: &mut File,
@@ -400,6 +405,7 @@ impl PrefixSeal {
         let len = self.sample_len as usize;
         let view = CertificateView {
             stamp: &self.stamp,
+            exact_stamp: true,
             scope: &self.scope,
             sealed_offset: sealed,
             samples_valid: u64::from(self.sample_len) == sealed.min(SAMPLE_BYTES as u64)
@@ -428,7 +434,7 @@ impl PrefixSeal {
         #[cfg(test)]
         between_guards();
         let after = file.metadata().and_then(FileStamp::capture);
-        if !after.is_ok_and(|after| after.same_content(&stamp)) {
+        if !after.is_ok_and(|after| after == stamp) {
             return Err(FullReason::Replaced);
         }
         match mode {
@@ -438,12 +444,11 @@ impl PrefixSeal {
     }
 
     /// U1a-2a fence, Q-U28 only: whether the held FD's head and boundary
-    /// windows still hash to this seal's samples. It exists for a same-size
-    /// change that moved mtime, which `admits` refuses as `SameSizeEdit`
-    /// before it reads any sample (a ctime-only change is the same content
-    /// since E1 S3, so `admits` no longer refuses it). It reads at most the
-    /// seal's two windows of `sample_len` (≤ 2 · `SAMPLE_BYTES`) through the
-    /// shared reader, at the offsets `admits` uses. A seal whose samples are invalid, an offset
+    /// windows still hash to this seal's samples. It exists for a same-size,
+    /// ctime-only change, which `admits` refuses as `SameSizeEdit` before it
+    /// reads any sample. It reads at most the seal's two windows of
+    /// `sample_len` (≤ 2 · `SAMPLE_BYTES`) through the shared reader, at the
+    /// offsets `admits` uses. A seal whose samples are invalid, an offset
     /// that does not compute, and a short or failed read are all `false`.
     ///
     /// **Seek position.** The reader seeks. This restores the FD's position
@@ -616,10 +621,26 @@ fn digest_shaped(digest: &str) -> bool {
 /// a `Checkpoint` or a `PrefixSeal`.
 struct CertificateView<'a> {
     stamp: &'a FileStamp,
+    /// A `PrefixSeal`'s rule: the stamp exactly, ctime included. Its only
+    /// users are Codex parent-proof authority (side records, proof install
+    /// and re-fence), where ctime is the only witness of a same-inode
+    /// replacement or an mtime-restored rewrite until a birth fence exists
+    /// (E1 S3b). A `Checkpoint` compares `same_content`.
+    exact_stamp: bool,
     scope: &'a str,
     sealed_offset: u64,
     samples_valid: bool,
     verified: u64,
+}
+
+impl CertificateView<'_> {
+    fn unchanged(&self, now: &FileStamp) -> bool {
+        if self.exact_stamp {
+            now == self.stamp
+        } else {
+            now.same_content(self.stamp)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -659,9 +680,9 @@ fn select_mode(
             ReadMode::Full(FullReason::Replaced)
         } else if stamp.length < old.stamp.length {
             ReadMode::Full(FullReason::Shrunk)
-        } else if stamp.length == old.stamp.length && !stamp.same_content(old.stamp) {
+        } else if stamp.length == old.stamp.length && !old.unchanged(stamp) {
             ReadMode::Full(FullReason::SameSizeEdit)
-        } else if stamp.same_content(old.stamp) && old.sealed_offset == stamp.length {
+        } else if old.unchanged(stamp) && old.sealed_offset == stamp.length {
             ReadMode::Unchanged
         } else if !sample_eq(SampleAt::Head)? {
             ReadMode::Full(FullReason::HeadChanged)
@@ -2124,13 +2145,15 @@ mod tests {
     /// checkpoint whose length equals its sealed offset `s`, a seal admits
     /// exactly when `prepare` would reuse the checkpoint, with the same
     /// refusal reason and the same sample bytes read, on every identity,
-    /// sample, scope and clock case.
+    /// sample, scope and clock case but one: a ctime-only change, which
+    /// `prepare` reuses (E1 S3) and a seal refuses as `SameSizeEdit` (C1: a
+    /// seal keeps the exact stamp until a birth fence exists).
     ///
     /// `partial` rows use a checkpoint with an unsealed EOF fragment
     /// (`s < L`). The seal certifies only `[0, s)`, so it admits an
     /// equal-length edit (interior beyond both windows, or in the fragment)
     /// and a shrink into `(s, L)` that `prepare` refuses. That is the
-    /// intended trimming; U1a-2's `side.parsed.append_compatible` guard
+    /// intended trimming; U1a-2's `side.parsed.wake_compatible` guard
     /// against the unnormalized stamp refuses them. A shrink to exactly `s`
     /// is refused by both, with different reasons.
     #[test]
@@ -2178,16 +2201,18 @@ mod tests {
         let rows = [
             same("unchanged", |_, _| None, 200, false, Ok(0)),
             same("grown", append, 200, false, Ok(windows)),
-            same(
-                "metadata only (E1 S3)",
-                |f, _| {
+            Row {
+                case: "metadata only (E1 S3; C1 for the seal)",
+                partial: false,
+                mutate: |f, _| {
                     metadata_only(&f.0, Meta::Chmod);
                     None
                 },
-                200,
-                false,
-                Ok(0),
-            ),
+                now: 200,
+                rescope: false,
+                prepare: Ok(0),
+                admits: Err(FullReason::SameSizeEdit),
+            },
             same(
                 "metadata only and growth (E1 S3)",
                 |f, _| {
@@ -2427,10 +2452,10 @@ mod tests {
         }
     }
 
-    /// U1a-2a Q-U28: `samples_match` is true for a ctime-only change (which
-    /// `admits` admits since E1 S3, reading nothing) and for a same-size
-    /// change that moved mtime (which `admits` still refuses as
-    /// `SameSizeEdit`), false for a head or a boundary edit, a truncation and
+    /// U1a-2a Q-U28: `samples_match` is true for a ctime-only change and
+    /// for a same-size change that moved mtime (both of which `admits`
+    /// still refuses as `SameSizeEdit`: a seal keeps the exact stamp, E1 S3
+    /// C1), false for a head or a boundary edit, a truncation and
     /// an invalid seal sample, and it leaves the FD's position where it was,
     /// so a reader on that FD continues correctly, on every path.
     #[test]
@@ -2451,8 +2476,8 @@ mod tests {
             matched
         };
 
-        // ctime only: same bytes, so the samples match; since E1 S3 it is
-        // the same content and `admits` admits it reading no sample.
+        // ctime only: same bytes, so the samples match; admission is
+        // unchanged (`SameSizeEdit`: a seal keeps the exact stamp, E1 S3 C1).
         let f = Fixture::new(&bytes);
         let seal = initial(&f, 1000).seal(1000);
         assert!(check(&f, &seal));
@@ -2460,7 +2485,7 @@ mod tests {
             metadata_only(&f.0, meta);
             assert_eq!(
                 seal.admits(&mut f.open(), &scope(), 1100, false),
-                Ok(0),
+                Err(FullReason::SameSizeEdit),
                 "{meta:?}"
             );
             assert!(check(&f, &seal), "ctime-only change: {meta:?}");
@@ -3199,8 +3224,9 @@ mod tests {
 
     /// E1 S3 (Ron's re-read rule): a metadata-only change at equal length
     /// is the same content. Before `prepare` it is `Unchanged` with zero
-    /// sample bytes read (never `SameSizeEdit`), the seal admits it reading
-    /// nothing and `stamp_matches` keeps the copy; with growth it is a
+    /// sample bytes read (never `SameSizeEdit`) and `stamp_matches` keeps
+    /// the copy, while a seal of the same checkpoint keeps the pre-S3 exact
+    /// stamp and refuses it as `SameSizeEdit` (C1); with growth it is a
     /// `Tail`; a moved mtime at equal length is still `SameSizeEdit`. Every
     /// decision is inside the horizon with no debt: before S1 an old or
     /// debt-due checkpoint is `Full(AuditDue)` whatever ctime does, so these
@@ -3216,8 +3242,8 @@ mod tests {
             assert!(cp.stamp_matches(&f.open()).unwrap(), "{meta:?}");
             assert_eq!(
                 seal.admits(&mut f.open(), &scope(), 1100, false),
-                Ok(0),
-                "{meta:?}"
+                Err(FullReason::SameSizeEdit),
+                "{meta:?}: a seal keeps the exact stamp"
             );
             let (mode, next, read) = run(&f, Some(&cp), None, 1100);
             assert_eq!((mode, read), (ReadMode::Unchanged, 0), "{meta:?}");
@@ -3243,8 +3269,9 @@ mod tests {
 
     /// E1 S3: a change between a decision's opening stamp and its
     /// re-capture (the `between_guards` hook). Metadata only keeps
-    /// `prepare`'s tail, the seal's admission and `unpark`'s resume; a moved
-    /// mtime there still aborts each.
+    /// `prepare`'s tail and `unpark`'s resume; a moved mtime there still
+    /// aborts each. A seal keeps the exact stamp (C1), so either change
+    /// there refuses its admission as `Replaced`, as before S3.
     #[test]
     fn metadata_only_change_between_guard_captures_keeps_the_decision() {
         struct Clear;
@@ -3284,12 +3311,7 @@ mod tests {
             arm(&f.0);
             let admitted = seal.admits(&mut f.open(), &scope(), 1100, false);
             set_between_guards(None);
-            let expected = if kept {
-                Ok(0)
-            } else {
-                Err(FullReason::Replaced)
-            };
-            assert_eq!(admitted, expected, "{change:?}");
+            assert_eq!(admitted, Err(FullReason::Replaced), "{change:?}");
 
             let f = Fixture::new(&wide_rows("s3-guards"));
             let (plan, consumed) = partial_read(&f, 2, 7);

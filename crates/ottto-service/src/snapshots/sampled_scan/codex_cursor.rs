@@ -519,8 +519,12 @@ impl OpenStamp {
     /// whose content inputs and birth still match already carries the
     /// stored ctime, and a birth or evidence mismatch keeps the live ctime,
     /// so ctime is the birth witness here and stays compared. Not
-    /// `append_compatible`, which never compares ctime (E1 S3).
-    fn wake_compatible(&self, now: &Self) -> bool {
+    /// `append_compatible`, which never compares ctime (E1 S3). Codex
+    /// parent-proof authority (the side record's parsed-stamp guard and the
+    /// proof wakes, on raw path stamps) keeps this rule too: there ctime is
+    /// the only witness of a same-inode replacement or an mtime-restored
+    /// rewrite until a birth fence exists (E1 S3b).
+    pub(in crate::snapshots) fn wake_compatible(&self, now: &Self) -> bool {
         self.same_object(now) && (now.extent > self.extent || self == now)
     }
 
@@ -5917,7 +5921,12 @@ pub(in crate::snapshots) fn revalidate(
 /// already read still names its boot object's content (`same_content`, at
 /// the exact boot length; a ctime-only change is not a change); the group's reduction
 /// dependencies, member set and counting view are unchanged; then the
-/// singleton's priority-decision and live-input rules.
+/// singleton's priority-decision and live-input rules. A member's path
+/// stamp carries no birth witness: an in-place same-length rewrite that
+/// restores mtime passes here, and a replacement is seen only through a new
+/// inode number, which APFS does not reuse (Linux would need a birth
+/// witness). The strict sealed-member validator before publication still
+/// compares ctime.
 fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resume {
     let (Some(meta), Some(group)) = (job.cursor.as_ref(), job.group.as_ref()) else {
         return Resume::Changed;
