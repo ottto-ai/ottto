@@ -11068,11 +11068,12 @@ pub(crate) fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<Snaps
 
 pub(crate) fn snapshot_api_base_url() -> String {
     normalize_api_base_url(
-        FileConnectionStore::default()
-            .load()
-            .ok()
-            .flatten()
-            .map(|binding| binding.api_base_url),
+        crate::local_resource_diagnostics::credential_file_read(
+            FileConnectionStore::default().load(),
+        )
+        .ok()
+        .flatten()
+        .map(|binding| binding.api_base_url),
         std::env::var("OTTTO_API_BASE_URL").ok(),
     )
 }

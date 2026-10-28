@@ -3202,7 +3202,9 @@ fn truncate_diagnostic(value: &str) -> String {
 /// pre-confirm guards are the crash boundary immediately before the request:
 /// a transport failure after that cut cannot prove the old authority survived.
 pub fn ensure_no_incomplete_device_credential_promotion() -> Result<()> {
-    let pending = FilePendingDeviceCredentialStore::default().load()?;
+    let pending = crate::local_resource_diagnostics::credential_file_read(
+        FilePendingDeviceCredentialStore::default().load(),
+    )?;
     if pending.as_ref().is_some_and(|pending| {
         pending.confirmed_at.is_some()
             || (pending.confirmation_authorized && pending.preconfirm_guards_passed)

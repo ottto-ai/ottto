@@ -10,6 +10,10 @@ pub enum CredentialFileCapRefused {
     DeviceBinding,
     #[error("file-backed secret exceeds 64 KiB")]
     FileSecret,
+    #[error("connection binding exceeds 64 KiB")]
+    ConnectionBinding,
+    #[error("pending device credential exceeds 64 KiB")]
+    PendingDeviceCredential,
 }
 impl CredentialFileCapRefused {
     fn refuse(self) -> io::Error {
@@ -44,6 +48,8 @@ mod tests {
         for kind in [
             CredentialFileCapRefused::DeviceBinding,
             CredentialFileCapRefused::FileSecret,
+            CredentialFileCapRefused::ConnectionBinding,
+            CredentialFileCapRefused::PendingDeviceCredential,
         ] {
             let exact = vec![b'x'; LIMIT as usize];
             assert_eq!(read_body(&exact[..], kind).unwrap().len(), LIMIT as usize);

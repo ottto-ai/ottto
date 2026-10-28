@@ -161,16 +161,17 @@ disclosed residue.
 ## Credential File Cap Refusals
 
 Schema 2 adds `credential_file_cap_refusal` point records on the same
-`ottto-service: local_resources` stderr carrier. Snapshot device-authority and
-destination loaders count typed device-binding and file-backed-secret cap
-errors through the service's existing diagnostic emitter before error detail
+`ottto-service: local_resources` stderr carrier. Snapshot device-authority,
+destination, promotion-guard and connection loaders count typed device-binding,
+file-backed-secret, pending-credential-journal and connection-binding cap errors through the service's existing diagnostic emitter before error detail
 is replaced. Both ordinary snapshot sync and retained retry use those loaders.
 Core returns typed errors and never emits or keeps counters itself. Metadata rejection before body
 allocation and growth past the cap during the bounded read both count once;
 oversize invalid UTF-8 counts as a cap refusal before decoding. Other I/O,
 JSON, UTF-8 and missing-file failures do not increment this counter.
 
-`counts.file_kind` is `device_binding` or `file_secret`;
+`counts.file_kind` is `device_binding`, `file_secret`, `connection_binding` or
+`pending_device_credential`;
 `credential_file_cap_refused` is 1 for this event and
 `credential_file_cap_refused_total` is a saturating process-lifetime total for
 that kind. Count attempts, not distinct files. Totals include only those observed

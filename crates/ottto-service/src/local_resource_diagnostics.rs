@@ -163,10 +163,10 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
 const SCHEMA_VERSION: u8 = 2;
 
 #[cfg(not(test))]
-static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 #[cfg(test)]
 thread_local! {
-    static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 2] = const { [const { AtomicU64::new(0) }; 2] };
+    static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = const { [const { AtomicU64::new(0) }; 4] };
 }
 /// Observe typed cap errors before snapshot callers replace their detail.
 /// Ordinary snapshot sync and retained retry use these same authority loads.
@@ -196,8 +196,10 @@ pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Resu
         let (slot, file_kind) = match kind {
             CredentialFileCapRefused::DeviceBinding => (0, "device_binding"),
             CredentialFileCapRefused::FileSecret => (1, "file_secret"),
+            CredentialFileCapRefused::ConnectionBinding => (2, "connection_binding"),
+            CredentialFileCapRefused::PendingDeviceCredential => (3, "pending_device_credential"),
         };
-        let increment = |counts: &[AtomicU64; 2]| {
+        let increment = |counts: &[AtomicU64; 4]| {
             counts[slot]
                 .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
                 .unwrap_or(u64::MAX)
@@ -1347,6 +1349,13 @@ mod tests {
             let error = credential_file_read(store.load()).unwrap_err();
             assert!(format!("{error:#}").contains("exceeds 64 KiB"));
             assert!(credential_file_read(store.load_with_credential_generation()).is_err());
+            assert!(
+                credential_file_read(ottto_core::FileConnectionStore::new(&path).load()).is_err()
+            );
+            assert!(credential_file_read(
+                ottto_core::FilePendingDeviceCredentialStore::new(&path).load()
+            )
+            .is_err());
             // The core secret store preserves this typed variant across its API.
             let secret: anyhow::Result<()> = Err(TokenStoreError::OversizeRefused.into());
             assert!(credential_file_read(secret)
@@ -1364,23 +1373,27 @@ mod tests {
             assert!(credential_file_read(other).is_err());
         });
         std::fs::remove_file(path).unwrap();
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 6);
         for (i, line) in lines.iter().enumerate() {
             assert_eq!(line["schema_version"], 2);
             assert_eq!(line["stage"], "credential_file_cap_refusal");
             assert_eq!(line["source"], "unknown");
             assert_eq!(
                 line["counts"]["file_kind"],
-                if i < 2 {
-                    "device_binding"
-                } else {
-                    "file_secret"
+                match i {
+                    0 | 1 => "device_binding",
+                    2 => "connection_binding",
+                    3 => "pending_device_credential",
+                    _ => "file_secret",
                 }
             );
             assert_eq!(line["counts"]["credential_file_cap_refused"], 1);
             assert_eq!(
                 line["counts"]["credential_file_cap_refused_total"],
-                i % 2 + 1
+                match i {
+                    0 | 2 | 3 | 4 => 1,
+                    _ => 2,
+                }
             );
             assert_eq!(line["counts"].as_object().unwrap().len(), 3);
         }

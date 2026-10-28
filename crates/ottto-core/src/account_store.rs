@@ -268,8 +268,12 @@ impl FileConnectionStore {
         if !self.path.exists() {
             return Ok(None);
         }
-        let body = fs::read_to_string(&self.path)
-            .with_context(|| format!("read connection binding {}", self.path.display()))?;
+        let body = crate::credential_file::read(
+            fs::File::open(&self.path)
+                .with_context(|| format!("open connection binding {}", self.path.display()))?,
+            crate::CredentialFileCapRefused::ConnectionBinding,
+        )
+        .with_context(|| format!("read connection binding {}", self.path.display()))?;
         serde_json::from_str(&body)
             .with_context(|| format!("parse connection binding {}", self.path.display()))
     }
@@ -448,8 +452,13 @@ impl FilePendingDeviceCredentialStore {
         if !self.path.exists() {
             return Ok(None);
         }
-        let body = fs::read_to_string(&self.path)
-            .with_context(|| format!("read pending device credential {}", self.path.display()))?;
+        let body = crate::credential_file::read(
+            fs::File::open(&self.path).with_context(|| {
+                format!("open pending device credential {}", self.path.display())
+            })?,
+            crate::CredentialFileCapRefused::PendingDeviceCredential,
+        )
+        .with_context(|| format!("read pending device credential {}", self.path.display()))?;
         serde_json::from_str(&body)
             .with_context(|| format!("parse pending device credential {}", self.path.display()))
     }
@@ -645,6 +654,38 @@ mod tests {
 
         assert_eq!(store.reset().expect("reset connection"), Some(connection));
         assert_eq!(store.load().expect("load reset"), None);
+    }
+
+    #[test]
+    fn connection_and_pending_credential_loads_enforce_64_kib_boundary() {
+        let path = temp_path("retry-other-authority-size-bound");
+        for pending in [false, true] {
+            let load = || {
+                if pending {
+                    FilePendingDeviceCredentialStore::new(&path)
+                        .load()
+                        .map(|v| v.is_none())
+                } else {
+                    FileConnectionStore::new(&path).load().map(|v| v.is_none())
+                }
+            };
+            let mut bytes = b"null".to_vec();
+            bytes.resize(64 * 1024, b' ');
+            fs::write(&path, &bytes).unwrap();
+            assert!(load().unwrap());
+            bytes.push(b' ');
+            fs::write(&path, &bytes).unwrap();
+            let error = load().unwrap_err();
+            assert!(format!("{error:#}").contains("exceeds 64 KiB"));
+            assert!(error
+                .chain()
+                .filter_map(|e| e.downcast_ref::<std::io::Error>())
+                .any(|e| e
+                    .get_ref()
+                    .is_some_and(|e| e.is::<crate::CredentialFileCapRefused>())));
+            fs::remove_file(&path).unwrap();
+            assert!(load().unwrap());
+        }
     }
 
     #[test]
