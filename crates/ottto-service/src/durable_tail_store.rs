@@ -903,16 +903,8 @@ impl Stamp {
     fn of(m: &fs::Metadata) -> Self {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (
-            m.dev(),
-            m.ino(),
-            m.len(),
-            m.mtime(),
-            m.mtime_nsec(),
-            m.ctime(),
-            m.ctime_nsec(),
-        )
-            .hash(&mut hasher);
+        [m.dev(), m.ino(), m.len()].hash(&mut hasher);
+        [m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()].hash(&mut hasher);
         Self(hasher.finish())
     }
 }
