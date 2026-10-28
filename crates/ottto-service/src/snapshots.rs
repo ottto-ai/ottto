@@ -25951,17 +25951,16 @@ impl OwnedSourceScan {
         // candidates and within the same page limit. Draining keeps the
         // buffer's capacity.
         let carry_replay = &mut index.claude_stale_family_carry.replay;
-        let replayed = selection_limit.saturating_sub(pending_paths.len()).min(
-            carry_replay
-                .iter()
-                .take_while(|path| {
-                    index.files.contains_key(&local_index_key(&path.path))
-                        && claude_index_path_member_ref(&path.path)
-                            .is_some_and(|m| index.claude_usage_family_pending.contains_key(m.root))
-                })
-                .count(),
-        );
-        pending_paths.extend(carry_replay.drain(..replayed));
+        while pending_paths.len() < selection_limit {
+            let Some(position) = carry_replay.iter().position(|path| {
+                index.files.contains_key(&local_index_key(&path.path))
+                    && claude_index_path_member_ref(&path.path)
+                        .is_some_and(|m| index.claude_usage_family_pending.contains_key(m.root))
+            }) else {
+                break;
+            };
+            pending_paths.push(carry_replay.remove(position));
+        }
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal
                 .pending_candidates
@@ -26194,6 +26193,12 @@ impl OwnedSourceScan {
                 }
             }
         }
+        forced_claude_family_reparses.retain(|root| {
+            !index
+                .claude_usage_family_pending
+                .get(root)
+                .is_some_and(|p| p.census_window_end != census_window_end)
+        });
         if !forced_claude_family_reparses.is_empty() {
             let already_identified = identified_candidates
                 .iter()
@@ -30925,7 +30930,7 @@ impl OwnedSourceScan {
                     "stale_request_evidence",
                     1,
                 );
-                continue;
+                pending!();
             }
             if source == SnapshotSource::Codex {
                 census.note_codex_selection(decision, parse_reason, codex_selected_by);
@@ -40543,6 +40548,7 @@ fn ensure_bounded_traversal(
         let rearmed_file_count = 0_usize;
         let mut carried_file_count = 0_usize;
         let mut capped_file_count = 0_usize;
+        let mut indexed_held = false;
         let window_rearmed_file_count = 0_usize;
         for (index_key, entry) in &mut index.files {
             let Some((root, _)) = claude_index_path_family_member(Path::new(index_key))
@@ -40555,13 +40561,18 @@ fn ensure_bounded_traversal(
             }
             if carried_roots.contains(&root) {
                 carried_file_count += 1;
-            } else if capped_roots.contains(&root) {
-                capped_file_count += 1;
+            } else {
+                indexed_held = true;
+                if capped_roots.contains(&root) {
+                    capped_file_count += 1;
+                }
             }
         }
         let held_roots = stale_pending_roots.difference(&carried_roots).count();
-        if held_roots > 0 {
+        if indexed_held {
             index.mark_bounded_sweep_unsettled();
+        }
+        if held_roots > 0 {
             crate::local_resource_diagnostics::claude_reread::stale_rearm_held(
                 "stale_request_evidence",
                 held_roots as u64,

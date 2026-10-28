@@ -899,3 +899,75 @@ fn stale_carry_batch_diagnostics_discard_failed_larger_attempts() {
     );
     assert_eq!(diagnostics.eligible_before_funding, 1);
 }
+
+#[test]
+fn bounded_stale_admission_crosses_128_roots_without_restart_or_reload_gap() {
+    let mut fixture = retry_durable_fixture(0, 260);
+    let root = fixture._scratch.to_path_buf();
+    retry_test_context(&mut fixture.index, &root);
+    let context = fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .context_fingerprint
+        .clone();
+    let window = fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .census_window_end
+        .clone();
+    let acks = fixture.index.accepted_snapshot_fingerprints.clone();
+    let fingerprints = fixture
+        .index
+        .files
+        .iter()
+        .map(|(k, e)| (k.clone(), e.source_file_fingerprint.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut served = 0;
+    for _ in 0..260 {
+        let previous = fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .and_then(|o| o.admission.clone());
+        claude_service_retained_retry(&mut fixture.index, CARRY_RETRY, &context, previous.as_ref());
+        let state = fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        let after = fixture
+            .roots
+            .iter()
+            .position(|r| Some(r) == state.after_root.as_ref())
+            .unwrap()
+            + 1;
+        assert!(after > served && after - served <= CLAUDE_RETRY_ADMISSION_ROOTS);
+        served = after;
+        let done = state.roots_complete;
+        fixture.index = retry_test_reload(&mut fixture.index, &root.join("bounded-stale.json"));
+        assert_eq!(
+            fixture.index.traversal.as_ref().unwrap().census_window_end,
+            window
+        );
+        assert_eq!(fixture.index.accepted_snapshot_fingerprints, acks);
+        for (key, fingerprint) in &fingerprints {
+            assert_eq!(
+                &fixture.index.files[key].source_file_fingerprint,
+                fingerprint
+            );
+        }
+        if done {
+            break;
+        }
+    }
+    assert_eq!(served, 260);
+}
