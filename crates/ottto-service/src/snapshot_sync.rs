@@ -55,6 +55,10 @@ mod rejection_log;
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+// Both scan workers' stack. Headroom, not a fix: the release cycle fits the
+// 2 MiB spawn default (scan_worker_stack_margin_receipt), and an overflow
+// would abort the daemon.
+const SNAPSHOT_SYNC_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 // Non-terminal collector check-in cadence. The sync loop sleeps a fixed
 // SNAPSHOT_SYNC_INTERVAL AFTER a cycle completes, so terminal status receipts
 // alone age by cycle_duration + interval; a long cycle (first onboarding scan,
@@ -3753,6 +3757,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     let phase_offset = local_cadence_phase_offset(SNAPSHOT_SYNC_INTERVAL);
     std::thread::Builder::new()
         .name("ottto-snapshot-sync".to_string())
+        .stack_size(SNAPSHOT_SYNC_WORKER_STACK_BYTES)
         .spawn(move || {
             // Spread the fleet's cycle phase deterministically before the first
             // cycle. Otherwise phase is set by install or restart time, and every
@@ -4170,6 +4175,7 @@ pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     }
     let spawn_result = std::thread::Builder::new()
         .name("ottto-snapshot-sync-now".to_string())
+        .stack_size(SNAPSHOT_SYNC_WORKER_STACK_BYTES)
         .spawn(move || {
             match sync_once(&home, &support_dir, &daemon) {
                 Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
