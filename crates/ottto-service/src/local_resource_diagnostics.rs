@@ -128,28 +128,23 @@ pub(crate) fn selector_key_rejected(unknown: bool) {
 /// Cumulative shared-process totals, NOT events attributed to the finishing
 /// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
 pub(crate) fn cache_lifecycle_totals() {
-    #[derive(Serialize)]
-    struct Counts {
-        #[serde(flatten)]
-        cache: cache_lifecycle::Counts,
-        selector_key_rejected: BTreeMap<&'static str, u64>,
-    }
+    traversal_point(
+        "process_retained_cache_lifecycle_totals",
+        "unknown",
+        &cache_lifecycle::snapshot(),
+    );
+}
+
+/// Process-wide cumulative capture attempts, not attributed to the finishing page.
+fn selector_key_rejection_counts() -> BTreeMap<&'static str, u64> {
     let cache = cache_lifecycle::snapshot();
-    let selector_key_rejected = [
+    [
         ("unknown", cache.selector_key_rejected_unknown),
         ("format", cache.selector_key_rejected_format),
     ]
     .into_iter()
     .filter(|(_, n)| *n > 0)
-    .collect();
-    traversal_point(
-        "process_retained_cache_lifecycle_totals",
-        "unknown",
-        &Counts {
-            cache,
-            selector_key_rejected,
-        },
-    );
+    .collect()
 }
 
 /// Cumulative shared-process Codex memo totals (L-2): lifetime counters plus
@@ -321,9 +316,12 @@ impl Probe {
             line_delivery: Option<BTreeMap<&'static str, LineDeliveryCounts>>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             line_delivery_unselected: BTreeMap<&'static str, u64>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            selector_key_rejected: BTreeMap<&'static str, u64>,
         }
         let claude = source == "claude_code";
         let counts = Counts {
+            selector_key_rejected: selector_key_rejection_counts(),
             line_delivery: self
                 .line_delivery
                 .filter(|(_, counts)| *counts != LineDeliveryCounts::default())

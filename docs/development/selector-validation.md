@@ -20,7 +20,7 @@ not parsed and reserialized. Recognized null candidates mean absence.
 
 Unknown fields in explicit selector containers and malformed captured values are
 dropped. Ordinary event-envelope fields are outside the selector vocabulary.
-The existing local resource diagnostics carrier reports process-wide cumulative
+The existing native collection page diagnostics carrier reports process-wide cumulative
 `selector_key_rejected` counts with only `unknown` and `format` classes; repeated
 capture attempts are counted, not unique lines. These counters contain no raw
 key, value or source text. Diagnostics do not affect parsing or recovery.
@@ -37,4 +37,6 @@ rejections, rejected-value record canaries, Pi occurrence inputs, and Claude/Cod
 restore followed by Tail versus cold Full. The money-equivalence dispatch also
 overlays only the valid-input test on its comparison ref and compares exact
 serialized emitted bodies, record bodies, row identity, tier keys and detected
-plan fingerprints. Invalid-input tests stay outside that equal-output comparison.
+plan fingerprints. Both comparison arms read the same physical synthetic files,
+so birth timestamps and file identity cannot create false byte differences.
+Invalid-input tests stay outside that equal-output comparison.

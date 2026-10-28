@@ -1616,3 +1616,12 @@ fn rejected_selector_candidates_never_save_and_restore_tail_equals_full() {
         assert_eq!(items(continued, &path, source), cold_items(&path, source));
     }
 }
+
+#[test]
+fn valid_selector_records_have_zero_rejections() {
+    let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(
+        selector_compatibility_tests::valid_native_bodies_records_tier_and_plan_receipt,
+    );
+    assert_eq!(counts.selector_key_rejected_unknown, 0);
+    assert_eq!(counts.selector_key_rejected_format, 0);
+}

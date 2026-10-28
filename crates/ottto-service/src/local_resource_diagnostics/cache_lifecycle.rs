@@ -5,9 +5,9 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! counters {
-    ($($field:ident: $event:ident),+ $(,)?) => {
+    ($($(#[$meta:meta])* $field:ident: $event:ident),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-        pub(crate) struct Counts { $(pub(crate) $field: u64),+ }
+        pub(crate) struct Counts { $($(#[$meta])* pub(crate) $field: u64),+ }
         pub(crate) struct Sparse(pub(crate) Counts);
         impl Serialize for Sparse {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -40,7 +40,9 @@ macro_rules! counters {
     };
 }
 counters! {
+    #[serde(skip)] // Projected only on the larger native_collection_page carrier.
     selector_key_rejected_unknown: SelectorKeyRejectedUnknown,
+    #[serde(skip)]
     selector_key_rejected_format: SelectorKeyRejectedFormat,
     take_hit: TakeHit,
     take_absent: TakeAbsent,

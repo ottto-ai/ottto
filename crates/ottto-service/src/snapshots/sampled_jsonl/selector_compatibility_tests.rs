@@ -55,23 +55,28 @@ mod selector_compatibility_tests {
     }
 
     #[test]
-    fn valid_native_bodies_records_tier_and_plan_receipt() {
-        let (bytes, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+    pub(super) fn valid_native_bodies_records_tier_and_plan_receipt() {
+        let bytes = {
             let mut receipts = BTreeMap::new();
             for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-                let scratch = if let Some(root) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_ROOT") {
+                let scratch = Scratch::new("selector-compatibility");
+                let path = if let Some(root) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_ROOT") {
+                    // Both comparison arms read this SAME physical synthetic file.
+                    // Keeping inode/birth stable preserves exact record-byte evidence.
                     let dir = PathBuf::from(root)
                         .join("selector-native")
                         .join(source.api_slug());
-                    if dir.exists() {
-                        fs::remove_dir_all(&dir).unwrap();
-                    }
                     fs::create_dir_all(&dir).unwrap();
-                    Scratch(dir)
+                    dir.join("selector.jsonl")
                 } else {
-                    Scratch::new("selector-compatibility")
+                    scratch.0.join("selector.jsonl")
                 };
-                let path = scratch.write("selector.jsonl", &lines(source));
+                let input = lines(source).join("\n") + "\n";
+                if path.exists() {
+                    assert_eq!(fs::read(&path).unwrap(), input.as_bytes());
+                } else {
+                    fs::write(&path, input).unwrap();
+                }
                 let (reduction, _) = full_read(&path, source);
                 let body = encode(
                     &reduction,
@@ -176,14 +181,7 @@ mod selector_compatibility_tests {
                 }
             }
             serde_json::to_vec(&receipts).unwrap()
-        });
-        let counts = serde_json::to_value(counts).unwrap();
-        for name in [
-            "selector_key_rejected_unknown",
-            "selector_key_rejected_format",
-        ] {
-            assert_eq!(counts.get(name).and_then(Value::as_u64).unwrap_or(0), 0);
-        }
+        };
         if let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") {
             let dir = PathBuf::from(out).join("selector");
             fs::create_dir_all(&dir).unwrap();

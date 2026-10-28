@@ -97,9 +97,16 @@ fn malformed_values_are_dropped_and_counted_without_content() {
     assert!(capture.context.is_empty() && capture.sources.is_empty());
     assert_eq!(counts.selector_key_rejected_format, 21);
     assert_eq!(counts.selector_key_rejected_unknown, 1);
-    let (_, logs) = crate::local_resource_diagnostics::capture(
-        crate::local_resource_diagnostics::cache_lifecycle_totals,
-    );
+    let (_, logs) = crate::local_resource_diagnostics::capture(|| {
+        crate::local_resource_diagnostics::Probe::start().collection(
+            "codex",
+            crate::local_resource_diagnostics::CollectionCounts {
+                scanned_files: 0,
+                semantic_noops: 0,
+                sampled_acquisition: None,
+            },
+        );
+    });
     let text = serde_json::to_string(&logs).unwrap();
     for secret in [
         "CANARY",
@@ -110,11 +117,13 @@ fn malformed_values_are_dropped_and_counted_without_content() {
     ] {
         assert!(!text.contains(secret));
     }
-    let counts = logs[0]["selector_key_rejected"].as_object().unwrap();
+    let counts = logs[0]["counts"]["selector_key_rejected"]
+        .as_object()
+        .unwrap();
     assert!(counts
         .keys()
         .all(|key| matches!(key.as_str(), "unknown" | "format")));
-    assert_eq!(logs[0]["stage"], "process_retained_cache_lifecycle_totals");
+    assert_eq!(logs[0]["stage"], "native_collection_page");
 }
 
 #[test]
