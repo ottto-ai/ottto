@@ -25,11 +25,15 @@ fn bounded_retry_cutoff_shape_refuses_before_typed_map_decode() {
             &f.hint,
             &f.progress.destination_namespace_hash,
             &ordinary,
+            [0; 32],
         )
     });
     eprintln!(
         "cutoff_preparation bytes={} requested_peak={} usable_peak={} optional_admitted={}",
-        bytes.len(), allocation.requested_peak, allocation.usable_peak, live.is_some()
+        bytes.len(),
+        allocation.requested_peak,
+        allocation.usable_peak,
+        live.is_some()
     );
     assert!(live.is_none());
     assert!(allocation.requested_peak < 256 * 1024);
@@ -53,17 +57,26 @@ fn bounded_retry_cutoff_node_boundary_preserves_ordinary_state() {
             .join(",");
         let bytes = format!("{{\"completed_parser_versions\":{{{entries}}}}}");
         assert!(bytes.len() < crate::snapshot_retry::RESPONSE_BYTES);
-        assert_eq!(crate::snapshot_retry::state_nodes(bytes.as_bytes()).unwrap(), 3 + count * 2);
+        assert_eq!(
+            crate::snapshot_retry::state_nodes(bytes.as_bytes()).unwrap(),
+            3 + count * 2
+        );
         std::fs::write(&path, &bytes).unwrap();
         let ordinary = crate::backfill::load_backfill_state(&f.support);
         assert_eq!(ordinary.completed_parser_versions.len(), count);
         let live = live_snapshot_retry::LiveAuthority::capture(
-            SnapshotSource::Pi, &f.home.0, &f.support, &f.hint,
-            &f.progress.destination_namespace_hash, &ordinary,
+            SnapshotSource::Pi,
+            &f.home.0,
+            &f.support,
+            &f.hint,
+            &f.progress.destination_namespace_hash,
+            &ordinary,
+            [0; 32],
         );
         assert_eq!(live.is_some(), expected);
         if let Some(live) = live {
-            live.validate_capture(&f.home.0, &f.items).unwrap();
+            live.validate_capture(&f.home.0, &f.items, &f.working)
+                .unwrap();
         }
         assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
         assert_eq!(crate::backfill::load_backfill_state(&f.support), ordinary);
@@ -88,8 +101,13 @@ impl PiLiveFixture {
     fn new() -> Self {
         Self::with_models(1)
     }
-    fn with_models(models: usize) -> Self { Self::with_shape(models, 0) }
+    fn with_models(models: usize) -> Self {
+        Self::with_shape(models, 0)
+    }
     fn with_shape(models: usize, label_bytes: usize) -> Self {
+        Self::with_page(1, models, label_bytes)
+    }
+    fn with_page(files: usize, models: usize, label_bytes: usize) -> Self {
         assert!(
             std::env::var_os("PI_CODING_AGENT_DIR").is_none(),
             "synthetic live retry tests require an isolated Pi root"
@@ -103,17 +121,32 @@ impl PiLiveFixture {
         let bytes = if models == 1 && label_bytes == 0 {
             format!("{row}\n")
         } else {
-            (0..models).map(|i| {
-                let label = (0..label_bytes).map(|j| match j % 23 {
-                    0 => '\\', 1 => '\"', 2 => '\u{1}',
-                    _ => char::from(b'a' + ((i * 17 + j * 31) % 26) as u8),
-                }).collect::<String>();
-                serde_json::json!({"type":"message_end","message":{
+            (0..models)
+                .map(|i| {
+                    let label = (0..label_bytes)
+                        .map(|j| match j % 23 {
+                            0 => '\\',
+                            1 => '\"',
+                            2 => '\u{1}',
+                            _ => char::from(b'a' + ((i * 17 + j * 31) % 26) as u8),
+                        })
+                        .collect::<String>();
+                    serde_json::json!({"type":"message_end","message":{
                     "model":format!("synthetic-{i:04}-{label}"),"timestamp":1791280801000i64,
-                    "usage":{"input":100,"output":1}}}).to_string() + "\n"
-            }).collect::<String>()
+                    "usage":{"input":100,"output":1}}})
+                    .to_string()
+                        + "\n"
+                })
+                .collect::<String>()
         };
-        std::fs::write(roots[0].join("one.jsonl"), bytes).unwrap();
+        for file in 0..files {
+            let name = if file == 0 {
+                "one.jsonl".into()
+            } else {
+                format!("{file}.jsonl")
+            };
+            std::fs::write(roots[0].join(name), &bytes).unwrap();
+        }
         let support = home.0.join("support");
         std::fs::create_dir_all(&support).unwrap();
         let hint = Self::hint();
@@ -124,6 +157,7 @@ impl PiLiveFixture {
         let mut progress = test_upload_progress();
         progress.save(&progress_path).unwrap();
         // The real hook freezes inputs before the native parser starts.
+        let opens_before = crate::snapshots::all_transcript_opens_for_test();
         let live = live_snapshot_retry::LiveAuthority::capture(
             SnapshotSource::Pi,
             &home.0,
@@ -131,8 +165,13 @@ impl PiLiveFixture {
             &hint,
             &progress.destination_namespace_hash,
             &Default::default(),
+            [0; 32],
         )
         .unwrap();
+        assert_eq!(
+            crate::snapshots::all_transcript_opens_for_test(),
+            opens_before
+        );
         let mut working = baseline.clone();
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
             SnapshotSource::Pi,
@@ -150,9 +189,15 @@ impl PiLiveFixture {
             SnapshotUploadPolicy::default(),
         );
         finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut working);
-        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(scan.snapshots.len(), files);
+        assert!(crate::snapshots::all_transcript_opens_for_test() > opens_before);
         let items = scan.snapshots;
-        live.validate_capture(&home.0, &items).unwrap();
+        let opens_after_scan = crate::snapshots::all_transcript_opens_for_test();
+        live.validate_capture(&home.0, &items, &working).unwrap();
+        assert_eq!(
+            crate::snapshots::all_transcript_opens_for_test(),
+            opens_after_scan
+        );
         Self {
             daemon: test_daemon(&"a".repeat(64)),
             home,
@@ -177,6 +222,55 @@ impl PiLiveFixture {
         )
         .unwrap()
     }
+    // Exercise production store reads while keeping every credential synthetic.
+    fn bind_turn(
+        &mut self,
+        client: &SnapshotApiClient,
+        endpoint: &str,
+        device: &LocalDeviceBinding,
+    ) -> [EnvVarGuard; 2] {
+        let secrets = self.support.join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let guards = [
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &self.support),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
+        ];
+        FileDeviceStore::default().save(device).unwrap();
+        std::fs::write(
+            secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "synthetic-secret",
+        )
+        .unwrap();
+        std::fs::write(
+            self.support.join("connection.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "setup_run_id":"synthetic", "setup_run_token_expires_at":"synthetic",
+                "machine_id":null, "api_base_url":endpoint
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // A destination gets a fresh checkpoint, never a cross-destination CAS.
+        self.progress_path = self.support.join("bound-progress.json");
+        self.progress = SnapshotUploadProgress::new(
+            snapshot_upload_destination_namespace(device, "synthetic-secret"),
+            snapshot_quarantine_witness(SnapshotSource::Pi),
+        );
+        self.progress.save(&self.progress_path).unwrap();
+        self.live = Some(
+            live_snapshot_retry::LiveAuthority::capture(
+                SnapshotSource::Pi,
+                &self.home.0,
+                &self.support,
+                &self.hint,
+                &self.progress.destination_namespace_hash,
+                &Default::default(),
+                client.api_base_seal(),
+            )
+            .unwrap(),
+        );
+        guards
+    }
     fn capture(&mut self, delay: Duration) -> live_snapshot_retry::LiveRetryOwner {
         self.try_capture(delay).expect("supported native fixture")
     }
@@ -194,6 +288,7 @@ impl PiLiveFixture {
         )
         .unwrap();
         let mut owner = live_snapshot_retry::LiveRetryOwner::isolated();
+        let opens_before = crate::snapshots::all_transcript_opens_for_test();
         let admitted = owner.capture_after_shed(
             self.live.take().unwrap(),
             &self.home.0,
@@ -209,6 +304,10 @@ impl PiLiveFixture {
             &self.progress_path,
             Instant::now(),
             delay,
+        );
+        assert_eq!(
+            crate::snapshots::all_transcript_opens_for_test(),
+            opens_before
         );
         admitted.then_some(owner)
     }
@@ -264,7 +363,7 @@ fn bounded_retry_live_inputs_decline_rewrites_replacements_new_paths_and_cutoff(
             f.live
                 .as_ref()
                 .unwrap()
-                .validate_capture(&f.home.0, &f.items)
+                .validate_capture(&f.home.0, &f.items, &f.working)
                 .is_err(),
             "{change}"
         );
@@ -276,7 +375,8 @@ fn bounded_retry_live_inputs_decline_rewrites_replacements_new_paths_and_cutoff(
         &f.support,
         &f.hint,
         "synthetic",
-        &Default::default()
+        &Default::default(),
+        [0; 32],
     )
     .is_none());
     let mut hint = PiLiveFixture::hint();
@@ -285,7 +385,8 @@ fn bounded_retry_live_inputs_decline_rewrites_replacements_new_paths_and_cutoff(
     hint.session_attribution_enabled = false;
     hint.snapshot_head_cas_required = true;
     assert!(live_snapshot_retry::policy_seal(&hint).is_none());
-    let closed = live_snapshot_retry::LiveRetryOwner::production();
+    assert!(live_snapshot_retry::LiveRetryOwner::production().enabled());
+    let closed = live_snapshot_retry::LiveRetryOwner::closed();
     assert!(!closed.enabled());
     let deadline = Instant::now() + Duration::from_secs(300);
     assert_eq!(closed.wake_before(deadline), deadline);
@@ -326,6 +427,200 @@ fn bounded_retry_owner_due_boundary_preserves_ordinary_deadline() {
 #[test]
 // The bounded turn leases the shared client_report counters across its token/batch I/O.
 #[serial(client_report)]
+fn bounded_retry_live_ack_lost_resends_same_revision_without_second_contribution() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut f = PiLiveFixture::new();
+    let item = &f.items[0];
+    let witness = snapshot_upload_body_witness(item);
+    let revision = serde_json::to_value(crate::snapshots::snapshot_semantic_envelope(
+        SnapshotSource::Pi,
+        item,
+        SnapshotUploadPolicy::default(),
+    ))
+    .unwrap();
+    assert!(revision["revision_v2_hash"].as_str().unwrap().len() >= 64);
+    let expected_tokens = item.input_tokens + item.output_tokens;
+    assert_eq!(expected_tokens, 101);
+    let ack = bounded_native_ack(item);
+    let hint = serde_json::json!({"source":"pi", "server_time":"2026-10-06T10:05:00Z",
+        "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
+        "local_usage_reconciliation_enabled":true,"backfill_window_days":30,
+        "recommended_scan_after":"2026-10-06T10:10:00Z"})
+    .to_string();
+    let initial = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "pi".into(),
+        machine_id: "a".repeat(64),
+        collector_version: Some(collector_version()),
+        snapshots: f.items.clone(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
+        .with_bounded_retry_loopback_http_for_test();
+    let expected_witness = witness.clone();
+    let expected_revision = revision.clone();
+    let server = bounded_native_server(listener, move |listener| {
+        // Synthetic backend revision store: an identical already-accepted
+        // revision has one contribution. Assert the actual wire bodies agree,
+        // rather than teaching a second client-side equality rule to the test.
+        let mut revisions = BTreeMap::new();
+        let mut contributions = 0;
+        let mut tokens = 0;
+        let mut posts = Vec::new();
+        for step in 0..5 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let bytes = bounded_native_read(&mut stream);
+            let request = String::from_utf8(bytes).unwrap();
+            if step == 2 {
+                assert!(request.contains("/relay-token "));
+                bounded_native_response(&mut stream, "200 OK", "{\"token\":\"fresh\"}");
+                continue;
+            }
+            if step == 3 {
+                assert!(request.contains("/activity-hints "));
+                bounded_native_response(&mut stream, "200 OK", &hint);
+                continue;
+            }
+            assert!(request.contains("/batches "));
+            let request: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let body = &request["snapshots"][0];
+            assert_eq!(body["semantic_envelope"], expected_revision);
+            let body_bytes = serde_json::to_vec(&request["snapshots"]).unwrap();
+            posts.push(body_bytes.clone());
+            if step == 1 {
+                bounded_native_response(&mut stream, "429 Too Many Requests", "{}");
+                continue;
+            }
+            let key = (
+                body["source_session_id"].as_str().unwrap().to_owned(),
+                body["semantic_envelope"]["revision_v2_hash"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+            match revisions.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    contributions += 1;
+                    tokens += body["input_tokens"].as_u64().unwrap()
+                        + body["output_tokens"].as_u64().unwrap();
+                    entry.insert((body_bytes, expected_witness.clone()));
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    assert_eq!(entry.get(), &(body_bytes, expected_witness.clone()));
+                }
+            }
+            if step == 0 {
+                // The backend committed, then the ACK was lost. No response.
+                drop(stream);
+            } else {
+                bounded_native_response(&mut stream, "200 OK", &ack);
+            }
+        }
+        assert_eq!(posts.len(), 3);
+        assert!(posts.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(contributions, 1);
+        assert_eq!(tokens, expected_tokens);
+        revisions.into_values().next().unwrap()
+    });
+    let before_index = std::fs::read(&f.index_path).unwrap();
+    let before_progress = std::fs::read(&f.progress_path).unwrap();
+    assert!(client.upload_batch("initial", &initial, false).is_err());
+    assert_eq!(std::fs::read(&f.index_path).unwrap(), before_index);
+    assert_eq!(std::fs::read(&f.progress_path).unwrap(), before_progress);
+    assert!(!f
+        .progress
+        .contains_body(&f.items[0].snapshot_fingerprint, &witness));
+    let shed = attempt_snapshot_page(
+        &f.items,
+        &[0],
+        "pi",
+        &mut f.progress,
+        &mut 0,
+        &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+        &snapshot_upload_body_witness,
+        &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+        &mut |snapshots| {
+            client.upload_batch(
+                "ordinary-retry",
+                &SnapshotBatchRequest {
+                    snapshots,
+                    ..initial.clone()
+                },
+                false,
+            )
+        },
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(shed.downcast_ref::<UploadShed>().unwrap().status, 429);
+    let mut owner = f.capture(Duration::ZERO);
+    let device = LocalDeviceBinding {
+        sources: vec!["pi".into()],
+        ..bounded_native_device()
+    };
+    let opens = crate::snapshots::all_transcript_opens_for_test();
+    let mut turns = 0;
+    owner.isolated_boundary(|page| {
+        turns += 1;
+        let live = page.take_live_authority()?;
+        let result = page.turn_live(
+            &client,
+            &device,
+            "synthetic-secret",
+            live.policy(),
+            &mut || live.validate_inputs(&f.home.0),
+        );
+        assert!(
+            matches!(result, Ok(SnapshotPageOutcome::Settled { conflicted: 0 })),
+            "{result:?}"
+        );
+        page.restore_live_authority(live);
+        result
+    });
+    assert_eq!(turns, 1);
+    assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
+    let (accepted_body, accepted_witness) = server.join().unwrap();
+    assert_eq!(
+        accepted_body,
+        serde_json::to_vec(&serde_json::to_value(&initial).unwrap()["snapshots"]).unwrap()
+    );
+    assert_eq!(accepted_witness, witness);
+    assert_eq!(snapshot_upload_body_witness(&f.items[0]), witness);
+    let durable = SnapshotUploadProgress::load(
+        &f.progress_path,
+        &f.progress.destination_namespace_hash,
+        test_quarantine_witness(),
+    )
+    .unwrap();
+    assert!(durable.contains_body(&f.items[0].snapshot_fingerprint, &witness));
+    let mut recovered = ScanIndex::load(&f.index_path).unwrap();
+    let scan = crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::Pi,
+        &f.roots,
+        &mut recovered,
+        "2026-10-06T10:06:00Z",
+        30,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        false,
+    )
+    .unwrap();
+    assert!(scan.snapshots.is_empty());
+    eprintln!("native_ack_lost snapshots_identical=true same_revision=true contributions=1 tokens={expected_tokens} witness_unchanged=true checkpoint_ack_restart=true");
+}
+
+#[test]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_and_ack() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -336,7 +631,63 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         .unwrap_or_else(|p| p.into_inner());
     let (_, allocation) = crate::retry_allocation_probe::measure(|| {
         let mut f = PiLiveFixture::new();
+        let ordinary_body = {
+            let mut index = f.baseline.clone();
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Pi,
+                &f.roots,
+                &mut index,
+                "2026-10-06T10:05:00Z",
+                30,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                false,
+            )
+            .unwrap();
+            apply_upload_policy(
+                SnapshotSource::Pi,
+                &mut scan.snapshots,
+                SnapshotUploadPolicy::default(),
+            );
+            finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index);
+            serde_json::to_value(SnapshotBatchRequest {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                source: "pi".into(),
+                machine_id: "a".repeat(64),
+                collector_version: Some(collector_version()),
+                snapshots: scan.snapshots,
+                upload_policy: SnapshotUploadPolicy::default(),
+                client_report: crate::client_report::ClientReport::empty(),
+            })
+            .unwrap()["snapshots"]
+                .clone()
+        };
+        let shed = attempt_snapshot_page(
+            &f.items,
+            &[0],
+            "pi",
+            &mut f.progress,
+            &mut 0,
+            &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+            &snapshot_upload_body_witness,
+            &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+            &mut |items| {
+                assert_eq!(
+                    serde_json::to_value(&items).unwrap(),
+                    serde_json::to_value(&f.items).unwrap()
+                );
+                Err(anyhow::Error::new(UploadShed {
+                    status: 429,
+                    retry_after: Some(Duration::from_millis(30)),
+                    code: None,
+                }))
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(shed.downcast_ref::<UploadShed>().unwrap().status, 429);
         let mut owner = f.capture(Duration::from_millis(30));
+        assert!(owner.enabled());
+        let opens_before_retry = crate::snapshots::all_transcript_opens_for_test();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
             .with_bounded_retry_loopback_http_for_test();
@@ -385,7 +736,6 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
                 owner.isolated_boundary(|page| {
                     turns += 1;
                     assert!(page.bound() <= 1024 * 1024);
-                    page.budget.force_gzip_for_test();
                     let expected_account = page.authority();
                     let live = page.take_live_authority()?;
                     let result = page.turn_live(
@@ -424,6 +774,13 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         assert!(trace[0].starts_with("POST ") && trace[0].contains("/relay-token "));
         assert!(trace[1].starts_with("GET ") && trace[1].contains("/activity-hints "));
         assert!(trace[2].contains("/batches "));
+        let request_body = trace[2].split_once("\r\n\r\n").unwrap().1;
+        let request: serde_json::Value = serde_json::from_str(request_body).unwrap();
+        assert_eq!(request["snapshots"], ordinary_body);
+        assert_eq!(
+            crate::snapshots::all_transcript_opens_for_test(),
+            opens_before_retry
+        );
         let durable = SnapshotUploadProgress::load(
             &f.progress_path,
             &f.progress.destination_namespace_hash,
@@ -463,6 +820,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
 
 #[test]
 // The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial]
 #[serial(client_report)]
 fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -472,13 +830,42 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    for change in ["policy", "stop", "account", "file", "cutoff"] {
+    for change in [
+        "policy",
+        "stop",
+        "account",
+        "file",
+        "cutoff",
+        "destination",
+        "grant",
+    ] {
         let mut f = PiLiveFixture::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let client = SnapshotApiClient::new(&endpoint).with_bounded_retry_loopback_http_for_test();
+        let device = LocalDeviceBinding {
+            sources: vec!["pi".into()],
+            ..bounded_native_device()
+        };
+        let _stores = f.bind_turn(&client, &endpoint, &device);
+        // Matching stores pass every production check before one fence changes.
+        f.live
+            .as_ref()
+            .unwrap()
+            .validate_turn(
+                &client,
+                &f.daemon,
+                (
+                    &device,
+                    SnapshotSource::Pi,
+                    &f.daemon.snapshot_scan_account_witness().unwrap(),
+                ),
+                &f.home.0,
+            )
+            .unwrap();
         let mut owner = f.capture(Duration::ZERO);
         let before = std::fs::read(&f.index_path).unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
-            .with_bounded_retry_loopback_http_for_test();
+        let no_post = listener.try_clone().unwrap();
         let server = if change != "policy" {
             None
         } else {
@@ -518,10 +905,23 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
             )
             .unwrap();
         }
-        let device = LocalDeviceBinding {
-            sources: vec!["pi".into()],
-            ..bounded_native_device()
-        };
+        if change == "destination" {
+            std::fs::write(
+                f.support
+                    .join("secrets")
+                    .join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+                "changed-secret",
+            )
+            .unwrap();
+        }
+        if change == "grant" {
+            FileDeviceStore::default()
+                .save(&LocalDeviceBinding {
+                    sources: vec![],
+                    ..device.clone()
+                })
+                .unwrap();
+        }
         let mut attempted = 0;
         owner.isolated_boundary(|page| {
             attempted += 1;
@@ -533,12 +933,12 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
                 "synthetic-secret",
                 live.policy(),
                 &mut || {
-                    anyhow::ensure!(daemon.snapshot_retry_running().unwrap(), "stopped");
-                    anyhow::ensure!(
-                        daemon.snapshot_scan_account_witness().unwrap() == expected_account,
-                        "account changed"
-                    );
-                    live.validate_inputs(&f.home.0)
+                    live.validate_turn(
+                        &client,
+                        daemon,
+                        (&device, SnapshotSource::Pi, &expected_account),
+                        &f.home.0,
+                    )
                 },
             );
             assert!(result.is_err());
@@ -548,6 +948,8 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
         });
         assert_eq!(attempted, 1);
         assert_eq!(std::fs::read(&f.index_path).unwrap(), before);
+        no_post.set_nonblocking(true).unwrap();
+        assert!(matches!(no_post.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
         if let Some(server) = server {
             let listener = server.join().unwrap();
             assert!(matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
@@ -674,4 +1076,196 @@ fn bounded_retry_json_escape_admission_declines_before_retained_copy_and_wire_gr
         "native_escape_refusal requested_peak={} no_retained_copy=true",
         stats.requested_peak
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn pi_retry_stat_witness_ignores_chmod_but_refuses_append_and_mtime() {
+    use std::os::unix::fs::PermissionsExt;
+    for change in ["chmod", "append", "mtime", "mtime_ns"] {
+        let f = PiLiveFixture::new();
+        let path = f.roots[0].join("one.jsonl");
+        let opens = crate::snapshots::all_transcript_opens_for_test();
+        match change {
+            "chmod" => {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap()
+            }
+            "append" => {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"\n")
+                    .unwrap();
+            }
+            "mtime_ns" => {
+                use std::os::unix::fs::MetadataExt;
+                let before = std::fs::symlink_metadata(&path).unwrap();
+                let ns = (before.mtime_nsec() as u32 + 1) % 1_000_000_000;
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + Duration::new(before.mtime() as u64, ns),
+                ))
+                .unwrap();
+                let after = std::fs::symlink_metadata(&path).unwrap();
+                assert_eq!(after.mtime(), before.mtime());
+                assert_ne!(after.mtime_nsec(), before.mtime_nsec());
+            }
+            _ => {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            f.live
+                .as_ref()
+                .unwrap()
+                .validate_capture(&f.home.0, &f.items, &f.working)
+                .is_ok(),
+            change == "chmod",
+            "{change}"
+        );
+        assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
+    }
+}
+
+#[test]
+fn pi_retry_index_representation_transition_refuses_before_post() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut f = PiLiveFixture::new();
+    let mut owner = f.capture(Duration::ZERO);
+    let mut representation: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&f.index_path).unwrap()).unwrap();
+    // E1's existing V-row contract: a changed index schema is a new
+    // representation even with unchanged checkpoint generation and Pi bytes.
+    representation["schema_version"] = serde_json::json!(f.baseline.schema_version + 1);
+    std::fs::write(&f.index_path, serde_json::to_vec(&representation).unwrap()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
+        .with_bounded_retry_loopback_http_for_test();
+    let device = LocalDeviceBinding {
+        sources: vec!["pi".into()],
+        ..bounded_native_device()
+    };
+    let mut turns = 0;
+    owner.isolated_boundary(|page| {
+        turns += 1;
+        let live = page.take_live_authority()?;
+        let result = page.turn_live(
+            &client,
+            &device,
+            "synthetic-secret",
+            live.policy(),
+            &mut || live.validate_inputs(&f.home.0),
+        );
+        assert!(result.is_err());
+        assert_eq!(page.budget.posts_left(), 3);
+        page.restore_live_authority(live);
+        result
+    });
+    assert_eq!(turns, 1);
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn pi_retry_checkpoint_comparison_accepts_both_native_encodings() {
+    let f = PiLiveFixture::new();
+    for pretty in [false, true] {
+        let bytes = if pretty {
+            serde_json::to_vec_pretty(&f.baseline).unwrap()
+        } else {
+            serde_json::to_vec(&f.baseline).unwrap()
+        };
+        std::fs::write(&f.index_path, bytes).unwrap();
+        assert!(
+            bounded_snapshot_retry::checkpoint_matches(&f.index_path, &f.baseline, false).unwrap()
+        );
+        let mut changed = f.baseline.clone();
+        changed.schema_version += 1;
+        assert!(
+            !bounded_snapshot_retry::checkpoint_matches(&f.index_path, &changed, false).unwrap()
+        );
+    }
+}
+
+#[test]
+#[serial]
+#[serial(client_report)]
+fn retained_endpoint_change_refuses_before_relay_token_or_post() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut f = PiLiveFixture::new();
+    let original = SnapshotApiClient::new("https://original.invalid");
+    let device = LocalDeviceBinding {
+        sources: vec!["pi".into()],
+        ..bounded_native_device()
+    };
+    let _stores = f.bind_turn(&original, "https://original.invalid", &device);
+    assert!(f
+        .live
+        .as_ref()
+        .unwrap()
+        .validate_turn(
+            &original,
+            &f.daemon,
+            (
+                &device,
+                SnapshotSource::Pi,
+                &f.daemon.snapshot_scan_account_witness().unwrap()
+            ),
+            &f.home.0
+        )
+        .is_ok());
+    let mut owner = f.capture(Duration::ZERO);
+    let before = std::fs::read(&f.index_path).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // Match the fresh client to the changed persisted endpoint: only the
+    // retained endpoint fence can distinguish this from a valid new turn.
+    let mut connection = FileConnectionStore::default().load().unwrap().unwrap();
+    connection.api_base_url = format!("http://{}", listener.local_addr().unwrap());
+    FileConnectionStore::default().save(&connection).unwrap();
+    let changed = SnapshotApiClient::new(&connection.api_base_url)
+        .with_bounded_retry_loopback_http_for_test();
+    assert!(changed.matches_api_base(&snapshot_api_base_url().unwrap()));
+    let mut attempted = 0;
+    owner.isolated_boundary(|page| {
+        attempted += 1;
+        let authority = page.authority();
+        let live = page.take_live_authority()?;
+        let result = page.turn_live(
+            &changed,
+            &device,
+            "synthetic-secret",
+            live.policy(),
+            &mut || {
+                live.validate_turn(
+                    &changed,
+                    &f.daemon,
+                    (&device, SnapshotSource::Pi, &authority),
+                    &f.home.0,
+                )
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(page.budget.posts_left(), 3);
+        page.restore_live_authority(live);
+        result
+    });
+    assert_eq!(attempted, 1);
+    assert_eq!(std::fs::read(&f.index_path).unwrap(), before);
+    listener.set_nonblocking(true).unwrap();
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
 }

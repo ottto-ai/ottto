@@ -20056,6 +20056,9 @@ for line in sys.stdin:
     #[test]
     #[serial]
     fn post_confirm_claim_commit_failure_fences_live_admission_then_rolls_forward() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
         let support_root = telemetry_key_store_root("credential-claim-commit-recovery");
         let secret_root = telemetry_key_store_root("credential-claim-commit-recovery-secret");
         fs::create_dir_all(&secret_root).expect("secret root");
@@ -22971,6 +22974,71 @@ for line in sys.stdin:
             .with_account(account)
             .with_connection(Some(connection));
         (root, guards, daemon, device)
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_login_claim_repairs_unreadable_binding_and_clears_doctor_finding() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let _lock = lock_backend_test_env();
+        for bytes in [b"invalid-json".to_vec(), vec![b' '; 64 * 1024 + 1]] {
+            let attach = r#"{"setup_run_id":"run_repaired","setup_run_token":"synthetic-fresh-token","expires_at":"2100-01-01T00:00:00Z","run":{"id":"run_repaired","status":"completed","machine_id":"machine_test"}}"#;
+            let detail = r#"{"run":{"id":"run_repaired","status":"completed","machine_id":"machine_test"},"sources":[],"next_action":null,"next_question":null}"#;
+            let (api_base_url, server) = scripted_json_backend(vec![
+                (200, attach),
+                (200, detail),
+                (200, "{}"),
+                (200, r#"{"action":null}"#),
+            ]);
+            let (root, _guards, daemon, _) =
+                connected_binding_fixture("repair-binding-claim", api_base_url.clone());
+            let home = root.join("synthetic-home");
+            fs::create_dir_all(&home).unwrap();
+            let _home = EnvVarGuard::set_path("HOME", &home);
+            fs::write(FileConnectionStore::default().path(), bytes).unwrap();
+            let has_finding = |daemon: &LocalDaemon| {
+                daemon
+                    .status("token")
+                    .unwrap()
+                    .canonical_health
+                    .unwrap()
+                    .blockers
+                    .iter()
+                    .any(|b| b.code == "connection_binding_unreadable")
+            };
+            assert!(has_finding(&daemon));
+            let payload = setup_run(
+                &daemon,
+                &RequestAuthorization::Token("token".into()),
+                vec![SourceKind::Pi],
+                Some("synthetic-fresh-claim".into()),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(payload["status"], "completed");
+            assert_eq!(payload["claim_code_provided"], true);
+            assert_ne!(payload["already_connected"], true);
+            let binding = FileConnectionStore::default().load().unwrap().unwrap();
+            assert_eq!(binding.setup_run_id, "run_repaired");
+            assert_eq!(binding.api_base_url, api_base_url);
+            assert_eq!(
+                crate::snapshot_sync::snapshot_api_base_url().unwrap(),
+                api_base_url
+            );
+            assert!(!has_finding(&daemon));
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert!(
+                requests[0].starts_with("POST /api/v1/setup-claims/synthetic-fresh-claim/attach ")
+            );
+            assert!(requests[1].contains("/run_repaired/local-client/scan-result "));
+            assert!(requests[2].contains("/run_repaired/local-client/heartbeat "));
+            assert!(requests[3].contains("/run_repaired/local-client/next-action "));
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

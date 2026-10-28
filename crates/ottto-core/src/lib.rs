@@ -3,6 +3,7 @@ pub mod claude_account;
 pub mod claude_config_slots;
 pub mod claude_statusline;
 pub mod codex_account_slots;
+mod credential_file;
 pub mod lifecycle;
 pub mod local_client;
 pub mod local_service;
@@ -12,6 +13,8 @@ pub mod redaction;
 pub mod state_dir_lock;
 pub mod status;
 pub mod token_store;
+
+pub use credential_file::CredentialFileCapRefused;
 
 pub use account_store::{
     default_account_path, default_connection_api_base_url, default_connection_path,

@@ -1139,7 +1139,7 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+    let api_base_url = crate::snapshot_sync::snapshot_api_base_url()?;
     let client = SnapshotApiClient::new(api_base_url.clone());
     let relay_token = client.issue_relay_token(&device, &device_secret, SnapshotSource::Codex)?;
     let identity = destination_identity(&device, &machine_id, &api_base_url);

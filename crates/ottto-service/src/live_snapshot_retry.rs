@@ -1,5 +1,5 @@
-//! Source-owned capture/wake plumbing. Production remains closed; isolated
-//! native callers exercise the same owner with synthetic authority adapters.
+//! Source-owned Pi capture/wake plumbing. The one-shot caller keeps a closed
+//! owner because it has no later collection boundary.
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use bounded_snapshot_retry::{PreparedRetry, RetryOwner};
@@ -8,6 +8,7 @@ pub(super) struct LiveAuthority {
     inputs: crate::snapshots::PiRetryInputs,
     policy: [u8; 32],
     destination: String,
+    endpoint: [u8; 32],
     backfill_path: PathBuf,
     backfill: Option<[u8; 32]>,
 }
@@ -64,6 +65,7 @@ impl LiveAuthority {
         hint: &crate::snapshot_client::ActivityHintResponse,
         destination: &str,
         backfill: &crate::backfill::BackfillState,
+        endpoint: [u8; 32],
     ) -> Option<Self> {
         if source != SnapshotSource::Pi {
             return None;
@@ -96,6 +98,7 @@ impl LiveAuthority {
             inputs,
             policy,
             destination: destination.to_owned(),
+            endpoint,
             backfill_path,
             backfill: seal,
         })
@@ -113,15 +116,39 @@ impl LiveAuthority {
         self.inputs.validate()
     }
 
-    pub(super) fn validate_capture(&self, home: &Path, items: &[SnapshotItem]) -> Result<()> {
+    pub(super) fn validate_capture(
+        &self,
+        home: &Path,
+        items: &[SnapshotItem],
+        index: &ScanIndex,
+    ) -> Result<()> {
         self.validate_inputs(home)?;
         anyhow::ensure!(
-            self.inputs.covers(items),
-            "optional Pi body lacks opened-file authority"
+            self.inputs.covers(items, index),
+            "optional Pi body lacks stat closure authority"
         );
         Ok(())
     }
 
+    pub(super) fn validate_turn(
+        &self,
+        client: &SnapshotApiClient,
+        daemon: &LocalDaemon,
+        (device, source, authority): (&LocalDeviceBinding, SnapshotSource, &[u8; 32]),
+        home: &Path,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.endpoint == client.api_base_seal(),
+            "optional snapshot endpoint changed"
+        );
+        anyhow::ensure!(
+            daemon.snapshot_retry_running().unwrap_or(false),
+            "snapshot daemon stopped"
+        );
+        ensure_snapshot_scan_authority(device, source, client, authority, daemon)?;
+        ensure_snapshot_destination_current(self.destination())?;
+        self.validate_inputs(home)
+    }
     pub(super) fn policy(&self) -> &[u8; 32] {
         &self.policy
     }
@@ -135,6 +162,7 @@ impl HeapLayoutBound for LiveAuthority {
             inputs,
             policy: _,
             destination,
+            endpoint: _,
             backfill_path,
             backfill: _,
         } = self;
@@ -157,16 +185,13 @@ impl LiveRetryOwner {
     }
     pub(super) fn production() -> Self {
         Self {
-            enabled: bounded_snapshot_retry::production_activation_reviewed(),
+            enabled: true,
             retry: RetryOwner::default(),
         }
     }
     #[cfg(test)]
     pub(super) fn isolated() -> Self {
-        Self {
-            enabled: true,
-            retry: RetryOwner::default(),
-        }
+        Self::production()
     }
     pub(super) fn enabled(&self) -> bool {
         self.enabled
@@ -197,7 +222,7 @@ impl LiveRetryOwner {
             || working.legacy_settlement_ledger_needs_migration()
             || committed.legacy_settlement_ledger_needs_migration()
             || live.destination() != progress.destination_namespace_hash
-            || live.validate_capture(home, items).is_err()
+            || live.validate_capture(home, items, working).is_err()
         {
             return false;
         }
@@ -262,7 +287,7 @@ impl LiveRetryOwner {
             // Fresh local credentials are scoped to this one turn. The page
             // owns only the hashed destination and account fence.
             let (device, secret) = load_snapshot_device_credentials()?;
-            let client = SnapshotApiClient::new(snapshot_api_base_url())
+            let client = SnapshotApiClient::new(snapshot_api_base_url()?)
                 .with_receipt_state_dir(support)
                 .with_receipt_destination_namespace(snapshot_upload_destination_namespace(
                     &device, &secret,
@@ -270,15 +295,8 @@ impl LiveRetryOwner {
             let source = page.source();
             let authority = page.authority();
             let live = page.take_live_authority()?;
-            let mut validate = || {
-                anyhow::ensure!(
-                    daemon.snapshot_retry_running().unwrap_or(false),
-                    "snapshot daemon stopped"
-                );
-                ensure_snapshot_scan_authority(&device, source, &client, &authority, daemon)?;
-                ensure_snapshot_destination_current(live.destination())?;
-                live.validate_inputs(home)
-            };
+            let mut validate =
+                || live.validate_turn(&client, daemon, (&device, source, &authority), home);
             let result = page.turn_live(&client, &device, &secret, live.policy(), &mut validate);
             page.restore_live_authority(live);
             result

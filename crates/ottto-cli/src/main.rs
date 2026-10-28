@@ -2555,6 +2555,7 @@ fn human_summary(payload: &serde_json::Value) -> String {
     if let Some(message) = payload
         .get("message")
         .and_then(|value| value.get("text"))
+        .or_else(|| payload.pointer("/canonical_health/blockers/0/clear_condition"))
         .and_then(|value| value.as_str())
     {
         return sanitize_for_terminal(message);
@@ -3194,6 +3195,20 @@ mod tests {
         .expect("fixture parses");
         assert_eq!(actual, expected);
         assert!(!output.contains("Ottto local daemon"));
+    }
+
+    #[test]
+    fn doctor_human_output_surfaces_reconnect_finding_before_daemon_running() {
+        let guidance = "Connection binding is unreadable; get a fresh claim code from Ottto Apps, then run `ottto login --claim-code <code>` to reconnect this Mac and resume uploads";
+        let mut payload = status_response().payload.unwrap();
+        payload["canonical_health"] = serde_json::json!({"blockers":[{
+            "code":"connection_binding_unreadable", "clear_condition":guidance
+        }]});
+        assert_eq!(human_summary(&payload), guidance);
+        let json = pretty_json(&payload);
+        assert_eq!(parse_json_output(&json), payload);
+        payload["canonical_health"]["blockers"] = serde_json::json!([]);
+        assert_eq!(human_summary(&payload), "Ottto local daemon: running");
     }
 
     #[test]

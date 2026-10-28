@@ -1,5 +1,5 @@
 //! Bounded optional retry state owned by the existing snapshot owner.
-//! Activation remains an explicit source-review boundary; no timer or worker.
+//! Source-owned collection boundaries drive retries; no timer or worker.
 use anyhow::{anyhow, Result};
 use std::time::{Duration, Instant};
 

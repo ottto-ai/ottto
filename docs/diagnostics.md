@@ -158,6 +158,61 @@ retryable (red) for the whole hold, so census close, retirement and
 account-family proof wait for that source; a held key is not yet terminal
 disclosed residue.
 
+## Credential File Cap Refusals
+
+Schema 2 adds `credential_file_cap_refusal` point records on the same
+`ottto-service: local_resources` stderr carrier. Snapshot device-authority,
+destination, promotion-guard and connection loaders count typed device-binding,
+file-backed-secret, pending-credential-journal and connection-binding cap errors through the service's existing diagnostic emitter before error detail
+is replaced. Both ordinary snapshot sync and retained retry use those loaders.
+Core returns typed errors and never emits or keeps counters itself. Metadata rejection before body
+allocation and growth past the cap during the bounded read both count once;
+oversize invalid UTF-8 counts as a cap refusal before decoding. Other I/O,
+JSON, UTF-8 and missing-file failures do not increment this counter.
+
+`counts.file_kind` is `device_binding`, `file_secret`, `connection_binding` or
+`pending_device_credential`;
+`credential_file_cap_refused` is 1 for this event and
+`credential_file_cap_refused_total` is a saturating process-lifetime total for
+that kind. Count attempts, not distinct files. Totals include only those observed
+snapshot authority/destination loads (including continuation authority), so
+`source` is `unknown`; other core
+callers are not counted. Never attribute totals to Pi alone or sum cumulative
+totals. The observation is a point with
+zero elapsed time and null CPU/RSS samples. These records contain no path,
+account, secret or content, add no probes or reads, and use the same ignored
+stderr-write errors as other local resource records. They remain local and
+may be unavailable if logging fails. Native Keychain loads are outside this
+file cap and remain in the shared ordinary-path resource domain. A connection
+binding read, parse or cap failure now stops endpoint resolution and propagates
+before creating a credential-bearing client. Environment/default endpoint
+fallback applies only when the binding is absent, never after a failed load.
+This applies to every source and composition/footprint/inventory harvest.
+
+## Unreadable Connection Binding
+
+Endpoint resolution also emits a schema-2 `connection_binding_read` point on
+the existing `local_resources` carrier with
+`counts.connection_binding_unreadable: 1` for each failed binding load (I/O,
+parse, UTF-8 or cap refusal). Absent and valid bindings do not count. Cap
+refusals also retain the distinct cap event above; these are two causes for
+one attempt, not two refused uploads. There is no cumulative total for this
+cause. No path, endpoint, account or error text is emitted.
+
+The existing canonical health blocker registry, used by `ottto doctor` and
+status, checks endpoint resolution too. An unreadable binding adds the blocking
+`connection_binding_unreadable` finding: get a fresh claim code from Ottto Apps,
+then run `ottto login --claim-code <code>` to reconnect this Mac and resume uploads.
+Plain `ottto login` may reuse a cached connected state and leave the corrupt file
+unrepaired; an explicit claim attaches and persists the fresh binding. Human doctor/status output shows the first blocker's
+guidance; `--json` retains all findings. The finding clears on the next health projection after
+the binding is repaired or removed. Each failed diagnostic check counts as a
+load attempt too. This uses the existing health and diagnostic channels; it
+adds no background subsystem or upload fallback.
+The safe diagnostic names the connection binding and asks to reconnect; it
+contains no path or endpoint URL. During owned-scan authority revalidation,
+an endpoint load failure remains a local-state rejection.
+
 ## Line Delivery Counters
 
 Schema 2's `native_collection_page` can add two sparse, counts-only objects.
@@ -660,6 +715,11 @@ refusals. While a placeholder is stored, a contract change cannot be
 classified into `from_empty`, `to_empty` or `collector_e2_grouping` from that
 unknown prior contract.
 
+Retained Pi retry authority also binds the original client's API endpoint digest.
+An endpoint-only transition refuses before relay-token acquisition and batch
+submission, even if device credentials and the account witness stay unchanged.
+The digest is RAM-only authority and is never emitted in diagnostic records.
+
 ### Restore Provenance (schema 2 additive)
 
 Completed `native_collection_page` records can include
@@ -705,6 +765,7 @@ store reports `missing`. Sample reads cut short by concurrent truncation report
 changes diagnostics only: it adds no Full-admission policy, new body reads, persisted fields, record grants, or integrity holds.
 Capacity/availability retain their existing degraded behavior. Full-cause
 admission and its other counter projections arrive in subsequent slices.
+
 
 ## Compressed Codex reader refusals
 

@@ -42126,6 +42126,15 @@ fn resolve_configured_scan_root(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ALL_TRANSCRIPT_OPENS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn all_transcript_opens_for_test() -> usize {
+    ALL_TRANSCRIPT_OPENS_FOR_TEST.with(std::cell::Cell::get)
+}
+
 /// Open the exact transcript object without following a final-component
 /// symlink, capture its stable object identity and a bounded content witness,
 /// then rewind it for the parser. Discovery metadata is never trusted as the
@@ -42162,6 +42171,8 @@ fn open_candidate_file_stat_retained(
     candidate: &mut CandidateFile,
     cache: Option<&sampled_scan::SharedCache>,
 ) -> std::io::Result<(File, Option<OpenedObjectStat>)> {
+    #[cfg(test)]
+    ALL_TRANSCRIPT_OPENS_FOR_TEST.with(|count| count.set(count.get() + 1));
     let mut file = open_candidate_beneath_root(candidate)?;
     let retained = cache
         .filter(|_| source == SnapshotSource::Codex)
