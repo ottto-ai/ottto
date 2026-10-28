@@ -1468,10 +1468,18 @@ fn plan_peer_walk(
         let mut stack = vec![root.clone()];
         while let Some(directory) = stack.pop() {
             scan.walk_directory_count += 1;
-            let mut entries = match fs::read_dir(&directory)
-                .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
-            {
-                Ok(entries) => entries,
+            let mut entries = match list_directory_within(
+                &directory,
+                bounds.max_walk_entries,
+                &mut scan.walk_entry_count,
+            ) {
+                Ok(Some(entries)) => entries,
+                Ok(None) => {
+                    coverage
+                        .cap_overflow
+                        .push("max_walk_entries reached".to_string());
+                    break 'roots;
+                }
                 Err(_) => {
                     coverage.unknown.push(format!(
                         "peer directory {} unreadable",
@@ -1483,13 +1491,6 @@ fn plan_peer_walk(
             entries.sort_by_key(|entry| entry.file_name());
             let mut subdirectories = Vec::new();
             for entry in entries {
-                scan.walk_entry_count += 1;
-                if scan.walk_entry_count > bounds.max_walk_entries {
-                    coverage
-                        .cap_overflow
-                        .push("max_walk_entries reached".to_string());
-                    break 'roots;
-                }
                 let path = entry.path();
                 let Ok(metadata) = fs::symlink_metadata(&path) else {
                     coverage
@@ -1581,6 +1582,25 @@ fn plan_peer_walk(
     planned
 }
 
+/// One directory's entries, each charged to the walk budget as it is read, so
+/// a huge directory is never listed past the budget. `None`: the budget ran
+/// out inside this directory.
+fn list_directory_within(
+    directory: &Path,
+    max_walk_entries: u64,
+    walk_entry_count: &mut u64,
+) -> std::io::Result<Option<Vec<fs::DirEntry>>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        *walk_entry_count += 1;
+        if *walk_entry_count > max_walk_entries {
+            return Ok(None);
+        }
+        entries.push(entry?);
+    }
+    Ok(Some(entries))
+}
+
 /// Fork-copied lines inside the targets' own transcripts. The parser skips
 /// them, so only this pass sees them. The file must still be the bytes the
 /// target was parsed from.
@@ -1601,8 +1621,12 @@ fn scan_target_copies(
         }
         let holder = input.targets[index].source_session_id.clone();
         match read_target_copies(path, holders) {
-            Ok((size, sha, copies))
-                if Some(size) == file.size_bytes && Some(&sha) == file.content_sha256.as_ref() =>
+            Ok(TargetCopies {
+                size_bytes,
+                content_sha256,
+                copies,
+            }) if Some(size_bytes) == file.size_bytes
+                && Some(&content_sha256) == file.content_sha256.as_ref() =>
             {
                 scan.target_inherited_copy_line_count += copies.len() as u64;
                 scan.copies
@@ -1629,12 +1653,20 @@ fn scan_target_copies(
     }
 }
 
+/// A target transcript's bytes as read, and its fork copies of held requests.
+struct TargetCopies {
+    size_bytes: u64,
+    content_sha256: String,
+    /// (request id, the source session the copy names)
+    copies: Vec<(String, Option<String>)>,
+}
+
 /// Stream one target transcript for its fork-copied lines carrying a request
-/// some target counts. Returns its byte count and content hash with them.
+/// some target counts.
 fn read_target_copies(
     path: &Path,
     holders: &BTreeMap<&str, Vec<usize>>,
-) -> Result<(u64, String, Vec<(String, Option<String>)>), String> {
+) -> Result<TargetCopies, String> {
     let file = File::open(path).map_err(|error| format!("open: {error}"))?;
     let mut reader = BufReader::new(file.take(TARGET_FILE_BYTES_CAP + 1));
     let mut digest = Sha256::new();
@@ -1670,7 +1702,11 @@ fn read_target_copies(
             }
         }
     }
-    Ok((total, format!("{:x}", digest.finalize()), copies))
+    Ok(TargetCopies {
+        size_bytes: total,
+        content_sha256: format!("{:x}", digest.finalize()),
+        copies,
+    })
 }
 
 fn forked_from_session(value: &Value) -> Option<String> {

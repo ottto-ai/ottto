@@ -838,3 +838,72 @@ fn producer_caps_are_pinned_apart_from_the_parser_cap() {
     }
     assert_eq!(TARGET_FILE_BYTES_CAP, 256 * 1024 * 1024);
 }
+
+#[test]
+fn fork_copies_resolve_only_through_a_counting_source_and_cycles_stay_absent() {
+    let copy = |holder: &str, named: &str, request_id: &str| CopyClaim {
+        request_id: request_id.to_string(),
+        named_session: Some(named.to_string()),
+        holder_session: Some(holder.to_string()),
+        path_sha256: format!("path-{holder}"),
+    };
+    let mut scan = PeerScan {
+        hits: vec![BTreeMap::new()],
+        copies: vec![
+            // A cycle with no counting source anywhere.
+            copy("cycle-a", "cycle-b", "req-cycle"),
+            copy("cycle-b", "cycle-a", "req-cycle"),
+            // A chain whose root owns the request.
+            copy("chain-a", "chain-b", "req-chain"),
+            copy("chain-b", "chain-c", "req-chain"),
+            // A deleted middle: another session owns the request, but the
+            // chain never reaches it.
+            copy("gap-a", "gap-deleted", "req-gap"),
+        ],
+        ..PeerScan::default()
+    };
+    scan.owned_held_ids
+        .entry("chain-c".to_string())
+        .or_default()
+        .insert("req-chain".to_string());
+    scan.owned_held_ids
+        .entry("gap-owner".to_string())
+        .or_default()
+        .insert("req-gap".to_string());
+    let holders = BTreeMap::from([
+        ("req-cycle", vec![0]),
+        ("req-chain", vec![0]),
+        ("req-gap", vec![0]),
+    ]);
+    resolve_fork_copies(&mut scan, &holders, &BTreeMap::new(), &[]);
+
+    assert_eq!(scan.inherited_resolved_line_count, 2);
+    assert_eq!(scan.inherited_absent_source_line_count, 3);
+    assert_eq!(
+        scan.hits[0].keys().map(String::as_str).collect::<Vec<_>>(),
+        ["req-cycle", "req-gap"]
+    );
+    assert_eq!(scan.hits[0]["req-cycle"].line_count, 2);
+    assert!(scan.hits[0]
+        .values()
+        .all(|hit| hit.inherited_from_absent_source));
+    assert_eq!(scan.hits[0]["req-gap"].path_sha256, "path-gap-a");
+}
+
+#[test]
+fn directory_listing_stops_at_the_walk_budget() {
+    let directory = crate::test_scratch::private_dir("h527-producer-listing");
+    for index in 0..5 {
+        fs::write(directory.join(format!("{index}.jsonl")), b"").expect("entry");
+    }
+    let mut count = 0;
+    assert!(list_directory_within(&directory, 3, &mut count)
+        .expect("listing")
+        .is_none());
+    assert_eq!(count, 4);
+    let mut count = 0;
+    let entries = list_directory_within(&directory, 5, &mut count)
+        .expect("listing")
+        .expect("within budget");
+    assert_eq!((entries.len(), count), (5, 5));
+}
