@@ -6,11 +6,11 @@ use crate::transcript_acquisition::{FileObject, ReadMode};
 use serde_json::Value;
 use std::time::SystemTime;
 
-/// Default declared pass-state charge, preserved for the Claude observer.
 pub(crate) const fn checked_observer_heap_bytes(bytes: usize) -> usize {
     assert!(bytes <= 256 * 1024);
     bytes
 }
+/// Default declared pass-state charge, preserved for the Claude observer.
 const OBSERVER_HEAP_BYTES: usize = checked_observer_heap_bytes(64 * 1024);
 /// Synchronous in the read: O(line), no I/O or cache/rotation lock, pass
 /// state within its static declaration; never paces or blocks acquisition.

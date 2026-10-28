@@ -4658,7 +4658,12 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                     continuation::ticket_lifetime(self.codex_started),
                 )
                 // K2: moved out only when a ticket was minted.
-                .map(|ticket| ticket.with_inputs(take_continuation_inputs(&mut completed.0)))
+                .map(|ticket| {
+                    ticket.with_inputs(take_continuation_inputs(
+                        &mut completed.0,
+                        &self.daemon.codex_preludes,
+                    ))
+                })
             });
         let finished = crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
             self.finish_completed(completed)
@@ -6270,6 +6275,8 @@ fn prepare_sync_source_inner(
     .with_codex_side_pass(codex_side_pass);
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
+    } else if source == SnapshotSource::Codex {
+        scan = scan.with_line_observer("codex_prelude", daemon.codex_preludes.observer(&roots));
     }
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
@@ -6324,6 +6331,7 @@ fn prepare_sync_source_inner(
 /// every other end. Charged as process-retained memory
 /// (`continuation::retained_bound`).
 struct ContinuationInputs {
+    codex_preludes: std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
@@ -6338,7 +6346,7 @@ struct ContinuationInputs {
     upload_progress_path: PathBuf,
 }
 
-crate::heap_layout_bound::fields!(ContinuationInputs; account_witness, activity_hint,
+crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
     receipt_window_days, context_curve_enabled, cache_observations_enabled,
     scan_agent_status_collection, attribution_context, upload_policy,
     upload_destination_namespace, receipt_client, index_path, upload_progress_path);
@@ -6356,13 +6364,17 @@ impl ContinuationInputs {
 /// page, taken before its finish. `finish_sync_source` never reads the
 /// attribution context, so moving it out changes nothing for the finish.
 /// Called only while continuation pages are enabled and a ticket was minted.
-fn take_continuation_inputs(preparation: &mut SourcePreparation) -> ContinuationInputs {
+fn take_continuation_inputs(
+    preparation: &mut SourcePreparation,
+    codex_preludes: &std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+) -> ContinuationInputs {
     let mut activity_hint = preparation.activity_hint.clone();
     // The prepare took the raw key out of its hint already; never keep one.
     if let Some(mut key) = activity_hint.session_attribution_hmac_key.take() {
         key.zeroize();
     }
     ContinuationInputs {
+        codex_preludes: std::sync::Arc::clone(codex_preludes),
         account_witness: preparation.account_witness,
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
@@ -6646,7 +6658,8 @@ fn prepare_continuation_source(
             false,
         ),
     )
-    .with_codex_side_pass(Some(codex_side_pass));
+    .with_codex_side_pass(Some(codex_side_pass))
+    .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots));
     Ok(Ok(SourcePreparation {
         native_comparison_reservation: None,
         native_comparison_lease: None,
