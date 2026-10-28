@@ -4082,6 +4082,21 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
         "scratch",
     ] {
         let mut fixture = contract_debt_fixture(2);
+        let changed_member = matches!(case, "content" | "sidecar" | "account");
+        if changed_member {
+            // Cancellation replays siblings: use the existing two-member
+            // accepted fixture, rather than a singleton with no sibling work.
+            fixture.index = carry_index();
+            fixture.index.claude_reemission_exclusions = ReemissionExclusions::parse(b"");
+            fixture.index.claude_request_identity_contract_changed = true;
+            fixture
+                .index
+                .claude_duplicate_fence_next_full_rearm_unix_seconds =
+                rfc3339_unix_seconds(CARRY_FAILED).map(|now| now + 86_400);
+            let [root_key, agent_key] = carry_family_keys();
+            fixture.candidates = vec![scoped_retry_accept_member(&mut fixture.index, &root_key)];
+            scoped_retry_accept_member(&mut fixture.index, &agent_key);
+        }
         let before = fixture.index.accepted_snapshot_fingerprints.clone();
         let _scratch = (case == "scratch").then(RefuseClaudeStaleFamilyCarryBudgetForTest::new);
         match case {
@@ -4092,6 +4107,12 @@ fn contract_debt_keeps_context_and_ledger_vetoes_and_changed_member_selection() 
             _ => (),
         }
         carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        if changed_member {
+            let traversal = fixture.index.traversal.as_mut().unwrap();
+            traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
+            traversal.observed_index_keys.extend(carry_family_keys());
+            carry_fill_queue(&mut fixture.index);
+        }
         let candidate = &mut fixture.candidates[0];
         match case {
             "content" => candidate.size_bytes += 1,

@@ -519,9 +519,9 @@ fn c1b_changed_member_after_carry_is_reparsed() {
     assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
 }
 
-/// Condition X(b): the contract-5 record is lost after the red window (a
-/// downgrade, then an upgrade). The retry start latches, nothing is carried,
-/// and every retry re-reads the family exactly as BASE.
+/// Contract-only debt now defers the exactly ACKed family. Admission refusal
+/// still takes BASE's whole re-arm; retain every original read/liveness
+/// assertion in that arm, and separately assert the new no-read arm.
 #[test]
 #[serial(source_manifests)]
 fn c1b_identity_contract_change_keeps_base_rearm() {
@@ -529,21 +529,39 @@ fn c1b_identity_contract_change_keeps_base_rearm() {
         return;
     }
     let _source_manifests = SourceManifestTestGuard::new();
-    let forget = |fixture: &RearmFixture| {
-        c1a_edit_index(fixture, |saved| {
-            saved.remove("claude_request_identity_contract");
-            saved.remove("claude_request_identity_contract_changed");
-        });
-    };
-    let fix = c1b_red_chain("c1b-identity-contract", "fix", forget);
-    let base = c1b_base_red_chain("c1b-identity-contract-base", forget);
-    let family = rearm_family_sessions().len();
-    for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(2).take(2) {
-        assert_eq!(window.family_reads, family, "the latch keeps the re-arm");
-        assert_eq!(window.family_reads, base_window.family_reads);
-        assert_eq!(window.start, base_window.start, "the start is BASE's");
+    for refused in [false, true] {
+        let _budget =
+            refused.then(|| crate::snapshots::ClaudeStaleFamilyCarryFundingBudgetForTest::new(0));
+        let forget = |fixture: &RearmFixture| {
+            c1a_edit_index(fixture, |saved| {
+                saved.remove("claude_request_identity_contract");
+                saved.remove("claude_request_identity_contract_changed");
+            });
+        };
+        let fix = c1b_red_chain("c1b-identity-contract", "fix", forget);
+        let base = c1b_base_red_chain("c1b-identity-contract-base", forget);
+        let family = rearm_family_sessions().len();
+        for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(2).take(2) {
+            if refused {
+                assert_eq!(window.family_reads, family, "the latch keeps the re-arm");
+                assert_eq!(window.family_reads, base_window.family_reads);
+                assert_eq!(window.start, base_window.start, "the start is BASE's");
+            } else {
+                assert_eq!(
+                    base_window.family_reads, family,
+                    "BASE still reads every member"
+                );
+                assert_eq!(window.family_reads, 0, "contract-only debt adds no read");
+                assert!(window.fence_after && window.census_invalid);
+                assert!(!window.full_rearm, "no fresh uniqueness proof");
+            }
+        }
+        if refused {
+            assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
+        }
+        assert_eq!(fix.heads_after, base.heads_after);
+        assert_eq!(fix.witness_after, base.witness_after);
     }
-    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
 }
 
 /// A request the provider ledger records for the first subagent from the
