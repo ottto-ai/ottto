@@ -1169,7 +1169,6 @@ fn census_of(key: &str) -> ScanTraversalCheckpoint {
         unhealthy_retry_not_before_unix_seconds: None,
         counts: ScanTraversalCounts::default(),
         residue: ScanTraversalResidue::default(),
-        native_comparison_restore: Default::default(),
     }
 }
 

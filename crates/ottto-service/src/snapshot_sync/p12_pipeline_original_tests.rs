@@ -2078,8 +2078,8 @@ fn native_comparison_deferred_target_without_reduction_holds_dependents_once() {
     assert!(!next.scan.census_complete);
     let (targets, _, refused) = next.index.native_comparison_restore_debt_for_test();
     assert!(
-        targets == 0 && refused,
-        "consumed once; the hold lasts this walk"
+        targets == 3 && refused,
+        "unresolved targets survive without being requeued this walk"
     );
     assert_eq!(
         family_keys
@@ -2104,6 +2104,33 @@ fn native_comparison_deferred_target_without_reduction_holds_dependents_once() {
             .any(|item| item.source_session_id == REARM_TERMINAL)),
         "unrelated bodies continue"
     );
+    // Production load/save on subsequent walks must keep the unresolved owner
+    // dependency even though the old traversal and lifecycle lease have ended.
+    for hour in [12, 13] {
+        let (later, records) =
+            crate::local_resource_diagnostics::capture(|| fixture.generation(hour));
+        assert!(
+            native_restore_counts(&records).refused <= 3,
+            "at most one attempt per target per walk"
+        );
+        assert!(later.iter().all(|page| !page.parsed.contains(COPY)));
+        assert!(later.iter().all(|page| page
+            .scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != COPY)));
+        let saved = later.last().unwrap();
+        assert!(!saved.index.scan_traversal_in_progress_for_test());
+        assert_eq!(saved.index.native_comparison_restore_debt_for_test().0, 3);
+        let encoded = serde_json::to_value(&saved.index).unwrap();
+        assert_eq!(
+            encoded["native_comparison_restore"]["targets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
     writeln!(std::io::stderr().lock(), "native_comparison_restore_unavailable: refused=3 deferred_base=3 disclosed={} family_reads=0 copy_held=true unrelated_continues=true stamps_intact=true requeued=0", restore.disclosed).unwrap();
 }
 

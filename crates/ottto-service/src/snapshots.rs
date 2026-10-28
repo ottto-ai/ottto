@@ -2627,14 +2627,11 @@ struct ScanTraversalCheckpoint {
     /// counts name their files instead of silently folding them into totals.
     #[serde(default, skip_serializing_if = "ScanTraversalResidue::is_empty")]
     residue: ScanTraversalResidue,
-    /// O1: deferred native comparison debt queued by selected recovery.
-    #[serde(default, skip_serializing_if = "NativeComparisonRestoreDebt::is_empty")]
-    native_comparison_restore: NativeComparisonRestoreDebt,
 }
 
 /// O1: logical correction debt kept beside each file's unchanged object stamp.
-/// A popped target is read only from a validated reduction. Once one is
-/// refused, every dependent still queued in this traversal is held unread.
+/// Debt survives traversal rollover; targets retire only after a complete
+/// reduction. Dependents stay held until every required target is available.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct NativeComparisonRestoreDebt {
@@ -3909,6 +3906,9 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_default"
     )]
     pub(crate) claude_money_birth_store: claude_money_birth_store::BirthStore,
+    /// O1: deferred native comparison debt queued by selected recovery.
+    #[serde(default, skip_serializing_if = "NativeComparisonRestoreDebt::is_empty")]
+    native_comparison_restore: NativeComparisonRestoreDebt,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -4059,6 +4059,7 @@ impl Default for ScanIndex {
     fn default() -> Self {
         Self {
             claude_money_birth_store: Default::default(),
+            native_comparison_restore: Default::default(),
             decode_holds: lenient_decode::Holds::default(),
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
@@ -25284,14 +25285,6 @@ fn prepare_owned_scan_candidate(
 
 pub(crate) mod claude_native_comparison;
 
-/// O1: the deferred comparison targets and dependents popped this page.
-#[derive(Default)]
-struct ComparisonRestore {
-    targets: BTreeSet<String>,
-    dependents: BTreeSet<String>,
-}
-crate::heap_layout_bound::fields!(ComparisonRestore; targets, dependents);
-
 pub(crate) struct OwnedSourceScan {
     native_comparison: Option<claude_native_comparison::NativePhase>,
     resource_probe: crate::local_resource_diagnostics::Probe,
@@ -25339,8 +25332,6 @@ pub(crate) struct OwnedSourceScan {
     /// E2: forced roots selected only for path-twin co-scheduling. Their
     /// owed adoption-only members keep the history gate (both or neither).
     claude_twin_only_family_reparses: BTreeSet<String>,
-    /// O1: this page's restore-only comparison targets and their dependents.
-    comparison_restore: ComparisonRestore,
     identified_candidates: VecDeque<CandidateFile>,
     /// The active file and, while it is a paged cursor job, its slot lease.
     /// A dropped frame returns an intact job to the slot.
@@ -26104,7 +26095,7 @@ impl OwnedSourceScan {
                             .front()
                             .is_some_and(|candidate| {
                                 let key = local_index_key(&candidate.path);
-                                traversal.native_comparison_restore.targets.contains(&key)
+                                index.native_comparison_restore.targets.contains(&key)
                                     || index.files.get(&key).is_some_and(|entry| {
                                         entry.source_file_fingerprint.is_empty()
                                     })
@@ -26242,25 +26233,6 @@ impl OwnedSourceScan {
                 retry_service_end,
                 &census_window_end,
             );
-        }
-        // O1: popped deferred comparison debt belongs to this page. It is
-        // consumed once and never requeued.
-        let mut comparison_restore = ComparisonRestore::default();
-        if let Some(debt) = index
-            .traversal
-            .as_mut()
-            .map(|traversal| &mut traversal.native_comparison_restore)
-        {
-            for key in pending_paths
-                .iter()
-                .map(|pending| local_index_key(&pending.path))
-            {
-                if debt.targets.remove(&key) {
-                    comparison_restore.targets.insert(key);
-                } else if debt.dependents.remove(&key) {
-                    comparison_restore.dependents.insert(key);
-                }
-            }
         }
         index.resume_census_window_end = Some(census_window_end.clone());
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
@@ -26576,7 +26548,6 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             forced_claude_family_reparses,
             claude_twin_only_family_reparses,
-            comparison_restore,
             identified_candidates: identified_candidates.into(),
             active_file: Default::default(),
             codex_join_inventory,
@@ -26758,7 +26729,6 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             mut forced_claude_family_reparses,
             claude_twin_only_family_reparses,
-            comparison_restore,
             mut identified_candidates,
             active_file: active_frame,
             mut codex_join_inventory,
@@ -29746,6 +29716,12 @@ impl OwnedSourceScan {
                         );
                     }
                 }
+                if complete_native_reduction {
+                    index.native_comparison_restore.targets.remove(&index_key);
+                    if index.native_comparison_restore.targets.is_empty() {
+                        index.native_comparison_restore.refused = false;
+                    }
+                }
                 pending_finalization.push(PendingIndexFinalization {
                     sampled_audit_verified,
                     codex_pending_recovery: index
@@ -30987,35 +30963,27 @@ impl OwnedSourceScan {
             // is an ordinary read). It keeps its old rearmed selection reason.
             let restore_demand = !comparison_target
                 && decision == CandidateDecision::Skip
-                && comparison_restore
+                && index
+                    .native_comparison_restore
                     .targets
                     .contains(&local_index_key(&candidate.path));
             if restore_demand {
                 decision = CandidateDecision::Parse;
                 parse_reason = Some(CandidateParseReason::Rearmed);
             }
-            // After a refused target, its queued dependents are held unread,
-            // like a decode hold: no body, finalization, coverage or ACK
-            // credit. Nothing is requeued; the next walk decides again.
-            if decision == CandidateDecision::Parse
-                && comparison_restore
-                    .dependents
-                    .contains(&local_index_key(&candidate.path))
-                && index
-                    .traversal
-                    .as_ref()
-                    .is_some_and(|traversal| traversal.native_comparison_restore.refused)
-            {
-                crate::local_resource_diagnostics::native_comparison_restore_unavailable(
-                    0, // Held unread: no constructed body was removed.
-                    comparison_restore.dependents.len()
-                        + index.traversal.as_ref().map_or(0, |traversal| {
-                            let debt = &traversal.native_comparison_restore;
-                            debt.targets.len() + debt.dependents.len()
-                        }),
-                );
-                index.mark_bounded_sweep_unsettled();
-                pending!();
+            // Unresolved targets hold dependents across pages, restarts and
+            // traversal rollover, including guards that refuse before acquisition.
+            let key = local_index_key(&candidate.path);
+            if index.native_comparison_restore.dependents.contains(&key) {
+                if !index.native_comparison_restore.targets.is_empty() {
+                    crate::local_resource_diagnostics::native_comparison_restore_unavailable(
+                        0,
+                        index.native_comparison_restore.dependents.len(),
+                    );
+                    index.mark_bounded_sweep_unsettled();
+                    pending!();
+                }
+                index.native_comparison_restore.dependents.remove(&key);
             }
             // History-upgrade gate (SOURCE P1), whatever selected the file:
             // unchanged Claude history that would carry a new body-witness
@@ -32124,8 +32092,8 @@ impl OwnedSourceScan {
                         restore_demand,
                     );
                 }
-                if let Some(traversal) = index.traversal.as_mut().filter(|_| restore_demand) {
-                    traversal.native_comparison_restore.refused = true;
+                if restore_demand {
+                    index.native_comparison_restore.refused = true;
                     index.mark_bounded_sweep_unsettled();
                 }
                 pending!();
@@ -32354,7 +32322,6 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             forced_claude_family_reparses,
             claude_twin_only_family_reparses,
-            comparison_restore,
             identified_candidates,
             active_file: sampled_scan::codex_cursor::ActiveFrame::new(
                 active_file,
@@ -41156,7 +41123,6 @@ fn ensure_bounded_traversal(
         unhealthy_retry_not_before_unix_seconds: None,
         counts,
         residue: ScanTraversalResidue::default(),
-        native_comparison_restore: Default::default(),
     });
     if source == SnapshotSource::ClaudeCode
         && index
@@ -44583,19 +44549,15 @@ impl ScanIndex {
         self.traversal.is_some()
     }
 
-    /// O1: the deferred comparison debt queued in the traversal.
+    /// O1: unresolved deferred comparison debt persisted beyond the traversal.
     #[cfg(test)]
     pub(crate) fn native_comparison_restore_target_for_test(&self, key: &str) -> bool {
-        self.traversal
-            .as_ref()
-            .is_some_and(|traversal| traversal.native_comparison_restore.targets.contains(key))
+        self.native_comparison_restore.targets.contains(key)
     }
     #[cfg(test)]
     pub(crate) fn native_comparison_restore_debt_for_test(&self) -> (usize, usize, bool) {
-        self.traversal.as_ref().map_or((0, 0, false), |traversal| {
-            let debt = &traversal.native_comparison_restore;
-            (debt.targets.len(), debt.dependents.len(), debt.refused)
-        })
+        let debt = &self.native_comparison_restore;
+        (debt.targets.len(), debt.dependents.len(), debt.refused)
     }
 
     /// Cheap in-memory custody oracle. No JSON, index clone or disk IO.
@@ -45820,7 +45782,6 @@ impl ScanIndex {
                 ..ScanTraversalCounts::default()
             },
             residue: ScanTraversalResidue::default(),
-            native_comparison_restore: Default::default(),
         });
     }
 
@@ -50191,7 +50152,6 @@ mod tests {
                 ..ScanTraversalCounts::default()
             },
             residue: ScanTraversalResidue::default(),
-            native_comparison_restore: Default::default(),
         }
     }
 
@@ -54306,7 +54266,6 @@ mod tests {
             unhealthy_retry_not_before_unix_seconds: None,
             counts: ScanTraversalCounts::default(),
             residue: ScanTraversalResidue::default(),
-            native_comparison_restore: Default::default(),
         });
 
         let scan = scan_source_roots(
@@ -54841,7 +54800,6 @@ mod tests {
                 unhealthy_retry_not_before_unix_seconds: None,
                 counts: ScanTraversalCounts::default(),
                 residue: ScanTraversalResidue::default(),
-                native_comparison_restore: Default::default(),
             }),
             ..ScanIndex::default()
         };
@@ -55970,7 +55928,6 @@ mod tests {
                     ..ScanTraversalCounts::default()
                 },
                 residue: ScanTraversalResidue::default(),
-                native_comparison_restore: Default::default(),
             };
 
         index.traversal = Some(stale_witness(&index, 46, Some(now - 15 * 60 * 60)));
@@ -66963,7 +66920,6 @@ mod tests {
                     unhealthy_retry_not_before_unix_seconds: None,
                     counts: ScanTraversalCounts::default(),
                     residue: ScanTraversalResidue::default(),
-                    native_comparison_restore: Default::default(),
                 });
                 assert!(reconcile_missing_index_entries_with_limit(
                     &mut working,
@@ -88654,7 +88610,6 @@ mod tests {
             unhealthy_retry_not_before_unix_seconds: None,
             counts,
             residue: ScanTraversalResidue::default(),
-            native_comparison_restore: Default::default(),
         }
     }
 
@@ -89294,7 +89249,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; #[cfg(test)] source_read_probe, complete_native_prefix, reread_required, reread_ticket, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, comparison_restore, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, durable_guard, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket, line_delivery);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, complete_native_reduction, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
@@ -89312,10 +89267,10 @@ crate::durable_tail_codec::durable_struct!(key RowKey {
     U subscription_product: Option<String>,
 });
 crate::heap_layout_bound::fields!(ScanCensus; oversized_discovery, #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, parse_reasons, codex_selections, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, reread_guard, held_audit_progress, claude_money_birth_store);
+crate::heap_layout_bound::fields!(ScanIndex; decode_holds, schema_version, generation, upload_ack_retirement_handoff, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_retired_family_tombstones, claude_retired_family_tombstones_initialized, claude_retired_family_tombstones_uncertain, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_full_rearm_progress, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, codex_counting_moved_evidence, codex_counting_tombstones, codex_counting_evicted_legacy, codex_counting_evictions, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, accepted_incidence_pending_census, accepted_rebuild_incidence, accepted_rebuild_pending_since_unix_seconds, accepted_rebuild_last_alarm_unix_seconds, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, terminal_contract_retries, claude_history_unverified_in_process, claude_rebuild_read_load_eligible, reason_reoffer_cooldowns, reread_guard, held_audit_progress, claude_money_birth_store, native_comparison_restore);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2, codex_counting_owner, opened_changed_nanos, opened_birth_nanos);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
-crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, native_comparison_restore);
+crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(NativeComparisonRestoreDebt; targets, dependents, refused);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; unchanged_reread_admitted, reread_budget_refused, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
