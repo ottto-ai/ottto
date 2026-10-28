@@ -1526,6 +1526,55 @@ fn rejected_selector_candidates_never_save_and_restore_tail_equals_full() {
         }
         let birth = birth_unix_nanos(&fs::metadata(&path).unwrap());
         let certificate = checkpoint.durable_certificate(birth).unwrap();
+        // Save through the production single-writer store and inspect its envelope.
+        let state = Scratch(crate::test_scratch::private_dir("selector-record"));
+        let lock = crate::locked_state_dir::LockedStateDir::acquire(&state.0).unwrap();
+        use crate::durable_tail_store::{
+            Binding, DurableSource, DurableTailStore, PendingRecord, ReadOutcome,
+        };
+        let durable_source = match source {
+            SnapshotSource::ClaudeCode => DurableSource::ClaudeCode,
+            _ => DurableSource::Codex,
+        };
+        let mut store = DurableTailStore::new(state.0.join("records"));
+        let saved = store
+            .write_after_save(
+                &lock,
+                1,
+                vec![PendingRecord {
+                    binding: Binding {
+                        source: durable_source,
+                        key: [0; 32],
+                        context: [1; 32],
+                        scope: [2; 32],
+                        entry: [3; 32],
+                    },
+                    certificate: certificate.clone(),
+                    body: body.clone(),
+                    allowlist: allowlist_digest(source),
+                }],
+            )
+            .unwrap();
+        assert_eq!(saved.written, 1);
+        let record_path = fs::read_dir(store.dir())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            fs::metadata(&record_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let envelope = fs::read(record_path).unwrap();
+        for secret in ["BUCKET_SAVE_CANARY", "KEY_SAVE_CANARY", "VALUE_SAVE_CANARY"] {
+            assert!(occurrences(&envelope, secret.as_bytes()).is_empty());
+        }
+        match store.read(&[0; 32], &allowlist_digest(source)) {
+            ReadOutcome::Found(record) => assert_eq!(record.record.body, body),
+            other => panic!("{other:?}"),
+        }
+
         let suffix = match source {
             SnapshotSource::ClaudeCode => vec![claude_append()],
             _ => codex_append(),

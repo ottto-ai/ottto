@@ -100,7 +100,7 @@ def main():
             print(selector_result.stdout, flush=True)
             (receipts / f"{arm}-selector.log").write_text(selector_result.stdout)
             selector_result.check_returncode()
-            if len(re.findall(r"^SELECTOR_COMPATIBILITY VERIFIED ", selector_result.stdout, re.M)) != 1:
+            if len(re.findall(r"\bSELECTOR_COMPATIBILITY VERIFIED ", selector_result.stdout, re.M)) != 1:
                 raise RuntimeError("missing or duplicate selector compatibility receipt")
             verified = re.findall(r"\bMONEY_EQUIVALENCE (\w+) VERIFIED ", result.stdout, re.M)
             expected = {
