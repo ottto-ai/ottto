@@ -551,10 +551,17 @@ impl Completion {
                                 && member.matches_member(&item.source_session_id)
                         },
                     )
-                    && previous
+                    && (previous
                         .files
                         .get(&pending.index_key)
                         .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                        // O1: recovery now queues the debt, not an empty stamp.
+                        || previous.traversal.as_ref().is_some_and(|traversal| {
+                            traversal
+                                .native_comparison_restore
+                                .targets
+                                .contains(&pending.index_key)
+                        }))
             }) else {
                 continue;
             };
@@ -1123,8 +1130,20 @@ impl SelectedFallback {
             cost.add(target.path.capacity())?;
             cost.add(target.scan_root.capacity())?;
             cost.add(path.len())?;
+            cost.add(path.len())?; // O1 restore-only target key
         }
         heap_layout_bound::tree_nodes::<String, ()>(keys, &mut cost)?;
+        let debt = &traversal.native_comparison_restore;
+        for (entries, operations) in [
+            (debt.targets.len(), target_count),
+            (debt.dependents.len(), pending.len()),
+        ] {
+            restore_tree_insert_peak::<String, ()>(
+                entries.checked_add(operations)?,
+                operations,
+                &mut cost,
+            )?;
+        }
         for read in pending {
             let path = Path::new(&read.index_key);
             let root = traversal
@@ -1133,6 +1152,7 @@ impl SelectedFallback {
                 .filter(|root| path.starts_with(root))
                 .max_by_key(|root| root.components().count())?;
             cost.add(read.index_key.len())?;
+            cost.add(read.index_key.len())?; // O1 dependent debt key
             cost.add(root.capacity())?;
         }
         for path in &traversal.pending_candidates {
@@ -1359,11 +1379,16 @@ impl SelectedFallback {
             .retain(|candidate| !keys.contains(&local_index_key(&candidate.path)));
         priority.append(&mut traversal.pending_candidates);
         traversal.pending_candidates = priority;
-        for target in &self.targets {
-            if let Some(entry) = index.files.get_mut(&local_index_key(&target.path)) {
-                entry.source_file_fingerprint.clear();
-            }
-        }
+        // O1: the deferred demand is restore-only debt beside the unchanged
+        // object stamp. A cleared fingerprint would refuse the durable restore
+        // and force a Full read of the frozen target.
+        let debt = &mut traversal.native_comparison_restore;
+        debt.targets.extend(
+            self.targets
+                .iter()
+                .map(|target| local_index_key(&target.path)),
+        );
+        debt.dependents.extend(self.withheld_keys.iter().cloned());
         index.mark_bounded_sweep_unsettled();
         Ok(())
     }
