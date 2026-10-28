@@ -4326,7 +4326,7 @@ pub struct ScanIndexEntry {
     )]
     pub codex_counting_owner: Option<String>,
     /// The ctime (unix nanos) in the opened-object identity that produced
-    /// `source_file_fingerprint` (Claude and Codex only). With size, mtime
+    /// `source_file_fingerprint` (all three sources). With size, mtime
     /// and file birth unchanged the next scan rebuilds the identity from it,
     /// so a ctime-only change never triggers a re-read. Older binaries drop
     /// it; zero keeps the live-identity comparison once.
