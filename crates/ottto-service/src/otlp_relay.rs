@@ -226,7 +226,7 @@ fn dispatch_relay_connection(mut stream: TcpStream, source: SnapshotSource, daem
 /// agents configured for it reconnect without any change.
 fn supervise_relay_listener(
     mut listener: TcpListener,
-    mut rebind: impl FnMut(u16) -> Result<TcpListener>,
+    mut rebind: impl FnMut(u16, u32) -> Result<TcpListener>,
     mut report: impl FnMut(RelayState),
     mut dispatch: impl FnMut(TcpStream),
 ) {
@@ -411,11 +411,13 @@ fn relay_accept_backoff(failures_in_a_row: u32) -> Duration {
 /// as it takes. The relay reads `Failed` in the meantime.
 pub(crate) fn rebind_relay_listener(
     port: u16,
-    rebind: &mut impl FnMut(u16) -> Result<TcpListener>,
+    rebind: &mut impl FnMut(u16, u32) -> Result<TcpListener>,
 ) -> TcpListener {
     let mut pause = RELAY_REBIND_BACKOFF_START;
+    let mut attempt = 0_u32;
     loop {
-        match rebind(port) {
+        attempt = attempt.saturating_add(1);
+        match rebind(port, attempt) {
             Ok(listener) => return listener,
             Err(error) => {
                 relay_log!("local OTLP relay rebind failed; retrying in {pause:?}: {error:#}");
@@ -532,13 +534,26 @@ pub(crate) fn bind_startup_local_relay_listener() -> Result<TcpListener> {
     bind_local_relay_listener(approved_candidate_relay_port())
 }
 
-pub(crate) fn bind_replacement_local_relay_listener(old_port: u16) -> Result<TcpListener> {
+// Give exporters a brief chance to keep their approved endpoint, then restore
+// availability for every source and the control/health routes on this listener.
+const APPROVED_RELAY_REBIND_ATTEMPTS: u32 = 3;
+
+pub(crate) fn bind_replacement_local_relay_listener(
+    old_port: u16,
+    attempt: u32,
+) -> Result<TcpListener> {
+    // Re-read consent/settings every attempt. The attempt budget belongs to one
+    // listener failure, so settings changes cannot restart it indefinitely.
     if let Some(port) = approved_candidate_relay_port() {
-        // Do not strand exporters when the approved port is briefly busy.
-        // Return the error to the supervisor's existing backoff loop, which
-        // re-reads consent/settings on every attempt.
-        return TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-            .context("rebind approved local OTLP relay port");
+        if attempt <= APPROVED_RELAY_REBIND_ATTEMPTS {
+            match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => return Ok(listener),
+                Err(error) if attempt < APPROVED_RELAY_REBIND_ATTEMPTS => {
+                    return Err(error).context("rebind approved local OTLP relay port");
+                }
+                Err(_) => {} // Budget exhausted: recover on the existing chain now.
+            }
+        }
     }
     bind_local_relay_listener(Some(old_port))
 }
@@ -670,6 +685,12 @@ fn current_uid() -> u32 {
     {
         0
     }
+}
+
+#[cfg(test)]
+pub(crate) fn serve_test_connection(stream: TcpStream, daemon: LocalDaemon) {
+    apply_relay_io_timeouts(&stream);
+    handle_client(stream, SnapshotSource::ClaudeCode, daemon).expect("serve test relay connection");
 }
 
 fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDaemon) -> Result<()> {
@@ -2279,7 +2300,9 @@ mod tests {
         thread::spawn(move || {
             supervise_relay_listener(
                 listener,
-                |port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).context("rebind test relay"),
+                |port, _attempt| {
+                    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).context("rebind test relay")
+                },
                 move |state| {
                     let _ = state_tx.send(state);
                 },

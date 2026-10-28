@@ -31628,20 +31628,109 @@ X-API-Key = "otel_redacted"
         let before = fs::read(&settings).unwrap();
         let mut busy = Some(std::net::TcpListener::bind(("127.0.0.1", ports[1])).unwrap());
         let mut attempts = 0;
-        let listener = crate::otlp_relay::rebind_relay_listener(ports[0], &mut |old_port| {
+        let listener =
+            crate::otlp_relay::rebind_relay_listener(ports[0], &mut |old_port, attempt| {
+                attempts += 1;
+                let result =
+                    crate::otlp_relay::bind_replacement_local_relay_listener(old_port, attempt);
+                if attempts == 1 {
+                    assert!(
+                        result.is_err(),
+                        "must retry approved port even while default is free"
+                    );
+                    drop(busy.take());
+                }
+                result
+            });
+        assert_eq!(attempts, 2);
+        assert_eq!(listener.local_addr().unwrap().port(), ports[1]);
+        assert_eq!(fs::read(settings).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn rebind_uses_free_approved_port_before_old_port() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let ports = startup_relay_candidates();
+        write_startup_relay_settings(
+            &root,
+            &crate::otlp_relay::local_relay_base_url_for_port(ports[1]),
+        );
+        let mut attempts = 0;
+        let listener = crate::otlp_relay::rebind_relay_listener(ports[0], &mut |old, attempt| {
             attempts += 1;
-            let result = crate::otlp_relay::bind_replacement_local_relay_listener(old_port);
-            if attempts == 1 {
-                assert!(
-                    result.is_err(),
-                    "must retry approved port even while default is free"
-                );
-                drop(busy.take());
+            crate::otlp_relay::bind_replacement_local_relay_listener(old, attempt)
+        });
+        assert_eq!(attempts, 1);
+        assert_eq!(listener.local_addr().unwrap().port(), ports[1]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn rebind_busy_approved_port_falls_back_after_three_attempts_and_serves() {
+        use std::io::{Read, Write};
+
+        let (root, _guards) = managed_claude_relay_fixture();
+        let ports = startup_relay_candidates();
+        let approved = ports[1];
+        let old = ports[2];
+        write_startup_relay_settings(
+            &root,
+            &crate::otlp_relay::local_relay_base_url_for_port(approved),
+        );
+        let settings = root.join(".claude/settings.json");
+        let before = fs::read(&settings).unwrap();
+        let _busy = std::net::TcpListener::bind(("127.0.0.1", approved)).unwrap();
+        let mut attempts = 0;
+        let listener = crate::otlp_relay::rebind_relay_listener(old, &mut |port, attempt| {
+            attempts += 1;
+            assert!(attempt <= 3, "approved retry must be bounded");
+            let result = crate::otlp_relay::bind_replacement_local_relay_listener(port, attempt);
+            if attempt < 3 {
+                assert!(result.is_err(), "approved port gets its retry budget first");
             }
             result
         });
-        assert_eq!(attempts, 2);
-        assert_eq!(listener.local_addr().unwrap().port(), ports[1]);
+        assert_eq!(attempts, 3);
+        let addr = listener.local_addr().unwrap();
+        assert_eq!(addr.port(), old, "old port precedes the free default port");
+        let daemon = daemon().with_account(connected_account());
+        daemon
+            .set_relay_state_for_trusted_client(ottto_protocol::RelayState {
+                state: ottto_protocol::RelayRuntimeState::Connected,
+                endpoint: Some(format!("http://{addr}")),
+                last_connected_at: None,
+                last_error: None,
+            })
+            .unwrap();
+        let relay = daemon.status_for_trusted_client().unwrap().relay;
+        assert_eq!(relay.state, ottto_protocol::RelayRuntimeState::Connected);
+        let finding = relay.last_error.unwrap();
+        assert_eq!(finding.code, "claude_relay_endpoint_mismatch");
+        assert!(finding.text.contains(&format!("127.0.0.1:{approved}")));
+        assert!(finding.text.contains(&format!("127.0.0.1:{old}")));
+
+        // Serve a real health request on the recovered listener, not just bind it.
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            crate::otlp_relay::serve_test_connection(stream, daemon);
+        });
+        let mut client =
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        server.join().unwrap();
         assert_eq!(fs::read(settings).unwrap(), before);
         fs::remove_dir_all(root).unwrap();
     }
@@ -31659,7 +31748,8 @@ X-API-Key = "otel_redacted"
             })
             .unwrap();
         let ports = startup_relay_candidates();
-        let bind = || crate::otlp_relay::bind_replacement_local_relay_listener(ports[1]).unwrap();
+        let bind =
+            || crate::otlp_relay::bind_replacement_local_relay_listener(ports[1], 1).unwrap();
         let old = bind();
         assert_eq!(old.local_addr().unwrap().port(), ports[1]);
         let default = bind();
@@ -31677,7 +31767,8 @@ X-API-Key = "otel_redacted"
         // The fixture's approved 48123 endpoint is outside every uid's list.
         let ports = startup_relay_candidates();
         let _busy_old = std::net::TcpListener::bind(("127.0.0.1", ports[1])).unwrap();
-        let listener = crate::otlp_relay::bind_replacement_local_relay_listener(ports[1]).unwrap();
+        let listener =
+            crate::otlp_relay::bind_replacement_local_relay_listener(ports[1], 1).unwrap();
         assert_eq!(listener.local_addr().unwrap().port(), ports[0]);
         fs::remove_dir_all(root).unwrap();
     }

@@ -332,9 +332,11 @@ settings. It clears when ports agree or Claude telemetry approval is absent
 or disabled. It does not rewrite settings or change account identity.
 
 After a listener failure, the relay re-reads approved settings on each retry
-and waits for an approved candidate port using its existing capped backoff.
-While that port is busy, the relay reports `failed`. Without an approved
-candidate, the old-port, default-port and per-user fallback order still applies.
+and tries an approved candidate port up to three times using its existing
+capped backoff. If all three attempts fail, recovery immediately uses the
+old-port, default-port and per-user fallback order so control, health and all
+OTLP sources can serve again. A busy approved port can then produce the mismatch
+finding above. Without an approved candidate, the fallback chain applies immediately.
 Startup retains its existing behavior of falling back if the approved port is
 busy.
 
