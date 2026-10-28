@@ -3976,10 +3976,14 @@ fn collect_claude_status(
     // patch writes during onboarding — must NOT read as "installed", or a Mac
     // that never had Claude reports it as present and then fails verification
     // with "claude is not installed or not executable".
-    let claude_desktop_root = claude_desktop_support_dir();
+    let claude_desktop_roots = crate::claude_desktop::support_roots(&home_dir());
     let claude_cli_present =
         crate::agent_configs::detection::source_present_locally(&SourceKind::ClaudeCode);
-    if !claude_cli_present && !claude_desktop_metadata_present(&claude_desktop_root) {
+    if !claude_cli_present
+        && !claude_desktop_roots
+            .iter()
+            .any(|root| claude_desktop_metadata_present(root))
+    {
         return (
             not_installed_snapshot(SourceKind::ClaudeCode, "claude", captured_at, expires_at),
             ClaudeDesktopPairs::default(),
@@ -4209,7 +4213,7 @@ fn collect_claude_status(
     let ClaudeDesktopScan {
         observations: desktop_plan_observations,
         pairs: desktop_pairs,
-    } = claude_desktop_scan_from_root(&claude_desktop_root, &snapshot.captured_at);
+    } = claude_desktop_scan_from_roots(&claude_desktop_roots, &snapshot.captured_at);
     let observable_account_identifier_hashes =
         claude_account_identifier_hashes_from_observations(&desktop_plan_observations);
     let apply_statusline_quota = |snapshot: &mut AgentStatusSnapshot,
@@ -9611,34 +9615,65 @@ fn append_claude_desktop_plan_observations(
     count
 }
 
-fn claude_desktop_support_dir() -> PathBuf {
-    home_path("Library/Application Support/Claude")
-}
-
 fn claude_cli_config_path() -> PathBuf {
     ClaudeConfigDirSlot::Default.identity_path(&home_dir())
 }
 
-/// Which Claude account this Mac uses by default right now: the Claude Desktop
+/// Which Claude accounts this Mac uses right now: each Claude Desktop
 /// app's last known account plus the default config dir's OAuth account and
 /// organization. Opaque, local-only, and cheap enough to re-read while the sync
-/// loop waits; it changes only when the user switches accounts.
+/// loop waits; it changes on account switches or configured profile changes.
 pub(crate) fn claude_default_account_fingerprint() -> Option<String> {
-    let desktop_account =
-        read_claude_desktop_config(&claude_desktop_support_dir()).last_known_account_uuid;
-    let cli_account = read_claude_cli_oauth_account(&claude_cli_config_path());
+    claude_default_account_fingerprint_from_paths(
+        &crate::claude_desktop::support_roots(&home_dir()),
+        &claude_cli_config_path(),
+    )
+}
+
+fn claude_default_account_fingerprint_from_paths(
+    desktop_roots: &[PathBuf],
+    cli_config: &Path,
+) -> Option<String> {
+    let desktop_accounts = desktop_roots
+        .iter()
+        .map(|root| {
+            (
+                root.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                read_claude_desktop_config(root).last_known_account_uuid,
+            )
+        })
+        .collect::<Vec<_>>();
+    let desktop_account = desktop_accounts
+        .first()
+        .and_then(|(_, account)| account.as_deref());
+    let cli_account = read_claude_cli_oauth_account(cli_config);
     let (cli_account_uuid, cli_organization_uuid) = cli_account
         .map(|account| (account.account_uuid, account.organization_uuid))
         .unwrap_or_default();
-    if desktop_account.is_none() && cli_account_uuid.is_none() {
+    if desktop_accounts
+        .iter()
+        .all(|(_, account)| account.is_none())
+        && cli_account_uuid.is_none()
+    {
         return None;
     }
-    Some(format!(
+    let mut fingerprint = format!(
         "desktop={};cli={};org={}",
         desktop_account.unwrap_or_default(),
         cli_account_uuid.unwrap_or_default(),
         cli_organization_uuid.unwrap_or_default()
-    ))
+    );
+    // Keep the single-Desktop fingerprint byte-for-byte stable. Sibling roots
+    // are sorted by discovery; encoding their names as well as accounts means
+    // profile additions/removals and switches wake the existing wait loop.
+    if desktop_accounts.len() > 1 {
+        fingerprint.push_str(";desktops=");
+        fingerprint.push_str(&serde_json::to_string(&desktop_accounts[1..]).ok()?);
+    }
+    Some(fingerprint)
 }
 
 fn claude_desktop_metadata_present(root: &Path) -> bool {
@@ -9653,6 +9688,43 @@ fn claude_desktop_plan_observations_from_root(
     observed_at: &str,
 ) -> Vec<AgentStatusPlanObservation> {
     claude_desktop_scan_from_root(root, observed_at).observations
+}
+
+fn claude_desktop_scan_from_roots(roots: &[PathBuf], observed_at: &str) -> ClaudeDesktopScan {
+    if let [root] = roots {
+        return claude_desktop_scan_from_root(root, observed_at);
+    }
+    let mut combined = ClaudeDesktopScan {
+        observations: Vec::new(),
+        pairs: ClaudeDesktopPairs::default(),
+    };
+    for root in roots {
+        // Resolve ownership and labels inside each root. In particular, a
+        // copied session ID in another app must never compete in this app's
+        // account/organization buckets or lend it identity metadata.
+        let scan = claude_desktop_scan_from_root(root, observed_at);
+        combined.observations.extend(scan.observations);
+        combined.pairs.pairs.extend(scan.pairs.pairs);
+        combined
+            .pairs
+            .duplicate_sessions
+            .extend(scan.pairs.duplicate_sessions);
+    }
+    let newest_first = |left: &ClaudeDesktopPairObservation,
+                        right: &ClaudeDesktopPairObservation| {
+        right
+            .observation
+            .observed_at
+            .cmp(&left.observation.observed_at)
+            .then_with(|| left.binding.cmp(&right.binding))
+    };
+    combined.pairs.pairs.sort_by(newest_first);
+    combined.pairs.duplicate_sessions.sort_by(newest_first);
+    combined
+        .pairs
+        .duplicate_sessions
+        .truncate(CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX);
+    combined
 }
 
 fn claude_desktop_scan_from_root(root: &Path, observed_at: &str) -> ClaudeDesktopScan {
@@ -28982,6 +29054,111 @@ for line in sys.stdin:
             None
         );
         assert_eq!(max_account.plan_type.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn claude_desktop_roots_keep_account_buckets_and_labels_separate() {
+        let home = crate::test_scratch::ScratchDir::new("desktop-multi-root");
+        let support = home.join("Library/Application Support");
+        let uuid = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let (a, b, x, y) = (uuid(1), uuid(2), uuid(11), uuid(12));
+        let write = |root: &str, account: &str, org: &str, plan: &str| {
+            let root = support.join(root);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("config.json"),
+                format!(r#"{{"lastKnownAccountUuid":"{account}"}}"#),
+            )
+            .unwrap();
+            for store in ["claude-code-sessions", "local-agent-mode-sessions"] {
+                let bucket = root.join(store).join(account).join(org);
+                fs::create_dir_all(&bucket).unwrap();
+                fs::write(bucket.join("local_session.json"), format!(r#"{{"cliSessionId":"shared-session","lastActivityAt":300,"planType":"{plan}","organizationName":"{plan} org"}}"#)).unwrap();
+            }
+        };
+        // The same session ID in separate apps must not tie their buckets.
+        write("Claude", &a, &x, "max");
+        write("Claude-ALT", &b, &y, "team");
+        // Same account in another root: no cross-root org/plan inference.
+        write("Claude-B", &a, &y, "pro");
+        let roots = crate::claude_desktop::support_roots(&home);
+        let scan = claude_desktop_scan_from_roots(&roots, "2026-08-12T08:00:00Z");
+        assert_eq!(scan.observations.len(), 3);
+        assert_eq!(scan.pairs.pairs.len(), 3);
+        for (root, account, org, plan) in
+            [(0, &a, &x, "max"), (1, &b, &y, "team"), (2, &a, &y, "pro")]
+        {
+            let observation = &scan.observations[root];
+            assert_eq!(observation.account_id.as_ref(), Some(account));
+            assert_eq!(observation.organization_id.as_ref(), Some(org));
+            assert_eq!(observation.plan_type.as_deref(), Some(plan));
+            assert_eq!(observation.is_current, Some(true));
+            assert_eq!(
+                observation.source_session_id.as_deref(),
+                Some("shared-session")
+            );
+            let pair = scan
+                .pairs
+                .pairs
+                .iter()
+                .find(|p| {
+                    p.observation.account_id.as_ref() == Some(account)
+                        && p.observation.organization_id.as_ref() == Some(org)
+                })
+                .unwrap();
+            assert_eq!(pair.observation.plan_type.as_deref(), Some(plan));
+            assert_eq!(
+                pair.observation.source_session_id.as_deref(),
+                Some("shared-session")
+            );
+        }
+    }
+
+    #[test]
+    fn claude_account_fingerprint_tracks_all_desktop_configs() {
+        let home = crate::test_scratch::ScratchDir::new("desktop-fingerprint");
+        let support = home.join("Library/Application Support");
+        let cli = home.join("identity.json");
+        let fingerprint = || {
+            claude_default_account_fingerprint_from_paths(
+                &crate::claude_desktop::support_roots(&home),
+                &cli,
+            )
+        };
+        assert_eq!(fingerprint(), None);
+        let write = |name: &str, account: &str| {
+            let root = support.join(name);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("config.json"),
+                format!(r#"{{"lastKnownAccountUuid":"{account}"}}"#),
+            )
+            .unwrap();
+        };
+        write("Claude", "main-account");
+        let single = fingerprint();
+        assert_eq!(single.as_deref(), Some("desktop=main-account;cli=;org="));
+        write("Claude-ALT", "alt-account");
+        let multiple = fingerprint();
+        assert_ne!(multiple, single);
+        assert_eq!(multiple, fingerprint());
+        write("Claude-ALT", "switched-account");
+        assert_ne!(multiple, fingerprint());
+        fs::remove_file(support.join("Claude-ALT/config.json")).unwrap();
+        assert_eq!(fingerprint(), single);
+        fs::remove_file(support.join("Claude/config.json")).unwrap();
+        write("Claude-ALT", "alt-only");
+        assert!(fingerprint().unwrap().contains("alt-only"));
+        fs::write(
+            &cli,
+            r#"{"oauthAccount":{"accountUuid":"cli-account","organizationUuid":"cli-org"}}"#,
+        )
+        .unwrap();
+        fs::remove_file(support.join("Claude-ALT/config.json")).unwrap();
+        assert_eq!(
+            fingerprint().as_deref(),
+            Some("desktop=;cli=cli-account;org=cli-org")
+        );
     }
 
     #[test]
