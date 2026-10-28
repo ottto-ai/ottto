@@ -542,6 +542,20 @@ impl HeaderInventory {
                     .is_ok_and(|stamp| header.stamp.same_content(&stamp))
             })
     }
+    /// Build the ordinary read queue AFTER full-roster family registration.
+    pub(super) fn retain_cached_archives(&mut self, index: &ScanIndex, paths: &BTreeSet<String>) {
+        self.pending = paths
+            .iter()
+            .filter(|path| {
+                !codex_archive_path(Path::new(path))
+                    || index.archive_header(Path::new(path)).is_some()
+            })
+            .take(MAX_HEADER_FILES + 1)
+            .map(PathBuf::from)
+            .collect();
+        self.complete = self.pending.len() <= MAX_HEADER_FILES && self.directories.stable;
+        self.bounded_out = !self.complete;
+    }
     pub(super) fn owner_for_path(&self, path: &Path) -> Option<&str> {
         // Headers append in the pending BTreeSet<String> path order. Compare
         // whole path strings, not Path's component order (a.jsonl vs a/b.jsonl).

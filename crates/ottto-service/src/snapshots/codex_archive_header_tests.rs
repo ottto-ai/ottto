@@ -658,7 +658,7 @@ fn double_uuid_archive_has_named_owner_hold_no_replacement_or_redecode() {
     not(target_os = "macos"),
     ignore = "funded decoder needs validated heap layout"
 )]
-fn inventory_step_charges_actual_physical_bytes_to_page_budget() {
+fn inventory_step_charges_decoded_bytes_to_page_and_keeps_physical_inventory_accounting() {
     let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
     let f = ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
     let root = f.0.parent().unwrap().to_owned();
@@ -682,6 +682,7 @@ fn inventory_step_charges_actual_physical_bytes_to_page_budget() {
         true,
     )
     .with_sampled_acquisition(cache, Scope("inventory-budget-test".into()));
+    scan.index.archive_pass.power = true; // synthetic pacing permission
     scan.identified_candidates = VecDeque::from([f.candidate()]);
     scan.codex_join_inventory = Some(inventory);
     scan.codex_join_prepared = false;
@@ -694,7 +695,7 @@ fn inventory_step_charges_actual_physical_bytes_to_page_budget() {
                 if inventory.archive_work.decoded_bytes > 0 {
                     assert_eq!(
                         next.codex_page.singleton_remaining(limits),
-                        before - inventory.archive_work.physical_bytes
+                        before - inventory.archive_work.decoded_bytes
                     );
                     assert_eq!(
                         inventory.read_bytes as u64,

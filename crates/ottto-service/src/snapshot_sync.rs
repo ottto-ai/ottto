@@ -24316,3 +24316,9 @@ fn archive_residue_receipt_discloses_terminal_loss_without_retryable_error() {
         assert!(!counts.has_retryable_problems());
     }
 }
+
+/// Temporary fail-closed adapter: unknown power does not authorize archive work.
+pub(crate) fn archive_power_ready() -> bool {
+    use continuation::{NoPlatformSignals, PlatformGates, PlatformState};
+    NoPlatformSignals.power() == PlatformState::Allowed
+}
