@@ -899,3 +899,226 @@ fn stale_carry_batch_diagnostics_discard_failed_larger_attempts() {
     );
     assert_eq!(diagnostics.eligible_before_funding, 1);
 }
+
+// Ordinary deadlines (without proof corrections) expose the service/census
+// clock mismatch. Empty root admission avoids native carry layout requirements.
+fn retry_offer_clock_fixture(count: usize) -> ScopedRetryFixture {
+    let mut fixture = retry_durable_fixture(count, 0);
+    let root = fixture._scratch.to_path_buf();
+    retry_test_context(&mut fixture.index, &root);
+    for record in fixture.index.claude_usage_authority_quarantine.values_mut() {
+        record.retry_after_unix_seconds = rfc3339_unix_seconds(CARRY_FAILED).unwrap() + 1;
+        assert!(record.proof_correction.is_none());
+    }
+    let (mut carry, _, state) =
+        claude_retry_admit_batch(&fixture.index, &BTreeSet::new(), None, CARRY_RETRY);
+    carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+        context_fingerprint: fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .context_fingerprint
+            .clone(),
+        process: claude_full_rearm_process(),
+        full_rearm_window: false,
+        admission: Some(state),
+    });
+    fixture.index.claude_stale_family_carry = carry;
+    fixture
+}
+
+#[test]
+fn retry_offer_clock_credits_missing_paths_once_across_reload_and_64_path_seed() {
+    let mut fixture = retry_offer_clock_fixture(70);
+    let root = fixture._scratch.to_path_buf();
+    let path = root.join("offer-clock-state.json");
+    let keys = fixture.index.files.keys().cloned().collect::<Vec<_>>();
+    for key in &keys {
+        std::fs::remove_file(key).unwrap();
+    }
+    let files = serde_json::to_value(&fixture.index.files).unwrap();
+    let pending = serde_json::to_value(&fixture.index.claude_usage_family_pending).unwrap();
+    let quarantine =
+        serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap();
+    let accepted = fixture.index.accepted_snapshot_fingerprints.clone();
+    let bodies = fixture.index.file_snapshot_fingerprints.clone();
+    let mut offered = BTreeSet::new();
+    for page in 0..35 {
+        fixture.index = retry_test_reload(&mut fixture.index, &path);
+        // Pipeline runtime policy is reloaded after durable state.
+        fixture.index.claude_reemission_exclusions =
+            ReemissionExclusions::load(&root.join("support"));
+        claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
+        assert!(fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .all(|candidate| !offered.contains(&local_index_key(&candidate.path))));
+        let scan = OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            fixture.index,
+            CARRY_RETRY,
+            BACKFILL_WINDOW_DAYS,
+            2,
+            false,
+            Some(&root.join("support")),
+            &[],
+            false,
+            true,
+            true,
+        );
+        assert!(
+            scan.identified_candidates.is_empty(),
+            "missing paths earn no body"
+        );
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.census_window_end, CARRY_FAILED);
+        assert_eq!(scan.census_unix_seconds, rfc3339_unix_seconds(CARRY_FAILED));
+        fixture.index = scan.index;
+        let state = fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        let through = (page + 1) * 2;
+        assert_eq!(state.due_after_path.as_ref(), Some(&keys[through - 1]));
+        assert_eq!(
+            state.served_before,
+            rfc3339_unix_seconds(CARRY_FAILED).unwrap()
+        );
+        assert_eq!(
+            state.due_through,
+            rfc3339_unix_seconds(CARRY_RETRY).unwrap()
+        );
+        assert!(!state.due_complete);
+        assert!(state.progressed);
+        offered.extend(keys[through - 2..through].iter().cloned());
+        let traversal = fixture.index.traversal.as_ref().unwrap();
+        assert_eq!(traversal.census_window_end, CARRY_FAILED);
+        assert!(traversal.observed_index_keys.is_empty());
+        assert_eq!(
+            fixture.index.resume_census_window_end.as_deref(),
+            Some(CARRY_FAILED)
+        );
+        assert!(fixture.index.bounded_sweep_had_unsettled_upload);
+        assert_eq!(serde_json::to_value(&fixture.index.files).unwrap(), files);
+        assert_eq!(
+            serde_json::to_value(&fixture.index.claude_usage_family_pending).unwrap(),
+            pending
+        );
+        assert_eq!(
+            serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap(),
+            quarantine
+        );
+        assert_eq!(fixture.index.accepted_snapshot_fingerprints, accepted);
+        assert_eq!(fixture.index.file_snapshot_fingerprints, bodies);
+    }
+    assert_eq!(
+        offered.len(),
+        70,
+        "all paths pass the 64-path seed boundary"
+    );
+    fixture.index = retry_test_reload(&mut fixture.index, &path);
+    claude_retry_queue_due_families(&mut fixture.index, CARRY_RETRY);
+    assert!(fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .pending_candidates
+        .is_empty());
+    assert!(
+        fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap()
+            .due_complete
+    );
+    assert_eq!(
+        fixture.index.claude_usage_authority_quarantine.len(),
+        70,
+        "offered opportunities never settle authority debt"
+    );
+}
+
+#[test]
+fn retry_offer_clock_preserves_gaps_and_frozen_horizon_after_reload() {
+    let mut fixture = retry_offer_clock_fixture(3);
+    let root = fixture._scratch.to_path_buf();
+    let keys = fixture.index.files.keys().cloned().collect::<Vec<_>>();
+    let future = fixture.roots.last().unwrap();
+    fixture
+        .index
+        .claude_usage_authority_quarantine
+        .get_mut(future)
+        .unwrap()
+        .retry_after_unix_seconds = rfc3339_unix_seconds(CARRY_RETRY).unwrap() + 1;
+    let records = serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap();
+    // Offering a later path cannot consume an earlier gap. Service after the
+    // frozen horizon cannot consume the future deadline either.
+    for (positions, expected) in [
+        (vec![1], None),
+        (vec![0], Some(&keys[0])),
+        (vec![0], Some(&keys[0])), // duplicate offer is idempotent
+        (vec![2], Some(&keys[0])),
+        (vec![1, 2], Some(&keys[1])),
+    ] {
+        let mut selected = positions
+            .into_iter()
+            .map(|position| ScanTraversalPath {
+                scan_root: root.clone(),
+                path: PathBuf::from(&keys[position]),
+                census_member: true,
+                watcher_hint: false,
+            })
+            .collect::<Vec<_>>();
+        let offered_end = selected.len();
+        finish_claude_retry_selection(
+            &mut fixture.index,
+            &mut selected,
+            offered_end,
+            CARRY_SECOND_RETRY,
+        );
+        fixture.index = retry_test_reload(&mut fixture.index, &root.join("gap-state.json"));
+        let state = fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_ref()
+            .unwrap()
+            .admission
+            .as_ref()
+            .unwrap();
+        assert_eq!(state.due_after_path.as_ref(), expected);
+        assert_eq!(
+            state.due_through,
+            rfc3339_unix_seconds(CARRY_RETRY).unwrap()
+        );
+        assert_eq!(
+            state.served_before,
+            rfc3339_unix_seconds(CARRY_FAILED).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap(),
+            records
+        );
+        assert_eq!(
+            fixture.index.traversal.as_ref().unwrap().census_window_end,
+            CARRY_FAILED
+        );
+    }
+}
