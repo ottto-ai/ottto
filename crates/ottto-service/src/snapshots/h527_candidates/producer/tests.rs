@@ -1001,8 +1001,11 @@ fn source_r4_vanished_without_census_holds_only_lineage() {
 
 #[test]
 fn source_r4_unrelated_target_proceeds_and_copy_lineage_is_transitive() {
-    let fixture = fixture();
+    let mut fixture = fixture();
     let peer = add_vanishing_peer(&fixture.input, "proj-unrelated");
+    let empty_index = fixture.root.join("index.json");
+    fs::write(&empty_index, b"{\"generation\":1}").unwrap();
+    fixture.input.census_index_path = Some(empty_index);
     vanish_after_plan(peer);
     let output = produce(&fixture.input, &"0".repeat(64), &fixture_build()).unwrap();
     let artifact: Value = serde_json::from_str(&output.artifact_json).unwrap();
@@ -1283,7 +1286,17 @@ fn source_r4_reappeared_peer_at_run_end_refuses_publication() {
 
 #[test]
 fn source_r4_target_tuple_copy_keeps_one_b2_counter() {
-    let fixture = fixture();
+    let mut fixture = fixture();
+    // Even the largest known first-ACK sorts before an unknown first-ACK.
+    // Pick the larger hash so a sentinel-only comparison would select wrongly.
+    let known = if fixture.input.targets[16].session_key_sha256
+        > fixture.input.targets[17].session_key_sha256
+    {
+        16
+    } else {
+        17
+    };
+    fixture.input.targets[known].b2_first_ack_order = Some(u64::MAX);
     let mut line = assistant_line(&session_id(17), 6, ("target-copy", 123, 7, 456));
     line.as_object_mut().unwrap().remove("requestId");
     for index in [16, 17] {
@@ -1335,6 +1348,10 @@ fn source_r4_target_tuple_copy_keeps_one_b2_counter() {
                     .unwrap()
             )
             .sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        target_report(&artifact, (known + 1) as u64)["missing_evidence_counted"]["lines"],
         1
     );
     fs::remove_dir_all(fixture.root).unwrap();

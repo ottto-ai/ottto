@@ -199,6 +199,7 @@ impl Drop for TupleExclusionGuard {
 #[derive(Deserialize)]
 struct CensusFields {
     generation: u64,
+    #[serde(default)]
     claude_request_census: ClaudeRequestCensus,
 }
 struct CensusSnapshot {
@@ -1765,7 +1766,8 @@ fn scan_peers(
                 });
                 let rank = |i: usize| {
                     (
-                        input.targets[i].b2_first_ack_order.unwrap_or(u64::MAX),
+                        input.targets[i].b2_first_ack_order.is_none(),
+                        input.targets[i].b2_first_ack_order,
                         &input.targets[i].session_key_sha256,
                     )
                 };
@@ -2411,7 +2413,8 @@ fn scan_peer_file(
                     };
                     let rank = |i: usize| {
                         (
-                            scan.target_ranks[i].0.unwrap_or(u64::MAX),
+                            scan.target_ranks[i].0.is_none(),
+                            scan.target_ranks[i].0,
                             &scan.target_ranks[i].1,
                         )
                     };
