@@ -18,6 +18,11 @@ The V1 parsers, accumulator and fixtures remain test-only oracles for V2
 comparisons. The scale harness's `v1` phase is removed; its V2 phases remain.
 The wire counter source stays `context_composition_v1`.
 
+Two V1-only pieces outside the module also go: the footprint module's
+first-cwd discovery reader and file-metadata witness (V1 discovery and cache
+were their only callers), and the JSON-body composition uploader that V1 used
+(V2 uploads through the serialized-body call).
+
 Orphaned V1 cache JSON files are intentionally left on disk. V2 uses its own
 state subdirectory and does not load these sibling files; this deletion adds
 no cleanup or migration path.

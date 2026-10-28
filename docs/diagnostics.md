@@ -208,9 +208,9 @@ counts, with no paths or values:
   - `footprint_observer_incomplete_files`: each delivery that ended before
     its read completed, plus the first appended or unchanged read of a file
     whose earlier lines this process never saw (restart, durable restore or
-    eviction); a file counts again only while it is not held (evicted, aged out
-    or without a modification time).
-    What was delivered is kept.
+    eviction). That second count repeats only after the file stops being held
+    (evicted, aged out or without a modification time). What was delivered is
+    kept.
 
 ## Private Codex Census Outcomes
 
