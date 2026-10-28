@@ -9,7 +9,9 @@ use std::cell::Cell;
 pub(crate) struct Rearm {
     #[serde(skip_serializing_if = "StaleRearmHeld::is_empty")]
     pub(crate) stale_rearm_held: StaleRearmHeld,
+    #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) admission_cleared_drained: u64,
+    #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) admission_cleared_held_roots: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) restored_empty_held: u64,
@@ -306,21 +308,16 @@ pub(crate) fn restored(previous_empty: bool, held: bool, exact_only: bool) {
 pub(crate) enum ClearSite {
     OwnedStart,
     AccountReproof,
-    RetryAdmission,
 }
 pub(crate) fn clear(site: ClearSite, nonempty: bool) {
     update(|counts| {
         let c = &mut counts.claude_reread;
-        let count_call = !matches!(site, ClearSite::RetryAdmission);
+        let count_call = true;
         let (calls, cleared) = match site {
             ClearSite::OwnedStart => (&mut c.owned_start_calls, &mut c.owned_start_cleared),
             ClearSite::AccountReproof => {
                 (&mut c.account_reproof_calls, &mut c.account_reproof_cleared)
             }
-            ClearSite::RetryAdmission => (
-                &mut c.retry_admission_offered,
-                &mut c.retry_admission_cleared,
-            ),
         };
         *calls = calls.saturating_add(u64::from(count_call));
         *cleared = cleared.saturating_add(u64::from(nonempty));

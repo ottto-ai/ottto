@@ -3664,3 +3664,65 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
     assert_eq!(body, oracle(&fixture, source));
     assert_eq!(uploaded_cache_breaks(&body), (first, &json!(6)));
 }
+
+#[test]
+fn stale_rearm_empty_fingerprint_preserves_sample_proven_real_edits() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for replaced in [false, true] {
+        let source = SnapshotSource::ClaudeCode;
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (mut index, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "stale-real-edit",
+        );
+        assert_eq!(modes.0, 1);
+        let key = local_index_key(&fixture.file.0);
+        let old_mtime = fs::metadata(&fixture.file.0).unwrap().modified().unwrap();
+        let old = fs::read_to_string(&fixture.file.0).unwrap();
+        let changed = old.replace("fixture-model", "changed-model");
+        assert_eq!(old.len(), changed.len());
+        if replaced {
+            let replacement = fixture.root.join("replacement.tmp");
+            fs::write(&replacement, &changed).unwrap();
+            fs::rename(&replacement, &fixture.file.0).unwrap();
+        } else {
+            fs::write(&fixture.file.0, &changed).unwrap();
+        }
+        File::options()
+            .write(true)
+            .open(&fixture.file.0)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old_mtime))
+            .unwrap();
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        index.traversal = None;
+        index.claude_usage_authority_quarantine.clear();
+        index.claude_usage_family_pending.insert(
+            "native-tail-fixture".into(),
+            ClaudeUsageFamilyPending {
+                census_window_end: "old-window".into(),
+                member_request_id_hashes: BTreeMap::new(),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+                idless_revision: None,
+            },
+        );
+        let (_, scan, modes, bytes) =
+            production_scan_with_metrics(&fixture, source, index, Some(cache), "stale-real-edit");
+        assert_eq!(modes.0, 1, "cheap checks retain A2, replaced={replaced}");
+        assert_eq!(bytes.0, changed.len() as u64);
+        assert!(!scan.snapshots.is_empty());
+    }
+}

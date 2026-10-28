@@ -954,6 +954,8 @@ fn bounded_stale_admission_crosses_128_roots_without_restart_or_reload_gap() {
         served = after;
         let done = state.roots_complete;
         fixture.index = retry_test_reload(&mut fixture.index, &root.join("bounded-stale.json"));
+        fixture.index.claude_reemission_exclusions =
+            ReemissionExclusions::load(&root.join("support"));
         assert_eq!(
             fixture.index.traversal.as_ref().unwrap().census_window_end,
             window
@@ -970,4 +972,78 @@ fn bounded_stale_admission_crosses_128_roots_without_restart_or_reload_gap() {
         }
     }
     assert_eq!(served, 260);
+}
+
+#[test]
+fn bounded_stale_terminal_and_clean_followup_never_settle_old_window_pending() {
+    let mut fixture = retry_durable_fixture(0, 2);
+    let root = fixture._scratch.to_path_buf();
+    retry_test_context(&mut fixture.index, &root);
+    let acks = fixture.index.accepted_snapshot_fingerprints.clone();
+    for at in [CARRY_RETRY, CARRY_SECOND_RETRY] {
+        let (index, scan, _) = retry_test_page(fixture.index, &root, at, 16);
+        fixture.index = index;
+        assert!(
+            !scan.census_complete,
+            "stale request evidence was not refreshed"
+        );
+        assert!(fixture.index.bounded_sweep_had_unsettled_upload);
+        assert_eq!(fixture.index.accepted_snapshot_fingerprints, acks);
+        assert_eq!(fixture.index.claude_usage_family_pending.len(), 2);
+        assert!(fixture
+            .index
+            .files
+            .values()
+            .all(|e| !e.source_file_fingerprint.is_empty()));
+    }
+}
+
+#[test]
+fn bounded_stale_large_family_keeps_a_one_file_page_incomplete() {
+    let mut fixture = retry_durable_fixture(1, 0);
+    let root = fixture._scratch.to_path_buf();
+    let family = fixture.roots[0].clone();
+    let root_path = root.join(format!("{family}.jsonl"));
+    let root_key = local_index_key(&root_path);
+    let entry = fixture.index.files[&root_key].clone();
+    let entities = fixture.index.file_snapshot_fingerprints[&root_key].clone();
+    let subagents = root.join(&family).join("subagents");
+    fs::create_dir_all(&subagents).unwrap();
+    let mut children = BTreeMap::new();
+    for n in 0..64 {
+        let path = subagents.join(format!("agent-{n}.jsonl"));
+        fs::write(&path, b"{}\n").unwrap();
+        let key = local_index_key(&path);
+        fixture.index.files.insert(key.clone(), entry.clone());
+        fixture
+            .index
+            .file_snapshot_fingerprints
+            .insert(key.clone(), entities.clone());
+        children.insert(key, entry.source_file_fingerprint.clone());
+    }
+    retry_test_context(&mut fixture.index, &root);
+    fixture.index.claude_usage_family_pending.remove(&family);
+    let keys = fixture.index.files.keys().cloned().collect();
+    let traversal = fixture.index.traversal.as_mut().unwrap();
+    traversal.counts = ScanTraversalCounts::default();
+    traversal.observed_index_keys = keys;
+    traversal.pending_candidates.push_back(ScanTraversalPath {
+        scan_root: root.clone(),
+        path: root_path.clone(),
+        census_member: true,
+        watcher_hint: false,
+    });
+    fs::write(root_path, b"{}\n{}\n").unwrap();
+    let acks = fixture.index.accepted_snapshot_fingerprints.clone();
+    let (index, scan, selected) = retry_test_page(fixture.index, &root, CARRY_RETRY, 1);
+    assert!(
+        selected.len() <= 1,
+        "family expansion cannot exceed the caller's page"
+    );
+    assert!(!scan.census_complete);
+    assert!(index.bounded_sweep_had_unsettled_upload);
+    assert_eq!(index.accepted_snapshot_fingerprints, acks);
+    for (key, fingerprint) in children {
+        assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
+    }
 }
