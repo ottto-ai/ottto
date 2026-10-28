@@ -1490,7 +1490,7 @@ include!("selector_compatibility_tests.rs");
 
 #[test]
 fn rejected_selector_candidates_never_save_and_restore_tail_equals_full() {
-    use crate::local_resource_diagnostics::cache_lifecycle;
+    use crate::local_resource_diagnostics::observe_selector_rejections;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let scratch = Scratch::new("selector-rejection");
         let inject = |line: String| {
@@ -1506,7 +1506,7 @@ fn rejected_selector_candidates_never_save_and_restore_tail_equals_full() {
         let lines: Vec<_> = lines.into_iter().map(inject).collect();
         let path = scratch.write("t.jsonl", &lines);
         let ((reduction, checkpoint), counts) =
-            cache_lifecycle::observe(|| full_read(&path, source));
+            observe_selector_rejections(|| full_read(&path, source));
         assert!(
             counts.selector_key_rejected_unknown > 0 && counts.selector_key_rejected_format > 0
         );
@@ -1613,13 +1613,27 @@ fn rejected_selector_candidates_never_save_and_restore_tail_equals_full() {
         for secret in ["BUCKET_SAVE_CANARY", "KEY_SAVE_CANARY", "VALUE_SAVE_CANARY"] {
             assert!(occurrences(&saved, secret.as_bytes()).is_empty());
         }
-        assert_eq!(items(continued, &path, source), cold_items(&path, source));
+        let dirty = cold_items(&path, source);
+        assert!(!dirty["items"].as_array().unwrap().is_empty());
+        assert_eq!(items(continued, &path, source), dirty);
+        // Reuse the physical file so birth/inode cannot affect the comparison.
+        let clean = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).unwrap();
+                value["selector_context"] = json!({"service_tier":"priority"});
+                value.to_string()
+            })
+            .collect::<Vec<_>>();
+        fs::write(&path, clean.join("\n") + "\n").unwrap();
+        assert_eq!(dirty, cold_items(&path, source));
     }
 }
 
 #[test]
 fn valid_selector_records_have_zero_rejections() {
-    let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(
+    let (_, counts) = crate::local_resource_diagnostics::observe_selector_rejections(
         selector_compatibility_tests::valid_native_bodies_records_tier_and_plan_receipt,
     );
     assert_eq!(counts.selector_key_rejected_unknown, 0);

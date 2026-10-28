@@ -189,6 +189,20 @@ after the existing decision, are drained by that source's next completed page,
 and count repeated decisions, not distinct files or bytes. They are recorded
 whether or not an observer is registered.
 
+`counts.selector_key_rejected` on the same `native_collection_page` line projects
+process-wide running totals for capture-time selector rejections. Its only keys
+are `unknown` (an unknown selector key) and `format` (a value accepted by the
+existing normalizer but rejected by the new key validator). Values already absent
+under normalization, including nulls and empty strings, add nothing to `format`.
+No raw key, value or source text appears. Repeated capture attempts count again.
+Unlike the line-delivery page counters, these saturating totals are never drained:
+every source's page repeats the current process totals. Consumers take the last
+or maximum value per `process_id`, never sum pages or attribute the total to the
+page's source. Restart resets the totals. An absent map means zero only when a
+page diagnostic exists. These two counters are independent of cache-lifecycle
+page events and native-decision diagnostics; this projection adds no reads or
+wire fields.
+
 ## Context Footprint Discovery
 
 Context footprint opens no transcript. Its workspaces come from the cwds of

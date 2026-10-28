@@ -116,12 +116,26 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
 const SCHEMA_VERSION: u8 = 2;
 
 /// Capture attempts, process-wide; fixed classes only, never key/value/source text.
+#[cfg(not(test))]
+static SELECTOR_REJECTED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+thread_local! {
+    static SELECTOR_REJECTED: [AtomicU64; 2] = const { [const { AtomicU64::new(0) }; 2] };
+}
+fn selector_rejection(unknown: bool, f: impl FnOnce(&AtomicU64) -> u64) -> u64 {
+    #[cfg(test)]
+    {
+        SELECTOR_REJECTED.with(|slots| f(&slots[unknown as usize]))
+    }
+    #[cfg(not(test))]
+    {
+        f(&SELECTOR_REJECTED[unknown as usize])
+    }
+}
 pub(crate) fn selector_key_rejected(unknown: bool) {
-    use cache_lifecycle::Event;
-    cache_lifecycle::record(if unknown {
-        Event::SelectorKeyRejectedUnknown
-    } else {
-        Event::SelectorKeyRejectedFormat
+    selector_rejection(unknown, |slot| {
+        slot.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
+            .unwrap()
     });
 }
 
@@ -137,10 +151,9 @@ pub(crate) fn cache_lifecycle_totals() {
 
 /// Process-wide cumulative capture attempts, not attributed to the finishing page.
 fn selector_key_rejection_counts() -> BTreeMap<&'static str, u64> {
-    let cache = cache_lifecycle::snapshot();
     [
-        ("unknown", cache.selector_key_rejected_unknown),
-        ("format", cache.selector_key_rejected_format),
+        ("unknown", selector_rejection(true, |n| n.load(Relaxed))),
+        ("format", selector_rejection(false, |n| n.load(Relaxed))),
     ]
     .into_iter()
     .filter(|(_, n)| *n > 0)
@@ -1934,4 +1947,27 @@ mod tests {
             assert_eq!(record["schema_version"], SCHEMA_VERSION);
         }
     }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SelectorRejectionCounts {
+    pub(crate) selector_key_rejected_unknown: u64,
+    pub(crate) selector_key_rejected_format: u64,
+}
+#[cfg(test)]
+pub(crate) fn observe_selector_rejections<T>(
+    f: impl FnOnce() -> T,
+) -> (T, SelectorRejectionCounts) {
+    let before = selector_key_rejection_counts();
+    let value = f();
+    let after = selector_key_rejection_counts();
+    let delta = |key| after.get(key).copied().unwrap_or(0) - before.get(key).copied().unwrap_or(0);
+    (
+        value,
+        SelectorRejectionCounts {
+            selector_key_rejected_unknown: delta("unknown"),
+            selector_key_rejected_format: delta("format"),
+        },
+    )
 }

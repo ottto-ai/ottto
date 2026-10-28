@@ -1,5 +1,5 @@
 use super::*;
-use crate::local_resource_diagnostics::cache_lifecycle;
+use crate::local_resource_diagnostics::{cache_lifecycle, observe_selector_rejections};
 
 #[test]
 fn exact_known_vocabulary_and_each_validator() {
@@ -29,7 +29,7 @@ fn exact_known_vocabulary_and_each_validator() {
             .collect::<BTreeSet<_>>(),
         expected
     );
-    let (_, counts) = cache_lifecycle::observe(|| {
+    let (_, counts) = observe_selector_rejections(|| {
         for (key, rule) in SELECTOR_KEY_RULES {
             let raw = match *rule {
                 "bool" => json!(true),
@@ -61,7 +61,7 @@ fn exact_known_vocabulary_and_each_validator() {
 #[test]
 fn malformed_values_are_dropped_and_counted_without_content() {
     let mut capture = SelectorCapture::default();
-    let (_, counts) = cache_lifecycle::observe(|| {
+    let (_, counts) = observe_selector_rejections(|| {
         for (key, raw) in [
             ("plan_window_bucket", json!("/tmp/BUCKET_CANARY/private")),
             ("plan_window_bucket", json!("some free text")),
@@ -95,7 +95,7 @@ fn malformed_values_are_dropped_and_counted_without_content() {
         );
     });
     assert!(capture.context.is_empty() && capture.sources.is_empty());
-    assert_eq!(counts.selector_key_rejected_format, 21);
+    assert_eq!(counts.selector_key_rejected_format, 18);
     assert_eq!(counts.selector_key_rejected_unknown, 1);
     let (_, logs) = crate::local_resource_diagnostics::capture(|| {
         crate::local_resource_diagnostics::Probe::start().collection(
@@ -127,8 +127,46 @@ fn malformed_values_are_dropped_and_counted_without_content() {
 }
 
 #[test]
+fn base_normalizer_absence_is_not_a_new_format_rejection() {
+    let (_, counts) = observe_selector_rejections(|| {
+        for (key, raw) in [
+            ("plan_window_bucket", Value::Null),
+            ("plan_window_bucket", json!("  ")),
+            ("service_tier", json!(["priority"])),
+            ("batch_mode", json!({"x": true})),
+            ("batch_mode", json!("maybe")),
+            ("mode", json!("turbo")),
+        ] {
+            assert!(normalize_selector_raw(key, &raw).is_none());
+            let mut capture = SelectorCapture::default();
+            insert_selector_raw(&mut capture, key, "fixture", &raw);
+            assert!(capture.is_empty());
+        }
+    });
+    assert_eq!(counts.selector_key_rejected_format, 0);
+    assert_eq!(counts.selector_key_rejected_unknown, 0);
+}
+
+#[test]
+fn pi_backend_context_values_survive_custom_capture() {
+    let (_, counts) = observe_selector_rejections(|| {
+        for bucket in ["short", "long", "standard", "unknown"] {
+            let selector = pi_selector_from_custom(&json!({"customType":"ottto-selector",
+                "data":{"context_bucket":bucket}}))
+            .unwrap();
+            assert_eq!(
+                selector.context.get("context_bucket").map(String::as_str),
+                Some(bucket)
+            );
+        }
+    });
+    assert_eq!(counts.selector_key_rejected_format, 0);
+    assert_eq!(counts.selector_key_rejected_unknown, 0);
+}
+
+#[test]
 fn scalar_boundaries_preserve_accepted_lexical_values() {
-    let (_, counts) = cache_lifecycle::observe(|| {
+    let (_, counts) = observe_selector_rejections(|| {
         for (key, raw) in [
             ("plan_window_bucket", json!(0)),
             ("plan_window_bucket", json!(u64::MAX)),
@@ -137,6 +175,8 @@ fn scalar_boundaries_preserve_accepted_lexical_values() {
             ("batch_mode", json!(0)),
             ("mode", json!(true)),
             ("mode", json!("default")),
+            ("context_bucket", json!("standard")),
+            ("context_bucket", json!("unknown")),
             ("cache_ttl", json!("5m")),
             ("cache_ttl", json!("1h")),
             ("cache_ttl", json!(3600)),
@@ -165,7 +205,7 @@ fn scalar_boundaries_preserve_accepted_lexical_values() {
 
 #[test]
 fn container_unknowns_alias_precedence_and_existing_capture_inventory() {
-    let (capture, counts) = cache_lifecycle::observe(|| {
+    let (capture, counts) = observe_selector_rejections(|| {
         selector_from_object(
             &json!({
                 "type":"ordinary-native-event", "unrelated":"native-value",
@@ -178,7 +218,7 @@ fn container_unknowns_alias_precedence_and_existing_capture_inventory() {
         )
     });
     assert_eq!(counts.selector_key_rejected_unknown, 1);
-    assert_eq!(counts.selector_key_rejected_format, 1);
+    assert_eq!(counts.selector_key_rejected_format, 0);
     assert_eq!(
         capture.context.get("speed_mode").map(String::as_str),
         Some("fast")
@@ -203,7 +243,7 @@ fn container_unknowns_alias_precedence_and_existing_capture_inventory() {
 
 #[test]
 fn native_producer_shapes_have_zero_rejections() {
-    let (_, counts) = cache_lifecycle::observe(|| {
+    let (_, counts) = observe_selector_rejections(|| {
         let fields = json!({"serviceTier":"priority", "speed":"normal", "batchMode":true,
             "dataResidency":"US", "contextLengthBucket":"long", "cache_write_ttl_seconds":3600,
             "fastMode":true, "gatewayProvider":"bedrock", "modelProvider":"anthropic",
@@ -289,7 +329,8 @@ fn pi_custom_rejects_before_occurrence_identity() {
     let mut dirty = clean.clone();
     dirty["data"]["selector_context"]["plan_window_bucket"] = json!("/tmp/PI_BUCKET_CANARY");
     dirty["data"]["selector_context"]["/tmp/PI_KEY_CANARY"] = json!("PI_VALUE_CANARY");
-    let (selector, counts) = cache_lifecycle::observe(|| pi_selector_from_custom(&dirty).unwrap());
+    let (selector, counts) =
+        observe_selector_rejections(|| pi_selector_from_custom(&dirty).unwrap());
     assert_eq!(counts.selector_key_rejected_unknown, 1);
     assert_eq!(counts.selector_key_rejected_format, 1);
     assert!(!selector.context.contains_key("plan_window_bucket"));
@@ -326,7 +367,7 @@ fn pi_custom_rejects_before_occurrence_identity() {
 
 #[test]
 fn all_existing_object_aliases_match_their_expected_formats_and_sources() {
-    let (_, counts) = cache_lifecycle::observe(|| {
+    let (_, counts) = observe_selector_rejections(|| {
         for (field, raw, expected, aliases) in [
             (
                 "service_tier",
@@ -526,12 +567,4 @@ fn claude_active_scopes_do_not_duplicate_selector_totals_in_cache_events() {
     ] {
         assert!(!text.contains(forbidden));
     }
-    let sparse = serde_json::to_value(cache_lifecycle::Sparse(cache_lifecycle::Counts {
-        selector_key_rejected_unknown: u64::MAX,
-        selector_key_rejected_format: u64::MAX,
-        ..Default::default()
-    }))
-    .unwrap();
-    assert!(sparse.get("selector_key_rejected_unknown").is_none());
-    assert!(sparse.get("selector_key_rejected_format").is_none());
 }

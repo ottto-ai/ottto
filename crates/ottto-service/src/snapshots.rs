@@ -34609,7 +34609,7 @@ fn selector_value_valid(rule: &str, raw: &Value, value: &str) -> bool {
     match rule {
         "bool" => matches!(value, "true" | "false"),
         "mode" => matches!(value, "fast" | "standard" | "priority" | "flex"),
-        "context" => matches!(value, "short" | "long"),
+        "context" => matches!(value, "short" | "long" | "standard" | "unknown"),
         "u64" => unsigned(value),
         "number" => value
             .parse::<f64>()
@@ -34630,16 +34630,17 @@ fn selector_value_valid(rule: &str, raw: &Value, value: &str) -> bool {
 }
 
 fn insert_selector_raw(capture: &mut SelectorCapture, field: &str, source: &str, value: &Value) {
-    let rule = SELECTOR_KEY_RULES.iter().find(|(key, _)| *key == field);
-    if rule.is_some() && value.is_null() {
-        return;
-    } // Optional absence, including quota balance.
-    let Some(normalized) = normalize_selector_raw(field, value)
-        .filter(|v| rule.is_some_and(|(_, rule)| selector_value_valid(rule, value, v)))
-    else {
-        crate::local_resource_diagnostics::selector_key_rejected(rule.is_none());
+    let Some((_, rule)) = SELECTOR_KEY_RULES.iter().find(|(key, _)| *key == field) else {
+        crate::local_resource_diagnostics::selector_key_rejected(true);
         return;
     };
+    let Some(normalized) = normalize_selector_raw(field, value) else {
+        return; // Already absent under the base normalizer; no new rejection.
+    };
+    if !selector_value_valid(rule, value, &normalized) {
+        crate::local_resource_diagnostics::selector_key_rejected(false);
+        return;
+    }
     capture.insert(field, normalized.clone(), source);
     if field == "speed_mode" && normalized == "fast" {
         capture.insert("service_tier", "fast".to_string(), "derived_from_speed");

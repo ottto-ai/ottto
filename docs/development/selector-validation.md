@@ -11,7 +11,7 @@ or bypass attribution consent.
 known keys and their validators. Token fields require JSON strings normalized to
 1–128 ASCII letters, digits, underscore, dot or colon. Batch mode keeps its existing
 boolean aliases; mode keeps fast/standard/priority/flex normalization. Context
-bucket accepts short/long. Cache TTL accepts unsigned decimal seconds or an
+bucket accepts short/long/standard/unknown. Cache TTL accepts unsigned decimal seconds or an
 unsigned decimal duration followed by s/m/h/d. Plan-window day bucket and quota
 window minutes/reset timestamps require decimal u64 strings. Quota percentages
 and balance require finite nonnegative numeric values; percentages may exceed
@@ -23,7 +23,9 @@ dropped. Ordinary event-envelope fields are outside the selector vocabulary.
 The existing native collection page diagnostics carrier reports process-wide cumulative
 `selector_key_rejected` counts with only `unknown` and `format` classes; repeated
 capture attempts are counted, not unique lines. These counters contain no raw
-key, value or source text. Diagnostics do not affect parsing or recovery.
+key, value or source text. `format` counts only candidates the base normalizer
+accepted and the new validator rejects; nulls, empty strings and other values
+already dropped by normalization remain uncounted. Diagnostics do not affect parsing or recovery.
 
 Current selector persistence, record framing, allowlist hashes, tier receipt keys
 and detected-use plan grouping remain unchanged for valid inputs. Validation is

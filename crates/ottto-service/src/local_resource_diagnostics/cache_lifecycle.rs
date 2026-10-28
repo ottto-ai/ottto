@@ -5,15 +5,15 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! counters {
-    ($($(#[$meta:meta])* $field:ident: $event:ident),+ $(,)?) => {
+    ($($field:ident: $event:ident),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-        pub(crate) struct Counts { $($(#[$meta])* pub(crate) $field: u64),+ }
+        pub(crate) struct Counts { $(pub(crate) $field: u64),+ }
         pub(crate) struct Sparse(pub(crate) Counts);
         impl Serialize for Sparse {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(None)?;
-                $(if Event::$event.is_scope_event() && self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
+                $(if self.0.$field != 0 { map.serialize_entry(stringify!($field), &self.0.$field)?; })+
                 map.end()
             }
         }
@@ -40,10 +40,6 @@ macro_rules! counters {
     };
 }
 counters! {
-    #[serde(skip)] // Projected only on the larger native_collection_page carrier.
-    selector_key_rejected_unknown: SelectorKeyRejectedUnknown,
-    #[serde(skip)]
-    selector_key_rejected_format: SelectorKeyRejectedFormat,
     take_hit: TakeHit,
     take_absent: TakeAbsent,
     take_poisoned_lock: TakePoisonedLock,
@@ -90,19 +86,8 @@ counters! {
     prefix_tag_clears: PrefixTagCleared,
 }
 
-impl Event {
-    fn is_scope_event(self) -> bool {
-        !matches!(
-            self,
-            Self::SelectorKeyRejectedUnknown | Self::SelectorKeyRejectedFormat
-        )
-    }
-}
-
 pub(crate) fn add(event: Event, amount: u64) {
-    if event.is_scope_event() {
-        super::claude_reread::cache_event(event, amount);
-    }
+    super::claude_reread::cache_event(event, amount);
     let _ = TOTALS[event as usize].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(amount))
     });
