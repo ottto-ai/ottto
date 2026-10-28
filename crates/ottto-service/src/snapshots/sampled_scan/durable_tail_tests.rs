@@ -177,11 +177,23 @@ fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
 /// RAM admission is unavailable. Positive restore/write controls still must
 /// run on the supported macOS layout.
 fn native_record(path: &Path, scope: &Scope) -> (CachedJsonlReduction, Checkpoint) {
+    native_record_of(path, scope, SnapshotSource::ClaudeCode)
+}
+
+fn native_record_of(
+    path: &Path,
+    scope: &Scope,
+    source: SnapshotSource,
+) -> (CachedJsonlReduction, Checkpoint) {
+    let apply = match source {
+        SnapshotSource::Codex => apply_codex_line,
+        _ => apply_claude_code_line,
+    };
     let mut parser = OwnedJsonlParser::new(
         File::open(path).unwrap(),
         path,
-        SnapshotSource::ClaudeCode,
-        apply_claude_code_line,
+        source,
+        apply,
         None,
         None,
         None,
@@ -472,4 +484,256 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
         assert_eq!(disk.records_read, 1);
     }
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// A Codex transcript whose open call's id is `call_id_bytes` long: the id
+/// is kept verbatim in the record body, so it sizes the body.
+fn codex_budget_fixture(path: &Path, session: &str, call_id_bytes: Option<usize>) {
+    let at = "2026-10-07T10:00:00Z";
+    let mut lines = vec![
+        serde_json::json!({"type":"session_meta","timestamp":at,"payload":{"id":session,
+            "timestamp":at,"cwd":"/tmp/dt-budget","originator":"codex_cli_rs",
+            "cli_version":"0.50.0","source":"cli"}}),
+        serde_json::json!({"type":"turn_context","timestamp":at,
+            "payload":{"turn_id":"turn-1","cwd":"/tmp/dt-budget","model":"gpt-5.2"}}),
+    ];
+    if let Some(bytes) = call_id_bytes {
+        lines.push(open_call(bytes));
+    }
+    let text = lines
+        .iter()
+        .map(|line| line.to_string() + "\n")
+        .collect::<String>();
+    std::fs::write(path, text).unwrap();
+}
+
+fn open_call(call_id_bytes: usize) -> serde_json::Value {
+    serde_json::json!({"type":"response_item","timestamp":"2026-10-07T10:00:01Z",
+        "payload":{"type":"function_call","name":"shell",
+            "arguments":"{\"command\":[\"true\"]}",
+            "call_id":format!("call_{}", "x".repeat(call_id_bytes))}})
+}
+
+/// P2-1 (review r10): a resident deferred by the per-save byte budget
+/// (`WRITE_PASS_BYTES`) keeps its acquired selection provenance. Its next
+/// save, with no rescan or admission of the key in between, writes its
+/// record: no selection refusal, no invalidation of the key's existing
+/// record (intact while its replacement waits), and a restart restores the
+/// replacement. Arm `spent`: the first two bodies use the allowance exactly
+/// (`budget == 0`); arm `too_large`: the third body exceeds the remainder.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
+    let source = SnapshotSource::Codex;
+    let namespace = Scope("dt-budget".into());
+    let scope = Scope("dt-budget-file".into());
+    let cap = jsonl_line_cap() as u64;
+    let body_of = |path: &Path| {
+        let (reduction, checkpoint) = native_record_of(path, &scope, source);
+        let body = codec::encode(&reduction, store::RECORD_BYTES, cap).unwrap();
+        (reduction, checkpoint, body)
+    };
+    let entry = |path: &Path, fingerprint: &str| -> ScanIndexEntry {
+        serde_json::from_value(serde_json::json!({
+            "size_bytes":std::fs::metadata(path).unwrap().len(),
+            "modified_unix_seconds":1,"source_file_fingerprint":fingerprint
+        }))
+        .unwrap()
+    };
+    let admit = |cache: &SharedCache,
+                 path: &Path,
+                 fingerprint: &str,
+                 (reduction, checkpoint): (CachedJsonlReduction, Checkpoint)| {
+        let key = local_index_key(path);
+        assert!(cache.insert_admitted(
+            key.clone(),
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint,
+                reduction: Some(reduction),
+                released: None,
+                unsealed: false,
+            },
+            0
+        ));
+        cache.durable_note_selection(&key, fingerprint);
+    };
+    for arm in ["spent", "too_large"] {
+        let root = crate::test_scratch::private_dir(&format!("ottto-dt-budget-{arm}"));
+        let lock = test_locks::hold(&root);
+        let index_path = root.join("index.json");
+        let store_dir = store::store_dir_for_index(&index_path);
+        let record_files = || {
+            std::fs::read_dir(store_dir.as_path())
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        // Keys write in key order: a, b, then c.
+        let [a, b, c] = ["a", "b", "c"].map(|name| root.join(format!("{name}.jsonl")));
+        let [session_a, session_b, session_c] = [
+            "019fa111-2222-7333-8444-00000000000a",
+            "019fa111-2222-7333-8444-00000000000b",
+            "019fa111-2222-7333-8444-00000000000c",
+        ];
+        let mut index = ScanIndex::default();
+
+        // Process 0: c's existing valid record.
+        codex_budget_fixture(&c, session_c, None);
+        let prior = SharedCache::default();
+        prior.durable_begin_pass(source, &index_path, &namespace, false);
+        let (reduction, checkpoint, _) = body_of(&c);
+        admit(&prior, &c, "fp-c0", (reduction, checkpoint));
+        index.files.insert(local_index_key(&c), entry(&c, "fp-c0"));
+        index.save(&index_path).unwrap();
+        prior.durable_write_after_save(lock, source, &index);
+        let existing = record_files();
+        assert_eq!(existing.len(), 1, "{arm}: c's prior record");
+        drop(prior);
+
+        // Process 1: a and b, then c's replacement, all resident.
+        let id_bytes = 3 * 1024 * 1024;
+        codex_budget_fixture(&a, session_a, Some(id_bytes));
+        let (reduction_a, checkpoint_a, body_a) = body_of(&a);
+        let b_body = |bytes: usize| {
+            codex_budget_fixture(&b, session_b, Some(bytes));
+            body_of(&b)
+        };
+        let mut b_bytes = id_bytes;
+        let mut found = b_body(b_bytes);
+        if arm == "spent" {
+            // Size b so a and b use the allowance exactly; the body grows
+            // with the id byte for byte (no varint boundary nearby).
+            let target = WRITE_PASS_BYTES - body_a.len();
+            for _ in 0..4 {
+                if found.2.len() == target {
+                    break;
+                }
+                b_bytes = (b_bytes + target).checked_sub(found.2.len()).unwrap();
+                found = b_body(b_bytes);
+            }
+            assert_eq!(
+                body_a.len() + found.2.len(),
+                WRITE_PASS_BYTES,
+                "{arm}: a={} b={} id={b_bytes}",
+                body_a.len(),
+                found.2.len()
+            );
+        }
+        let (reduction_b, checkpoint_b, body_b) = found;
+        let mut appended = std::fs::OpenOptions::new().append(true).open(&c).unwrap();
+        std::io::Write::write_all(
+            &mut appended,
+            (open_call(id_bytes).to_string() + "\n").as_bytes(),
+        )
+        .unwrap();
+        drop(appended);
+        let (reduction_c, checkpoint_c, body_c) = body_of(&c);
+        if arm == "too_large" {
+            let remainder = WRITE_PASS_BYTES - body_a.len() - body_b.len();
+            assert!(remainder > 0 && body_c.len() > remainder, "{arm}");
+        }
+        let cache = SharedCache::default();
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        admit(&cache, &a, "fp-a", (reduction_a, checkpoint_a));
+        admit(&cache, &b, "fp-b", (reduction_b, checkpoint_b));
+        admit(&cache, &c, "fp-c1", (reduction_c, checkpoint_c));
+        index.files.insert(local_index_key(&a), entry(&a, "fp-a"));
+        index.files.insert(local_index_key(&b), entry(&b, "fp-b"));
+        index.files.insert(local_index_key(&c), entry(&c, "fp-c1"));
+        index.save(&index_path).unwrap();
+        cache.durable_write_after_save(lock, source, &index);
+        let (counts, disk) = cache.durable_counters(source).unwrap();
+        println!(
+            "dt_budget {arm} first save: {}",
+            counts.summary(source, &disk)
+        );
+        assert_eq!(counts.write_deferred, 1, "{arm}: c deferred by bytes");
+        assert_eq!(disk.records_written, 2, "{arm}: a and b");
+        assert_eq!(disk.disk_records, 3, "{arm}: c's prior, a, b");
+        assert!(counts.not_persisted.is_empty(), "{arm}");
+        assert_eq!(disk.records_invalidated, 0, "{arm}");
+        let after_first = record_files();
+        assert_eq!(after_first.len(), 3, "{arm}");
+        for (path, bytes) in &existing {
+            assert_eq!(
+                after_first.get(path),
+                Some(bytes),
+                "{arm}: c's record intact"
+            );
+        }
+        {
+            let stores = cache.durable().unwrap();
+            let key_c = local_index_key(&c);
+            assert!(stores.touched.contains(&key_c), "{arm}: c offered again");
+            assert_eq!(
+                stores.selected.get(&key_c).map(String::as_str),
+                Some("fp-c1"),
+                "{arm}: c keeps its acquired provenance"
+            );
+        }
+
+        // The next save: no rescan or admission of c in between.
+        cache.durable_begin_pass(source, &index_path, &namespace, false);
+        index.save(&index_path).unwrap();
+        cache.durable_write_after_save(lock, source, &index);
+        let (counts, disk) = cache.durable_counters(source).unwrap();
+        println!(
+            "dt_budget {arm} second save: {}",
+            counts.summary(source, &disk)
+        );
+        assert_eq!(counts.write_deferred, 1, "{arm}");
+        assert_eq!(disk.records_written, 3, "{arm}: c's replacement written");
+        assert_eq!(disk.disk_records, 3, "{arm}");
+        assert!(
+            counts.not_persisted.is_empty(),
+            "{arm}: no selection refusal"
+        );
+        assert_eq!(disk.records_invalidated, 0, "{arm}");
+        let after_second = record_files();
+        assert_eq!(after_second.len(), 3, "{arm}");
+        for path in existing.keys() {
+            assert_ne!(
+                after_second.get(path),
+                existing.get(path),
+                "{arm}: replaced"
+            );
+        }
+        drop(cache);
+
+        // Restart: all three restore from the committed index.
+        let loaded = ScanIndex::load(&index_path).unwrap();
+        let restart = SharedCache::default();
+        restart.durable_begin_pass(source, &index_path, &namespace, false);
+        for (path, body) in [(&a, &body_a), (&b, &body_b), (&c, &body_c)] {
+            let key = local_index_key(path);
+            let interpretation = Interpretation::of(source, &key, &loaded, false, &namespace);
+            let taken = restart
+                .durable_restore(
+                    source,
+                    &key,
+                    path,
+                    &scope,
+                    &mut File::open(path).unwrap(),
+                    &loaded,
+                    &interpretation,
+                )
+                .unwrap_or_else(|| {
+                    let (counts, disk) = restart.durable_counters(source).unwrap();
+                    panic!("{arm}: restore: {}", counts.summary(source, &disk))
+                });
+            assert_eq!(
+                codec::encode(&taken.retained.state, store::RECORD_BYTES, cap).unwrap(),
+                *body,
+                "{arm}"
+            );
+        }
+        let (counts, disk) = restart.durable_counters(source).unwrap();
+        println!("dt_budget {arm} restart: {}", counts.summary(source, &disk));
+        assert_eq!(counts.restored, 3, "{arm}");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

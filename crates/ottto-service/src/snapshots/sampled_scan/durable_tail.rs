@@ -637,7 +637,10 @@ impl SharedCache {
                     not_persisted.push("certificate");
                     continue;
                 };
+                // Byte-budget deferral keeps the acquired provenance (the
+                // requeue below carries it to the next save).
                 if budget == 0 {
+                    selected.extend(acquired_for.map(|fingerprint| (key.clone(), fingerprint)));
                     later.insert(key);
                     continue;
                 }
@@ -658,6 +661,7 @@ impl SharedCache {
                         });
                     }
                     Err(Refuse::TooLarge) if budget < store::RECORD_BYTES => {
+                        selected.extend(acquired_for.map(|fingerprint| (key.clone(), fingerprint)));
                         later.insert(key);
                     }
                     Err(refuse) => not_persisted.push(refuse_class(refuse)),
