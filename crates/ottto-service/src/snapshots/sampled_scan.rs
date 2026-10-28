@@ -2017,6 +2017,9 @@ pub(super) fn configure_tier_replay(
 
 /// Actual path-scoped interpretation dependencies. Decode no provider row here;
 /// reuse existing sidecar inventory and bounded owning-header authority.
+#[cfg(test)]
+thread_local! { static TEST_REFUSE_REDUCTION_DEPENDENCIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 pub(super) fn reduction_dependencies(
     source: SnapshotSource,
     candidate: &CandidateFile,
@@ -2024,6 +2027,10 @@ pub(super) fn reduction_dependencies(
     claude: &ClaudeTitleMetadata,
     support: Option<&Path>,
 ) -> Option<String> {
+    #[cfg(test)]
+    if TEST_REFUSE_REDUCTION_DEPENDENCIES.with(std::cell::Cell::get) {
+        return None;
+    }
     if source == SnapshotSource::Codex {
         Some(sha256_hex(&[
             "codex_reduction_dependencies:v1",

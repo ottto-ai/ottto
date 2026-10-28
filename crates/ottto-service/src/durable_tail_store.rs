@@ -369,6 +369,7 @@ pub(crate) struct StoreCounters {
     pub(crate) records_read: u64,
     pub(crate) missing: u64,
     pub(crate) format_hold: [u64; 5],
+    pub(crate) store_write_skipped: [u64; 2],
     pub(crate) guard_header_bytes: u64,
     pub(crate) guard_verify_bytes: u64,
     pub(crate) delete_verify_bytes: u64,
@@ -404,7 +405,6 @@ pub(crate) struct BatchReceipt {
 pub(crate) struct DurableTailStore {
     dir: PathBuf,
     source: DurableSource,
-    // Exact-predecessor verification memo and optional content digest, in the existing slot.
     durable: BTreeMap<Digest32, (Option<Digest32>, Stamp)>,
     counters: StoreCounters,
 }
@@ -450,7 +450,6 @@ impl DurableTailStore {
         self.dir.join(format!("{}{RECORD_SUFFIX}", hex(key)))
     }
 
-    /// One bounded classifier for acquisition, reads and every mutation seam.
     /// Header dispatch precedes size/mode checks. Only a verified known record licenses mutation.
     fn classify(&mut self, key: &Digest32, work: &str) -> Result<Option<Binding>, Refusal> {
         let path = self.record_path(key);
@@ -558,7 +557,8 @@ impl DurableTailStore {
             .map(|record| record.body.len())
             .sum::<usize>();
         for record in pending {
-            if self.classify(&record.binding.key, "overwrite").is_err() {
+            if let Err(reason) = self.classify(&record.binding.key, "overwrite") {
+                self.counters.store_write_skipped[usize::from(reason == Refusal::Corrupt)] += 1;
                 continue;
             }
             let content = content_digest(&record);

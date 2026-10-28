@@ -2328,7 +2328,7 @@ fn held_original_keeps_dependent_copy_proof_only_for_unchanged_stamp() {
         .get(&original)
         .unwrap()
         .clone()
-        .with_birth_for_test(Some(ClaudeRequestBirth {
+        .with_birth_for_test(Some(claude_request_census::ClaudeRequestBirth {
             unix_seconds: 1,
             device: metadata.dev(),
             inode: metadata.ino(),

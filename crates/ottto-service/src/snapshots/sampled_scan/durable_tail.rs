@@ -111,7 +111,7 @@ impl Counters {
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} format_hold{{newer:{},unknown:{},undecodable:{},unbindable:{},known_corrupt:{}}} durable_held={{{}}} held_census{{kept:{},invalidated:{}}} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
-             uninventoried_records={} \
+             uninventoried_records={} store_write_skipped{{unknown:{},known_corrupt:{}}} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={}",
             source.api_slug(),
@@ -151,6 +151,8 @@ impl Counters {
             store.delete_verify_bytes,
             store.overwrite_verify_bytes,
             store.uninventoried_records,
+            store.store_write_skipped[0],
+            store.store_write_skipped[1],
             store.gc_records_deleted,
             store.gc_records_read,
             store.gc_bytes_read,
@@ -392,7 +394,6 @@ impl SharedCache {
         }
     }
 
-    /// Independent of index membership, sampling, trust and reduction dependencies.
     pub(crate) fn durable_hold(
         &self,
         snapshot_source: SnapshotSource,
@@ -406,7 +407,7 @@ impl SharedCache {
             .hold(&store::key_digest(source, key))
     }
 
-    pub(super) fn durable_hold_exit(
+    pub(in crate::snapshots) fn durable_hold_exit(
         &self,
         source: SnapshotSource,
         reason: store::Refusal,

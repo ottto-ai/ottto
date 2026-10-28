@@ -787,7 +787,14 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
-        for corrupt in [false, true] {
+        for kind in [
+            "newer",
+            "unknown",
+            "undecodable",
+            "unbindable",
+            "known_corrupt",
+        ] {
+            let corrupt = kind == "known_corrupt";
             for bypass in [
                 "ordinary",
                 "sampling_none",
@@ -855,7 +862,13 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                         .collect::<String>()
                 ));
                 let mut bytes = std::fs::read(&record_path).unwrap();
-                if corrupt {
+                if kind == "unknown" {
+                    bytes[10] ^= 1;
+                } else if kind == "undecodable" {
+                    bytes.truncate(5);
+                } else if kind == "unbindable" {
+                    bytes[43] ^= 1;
+                } else if corrupt {
                     let end = bytes.len() - 1;
                     bytes[end] ^= 1;
                 } else {
@@ -900,13 +913,45 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 if bypass == "state_false" {
                     scan.state_census_complete = false;
                 }
-                if bypass == "sidecar_false" || bypass == "dependencies_missing" {
+                if bypass == "sidecar_false" {
                     scan.sidecar_census_complete = false;
                 }
                 if bypass == "owning_header_false" {
                     if let Some(inv) = scan.codex_join_inventory.as_mut() {
                         inv.complete = false;
                     }
+                }
+                struct ResetDependencies;
+                impl Drop for ResetDependencies {
+                    fn drop(&mut self) {
+                        super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(false));
+                    }
+                }
+                let _reset = ResetDependencies;
+                if bypass == "dependencies_missing" {
+                    super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(true));
+                    let candidate = candidate_from_traversal_path(
+                        source,
+                        ScanTraversalPath {
+                            scan_root: transcripts.clone(),
+                            path: path.clone(),
+                            census_member: true,
+                            watcher_hint: false,
+                        },
+                        &mut ScanCensus::default(),
+                        None,
+                        365,
+                        &BTreeMap::new(),
+                    )
+                    .unwrap();
+                    assert!(sampled_scan::reduction_dependencies(
+                        source,
+                        &candidate,
+                        &scan.codex_title_metadata,
+                        &scan.claude_title_metadata,
+                        None
+                    )
+                    .is_none());
                 }
                 let mut completed = false;
                 for _ in 0..10_000 {
@@ -934,7 +979,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 }
                 assert!(completed);
                 let (counts, _) = cache.durable_counters(source).unwrap();
-                let class = if corrupt { "known_corrupt" } else { "newer" };
+                let class = kind;
                 assert_eq!(
                     counts.durable_held.get(class),
                     Some(&1),
