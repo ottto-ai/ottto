@@ -250,16 +250,24 @@ pub(crate) fn large_prior_and_replacement_fixture() -> (CacheObservations, Value
     let mut selected = desired[10..].to_vec();
     selected.extend_from_slice(&desired[..10]);
     let extra = rows(&codex_cache_wire_for_requests("s", &session("old_", 10)).unwrap());
-    let old = desired[..10]
-        .iter()
-        .chain(extra.iter())
-        .cloned()
-        .map(|row| large_row(row, 17))
-        .collect();
-    let prior = cache_state_from_patch(None, &partial(old));
-    assert!(cache_state_within_limits(&prior));
     let candidate = partial(selected);
-    (candidate, prior)
+    // Build the boundary by measured canonical bytes, not guessed row sizes.
+    for conditions in 1..=32 {
+        let old = desired[..10]
+            .iter()
+            .chain(extra.iter())
+            .cloned()
+            .map(|row| large_row(row, conditions))
+            .collect();
+        let prior = cache_state_from_patch(None, &partial(old));
+        let merged = cache_state_from_patch(Some(&prior), &candidate);
+        if encoded(&prior) <= cache_observations::MAX_WIRE_BYTES
+            && encoded(&merged) > cache_observations::MAX_WIRE_BYTES
+        {
+            return (candidate, prior);
+        }
+    }
+    panic!("schema-valid near-cap prior fixture must exist");
 }
 
 #[test]
@@ -334,16 +342,16 @@ fn cumulative_row_cap_and_metadata_only_refusal_preserve_accepted_evidence() {
     assert_eq!(wire.omitted_observation_count, None);
     assert_eq!(state["observations"], prior["observations"]);
 
-    // An accepted prior exactly at the byte cap can fit complete/null metadata
-    // while partial/null needs one more byte. Refuse the cache member entirely.
+    // An accepted prior exactly at the byte cap can fit partial/0 metadata,
+    // while unknown omission (partial/null) needs three more bytes. Refuse the
+    // cache member entirely rather than publishing a false exact count.
     let mut exact = cache_state_from_patch(
         None,
         &partial(rows(
             &codex_cache_wire_for_requests("s", &session("old_", 10)).unwrap(),
         )),
     );
-    exact["coverage"] = json!("complete");
-    exact["omitted_observation_count"] = Value::Null;
+    exact["omitted_observation_count"] = json!(0);
     // Fill using schema-valid condition strings within per-field limits.
     let budget = cache_observations::MAX_WIRE_BYTES;
     // This fixture targets refusal, so the prior is a server-sized state rather
