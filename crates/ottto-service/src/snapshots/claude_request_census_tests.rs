@@ -2395,3 +2395,190 @@ fn held_original_keeps_dependent_copy_proof_only_for_unchanged_stamp() {
         );
     }
 }
+
+/// Review F3 / L26 on the production path: a Held durable record for an
+/// unchanged original takes the common-hold exit; the dependent copy is
+/// rescanned in the same pass. Its emitted envelopes, witnesses and money
+/// equal the cold arm's (original read Full), the original's census record
+/// and last accepted body stay, and the stale original equals what a cold
+/// read emits. Changed-stamp control: the same hold invalidates the record
+/// (birth stub) and the copy loses its proof.
+#[cfg(unix)]
+#[test]
+fn held_original_production_exit_conserves_copy_money_and_stamp_change_invalidates() {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let scratch = crate::test_scratch::ScratchDir::new("held-census-production");
+    let root = scratch.join("projects");
+    for name in ["held-original", "dependent-copy"] {
+        census_write(
+            &root,
+            &format!("{name}.jsonl"),
+            &[census_response(
+                name,
+                Some("req_held_shared"),
+                "msg_held_shared",
+                1,
+                100,
+            )],
+        );
+    }
+    let accept = |index: &mut ScanIndex, scan: &SourceScanResult| {
+        let mut projected = scan.clone();
+        apply_upload_policy(
+            SnapshotSource::ClaudeCode,
+            &mut projected.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut projected, index);
+        let accepted = projected
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+            .collect();
+        index.record_accepted_snapshot_fingerprints(&accepted);
+        projected.snapshots
+    };
+    let mut seeded = ScanIndex::default();
+    let seed = census_scan(&root, &mut seeded, FIRST_WINDOW);
+    accept(&mut seeded, &seed);
+    let original = census_key(&seeded, &root, "held-original.jsonl");
+    let copy = census_key(&seeded, &root, "dependent-copy.jsonl");
+    let record = seeded.claude_request_census.get(&original).unwrap().clone();
+    let accepted = |index: &ScanIndex| {
+        let entry = &index.files[&original];
+        (
+            entry.last_snapshot_fingerprint.clone(),
+            entry.last_upload_body_witness.clone(),
+        )
+    };
+    let last_accepted = accepted(&seeded);
+    assert!(last_accepted.0.is_some());
+    let session = |snapshots: &[SnapshotItem], id: &str| {
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.source_session_id == id)
+            .map(|snapshot| serde_json::to_value(snapshot).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let mut cold = None;
+    for arm in ["cold", "held", "changed_stamp"] {
+        let state = scratch.join(arm);
+        let index_path = state.join("index.json");
+        let cache = std::sync::Arc::new(sampled_scan::SharedCache::default());
+        let namespace = Scope("held-census-production".to_owned());
+        cache.durable_begin_pass(SnapshotSource::ClaudeCode, &index_path, &namespace, false);
+        // Both entries are reparse debt, so both files are Parse while unchanged.
+        let mut index = seeded.clone();
+        for key in [&original, &copy] {
+            index.files.get_mut(key).unwrap().source_file_fingerprint = String::new();
+        }
+        if arm != "cold" {
+            let dir = crate::durable_tail_store::store_dir_for_index(&index_path);
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .unwrap();
+            let key = crate::durable_tail_store::key_digest(
+                crate::durable_tail_store::DurableSource::ClaudeCode,
+                &original,
+            );
+            let name = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            std::io::Write::write_all(
+                &mut std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(dir.join(format!("{name}.rec")))
+                    .unwrap(),
+                b"opaque-newer-writer-record",
+            )
+            .unwrap();
+        }
+        if arm == "changed_stamp" {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&original)
+                .unwrap();
+            let modified = file.metadata().unwrap().modified().unwrap();
+            file.set_modified(modified + std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            index,
+            FIRST_WINDOW,
+            365,
+            1_000,
+            true,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(cache.clone(), namespace);
+        let (mut index, result) = loop {
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => break (index, scan),
+            }
+        };
+        let emitted = accept(&mut index, &result);
+        let (counts, _) = cache.durable_counters(SnapshotSource::ClaudeCode).unwrap();
+        let copy_status =
+            claude_census_member_status(&index, &copy, &result.census_window_end, true);
+        let copy_entry = |index: &ScanIndex| {
+            let entry = &index.files[&copy];
+            (
+                entry.last_snapshot_fingerprint.clone(),
+                entry.last_upload_body_witness.clone(),
+            )
+        };
+        match arm {
+            "cold" => {
+                assert_eq!(counts.durable_held, [0; 5]);
+                assert_eq!(copy_status, ClaudeCensusMemberStatus::SharesHash);
+                // Money conservation premise: the stale accepted original
+                // equals what a cold read of the unchanged original emits.
+                assert_eq!(accepted(&index), last_accepted);
+                assert!(!session(&emitted, "held-original").is_empty());
+                cold = Some((session(&emitted, "dependent-copy"), copy_entry(&index)));
+            }
+            "held" => {
+                assert_eq!(counts.durable_held.iter().sum::<u64>(), 1);
+                assert!(session(&emitted, "held-original").is_empty(), "no POST");
+                assert_eq!(accepted(&index), last_accepted, "last accepted body kept");
+                if record.birth().is_some() {
+                    assert_eq!(counts.held_census, [1, 0]);
+                    assert_eq!(index.claude_request_census.get(&original), Some(&record));
+                    assert_eq!(copy_status, ClaudeCensusMemberStatus::SharesHash);
+                    let (copy_body, copy_witness) = cold.clone().unwrap();
+                    assert!(!copy_body.is_empty());
+                    assert_eq!(session(&emitted, "dependent-copy"), copy_body);
+                    assert_eq!(copy_entry(&index), copy_witness);
+                } else {
+                    // No opened birth on this filesystem: the stamp cannot be
+                    // proven unchanged, so the existing invalidator runs.
+                    assert_eq!(counts.held_census, [0, 1]);
+                }
+            }
+            _ => {
+                assert_eq!(counts.durable_held.iter().sum::<u64>(), 1);
+                assert_eq!(counts.held_census, [0, 1]);
+                assert!(session(&emitted, "held-original").is_empty(), "no POST");
+                assert_eq!(accepted(&index), last_accepted, "last accepted body kept");
+                assert!(index
+                    .claude_request_census
+                    .get(&original)
+                    .map_or(true, |r| r.is_birth_stub_for_test()));
+                assert_ne!(copy_status, ClaudeCensusMemberStatus::SharesHash);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    assert!(
+        record.birth().is_some(),
+        "macOS records carry an opened birth"
+    );
+}

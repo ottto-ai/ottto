@@ -781,7 +781,9 @@ impl RestoreTestOutcome for sampled_scan::durable_tail::RestoreOutcome {
     }
 }
 
-/// L23/F1: the production guard dominates all sampling, trust and dependency fallbacks.
+/// L23/F1: the production guard dominates all sampling, trust and dependency
+/// fallbacks. Kind `none` is the non-held control: the same fixture with no
+/// record reaches acquisition, and the arm's later gate observes its false value.
 #[test]
 fn common_hold_precedes_outer_gates_and_full_acquisition() {
     use sha2::{Digest, Sha256};
@@ -793,6 +795,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
             "undecodable",
             "unbindable",
             "known_corrupt",
+            "none",
         ] {
             let corrupt = kind == "known_corrupt";
             for bypass in [
@@ -808,6 +811,11 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 "owed",
                 "compressed",
             ] {
+                // Production never opens a compressed Codex rollout
+                // (codex_compressed_input.rs: discovery does not enumerate them);
+                // a gzip-bodied `.jsonl` has no readable session header, so the
+                // join inventory withholds it before selection, held or not.
+                let reachable = !(source == SnapshotSource::Codex && bypass == "compressed");
                 let root = crate::test_scratch::private_dir("ottto-dt-common-hold");
                 let lock = test_locks::hold(&root);
                 let transcripts = root.join("sessions");
@@ -837,32 +845,33 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 // Certificate source is irrelevant for preservation; it is never restored.
                 let cert_path = root.join("certificate.jsonl");
                 std::fs::write(&cert_path, b"{}\n").unwrap();
-                disk.write_after_save(
-                    lock,
-                    1,
-                    vec![PendingRecord {
-                        binding: Binding {
-                            source: ds,
-                            key: store_key,
-                            context: [0; 32],
-                            scope: [0; 32],
-                            entry: [0; 32],
-                        },
-                        certificate: certificate(&cert_path, &namespace),
-                        body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
-                        allowlist: codec::allowlist_digest(source),
-                    }],
-                )
-                .unwrap();
-                let record_path = disk.dir().join(format!(
-                    "{}.rec",
-                    store_key
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
-                ));
+                // A verified known record of a key absent from every index:
+                // production fresh-index cleanup must delete it.
+                let absent_key = store::key_digest(ds, "/synthetic/absent-known.jsonl");
+                let record = |key| PendingRecord {
+                    binding: Binding {
+                        source: ds,
+                        key,
+                        context: [0; 32],
+                        scope: [0; 32],
+                        entry: [0; 32],
+                    },
+                    certificate: certificate(&cert_path, &namespace),
+                    body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+                    allowlist: codec::allowlist_digest(source),
+                };
+                disk.write_after_save(lock, 1, vec![record(store_key), record(absent_key)])
+                    .unwrap();
+                let hex = |key: store::Digest32| {
+                    key.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                };
+                let absent_path = disk.dir().join(format!("{}.rec", hex(absent_key)));
+                assert!(absent_path.exists());
+                let record_path = disk.dir().join(format!("{}.rec", hex(store_key)));
                 let mut bytes = std::fs::read(&record_path).unwrap();
-                if kind == "unknown" {
+                if kind == "none" {
+                    std::fs::remove_file(&record_path).unwrap();
+                } else if kind == "unknown" {
                     bytes[10] ^= 1;
                 } else if kind == "undecodable" {
                     bytes.truncate(5);
@@ -877,18 +886,49 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     let trailer = Sha256::digest(&bytes[..end]);
                     bytes[end..].copy_from_slice(&trailer);
                 }
-                std::fs::write(&record_path, &bytes).unwrap();
-                std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600))
-                    .unwrap();
+                if kind != "none" {
+                    std::fs::write(&record_path, &bytes).unwrap();
+                    std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }
                 // New store owner, no RAM verification or reduction from the writer.
                 drop(cache);
                 drop(disk);
                 let cache = Arc::new(SharedCache::default());
-                cache.durable_begin_pass(source, &index_path, &namespace, false);
                 let mut index = ScanIndex::default();
-                if bypass != "fresh_index" {
-                    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"","last_snapshot_fingerprint":"accepted-body"})).unwrap();
+                if bypass == "fresh_index" {
+                    // Production begin with a freshly loaded index runs the
+                    // selective cleanup under the held lock.
+                    crate::snapshots::begin_durable_pass(
+                        &cache,
+                        &root,
+                        source,
+                        &index_path,
+                        true,
+                        &namespace,
+                        false,
+                    );
+                    assert!(!absent_path.exists(), "fresh cleanup ran");
+                } else {
+                    cache.durable_begin_pass(source, &index_path, &namespace, false);
+                    let fingerprint = if bypass == "cleared" { "" } else { "fp" };
+                    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":fingerprint,"last_snapshot_fingerprint":"accepted-body"})).unwrap();
                     index.files.insert(key.clone(), entry);
+                    if bypass == "owed" {
+                        index.activate_effective_upload_body_witness_revision(2);
+                    }
+                    // Distinct, asserted M1 veto states.
+                    assert_eq!(
+                        index.effective_upload_body_witness_revision_requires_adoption(&key),
+                        bypass == "owed"
+                    );
+                    assert_eq!(
+                        index.files[&key].source_file_fingerprint.is_empty(),
+                        bypass == "cleared"
+                    );
+                }
+                if kind != "none" {
+                    assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 }
                 let mut scan = OwnedSourceScan::new(
                     source,
@@ -915,11 +955,6 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 }
                 if bypass == "sidecar_false" {
                     scan.sidecar_census_complete = false;
-                }
-                if bypass == "owning_header_false" {
-                    if let Some(inv) = scan.codex_join_inventory.as_mut() {
-                        inv.complete = false;
-                    }
                 }
                 struct ResetDependencies;
                 impl Drop for ResetDependencies {
@@ -953,31 +988,80 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     )
                     .is_none());
                 }
+                let held = kind != "none";
                 let mut completed = false;
+                let mut acquired = false;
+                let mut header_dropped = false;
+                let mut admission = None;
                 for _ in 0..10_000 {
                     match scan.step(None) {
-                        OwnedSourceScanStep::Pending(next) => {
-                            assert!(
-                                next.active_file.is_none(),
-                                "{source:?}/{corrupt}/{bypass}: parser acquired"
-                            );
+                        OwnedSourceScanStep::Pending(mut next) => {
+                            acquired |= next.active_file.is_some();
                             if let Some(c) = next.sampling.as_ref() {
-                                assert_eq!(c.full_files, 0);
-                                assert_eq!(c.native_bytes, 0);
+                                admission = Some(serde_json::to_value(c.admission).unwrap());
+                                if held {
+                                    assert_eq!(c.full_files, 0);
+                                    assert_eq!(c.native_bytes, 0);
+                                }
+                            }
+                            // The Codex owning header goes missing after the
+                            // join was prepared: the candidate is selected and
+                            // reaches the later owning-header gate.
+                            if bypass == "owning_header_false"
+                                && next.codex_join_prepared
+                                && !header_dropped
+                            {
+                                if let Some(inventory) = next.codex_join_inventory.as_mut() {
+                                    inventory
+                                        .headers
+                                        .retain(|header| header.candidate.path != path);
+                                    header_dropped = true;
+                                }
                             }
                             scan = next;
                         }
                         OwnedSourceScanStep::Complete { scan: result, .. } => {
-                            assert!(
-                                result.snapshots.is_empty(),
-                                "Held key produces no POST body"
-                            );
+                            if held {
+                                assert!(
+                                    result.snapshots.is_empty(),
+                                    "Held key produces no POST body"
+                                );
+                                assert_eq!(result.scanned_file_count, 0, "{bypass}");
+                            } else {
+                                acquired |= result.scanned_file_count > 0;
+                            }
                             completed = true;
                             break;
                         }
                     }
                 }
                 assert!(completed);
+                assert_eq!(acquired, !held && reachable, "{source:?}/{kind}/{bypass}");
+                let gate = |name: &str| {
+                    admission
+                        .as_ref()
+                        .map(|a| (a[name]["assessed"].as_u64(), a[name]["matched"].as_u64()))
+                };
+                if held {
+                    assert!(admission
+                        .as_ref()
+                        .map_or(true, |a| a["attempts"].as_u64() == Some(0)));
+                } else if reachable {
+                    let observed = match bypass {
+                        "owning_header_false" if source == SnapshotSource::Codex => {
+                            Some("owning_header_current")
+                        }
+                        "state_false" => Some("state_census_complete"),
+                        "sidecar_false" => Some("sidecar_census_complete"),
+                        "dependencies_missing" => Some("reduction_dependencies_available"),
+                        _ => None,
+                    };
+                    if let Some(name) = observed {
+                        let (assessed, matched) = gate(name).unwrap();
+                        assert!(assessed.unwrap() >= 1, "{source:?}/{bypass}: {name}");
+                        assert_eq!(matched, Some(0), "{source:?}/{bypass}: {name}");
+                    }
+                }
                 let (counts, _) = cache.durable_counters(source).unwrap();
                 let class = [
                     "newer",
@@ -987,22 +1071,92 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     "known_corrupt",
                 ]
                 .iter()
-                .position(|class| *class == kind)
-                .unwrap();
-                // An incomplete Codex join inventory, or a compressed rollout whose
-                // owning header it cannot read, withholds the candidate before
-                // selection: nothing is acquired, so nothing is held.
-                let selected = !(source == SnapshotSource::Codex
-                    && matches!(bypass, "owning_header_false" | "compressed"));
-                assert_eq!(
-                    counts.durable_held[class],
-                    u64::from(selected),
-                    "{source:?}/{corrupt}/{bypass}"
-                );
+                .position(|class| *class == kind);
+                if let Some(class) = class {
+                    assert_eq!(
+                        counts.durable_held[class],
+                        u64::from(reachable),
+                        "{source:?}/{corrupt}/{bypass}"
+                    );
+                    assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
+                } else {
+                    assert_eq!(counts.durable_held, [0; 5]);
+                }
                 assert_eq!(counts.restored, 0);
-                assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 let _ = std::fs::remove_dir_all(root);
             }
         }
     }
+}
+
+/// Lead B (#829): a production post-save that skipped the per-pass setup
+/// never wipes valid records, even for keys the index does not hold. With
+/// the setup, ordinary GC keeps an indexed but undecided key and collects
+/// only the absent key's record (the control proving GC ran).
+#[test]
+fn save_without_per_pass_setup_keeps_valid_records() {
+    let root = crate::test_scratch::private_dir("ottto-dt-no-setup-save");
+    let lock = test_locks::hold(&root);
+    let source = SnapshotSource::ClaudeCode;
+    let ds = durable_source(source).unwrap();
+    let index_path = root.join("index.json");
+    let namespace = Scope("no-setup".into());
+    let transcript = root.join("t.jsonl");
+    std::fs::write(&transcript, b"{\"n\":1}\n").unwrap();
+    let context = store::context_digest(&namespace.0, None);
+    let (indexed, absent) = ("/synthetic/indexed.jsonl", "/synthetic/absent.jsonl");
+    let mut disk = DurableTailStore::new(store::store_dir_for_index(&index_path), ds);
+    let pending = [indexed, absent]
+        .iter()
+        .map(|key| PendingRecord {
+            binding: Binding {
+                source: ds,
+                key: store::key_digest(ds, key),
+                context,
+                scope: [0; 32],
+                entry: store::entry_digest("fp", None),
+            },
+            certificate: certificate(&transcript, &Scope("no-setup-file".into())),
+            body: crate::snapshots::durable_store_fixture_body(source, 0, 0),
+            allowlist: codec::allowlist_digest(source),
+        })
+        .collect();
+    assert_eq!(disk.write_after_save(lock, 1, pending).unwrap().written, 2);
+    let path = |key: &str| {
+        let hex = store::key_digest(ds, key)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        disk.dir().join(format!("{hex}.rec"))
+    };
+    let before = [indexed, absent].map(|key| std::fs::read(path(key)).unwrap());
+    let entry: ScanIndexEntry = serde_json::from_value(serde_json::json!(
+        {"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp"}
+    ))
+    .unwrap();
+    let mut index = ScanIndex::default();
+    index.files.insert(indexed.into(), entry);
+    for empty in [true, false] {
+        let saved = if empty {
+            ScanIndex::default()
+        } else {
+            index.clone()
+        };
+        let cache = SharedCache::default();
+        crate::snapshots::durable_after_save(&cache, &root, source, &saved);
+        assert!(
+            cache.durable_counters(source).is_none(),
+            "no slot, no store"
+        );
+        let after = [indexed, absent].map(|key| std::fs::read(path(key)).unwrap());
+        assert_eq!(after, before, "empty_index={empty}");
+    }
+    let cache = SharedCache::default();
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    crate::snapshots::durable_after_save(&cache, &root, source, &index);
+    assert_eq!(std::fs::read(path(indexed)).unwrap(), before[0]);
+    assert!(!path(absent).exists());
+    let (_, disk_counters) = cache.durable_counters(source).unwrap();
+    assert_eq!(disk_counters.gc_records_deleted, 1);
+    let _ = std::fs::remove_dir_all(&root);
 }

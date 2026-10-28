@@ -111,7 +111,7 @@ impl Counters {
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
-             uninventoried_records={} store_write_skipped[unknown,known_corrupt]={:?} \
+             uninventoried_records={} store_write_skipped[unknown,known_corrupt,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
              records_invalidated={} peak_codec_bytes={}",
             source.api_slug(),

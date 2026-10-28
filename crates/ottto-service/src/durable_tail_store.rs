@@ -358,7 +358,9 @@ pub(crate) struct StoreCounters {
     pub(crate) records_read: u64,
     pub(crate) missing: u64,
     pub(crate) format_hold: [u64; 5],
-    pub(crate) store_write_skipped: [u64; 2],
+    /// Writes skipped: predecessor unknown, known corrupt, or a new key while
+    /// record files exceed `INVENTORY_BOUND` (offered again after the next save).
+    pub(crate) store_write_skipped: [u64; 3],
     pub(crate) guard_header_bytes: u64,
     pub(crate) guard_verify_bytes: u64,
     pub(crate) delete_verify_bytes: u64,
@@ -567,7 +569,7 @@ impl DurableTailStore {
             return Ok(receipt);
         }
         ensure_private_dir(&self.dir)?;
-        let mut on_disk = self.scan_disk()?;
+        let (mut on_disk, mut unlisted) = self.scan_disk()?;
         let mut changed = false;
         for (record, content) in dirty {
             if receipt.written + receipt.budget_refused >= MAX_BATCH {
@@ -577,6 +579,22 @@ impl DurableTailStore {
             }
             let key = record.binding.key;
             let path = self.record_path(&key);
+            // Past the inventory bound an existing key still replaces its own
+            // record; a new key waits.
+            if unlisted[0] > 0 && !on_disk.contains_key(&key) {
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) => {
+                        unlisted = [unlisted[0] - 1, unlisted[1].saturating_sub(metadata.len())];
+                        on_disk.insert(key, metadata.len());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        self.counters.store_write_skipped[2] += 1;
+                        receipt.deferred_keys.push(key);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             let stored = DurableRecord {
                 record,
                 index_generation: committed_generation,
@@ -587,6 +605,7 @@ impl DurableTailStore {
             let total = on_disk
                 .values()
                 .sum::<u64>()
+                .saturating_add(unlisted[1])
                 .saturating_sub(previous)
                 .saturating_add(bytes.len() as u64);
             if bytes.len() > RECORD_BYTES
@@ -624,7 +643,7 @@ impl DurableTailStore {
         self.counters.records_deferred += receipt.deferred as u64;
         self.counters.budget_refused += receipt.budget_refused as u64;
         self.counters.bytes_written += receipt.bytes_written;
-        self.set_disk_level(&on_disk);
+        self.set_disk_level(&on_disk, unlisted);
         Ok(receipt)
     }
 
@@ -647,7 +666,7 @@ impl DurableTailStore {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.durable.clear();
-                self.set_disk_level(&BTreeMap::new());
+                self.set_disk_level(&BTreeMap::new(), [0; 2]);
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -709,7 +728,7 @@ impl DurableTailStore {
         if deleted {
             sync_dir(&self.dir)?;
         }
-        self.set_disk_level(&on_disk);
+        self.set_disk_level(&on_disk, [0; 2]);
         Ok(())
     }
 
@@ -758,8 +777,8 @@ impl DurableTailStore {
         if removed > 0 {
             sync_dir(&self.dir)?;
             self.counters.records_invalidated += removed as u64;
-            let on_disk = self.scan_disk()?;
-            self.set_disk_level(&on_disk);
+            let (on_disk, unlisted) = self.scan_disk()?;
+            self.set_disk_level(&on_disk, unlisted);
         }
         Ok(removed)
     }
@@ -775,9 +794,11 @@ impl DurableTailStore {
         }
     }
 
-    /// Record files and their sizes, as on disk now.
-    fn scan_disk(&self) -> io::Result<BTreeMap<Digest32, u64>> {
+    /// Record files and their sizes, as on disk now: the first
+    /// `INVENTORY_BOUND` by key, the rest only counted and summed.
+    fn scan_disk(&self) -> io::Result<(BTreeMap<Digest32, u64>, [u64; 2])> {
         let mut on_disk = BTreeMap::new();
+        let mut unlisted = [0; 2];
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -788,21 +809,19 @@ impl DurableTailStore {
             else {
                 continue;
             };
-            if on_disk.len() >= INVENTORY_BOUND {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "durable inventory bound",
-                ));
+            let len = fs::symlink_metadata(entry.path())?.len();
+            if on_disk.len() < INVENTORY_BOUND {
+                on_disk.insert(key, len);
+            } else {
+                unlisted = [unlisted[0] + 1, unlisted[1] + len];
             }
-            let metadata = fs::symlink_metadata(entry.path())?;
-            on_disk.insert(key, metadata.len());
         }
-        Ok(on_disk)
+        Ok((on_disk, unlisted))
     }
 
-    fn set_disk_level(&mut self, on_disk: &BTreeMap<Digest32, u64>) {
-        self.counters.disk_records = on_disk.len() as u64;
-        self.counters.disk_bytes = on_disk.values().sum();
+    fn set_disk_level(&mut self, on_disk: &BTreeMap<Digest32, u64>, unlisted: [u64; 2]) {
+        self.counters.disk_records = on_disk.len() as u64 + unlisted[0];
+        self.counters.disk_bytes = on_disk.values().sum::<u64>() + unlisted[1];
     }
 
     fn note_codec(&mut self, bytes: usize) {

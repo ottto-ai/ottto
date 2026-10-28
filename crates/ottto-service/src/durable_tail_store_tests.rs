@@ -1390,3 +1390,67 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
     assert_eq!(store.counters().uninventoried_records, 6);
     assert_eq!(store.counters().gc_temps_deleted, 1);
 }
+
+/// Review F1: kept U records past `INVENTORY_BOUND` never block an existing
+/// key's replacement; a new key is a counted deferral, and nothing kept is
+/// deleted.
+#[test]
+fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("t.jsonl", b"{}\n");
+    let b = binding("acct", "scope", ("fp", None));
+    let receipt = scratch
+        .store()
+        .write_after_save(
+            &lock,
+            1,
+            vec![pending(b.clone(), certificate(&transcript), 1)],
+        )
+        .unwrap();
+    assert_eq!(receipt.written, 1);
+    let store = scratch.store();
+    let mut kept = Vec::new();
+    for n in 0..=INVENTORY_BOUND {
+        let mut record = pending(b.clone(), certificate(&transcript), 1);
+        record.binding.key = key_digest(DurableSource::ClaudeCode, &format!("kept-{n}"));
+        let mut bytes = encode(&DurableRecord {
+            record: record.clone(),
+            index_generation: 1,
+        });
+        set_version(&mut bytes, 2);
+        let path = record_file(&store, &record.binding.key);
+        put_record(&path, &bytes);
+        kept.push((path, bytes));
+    }
+    // Fresh process: no RAM memo of the known record.
+    let mut store = scratch.store();
+    let mut new = b.clone();
+    new.key = key_digest(DurableSource::ClaudeCode, "new-session");
+    new.entry = entry_digest("fp-new", None);
+    let mut replaced = b.clone();
+    replaced.entry = entry_digest("fp-2", None);
+    let receipt = store
+        .write_after_save(
+            &lock,
+            2,
+            vec![
+                pending(replaced.clone(), certificate(&transcript), 2),
+                pending(new.clone(), certificate(&transcript), 3),
+            ],
+        )
+        .unwrap();
+    assert_eq!(receipt.written, 1);
+    assert_eq!(receipt.budget_refused, 0);
+    assert_eq!(receipt.deferred_keys, vec![new.key]);
+    let counters = store.counters();
+    assert_eq!(counters.store_write_skipped, [0, 0, 1]);
+    assert_eq!(counters.disk_records, INVENTORY_BOUND as u64 + 2);
+    assert!(!record_file(&store, &new.key).exists());
+    let record = found(scratch.store().read(&b.key, &placeholder_allowlist()));
+    assert_eq!(record.index_generation, 2);
+    assert_eq!(record.record.binding, replaced);
+    for (path, bytes) in kept {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
