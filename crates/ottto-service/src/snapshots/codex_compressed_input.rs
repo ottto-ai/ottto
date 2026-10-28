@@ -899,4 +899,58 @@ mod tests {
             assert!(index.codex_state_only_blocked_session_ids.contains(id));
         }
     }
+    #[test]
+    fn archive_owner_normal_early_return_and_finish_error_release_explicitly() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            fn early_return(input: OpenedInput) {
+                input.close();
+            }
+            early_return(OpenedInput::funded(File::open(&f.0).unwrap(), &cache).unwrap());
+            assert_eq!(cache.cursor_reserved(), 0);
+            let input = OpenedInput::funded(File::open(&f.0).unwrap(), &cache).unwrap();
+            let parser = codex_parser(input, &f.0);
+            assert!(parser
+                .finish(
+                    "unused",
+                    &f.0,
+                    NOW,
+                    "fixture".into(),
+                    Some(&CodexTitleMetadata::default()),
+                    None,
+                    None
+                )
+                .is_err());
+            assert_eq!(cache.cursor_reserved(), 0);
+        });
+        assert!(!rows.iter().any(|row| row["stage"] == "codex_zst_owner"));
+    }
+    #[test]
+    fn archive_owner_unwind_refunds_and_reports_safety_net_release() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _input = OpenedInput::funded(File::open(&f.0).unwrap(), &cache).unwrap();
+                panic!("synthetic archive unwind");
+            }))
+        });
+        assert!(result.is_err());
+        assert_eq!(cache.cursor_reserved(), 0);
+        let leaks = rows
+            .iter()
+            .filter(|row| row["stage"] == "codex_zst_owner")
+            .map(|row| row["counts"]["leaked_release"].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(leaks, 1);
+        OpenedInput::funded(File::open(&f.0).unwrap(), &cache)
+            .unwrap()
+            .close();
+        assert_eq!(cache.cursor_reserved(), 0);
+    }
 }

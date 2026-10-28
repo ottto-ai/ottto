@@ -3756,7 +3756,8 @@ impl Drop for CursorCredit {
     }
 }
 
-// Decoder ownership uses the existing retained -> cursor admission order.
+// Decoder ownership takes retained -> cursor, never the reverse; free room
+// only, so decoder admission never evicts primary Tail state or proof state.
 static DECODER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(in crate::snapshots) struct DecoderOwner(Option<CursorCredit>);
 impl DecoderOwner {
@@ -3768,7 +3769,7 @@ impl DecoderOwner {
         {
             return None;
         }
-        match cache.cursor_reserve(bytes) {
+        match cache.cursor_reserve_kind(bytes, true) {
             Some(credit) => Some(Self(Some(credit))),
             None => {
                 DECODER_LIVE.store(false, SeqCst);
@@ -3789,8 +3790,15 @@ impl DecoderOwner {
 }
 impl Drop for DecoderOwner {
     fn drop(&mut self) {
-        self.refund();
-    } // cancellation/unwind fallback
+        if self.0.is_some() {
+            crate::local_resource_diagnostics::traversal_point(
+                "codex_zst_owner",
+                "codex",
+                &BTreeMap::from([("leaked_release", 1_u64)]),
+            );
+        }
+        self.refund(); // cancellation/unwind safety net, observable as a leak
+    }
 }
 
 /// Checked: a claim that is not outstanding on this state is corrupt
@@ -4088,10 +4096,22 @@ impl SharedCache {
     /// later measurement (`cursor_resident`, another admission, a retained
     /// insert) sees it until the credit is settled. None: nothing claimed.
     fn cursor_reserve(self: &Arc<Self>, charge: usize) -> Option<CursorCredit> {
+        self.cursor_reserve_kind(charge, false)
+    }
+    fn cursor_reserve_kind(
+        self: &Arc<Self>,
+        charge: usize,
+        free_only: bool,
+    ) -> Option<CursorCredit> {
         let mut retained = self.retained().ok()?;
         let claimed = self
             .with_cursor(|cursor| {
-                if !admit_locked(&mut retained, cursor, charge, true, Admitter::Main) {
+                let admitted = if free_only {
+                    proof_free_room(&retained, cursor, charge)
+                } else {
+                    admit_locked(&mut retained, cursor, charge, true, Admitter::Main)
+                };
+                if !admitted {
                     return None;
                 }
                 cursor.reserved = cursor.reserved.checked_add(charge)?;

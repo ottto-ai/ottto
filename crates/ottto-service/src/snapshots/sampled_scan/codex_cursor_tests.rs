@@ -13565,3 +13565,28 @@ fn compressed_memo_rechecks_refuse_decoded_offsets() {
             .is_none());
     });
 }
+
+#[test]
+fn decoder_admission_yields_without_evicting_primary_state() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = admission_floor(&cache);
+    let empty = cache.cursor_resident();
+    let members = join_members(&["a.jsonl", "b.jsonl"]);
+    cache.record_join_owner(JOIN_OWNER, &members);
+    let claim = join_charge(JOIN_OWNER, &members);
+    with_test_state_budget(empty + claim + floor, || {
+        let before = cache.cursor_resident();
+        assert!(cache.cursor_reserve_kind(claim, true).is_none());
+        assert_eq!(cache.cursor_resident(), before);
+        assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
+        assert_eq!(cache.cursor_reserved(), 0);
+        let primary = cache
+            .cursor_reserve(claim)
+            .expect("primary progress keeps its reservation");
+        primary.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}

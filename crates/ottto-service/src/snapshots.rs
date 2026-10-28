@@ -27693,6 +27693,7 @@ impl OwnedSourceScan {
             if let Some(mut active) = active_file.take() {
                 if !active.parser.reread_read_allowed() {
                     index.note_reread_refusal(None);
+                    active.parser.reader.reader.close();
                     pending!();
                 }
                 if let Some(delivery) = line_delivery.as_mut() {
@@ -27951,6 +27952,7 @@ impl OwnedSourceScan {
                                 );
                             }
                             census.record_unreadable(UnreadableCause::Reduction, 1);
+                            active.parser.reader.reader.close();
                             pending!();
                         }
                         Ok(true) => {}
@@ -28409,6 +28411,7 @@ impl OwnedSourceScan {
                                 codex_state_only_blocked_session_ids
                                     .insert(resolve_codex_identity(owner));
                             }
+                            parser.reader.reader.close();
                             pending!();
                         }
                     }
@@ -28449,6 +28452,7 @@ impl OwnedSourceScan {
                             .iter()
                             .flat_map(|member| codex_session_id_candidates_from_path(&member.path)),
                     );
+                    parser.reader.reader.close();
                     pending!();
                 }
                 // The existing copy budget funds two simultaneous allocations:
@@ -33126,10 +33130,13 @@ impl OwnedJsonlParser {
         accumulator.codex_parent_ownership_ledgers = codex_parent_ownership_ledgers;
         if source == SnapshotSource::Codex {
             if let Some(metadata) = codex_title_metadata {
-                let file_metadata = reader
-                    .get_ref()
-                    .metadata()
-                    .with_context(|| format!("read opened JSONL metadata {}", path.display()))?;
+                let file_metadata = match reader.get_ref().metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        reader.close();
+                        return Err(error.into());
+                    }
+                };
                 let logical = path.with_extension("");
                 let classification_path =
                     if reader.is_compressed() && is_compressed_codex_rollout(Some(path), None) {
@@ -33365,20 +33372,20 @@ impl OwnedJsonlParser {
         repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
         money_context: Option<claude_request_money::e2::ReadContext<'_>>,
     ) -> Result<ParsedJsonlFile> {
-        anyhow::ensure!(
-            self.reader.finished && self.reader.failure.is_none(),
-            "incomplete parser cannot finalize a file"
-        );
+        if !self.reader.finished || self.reader.failure.is_some() {
+            self.reader.reader.close();
+            anyhow::bail!("incomplete parser cannot finalize a file");
+        }
         if let Some(context) = attribution_context {
             let workers = launch_workers_for_parsed(
                 self.source,
                 self.accumulator.source_session_id.as_deref(),
                 path,
             );
-            anyhow::ensure!(
-                context.launches_prepared(&workers),
-                "launch evidence lookup incomplete"
-            );
+            if !context.launches_prepared(&workers) {
+                self.reader.reader.close();
+                anyhow::bail!("launch evidence lookup incomplete");
+            }
         }
         let Self {
             reader: bounded,
@@ -33405,8 +33412,13 @@ impl OwnedJsonlParser {
         recognized_usage_drop_count =
             recognized_usage_drop_count.saturating_add(report.over_line_cap_count);
         let (observed_after_read, observed_stat) =
-            opened_object_identity_and_stat(source, reader.get_mut())
-                .with_context(|| format!("revalidate opened JSONL {}", path.display()))?;
+            match opened_object_identity_and_stat(source, reader.get_mut()) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    reader.close();
+                    return Err(error.into());
+                }
+            };
         // A cursor job read only up to its frozen extent; appended bytes
         // belong to the next tail, so its object may have grown. Only a job
         // whose prefix certificate passed against the held FD carries
