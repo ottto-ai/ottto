@@ -2943,7 +2943,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     let (root, _) = fixture();
     let source = SnapshotSource::Codex;
     let cache = Arc::new(SharedCache::default());
-    let (mut index, seed) = sampled(&root, ScanIndex::default(), 10, &cache);
+    let (index, seed) = sampled(&root, ScanIndex::default(), 10, &cache);
     assert!(seed.census_complete);
     let key = local_index_key(&root.join("sessions/a.jsonl"));
     let accepted = index.files[&key].last_snapshot_fingerprint.clone();
@@ -3024,10 +3024,10 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
         &root.join("sessions/peer.jsonl"),
         &member(peer_owner, "r-peer", 90, 90),
     );
-    // Force the existing group to be offered without changing accepted witnesses.
-    for entry in index.files.values_mut() {
-        entry.source_file_fingerprint.clear();
-    }
+    // A size change invalidates the joined witness (clearing only the
+    // singleton fingerprint does not force a joined acquisition).
+    use std::io::Write;
+    writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap()).unwrap();
     let (index, result) = sampled_at(&root, index, 10, &cache, "2026-10-06T23:01:00Z");
     assert!(
         result.census_complete,
@@ -3046,7 +3046,7 @@ fn spent_known_corrupt_group_keeps_census_healthy_and_peer_progresses() {
     let (counts, stats) = cache.durable_counters(source).unwrap();
     assert_eq!(counts.durable_held, [0; 5]);
     assert!(counts.not_persisted["known_corrupt_held"] > 0);
-    assert_eq!(stats.known_corrupt_rebuild_after_restart, 1);
+    assert_eq!(stats.t14_rebuild_full_started, 1);
     assert_eq!(fs::read(&record).unwrap(), corrupt);
     fs::remove_dir_all(root).unwrap();
 }

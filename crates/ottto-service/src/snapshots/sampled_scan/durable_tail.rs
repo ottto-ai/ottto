@@ -113,7 +113,7 @@ impl Counters {
              guard_header_bytes={} guard_verify_bytes={} delete_verify_bytes={} overwrite_verify_bytes={} \
              uninventoried_records={} store_write_skipped[unknown,inventory_overflow]={:?} \
              gc_records_deleted={} gc_records_read={} gc_bytes_read={} gc_keep_peak={} \
-             records_invalidated={} peak_codec_bytes={} known_corrupt_rebuild_after_restart={}",
+             records_invalidated={} peak_codec_bytes={} t14_rebuild_full_started={}",
             source.api_slug(),
             self.restore_attempts,
             self.restored,
@@ -153,7 +153,7 @@ impl Counters {
             self.gc_keep_peak,
             store.records_invalidated,
             store.peak_codec_bytes,
-            store.known_corrupt_rebuild_after_restart,
+            store.t14_rebuild_full_started,
         )
     }
 }
@@ -417,7 +417,7 @@ impl SharedCache {
             .slot(source)
             .as_mut()?
             .store
-            .hold(&store::key_digest(source, key), restore_recheck);
+            .hold(&store::key_digest(source, key));
         if held == Some(store::Refusal::Corrupt) && ram {
             Counters::bump(
                 &mut self.durable()?.counters.not_persisted,
@@ -921,7 +921,7 @@ impl SharedCache {
         struct Alarm {
             held_keys: [u64; 2],
             t14_rebuild: [u64; 2],
-            known_corrupt_rebuild_after_restart: u64,
+            t14_rebuild_full_started: u64,
             mode_repaired: [u64; 2],
             #[serde(skip_serializing_if = "Option::is_none")]
             store_disabled: Option<&'static str>,
@@ -941,7 +941,7 @@ impl SharedCache {
             store.t14_rebuild,
             store.mode_repaired,
             u64::from(disabled.is_some()),
-            store.known_corrupt_rebuild_after_restart,
+            store.t14_rebuild_full_started,
         ];
         let last = std::mem::replace(&mut slot.reported, now);
         drop(stores);
@@ -952,7 +952,7 @@ impl SharedCache {
                 &Alarm {
                     held_keys: pair(0),
                     t14_rebuild: pair(1),
-                    known_corrupt_rebuild_after_restart: store.known_corrupt_rebuild_after_restart,
+                    t14_rebuild_full_started: store.t14_rebuild_full_started,
                     mode_repaired: pair(2),
                     store_disabled: disabled.filter(|_| last[3] == 0),
                 },

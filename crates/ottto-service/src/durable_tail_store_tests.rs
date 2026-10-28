@@ -895,7 +895,7 @@ fn store_mode_faults_are_repaired_without_rebuilds() {
     fs::set_permissions(store.dir(), fs::Permissions::from_mode(0o755)).unwrap();
     let mut cold = scratch.store();
     for b in &bindings {
-        assert_eq!(cold.hold(&b.key, false), None);
+        assert_eq!(cold.hold(&b.key), None);
         found(cold.read(&b.key, &placeholder_allowlist()));
     }
     assert_eq!(mode(cold.dir()), 0o700);
@@ -961,12 +961,12 @@ fn foreign_owner_disables_the_store_without_rebuilds() {
     // The directory passes its check; then a foreign-owned record with a
     // newer header is store-level, not a hold.
     let mut cold = scratch.store();
-    assert_eq!(cold.hold(&bindings[0].key, false), None);
+    assert_eq!(cold.hold(&bindings[0].key), None);
     let _foreign = ForeignUid::set();
-    assert_eq!(cold.hold(&bindings[2].key, false), None);
+    assert_eq!(cold.hold(&bindings[2].key), None);
     assert_eq!(cold.disabled(), Some("foreign_owner"));
     for b in &bindings {
-        assert_eq!(cold.hold(&b.key, false), None);
+        assert_eq!(cold.hold(&b.key), None);
         assert_eq!(
             cold.read(&b.key, &placeholder_allowlist()),
             ReadOutcome::Missing
@@ -993,7 +993,7 @@ fn foreign_owner_disables_the_store_without_rebuilds() {
     assert!(cold.inventory().unwrap().is_empty());
     cold.begin_pass();
     assert_eq!(
-        cold.hold(&bindings[2].key, false),
+        cold.hold(&bindings[2].key),
         None,
         "disabled for the process"
     );
@@ -1049,32 +1049,31 @@ fn t14_rebuilds_are_counted_and_the_breaker_trips_past_twenty() {
         let mut cold = scratch.store();
         cold.begin_pass();
         for b in &bindings {
-            assert_eq!(
-                cold.hold(&b.key, false),
-                None,
-                "T14 and valid records never hold"
-            );
+            assert_eq!(cold.hold(&b.key), None, "T14 and valid records never hold");
         }
         // A repeat in the same pass (the restore seam's re-check) counts once.
-        assert_eq!(cold.hold(&bindings[0].key, true), None);
+        assert_eq!(cold.hold(&bindings[0].key), None);
         let tripped = corrupt_count > 20;
         assert_eq!(cold.counters().t14_rebuild, 20);
         assert_eq!(cold.disabled(), tripped.then_some("t14_breaker"));
         for (path, bytes) in &kept {
             assert_eq!(&fs::read(path).unwrap(), bytes, "nothing deleted first");
         }
-        // A rebuilt T14 key stays memory-only: the save never writes its record.
+        // The rebuild post-save write repairs T14 unless the breaker disabled the store.
+        for n in &corrupt {
+            assert_eq!(cold.full_hold(&bindings[*n].key, true), None);
+        }
         let rebuild = corrupt
             .iter()
             .map(|n| pending(bindings[*n].clone(), certificate(&transcript), 2))
             .collect::<Vec<_>>();
         let receipt = cold.write_after_save(&lock, 2, rebuild).unwrap();
-        assert_eq!(receipt.written, 0);
+        assert_eq!(receipt.written, if tripped { 0 } else { corrupt_count });
         for n in &corrupt {
             let outcome = scratch
                 .store()
                 .read(&bindings[*n].key, &placeholder_allowlist());
-            assert_eq!(outcome, ReadOutcome::Refused(Refusal::Corrupt));
+            assert_eq!(matches!(outcome, ReadOutcome::Found(_)), !tripped);
         }
     }
 }
@@ -1488,14 +1487,14 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
             }
             assert_eq!(fs::read(&path).unwrap(), bytes, "{kind} x {seam}");
             let held = (!t14).then_some(reason);
-            assert_eq!(cold.hold(&b.key, false), held, "{kind} x {seam}");
+            assert_eq!(cold.hold(&b.key), held, "{kind} x {seam}");
             assert_eq!(
                 cold.counters().t14_rebuild,
                 u64::from(t14),
                 "{kind} x {seam}"
             );
             assert_eq!(
-                scratch.store().hold(&b.key, false),
+                scratch.store().hold(&b.key),
                 held,
                 "restart {kind} x {seam}"
             );
@@ -1518,10 +1517,10 @@ fn exact_predecessor_memo_reuses_verification_and_invalidates_on_change() {
         )
         .unwrap();
     let mut cold = scratch.store();
-    assert_eq!(cold.hold(&b.key, false), None);
+    assert_eq!(cold.hold(&b.key), None);
     let verified = cold.counters().guard_verify_bytes;
     assert!(verified > 0);
-    assert_eq!(cold.hold(&b.key, false), None);
+    assert_eq!(cold.hold(&b.key), None);
     assert_eq!(cold.counters().guard_verify_bytes, verified);
     let path = record_file(&cold, &b.key);
     let mut bytes = fs::read(&path).unwrap();
@@ -1529,7 +1528,7 @@ fn exact_predecessor_memo_reuses_verification_and_invalidates_on_change() {
     bytes[end] ^= 1;
     put_record(&path, &bytes);
     // T14 is not held: one counted rebuild.
-    assert_eq!(cold.hold(&b.key, false), None);
+    assert_eq!(cold.hold(&b.key), None);
     assert_eq!(cold.counters().t14_rebuild, 1);
     assert!(cold.counters().guard_verify_bytes > verified);
 }
@@ -1598,8 +1597,8 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
     // not bytes claiming an unknown format; it disables without mutation.
     symlink(&transcript, &link).unwrap();
     fs::create_dir(&directory).unwrap();
-    assert_eq!(store.hold(&[2; 32], false), Some(Refusal::Undecodable));
-    assert_eq!(store.hold(&[1; 32], false), None);
+    assert_eq!(store.hold(&[2; 32]), Some(Refusal::Undecodable));
+    assert_eq!(store.hold(&[1; 32]), None);
     assert_eq!(store.disabled(), Some("record_access"));
     assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
     assert!(directory.is_dir());
@@ -1749,7 +1748,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
             })));
         }
         let mut cold = scratch.store();
-        assert_eq!(cold.hold(&b.key, false), None, "{arm}");
+        assert_eq!(cold.hold(&b.key), None, "{arm}");
         let missing = arm.ends_with("missing");
         assert_eq!(cold.disabled().is_some(), !missing, "{arm}");
         assert_eq!(cold.counters().format_hold, [0; 5], "{arm}");
@@ -1779,7 +1778,7 @@ fn access_failures_disable_instead_of_holding_and_not_found_stays_absent() {
             cold.gc(&lock, &[0; 32], &placeholder_allowlist(), &BTreeMap::new())
                 .unwrap();
             cold.begin_pass();
-            assert_eq!(cold.hold(&b.key, false), None);
+            assert_eq!(cold.hold(&b.key), None);
         }
         assert_eq!(
             fs::read(&path).unwrap(),
@@ -1849,8 +1848,8 @@ fn gc_stops_before_orphan_cleanup_when_classification_disables_mid_loop() {
 }
 
 #[test]
-fn rebuilt_t14_is_memory_only_and_never_reaches_the_writer() {
-    for arm in ["write_failure", "budget"] {
+fn rebuilt_t14_replaces_once_or_stays_memory_only_until_restart() {
+    for arm in ["success", "write_failure", "budget", "no_reduction"] {
         let _reset = ResetFaults;
         let scratch = Scratch::new();
         let lock = LockedStateDir::acquire(&scratch.root).unwrap();
@@ -1869,42 +1868,68 @@ fn rebuilt_t14_is_memory_only_and_never_reaches_the_writer() {
         *bytes.last_mut().unwrap() ^= 1;
         put_record(&path, &bytes);
         let mut cold = scratch.store();
-        assert_eq!(cold.hold(&b.key, false), None);
+        assert_eq!(cold.hold(&b.key), None);
         assert_eq!(
-            cold.hold(&b.key, true),
+            cold.hold(&b.key),
             None,
             "same acquisition's restore recheck"
         );
         assert_eq!(
-            cold.hold(&b.key, false),
+            cold.hold(&b.key),
             None,
             "unstarted allowance survives scheduling deferral"
         );
         assert_eq!(cold.full_hold(&b.key, true), None);
-        assert_eq!(cold.counters().known_corrupt_rebuild_after_restart, 1);
+        assert_eq!(cold.counters().t14_rebuild_full_started, 1);
         assert_eq!(cold.full_hold(&b.key, true), Some(Refusal::Corrupt));
         let mut replacement = pending(b.clone(), certificate(&transcript), 2);
         if arm == "budget" {
             replacement.body.resize(RECORD_BYTES, 0);
         }
-        test_hooks::set_before_rename(Some(Box::new(|_, _| {
-            panic!("memory-only record reached writer")
-        })));
-        assert_eq!(
-            cold.write_after_save(&lock, 2, vec![replacement]).unwrap(),
-            BatchReceipt::default()
+        if arm == "write_failure" {
+            test_hooks::set_before_rename(Some(Box::new(|_, _| {
+                Err(io::Error::other("replacement refused"))
+            })));
+        }
+        let result = cold.write_after_save(
+            &lock,
+            2,
+            if arm == "no_reduction" {
+                vec![]
+            } else {
+                vec![replacement]
+            },
         );
         test_hooks::set_before_rename(None);
+        if arm == "success" {
+            assert_eq!(result.unwrap().written, 1);
+            assert!(!cold.rebuilt.contains_key(&b.key));
+            cold.begin_pass();
+            assert_eq!(cold.hold(&b.key), None, "healthy after RAM eviction");
+            assert_eq!(cold.full_hold(&b.key, true), None);
+            assert_eq!(cold.counters().t14_rebuild_full_started, 1);
+            let mut restarted = scratch.store();
+            assert!(
+                matches!(restarted.read(&b.key, &placeholder_allowlist()), ReadOutcome::Found(record) if record.index_generation == 2)
+            );
+            assert_eq!(restarted.full_hold(&b.key, true), None);
+            assert_eq!(restarted.counters().t14_rebuild_full_started, 0);
+            assert!(restarted.rebuilt.is_empty(), "restart needs no rebuild");
+            continue;
+        }
+        assert_eq!(result.is_err(), arm == "write_failure");
+        assert_eq!(cold.rebuilt.get(&b.key), Some(&Rebuild::NotReplaced));
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(cold.counters().t14_rebuild, 1);
         cold.take_pass();
         for _ in 0..3 {
             cold.begin_pass();
-            assert_eq!(cold.hold(&b.key, false), Some(Refusal::Corrupt), "{arm}");
+            assert_eq!(cold.hold(&b.key), Some(Refusal::Corrupt), "{arm}");
         }
         assert_eq!(cold.counters().t14_rebuild, 0);
         assert_eq!(cold.counters().format_hold[Refusal::Corrupt as usize], 3);
-        // A later offer remains memory-only; only restart grants a new Full.
+        // A failed replacement cannot reach the writer again.
+        test_hooks::set_before_rename(Some(Box::new(|_, _| panic!("second replacement"))));
         cold.write_after_save(
             &lock,
             3,
@@ -1912,14 +1937,18 @@ fn rebuilt_t14_is_memory_only_and_never_reaches_the_writer() {
         )
         .unwrap();
         cold.begin_pass();
-        assert_eq!(cold.hold(&b.key, false), Some(Refusal::Corrupt));
+        assert_eq!(cold.hold(&b.key), Some(Refusal::Corrupt));
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(cold.counters().t14_rebuild, 0);
         assert_eq!(
-            scratch.store().hold(&b.key, false),
+            scratch.store().hold(&b.key),
             None,
             "restart has its own allowance"
         );
+        let mut restarted = scratch.store();
+        assert_eq!(restarted.full_hold(&b.key, true), None);
+        assert_eq!(restarted.counters().t14_rebuild_full_started, 1);
+        assert_eq!(restarted.full_hold(&b.key, true), Some(Refusal::Corrupt));
     }
 }
 
@@ -1942,7 +1971,7 @@ fn process_rebuild_history_overflow_disables_without_forgetting_an_attempt() {
         put_record(&path, &bytes);
         records.push((path, bytes));
         store.begin_pass();
-        assert_eq!(store.hold(&b.key, false), None);
+        assert_eq!(store.hold(&b.key), None);
         assert_eq!(store.rebuilt.len(), (n + 1).min(REBUILT_BOUND));
         assert_eq!(
             store.disabled(),
@@ -2025,10 +2054,10 @@ fn non_format_io_errors_disable_at_every_read_boundary_without_spending_t14() {
                     ReadOutcome::Missing
                 );
             } else {
-                assert_eq!(cold.hold(&b.key, false), None);
+                assert_eq!(cold.hold(&b.key), None);
             }
             assert!(cold.disabled().is_some(), "{stage}/{errno}");
-            assert_eq!(cold.hold(&b.key, false), None);
+            assert_eq!(cold.hold(&b.key), None);
             assert_eq!(cold.counters().format_hold, [0; 5]);
             assert_eq!(cold.counters().t14_rebuild, 0);
             assert!(cold.rebuilt.is_empty());
@@ -2052,18 +2081,18 @@ fn scheduling_deferral_preserves_t14_allowance_until_full_actually_starts() {
     put_record(&record_file(&store, &b.key), &bytes);
     for _ in 0..3 {
         store.begin_pass();
-        assert_eq!(store.hold(&b.key, false), None);
+        assert_eq!(store.hold(&b.key), None);
         assert_eq!(
             store.full_hold(&b.key, false),
             None,
             "plan/defer does not spend"
         );
-        assert_eq!(store.counters().known_corrupt_rebuild_after_restart, 0);
+        assert_eq!(store.counters().t14_rebuild_full_started, 0);
     }
     assert_eq!(store.full_hold(&b.key, true), None);
-    assert_eq!(store.counters().known_corrupt_rebuild_after_restart, 1);
+    assert_eq!(store.counters().t14_rebuild_full_started, 1);
     store.begin_pass();
-    assert_eq!(store.hold(&b.key, false), Some(Refusal::Corrupt));
+    assert_eq!(store.hold(&b.key), Some(Refusal::Corrupt));
     assert_eq!(store.full_hold(&b.key, true), Some(Refusal::Corrupt));
     assert_eq!(store.counters().t14_rebuild, 1);
     assert_eq!(fs::read(record_file(&store, &b.key)).unwrap(), bytes);

@@ -1596,6 +1596,12 @@ fn known_corrupt_scan(
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS retained layout")]
 fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
+    for fail_replacement in [false, true] {
+        known_corrupt_replacement_case(fail_replacement);
+    }
+}
+
+fn known_corrupt_replacement_case(fail_replacement: bool) {
     use std::io::Write;
     let root = crate::test_scratch::private_dir("ottto-known-corrupt-census");
     let lock = test_locks::hold(&root);
@@ -1662,7 +1668,7 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
     let mut corrupt = std::fs::read(&record).unwrap();
     *corrupt.last_mut().unwrap() ^= 1;
     std::fs::write(&record, &corrupt).unwrap();
-    let cache = Arc::new(SharedCache::default());
+    let mut cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &namespace, false);
     for entry in index.files.values_mut() {
         entry.source_file_fingerprint.clear();
@@ -1686,15 +1692,39 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
         None,
         "fresh RAM in the SAME pass wins"
     );
+    index.save(&index_path).unwrap();
+    if fail_replacement {
+        let record = record.clone();
+        store::test_hooks::set_before_rename(Some(Box::new(move |_, target| {
+            if target == record {
+                Err(std::io::Error::other("rebuild replacement failed"))
+            } else {
+                Ok(())
+            }
+        })));
+    }
     let ((), startup_alarms) = crate::local_resource_diagnostics::capture(|| {
         crate::snapshots::durable_after_save(&cache, &root, source, &index)
     });
+    store::test_hooks::set_before_rename(None);
     assert_eq!(startup_alarms.len(), 1);
-    assert_eq!(
-        startup_alarms[0]["counts"]["known_corrupt_rebuild_after_restart"],
-        1
-    );
-    assert_eq!(std::fs::read(&record).unwrap(), corrupt);
+    assert_eq!(startup_alarms[0]["counts"]["t14_rebuild_full_started"], 1);
+    if fail_replacement {
+        assert_eq!(std::fs::read(&record).unwrap(), corrupt);
+    } else {
+        assert!(matches!(
+            disk.read(&digest, &codec::allowlist_digest(source)),
+            store::ReadOutcome::Found(_)
+        ));
+        cache.retained().unwrap().remove(&key);
+        assert_eq!(
+            cache.durable_hold(source, &key),
+            None,
+            "repaired record never holds"
+        );
+        // A fresh process restores the healthy replacement, with no T14 Full.
+        cache = Arc::new(SharedCache::default());
+    }
     let append = |path: &Path, request: &str| {
         let row = serde_json::json!({"type":"assistant","sessionId": if path == held.as_path() {"11111111-2222-4333-8444-000000000000"} else {"11111111-2222-4333-8444-000000000001"},"timestamp":"2026-10-07T10:00:01Z","requestId":request,"message":{"id":request,"model":"fixture-model","usage":{"input_tokens":200,"output_tokens":20}}});
         writeln!(
@@ -1739,6 +1769,15 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
         .unwrap()
     };
     assert_eq!(held_body(&tailed), held_body(&full));
+    if !fail_replacement {
+        let (_, stats) = cache.durable_counters(source).unwrap();
+        assert_eq!(
+            stats.t14_rebuild_full_started, 0,
+            "restart restored the repaired record"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        return;
+    }
     let accepted = index.files[&key].clone();
     cache.retained().unwrap().remove(&key);
     append(&held, "req-held-after-eviction");
@@ -1787,14 +1826,14 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
     assert!(counts.not_persisted["known_corrupt_memory_only"] > 0);
     assert!(counts.not_persisted["known_corrupt_held"] > 0);
     assert_eq!(counts.durable_held, [0; 5]);
-    assert_eq!(stats.known_corrupt_rebuild_after_restart, 1);
+    assert_eq!(stats.t14_rebuild_full_started, 1);
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| cache.durable_alarm(source));
-    assert!(alarms.iter().all(
-        |alarm| alarm["counts"]["known_corrupt_rebuild_after_restart"]
+    assert!(alarms
+        .iter()
+        .all(|alarm| alarm["counts"]["t14_rebuild_full_started"]
             .as_u64()
             .unwrap()
-            <= 1
-    ));
+            <= 1));
     assert_eq!(std::fs::read(&record).unwrap(), corrupt);
     // P2 review: preserve size/mtime while replacing the object. The healthy
     // production exit must still invalidate stale request-hash authority.
@@ -1839,7 +1878,7 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
     let mut restarted = DurableTailStore::new(disk.dir().to_path_buf(), DurableSource::ClaudeCode);
     assert_eq!(restarted.full_hold(&digest, true), None);
     assert_eq!(
-        restarted.counters().known_corrupt_rebuild_after_restart,
+        restarted.counters().t14_rebuild_full_started,
         1,
         "a restart gets one fresh attempt, not a persisted repetition count"
     );

@@ -18,9 +18,9 @@
 //!   generation and the index entry it was written for is still the
 //!   committed one. Anything else is Full; nothing is partially applied.
 //! - Unknown representations hold acquisition and survive every mutation. A
-//!   known corrupt record (T14) permits one rebuild Full; then RAM alone
-//!   serves the key, or it is held without affecting the source census.
-//!   Its record is never deleted or rewritten by this process. More than
+//!   known corrupt record (T14) permits one rebuild Full and its post-save
+//!   rename-over replacement. If no replacement lands, RAM alone serves
+//!   the key, or it is held without affecting the source census. More than
 //!   `max(T14_BREAKER, 2%)` T14 records in one pass disable the store.
 //! - Owner or mode faults are store-level: our own entries get 0700/0600
 //!   back; a foreign owner disables the store for this process (memory-only).
@@ -370,7 +370,7 @@ pub(crate) struct StoreCounters {
     /// T14 rebuild authorizations (RAM may already hold the file), and mode repairs.
     pub(crate) t14_rebuild: u64,
     /// First admitted rebuild Full starts in this process, not persisted repetition history.
-    pub(crate) known_corrupt_rebuild_after_restart: u64,
+    pub(crate) t14_rebuild_full_started: u64,
     pub(crate) mode_repaired: u64,
     pub(crate) guard_header_bytes: u64,
     pub(crate) guard_verify_bytes: u64,
@@ -414,9 +414,15 @@ pub(crate) struct DurableTailStore {
     /// This pass: directory checked and [records loaded, T14 rebuilds].
     checked: bool,
     pass: [u64; 2],
-    /// Process-lifetime attempts; true survives scheduling deferral until Full starts.
-    /// Spent keys are memory-only, or held when no RAM chain remains.
-    rebuilt: BTreeMap<Digest32, bool>,
+    /// Process-lifetime attempts, removed only after a successful replacement.
+    rebuilt: BTreeMap<Digest32, Rebuild>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rebuild {
+    Authorized,  // Scheduling deferral has not spent the Full allowance.
+    Started,     // The rebuild may offer its own replacement after save.
+    NotReplaced, // Memory-only with RAM; otherwise a census-safe hold.
 }
 
 /// The most record files one GC or inventory pass looks at. Twice the
@@ -638,7 +644,7 @@ impl DurableTailStore {
     }
 
     /// U holds. T14 permits one rebuild; the adapter checks RAM before holding.
-    pub(crate) fn hold(&mut self, key: &Digest32, _restore_recheck: bool) -> Option<Refusal> {
+    pub(crate) fn hold(&mut self, key: &Digest32) -> Option<Refusal> {
         let result = self.classify(key, "guard");
         self.pass[0] += u64::from(!matches!(result, Ok(None)));
         match result {
@@ -650,24 +656,25 @@ impl DurableTailStore {
                 } else {
                     self.pass[1] += 1;
                     self.counters.t14_rebuild += 1;
-                    self.rebuilt.insert(*key, true);
+                    self.rebuilt.insert(*key, Rebuild::Authorized);
                 }
                 None
             }
-            Err(Refusal::Corrupt) if self.rebuilt[key] => None,
+            Err(Refusal::Corrupt) if self.rebuilt[key] == Rebuild::Authorized => None,
             Ok(_) => None,
             Err(reason) => Some(reason),
         }
     }
 
     pub(crate) fn full_hold(&mut self, key: &Digest32, start: bool) -> Option<Refusal> {
-        let held = self.hold(key, true);
+        let held = self.hold(key);
         if start
             && held.is_none()
             && self.disabled.is_none()
-            && self.rebuilt.get_mut(key).is_some_and(std::mem::take)
+            && self.rebuilt.get(key) == Some(&Rebuild::Authorized)
         {
-            self.counters.known_corrupt_rebuild_after_restart += 1;
+            self.rebuilt.insert(*key, Rebuild::Started);
+            self.counters.t14_rebuild_full_started += 1;
         }
         held
     }
@@ -716,6 +723,23 @@ impl DurableTailStore {
         committed_generation: u64,
         pending: Vec<PendingRecord>,
     ) -> io::Result<BatchReceipt> {
+        let result = self.write_batch(writer, committed_generation, pending);
+        for (key, state) in &mut self.rebuilt {
+            if *state == Rebuild::Started
+                && !result.as_ref().is_ok_and(|r| r.deferred_keys.contains(key))
+            {
+                *state = Rebuild::NotReplaced;
+            }
+        }
+        result
+    }
+
+    fn write_batch<W: SingleWriter>(
+        &mut self,
+        writer: &W,
+        committed_generation: u64,
+        pending: Vec<PendingRecord>,
+    ) -> io::Result<BatchReceipt> {
         self.check_writer(writer)?;
         let mut receipt = BatchReceipt::default();
         let mut dirty = Vec::new();
@@ -728,10 +752,10 @@ impl DurableTailStore {
             .map(|record| record.body.len())
             .sum::<usize>();
         for record in pending {
-            if self.rebuilt.contains_key(&record.binding.key) {
+            if self.rebuilt.get(&record.binding.key) == Some(&Rebuild::NotReplaced) {
                 continue;
             }
-            // Only a T14 not attempted by acquisition may still be replaced.
+            // A rebuild may replace its corrupt predecessor once, after save.
             let corrupt = match self.classify(&record.binding.key, "overwrite") {
                 Err(Refusal::Corrupt) => true,
                 Err(_) => {
@@ -818,6 +842,7 @@ impl DurableTailStore {
                 continue;
             }
             write_atomic(&self.dir, &path, &bytes)?;
+            self.rebuilt.remove(&key);
             changed = true;
             on_disk.insert(key, bytes.len() as u64);
             let stamp = Stamp::of(&fs::symlink_metadata(&path)?);
