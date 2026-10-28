@@ -27856,6 +27856,10 @@ impl OwnedSourceScan {
                         census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
                     }
+                    // LD: the replay is a fresh Full delivery from 0.
+                    if let Some(delivery) = line_delivery.as_mut() {
+                        delivery.arm();
+                    }
                     active_file = Some(active);
                     pending!();
                 }

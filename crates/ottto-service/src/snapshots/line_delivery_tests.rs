@@ -124,6 +124,7 @@ fn new_scan(root: &Path, index: ScanIndex) -> OwnedSourceScan {
 
 /// Step to completion; returns the index, result and the number of steps.
 fn finish(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult, usize) {
+    let source = scan.source;
     for steps in 1..100_000 {
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
@@ -132,11 +133,11 @@ fn finish(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult, usize) {
             } => {
                 let mut projected = scan.clone();
                 apply_upload_policy(
-                    SnapshotSource::ClaudeCode,
+                    source,
                     &mut projected.snapshots,
                     SnapshotUploadPolicy::default(),
                 );
-                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut projected, &mut index);
+                finalize_scan_after_policy(source, &mut projected, &mut index);
                 let accepted = projected
                     .snapshots
                     .iter()
@@ -769,6 +770,88 @@ fn sampled_full_tail_unchanged_and_reset_deliver_by_mode() {
     assert_eq!(view.mode, DeliveryMode::Full);
     assert_eq!(rewritten.lines().len(), 1);
     assert_eq!(delivered(&rows), rewrite.len() as u64, "from 0");
+}
+
+/// Review #4 (layout-supported builds): a Codex Tail that meets a protected
+/// tier ends at EOF, then its in-place Full replacement is delivered as one
+/// fresh Full from 0: every line once, the Tail's line not repeated.
+#[test]
+fn in_place_full_fallback_after_tail_is_one_fresh_full_delivery() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let root = Root::new("ld-fallback");
+    let sessions = root.0.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let id = "019fa111-2222-7333-8444-555555555555";
+    let path = sessions.join(format!("rollout-2026-10-07T10-00-00-{id}.jsonl"));
+    let usage = |n: u64, hour: u32| {
+        json!({"type": "event_msg", "timestamp": format!("2026-10-07T{hour}:00:00Z"),
+            "payload": {"type": "token_count", "info": {"model": "fixture-model",
+            "total_token_usage": {"input_tokens": n, "cached_input_tokens": n / 2, "output_tokens": n / 10},
+            "last_token_usage": {"input_tokens": n, "cached_input_tokens": n / 2, "output_tokens": n / 10}}}})
+    };
+    let meta = json!({"type": "session_meta", "payload": {"id": id}});
+    let first = usage(100, 10);
+    let mut priority = usage(140, 11);
+    priority["payload"]["service_tier"] = json!("priority");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let page = |index: ScanIndex, observer: &Recorder| {
+        let scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions),
+            index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(
+            cache.clone(),
+            crate::transcript_acquisition::Scope("ld-tests".into()),
+        )
+        .with_line_observer("test", Box::new(observer.clone()));
+        finish(scan).0
+    };
+    for value in [&meta, &first] {
+        append(&path, &[raw(value), b"\n".to_vec()].concat());
+    }
+    let index = page(ScanIndex::default(), &Recorder::default());
+    append(&path, &[raw(&priority), b"\n".to_vec()].concat());
+    let recorder = Recorder::default();
+    page(index, &recorder);
+
+    let events = recorder.events();
+    let modes: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Begin(view) => Some(view.mode),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        modes,
+        [DeliveryMode::Tail, DeliveryMode::Full],
+        "{events:?}"
+    );
+    let line = |value: &Value| Event::Line(Some(value.clone()));
+    let complete = Event::End(DeliveryEnd::Complete);
+    assert_eq!(
+        events[1..],
+        [
+            line(&priority),
+            complete.clone(),
+            events[3].clone(),
+            line(&meta),
+            line(&first),
+            line(&priority),
+            complete,
+        ]
+    );
 }
 
 // ---- E3 condition 1: unselected counters after unchanged gate decisions ----

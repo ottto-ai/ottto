@@ -75,6 +75,7 @@ impl OwnedSourceScan {
     }
 }
 impl LineDelivery {
+    /// A fresh primary read of the active file: opened, or replaced in place.
     pub(super) fn arm(&mut self) {
         self.end_open(DeliveryEnd::Incomplete);
         self.armed = true;
