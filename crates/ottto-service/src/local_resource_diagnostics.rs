@@ -3,7 +3,6 @@
 use serde::{ser::SerializeMap, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod cache_lifecycle;
@@ -13,7 +12,6 @@ pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
 
-/// Closed, content-free refusal labels; cumulative process counters on #799.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedReplayNotAuthorized")]
@@ -50,27 +48,39 @@ pub(crate) enum CodexZstCause {
     ParserStateRequired,
     #[serde(rename = "CompressedHeaderInvalid")]
     HeaderInvalid,
+    #[serde(rename = "ArchiveEquivalenceUnproven")]
+    ArchiveEquivalenceUnproven,
+    #[serde(rename = "CompressedCatchupTooLarge")]
+    CatchupTooLarge,
     #[doc(hidden)]
     #[serde(skip)]
     __Count,
 }
 const CODEX_ZST_CAUSES: usize = CodexZstCause::__Count as usize;
-static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
-    [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
-
+thread_local! {
+    static CODEX_ZST_REFUSED: std::cell::RefCell<BTreeMap<CodexZstCause, u64>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+    static CODEX_ZST_CLASSIFICATIONS: std::cell::RefCell<BTreeMap<&'static str, u64>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
-    let counter = &CODEX_ZST_REFUSED[cause as usize];
-    let previous = counter
-        .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
-        .unwrap_or_else(|n| n);
-    traversal_point(
-        "codex_zst_refused",
-        "codex",
-        &BTreeMap::from([(
+    debug_assert!((cause as usize) < CODEX_ZST_CAUSES);
+    CODEX_ZST_REFUSED.with(|c| *c.borrow_mut().entry(cause).or_default() += 1);
+}
+pub(crate) fn codex_zst_classified(name: &'static str) {
+    CODEX_ZST_CLASSIFICATIONS.with(|c| {
+        let mut c = c.borrow_mut();
+        *c.entry(name).or_default() += 1;
+    });
+}
+pub(crate) fn flush_codex_zst_refusals() {
+    let counts = CODEX_ZST_REFUSED.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let classes = CODEX_ZST_CLASSIFICATIONS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if !counts.is_empty() || !classes.is_empty() {
+        traversal_point(
             "codex_zst_refused",
-            BTreeMap::from([(cause, previous.saturating_add(1))]),
-        )]),
-    );
+            "codex",
+            &serde_json::json!({ "codex_zst_refused": counts, "codex_zst_classification": classes }),
+        );
+    }
 }
 
 /// Nonzero-only counters on the existing native_collection_page line.

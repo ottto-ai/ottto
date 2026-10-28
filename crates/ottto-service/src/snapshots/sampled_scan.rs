@@ -2001,7 +2001,10 @@ pub(super) fn new_source_parser(
             );
             index.files.entry(key).or_default().archive = Some(evidence);
             match cache.and_then(|cache| OpenedInput::funded(file, cache).ok()) {
-                Some(input) => input,
+                Some(input) => {
+                    crate::local_resource_diagnostics::codex_zst_classified("codex_zst_first_read");
+                    input
+                }
                 None => {
                     index.archive_refuse(&candidate.path, CodexZstCause::AdmissionRefused);
                     anyhow::bail!("compressed rollout admission unavailable");

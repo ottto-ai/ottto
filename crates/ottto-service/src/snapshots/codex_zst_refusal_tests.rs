@@ -18,10 +18,14 @@ pub(super) fn jsonl_parse_attempted() {
         counts.set((d, p + 1));
     });
 }
-/// Counters are cumulative process totals; captures isolate this thread's events.
+/// Captures flush this worker's pass delta, without stealing another worker's events.
 pub(super) fn assert_refused<T>(cause: CodexZstCause, run: impl FnOnce() -> T) -> T {
     let before = ACTIVITY.with(std::cell::Cell::get);
-    let (result, rows) = capture(run);
+    let (result, rows) = capture(|| {
+        let result = run();
+        crate::local_resource_diagnostics::flush_codex_zst_refusals();
+        result
+    });
     assert_eq!(
         ACTIVITY.with(std::cell::Cell::get),
         before,
@@ -231,7 +235,7 @@ fn predicate_covers_opened_compression_and_leaves_plain_physical_samples_legal()
 #[test]
 fn compressed_refusal_cardinality_has_unique_pinned_indices() {
     use CodexZstCause::*;
-    const ALL: [CodexZstCause; 17] = [
+    const ALL: [CodexZstCause; 19] = [
         ReplayNotAuthorized,
         ProofParentUnsupported,
         ProofChildUnsupported,
@@ -249,6 +253,8 @@ fn compressed_refusal_cardinality_has_unique_pinned_indices() {
         SettlementStuck,
         ParserStateRequired,
         HeaderInvalid,
+        ArchiveEquivalenceUnproven,
+        CatchupTooLarge,
     ];
     const _: [(); ALL.len()] = [(); CodexZstCause::__Count as usize];
     let indices = ALL

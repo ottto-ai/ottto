@@ -602,9 +602,12 @@ unknown prior contract.
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with
-`counts.codex_zst_refused{cause}`: a sparse map containing the incremented,
-saturating process-lifetime counter for that cause. These count refused attempts,
-not distinct sessions, decoded bytes or money. No path or session id is included.
+`counts.codex_zst_refused{cause}`: a sparse map of this worker's refused
+attempts, batched once per pass. `counts.codex_zst_classification` contains
+`codex_zst_plain_twin_skip`, `codex_zst_first_read` and `codex_zst_held`.
+These are attempt counts, not distinct sessions or money. No path or session id
+is included. Held moves use `ArchiveEquivalenceUnproven`; frame-declared decoded
+sizes over 1 GiB use `CompressedCatchupTooLarge`.
 
 | Cause | Unsupported boundary |
 | --- | --- |
@@ -633,11 +636,10 @@ funded decoder may be live in the process. Physical offset certificates remain
 unsupported for archives.
 
 Archive disposition stays `pending` until the final body is ACK-settled.
-Pending evidence carries a retry deadline: at most one first-read re-decode per
-six hours. Each retry increments `codex_zst_first_read_retry` on the same carrier;
-its decoded bytes are included above. Three failed settlements hold the archive
-with counted cause `CompressedSettlementStuck`; no empty or zero-cost body is
-substituted. Settled, empty, held and refused stamps remain quiet until content
+The acquisition API retains its bounded settlement-recovery deadline, but ordinary
+archive discovery does not use that deadline to authorize another read. An
+unchanged attempted archive stays quiet, including pending and failed outputs;
+no empty or zero-cost body is substituted. Settled, empty, held and refused stamps remain quiet until content
 changes. Decoder safety-net release emits `codex_zst_owner.counts.leaked_release`;
 normal completion and error paths release explicitly after any Stores guard.
 
@@ -655,3 +657,18 @@ reports the same physical input as an encoding view; do not sum the two views.
 for an archive; the paid main parser uses its stateful factory.
 `codex_zst_refused` reader failures also enter the unreadable census at their
 caller; the direct compatibility API has no census. Refusals retain prior output.
+
+Codex discovery admits exact `.jsonl.zst` only for Codex. Plain twins win without
+an archive decode. Moves remain held as `ArchiveEquivalenceUnproven`; the plain
+index carrier and its accepted output survive compression and restart. A move
+is not a disappearance, absence retirement or fingerprint re-arm. Cross-directory
+or owner-ambiguous twins remain held pending validated equivalence support.
+
+Ordinary inventory can reuse only stamp-matching archive header evidence, with
+zero decodes. Unseen archives enter a separate newest-first backlog after live
+work. One funded decoder runs at utility QoS, only on known AC power; unknown
+power defers. Thread CPU stops admission at the first archive boundary after
+30 CPU-seconds per ordinary five-minute pass; contention skips the backlog.
+Header and body decoded bytes share the existing per-pass budget. File-boundary
+overshoot and decoder read-ahead are charged. Archives have a 1 GiB decoded cap.
+No physical offsets, certificates or synthetic acknowledgements are introduced.

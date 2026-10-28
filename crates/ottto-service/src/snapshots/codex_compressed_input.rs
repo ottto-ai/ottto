@@ -417,11 +417,7 @@ impl OpenedInput {
         let credit = compressed_input_credit()?;
         let owner = super::sampled_scan::codex_cursor::DecoderOwner::acquire(cache, credit)
             .ok_or_else(|| invalid("compressed rollout admission refused"))?;
-        let mut input = Self::compressed(
-            file,
-            super::max_jsonl_file_bytes(super::SnapshotSource::Codex),
-            credit,
-        );
+        let mut input = Self::compressed(file, 1 << 30, credit);
         if let Ok(Self::Compressed(_, paid)) = &mut input {
             *paid = Some(owner);
         } else {
@@ -447,6 +443,12 @@ impl OpenedInput {
             if let Some(owner) = owner {
                 owner.release();
             }
+        }
+    }
+    pub(super) fn decoded_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Compressed(r, _) => Some(r.get_ref().decoded_bytes),
+            _ => None,
         }
     }
     pub(super) fn is_compressed(&self) -> bool {
@@ -613,6 +615,9 @@ impl super::ScanIndex {
             evidence.owner = Some(header.owner.clone());
             evidence.header_validated = Some(header.clone());
         } else {
+            evidence.disposition = ArchiveDisposition::Refused {
+                cause: CodexZstCause::HeaderInvalid,
+            };
             codex_zst_refused(CodexZstCause::HeaderInvalid);
         }
         result.map(|header| (header, decoded as usize))
@@ -662,6 +667,10 @@ impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
 #[cfg(test)]
 pub(in crate::snapshots) mod tests {
     include!("codex_archive_header_tests.rs");
+    mod money_equivalence_tests {
+        use super::*;
+        include!("codex_archive_money_equivalence_tests.rs");
+    }
     use super::super::*;
     use super::*;
     use crate::transcript_acquisition::Scope;
@@ -1158,6 +1167,7 @@ pub(in crate::snapshots) mod tests {
             let (saved, rows) = crate::local_resource_diagnostics::capture(|| {
                 let mut failed = index;
                 failed.settle_archive_bodies(&BTreeMap::new());
+                crate::local_resource_diagnostics::flush_codex_zst_refusals();
                 checkpoint(&failed)
             });
             state = saved;

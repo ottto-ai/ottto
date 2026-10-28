@@ -23979,3 +23979,8 @@ crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reas
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+
+pub(crate) fn archive_power_ready() -> bool {
+    use continuation::{NoPlatformSignals, PlatformGates, PlatformState};
+    NoPlatformSignals.power() == PlatformState::Allowed
+}
