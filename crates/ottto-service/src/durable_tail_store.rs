@@ -366,7 +366,8 @@ pub(crate) struct StoreCounters {
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
-    /// T14 records read Full once to be rebuilt; owner-only modes restored.
+    /// T14 records to rebuild (read Full unless the RAM cache still holds the
+    /// file, then replaced after the save); owner-only modes restored.
     pub(crate) t14_rebuild: u64,
     pub(crate) mode_repaired: u64,
     pub(crate) guard_header_bytes: u64,
@@ -512,8 +513,9 @@ impl DurableTailStore {
         self.dir.join(format!("{}{RECORD_SUFFIX}", hex(key)))
     }
 
-    /// Header dispatch precedes owner/mode and size checks. Only a verified
-    /// known record licenses mutation. `Ok(None)` also when the store is disabled.
+    /// Owner/mode (store-level) precede header dispatch, which precedes the
+    /// size check. Only a verified known record licenses mutation. `Ok(None)`
+    /// also when the store is disabled.
     fn classify(&mut self, key: &Digest32, work: &str) -> Result<Option<Binding>, Refusal> {
         if !self.usable() {
             return Ok(None);
@@ -542,6 +544,10 @@ impl DurableTailStore {
                 }
                 Err(_) => return Err(Refusal::Undecodable),
             };
+            let metadata = file.metadata().map_err(|_| Refusal::Undecodable)?;
+            if metadata.is_file() && !self.repair(&path, &metadata, 0o600) {
+                return Ok(None);
+            }
             let mut header = Vec::with_capacity(HEADER_BYTES);
             Read::by_ref(&mut file)
                 .take(HEADER_BYTES as u64)
@@ -550,10 +556,6 @@ impl DurableTailStore {
             let n = header.len();
             self.counters.guard_header_bytes += n as u64;
             let binding = decode_header(&header, key, self.source)?;
-            let metadata = file.metadata().map_err(|_| Refusal::Corrupt)?;
-            if !self.repair(&path, &metadata, 0o600) {
-                return Ok(None);
-            }
             // After any repair: its ctime moved.
             let metadata = file.metadata().map_err(|_| Refusal::Corrupt)?;
             let stamp = Stamp::of(&metadata);

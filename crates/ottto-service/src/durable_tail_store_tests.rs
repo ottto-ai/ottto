@@ -925,8 +925,9 @@ impl Drop for ForeignUid {
     }
 }
 
-/// C1: a store this process does not own is disabled for the process
-/// (memory-only, pre-#806): no hold, no rebuild, no restore, no mutation.
+/// C1: a store this process does not own (here a record, after the directory
+/// passed) is disabled for the process (memory-only, pre-#806): no hold, no
+/// rebuild, no restore, no mutation.
 #[test]
 fn foreign_owner_disables_the_store_without_rebuilds() {
     let scratch = Scratch::new();
@@ -957,8 +958,13 @@ fn foreign_owner_disables_the_store_without_rebuilds() {
     set_version(&mut newer, 2);
     put_record(&paths[2], &newer);
     let before = paths.each_ref().map(|path| fs::read(path).unwrap());
-    let _foreign = ForeignUid::set();
+    // The directory passes its check; then a foreign-owned record with a
+    // newer header is store-level, not a hold.
     let mut cold = scratch.store();
+    assert_eq!(cold.hold(&bindings[0].key), None);
+    let _foreign = ForeignUid::set();
+    assert_eq!(cold.hold(&bindings[2].key), None);
+    assert_eq!(cold.disabled(), Some("foreign_owner"));
     for b in &bindings {
         assert_eq!(cold.hold(&b.key), None);
         assert_eq!(
