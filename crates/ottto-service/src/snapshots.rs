@@ -38074,7 +38074,7 @@ struct CandidateFile {
     opened_object_identity: String,
     /// The ctime (unix nanos) in the opened-object identity that
     /// `source_file_fingerprint` used: the live one, or the entry's stored
-    /// one when size, mtime and birth are unchanged (Claude and Codex only).
+    /// one when size, mtime and birth are unchanged.
     fingerprint_changed_nanos: u64,
     /// The live file birth (unix nanos) of that open; zero if unavailable.
     fingerprint_birth_nanos: u64,

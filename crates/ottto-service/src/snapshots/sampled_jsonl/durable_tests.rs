@@ -1622,7 +1622,7 @@ fn pi_section_absent_or_not_refilled_is_corrupt_t14() {
     assert!(decode(&stripped, SnapshotSource::Pi).is_err());
     assert_eq!(verified_without_allocation(&stripped), Err(Corrupt));
     let mut d = Dec::new(&stripped);
-    d.require_pi_section();
+    d.require_section();
     CachedJsonlReduction::take(&mut d).unwrap();
     Rederive::take(&mut d).unwrap();
     assert_eq!(
@@ -1632,7 +1632,7 @@ fn pi_section_absent_or_not_refilled_is_corrupt_t14() {
     );
     let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
     let mut d = Dec::new(&body);
-    d.require_pi_section();
+    d.require_section();
     CachedJsonlReduction::take(&mut d).unwrap();
     Rederive::take(&mut d).unwrap();
     let mut section = PiSection::section(&mut d).unwrap();

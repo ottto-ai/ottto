@@ -109,6 +109,8 @@ impl Enc {
         tag: u64,
         put: impl FnOnce(&mut Enc) -> Result<(), Refuse>,
     ) -> Result<(), Refuse> {
+        // Only record bytes carry sections; no digest hashes one.
+        debug_assert!(!self.hashing(), "a section in a hash sink");
         self.varint(tag)?;
         let Sink::Bytes { out, .. } = &self.sink else {
             return Err(Refuse::UnknownLabel);
@@ -185,7 +187,8 @@ impl Enc {
 pub(crate) struct Dec<'a> {
     bytes: &'a [u8],
     at: usize,
-    pi_section: Option<bool>,
+    /// A section the body must carry: `Some(false)` until it is read.
+    required_section: Option<bool>,
 }
 
 impl<'a> Dec<'a> {
@@ -193,7 +196,7 @@ impl<'a> Dec<'a> {
         Self {
             bytes,
             at: 0,
-            pi_section: None,
+            required_section: None,
         }
     }
     pub(crate) fn raw(&mut self, len: usize) -> Result<&'a [u8], Corrupt> {
@@ -235,14 +238,14 @@ impl<'a> Dec<'a> {
     pub(crate) fn remaining(&self) -> usize {
         self.bytes.len() - self.at
     }
-    pub(crate) fn require_pi_section(&mut self) {
-        self.pi_section = Some(false);
+    pub(crate) fn require_section(&mut self) {
+        self.required_section = Some(false);
     }
-    pub(crate) fn refilled_pi_section(&mut self) {
-        self.pi_section = Some(true);
+    pub(crate) fn refilled_section(&mut self) {
+        self.required_section = Some(true);
     }
     pub(crate) fn finish(self) -> Result<(), Corrupt> {
-        (self.at == self.bytes.len() && self.pi_section != Some(false))
+        (self.at == self.bytes.len() && self.required_section != Some(false))
             .then_some(())
             .ok_or(Corrupt)
     }
@@ -584,7 +587,7 @@ fn verify_entries<'a, K: Ord>(
             let mut earlier = Dec {
                 bytes: d.bytes,
                 at: start,
-                pi_section: None,
+                required_section: None,
             };
             for _ in 0..i {
                 if key(&mut earlier)? == current {

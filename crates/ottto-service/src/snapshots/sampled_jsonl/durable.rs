@@ -66,6 +66,7 @@ impl PiSection {
         }
         let keys = &reduction.accumulator.seen_pi_usage_keys;
         if keys.len() > PI_LEDGER_MAX_KEYS {
+            // Not an E field: only this static class leaves the codec.
             return Err(Refuse::NonEmpty("pi_ledger_cap"));
         }
         e.with_pi_ledger(|e| reduction.put(e))?;
@@ -86,7 +87,7 @@ impl PiSection {
     fn take_record(body: &[u8], source: SnapshotSource) -> Result<Decoded, Corrupt> {
         let mut d = Dec::new(body);
         if source == SnapshotSource::Pi {
-            d.require_pi_section();
+            d.require_section();
         }
         let mut reduction = CachedJsonlReduction::take(&mut d)?;
         let rederive = Rederive::take(&mut d)?;
@@ -97,7 +98,7 @@ impl PiSection {
             let mut section = Self::section(&mut d)?;
             reduction.accumulator.seen_pi_usage_keys = Self::take(&mut section)?.usage_keys;
             section.finish()?;
-            d.refilled_pi_section();
+            d.refilled_section();
         }
         d.finish()?;
         Ok(Decoded {
@@ -110,7 +111,7 @@ impl PiSection {
         let source = SnapshotSource::take(&mut Dec::new(body))?;
         let mut d = Dec::new(body);
         if source == SnapshotSource::Pi {
-            d.require_pi_section();
+            d.require_section();
         }
         CachedJsonlReduction::verify(&mut d)?;
         Rederive::verify(&mut d)?;
@@ -118,7 +119,7 @@ impl PiSection {
             let mut section = Self::section(&mut d)?;
             Self::verify(&mut section)?;
             section.finish()?;
-            d.refilled_pi_section();
+            d.refilled_section();
         }
         d.finish()
     }
