@@ -15,6 +15,14 @@ fn write_login(home: &Path) {
     .unwrap();
 }
 
+fn write_refreshable_login(home: &Path) {
+    write_login(home);
+    let path = home.join(".claude/.credentials.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["claudeAiOauth"]["expiresAt"] = serde_json::json!(1);
+    fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
 fn fixture_binding(home: &Path) -> Binding {
     Binding {
         provider: Provider::ClaudeCode,
@@ -305,6 +313,31 @@ fn fresh_identity_switch_and_needs_login_are_refused_without_spawning() {
         binding::recheck(&binding).unwrap_err().reason,
         Reason::SlotNeedsLogin
     );
+    fs::write(root.join(".claude/.credentials.json"), "{bad").unwrap();
+    assert_eq!(
+        binding::recheck(&binding).unwrap_err().reason,
+        Reason::SlotNotVerified
+    );
+    write_refreshable_login(root);
+    collection.state = ottto_protocol::ClaudeConfigSlotCollectionStateV1::UpkeepNotConsented;
+    save(&collection);
+    assert!(binding::recheck(&binding).is_ok());
+    let pair = ottto_protocol::AccountNicknamePairV1 {
+        source: Provider::ClaudeCode,
+        account_identifier_hash: Some(account.clone()),
+        organization_identifier_hash: Some(org.clone()),
+    };
+    assert!(nickname_target_is_current_for_user(&pair, user.clone()));
+    collection.upkeep =
+        Some(serde_json::from_value(serde_json::json!({"result":"in_progress"})).unwrap());
+    save(&collection);
+    assert_eq!(
+        binding::recheck(&binding).unwrap_err().reason,
+        Reason::SlotNotVerified
+    );
+    collection.upkeep = None;
+    collection.state = ottto_protocol::ClaudeConfigSlotCollectionStateV1::Fresh;
+    save(&collection);
     write_login(root);
 
     fs::write(
@@ -346,7 +379,7 @@ fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
     fs::create_dir(home.join(".claude")).unwrap();
     std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
     std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin);
-    write_login(&home);
+    write_refreshable_login(&home);
     let cli = bin.join("claude");
     fs::write(
         &cli,

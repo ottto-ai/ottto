@@ -97,9 +97,15 @@ pub(super) fn resolve(
                     return Err(block(Reason::AccountMismatch));
                 }
             }
+            if descriptor.collection.upkeep.as_ref().is_some_and(|status| {
+                status.result == ottto_protocol::ClaudeConfigSlotUpkeepResultV1::InProgress
+            }) {
+                return Err(block(Reason::SlotNotVerified));
+            }
             match crate::agent_status::session_launch_claude_login_state(&slot, &user.home) {
-                crate::agent_status::ClaudeLocalLoginState::AccessValid => {}
-                crate::agent_status::ClaudeLocalLoginState::RefreshPending => {
+                crate::agent_status::ClaudeLocalLoginState::AccessValid
+                | crate::agent_status::ClaudeLocalLoginState::RefreshPending => {}
+                crate::agent_status::ClaudeLocalLoginState::Unreadable => {
                     return Err(block(Reason::SlotNotVerified))
                 }
                 _ => return Err(block(Reason::SlotNeedsLogin)),

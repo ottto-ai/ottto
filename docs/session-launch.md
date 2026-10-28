@@ -21,8 +21,10 @@ or move a binding. Missing, mismatched, duplicate, or unverified logins refuse
 the launch. Prepare and consume perform this check independently. Retry,
 cancel, account mutation and restart invalidate pending handoffs.
 
-Claude also needs a currently usable exact-slot OAuth credential, classified
-locally without refresh or provider commands. Missing, cleared or unreadable
+Claude also needs a current exact-slot OAuth login, classified locally without
+refresh or provider commands. An expired access token with a live refresh token
+can open an interactive session, where the provider CLI owns renewal. A reported
+background refresh in progress blocks until it finishes. Missing, cleared or unreadable
 credentials cannot fall back to a stored Console key. Codex reads only the
 existing saved provider-verified collection and current credential claims; this
 projection performs no login/model probes, provider reads or scheduler wakeup.

@@ -64,7 +64,9 @@ pub(crate) fn interactive_probe_path(home: &Path, program: &Path) -> Option<OsSt
         Some(home.as_os_str().to_owned()),
         true,
     ) {
-        push_unique(&mut dirs, dir);
+        if dir.is_absolute() {
+            push_unique(&mut dirs, dir);
+        }
     }
     env::join_paths(dirs).ok()
 }
