@@ -725,15 +725,9 @@ fn unavailable_birth_never_adopts_a_stored_ctime() {
         // Control: the same birth adopts the stored ctime.
         let mut bound = candidate.clone();
         assert!(
-            adopt_stored_changed_time(
-                source,
-                &mut bound,
-                &fixture.index.files,
-                Some(live),
-                &mut file
-            )
-            .expect("adopt")
-            .is_some(),
+            adopt_stored_changed_time(&mut bound, &fixture.index.files, Some(live), &mut file)
+                .expect("adopt")
+                .is_some(),
             "{name}: an equal known birth adopts"
         );
         assert_eq!(bound.fingerprint_changed_nanos, stored_changed);
@@ -743,7 +737,6 @@ fn unavailable_birth_never_adopts_a_stored_ctime() {
         };
         assert_eq!(
             adopt_stored_changed_time(
-                source,
                 &mut candidate,
                 &fixture.index.files,
                 Some(unbound),
@@ -886,4 +879,39 @@ fn codex_parent_with_an_unequal_birth_refuses_its_ledger() {
         "ownership and output match a full fresh read"
     );
     let _ = fs::remove_dir_all(home);
+}
+
+/// SOURCE P2: Pi adopts metadata-only ctime changes using the shared samples.
+#[test]
+fn pi_metadata_only_changes_skip_the_reader_but_mtime_does_not() {
+    let body = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"pi-metadata-fixture\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+        "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"usage\":{\"input\":12,\"output\":4}}}\n"
+    );
+    let mut fixture = Fixture::settled(SnapshotSource::Pi, "pi-metadata", body.as_bytes());
+    let stored = fixture.fingerprint();
+    let modified = fixture.modified();
+    let mode = fixture.metadata().permissions().mode();
+    tick();
+    fs::set_permissions(&fixture.path, fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+    let (read, actual) = terminal_contract_retry::source_acquisitions(|| fixture.rescan());
+    assert_eq!(read, 0);
+    assert!(actual.is_empty(), "chmod cannot enter the native parser");
+    assert_eq!(fixture.fingerprint(), stored);
+    tick();
+    assert!(
+        set_test_xattr(&fixture.path),
+        "fixture filesystem must support xattr"
+    );
+    let (read, actual) = terminal_contract_retry::source_acquisitions(|| fixture.rescan());
+    assert_eq!(read, 0);
+    assert!(actual.is_empty(), "xattr cannot enter the native parser");
+    assert_eq!(fixture.fingerprint(), stored);
+    assert_eq!(fixture.modified(), modified);
+    fixture.set_modified(modified + std::time::Duration::from_nanos(1));
+    let (read, actual) = terminal_contract_retry::source_acquisitions(|| fixture.rescan());
+    assert_eq!(read, 1, "nanosecond mtime change requires re-read");
+    assert_eq!(actual.get(&fixture.path), Some(&1));
+    assert_ne!(fixture.fingerprint(), stored);
+    assert_eq!(fixture.rescan(), 0);
 }

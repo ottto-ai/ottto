@@ -28,7 +28,9 @@ impl Fixture {
             SnapshotSource::ClaudeCode => {
                 json!({"type":"user","sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:00:00Z", "message":{"role":"user","content":"Synthetic test"}})
             }
-            _ => unreachable!(),
+            SnapshotSource::Pi => json!({"type":"session", "version":3,
+                "id":"native-tail-fixture", "timestamp":"2026-10-07T10:00:00Z",
+                "cwd":"/synthetic/pi"}),
         };
         let fixture = Self(path);
         fixture.append(&value);
@@ -61,7 +63,10 @@ fn usage(source: SnapshotSource, n: u64, id: usize, model: &str) -> Value {
             "requestId":format!("req-{id}"), "message":{"id":format!("response-{id}"), "model":model,
             "usage":{"input_tokens":n,"cache_read_input_tokens":n/2,"output_tokens":n/10}}})
         }
-        _ => unreachable!(),
+        SnapshotSource::Pi => json!({"type":"message", "timestamp":timestamp,
+            "message":{"role":"assistant", "responseId":format!("response-{id}"),
+            "model":model, "timestamp":timestamp,
+            "usage":{"input":n,"output":n/10,"cacheRead":n/2}}}),
     }
 }
 
@@ -83,7 +88,7 @@ fn native_parser_with(
         match source {
             SnapshotSource::Codex => apply_codex_line,
             SnapshotSource::ClaudeCode => apply_claude_code_line,
-            _ => unreachable!(),
+            SnapshotSource::Pi => apply_pi_line,
         },
         Some(metadata),
         None,
@@ -1023,7 +1028,7 @@ impl ScanFixture {
         let root = match source {
             SnapshotSource::Codex => dir.join("home/.codex/sessions"),
             SnapshotSource::ClaudeCode => dir.join("home/.claude/projects"),
-            _ => unreachable!(),
+            SnapshotSource::Pi => dir.join("home/.pi/agent/sessions"),
         };
         fs::create_dir_all(&root).unwrap();
         let path = root.join(if source == SnapshotSource::Codex {
@@ -3944,4 +3949,285 @@ fn sampled_native_codex_over_cap_cache_breaks_tail_with_full_parse_parity() {
     assert_eq!(mode, ReadMode::Tail);
     assert_eq!(body, oracle(&fixture, source));
     assert_eq!(uploaded_cache_breaks(&body), (first, &json!(6)));
+}
+
+thread_local! {
+    pub(super) static PI_LEGACY_HASH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[test]
+fn pi_h_keys_preserve_the_legacy_reducer_body() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PI_LEGACY_HASH.with(|old| old.set(false));
+        }
+    }
+    let _reset = Reset;
+    let source = SnapshotSource::Pi;
+    let fixture = Fixture::new(source);
+    for (shape, n, id) in [
+        ("message", 100, 0),
+        ("message", 100, 0),
+        ("message_end", 100, 0),
+        ("message_end", 100, 0),
+        ("message_end", 200, 1),
+        ("message", 200, 1),
+        ("message", 300, 2),
+    ] {
+        let mut line = usage(source, n, id, "fixture-model");
+        line["type"] = json!(shape);
+        fixture.append(&line);
+    }
+    let parse = || {
+        let (mut parser, expected, _) = native_parser(&fixture, source);
+        while !parser.step().unwrap() {}
+        let keys = parser
+            .accumulator
+            .seen_pi_usage_keys
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let parsed = parser
+            .finish(
+                &expected,
+                &fixture.0,
+                NOW,
+                "native-fixture".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        (serde_json::to_vec(&parsed.snapshots).unwrap(), keys)
+    };
+    PI_LEGACY_HASH.with(|old| old.set(true));
+    let (legacy, raw_keys) = parse();
+    assert!(raw_keys.iter().any(|key| key == "response-0"));
+    PI_LEGACY_HASH.with(|old| old.set(false));
+    let (hashed, keys) = parse();
+    assert_eq!(
+        hashed, legacy,
+        "hash representation cannot change emitted bytes"
+    );
+    assert!(!keys.is_empty());
+    assert!(keys.iter().all(|key| key.len() == 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))));
+    assert_ne!(
+        pi_usage_hash("ottto-pi-usage-key:v1", &["ab", "c"]),
+        pi_usage_hash("ottto-pi-usage-key:v1", &["a", "bc"])
+    );
+    assert_ne!(
+        pi_usage_hash("ottto-pi-usage-key:v1", &["id"]),
+        pi_usage_hash("ottto-pi-usage-occurrence:v1", &["id"])
+    );
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_ram_tail_ignores_age_clock_and_audit_slot_pressure() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            sampled_scan::set_test_now(None);
+        }
+    }
+    let _reset = Reset;
+    const START: u64 = 1_800_000_000;
+    let source = SnapshotSource::Pi;
+    for (label, clock, pending) in [
+        ("aged", START + 7_200, 0),
+        ("clock", START - 1, 0),
+        ("slots", START + 7_200, 300),
+    ] {
+        sampled_scan::set_test_now(Some(START));
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (mut index, initial, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            label,
+        );
+        assert_eq!(modes, (1, 0, 0));
+        assert!(!initial.snapshots.is_empty());
+        let key = local_index_key(&fixture.file.0);
+        for n in 0..pending {
+            let mut entry = index.files[&key].clone();
+            entry.set_unverified_deadline(START + 1);
+            index.files.insert(format!("/synthetic-pending/{n}"), entry);
+        }
+        sampled_scan::set_test_now(Some(clock));
+        let ((quiet, _, modes, bytes), reads) =
+            terminal_contract_retry::source_acquisitions(|| {
+                production_scan_at(&fixture, source, index, Some(cache.clone()), label, NOW)
+            });
+        assert!(reads.is_empty(), "idle Pi never enters the native reader");
+        assert_eq!(modes, (0, 0, 0));
+        assert_eq!(bytes, (0, 0));
+        let before = fs::metadata(&fixture.file.0).unwrap().len();
+        fixture.file.append(&usage(source, 200, 1, "fixture-model"));
+        let suffix = fs::metadata(&fixture.file.0).unwrap().len() - before;
+        let ((_, tail, modes, bytes), counts) = observe(|| {
+            production_scan_at_with_setup(
+                &fixture,
+                source,
+                quiet.clone(),
+                Some(cache.clone()),
+                label,
+                NOW,
+                |scan| {
+                    let context = scan.sampling.as_ref().unwrap();
+                    if pending > 0 {
+                        assert_eq!(context.audit_slots, 0);
+                    }
+                },
+            )
+        });
+        assert_eq!(
+            modes,
+            (0, 1, 0),
+            "{label}: no AuditDue or ClockChanged Full"
+        );
+        assert_eq!(bytes.0, suffix, "only appended body bytes are consumed");
+        assert_eq!(counts.pi, 0);
+        let (_, full, _) = production_scan(&fixture, source, quiet, None, label);
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_recordless_restart_and_eviction_full_only_on_change() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let source = SnapshotSource::Pi;
+    for evict in [false, true] {
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (index, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "pi-recordless",
+        );
+        assert_eq!(modes, (1, 0, 0));
+        let state = fixture.dir.join("index.json");
+        let mut saved = index;
+        saved.save(&state).unwrap();
+        let cache = if evict {
+            cache.clear();
+            cache
+        } else {
+            Arc::new(sampled_scan::SharedCache::default())
+        };
+        assert!(cache.durable_counters(source).is_none());
+        let ((quiet, _, modes, bytes), reads) =
+            terminal_contract_retry::source_acquisitions(|| {
+                production_scan_at(
+                    &fixture,
+                    source,
+                    ScanIndex::load(&state).unwrap(),
+                    Some(cache.clone()),
+                    "pi-recordless",
+                    NOW,
+                )
+            });
+        assert!(reads.is_empty(), "restart and eviction cannot read idle Pi");
+        assert_eq!((modes, bytes), ((0, 0, 0), (0, 0)));
+        fixture.file.append(&usage(source, 200, 1, "fixture-model"));
+        let ((index, _, modes, _), counts) = observe(|| {
+            production_scan_at(
+                &fixture,
+                source,
+                quiet,
+                Some(cache.clone()),
+                "pi-recordless",
+                NOW,
+            )
+        });
+        assert_eq!(modes, (1, 0, 0));
+        assert_eq!(counts.pi, 1, "one counted transitional pi Full");
+        let ((_, _, modes, _), counts) = observe(|| {
+            production_scan_at(
+                &fixture,
+                source,
+                index,
+                Some(cache.clone()),
+                "pi-recordless",
+                NOW,
+            )
+        });
+        assert_eq!(modes, (0, 0, 0));
+        assert_eq!(counts.pi, 0);
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_retention_refusal_is_cache_only_and_counts_bytes() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let source = SnapshotSource::Pi;
+    let fixture = Fixture::new(source);
+    let (mut parser, _, scope) = native_parser(&fixture, source);
+    parser
+        .prepare_acquisition(None, &scope, None, 1_800_000_000)
+        .unwrap();
+    while !parser.step().unwrap() {}
+    for n in 0..8_000 {
+        parser
+            .accumulator
+            .seen_pi_usage_keys
+            .insert(format!("{n:064x}"), PiUsageDedupState::default());
+    }
+    let charge = crate::heap_layout_bound::completed_bound(&parser.accumulator, usize::MAX)
+        .unwrap()
+        + std::mem::size_of::<sampled_jsonl::CachedJsonlReduction>()
+        - std::mem::size_of::<SnapshotAccumulator>();
+    assert!(charge > crate::transcript_cache::ENTRY_BYTES);
+    assert!(parser
+        .retention_bound(crate::transcript_cache::ENTRY_BYTES)
+        .is_none());
+    let (completed, counts) = observe(|| {
+        parser
+            .retain_reduction(
+                &scope,
+                1_800_000_000,
+                sampled_scan::RetainBudget::granted_unclassified(usize::MAX),
+            )
+            .unwrap()
+            .unwrap()
+    });
+    assert!(completed.reduction.is_none());
+    assert_eq!(counts.retention_bound_refused, 1);
+    assert_eq!(counts.retention_bound_refused_pi, 1);
+    assert_eq!(counts.retention_bound_refused_pi_bytes, charge as u64);
+    assert!(sampled_scan::SharedCache::default()
+        .durable_counters(source)
+        .is_none());
+    let control_fixture = Fixture::new(SnapshotSource::ClaudeCode);
+    let (mut control, _, control_scope) =
+        native_parser(&control_fixture, SnapshotSource::ClaudeCode);
+    control
+        .prepare_acquisition(None, &control_scope, None, 1_800_000_000)
+        .unwrap();
+    while !control.step().unwrap() {}
+    let (_, counts) = observe(|| {
+        control
+            .retain_reduction(
+                &control_scope,
+                1_800_000_000,
+                sampled_scan::RetainBudget::granted_unclassified(0),
+            )
+            .unwrap()
+    });
+    assert_eq!(counts.retention_bound_refused, 1);
+    assert_eq!(counts.retention_bound_refused_pi, 0);
+    assert_eq!(counts.retention_bound_refused_pi_bytes, 0);
 }

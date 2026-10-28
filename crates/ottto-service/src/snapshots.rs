@@ -4354,7 +4354,7 @@ pub struct ScanIndexEntry {
     )]
     pub codex_counting_owner: Option<String>,
     /// The ctime (unix nanos) in the opened-object identity that produced
-    /// `source_file_fingerprint` (Claude and Codex only). With size, mtime
+    /// `source_file_fingerprint` (all three sources). With size, mtime
     /// and file birth unchanged the next scan rebuilds the identity from it,
     /// so a ctime-only change never triggers a re-read. Older binaries drop
     /// it; zero keeps the live-identity comparison once.
@@ -32155,6 +32155,16 @@ impl OwnedSourceScan {
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
+                if source == SnapshotSource::Pi
+                    && mode
+                        == crate::transcript_acquisition::ReadMode::Full(
+                            crate::transcript_acquisition::FullReason::StateMissing,
+                        )
+                {
+                    crate::local_resource_diagnostics::cache_lifecycle::record(
+                        crate::local_resource_diagnostics::cache_lifecycle::Event::Pi,
+                    );
+                }
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
@@ -37542,6 +37552,7 @@ fn pi_usage_dedup_key(value: &Value) -> Option<String> {
         .or_else(|| string_at(value, &["message", "response_id"]))
         .or_else(|| string_at(value, &["responseId"]))
         .or_else(|| string_at(value, &["response_id"]))
+        .map(|id| pi_usage_hash("ottto-pi-usage-key:v1", &[&id]))
 }
 
 fn apply_pi_usage_line(
@@ -37575,6 +37586,25 @@ fn apply_pi_usage_line(
     }
 }
 
+/// Domain and each part use a u64 little-endian byte length followed by
+/// UTF-8 bytes. NULs within provider ids or selector values stay unambiguous.
+fn pi_usage_hash(domain: &str, parts: &[&str]) -> String {
+    #[cfg(test)]
+    if transcript_acquisition_tests::PI_LEGACY_HASH.with(std::cell::Cell::get) {
+        return if domain == "ottto-pi-usage-key:v1" {
+            parts[0].to_owned()
+        } else {
+            sha256_hex(parts)
+        };
+    }
+    let mut hash = Sha256::new();
+    for part in std::iter::once(domain).chain(parts.iter().copied()) {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
 fn pi_usage_occurrence_digest(
     model: Option<&str>,
     usage: &UsageTotals,
@@ -37582,28 +37612,31 @@ fn pi_usage_occurrence_digest(
     timestamp: Option<&str>,
 ) -> String {
     let selector_context = serde_json::to_string(&selector.context).unwrap_or_default();
-    sha256_hex(&[
-        model.unwrap_or(""),
-        &timestamp
-            .and_then(pi_usage_timestamp_identity)
-            .unwrap_or_default(),
-        &usage.input_tokens.to_string(),
-        &usage.output_tokens.to_string(),
-        &usage.cache_read_tokens.to_string(),
-        &usage.cache_creation_5m_tokens.to_string(),
-        &usage.cache_creation_1h_tokens.to_string(),
-        &usage.reasoning_output_tokens.to_string(),
-        &usage.unattributed_total_tokens.to_string(),
-        &usage.request_count.to_string(),
-        &usage.costs.observed.to_string(),
-        &usage.costs.reported.to_string(),
-        &format!("{:?}", usage.costs.total),
-        &format!("{:?}", usage.costs.input),
-        &format!("{:?}", usage.costs.output),
-        &format!("{:?}", usage.costs.cache_read),
-        &format!("{:?}", usage.costs.cache_creation),
-        &selector_context,
-    ])
+    pi_usage_hash(
+        "ottto-pi-usage-occurrence:v1",
+        &[
+            model.unwrap_or(""),
+            &timestamp
+                .and_then(pi_usage_timestamp_identity)
+                .unwrap_or_default(),
+            &usage.input_tokens.to_string(),
+            &usage.output_tokens.to_string(),
+            &usage.cache_read_tokens.to_string(),
+            &usage.cache_creation_5m_tokens.to_string(),
+            &usage.cache_creation_1h_tokens.to_string(),
+            &usage.reasoning_output_tokens.to_string(),
+            &usage.unattributed_total_tokens.to_string(),
+            &usage.request_count.to_string(),
+            &usage.costs.observed.to_string(),
+            &usage.costs.reported.to_string(),
+            &format!("{:?}", usage.costs.total),
+            &format!("{:?}", usage.costs.input),
+            &format!("{:?}", usage.costs.output),
+            &format!("{:?}", usage.costs.cache_read),
+            &format!("{:?}", usage.costs.cache_creation),
+            &selector_context,
+        ],
+    )
 }
 
 fn pi_message_text(value: &Value) -> Option<String> {
@@ -38087,7 +38120,7 @@ struct CandidateFile {
     opened_object_identity: String,
     /// The ctime (unix nanos) in the opened-object identity that
     /// `source_file_fingerprint` used: the live one, or the entry's stored
-    /// one when size, mtime and birth are unchanged (Claude and Codex only).
+    /// one when size, mtime and birth are unchanged.
     fingerprint_changed_nanos: u64,
     /// The live file birth (unix nanos) of that open; zero if unavailable.
     fingerprint_birth_nanos: u64,
@@ -42167,12 +42200,8 @@ fn open_candidate_file_stat_retained(
         .map(|cache| (cache, candidate.path.as_path()));
     let (identity, stat) = opened_object_identity_and_stat_retained(source, &mut file, retained)?;
     candidate.opened_object_identity = identity;
-    let tracked =
-        stat.filter(|_| matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex));
-    candidate.fingerprint_changed_nanos = tracked.map_or(0, |stat| stat.changed_unix_nanos());
-    candidate.fingerprint_birth_nanos = tracked
-        .and_then(|stat| stat.birth_nanos)
-        .unwrap_or_default();
+    candidate.fingerprint_changed_nanos = stat.map_or(0, |stat| stat.changed_unix_nanos());
+    candidate.fingerprint_birth_nanos = stat.and_then(|stat| stat.birth_nanos).unwrap_or_default();
     let metadata = file.metadata()?;
     candidate.physical_identity = physical_identity(&metadata);
     let modified = metadata.modified().ok();
@@ -42283,7 +42312,7 @@ fn open_and_identify_scan_candidate_with_rescue(
     // `opened_object_identity` stays the live identity: the parse-time TOCTOU
     // check compares against it. Only the re-read trigger uses the adoption.
     let Ok(adopted_identity) =
-        adopt_stored_changed_time(source, &mut candidate, files, live, &mut opened_file)
+        adopt_stored_changed_time(&mut candidate, files, live, &mut opened_file)
     else {
         census.record_unreadable(UnreadableCause::OpenRead, 1);
         return None;
@@ -42526,15 +42555,11 @@ fn opened_object_identity_and_stat_retained(
 /// the live identity and reads.
 /// Returns the opened-object identity to fingerprint with, if adopted.
 fn adopt_stored_changed_time(
-    source: SnapshotSource,
     candidate: &mut CandidateFile,
     files: &BTreeMap<String, ScanIndexEntry>,
     live: Option<OpenedObjectStat>,
     file: &mut File,
 ) -> std::io::Result<Option<String>> {
-    if !matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
-        return Ok(None);
-    }
     let (Some(entry), Some(live)) = (files.get(&local_index_key(&candidate.path)), live) else {
         return Ok(None);
     };

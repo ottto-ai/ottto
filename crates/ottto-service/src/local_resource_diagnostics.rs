@@ -1778,7 +1778,16 @@ mod tests {
         assert_eq!(record["counts"]["take_poisoned_lock"], u64::MAX);
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
-        assert!(serde_json::to_string(record).unwrap().len() < 2048);
+        for key in [
+            "cache_evicted_by_pi_claude_code",
+            "cache_evicted_by_pi_codex",
+            "retention_bound_refused_pi",
+            "retention_bound_refused_pi_bytes",
+            "pi",
+        ] {
+            assert_eq!(record["counts"][key], u64::MAX);
+        }
+        assert!(serde_json::to_string(record).unwrap().len() < 2560);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);

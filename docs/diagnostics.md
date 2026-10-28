@@ -749,3 +749,24 @@ counts. Callers close the decoder and explicitly release after Stores drops.
 Fallback Drop release counts `codex_zst_owner.counts.leaked_release`; it is a
 cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
+
+Pi joins the shared sampled RAM reader. Its `native_collection_page` acquisition
+counts report Full, Tail and Unchanged decisions with the actual planner reasons.
+Audit age, clock changes and audit-slot pressure do not gate checkpoint reuse.
+Until Pi durable records are enabled, a changed file without a RAM reduction
+still reads Full: the transitional `pi` leaf in `retained_cache_page_events`
+counts that attempt once at read start, alongside `state_missing`. Restart or
+RAM eviction never triggers a read of an idle file. This is a staged exception;
+it does not turn a cache miss into a first-read authorization.
+
+The same #799 page line (source `pi`) reports cache-only
+`retention_bound_refused_pi` events and `retention_bound_refused_pi_bytes`:
+the completed reduction's measured allocation charge, summed across refusals.
+`retention_bound_refused_pi_bytes_unavailable` counts refusals whose charge could
+not be measured; zero bytes with that count is unavailable, not a zero-sized
+copy. These counters do not mean a durable write was attempted or refused.
+`cache_evicted_by_pi_claude_code` and `cache_evicted_by_pi_codex` count respective
+victims removed by Pi cache insertion. They also appear on the existing
+`process_retained_cache_lifecycle_totals` line (source `unknown`): cumulative,
+saturating process totals since startup, shared across namespaces. They are
+counts and bytes only, with no file names, response ids or content.
