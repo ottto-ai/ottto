@@ -320,6 +320,13 @@ fn refused_header_admission_does_not_spend_a_decode_attempt() {
             .is_err());
     });
     assert_eq!(decodes(&rows), 0);
+    assert_eq!(
+        rows.iter()
+            .filter_map(|r| r["counts"]["codex_zst_refused"]["CompressedAdmissionRefused"].as_u64())
+            .count(),
+        1
+    );
+    assert!(!rows.iter().any(|r| r["stage"] == "codex_zst_inventory"));
     assert!(!state.files.contains_key(&local_index_key(&f.0)));
     occupied.close();
     assert_eq!(decodes(&header_inventory(&f, &mut state, &cache)), 1);

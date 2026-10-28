@@ -641,14 +641,13 @@ impl super::ScanIndex {
         let started = thread_cpu_micros();
         let mut evidence = ArchiveEvidence::begin(&file, &candidate.path, old)?;
         evidence.disposition = ArchiveDisposition::HeaderValidated;
-        let mut input =
-            match cache.and_then(|cache| OpenedInput::funded(file, cache).ok().flatten()) {
-                Some(input) => input.header_only(),
-                None => {
-                    codex_zst_refused(CodexZstCause::AdmissionRefused);
-                    anyhow::bail!("archive header admission unavailable");
-                }
-            };
+        let mut input = match cache.map(|cache| OpenedInput::funded(file, cache)) {
+            Some(Ok(input)) => input.context("header admission unavailable")?.header_only(),
+            _ => {
+                codex_zst_refused(CodexZstCause::AdmissionRefused);
+                anyhow::bail!("archive header admission unavailable");
+            }
+        };
         evidence.header_attempted = true;
         self.files.entry(key.clone()).or_default().archive = Some(Box::new(evidence));
         let mut bytes = Vec::new();
