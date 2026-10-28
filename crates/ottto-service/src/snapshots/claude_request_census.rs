@@ -1,10 +1,9 @@
 //! Slice D1: one durable request-census record per Claude transcript (index
-//! key), bound to the exact revision and census window that produced it, plus
-//! a shadow of the convergence predicate those records would allow.
+//! key), bound to the exact revision and census window that produced it.
 //!
 //! A record is local-only and content-free: the sorted 8-byte SHA-256 prefixes
 //! of the provider request ids one parse saw. It is never proof, usage or
-//! upload input. D1 only produces, persists, prunes and measures records; no
+//! upload input. D1 only produces, persists, prunes and retires records; no
 //! fence, coverage, posture or upload decision reads them. The narrowed
 //! unhealthy-retry carry conservatively refuses its per-family exception
 //! on saved negative evidence for loss or incomplete identity, and uses a
@@ -19,15 +18,19 @@
 
 use super::{
     claude_index_path_family_member, claude_snapshot_family_root_ref, rfc3339_unix_seconds,
-    ClaudeRequestCensusShadowCounts, ScanIndex, ScanIndexEntry, SnapshotItem,
-    MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+    ScanIndex, SnapshotItem,
 };
+#[cfg(test)]
+use super::{ClaudeRequestCensusShadowCounts, ScanIndexEntry, MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS};
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+#[cfg(test)]
+use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -136,6 +139,7 @@ pub(crate) const MAX_RAW_BYTES: usize = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYT
 /// base64, plus fixed fields. Legacy hex records were bounded by the old
 /// 1,048,576-hash budget (16 MiB), which fits too.
 pub(crate) const MAX_RECORD_BYTES: usize = base64_len(MAX_CLAUDE_REQUEST_CENSUS_HASHES) + 4096;
+#[cfg(test)]
 const MAX_SHADOW_WORKSPACE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES: usize = 4_096;
 /// Longest scalar string the decoder copies (a fingerprint is 64 bytes).
@@ -189,6 +193,7 @@ impl ClaudeRequestCensusShape {
     }
 
     /// The record leaves its own family census-unknown.
+    #[cfg(test)]
     fn unknown(self) -> bool {
         matches!(self, Self::IdentityIncomplete | Self::Lossy)
     }
@@ -1261,19 +1266,14 @@ impl ClaudeRequestCensus {
     }
 }
 
-/// `ScanIndex::claude_request_census_shadow`: the little the shadow needs to
-/// remember between terminals. Count-only; nothing reads it into a decision.
+/// Count-only derivation drift; nothing reads it into a decision.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ClaudeRequestCensusShadowState {
-    /// `would_open` at the previous complete terminal.
-    would_open: Option<bool>,
-    /// Terminals whose `would_open` differed from the previous one.
-    would_open_flips: u64,
     /// S3(d) tripwire: a verified complete re-parse at an unchanged
     /// fingerprint and derivation changed the hash set or shape.
     derivation_drift: u64,
 }
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; would_open, would_open_flips, derivation_drift);
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; derivation_drift);
 
 impl ClaudeRequestCensusShadowState {
     pub(crate) fn is_empty(&self) -> bool {
@@ -1377,12 +1377,6 @@ impl Serialize for ClaudeRequestCensus {
 impl Serialize for ClaudeRequestCensusShadowState {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        if let Some(would_open) = self.would_open {
-            map.serialize_entry("o", &would_open)?;
-        }
-        if self.would_open_flips > 0 {
-            map.serialize_entry("f", &self.would_open_flips)?;
-        }
         if self.derivation_drift > 0 {
             map.serialize_entry("d", &self.derivation_drift)?;
         }
@@ -1972,11 +1966,8 @@ impl<'de> Visitor<'de> for ShadowStateVisitor {
         let mut state = ClaudeRequestCensusShadowState::default();
         while let Some(field) = map.next_key::<String>()? {
             let value = map.next_value::<Loose>()?;
-            match (field.as_str(), value) {
-                ("o", Loose::Bool(would_open)) => state.would_open = Some(would_open),
-                ("f", Loose::U64(flips)) => state.would_open_flips = flips,
-                ("d", Loose::U64(drift)) => state.derivation_drift = drift,
-                _ => {}
+            if let ("d", Loose::U64(drift)) = (field.as_str(), value) {
+                state.derivation_drift = drift;
             }
         }
         Ok(state)
@@ -2785,15 +2776,13 @@ pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Pat
     }
 }
 
-/// Complete Claude terminal, before any join and before the snapshot_sync
-/// folds: prune records of keys neither indexed nor walked this generation,
-/// then measure the shadow census. Nothing reads the result into a decision.
+/// Complete Claude terminal, before the snapshot_sync folds: prune records
+/// of keys neither indexed nor walked this generation, then retire old records.
 pub(crate) fn settle_claude_request_census_terminal(
     index: &mut ScanIndex,
     observed_index_keys: &BTreeSet<String>,
-    residue_index_keys: &BTreeSet<String>,
     census_window_end: &str,
-) -> ClaudeRequestCensusShadowCounts {
+) {
     let files = &index.files;
     let vanished = index
         .claude_request_census
@@ -2801,30 +2790,13 @@ pub(crate) fn settle_claude_request_census_terminal(
     let window = rfc3339_unix_seconds(census_window_end).unwrap_or_default();
     let aged = retire_claude_transcript_records(index, window);
     note_transcript_retirements(aged, vanished);
-    let join = ClaudeRequestCensusJoin::new(index, window, residue_index_keys);
-    let mut counts = join.counts(true);
-    let state = &mut index.claude_request_census_shadow;
-    if state
-        .would_open
-        .is_some_and(|before| before != counts.would_open)
-    {
-        state.would_open_flips = state.would_open_flips.saturating_add(1);
-    }
-    state.would_open = Some(counts.would_open);
-    counts.would_open_flips = state.would_open_flips;
-    counts.derivation_drift = state.derivation_drift;
-    counts.json_bytes = serialized_bytes(&index.claude_request_census);
-    counts.heap_bytes =
-        crate::heap_layout_bound::completed_bound(&index.claude_request_census, usize::MAX)
-            .unwrap_or_default();
-    counts
 }
 
 /// A transcript is retired 35 days after its last modification.
 pub(crate) const CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS: u64 = 35 * 24 * 60 * 60;
 
 /// Process counters of transcript retirements (aged, vanished) for the P1
-/// shadow line; D1's counts are unchanged.
+/// shadow line.
 static TRANSCRIPT_RETIRED: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -2898,25 +2870,10 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
     aged
 }
 
-fn serialized_bytes(census: &ClaudeRequestCensus) -> usize {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = Count(0);
-    serde_json::to_writer(&mut count, census).map_or(0, |()| count.0)
-}
-
 /// Per-key answer for Context 2c and D2's posture seam. D1 computes it only in
 /// tests; nothing in production reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) enum ClaudeCensusMemberStatus {
     /// The predicate holds, the own record is Exact or Empty from a verified
     /// parse, the own family is not census-unknown, and no hash of the record
@@ -2934,6 +2891,7 @@ pub(crate) enum ClaudeCensusMemberStatus {
 
 /// Why a key has no record that would cover it, first match wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum ClaudeRequestCensusCoverage {
     /// Record fingerprint equals the key's non-empty entry fingerprint.
     Fingerprint,
@@ -2949,6 +2907,7 @@ enum ClaudeRequestCensusCoverage {
     Migrate,
 }
 
+#[cfg(test)]
 impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestCensusCoverage {
     const INLINE_ONLY: bool = true;
     const STABLE_HEAP: bool = true;
@@ -2962,6 +2921,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestCensusCoverage {
 /// duplicates) and the census-unknown families. Coverage, path-owner, shared
 /// and unknown-key trees plus merge buffers are bounded before allocation;
 /// their peak requested layout is reported separately. No hash is copied.
+// Live census/load/retirement tests use this join as their member-status oracle.
+#[cfg(test)]
 pub(crate) struct ClaudeRequestCensusJoin {
     counts: ClaudeRequestCensusShadowCounts,
     coverage: BTreeMap<String, ClaudeRequestCensusCoverage>,
@@ -2969,6 +2930,7 @@ pub(crate) struct ClaudeRequestCensusJoin {
     unknown_roots: BTreeSet<String>,
 }
 
+#[cfg(test)]
 impl ClaudeRequestCensusJoin {
     pub(crate) fn new(
         index: &ScanIndex,
@@ -3268,7 +3230,6 @@ impl ClaudeRequestCensusJoin {
             && counts.duplicate_owner_entries <= MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn member_status(
         &self,
         index: &ScanIndex,
@@ -3296,14 +3257,6 @@ impl ClaudeRequestCensusJoin {
             ClaudeCensusMemberStatus::Unverified
         } else {
             ClaudeCensusMemberStatus::Disjoint
-        }
-    }
-
-    fn counts(&self, census_complete: bool) -> ClaudeRequestCensusShadowCounts {
-        ClaudeRequestCensusShadowCounts {
-            would_open: self.disjointness_complete(census_complete),
-            shared_keys: self.shared_keys.len(),
-            ..self.counts
         }
     }
 }
@@ -3451,7 +3404,9 @@ impl ClaudeRequestCensus {
         self.serialized_total
     }
     pub(crate) fn exact_serialized_len_for_test(&self) -> usize {
-        serialized_bytes(self)
+        serde_json::to_vec(self)
+            .expect("census serialization")
+            .len()
     }
     pub(crate) fn record_for_test(&self, key: &str) -> Option<&ClaudeRequestCensusRecord> {
         self.records.get(key)
@@ -3480,9 +3435,6 @@ impl ClaudeRequestCensus {
 impl ClaudeRequestCensusShadowState {
     pub(crate) fn derivation_drift_for_test(&self) -> u64 {
         self.derivation_drift
-    }
-    pub(crate) fn would_open_for_test(&self) -> Option<bool> {
-        self.would_open
     }
 }
 
@@ -3710,8 +3662,6 @@ mod reader_regression_tests {
             }))
             .expect("valid evidence"),
             claude_request_census_shadow: ClaudeRequestCensusShadowState {
-                would_open: Some(true),
-                would_open_flips: 7,
                 derivation_drift: 0,
             },
             ..ScanIndex::default()

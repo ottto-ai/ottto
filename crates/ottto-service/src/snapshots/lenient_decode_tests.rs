@@ -2017,7 +2017,7 @@ fn every_persisted_field_fixture() -> ScanIndex {
             "claude_request_census" => {
                 serde_json::json!({"/synthetic/0.jsonl":{"v":claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,"fp":"a".repeat(64),"w":7,"s":"exact","b":"AAAAAAAAAAE="}})
             }
-            "claude_request_census_shadow" => serde_json::json!({"o":true}),
+            "claude_request_census_shadow" => serde_json::json!({"d":1}),
             "reread_guard" => serde_json::json!({"closed":true}),
             "claude_retired_family_tombstones" => {
                 serde_json::json!({"a".repeat(64): 1})

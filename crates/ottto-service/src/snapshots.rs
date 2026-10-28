@@ -3500,7 +3500,7 @@ pub struct ScanIndex {
     /// never the index.
     #[serde(default, skip_serializing_if = "ClaudeRequestCensus::is_empty")]
     claude_request_census: ClaudeRequestCensus,
-    /// Slice D1: count-only shadow memory between complete terminals.
+    /// Count-only derivation drift (retained independently of terminal measurement).
     #[serde(
         default,
         skip_serializing_if = "ClaudeRequestCensusShadowState::is_empty"
@@ -7063,9 +7063,6 @@ pub struct ClaudeDuplicateCensusCounts {
     pub full_rearm: bool,
     pub rearm_attempt: u8,
     pub full_rearm_deferred_until: Option<u64>,
-    /// Slice D1 shadow, present only on a complete Claude terminal scan.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_census: Option<ClaudeRequestCensusShadowCounts>,
 }
 
 /// Fix 1 disclosure for one complete Claude terminal, logged beside the
@@ -7094,17 +7091,10 @@ impl ClaudeFullRearmSuppressionCounts {
     }
 }
 
-/// Slice D1: the request-census shadow, measured by the scan on a complete
-/// Claude terminal before any fold and reported beside the duplicate-census
-/// counters. Content-free counts; nothing reads them into a decision.
-/// `would_open` is whether every indexed Claude family-member key (not
-/// confirmed empty) has a record covering it, by fingerprint or by this
-/// census window, within the hash budget and the duplicate-owner bound.
-/// `missing_*` name, first match wins, why the other keys are not covered.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+/// Test oracle workspace for live census, copy-holder and retirement behavior.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClaudeRequestCensusShadowCounts {
-    pub would_open: bool,
-    pub would_open_flips: u64,
     pub family_keys: usize,
     pub covered_by_fingerprint: usize,
     pub covered_by_window: usize,
@@ -7131,10 +7121,6 @@ pub struct ClaudeRequestCensusShadowCounts {
     pub transient_peak_bytes: usize,
     pub duplicate_hashes: usize,
     pub duplicate_owner_entries: usize,
-    pub shared_keys: usize,
-    pub derivation_drift: u64,
-    pub json_bytes: usize,
-    pub heap_bytes: usize,
 }
 
 /// Content-free first-proof hold counters for one Claude fold, never a
@@ -7321,9 +7307,6 @@ pub struct SourceScanResult {
     pub(crate) codex_counting_v2: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
     codex_join_validation: Option<codex_file_join::Validation>,
     codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
-    /// Slice D1 shadow, measured by a complete Claude terminal scan before
-    /// any fold. Count-only; the usage fold copies it into its counters.
-    pub(crate) claude_request_census_shadow: Option<ClaudeRequestCensusShadowCounts>,
     /// Stage 1 hunk A: the paused cursor job's continuation ticket, minted
     /// at this page's pause (`PauseEnd::Paused` only). None on every other
     /// end, and on an unaccelerated attempt.
@@ -8597,7 +8580,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
             .map(|pending| pending.index_key.clone())
             .collect()
     };
-    let mut disposition = apply_claude_reported_usage_with_index_limits_and_current_files(
+    apply_claude_reported_usage_with_index_limits_and_current_files(
         &mut scan.snapshots,
         api_report,
         trace_report,
@@ -8611,11 +8594,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         observations,
         comparison,
         veto_api_rows,
-    );
-    // Slice D1: report only. The shadow was measured by the scan; no fold
-    // input above read it.
-    disposition.duplicate_census.request_census = scan.claude_request_census_shadow;
-    disposition
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30315,16 +30294,14 @@ impl OwnedSourceScan {
                 let census_complete = raw_census_complete
                     && !needs_clean_followup
                     && !authority_debt_withholds_census;
-                // Slice D1: prune and measure only, before any fold.
-                let claude_request_census_shadow =
-                    (source == SnapshotSource::ClaudeCode && census_complete).then(|| {
-                        claude_request_census::settle_claude_request_census_terminal(
-                            index,
-                            &traversal_snapshot.observed_index_keys,
-                            &traversal_snapshot.residue.index_keys,
-                            &census_window_end,
-                        )
-                    });
+                // Census maintenance stays before any fold.
+                if source == SnapshotSource::ClaudeCode && census_complete {
+                    claude_request_census::settle_claude_request_census_terminal(
+                        index,
+                        &traversal_snapshot.observed_index_keys,
+                        &census_window_end,
+                    );
+                }
                 let reconciliation_pending = traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation
@@ -30583,7 +30560,6 @@ impl OwnedSourceScan {
                     snapshots,
                     pending_finalization,
                     codex_legacy_join_baselines,
-                    claude_request_census_shadow,
                     continuation_ticket,
                     continuation_committed: codex_page.continuation_committed(),
                     codex_join_validation: codex_join_inventory
@@ -64624,7 +64600,6 @@ mod tests {
             full_rearm: true,
             rearm_attempt: u8::MAX,
             full_rearm_deferred_until: Some(u64::MAX),
-            request_census: None,
         };
         let encoded = serde_json::to_string(&max).expect("encode counters");
         assert!(encoded.len() <= 589, "{} bytes", encoded.len());
@@ -89713,9 +89688,10 @@ mod census_unreadable_tests {
 crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_member);
 
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
-crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
+crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until);
 crate::heap_layout_bound::fields!(ClaudeFullRearmSuppressionCounts; full_rearm_suppressed, full_rearm_skipped_invalid_unchanged, full_rearm_post_rebuild_skipped, structural_invalid_family_count, suppressed_since_unix_seconds);
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
+#[cfg(test)]
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries);
 
 #[path = "snapshots/composition_compactions.rs"]
 mod composition_compactions;
