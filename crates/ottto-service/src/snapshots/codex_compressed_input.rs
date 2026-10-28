@@ -42,7 +42,7 @@ const BUFFER_BYTES: usize = 8 * 1024;
 // Independent from the decoded-file limit: a small file may demand a huge window.
 const WINDOW_LOG: u32 = 23;
 
-fn invalid(message: &'static str) -> io::Error {
+fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
@@ -75,7 +75,6 @@ pub(super) fn compressed_input_credit() -> io::Result<usize> {
 }
 
 fn thread_cpu_micros() -> u64 {
-    // SAFETY: all-zero integer timespec fields are valid.
     let mut spec: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: valid writable timespec, querying only the current thread.
     if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } != 0 {
@@ -109,7 +108,6 @@ impl ArchiveEvidence {
             .into_iter()
             .next()
             .ok_or_else(|| invalid("compressed rollout logical id unavailable"))?;
-        let now = super::sampled_scan::now_seconds();
         let attempts = match previous
             .filter(|old| old.matches(file))
             .map(|old| &old.disposition)
@@ -131,7 +129,7 @@ impl ArchiveEvidence {
             owner: None,
             disposition: ArchiveDisposition::Pending {
                 attempts,
-                retry_after: now.saturating_add(6 * 3600),
+                retry_after: super::sampled_scan::now_seconds().saturating_add(6 * 3600),
             },
         })
     }
@@ -256,9 +254,7 @@ impl<R: Read> BoundedDecoder<R> {
             let hint = self
                 .context
                 .decompress_stream(&mut out, &mut input)
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, CodexZstCause::DecodeFailed)
-                })?;
+                .map_err(|_| invalid(CodexZstCause::DecodeFailed))?;
             let consumed = input.pos;
             let produced = out.pos();
             self.compressed_bytes = self.compressed_bytes.saturating_add(consumed as u64);
@@ -270,10 +266,7 @@ impl<R: Read> BoundedDecoder<R> {
                 return Err(invalid("compressed rollout decoder exceeded its credit"));
             }
             if at_limit && produced != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    CodexZstCause::DecodedOverLimit,
-                ));
+                return Err(invalid(CodexZstCause::DecodedOverLimit));
             }
             self.remaining -= produced as u64;
             if produced != 0 {
@@ -316,7 +309,7 @@ impl<R: Read> Drop for BoundedDecoder<R> {
         crate::local_resource_diagnostics::traversal_point(
             "codex_zst_input",
             "codex",
-            &BTreeMap::from([
+            &std::collections::BTreeMap::from([
                 ("codex_zst_compressed_bytes", self.compressed_bytes),
                 ("codex_zst_decoded_bytes", self.decoded_bytes),
                 ("codex_zst_cpu_micros", self.cpu_micros),
@@ -1556,7 +1549,7 @@ pub(in crate::snapshots) mod tests {
         let cache = Arc::new(sampled_scan::SharedCache::default());
         let mut index = ScanIndex::default();
         let parser = factory(&f, &mut index, Some(&cache)).unwrap();
-        drop(parser); // interrupt the first read, without any body or ACK
+        parser.reader.reader.close(); // interrupted first read, without body or ACK
         index.archive_decode_error(&f.0, &io::Error::other("synthetic step EIO").into());
         for _ in 0..3 {
             let (next, result, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
