@@ -2598,6 +2598,11 @@ fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
     conflict_only(true);
 }
 
+// Shared helpers above remain the real scan/evidence/finish/upload callers.
+mod money_equivalence_tests {
+    include!("money_equivalence_tests.rs");
+}
+
 #[test]
 fn e2_page_never_creates_p1_ledger_or_diagnostics() {
     with_e2(|| {

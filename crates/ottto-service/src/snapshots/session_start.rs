@@ -548,9 +548,9 @@ crate::durable_tail_codec::durable_struct!(ConfigDigest {
     X b: u64,
     X len: u64,
 });
-crate::durable_tail_codec::durable_struct!(ClaudeRequestKey(H digest: [u8; 32]));
+crate::durable_tail_codec::durable_struct!(key ClaudeRequestKey(H digest: [u8; 32]));
 crate::heap_layout_bound::fields!(OpeningCallId; id);
-crate::durable_tail_codec::durable_struct!(OpeningCallId { L id: String });
+crate::durable_tail_codec::durable_struct!(key OpeningCallId { L id: String });
 crate::heap_layout_bound::fields!(OpeningCall; response, tool, candidates, files, answered, truncated);
 crate::durable_tail_codec::durable_struct!(OpeningCall {
     N response: u8,

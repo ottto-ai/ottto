@@ -1328,3 +1328,160 @@ fn codec_budget_receipt() {
         assert!(receipt.head_bytes <= HEAD_BOUND);
     }
 }
+
+/// Decode all stored sections, excluding the caller's independent source
+/// binding check. This is the structural acceptance oracle for `verify`.
+fn structurally_decodes(body: &[u8]) -> bool {
+    [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ]
+    .into_iter()
+    .any(|source| decode(body, source).is_ok())
+}
+
+fn verified_without_allocation(body: &[u8]) -> Result<(), Corrupt> {
+    let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| verify(body));
+    assert_eq!(stats.allocations, 0, "{stats:?}");
+    result
+}
+
+#[test]
+fn structural_verifier_real_records_truncations_tags_lengths_and_mutation_corpus() {
+    let scratch = Scratch::new("structural-verifier");
+    for (source, name, lines, min_present_options) in [
+        (
+            SnapshotSource::ClaudeCode,
+            "claude.jsonl",
+            claude_lines(2, 2),
+            10,
+        ),
+        (SnapshotSource::Codex, "codex.jsonl", codex_lines(), 10),
+        (
+            SnapshotSource::ClaudeCode,
+            "held-claude.jsonl",
+            claude_held_request_lines("verify-canary"),
+            10,
+        ),
+        (
+            SnapshotSource::Codex,
+            "instructions-codex.jsonl",
+            codex_instruction_lines("verify-canary"),
+            10,
+        ),
+    ] {
+        let path = scratch.write(name, &lines);
+        let (reduction, _) = full_read(&path, source);
+        let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
+        assert_eq!(verified_without_allocation(&body), Ok(()));
+        assert!(decode(&body, source).is_ok());
+        // Byte/hash stability: re-encoding the same retained value is exact.
+        assert_eq!(encode(&reduction, 1 << 20, line_cap()).unwrap(), body);
+        for end in 0..body.len() {
+            assert_eq!(
+                verified_without_allocation(&body[..end]),
+                Err(Corrupt),
+                "{name} prefix {end}"
+            );
+        }
+        let (mut visits, present_options) =
+            crate::durable_tail_codec::trace_verify(|| assert_eq!(verify(&body), Ok(())));
+        assert!(
+            present_options >= min_present_options,
+            "{name}: walked {present_options} populated optional sections, expected >= {min_present_options}"
+        );
+        println!("verifier fixture {name}: {present_options} populated optional sections");
+        visits.sort_unstable();
+        visits.dedup();
+        assert!(visits.iter().any(|(_, varint)| *varint));
+        assert!(visits.iter().any(|(_, varint)| !varint));
+        for (at, varint) in visits {
+            let mut corrupt = body.clone();
+            if varint {
+                // Every visited length/scalar/enum/H-option varint overflows.
+                corrupt.splice(at..at, [0xff; 10]);
+            } else {
+                corrupt[at] = 2; // invalid bool / raw Option tag
+            }
+            assert!(
+                !structurally_decodes(&corrupt),
+                "{name} corrupt tag/length {at}"
+            );
+            assert_eq!(
+                verified_without_allocation(&corrupt),
+                Err(Corrupt),
+                "{name} offset {at}"
+            );
+        }
+        // Deterministic fuzz-style corpus, with a substitution/deletion at
+        // every byte and every appended byte value. Valid mutations stay valid.
+        for at in 0..body.len() {
+            for byte in [0, 1, 2, 0x7f, 0x80, 0xff] {
+                let mut mutated = body.clone();
+                mutated[at] = byte;
+                assert_eq!(
+                    verified_without_allocation(&mutated).is_ok(),
+                    structurally_decodes(&mutated),
+                    "{name} mutation {at}/{byte}"
+                );
+            }
+            let mut mutated = body.clone();
+            mutated.remove(at);
+            assert_eq!(
+                verified_without_allocation(&mutated).is_ok(),
+                structurally_decodes(&mutated),
+                "{name} deletion {at}"
+            );
+        }
+        for byte in 0..=255 {
+            let mut mutated = body.clone();
+            mutated.push(byte);
+            assert_eq!(verified_without_allocation(&mutated), Err(Corrupt));
+        }
+    }
+}
+
+#[test]
+fn structural_verifier_nonempty_selector_capture() {
+    let mut capture = crate::snapshots::SelectorCapture::default();
+    capture.insert("service_tier", "priority".into(), "derived_from_logs_2");
+    assert!(!capture.context.is_empty());
+    assert!(!capture.sources.is_empty());
+    let mut e = Enc::bytes(1024);
+    capture.put(&mut e).unwrap();
+    let body = e.into_bytes();
+    let (result, stats) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut d = Dec::new(&body);
+        crate::snapshots::SelectorCapture::verify(&mut d).and_then(|()| d.finish())
+    });
+    assert_eq!(result, Ok(()));
+    assert_eq!(stats.allocations, 0, "{stats:?}");
+    let mut d = Dec::new(&body);
+    let restored = crate::snapshots::SelectorCapture::take(&mut d).unwrap();
+    d.finish().unwrap();
+    assert_eq!(restored, capture);
+    for end in 0..body.len() {
+        let mut d = Dec::new(&body[..end]);
+        assert!(crate::snapshots::SelectorCapture::verify(&mut d)
+            .and_then(|()| d.finish())
+            .is_err());
+    }
+}
+
+#[test]
+fn structural_verifier_large_body_still_allocates_nothing() {
+    let scratch = Scratch::new("large-structural-verifier");
+    let path = scratch.write("large.jsonl", &codex_lines());
+    let (mut reduction, _) = full_read(&path, SnapshotSource::Codex);
+    // Uploaded model/tool strings are stored U fields, so make the body large
+    // without increasing transcript acquisition or test-probe bookkeeping.
+    reduction.accumulator.latest_model = Some("m".repeat(256 * 1024));
+    let body = encode(&reduction, 1 << 20, line_cap()).unwrap();
+    assert!(body.len() > 256 * 1024);
+    assert_eq!(verified_without_allocation(&body), Ok(()));
+    assert_eq!(
+        verified_without_allocation(&body[..body.len() - 1]),
+        Err(Corrupt)
+    );
+}

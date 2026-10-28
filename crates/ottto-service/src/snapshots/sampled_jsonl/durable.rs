@@ -155,6 +155,16 @@ pub(crate) fn encode(
     Ok(e.into_bytes())
 }
 
+/// Structural body verification only: no reduction, re-derivation or live
+/// inputs. The caller separately checks source/binding and envelope integrity.
+/// Precondition: check size, mode and the envelope trailer before this walk.
+pub(crate) fn verify(body: &[u8]) -> Result<(), Corrupt> {
+    let mut d = Dec::new(body);
+    CachedJsonlReduction::verify(&mut d)?;
+    Rederive::verify(&mut d)?;
+    d.finish()
+}
+
 /// A decoded record before re-derivation. Its content fields are empty.
 pub(crate) struct Decoded {
     reduction: CachedJsonlReduction,
