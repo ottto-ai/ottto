@@ -59,13 +59,20 @@ symlinks; helper folders without config are skipped. Each root uses the existing
 config, `claude-code-sessions`, and `local-agent-mode-sessions` metadata readers.
 Session ownership and labels are resolved separately inside each root before
 combining observations, so buckets from different apps cannot lend each other
-identity. Pair uploads retain their existing global observation limits.
+identity. Primary pairs are consolidated by strong account/org binding before
+global upload and connect-target limits. The newest root-local pair supplies
+the primary reading; other distinct session witnesses remain duplicate evidence.
+Unresolved connect-target IDs are deduplicated before their limit.
 The snapshot fold's existing native-identity/title sidecar reader uses the same
 roots and retains its global file/entry budgets. Native witnesses still fail
 closed when copies of a transcript disagree on account or organization.
 Desktop-local parent IDs resolve within their own app; copies of a child across
-apps must agree on the resolved parent. The existing path-keyed index keeps
-the app scope without a persisted-format change.
+apps must agree on the resolved parent. The existing path-keyed session entries
+keep the app scope. An additive, optional inventory digest binds the saved census
+cursor, frozen ceiling and completeness to the configured stores. Changed or
+unknown inventory clears those claims and restarts the bounded sweep under the
+existing retry backoff. Older indexes rebuild that census before asserting it
+complete; session-entry formats are unchanged.
 Installation detection uses the same roots. The existing account-switch probe
 includes every root's config identity, waking the existing wait loop on a sibling
 account switch or profile addition/removal. The single-app fingerprint is

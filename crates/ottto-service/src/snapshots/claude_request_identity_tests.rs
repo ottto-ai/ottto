@@ -1421,6 +1421,7 @@ fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
     let swept = BTreeSet::from([PathBuf::from("/synthetic/store-a")]);
     let backed_off = |store_dirs: &BTreeSet<PathBuf>| {
         let mut index = ScanIndex {
+            claude_desktop_store_inventory: Some(identity::inventory_digest(&swept)),
             claude_desktop_identity_census_complete: true,
             claude_desktop_census_witness: Some(identity::DesktopCensusWitness::new(
                 NOW - 30,

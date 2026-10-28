@@ -9505,6 +9505,7 @@ fn derive_unresolved_claude_accounts(
                 <= CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS
         })
     };
+    let mut unresolved_ids = BTreeSet::new();
     let mut descriptors = desktop_pairs
         .pairs
         .iter()
@@ -9538,6 +9539,7 @@ fn derive_unresolved_claude_accounts(
                 }
             })
         })
+        .filter(|descriptor| unresolved_ids.insert(descriptor.unresolved_id.clone()))
         .take(CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX)
         .collect::<Vec<_>>();
     // Only an emitted pair row stands in for its account's account-only row;
@@ -9582,24 +9584,29 @@ fn derive_unresolved_claude_accounts(
             })
             .or_insert(observed_at);
     }
-    descriptors.extend(by_hash.into_iter().map(|(account_hash, observed_at)| {
-        let unresolved_id = format!(
-            "claude-unresolved-{}",
-            &format!(
-                "{:x}",
-                Sha256::digest(format!("unresolved:{account_hash}").as_bytes())
-            )[..16]
-        );
-        ClaudeUnresolvedAccountDescriptorV1 {
-            unresolved_id,
-            account_identifier_hash: Some(account_hash),
-            organization_identifier_hash: None,
-            account_label: None,
-            organization_label: None,
-            observed_at: Some(observed_at),
-            evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
-        }
-    }));
+    descriptors.extend(
+        by_hash
+            .into_iter()
+            .map(|(account_hash, observed_at)| {
+                let unresolved_id = format!(
+                    "claude-unresolved-{}",
+                    &format!(
+                        "{:x}",
+                        Sha256::digest(format!("unresolved:{account_hash}").as_bytes())
+                    )[..16]
+                );
+                ClaudeUnresolvedAccountDescriptorV1 {
+                    unresolved_id,
+                    account_identifier_hash: Some(account_hash),
+                    organization_identifier_hash: None,
+                    account_label: None,
+                    organization_label: None,
+                    observed_at: Some(observed_at),
+                    evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
+                }
+            })
+            .filter(|descriptor| unresolved_ids.insert(descriptor.unresolved_id.clone())),
+    );
     descriptors
 }
 
@@ -9719,7 +9726,29 @@ fn claude_desktop_scan_from_roots(roots: &[PathBuf], observed_at: &str) -> Claud
             .then_with(|| left.binding.cmp(&right.binding))
     };
     combined.pairs.pairs.sort_by(newest_first);
+    // Each root resolves its own buckets first. Downstream limits count unique
+    // strong bindings, while other sessions for that binding remain witnesses.
+    let mut bindings = BTreeSet::new();
+    let mut witnesses = BTreeSet::new();
+    for pair in std::mem::take(&mut combined.pairs.pairs) {
+        if bindings.insert(pair.binding.clone()) {
+            witnesses.insert((
+                pair.binding.clone(),
+                pair.observation.source_session_id.clone(),
+            ));
+            combined.pairs.pairs.push(pair);
+        } else {
+            combined.pairs.duplicate_sessions.push(pair);
+        }
+    }
     combined.pairs.duplicate_sessions.sort_by(newest_first);
+    combined.pairs.duplicate_sessions.retain(|pair| {
+        pair.observation.source_session_id.is_some()
+            && witnesses.insert((
+                pair.binding.clone(),
+                pair.observation.source_session_id.clone(),
+            ))
+    });
     combined
         .pairs
         .duplicate_sessions
@@ -29389,6 +29418,103 @@ for line in sys.stdin:
         }));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_desktop_overlapping_roots_keep_twenty_unique_pairs() {
+        let home = crate::test_scratch::ScratchDir::new("desktop-overlapping-pairs");
+        let support = home.join("Library/Application Support");
+        let uuid = |n: usize| format!("00000000-0000-4000-8000-{n:012}");
+        let account = uuid(1);
+        let write = |root: &str, org: &str, session: &str, activity: usize| {
+            let root = support.join(root);
+            let bucket = root.join("claude-code-sessions").join(&account).join(org);
+            fs::create_dir_all(&bucket).unwrap();
+            fs::write(
+                root.join("config.json"),
+                format!(r#"{{"lastKnownAccountUuid":"{account}"}}"#),
+            )
+            .unwrap();
+            fs::write(
+                bucket.join("local_session.json"),
+                format!(r#"{{"cliSessionId":"{session}","lastActivityAt":{activity}}}"#),
+            )
+            .unwrap();
+        };
+        for i in 0..CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX {
+            write("Claude", &uuid(100 + i), &format!("main-{i}"), 300 - i);
+        }
+        write("Claude-ALT", &uuid(100), "alt-primary", 400);
+        let scan = claude_desktop_scan_from_roots(
+            &crate::claude_desktop::support_roots(&home),
+            "1970-01-01T00:10:00Z",
+        );
+        assert_eq!(scan.pairs.pairs.len(), CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX);
+        assert_eq!(
+            scan.pairs
+                .pairs
+                .iter()
+                .map(|p| &p.binding)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX
+        );
+        assert_eq!(
+            scan.pairs.pairs[0].observation.source_session_id.as_deref(),
+            Some("alt-primary")
+        );
+        assert_eq!(scan.pairs.duplicate_sessions.len(), 1);
+        assert_eq!(
+            scan.pairs.duplicate_sessions[0]
+                .observation
+                .source_session_id
+                .as_deref(),
+            Some("main-0")
+        );
+        let at = "1970-01-01T00:10:00Z";
+        let until = "1970-01-01T00:15:00Z";
+        let snapshot = claude_desktop_pairs_snapshot(&scan.pairs, &[], at, until).unwrap();
+        assert_eq!(
+            snapshot.plan_observations.len(),
+            CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX
+        );
+        assert!(
+            snapshot
+                .plan_observations
+                .iter()
+                .any(|o| o.source_session_id.as_deref() == Some("main-19")),
+            "the oldest unique binding still fits"
+        );
+        let mut covered = snapshot.clone();
+        covered.plan_observations = vec![scan.pairs.pairs[1].observation.clone()];
+        let with_witness =
+            claude_desktop_pairs_snapshot(&scan.pairs, &[covered], at, until).unwrap();
+        assert!(
+            with_witness
+                .plan_observations
+                .iter()
+                .any(|o| o.source_session_id.as_deref() == Some("main-0")),
+            "other root's distinct session fills remaining upload room"
+        );
+        // Also defend the connect-target cap against duplicate input IDs.
+        let mut repeated = scan.pairs.clone();
+        repeated.pairs.insert(1, repeated.pairs[0].clone());
+        let unresolved = derive_unresolved_claude_accounts(
+            &snapshot,
+            &repeated,
+            &[],
+            &BTreeMap::new(),
+            OffsetDateTime::parse(at, &Rfc3339).unwrap(),
+        );
+        assert_eq!(unresolved.len(), CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX);
+        assert_eq!(
+            unresolved
+                .iter()
+                .map(|d| &d.unresolved_id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX
+        );
     }
 
     #[test]
