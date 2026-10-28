@@ -262,6 +262,7 @@ pub(super) struct HeaderInventory {
     pub(super) complete: bool,
     pub(super) read_bytes: usize,
     pub(super) held_archives: BTreeSet<String>,
+    pub(super) held_owners: BTreeSet<String>,
     pub(super) archive_work: codex_compressed_input::HeaderWork,
     /// Roster files whose first record was refused, each with the metadata
     /// witness seen at the refusal (`None` when it could not be read). This is
@@ -279,6 +280,9 @@ fn group_key(home: &Path, owner: &str) -> String {
 }
 
 impl HeaderInventory {
+    pub(super) fn complete_for(&self, owner: Option<&String>) -> bool {
+        self.complete && !owner.is_some_and(|owner| self.held_owners.contains(owner))
+    }
     pub(super) fn new(
         roots: &[PathBuf],
         paths: &BTreeSet<String>,
@@ -297,6 +301,7 @@ impl HeaderInventory {
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
             held_archives: BTreeSet::new(),
+            held_owners: BTreeSet::new(),
             archive_work: codex_compressed_input::HeaderWork::default(),
             refused: BTreeMap::new(),
             bounded_out: paths.len() > MAX_HEADER_FILES
@@ -416,6 +421,10 @@ impl HeaderInventory {
         match result {
             Ok(header) => self.headers.push(header),
             Err(_) if excluded => {
+                self.held_owners
+                    .extend(codex_session_id_candidates_from_path(
+                        &Path::new(&key).with_extension(""),
+                    ));
                 self.held_archives.insert(key);
             }
             Err(_) => {
@@ -496,7 +505,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, archive_stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, held_archives, archive_work, refused, bounded_out);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, held_archives, held_owners, archive_work, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {

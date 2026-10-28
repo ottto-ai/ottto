@@ -182,15 +182,10 @@ impl ValidatedHeader {
         }
         let value: Value = serde_json::from_slice(bytes).ok()?;
         let meta = codex_session_meta_payload(&value)?;
+        let digest = Sha256::new().chain_update(bytes).chain_update(b"\n");
         Some(Self {
             owner: resolve_codex_identity_option(codex_identity_at(meta, &["id"]))?,
-            digest: format!(
-                "{:x}",
-                Sha256::new()
-                    .chain_update(bytes)
-                    .chain_update(b"\n")
-                    .finalize()
-            ),
+            digest: format!("{:x}", digest.finalize()),
             created_unix_ms: meta
                 .get("timestamp")
                 .and_then(Value::as_str)
@@ -609,11 +604,8 @@ impl super::ScanIndex {
         self.archive_header(path)?.cli_version()
     }
     pub(super) fn archive_header(&self, path: &Path) -> Option<&ValidatedHeader> {
-        let archive = self
-            .files
-            .get(&super::local_index_key(path))?
-            .archive
-            .as_ref()?;
+        let key = super::local_index_key(path);
+        let archive = self.files.get(&key)?.archive.as_ref()?;
         let meta = std::fs::symlink_metadata(path).ok()?;
         let stamp = crate::transcript_acquisition::FileStamp::capture(meta).ok()?;
         archive.stamp.same_content(&stamp).then_some(())?;
@@ -702,11 +694,8 @@ impl super::ScanIndex {
             }),
         );
         input.close();
-        let evidence = self
-            .files
-            .get_mut(&key)
-            .and_then(|e| e.archive.as_mut())
-            .expect("header attempt");
+        let entry = self.files.get_mut(&key).expect("header attempt");
+        let evidence = entry.archive.as_mut().expect("header attempt");
         if let Ok(header) = &result {
             evidence.header_validated = Some(header.clone());
         } else {

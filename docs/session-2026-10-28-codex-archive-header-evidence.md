@@ -36,3 +36,5 @@ This is not universal archive coverage.
 Validation for this prerequisite slice is explicit-file formatting, whitespace
 checks and strict code review. CI waits for the predecessor slice to merge;
 Linux then precedes macOS contracts and money-equivalence at the exact head.
+
+Failed archive filename owners also block paused singleton and group cursor revalidation. A paused reader cannot publish a partial owner body while an excluded archive leaves that owner's membership unresolved; unrelated owners retain a complete inventory.
