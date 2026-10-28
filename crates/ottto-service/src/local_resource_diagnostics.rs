@@ -46,8 +46,10 @@ pub(crate) enum CodexZstCause {
     OwnerUnproven,
     #[serde(rename = "CompressedOutputHeld")]
     OutputHeld,
+    #[serde(rename = "CompressedSettlementStuck")]
+    SettlementStuck,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::OutputHeld as usize + 1;
+const CODEX_ZST_CAUSES: usize = CodexZstCause::SettlementStuck as usize + 1;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 

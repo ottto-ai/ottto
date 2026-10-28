@@ -13579,7 +13579,7 @@ fn decoder_admission_yields_without_evicting_primary_state() {
     let claim = join_charge(JOIN_OWNER, &members);
     with_test_state_budget(empty + claim + floor, || {
         let before = cache.cursor_resident();
-        assert!(cache.cursor_reserve_kind(claim, true).is_none());
+        assert!(cache.cursor_claim(claim, true).is_none());
         assert_eq!(cache.cursor_resident(), before);
         assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
         assert_eq!(cache.cursor_reserved(), 0);
@@ -13589,4 +13589,46 @@ fn decoder_admission_yields_without_evicting_primary_state() {
         primary.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
+fn decoder_owner_outlives_stores_guard_on_normal_early_return_and_unwind() {
+    let _lock = crate::snapshots::codex_compressed_input::tests::ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap();
+    for exit in 0..3 {
+        let cache = Arc::new(SharedCache::default());
+        let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let owner = DecoderOwner::acquire(&cache, 1024).unwrap();
+                // Declaration order also releases Stores before the owner's
+                // fallback Drop during unwind. No accounting inside I/O.
+                let stores = cache.durable.lock().unwrap();
+                if exit == 2 {
+                    panic!("synthetic durable I/O unwind");
+                }
+                drop(stores);
+                owner.release();
+                if exit == 1 {
+                    return;
+                }
+            }))
+        });
+        assert_eq!(result.is_err(), exit == 2);
+        assert_eq!(cache.cursor_reserved(), 0);
+        assert!(cache.inner.try_lock().is_ok());
+        assert!(cache.cursor.try_lock().is_ok());
+        assert!(!matches!(
+            cache.durable.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["stage"] == "codex_zst_owner")
+                .count(),
+            usize::from(exit == 2)
+        );
+        DecoderOwner::acquire(&cache, 1024).unwrap().release();
+    }
 }

@@ -7566,6 +7566,8 @@ fn finish_sync_source(
     // obligations this full scan references before any selection (#794 F1).
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
+    // Settle exact current bodies before selection can restore older file facts.
+    index.settle_archive_bodies(&upload_progress.accepted_body_witnesses);
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);

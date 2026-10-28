@@ -3756,20 +3756,18 @@ impl Drop for CursorCredit {
     }
 }
 
-// Decoder ownership takes retained -> cursor, never the reverse; free room
-// only, so decoder admission never evicts primary Tail state or proof state.
+// Reserve under retained -> cursor BEFORE taking durable Stores; carry only
+// the owner across I/O. Drop Stores before release, including unwind/early exits.
+// Never account from encode/write. Free room only: no primary/proof eviction.
 static DECODER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(in crate::snapshots) struct DecoderOwner(Option<CursorCredit>);
 impl DecoderOwner {
     pub(in crate::snapshots) fn acquire(cache: &Arc<SharedCache>, bytes: usize) -> Option<Self> {
         use std::sync::atomic::Ordering::SeqCst;
-        if DECODER_LIVE
-            .compare_exchange(false, true, SeqCst, SeqCst)
-            .is_err()
-        {
+        if DECODER_LIVE.swap(true, SeqCst) {
             return None;
         }
-        match cache.cursor_reserve_kind(bytes, true) {
+        match cache.cursor_claim(bytes, true) {
             Some(credit) => Some(Self(Some(credit))),
             None => {
                 DECODER_LIVE.store(false, SeqCst);
@@ -4096,13 +4094,9 @@ impl SharedCache {
     /// later measurement (`cursor_resident`, another admission, a retained
     /// insert) sees it until the credit is settled. None: nothing claimed.
     fn cursor_reserve(self: &Arc<Self>, charge: usize) -> Option<CursorCredit> {
-        self.cursor_reserve_kind(charge, false)
+        self.cursor_claim(charge, false)
     }
-    fn cursor_reserve_kind(
-        self: &Arc<Self>,
-        charge: usize,
-        free_only: bool,
-    ) -> Option<CursorCredit> {
+    fn cursor_claim(self: &Arc<Self>, charge: usize, free_only: bool) -> Option<CursorCredit> {
         let mut retained = self.retained().ok()?;
         let claimed = self
             .with_cursor(|cursor| {

@@ -4344,7 +4344,12 @@ pub struct ScanIndexEntry {
 }
 impl ScanIndexEntry {
     fn codex_recovery_is_pending(&self) -> bool {
-        self.codex_captured_joined_member_set.is_some()
+        self.archive.as_ref().is_some_and(|a| {
+            matches!(
+                a.disposition,
+                codex_compressed_input::ArchiveDisposition::Pending { .. }
+            )
+        }) || self.codex_captured_joined_member_set.is_some()
             || self.codex_captured_tier_receipt_required
             || self.codex_captured_tier_receipt.is_some()
             || self.codex_captured_uncommitted
@@ -29148,36 +29153,17 @@ impl OwnedSourceScan {
                     .get_mut(&local_index_key(&candidate.path))
                     .and_then(|entry| entry.archive.as_mut())
                 {
-                    evidence.owner = archive_owner.clone();
-                    let logical = candidate.path.with_extension("");
-                    let owned = archive_owner.as_ref().is_some_and(|owner| {
-                        codex_session_id_candidates_from_path(&logical).contains(owner)
-                    });
-                    if let Some(owner) = archive_owner.as_ref().filter(|_| owned) {
-                        evidence.logical_id = owner.clone();
-                    }
-                    evidence.disposition = if !owned {
-                        crate::local_resource_diagnostics::codex_zst_refused(
-                            CodexZstCause::OwnerUnproven,
-                        );
-                        codex_compressed_input::ArchiveDisposition::Refused {
-                            cause: CodexZstCause::OwnerUnproven,
-                        }
-                    } else if !parsed_file.complete() {
-                        codex_compressed_input::ArchiveDisposition::Held {
-                            cause: CodexZstCause::OutputHeld,
-                        }
-                    } else if parsed_file.snapshots.is_empty() {
-                        codex_compressed_input::ArchiveDisposition::Empty
-                    } else {
-                        codex_compressed_input::ArchiveDisposition::Acquired
-                    };
-                    if let Some(owner) = archive_owner.as_ref() {
+                    if let Some(owner) = &archive_owner {
                         index
                             .codex_state_only_blocked_session_ids
                             .insert(owner.clone());
                     }
-                    if !owned || !parsed_file.complete() {
+                    if !evidence.finish(
+                        archive_owner,
+                        &candidate.path,
+                        parsed_file.complete(),
+                        parsed_file.snapshots.is_empty(),
+                    ) {
                         census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
                     }
@@ -31233,6 +31219,7 @@ impl OwnedSourceScan {
                     decision,
                     CandidateDecision::Parse | CandidateDecision::ReconcileLegacy
                 )
+                && !is_compressed_codex_rollout(Some(&candidate.path), None)
                 && index.reread_unchanged_candidate(&candidate)
             {
                 match index.admit_unchanged_reread(
@@ -42353,7 +42340,7 @@ fn open_and_identify_scan_candidate_with_rescue(
         && files
             .get(&local_index_key(&candidate.path))
             .and_then(|entry| entry.archive.as_ref())
-            .is_some_and(|archive| archive.matches(&opened_file))
+            .is_some_and(|archive| archive.quiet(&opened_file))
     {
         return None;
     }
@@ -48406,6 +48393,12 @@ impl ScanIndex {
                 Some(CandidateParseReason::NewFile),
             );
         };
+        if entry.archive.is_some() {
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::UnknownOutcome),
+            );
+        }
         if let Some((root_session_id, member)) = claude_index_path_family_member(&candidate.path) {
             if self
                 .claude_usage_authority_quarantine
@@ -89663,7 +89656,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for BoundedJsonlReader<OpenedInpu
             sealed_prefix,
             retain_room,
         } = self;
-        c.add(reader.admitted_capacity())?;
+        c.add(reader.capacity())?;
         buf.heap_bound(c)?;
         report.heap_bound(c)?;
         max_line_bytes.heap_bound(c)?;

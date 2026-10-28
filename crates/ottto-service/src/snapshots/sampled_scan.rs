@@ -1984,24 +1984,28 @@ pub(super) fn new_source_parser(
                     .files
                     .get(&local_index_key(&candidate.path))
                     .and_then(|entry| entry.archive.as_ref())
-                    .is_some_and(|archive| archive.matches(&file)),
+                    .is_some_and(|archive| archive.quiet(&file)),
                 "compressed rollout already attempted"
             );
-            let evidence = codex_compressed_input::ArchiveEvidence::begin(&file, &candidate.path)?;
             let key = local_index_key(&candidate.path);
+            let evidence = codex_compressed_input::ArchiveEvidence::begin(
+                &file,
+                &candidate.path,
+                index
+                    .files
+                    .get(&key)
+                    .and_then(|entry| entry.archive.as_ref()),
+            )?;
             index.codex_state_only_blocked_session_ids.extend(
                 codex_session_id_candidates_from_path(&candidate.path.with_extension("")),
             );
             index.files.entry(key.clone()).or_default();
             index.files.get_mut(&key).expect("archive entry").archive = Some(evidence);
-            match cache
-                .ok_or_else(|| anyhow::anyhow!("compressed rollout admission unavailable"))
-                .and_then(|cache| OpenedInput::funded(file, cache).map_err(Into::into))
-            {
-                Ok(input) => input,
-                Err(error) => {
+            match cache.and_then(|cache| OpenedInput::funded(file, cache).ok()) {
+                Some(input) => input,
+                None => {
                     index.archive_refuse(&candidate.path, CodexZstCause::AdmissionRefused);
-                    return Err(error);
+                    anyhow::bail!("compressed rollout admission unavailable");
                 }
             }
         } else {
@@ -2022,7 +2026,9 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
-    parser.bind_reread(index, candidate);
+    if !parser.reader.reader.is_compressed() {
+        parser.bind_reread(index, candidate);
+    }
     parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);
