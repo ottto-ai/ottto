@@ -112,6 +112,20 @@ fn claude_retry_admit_batch_observed(
             state.progressed = true;
             return (ClaudeStaleFamilyCarry::default(), batch, state);
         }
+        if !claude_accepted_retry_start_admitted(index, debt_scope) {
+            diagnostics.reject(
+                StaleCarryRejectionCounts::start_gate(index, true),
+                batch.len(),
+            );
+            state.after_root = batch.last().cloned();
+            state.roots_complete = state.after_root.as_ref().is_some_and(|after| {
+                !stale
+                    .iter()
+                    .any(|root| root > after && root <= &state.upper_root)
+            });
+            state.progressed = true;
+            return (ClaudeStaleFamilyCarry::default(), batch, state);
+        }
         let mut attempt = StaleCarryRejectionCounts::default();
         match claude_stream_accepted_retry_carry_observed(index, &batch, &mut attempt, debt_scope) {
             Ok(carry) => {
@@ -512,29 +526,12 @@ fn claude_retry_note_offered(
         crate::local_resource_diagnostics::claude_reread::retry_offered();
         oversized_after = Some(key.clone());
     }
-    let oversized = state.oversized_root.clone();
-    let previous = state.oversized_after_path.clone();
     if oversized_after.is_some() {
-        for path in paths {
-            let key = local_index_key(&path.path);
-            if claude_index_path_member_ref(&path.path)
-                .is_some_and(|m| oversized.as_deref() == Some(m.root))
-                && previous
-                    .as_deref()
-                    .map_or(true, |after| key.as_str() > after)
-                && oversized_after
-                    .as_deref()
-                    .is_some_and(|after| key.as_str() <= after)
-            {
-                if let Some(entry) = index.files.get_mut(&key) {
-                    crate::local_resource_diagnostics::claude_reread::clear(
-                        crate::local_resource_diagnostics::claude_reread::ClearSite::RetryAdmission,
-                        !entry.source_file_fingerprint.is_empty(),
-                    );
-                    entry.source_file_fingerprint.clear();
-                }
-            }
-        }
+        index.mark_bounded_sweep_unsettled();
+        crate::local_resource_diagnostics::claude_reread::stale_rearm_held(
+            "stale_request_evidence",
+            1,
+        );
     }
     let state = index
         .claude_stale_family_carry
@@ -558,4 +555,94 @@ thread_local! {
 #[cfg(test)]
 fn retry_admission_tests_refuse_multi() -> bool {
     RETRY_ADMISSION_REFUSE_MULTI.with(std::cell::Cell::get)
+}
+
+// Scheduling only: every carry still passes the start/member/ACK gates. Old
+// roots move to explicit pending custody before the bounded batch replaces them.
+fn claude_service_retained_retry(
+    index: &mut ScanIndex,
+    now: &str,
+    context: &str,
+    previous: Option<&ClaudeRetryAdmission>,
+) {
+    if !index.claude_stale_family_carry.replay.is_empty() {
+        claude_hold_stale_carry(index, "stale_request_evidence");
+        if !index.claude_stale_family_carry.replay.is_empty() {
+            return;
+        }
+    }
+    let stale = index
+        .claude_usage_family_pending
+        .iter()
+        .filter(|(_, pending)| pending.census_window_end != now)
+        .map(|(root, _)| root.clone())
+        .collect();
+    let (mut carry, covered, state) = claude_retry_admit_batch_observed(
+        index,
+        &stale,
+        previous,
+        now,
+        &mut Default::default(),
+        claude_contract_debt_scope(index),
+    );
+    let held = covered.difference(&carry.roots).count();
+    if !index.claude_stale_family_carry.is_empty() {
+        claude_hold_stale_carry(index, "stale_request_evidence");
+    }
+    if held > 0 {
+        index.mark_bounded_sweep_unsettled();
+    }
+    carry.origin = Some(ClaudeStaleFamilyCarryOrigin {
+        context_fingerprint: context.to_owned(),
+        process: claude_full_rearm_process(),
+        full_rearm_window: false,
+        admission: Some(state),
+    });
+    index.claude_stale_family_carry = carry;
+    if held > 0 {
+        crate::local_resource_diagnostics::claude_reread::stale_rearm_held(
+            "stale_request_evidence",
+            held as u64,
+        );
+    }
+}
+
+fn claude_clear_drained_retry_admission(index: &mut ScanIndex, now: &str) {
+    let Some(state) = index
+        .claude_stale_family_carry
+        .origin
+        .as_ref()
+        .and_then(|o| o.admission.as_ref())
+    else {
+        return;
+    };
+    if !state.roots_complete
+        || !state.due_complete
+        || state.oversized_root.is_some()
+        || rfc3339_unix_seconds(now).map_or(true, |now| now < state.due_through)
+        || index
+            .claude_usage_authority_quarantine
+            .iter()
+            .any(|(root, record)| {
+                claude_retry_record_due(record, state.due_through, state.served_before)
+                    && !index.claude_usage_family_pending.contains_key(root)
+                    && !index
+                        .claude_usage_family_witnesses
+                        .get(root)
+                        .is_some_and(|w| claude_usage_authority_preserves_pending(record, w))
+            })
+    {
+        return;
+    }
+    // Accepted roots were independently verified; all other roots are explicitly
+    // held in pending/roster or bound quarantine custody, not counted as observed.
+    crate::local_resource_diagnostics::claude_reread::admission_cleared(
+        index.bounded_sweep_had_unsettled_upload,
+    );
+    index
+        .claude_stale_family_carry
+        .origin
+        .as_mut()
+        .expect("admission origin")
+        .admission = None;
 }

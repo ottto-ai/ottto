@@ -7,6 +7,10 @@ use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Rearm {
+    #[serde(skip_serializing_if = "StaleRearmHeld::is_empty")]
+    pub(crate) stale_rearm_held: StaleRearmHeld,
+    pub(crate) admission_cleared_drained: u64,
+    pub(crate) admission_cleared_held_roots: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) restored_empty_held: u64,
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -43,12 +47,61 @@ pub(crate) struct Rearm {
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) history_permitted_not_stamped_other: u64,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct StaleRearmHeld {
+    pub(crate) stale_request_evidence: u64,
+    pub(crate) provenance_or_context: u64,
+    pub(crate) cancellation_funding: u64,
+    pub(crate) member_changed: u64,
+}
+impl StaleRearmHeld {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    fn merge(&mut self, other: Self) {
+        self.stale_request_evidence = self
+            .stale_request_evidence
+            .saturating_add(other.stale_request_evidence);
+        self.provenance_or_context = self
+            .provenance_or_context
+            .saturating_add(other.provenance_or_context);
+        self.cancellation_funding = self
+            .cancellation_funding
+            .saturating_add(other.cancellation_funding);
+        self.member_changed = self.member_changed.saturating_add(other.member_changed);
+    }
+}
+pub(crate) fn admission_cleared(held: bool) {
+    update(|c| {
+        let n = if held {
+            &mut c.claude_reread.admission_cleared_held_roots
+        } else {
+            &mut c.claude_reread.admission_cleared_drained
+        };
+        *n = n.saturating_add(1);
+    });
+}
+pub(crate) fn stale_rearm_held(reason: &str, roots: u64) {
+    update(|c| {
+        let held = &mut c.claude_reread.stale_rearm_held;
+        let count = match reason {
+            "provenance_or_context" => &mut held.provenance_or_context,
+            "cancellation_funding" => &mut held.cancellation_funding,
+            "member_changed" => &mut held.member_changed,
+            _ => &mut held.stale_request_evidence,
+        };
+        *count = count.saturating_add(roots);
+    });
+}
 impl Rearm {
     fn merge(&mut self, other: Self) {
+        self.stale_rearm_held.merge(other.stale_rearm_held);
         macro_rules! merge { ($($field:ident),+ $(,)?) => { $(
             self.$field = self.$field.saturating_add(other.$field);
         )+ }; }
         merge!(
+            admission_cleared_drained,
+            admission_cleared_held_roots,
             restored_empty_held,
             restored_nonempty_held,
             restored_empty_sibling,
