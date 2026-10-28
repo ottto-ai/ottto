@@ -367,6 +367,80 @@ pub(in crate::snapshots) mod tests {
     }
 
     #[test]
+    fn decoder_production_window_peak_allocation() {
+        // Streaming, unknown content size prevents the encoder shrinking the
+        // window. Alternate small/large frames to exercise DCtx buffer resizing.
+        // 514 MiB decoded: production archive scale, never retained as a whole.
+        let archive = fixture(&[], ".jsonl.zst");
+        let mut file = File::create(&archive.0).unwrap();
+        let mut row = [b'a'; 64 * 1024];
+        let mut random = 1_u64;
+        for byte in &mut row[1..64 * 1024 - 2] {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            *byte = b'a' + (random % 26) as u8;
+        }
+        row[0] = b'"';
+        row[64 * 1024 - 2] = b'"';
+        row[64 * 1024 - 1] = b'\n';
+        for log in [17, WINDOW_LOG, 17, WINDOW_LOG] {
+            let mut encoder = zstd::stream::write::Encoder::new(&mut file, 1).unwrap();
+            encoder.window_log(log).unwrap();
+            let rows = if log == WINDOW_LOG { 4096 } else { 16 };
+            for _ in 0..rows {
+                encoder.write_all(&row).unwrap();
+            }
+            encoder.finish().unwrap();
+        }
+        drop(file);
+        let mut file = File::open(&archive.0).unwrap();
+        let mut prefix = [0; 18];
+        file.read_exact(&mut prefix).unwrap();
+        // The second frame, not the 1 MiB prefix, must declare an 8 MiB window.
+        let first_size =
+            zstd::zstd_safe::find_frame_compressed_size(&fs::read(&archive.0).unwrap()).unwrap();
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(first_size as u64)).unwrap();
+        file.read_exact(&mut prefix).unwrap();
+        // Zstd frame descriptor: non-single-segment + window descriptor 13*8.
+        assert_eq!(&prefix[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+        assert_eq!(prefix[4] & 0x20, 0);
+        assert_eq!(prefix[5], ((WINDOW_LOG - 10) * 8) as u8);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let credit = compressed_input_credit().unwrap();
+        let (_, allocation) = crate::retry_allocation_probe::measure(|| {
+            let mut input = OpenedInput::compressed(file, 2 * 1024 * 1024 * 1024, credit).unwrap();
+            let mut output = [0; BUFFER_BYTES];
+            let mut total = 0_u64;
+            loop {
+                let n = input.read(&mut output).unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n as u64;
+            }
+            assert_eq!(total, 514 * 1024 * 1024);
+            input.close();
+        });
+        let peak = allocation
+            .requested_peak_with_overlap
+            .max(allocation.usable_peak_with_overlap);
+        eprintln!("decoder_allocation_receipt zstd={} window_log={} decoded_bytes={} requested_peak={} usable_peak={} overlap_peak={} credit={}",
+            zstd::zstd_safe::version_string(), WINDOW_LOG, 514 * 1024 * 1024,
+            allocation.requested_peak, allocation.usable_peak, peak, credit);
+        assert!(
+            peak >= 8 * 1024 * 1024,
+            "native zstd allocations must be counted"
+        );
+        assert!(peak <= credit, "measured peak must fit prepaid credit");
+        assert_eq!(
+            allocation.requested_live, 0,
+            "all decoder allocations released"
+        );
+    }
+
+    #[test]
     fn compressed_input_exact_limit_and_concatenated_frames() {
         let plain = b"{\"type\":\"session_meta\"}\n{\"type\":\"event_msg\"}\n";
         let mut encoded = zstd::stream::encode_all(&plain[..24], 1).unwrap();
