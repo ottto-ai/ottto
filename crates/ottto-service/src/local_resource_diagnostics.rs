@@ -476,6 +476,7 @@ fn rearm_collection(rearm: claude_reread::Counts) {
                 scanned_files: 0,
                 semantic_noops: 0,
                 sampled_acquisition: None,
+                full_causes: Default::default(),
             },
             rearm,
         },
@@ -1986,6 +1987,7 @@ mod tests {
                     scanned_files: 1,
                     semantic_noops: 0,
                     sampled_acquisition: None,
+                    full_causes: Default::default(),
                 },
             );
             // Disabled comparison must omit these fields too.
