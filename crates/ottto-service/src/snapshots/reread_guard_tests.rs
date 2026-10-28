@@ -829,10 +829,14 @@ fn upgrade_missing_progresses_past_tracking_window_and_keeps_once_semantics() {
         assert!(state.upgrade_missing(&key, true));
         assert!(!state.upgrade_missing(&key, true));
     }
-    assert!(!state
+    assert!(state
         .replayed
         .contains_key("upgrade_state_missing:old-release"));
     let mut restart: State = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    assert_eq!(
+        restart.replayed.get("upgrade_state_missing:old-release"),
+        Some(&BTreeSet::from([KeyHash::of("old")]))
+    );
     for n in 0..MAX_TRACKED_KEYS + 2 {
         assert!(!restart.upgrade_missing(&format!("indexed-{n}"), true));
     }
