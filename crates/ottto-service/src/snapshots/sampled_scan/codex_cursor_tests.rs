@@ -13840,9 +13840,11 @@ fn invalid_archive_owner_holds_paused_singleton_without_more_reads() {
     let cache = Arc::new(SharedCache::default());
     with_test_limits(2048, 1024, 64, || {
         let (mut index, members) = paused_singleton(&fixture, &cache);
-        let archive = fixture
-            .root
-            .join(format!("rollout-segment-{SESSION}.jsonl.zst"));
+        let archive = fixture.file(SESSION).with_extension("jsonl.zst");
+        assert!(
+            codex_session_id_candidates_from_path(&archive.with_extension(""))
+                .contains(&SESSION.to_owned())
+        );
         fs::write(&archive, b"corrupt archive").unwrap();
         let mut candidate = crate::snapshots::codex_zst_refusal_tests::candidate(&archive);
         candidate.scan_root = fixture.root.clone();
