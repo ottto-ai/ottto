@@ -790,7 +790,8 @@ Decoder admission keeps fixed headroom of one 8 MiB primary entry plus side-ledg
 bytes; the resident cache is charged once. Each admission yield increments the
 cumulative `codex_zst_refused` counter once per attempted archive per pass. After
 12 consecutive yields for an archive, `codex_zst_admission_alarm` discloses the
-starvation once, with `consecutive_yields: 12`. Diagnostic-only counts in the
-existing ScanIndex survive reloads and reset on admission; they never change
-archive evidence. Decoder input
-and leaked-release fields are per-event counts, not cumulative totals.
+starvation once, with `consecutive_yields: 12`. RAM-only process streaks survive
+index reloads, reset on admission or process restart, and are cleared when a key
+is retired. A bounded process map holds at most 256 SHA-256
+identities and byte counters; at capacity, a new identity evicts the lowest hash. No streak is serialized or changes archive
+evidence. Decoder input and leaked-release fields are per-event counts.

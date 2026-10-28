@@ -1,13 +1,11 @@
 //! Bounded `.jsonl.zst` rollout input behind the one opened-object parser seam.
-//! Discovery does not enumerate compressed rollouts yet. Activation must also
-//! bind plain/compressed twin identity and pacing before activation. Main-scan
-//! decoding already validates the owner and pays the DecoderOwner reservation.
 use crate::local_resource_diagnostics::{codex_zst_refused, CodexZstCause};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem::size_of;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer};
 
 /// One predicate for a candidate's encoding or the already-opened input kind.
@@ -83,6 +81,23 @@ fn thread_cpu_micros() -> u64 {
     (spec.tv_sec as u64)
         .saturating_mul(1_000_000)
         .saturating_add(spec.tv_nsec as u64 / 1_000)
+}
+
+static STREAKS: Mutex<BTreeMap<[u8; 32], u8>> = Mutex::new(BTreeMap::new());
+pub(super) fn admission_streak(key: &str, yielded: bool) -> u8 {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(key.as_bytes()).into();
+    let mut slots = STREAKS.lock().unwrap_or_else(PoisonError::into_inner);
+    let previous = slots.remove(&hash).unwrap_or(0);
+    if !yielded {
+        return 0;
+    }
+    if slots.len() == 256 {
+        slots.pop_first();
+    }
+    let count = previous.saturating_add(1).min(13);
+    slots.insert(hash, count);
+    count
 }
 
 /// SOURCE Q3: no content, offsets, checkpoint or acceptance authority.
@@ -452,17 +467,14 @@ impl super::ScanIndex {
                 let bodies = self
                     .file_snapshot_fingerprints
                     .get(key)
-                    .filter(|fps| !fps.is_empty())
-                    .and_then(|fps| {
-                        fps.iter()
-                            .map(|fp| accepted.get(fp))
-                            .collect::<Option<BTreeSet<_>>>()
-                    });
+                    .into_iter()
+                    .flatten()
+                    .map(|fp| accepted.get(fp))
+                    .collect::<Option<BTreeSet<_>>>()
+                    .filter(|bodies| !bodies.is_empty());
                 let settled = bodies
                     .map(super::snapshot_file_upload_body_set_hex)
-                    .as_ref()
-                    .zip(entry.last_upload_body_witness.as_ref())
-                    .is_some_and(|(a, b)| a == b);
+                    .is_some_and(|witness| Some(witness) == entry.last_upload_body_witness);
                 archive.settle(settled);
             }
         }
@@ -1571,7 +1583,14 @@ pub(in crate::snapshots) mod tests {
         let mut index = ScanIndex::default();
         let saved_index = f.0.parent().unwrap().join("index.json");
         for pass in 1..=14 {
+            assert!(serde_json::to_value(&index)
+                .unwrap()
+                .get("compressed_admission_yields")
+                .is_none());
             index.save(&saved_index).unwrap();
+            assert!(!fs::read_to_string(&saved_index)
+                .unwrap()
+                .contains("compressed_admission_yields"));
             index = ScanIndex::load(&saved_index).unwrap();
             let (next, result, rows, _) = archive_pass(&f, index, false, None);
             assert!(next.files.is_empty());
@@ -1593,7 +1612,61 @@ pub(in crate::snapshots) mod tests {
         }
         let (index, _, rows, _) = archive_pass(&f, index, true, None);
         assert_eq!(decodes(&rows), 1);
-        assert!(index.compressed_admission_yields.is_empty());
+        let key = local_index_key(&f.0);
+        assert_eq!(
+            admission_streak(&key, true),
+            1,
+            "funding reset the process streak"
+        );
+        admission_streak(&key, false);
+        assert!(index.files[&key].archive.is_some());
+    }
+    #[test]
+    fn admission_streaks_are_bounded_and_retired_with_archive_keys() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        STREAKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        for i in 0..512 {
+            assert_eq!(admission_streak(&format!("synthetic-archive-{i}"), true), 1);
+            assert!(STREAKS.lock().unwrap_or_else(PoisonError::into_inner).len() <= 256);
+        }
+        assert_eq!(
+            STREAKS.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            256
+        );
+        let f = ArchiveFixture::new(b"synthetic stamp only");
+        let key = local_index_key(&f.0);
+        assert_eq!(admission_streak(&key, true), 1);
+        let mut index = ScanIndex::default();
+        index.files.entry(key.clone()).or_default().archive = Some(Box::new(
+            ArchiveEvidence::begin(&File::open(&f.0).unwrap(), &f.0, None).unwrap(),
+        ));
+        assert!(serde_json::to_value(&index)
+            .unwrap()
+            .get("compressed_admission_yields")
+            .is_none());
+        assert!(!super::super::lenient_decode::FIELDS.contains(&"compressed_admission_yields"));
+        index.remove_file_entry(&key);
+        assert!(!index.files.contains_key(&key));
+        assert_eq!(
+            admission_streak(&key, true),
+            1,
+            "retirement reset the streak"
+        );
+        STREAKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        assert_eq!(
+            admission_streak(&key, true),
+            1,
+            "new process starts a new streak"
+        );
+        admission_streak(&key, false);
     }
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs validated heap layout")]
