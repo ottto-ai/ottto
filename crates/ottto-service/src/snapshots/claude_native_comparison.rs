@@ -2493,7 +2493,7 @@ impl Qualification {
         &mut self,
         native: &[SnapshotItem],
         frontier: usize,
-        _remaining_files: usize,
+        remaining_files: usize,
         pending: &[PendingIndexFinalization],
         file_limit: usize,
         mut recovery: Option<&mut RecoveryBudget<'_>>,
@@ -2594,15 +2594,17 @@ impl Qualification {
                 }
             }
         }
-        let candidates = Vec::new();
+        let mut candidates = Vec::new();
         for (root, sources) in sources_by_root {
             if recovery.is_some() {
                 let bytes = self.families.get(&root).and_then(|family| {
                     let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
                     // Includes moved target vectors, all frozen member strings
-                    // and old-plus-new plan ownership before removal below.
+                    // and old-plus-new plan ownership before removal below,
+                    // plus this pass's restore-only target copies and their
+                    // vector growth (old and new buffers).
                     family.completed_heap_bound(&mut cost)?;
-                    cost.add(cost.bytes)?;
+                    cost.add(cost.bytes.checked_mul(3)?)?;
                     heap_layout_bound::tree_nodes::<String, PendingComparison>(1, &mut cost)?;
                     let items = native_by_root.get(&root).map_or(&[][..], Vec::as_slice);
                     heap_layout_bound::tree_nodes::<String, String>(
@@ -2668,10 +2670,11 @@ impl Qualification {
                 available: complete_selected_family,
             };
             // Already parsed page bodies can cover the whole frozen plan.
-            // Otherwise defer to BASE; never enqueue an immediate Full.
+            // Otherwise its frozen plain Skips are acquired in THIS pass,
+            // restore-only (O1); never a Full, never debt for a later pass.
             if !plan.covered_by(&root, native, pending) {
-                // Missing reduction coverage can queue NEXT BASE recovery;
-                // exact page coverage incurs no deferral or family latch.
+                // Missing reduction coverage latches the family once; exact
+                // page coverage incurs no deferral or family latch.
                 if let Some(recovery) = recovery.as_mut() {
                     let new_local = plan
                         .sources
@@ -2697,9 +2700,18 @@ impl Qualification {
                         continue;
                     }
                 }
-                result
-                    .unresolved_sources
-                    .extend(plan.sources.iter().cloned());
+                // A refused or incomplete restore leaves the plan uncovered:
+                // only its own sources are held, and only for this pass.
+                if recovery.is_some()
+                    && plan.available
+                    && candidates.len().saturating_add(plan.candidates.len()) <= remaining_files
+                {
+                    candidates.extend(plan.candidates.iter().cloned());
+                } else {
+                    result
+                        .unresolved_sources
+                        .extend(plan.sources.iter().cloned());
+                }
             }
             result.matched_roots += 1;
             assert!(

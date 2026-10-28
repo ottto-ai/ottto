@@ -541,6 +541,7 @@ impl Completion {
             }
             let Some(pending) = scan.pending_finalization.iter().find(|pending| {
                 pending.parse_complete
+                    && pending.complete_native_reduction
                     && pending.parsed_snapshot_count == 1
                     && !pending.sampled_audit_verified
                     && pending.source_file_fingerprint == plan.revision
@@ -1192,6 +1193,13 @@ impl SelectedFallback {
             cost.add(identity_scratch)?;
             restore_vec_peak::<ClaudeEmptyMapAdvance>(advances, &mut cost)?;
         }
+        // O1 (E3): the scoped hold marker's root set and root digests; one
+        // root/member pair is built at a time.
+        heap_layout_bound::tree_nodes::<String, ()>(pending.len().checked_mul(2)?, &mut cost)?;
+        for read in pending {
+            cost.add(read.index_key.len().checked_add(32)?)?;
+        }
+        cost.add(lookup_scratch)?;
         Some(cost.bytes)
     }
 
@@ -1212,7 +1220,19 @@ impl SelectedFallback {
         scan.pending_finalization
             .retain(|pending| !self.withheld_keys.contains(&pending.index_key));
         scan.census_complete = false;
-        index.mark_bounded_sweep_unsettled();
+        self.mark_held(index);
+    }
+
+    /// O1 (E3): a comparison hold is scoped to the withheld sources' families
+    /// (D-COMPARISON), never sweep-wide, and nothing carries to a later pass.
+    fn mark_held(&self, index: &mut ScanIndex) {
+        let roots = self
+            .withheld_keys
+            .iter()
+            .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+            .map(|(root, _)| root)
+            .collect::<BTreeSet<_>>();
+        index.mark_bounded_sweep_held_by_families(Some(&roots));
     }
 
     /// Restore only selected B/C facts. Queue known A first and B/C after A in
@@ -1328,12 +1348,9 @@ impl SelectedFallback {
         // A missing path remains debt; a later native read decides disappearance.
         let mut priority = VecDeque::new();
         let mut keys = BTreeSet::new();
-        for path in self
-            .targets
-            .iter()
-            .map(|target| target.path.as_path())
-            .chain(self.withheld_keys.iter().map(Path::new))
-        {
+        // O1 (E3): targets keep their object stamp and are not requeued; a
+        // comparison is re-derived and restored in the pass that needs it.
+        for path in self.withheld_keys.iter().map(Path::new) {
             let key = local_index_key(path);
             if !keys.insert(key.clone()) {
                 continue;
@@ -1359,12 +1376,7 @@ impl SelectedFallback {
             .retain(|candidate| !keys.contains(&local_index_key(&candidate.path)));
         priority.append(&mut traversal.pending_candidates);
         traversal.pending_candidates = priority;
-        for target in &self.targets {
-            if let Some(entry) = index.files.get_mut(&local_index_key(&target.path)) {
-                entry.source_file_fingerprint.clear();
-            }
-        }
-        index.mark_bounded_sweep_unsettled();
+        self.mark_held(index);
         Ok(())
     }
 }

@@ -26075,9 +26075,10 @@ impl OwnedSourceScan {
         // fingerprint, census flag or budget is changed by selection.
         if source == SnapshotSource::ClaudeCode && claude_native_comparison::enabled() {
             if recovery_priority.is_empty() {
-                // Selected fallback persists A at the front of this SAME
-                // queue with existing empty-fp debt. A restarted process has
-                // no lease/certificate or separate recovery path list. Honor
+                // An empty-fp prefix of this SAME queue is existing rearm
+                // debt (comparison fallback no longer clears or requeues its
+                // targets: O1, E3). A restarted process has no lease or
+                // separate recovery path list. Honor
                 // only that queued debt prefix before audits; never inject a
                 // path, scan for missing members or mint native eligibility.
                 while pending_paths.len() < selection_limit {
