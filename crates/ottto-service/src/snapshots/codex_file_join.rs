@@ -364,7 +364,11 @@ impl HeaderInventory {
             if metadata.spawn_parents.get(&owner).is_some_and(|parent| {
                 super::codex_compressed_holds::parent_unbound(
                     parent,
-                    CodexParentCensus::new(&self.roots, paths),
+                    CodexParentCensus {
+                        scan_roots: &self.roots,
+                        paths,
+                        available: true,
+                    },
                     metadata,
                 )
             }) {
