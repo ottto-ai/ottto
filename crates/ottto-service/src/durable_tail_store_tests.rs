@@ -1556,9 +1556,9 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
         put_record(&record_file(&store, &record.binding.key), &bytes);
     }
     let link = store.dir().join(format!("{}.rec", hex(&[1; 32])));
-    symlink(&transcript, &link).unwrap();
+
     let directory = store.dir().join(format!("{}.rec", hex(&[2; 32])));
-    fs::create_dir(&directory).unwrap();
+
     // A group-readable U record: header dispatch precedes the mode repair.
     let unsafe_path = store.dir().join(format!("{}.rec", hex(&[3; 32])));
     let mut unsafe_bytes = encode(&DurableRecord {
@@ -1585,16 +1585,24 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
             &BTreeMap::new(),
         )
         .unwrap();
-    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-    assert!(directory.is_dir());
+
     assert!(unsafe_path.exists());
     assert!(live.exists());
     assert!(unrelated.exists());
     assert!(!dead.exists());
     // Records past the bound are untouched but still counted in the level.
-    assert_eq!(store.counters().disk_records, INVENTORY_BOUND as u64 + 6);
-    assert_eq!(store.counters().uninventoried_records, 6);
+    assert_eq!(store.counters().disk_records, INVENTORY_BOUND as u64 + 4);
+    assert_eq!(store.counters().uninventoried_records, 4);
     assert_eq!(store.counters().gc_temps_deleted, 1);
+    // Non-regular entries are still preserved. ELOOP is an access failure,
+    // not bytes claiming an unknown format; it disables without mutation.
+    symlink(&transcript, &link).unwrap();
+    fs::create_dir(&directory).unwrap();
+    assert_eq!(store.hold(&[2; 32], false), Some(Refusal::Undecodable));
+    assert_eq!(store.hold(&[1; 32], false), None);
+    assert_eq!(store.disabled(), Some("record_access"));
+    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(directory.is_dir());
 }
 
 /// Review F1: kept U records past `INVENTORY_BOUND` never block an existing

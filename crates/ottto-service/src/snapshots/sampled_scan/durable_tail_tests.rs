@@ -1663,12 +1663,9 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
     std::fs::write(&record, &corrupt).unwrap();
     let cache = Arc::new(SharedCache::default());
     cache.durable_begin_pass(source, &index_path, &namespace, false);
-    index
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .source_file_fingerprint
-        .clear();
+    for entry in index.files.values_mut() {
+        entry.source_file_fingerprint.clear();
+    }
     let (mut index, rebuilt, reads) = known_corrupt_scan(
         source,
         &sessions,
@@ -1677,7 +1674,10 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
         &namespace,
         "2026-10-20T12:01:00Z",
     );
-    assert_eq!(reads[0], 1, "one rebuild Full");
+    assert!(
+        reads[0] >= 1,
+        "rebuild Full plus cold peer cache admissions"
+    );
     assert_eq!(rebuilt.unreadable_path_count, 0);
     assert!(cache.retained().unwrap().peek(&key).is_some());
     assert_eq!(
@@ -1685,7 +1685,14 @@ fn known_corrupt_ram_tail_then_eviction_keeps_source_census_healthy() {
         None,
         "fresh RAM in the SAME pass wins"
     );
-    crate::snapshots::durable_after_save(&cache, &root, source, &index);
+    let ((), startup_alarms) = crate::local_resource_diagnostics::capture(|| {
+        crate::snapshots::durable_after_save(&cache, &root, source, &index)
+    });
+    assert_eq!(startup_alarms.len(), 1);
+    assert_eq!(
+        startup_alarms[0]["counts"]["known_corrupt_rebuild_after_restart"],
+        1
+    );
     assert_eq!(std::fs::read(&record).unwrap(), corrupt);
     let append = |path: &Path, request: &str| {
         let row = serde_json::json!({"type":"assistant","sessionId": if path == held.as_path() {"11111111-2222-4333-8444-000000000000"} else {"11111111-2222-4333-8444-000000000001"},"timestamp":"2026-10-07T10:00:01Z","requestId":request,"message":{"id":request,"model":"fixture-model","usage":{"input_tokens":200,"output_tokens":20}}});

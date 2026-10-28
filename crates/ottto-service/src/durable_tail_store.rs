@@ -555,9 +555,6 @@ impl DurableTailStore {
                         }
                     }
                 }
-                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-                    return Err(Refusal::Undecodable)
-                }
                 Err(e) => return Err(self.read_failure(e, Refusal::Undecodable)),
             };
             let Some(metadata) = self.inspect_file(&file) else {
