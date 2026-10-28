@@ -1740,6 +1740,108 @@ fn a_never_permitted_cutover_rearms_once_and_is_counted() {
     );
 }
 
+/// A pre-cutover writer drops the spent field and records `""` again.
+/// Re-upgrading owes exactly one additional counted cutover, then keeps SPENT
+/// through another terminal and restart. An unknown contract is not this case.
+#[test]
+fn a_dropped_cutover_field_with_recorded_empty_spends_one_more_run() {
+    let _gate = crate::snapshots::claude_request_money::e2::GateForTest::off();
+    claude_request_identity::with_cycle_contract_for_test(
+        claude_request_identity::COLLECTOR,
+        || {
+            let rearm = Rearm::new();
+            let support = temp_dir("full-rearm-cutover-reupgrade");
+            let path = support.join("index.json");
+            let mut index = rearm.index();
+            assert_eq!(index.claude_request_identity_contract.as_deref(), Some(""));
+            {
+                let _pre_cutover = claude_request_identity::PreCutoverEvidenceForTest::enter();
+                let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                assert!(first.counts.full_rearm, "{first:?} {state}");
+                let (quiet, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                assert!(quiet.suppression.full_rearm_suppressed, "{quiet:?} {state}");
+            }
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            index.observe_claude_request_identity_contract(true);
+            let (first, _, state) = always_on_terminal(&rearm, &support, &mut index);
+            assert_eq!(first.rearmed_files, 2, "{first:?} {state}");
+            assert_eq!(
+                index.claude_full_rearm_progress.contract_cutover,
+                CLAUDE_CONTRACT_CUTOVER_SPENT
+            );
+            let before = scope.finish().contract.contract_cutover_rearm.runs;
+            assert_eq!(before, 1, "the original cutover was actually spent");
+            index.save(&path).unwrap();
+
+            // Model the older writer's rewrite: drop only the unknown field,
+            // and record its never-permitted contract explicitly (not None).
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                saved["claude_full_rearm_progress"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("contract_cutover"),
+                Some(serde_json::json!(CLAUDE_CONTRACT_CUTOVER_SPENT))
+            );
+            saved["claude_request_identity_contract"] = serde_json::json!("");
+            fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+            index = ScanIndex::load(&path).unwrap();
+            assert_eq!(index.claude_full_rearm_progress.contract_cutover, 0);
+            assert_eq!(index.claude_request_identity_contract.as_deref(), Some(""));
+            {
+                let _pre_cutover = claude_request_identity::PreCutoverEvidenceForTest::enter();
+                always_on_terminal(&rearm, &support, &mut index);
+                let (quiet, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                assert!(quiet.suppression.full_rearm_suppressed, "{quiet:?} {state}");
+            }
+            index.save(&path).unwrap();
+            index = ScanIndex::load(&path).unwrap();
+            assert_eq!(index.claude_full_rearm_progress.contract_cutover, 0);
+            assert_eq!(index.claude_request_identity_contract.as_deref(), Some(""));
+
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            index.observe_claude_request_identity_contract(true);
+            assert_eq!(
+                index.claude_full_rearm_progress.contract_cutover,
+                CLAUDE_CONTRACT_CUTOVER_OWED
+            );
+            let (reupgrade, _, state) = always_on_terminal(&rearm, &support, &mut index);
+            assert_eq!(reupgrade.rearmed_files, 2, "{reupgrade:?} {state}");
+            assert_eq!(
+                index.claude_full_rearm_progress.contract_cutover,
+                CLAUDE_CONTRACT_CUTOVER_SPENT
+            );
+            let after = before + scope.finish().contract.contract_cutover_rearm.runs;
+            assert_eq!(after, before + 1, "exactly one more cutover run");
+
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            for restart in [false, true] {
+                if restart {
+                    index.save(&path).unwrap();
+                    index = ScanIndex::load(&path).unwrap();
+                }
+                index.observe_claude_request_identity_contract(true);
+                let (quiet, _, state) = always_on_terminal(&rearm, &support, &mut index);
+                assert_eq!(
+                    quiet.rearmed_files, 0,
+                    "restart={restart}: {quiet:?} {state}"
+                );
+                assert_eq!(
+                    index.claude_full_rearm_progress.contract_cutover,
+                    CLAUDE_CONTRACT_CUTOVER_SPENT
+                );
+            }
+            assert_eq!(
+                after + scope.finish().contract.contract_cutover_rearm.runs,
+                after,
+                "SPENT stays sticky on the next pass and after restart"
+            );
+            fs::remove_dir_all(support).unwrap();
+        },
+    );
+}
+
 /// The real rebuild produces BadClock for an auxiliary row in this pass,
 /// before final identity application installs its refusal counter on the item.
 #[test]
