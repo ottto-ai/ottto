@@ -398,7 +398,7 @@ fn observe_never_waits_for_a_reservation_save_even_when_the_path_is_unwritable()
 #[should_panic(expected = "byte-unchanged indexed Full read requires an Admit ticket")]
 fn indexed_full_read_without_an_admit_ticket_panics() {
     let f = Fixture::new();
-    let (index, candidate) = f.indexed();
+    let (mut index, candidate) = f.indexed();
     let file = File::open(&f.path).unwrap();
     let mut parser = sampled_scan::new_source_parser(
         file,
@@ -410,7 +410,8 @@ fn indexed_full_read_without_an_admit_ticket_panics() {
         false,
         false,
         false,
-        &index,
+        &mut index,
+        None,
     )
     .unwrap();
     let scope = Scope("synthetic-reread-invariant".into());
@@ -595,7 +596,8 @@ fn indexed_full_reader_cannot_recover_an_earlier_claimed_ticket() {
         false,
         false,
         false,
-        &index,
+        &mut index,
+        None,
     )
     .unwrap();
     let _ = parser.prepare_acquisition(None, &Scope("new-reader".into()), None, WALL);

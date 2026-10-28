@@ -3756,6 +3756,43 @@ impl Drop for CursorCredit {
     }
 }
 
+// Decoder ownership uses the existing retained -> cursor admission order.
+static DECODER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(in crate::snapshots) struct DecoderOwner(Option<CursorCredit>);
+impl DecoderOwner {
+    pub(in crate::snapshots) fn acquire(cache: &Arc<SharedCache>, bytes: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if DECODER_LIVE
+            .compare_exchange(false, true, SeqCst, SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        match cache.cursor_reserve(bytes) {
+            Some(credit) => Some(Self(Some(credit))),
+            None => {
+                DECODER_LIVE.store(false, SeqCst);
+                None
+            }
+        }
+    }
+    // Normal completion/error calls this after destroying the decoder.
+    pub(in crate::snapshots) fn release(mut self) {
+        self.refund();
+    }
+    fn refund(&mut self) {
+        if let Some(credit) = self.0.take() {
+            credit.refund();
+            DECODER_LIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+impl Drop for DecoderOwner {
+    fn drop(&mut self) {
+        self.refund();
+    } // cancellation/unwind fallback
+}
+
 /// Checked: a claim that is not outstanding on this state is corrupt
 /// accounting. Fail closed: the state measures unbounded from then on.
 fn settle_claim(cursor: &mut CursorState, id: u64, bytes: usize) {

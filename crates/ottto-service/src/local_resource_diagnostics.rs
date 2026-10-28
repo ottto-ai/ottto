@@ -14,7 +14,7 @@ pub(crate) mod codex_memo_lifecycle;
 pub(crate) mod codex_side_lifecycle;
 
 /// Closed, content-free refusal labels; cumulative process counters on #799.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedReplayNotAuthorized")]
     ReplayNotAuthorized,
@@ -38,8 +38,16 @@ pub(crate) enum CodexZstCause {
     HeaderUnfunded,
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded,
+    #[serde(rename = "CompressedAdmissionRefused")]
+    AdmissionRefused,
+    #[serde(rename = "CompressedDecodeFailed")]
+    DecodeFailed,
+    #[serde(rename = "CompressedOwnerUnproven")]
+    OwnerUnproven,
+    #[serde(rename = "CompressedOutputHeld")]
+    OutputHeld,
 }
-const CODEX_ZST_CAUSES: usize = CodexZstCause::CompatibilityUnfunded as usize + 1;
+const CODEX_ZST_CAUSES: usize = CodexZstCause::OutputHeld as usize + 1;
 static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
     [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
@@ -620,7 +628,7 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
     };
     traversal_point(stage, "claude_code", counts);
 }
-fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
+pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,
         process_id: std::process::id(),

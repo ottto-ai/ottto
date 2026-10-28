@@ -74,6 +74,54 @@ pub(super) fn compressed_input_credit() -> io::Result<usize> {
         .ok_or_else(|| invalid("compressed rollout credit overflow"))
 }
 
+fn thread_cpu_micros() -> u64 {
+    let mut spec: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: valid writable timespec, querying only the current thread.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } != 0 {
+        return 0;
+    }
+    (spec.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(spec.tv_nsec as u64 / 1_000)
+}
+
+/// SOURCE Q3: no content, offsets, checkpoint or acceptance authority.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ArchiveEvidence {
+    pub(super) stamp: crate::transcript_acquisition::FileStamp,
+    pub(super) logical_id: String,
+    pub(super) owner: Option<String>,
+    pub(super) disposition: ArchiveDisposition,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ArchiveDisposition {
+    Acquired,
+    Empty,
+    Pending,
+    Held { cause: CodexZstCause },
+    Refused { cause: CodexZstCause },
+}
+impl ArchiveEvidence {
+    pub(super) fn begin(file: &File, path: &Path) -> io::Result<Self> {
+        let logical = path.with_extension("");
+        let logical_id = super::codex_session_id_candidates_from_path(&logical)
+            .into_iter()
+            .next()
+            .ok_or_else(|| invalid("compressed rollout logical id unavailable"))?;
+        Ok(Self {
+            stamp: crate::transcript_acquisition::FileStamp::capture(file.metadata()?)?,
+            logical_id,
+            owner: None,
+            disposition: ArchiveDisposition::Pending,
+        })
+    }
+    pub(super) fn matches(&self, file: &File) -> bool {
+        file.metadata()
+            .and_then(crate::transcript_acquisition::FileStamp::capture)
+            .is_ok_and(|stamp| self.stamp.same_content(&stamp))
+    }
+}
+
 /// Streaming decoder with sticky failure and an explicit decoded-byte budget.
 /// EOF is successful only after a complete frame (including checksum). Supports
 /// concatenated frames; a truncated last frame is never a successful prefix.
@@ -84,6 +132,9 @@ pub(super) struct BoundedDecoder<R: Read> {
     remaining: u64,
     frame_complete: bool,
     failed: bool,
+    compressed_bytes: u64,
+    decoded_bytes: u64,
+    cpu_micros: u64,
 }
 
 impl<R: Read> BoundedDecoder<R> {
@@ -103,6 +154,9 @@ impl<R: Read> BoundedDecoder<R> {
             remaining: decoded_limit,
             frame_complete: false,
             failed: false,
+            compressed_bytes: 0,
+            decoded_bytes: 0,
+            cpu_micros: 0,
         })
     }
 
@@ -136,6 +190,8 @@ impl<R: Read> BoundedDecoder<R> {
                 .map_err(|_| invalid("invalid compressed rollout frame"))?;
             let consumed = input.pos;
             let produced = out.pos();
+            self.compressed_bytes = self.compressed_bytes.saturating_add(consumed as u64);
+            self.decoded_bytes = self.decoded_bytes.saturating_add(produced as u64);
             self.input.consume(consumed);
             self.frame_complete = hint == 0;
             // The credit was paid before construction; never grow past it.
@@ -169,11 +225,29 @@ impl<R: Read> Read for BoundedDecoder<R> {
         if self.failed {
             return Err(invalid("compressed rollout previously failed"));
         }
+        let started = thread_cpu_micros();
         let result = self.read_inner(output);
+        self.cpu_micros = self
+            .cpu_micros
+            .saturating_add(thread_cpu_micros().saturating_sub(started));
         if result.is_err() {
             self.failed = true;
         }
         result
+    }
+}
+
+impl<R: Read> Drop for BoundedDecoder<R> {
+    fn drop(&mut self) {
+        crate::local_resource_diagnostics::traversal_point(
+            "codex_zst_input",
+            "codex",
+            &std::collections::BTreeMap::from([
+                ("codex_zst_compressed_bytes", self.compressed_bytes),
+                ("codex_zst_decoded_bytes", self.decoded_bytes),
+                ("codex_zst_cpu_micros", self.cpu_micros),
+            ]),
+        );
     }
 }
 
@@ -183,7 +257,10 @@ impl<R: Read> Read for BoundedDecoder<R> {
 /// names match the `BufReader<File>` calls the parser already makes.
 pub(super) enum OpenedInput {
     Plain(BufReader<File>),
-    Compressed(Box<BufReader<BoundedDecoder<File>>>),
+    Compressed(
+        Box<BufReader<BoundedDecoder<File>>>,
+        Option<super::sampled_scan::codex_cursor::DecoderOwner>,
+    ),
 }
 
 impl OpenedInput {
@@ -200,11 +277,47 @@ impl OpenedInput {
         }
         let decoder = BoundedDecoder::new(file, decoded_limit)?;
         let decoded = BufReader::with_capacity(BUFFER_BYTES, decoder);
-        Ok(Self::Compressed(Box::new(decoded)))
+        Ok(Self::Compressed(Box::new(decoded), None))
+    }
+
+    pub(super) fn funded(
+        file: File,
+        cache: &std::sync::Arc<super::sampled_scan::SharedCache>,
+    ) -> io::Result<Self> {
+        let credit = compressed_input_credit()?;
+        let owner = super::sampled_scan::codex_cursor::DecoderOwner::acquire(cache, credit)
+            .ok_or_else(|| invalid("compressed rollout admission refused"))?;
+        match Self::compressed(
+            file,
+            super::max_jsonl_file_bytes(super::SnapshotSource::Codex),
+            credit,
+        ) {
+            Ok(Self::Compressed(reader, _)) => Ok(Self::Compressed(reader, Some(owner))),
+            Err(error) => {
+                owner.release();
+                Err(error)
+            }
+            Ok(_) => unreachable!(),
+        }
+    }
+    pub(super) fn close(self) {
+        if let Self::Compressed(reader, owner) = self {
+            drop(reader);
+            if let Some(owner) = owner {
+                owner.release();
+            }
+        }
+    }
+    pub(super) fn admitted_capacity(&self) -> usize {
+        if matches!(self, Self::Compressed(_, Some(_))) {
+            0
+        } else {
+            self.capacity()
+        }
     }
 
     pub(super) fn is_compressed(&self) -> bool {
-        matches!(self, Self::Compressed(_))
+        matches!(self, Self::Compressed(..))
     }
 
     /// The original opened File: metadata and identity revalidation use it, so
@@ -213,21 +326,21 @@ impl OpenedInput {
     pub(super) fn get_ref(&self) -> &File {
         match self {
             Self::Plain(reader) => reader.get_ref(),
-            Self::Compressed(reader) => reader.get_ref().input.get_ref(),
+            Self::Compressed(reader, _) => reader.get_ref().input.get_ref(),
         }
     }
 
     pub(super) fn get_mut(&mut self) -> &mut File {
         match self {
             Self::Plain(reader) => reader.get_mut(),
-            Self::Compressed(reader) => reader.get_mut().input.get_mut(),
+            Self::Compressed(reader, _) => reader.get_mut().input.get_mut(),
         }
     }
 
     pub(super) fn buffer(&self) -> &[u8] {
         match self {
             Self::Plain(reader) => reader.buffer(),
-            Self::Compressed(reader) => reader.buffer(),
+            Self::Compressed(reader, _) => reader.buffer(),
         }
     }
 
@@ -237,7 +350,7 @@ impl OpenedInput {
     pub(super) fn capacity(&self) -> usize {
         match self {
             Self::Plain(reader) => reader.capacity(),
-            Self::Compressed(reader) => {
+            Self::Compressed(reader, _) => {
                 let boxed = size_of::<BufReader<BoundedDecoder<File>>>();
                 boxed
                     .saturating_add(reader.capacity())
@@ -251,7 +364,7 @@ impl Read for OpenedInput {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(output),
-            Self::Compressed(reader) => reader.read(output),
+            Self::Compressed(reader, _) => reader.read(output),
         }
     }
 }
@@ -260,15 +373,34 @@ impl BufRead for OpenedInput {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         match self {
             Self::Plain(reader) => reader.fill_buf(),
-            Self::Compressed(reader) => reader.fill_buf(),
+            Self::Compressed(reader, _) => reader.fill_buf(),
         }
     }
 
     fn consume(&mut self, amount: usize) {
         match self {
             Self::Plain(reader) => reader.consume(amount),
-            Self::Compressed(reader) => reader.consume(amount),
+            Self::Compressed(reader, _) => reader.consume(amount),
         }
+    }
+}
+
+impl super::ScanIndex {
+    pub(super) fn archive_refuse(&mut self, path: &Path, cause: CodexZstCause) {
+        if let Some(archive) = self
+            .files
+            .get_mut(&super::local_index_key(path))
+            .and_then(|entry| entry.archive.as_mut())
+        {
+            archive.disposition = ArchiveDisposition::Refused { cause };
+            codex_zst_refused(cause);
+        }
+    }
+}
+crate::heap_layout_bound::fields!(ArchiveEvidence; stamp, logical_id, owner, disposition);
+impl crate::heap_layout_bound::HeapLayoutBound for ArchiveDisposition {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
     }
 }
 
@@ -442,5 +574,261 @@ mod tests {
         let input = OpenedInput::compressed(file, plain.len() as u64 - 1, credit).unwrap();
         let error = parse(codex_parser(input, path), &expected, path).unwrap_err();
         assert!(format!("{error:#}").contains("decoded-byte limit"));
+    }
+    static ARCHIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    struct ArchiveFixture(PathBuf);
+    impl ArchiveFixture {
+        fn new(bytes: &[u8]) -> Self {
+            let root = crate::test_scratch::private_dir("codex-archive-completion");
+            let path = root.join("rollout-compressed-fixture.jsonl.zst");
+            fs::write(&path, bytes).unwrap();
+            Self(path)
+        }
+        fn candidate(&self) -> CandidateFile {
+            let mut candidate = super::super::codex_zst_refusal_tests::candidate(&self.0);
+            candidate.size_bytes = fs::metadata(&self.0).unwrap().len();
+            candidate
+        }
+    }
+    impl Drop for ArchiveFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+    #[derive(Clone, Default)]
+    struct Ends(Arc<Mutex<Vec<super::super::line_delivery::DeliveryEnd>>>);
+    impl super::super::line_delivery::LineObserver for Ends {
+        fn begin(
+            &mut self,
+            file: &super::super::line_delivery::FileView,
+        ) -> super::super::line_delivery::Want {
+            assert_eq!(file.mode, super::super::line_delivery::DeliveryMode::Full);
+            super::super::line_delivery::Want::Lines
+        }
+        fn line(
+            &mut self,
+            _: &super::super::line_delivery::FileView,
+            _: &super::super::line_delivery::PhysicalLine<'_>,
+        ) {
+        }
+        fn end(
+            &mut self,
+            _: &super::super::line_delivery::FileView,
+            end: &super::super::line_delivery::DeliveryEnd,
+        ) {
+            self.0.lock().unwrap().push(*end);
+        }
+    }
+    // Inject the candidate at the selection seam: discovery remains plain-only
+    // until 11b. Everything from secure open through LD/output is production.
+    fn archive_pass(
+        f: &ArchiveFixture,
+        index: ScanIndex,
+        paid: bool,
+        limit: Option<u64>,
+    ) -> (ScanIndex, SourceScanResult, Vec<Value>, Ends) {
+        let ends = Ends::default();
+        let ((index, result), diagnostics) = crate::local_resource_diagnostics::capture(|| {
+            let mut scan = OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                &[],
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_line_observer("archive", Box::new(ends.clone()));
+            if paid {
+                scan = scan.with_sampled_acquisition(
+                    Arc::new(sampled_scan::SharedCache::default()),
+                    Scope("archive-test".into()),
+                );
+            }
+            scan.identified_candidates = VecDeque::from([f.candidate()]);
+            scan.codex_join_prepared = true;
+            scan.census_unix_seconds = None;
+            for _ in 0..1000 {
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(mut next) => {
+                        // Synthetic over-limit without allocating a 2GiB fixture.
+                        if let Some(limit) = limit {
+                            let (active, lease) = next.active_file.into_parts();
+                            let mut active = active;
+                            if let Some(active) = active.as_mut() {
+                                if active.charged_bytes == 0 {
+                                    if let OpenedInput::Compressed(reader, _) =
+                                        &mut active.parser.reader.reader
+                                    {
+                                        reader.get_mut().remaining = limit;
+                                    }
+                                }
+                            }
+                            next.active_file =
+                                sampled_scan::codex_cursor::ActiveFrame::new(active, lease);
+                        }
+                        scan = next;
+                    }
+                    OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+                }
+            }
+            panic!("archive scan did not complete");
+        });
+        (index, result, diagnostics, ends)
+    }
+    fn decodes(rows: &[Value]) -> usize {
+        rows.iter()
+            .filter(|row| row["stage"] == "codex_zst_input")
+            .count()
+    }
+    fn checkpoint(index: &ScanIndex) -> ScanIndex {
+        let partial = index.committable_subset_with_local_holds(
+            &ScanIndex::default(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        serde_json::from_slice(&serde_json::to_vec(&partial).unwrap()).unwrap()
+    }
+    #[test]
+    fn archive_acquisition_money_identity_ld_and_failure_checkpoint_are_quiet() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let bytes = synthetic_rollout();
+        let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
+        let (index, result, rows, ends) = archive_pass(&f, ScanIndex::default(), true, None);
+        assert_eq!(decodes(&rows), 1);
+        assert_eq!(
+            *ends.0.lock().unwrap(),
+            vec![super::super::line_delivery::DeliveryEnd::Complete]
+        );
+        assert_eq!(result.snapshots.len(), 1);
+        let plain = fixture(&bytes, ".jsonl");
+        let mut file = File::open(&plain.0).unwrap();
+        let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+        let oracle = parse(
+            codex_parser(OpenedInput::plain(file), &plain.0),
+            &identity,
+            &plain.0,
+        )
+        .unwrap();
+        let actual = serde_json::to_value(&result.snapshots[0]).unwrap();
+        for key in [
+            "source_session_id",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens",
+            "reasoning_output_tokens",
+            "unattributed_total_tokens",
+            "request_count",
+            "model_usage",
+            "usage_buckets",
+            "usage_accounting_contract",
+        ] {
+            assert_eq!(
+                actual[key], oracle["snapshots"][0][key],
+                "money field {key}"
+            );
+        }
+        assert_eq!(result.snapshots[0].source_session_id, "compressed-fixture");
+        let key = local_index_key(&f.0);
+        assert!(matches!(
+            index.files[&key].archive.as_ref().unwrap().disposition,
+            ArchiveDisposition::Acquired
+        ));
+        let saved = checkpoint(&index); // upload failure / lost ACK, then restart
+        assert!(saved.files[&key].last_snapshot_fingerprint.is_none());
+        assert!(saved.accepted_snapshot_fingerprints.is_empty());
+        assert!(!saved.file_snapshot_fingerprints.contains_key(&key));
+        for state in [index, saved] {
+            let (_, result, rows, _) = archive_pass(&f, state, true, None);
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.snapshots.is_empty());
+        }
+    }
+    #[test]
+    fn archive_failed_attempts_never_publish_and_refusals_survive_restart() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let bytes = synthetic_rollout();
+        let valid = zstd::stream::encode_all(&bytes[..], 1).unwrap();
+        for (encoded, paid, limit) in [
+            (b"corrupt".to_vec(), true, None),
+            (valid[..valid.len() - 1].to_vec(), true, None),
+            (valid.clone(), true, Some(1)),
+            (valid.clone(), false, None),
+        ] {
+            let f = ArchiveFixture::new(&encoded);
+            let (index, result, rows, ends) = archive_pass(&f, ScanIndex::default(), paid, limit);
+            assert_eq!(decodes(&rows), usize::from(paid));
+            assert!(result.snapshots.is_empty());
+            assert!(index.codex_parent_ownership_ledgers.is_empty());
+            assert!(!ends
+                .0
+                .lock()
+                .unwrap()
+                .contains(&super::super::line_delivery::DeliveryEnd::Complete));
+            assert!(matches!(
+                index.files[&local_index_key(&f.0)]
+                    .archive
+                    .as_ref()
+                    .unwrap()
+                    .disposition,
+                ArchiveDisposition::Refused { .. }
+            ));
+            let (_, result, rows, _) = archive_pass(&f, checkpoint(&index), true, None);
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.snapshots.is_empty());
+        }
+    }
+    #[test]
+    fn archive_empty_held_and_selected_held_restore_carry_only_evidence() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        for bytes in [
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed-fixture\"}}\n".to_vec(),
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"wrong-owner\"}}\n".to_vec(),
+        ] {
+            let f = ArchiveFixture::new(&zstd::stream::encode_all(&bytes[..], 1).unwrap());
+            let (mut index, result, _, _) = archive_pass(&f, ScanIndex::default(), true, None);
+            assert!(result.snapshots.is_empty());
+            let key = local_index_key(&f.0);
+            index.files.get_mut(&key).unwrap().last_snapshot_fingerprint =
+                Some("unacknowledged".into());
+            let held = BTreeSet::from(["unacknowledged".into()]);
+            let previous = ScanIndex::default();
+            let oracle = index.with_locally_held_keys_reverted(&previous, &held, &held);
+            let mut restored = index.into_locally_held_keys_reverted(&previous, &held, &held);
+            assert_eq!(
+                serde_json::to_value(&restored.files).unwrap(),
+                serde_json::to_value(oracle.files).unwrap()
+            );
+            assert!(restored.files[&key].last_snapshot_fingerprint.is_none());
+            restored.migrate(f.candidate());
+            restored.record(f.candidate(), None, ScanParseOutcome::Unknown);
+            let (_, result, rows, _) = archive_pass(&f, checkpoint(&restored), true, None);
+            assert_eq!(decodes(&rows), 0);
+            assert!(result.snapshots.is_empty());
+        }
+    }
+    #[test]
+    fn archive_decoder_has_one_process_owner_and_explicit_release() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        let f =
+            ArchiveFixture::new(&zstd::stream::encode_all(&synthetic_rollout()[..], 1).unwrap());
+        let first = Arc::new(sampled_scan::SharedCache::default());
+        let second = Arc::new(sampled_scan::SharedCache::default());
+        let input = OpenedInput::funded(File::open(&f.0).unwrap(), &first).unwrap();
+        assert_eq!(first.cursor_reserved(), compressed_input_credit().unwrap());
+        assert!(OpenedInput::funded(File::open(&f.0).unwrap(), &second).is_err());
+        input.close();
+        assert_eq!(first.cursor_reserved(), 0);
+        OpenedInput::funded(File::open(&f.0).unwrap(), &second)
+            .unwrap()
+            .close();
+        assert_eq!(second.cursor_reserved(), 0);
     }
 }
