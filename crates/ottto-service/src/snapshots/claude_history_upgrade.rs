@@ -2109,7 +2109,7 @@ mod tests {
     #[test]
     fn unread_telemetry_holds_permitted_upgrades_only() {
         let mut index = super::super::ScanIndex::default();
-        let gated = |held, literal_denied| GatedHistory {
+        let gated = |held: Option<HistoryHold>, literal_denied: bool| GatedHistory {
             index_key: "k".into(),
             held,
             permitted: held.is_none() && !literal_denied,
