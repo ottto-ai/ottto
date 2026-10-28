@@ -162,6 +162,16 @@ pub(crate) fn line_delivery_unselected(source: &str, reason: UnselectedReason) {
 
 const SCHEMA_VERSION: u8 = 2;
 
+pub(crate) fn connection_binding_read<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    credential_file_read(result).inspect_err(|_| {
+        traversal_point(
+            "connection_binding_read",
+            "unknown",
+            &serde_json::json!({"connection_binding_unreadable": 1}),
+        );
+    })
+}
+
 #[cfg(not(test))]
 static CREDENTIAL_FILE_CAP_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 #[cfg(test)]
@@ -174,22 +184,19 @@ pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Resu
     use ottto_core::{CredentialFileCapRefused, TokenStoreError};
     let kind = result.as_ref().err().and_then(|error| {
         error.chain().find_map(|cause| {
-            if matches!(
-                cause.downcast_ref::<TokenStoreError>(),
-                Some(TokenStoreError::OversizeRefused)
-            ) {
+            if let Some(TokenStoreError::OversizeRefused) = cause.downcast_ref::<TokenStoreError>()
+            {
                 return Some(CredentialFileCapRefused::FileSecret);
             }
             cause
                 .downcast_ref::<CredentialFileCapRefused>()
-                .copied()
                 .or_else(|| {
                     cause
                         .downcast_ref::<std::io::Error>()?
                         .get_ref()?
                         .downcast_ref::<CredentialFileCapRefused>()
-                        .copied()
                 })
+                .copied()
         })
     });
     if let Some(kind) = kind {
@@ -202,27 +209,20 @@ pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Resu
         let increment = |counts: &[AtomicU64; 4]| {
             counts[slot]
                 .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_add(1)))
-                .unwrap_or(u64::MAX)
-                .saturating_add(1)
+                .map_or(u64::MAX, |n| n.saturating_add(1))
         };
         #[cfg(not(test))]
         let total = increment(&CREDENTIAL_FILE_CAP_REFUSED);
         #[cfg(test)]
         let total = CREDENTIAL_FILE_CAP_REFUSED.with(increment);
-        #[derive(Serialize)]
-        struct Counts {
-            file_kind: &'static str,
-            credential_file_cap_refused: u64,
-            credential_file_cap_refused_total: u64,
-        }
         traversal_point(
             "credential_file_cap_refusal",
             "unknown",
-            &Counts {
-                file_kind,
-                credential_file_cap_refused: 1,
-                credential_file_cap_refused_total: total,
-            },
+            &serde_json::json!({
+                "file_kind": file_kind,
+                "credential_file_cap_refused": 1,
+                "credential_file_cap_refused_total": total,
+            }),
         );
     }
     result
@@ -1336,6 +1336,48 @@ mod tests {
         counts.restored = 1;
         let json = serde_json::to_value(&probe.full_causes).unwrap();
         assert_eq!(json["restore_outcome"]["restored"], 1);
+    }
+
+    #[test]
+    fn connection_binding_failures_are_counted_without_sensitive_detail() {
+        let (_, lines) = capture(|| {
+            assert!(connection_binding_read(Ok::<_, anyhow::Error>(None::<()>))
+                .unwrap()
+                .is_none());
+            assert_eq!(connection_binding_read(Ok(7)).unwrap(), 7);
+            for message in [
+                "open connection binding /private/synthetic",
+                "parse connection binding https://synthetic.invalid",
+            ] {
+                let error =
+                    connection_binding_read::<()>(Err(anyhow::anyhow!(message))).unwrap_err();
+                assert_eq!(error.to_string(), message);
+            }
+            let error = anyhow::Error::new(ottto_core::CredentialFileCapRefused::ConnectionBinding);
+            assert!(connection_binding_read::<()>(Err(error)).is_err());
+        });
+        let unreadable: Vec<_> = lines
+            .iter()
+            .filter(|r| r["stage"] == "connection_binding_read")
+            .collect();
+        assert_eq!(unreadable.len(), 3);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|r| r["stage"] == "credential_file_cap_refusal")
+                .count(),
+            1
+        );
+        for line in unreadable {
+            assert_eq!(line["schema_version"], 2);
+            assert_eq!(line["source"], "unknown");
+            assert_eq!(
+                line["counts"],
+                serde_json::json!({"connection_binding_unreadable": 1})
+            );
+            let text = line.to_string();
+            assert!(!text.contains("/private") && !text.contains("synthetic.invalid"));
+        }
     }
 
     #[test]

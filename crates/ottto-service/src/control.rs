@@ -20056,6 +20056,9 @@ for line in sys.stdin:
     #[test]
     #[serial]
     fn post_confirm_claim_commit_failure_fences_live_admission_then_rolls_forward() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
         let support_root = telemetry_key_store_root("credential-claim-commit-recovery");
         let secret_root = telemetry_key_store_root("credential-claim-commit-recovery-secret");
         fs::create_dir_all(&secret_root).expect("secret root");

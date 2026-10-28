@@ -188,6 +188,24 @@ binding read, parse or cap failure now stops endpoint resolution and propagates
 before creating a credential-bearing client. Environment/default endpoint
 fallback applies only when the binding is absent, never after a failed load.
 This applies to every source and composition/footprint/inventory harvest.
+
+## Unreadable Connection Binding
+
+Endpoint resolution also emits a schema-2 `connection_binding_read` point on
+the existing `local_resources` carrier with
+`counts.connection_binding_unreadable: 1` for each failed binding load (I/O,
+parse, UTF-8 or cap refusal). Absent and valid bindings do not count. Cap
+refusals also retain the distinct cap event above; these are two causes for
+one attempt, not two refused uploads. There is no cumulative total for this
+cause. No path, endpoint, account or error text is emitted.
+
+The existing canonical health blocker registry, used by `ottto doctor` and
+status, checks endpoint resolution too. An unreadable binding adds the blocking
+`connection_binding_unreadable` finding: run `ottto login` to reconnect this
+Mac and resume uploads. The finding clears on the next health projection after
+the binding is repaired or removed. Each failed diagnostic check counts as a
+load attempt too. This uses the existing health and diagnostic channels; it
+adds no background subsystem or upload fallback.
 The safe diagnostic names the connection binding and asks to reconnect; it
 contains no path or endpoint URL. During owned-scan authority revalidation,
 an endpoint load failure remains a local-state rejection.

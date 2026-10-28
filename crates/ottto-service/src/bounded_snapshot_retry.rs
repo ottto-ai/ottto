@@ -137,12 +137,6 @@ impl PreparedRetry {
             || !crate::snapshot_retry::json_fits(baseline, crate::snapshot_retry::RESPONSE_BYTES)
             || !crate::snapshot_retry::json_fits(progress, crate::snapshot_retry::RESPONSE_BYTES)
         {
-            #[cfg(test)]
-            eprintln!("pi_retry_capture_refused bound=serialized-json items_fit={} working_fit={} baseline_fit={} progress_fit={}",
-                crate::snapshot_retry::json_fits(items, crate::snapshot_retry::REQUEST_BYTES / 2),
-                crate::snapshot_retry::json_fits(working, crate::snapshot_retry::RESPONSE_BYTES),
-                crate::snapshot_retry::json_fits(baseline, crate::snapshot_retry::RESPONSE_BYTES),
-                crate::snapshot_retry::json_fits(progress, crate::snapshot_retry::RESPONSE_BYTES));
             return None;
         }
         let mut counter = Counter::new(cap);

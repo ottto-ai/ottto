@@ -427,6 +427,200 @@ fn bounded_retry_owner_due_boundary_preserves_ordinary_deadline() {
 #[test]
 // The bounded turn leases the shared client_report counters across its token/batch I/O.
 #[serial(client_report)]
+fn bounded_retry_live_ack_lost_resends_same_revision_without_second_contribution() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut f = PiLiveFixture::new();
+    let item = &f.items[0];
+    let witness = snapshot_upload_body_witness(item);
+    let revision = serde_json::to_value(crate::snapshots::snapshot_semantic_envelope(
+        SnapshotSource::Pi,
+        item,
+        SnapshotUploadPolicy::default(),
+    ))
+    .unwrap();
+    assert!(revision["revision_v2_hash"].as_str().unwrap().len() >= 64);
+    let expected_tokens = item.input_tokens + item.output_tokens;
+    assert_eq!(expected_tokens, 101);
+    let ack = bounded_native_ack(item);
+    let hint = serde_json::json!({"source":"pi", "server_time":"2026-10-06T10:05:00Z",
+        "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
+        "local_usage_reconciliation_enabled":true,"backfill_window_days":30,
+        "recommended_scan_after":"2026-10-06T10:10:00Z"})
+    .to_string();
+    let initial = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: "pi".into(),
+        machine_id: "a".repeat(64),
+        collector_version: Some(collector_version()),
+        snapshots: f.items.clone(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
+        .with_bounded_retry_loopback_http_for_test();
+    let expected_witness = witness.clone();
+    let expected_revision = revision.clone();
+    let server = bounded_native_server(listener, move |listener| {
+        // Synthetic backend revision store: an identical already-accepted
+        // revision has one contribution. Assert the actual wire bodies agree,
+        // rather than teaching a second client-side equality rule to the test.
+        let mut revisions = BTreeMap::new();
+        let mut contributions = 0;
+        let mut tokens = 0;
+        let mut posts = Vec::new();
+        for step in 0..5 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let bytes = bounded_native_read(&mut stream);
+            let request = String::from_utf8(bytes).unwrap();
+            if step == 2 {
+                assert!(request.contains("/relay-token "));
+                bounded_native_response(&mut stream, "200 OK", "{\"token\":\"fresh\"}");
+                continue;
+            }
+            if step == 3 {
+                assert!(request.contains("/activity-hints "));
+                bounded_native_response(&mut stream, "200 OK", &hint);
+                continue;
+            }
+            assert!(request.contains("/batches "));
+            let request: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let body = &request["snapshots"][0];
+            assert_eq!(body["semantic_envelope"], expected_revision);
+            let body_bytes = serde_json::to_vec(&request["snapshots"]).unwrap();
+            posts.push(body_bytes.clone());
+            if step == 1 {
+                bounded_native_response(&mut stream, "429 Too Many Requests", "{}");
+                continue;
+            }
+            let key = (
+                body["source_session_id"].as_str().unwrap().to_owned(),
+                body["semantic_envelope"]["revision_v2_hash"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+            match revisions.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    contributions += 1;
+                    tokens += body["input_tokens"].as_u64().unwrap()
+                        + body["output_tokens"].as_u64().unwrap();
+                    entry.insert((body_bytes, expected_witness.clone()));
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    assert_eq!(entry.get(), &(body_bytes, expected_witness.clone()));
+                }
+            }
+            if step == 0 {
+                // The backend committed, then the ACK was lost. No response.
+                drop(stream);
+            } else {
+                bounded_native_response(&mut stream, "200 OK", &ack);
+            }
+        }
+        assert_eq!(posts.len(), 3);
+        assert!(posts.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(contributions, 1);
+        assert_eq!(tokens, expected_tokens);
+        revisions.into_values().next().unwrap()
+    });
+    let before_index = std::fs::read(&f.index_path).unwrap();
+    let before_progress = std::fs::read(&f.progress_path).unwrap();
+    assert!(client.upload_batch("initial", &initial, false).is_err());
+    assert_eq!(std::fs::read(&f.index_path).unwrap(), before_index);
+    assert_eq!(std::fs::read(&f.progress_path).unwrap(), before_progress);
+    assert!(!f
+        .progress
+        .contains_body(&f.items[0].snapshot_fingerprint, &witness));
+    let shed = attempt_snapshot_page(
+        &f.items,
+        &[0],
+        "pi",
+        &mut f.progress,
+        &mut 0,
+        &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+        &snapshot_upload_body_witness,
+        &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
+        &mut |snapshots| {
+            client.upload_batch(
+                "ordinary-retry",
+                &SnapshotBatchRequest {
+                    snapshots,
+                    ..initial.clone()
+                },
+                false,
+            )
+        },
+        &mut |_| Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(shed.downcast_ref::<UploadShed>().unwrap().status, 429);
+    let mut owner = f.capture(Duration::ZERO);
+    let device = LocalDeviceBinding {
+        sources: vec!["pi".into()],
+        ..bounded_native_device()
+    };
+    let opens = crate::snapshots::all_transcript_opens_for_test();
+    let mut turns = 0;
+    owner.isolated_boundary(|page| {
+        turns += 1;
+        let live = page.take_live_authority()?;
+        let result = page.turn_live(
+            &client,
+            &device,
+            "synthetic-secret",
+            live.policy(),
+            &mut || live.validate_inputs(&f.home.0),
+        );
+        assert!(
+            matches!(result, Ok(SnapshotPageOutcome::Settled { conflicted: 0 })),
+            "{result:?}"
+        );
+        page.restore_live_authority(live);
+        result
+    });
+    assert_eq!(turns, 1);
+    assert_eq!(crate::snapshots::all_transcript_opens_for_test(), opens);
+    let (accepted_body, accepted_witness) = server.join().unwrap();
+    assert_eq!(
+        accepted_body,
+        serde_json::to_vec(&serde_json::to_value(&initial).unwrap()["snapshots"]).unwrap()
+    );
+    assert_eq!(accepted_witness, witness);
+    assert_eq!(snapshot_upload_body_witness(&f.items[0]), witness);
+    let durable = SnapshotUploadProgress::load(
+        &f.progress_path,
+        &f.progress.destination_namespace_hash,
+        test_quarantine_witness(),
+    )
+    .unwrap();
+    assert!(durable.contains_body(&f.items[0].snapshot_fingerprint, &witness));
+    let mut recovered = ScanIndex::load(&f.index_path).unwrap();
+    let scan = crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::Pi,
+        &f.roots,
+        &mut recovered,
+        "2026-10-06T10:06:00Z",
+        30,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        false,
+    )
+    .unwrap();
+    assert!(scan.snapshots.is_empty());
+    eprintln!("native_ack_lost snapshots_identical=true same_revision=true contributions=1 tokens={expected_tokens} witness_unchanged=true checkpoint_ack_restart=true");
+}
+
+#[test]
+// The bounded turn leases the shared client_report counters across its token/batch I/O.
+#[serial(client_report)]
 fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_and_ack() {
     if !crate::heap_layout_bound::layout_supported() {
         return;

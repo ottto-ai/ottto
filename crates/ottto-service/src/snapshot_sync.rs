@@ -11079,7 +11079,7 @@ fn snapshot_api_base_url_from(
 ) -> Result<String> {
     // Read/parse/cap errors are not an absent binding: never redirect secrets
     // to the environment/default destination after a persisted binding fails.
-    let connection = crate::local_resource_diagnostics::credential_file_read(connection)?;
+    let connection = crate::local_resource_diagnostics::connection_binding_read(connection)?;
     Ok(normalize_api_base_url(
         connection.map(|binding| binding.api_base_url),
         env_value,
@@ -18276,6 +18276,9 @@ mod tests {
     #[test]
     #[serial]
     fn endpoint_load_failure_during_scan_is_local_state() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
         let root = test_dir("scan-endpoint-load-failure");
         std::fs::create_dir_all(&root).unwrap();
         let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
