@@ -1227,17 +1227,22 @@ fn always_on_veto_state(rearm: &Rearm, index: &ScanIndex, items: &[SnapshotItem]
 /// matched, or matched with request identity but no account check, the
 /// first due terminal records the structural baseline and every later due
 /// terminal with no contract change skips: no fingerprint is cleared, so
-/// nothing reads Full. Under the released E2 contract (gate on) and the
-/// gate-off collector.
+/// nothing reads Full. Under the released E2 contract (gate on); the
+/// gate-off (pre-flip) collector only with absent sidecars, since there a
+/// dark row is refused as invalid evidence, a non-structural veto.
 #[test]
 fn always_on_terminals_keep_the_structural_suppression() {
-    for (contract, gate) in [
-        (claude_request_identity::E2_GROUPING, true),
-        (claude_request_identity::COLLECTOR, false),
+    for (contract, gate, causes) in [
+        (
+            claude_request_identity::E2_GROUPING,
+            true,
+            &["absent", "matched", "matched-identity"][..],
+        ),
+        (claude_request_identity::COLLECTOR, false, &["absent"][..]),
     ] {
         let _gate = crate::snapshots::claude_request_money::e2::GateForTest::set(gate);
         claude_request_identity::with_cycle_contract_for_test(contract, || {
-            for cause in ["absent", "matched", "matched-identity"] {
+            for &cause in causes {
                 let arm = format!("{contract} {cause}");
                 let rearm = Rearm::new();
                 let support = temp_dir("full-rearm-always-on");
