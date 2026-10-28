@@ -182,7 +182,10 @@ zero elapsed time and null CPU/RSS samples. These records contain no path,
 account, secret or content, add no probes or reads, and use the same ignored
 stderr-write errors as other local resource records. They remain local and
 may be unavailable if logging fails. Native Keychain loads are outside this
-file cap and remain in the shared ordinary-path resource domain.
+file cap and remain in the shared ordinary-path resource domain. A connection
+binding read, parse or cap failure now stops endpoint resolution and propagates
+before creating a credential-bearing client. Environment/default endpoint
+fallback applies only when the binding is absent, never after a failed load.
 
 ## Line Delivery Counters
 

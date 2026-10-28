@@ -285,7 +285,7 @@ fn harvest_all_once(
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+    let api_base_url = crate::snapshot_sync::snapshot_api_base_url()?;
     let client = SnapshotApiClient::new(api_base_url.clone());
     harvest_source(
         &client,

@@ -928,7 +928,7 @@ impl Host for ProductionHost<'_> {
     fn authority(&mut self) -> Option<[u8; 32]> {
         let current = ottto_core::FileDeviceStore::default().load().ok()??;
         let account = self.daemon.snapshot_scan_account_witness().ok()?;
-        current_authority(&current, &snapshot_api_base_url(), &account)
+        current_authority(&current, &snapshot_api_base_url().ok()?, &account)
     }
     fn complete_eof(&mut self, completion: EofCompletion) -> Result<()> {
         let completed = completion

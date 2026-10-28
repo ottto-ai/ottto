@@ -188,7 +188,7 @@ impl ClientHealthPoster {
         let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
             return Err(anyhow!("machine identity is missing"));
         };
-        let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+        let api_base_url = crate::snapshot_sync::snapshot_api_base_url()?;
         Ok(Self {
             client: SnapshotApiClient::new(api_base_url.clone()),
             destination: destination_identity(&device, &machine_id, &api_base_url),
@@ -502,7 +502,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
-    let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+    let api_base_url = crate::snapshot_sync::snapshot_api_base_url()?;
     let enabled = crate::snapshot_sync::enabled_snapshot_sources(&device);
     let destination = destination_identity(&device, &machine_id, &api_base_url);
     // Persist attempts before root discovery, identity-state loading or network
