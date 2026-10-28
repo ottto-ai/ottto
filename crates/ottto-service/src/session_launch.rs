@@ -38,19 +38,37 @@ pub(super) fn block(reason: Reason) -> Block {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ProgramIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+fn program_identity(path: &Path) -> Option<ProgramIdentity> {
+    let metadata = fs::metadata(path).ok()?;
+    (metadata.is_file() && metadata.mode() & 0o111 != 0).then(|| ProgramIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 struct Entry {
     binding: Binding,
     cwd: PathBuf,
     dev: u64,
     ino: u64,
     program: PathBuf,
+    program_identity: ProgramIdentity,
     secret: [u8; 32],
     created: Instant,
     state: State,
     block: Option<Block>,
     attempt: Option<SecretString>,
     launcher: PathBuf,
-    generation: Option<crate::account_nicknames::Generation>,
+    generation: (u64, Option<crate::account_nicknames::Generation>),
 }
 
 #[derive(Default)]
@@ -129,9 +147,37 @@ impl Registry {
         ottto: Option<PathBuf>,
         support: &Path,
     ) -> Result<SessionLaunchPrepareResultV1, Block> {
+        let user = launch_user().ok_or_else(|| block(Reason::SlotNotVerified))?;
+        self.prepare_for_user(
+            provider,
+            slot_id,
+            account,
+            organization,
+            folder,
+            ottto,
+            support,
+            user,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_for_user(
+        &mut self,
+        provider: Provider,
+        slot_id: &str,
+        account: &str,
+        organization: &str,
+        folder: SessionLaunchFolderV1,
+        ottto: Option<PathBuf>,
+        support: &Path,
+        user: ottto_core::session_launch::LaunchUser,
+    ) -> Result<SessionLaunchPrepareResultV1, Block> {
         let now = Instant::now();
         self.sweep(now);
-        let user = launch_user().ok_or_else(|| block(Reason::SlotNotVerified))?;
+        let generation = crate::account_nicknames::launch_generation();
+        if crate::control::identity_mutation_in_progress() {
+            return Err(block(Reason::AccountMismatch));
+        }
         let binding = binding::resolve(provider, slot_id, account, organization, user)?;
         let selected = match (folder.path, folder.recent_id) {
             (Some(path), None) => PathBuf::from(path),
@@ -153,7 +199,15 @@ impl Registry {
             &binding.user.home,
         )
         .ok_or_else(|| block(Reason::CliNotFound))?;
+        let program = program
+            .canonicalize()
+            .map_err(|_| block(Reason::CliNotFound))?;
+        let program_identity =
+            program_identity(&program).ok_or_else(|| block(Reason::CliNotFound))?;
         let cli_version = supported_version(&program, &binding, &cwd)?;
+        if self::program_identity(&program).as_ref() != Some(&program_identity) {
+            return Err(block(Reason::CliVersionUnsupported));
+        }
         let ottto = ottto
             .filter(|path| executable(path))
             .ok_or_else(|| block(Reason::CliNotFound))?;
@@ -190,6 +244,9 @@ impl Registry {
                 break;
             }
         }
+        if generation != crate::account_nicknames::launch_generation() {
+            return Err(block(Reason::AccountMismatch));
+        }
         let dir = launcher_directory(support, true)?;
         let secret = generate_control_token().map_err(|_| block(Reason::LauncherDirUnsafe))?;
         let (id, launcher) = write_launcher(&dir, support, &ottto, &secret)?;
@@ -216,13 +273,14 @@ impl Registry {
                 dev: metadata.dev(),
                 ino: metadata.ino(),
                 program,
+                program_identity,
                 secret: Sha256::digest(secret.as_bytes()).into(),
                 created: Instant::now(),
                 state: State::Pending,
                 block: None,
                 attempt: None,
                 launcher,
-                generation: crate::account_nicknames::generation(),
+                generation,
             },
         );
         Ok(response)
@@ -386,7 +444,9 @@ fn check_entry(entry: &Entry, secret: &str) -> Result<SessionLaunchExecPlanV1, B
     if entry.created.elapsed() >= TTL {
         return Err(block(Reason::LaunchExpired));
     }
-    if entry.generation != crate::account_nicknames::generation() {
+    if entry.generation != crate::account_nicknames::launch_generation()
+        || crate::control::identity_mutation_in_progress()
+    {
         return Err(block(Reason::AccountMismatch));
     }
     binding::recheck(&entry.binding)?;
@@ -397,6 +457,9 @@ fn check_entry(entry: &Entry, secret: &str) -> Result<SessionLaunchExecPlanV1, B
     preflight::evaluate(&entry.binding, &entry.cwd)?;
     if !executable(&entry.program) {
         return Err(block(Reason::CliNotFound));
+    }
+    if program_identity(&entry.program).as_ref() != Some(&entry.program_identity) {
+        return Err(block(Reason::CliVersionUnsupported));
     }
     let (env_unset, env_set) = environment(&entry.binding);
     Ok(SessionLaunchExecPlanV1 {

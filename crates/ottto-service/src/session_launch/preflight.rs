@@ -15,9 +15,20 @@ pub(super) const CLAUDE_UNSET: &[&str] = &[
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_PROFILE",
+    "ANTHROPIC_CONFIG_DIR",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_WORKSPACE_ID",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_AWS_WORKSPACE_ID",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
     "CLAUDECODE",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
     "ANTHROPIC_BEDROCK_BASE_URL",
@@ -25,9 +36,8 @@ pub(super) const CLAUDE_UNSET: &[&str] = &[
     "ANTHROPIC_FOUNDRY_BASE_URL",
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_SSE_PORT",
-    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
-    "CLAUDE_CODE_SUBAGENT_MODEL",
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+    "CLAUDE_CODE_OAUTH_TOKEN_FD",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "OTTTO_CONTROL_TOKEN",
 ];
 pub(super) const CODEX_UNSET: &[&str] = &[
@@ -108,6 +118,27 @@ fn claude(binding: &Binding, cwd: &Path) -> Result<(), Block> {
             ancestor.join(".claude/settings.local.json"),
         ));
     }
+    if let Some(main) = main_checkout_for_settings(cwd)? {
+        paths.push((
+            Layer::ProjectLocal,
+            main.join(".claude/settings.local.json"),
+        ));
+        paths.push((Layer::Project, main.join(".claude/settings.json")));
+    }
+    // These policy sources are not statically evaluable by this version.
+    for path in [
+        binding.root.join("remote-settings.json"),
+        binding.root.join("managed-settings.json"),
+        binding
+            .user
+            .home
+            .join("Library/Preferences/com.anthropic.claudecode.plist"),
+        PathBuf::from("/Library/Managed Preferences")
+            .join(&binding.user.name)
+            .join("com.anthropic.claudecode.plist"),
+    ] {
+        refuse_present(&path, Layer::Managed)?;
+    }
     paths.push((
         Layer::Managed,
         PathBuf::from(if cfg!(target_os = "macos") {
@@ -147,10 +178,48 @@ fn claude(binding: &Binding, cwd: &Path) -> Result<(), Block> {
     Ok(())
 }
 
+/// Resolve the usual linked-worktree common directory without starting git
+/// (and without consulting inherited GIT_DIR/GIT_WORK_TREE or running helpers).
+fn main_checkout_for_settings(cwd: &Path) -> Result<Option<PathBuf>, Block> {
+    for root in ancestors(cwd) {
+        let git = root.join(".git");
+        match fs::symlink_metadata(&git) {
+            Ok(metadata) if metadata.is_dir() => return Ok(None),
+            Ok(_) => {
+                let Some(text) = read_layer(&git, Layer::Project)? else {
+                    return Err(failure(Reason::ConfigUnsupported, Layer::Project));
+                };
+                let target = text
+                    .trim()
+                    .strip_prefix("gitdir: ")
+                    .ok_or_else(|| failure(Reason::ConfigUnsupported, Layer::Project))?;
+                let gitdir = root.join(target);
+                let Some(common) = read_layer(&gitdir.join("commondir"), Layer::Project)? else {
+                    return Ok(None);
+                };
+                let common = gitdir
+                    .join(common.trim())
+                    .canonicalize()
+                    .map_err(|_| failure(Reason::SettingsUnreadable, Layer::Project))?;
+                if common.file_name().is_none_or(|name| name != ".git") {
+                    return Err(failure(Reason::ConfigUnsupported, Layer::Project));
+                }
+                return Ok(common.parent().map(Path::to_path_buf));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(failure(Reason::SettingsUnreadable, Layer::Project)),
+        }
+    }
+    Ok(None)
+}
+
 fn validate_claude_layer(value: &Value, layer: Layer, organization: &str) -> Result<(), Block> {
     let object = value
         .as_object()
         .ok_or_else(|| failure(Reason::SettingsMalformed, layer))?;
+    if object.contains_key("policyHelper") || object.contains_key("forceLoginGatewayUrl") {
+        return Err(failure(Reason::ConfigUnsupported, layer));
+    }
     if let Some(env) = object.get("env") {
         let env = env
             .as_object()
@@ -160,6 +229,13 @@ fn validate_claude_layer(value: &Value, layer: Layer, organization: &str) -> Res
                 "CLAUDE_CODE_USE_BEDROCK",
                 "CLAUDE_CODE_USE_VERTEX",
                 "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+                "ANTHROPIC_AWS_API_KEY",
+                "ANTHROPIC_AWS_BASE_URL",
+                "ANTHROPIC_AWS_WORKSPACE_ID",
+                "ANTHROPIC_FOUNDRY_API_KEY",
+                "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+                "ANTHROPIC_FOUNDRY_RESOURCE",
             ]
             .contains(&key.as_str())
             {
@@ -228,6 +304,17 @@ fn codex(binding: &Binding, cwd: &Path) -> Result<(), Block> {
         refuse_present(Path::new(path), Layer::Managed)?;
     }
     refuse_present(&binding.root.join("managed_config.toml"), Layer::Managed)?;
+    for path in [
+        binding
+            .user
+            .home
+            .join("Library/Preferences/com.openai.codex.plist"),
+        PathBuf::from("/Library/Managed Preferences")
+            .join(&binding.user.name)
+            .join("com.openai.codex.plist"),
+    ] {
+        refuse_present(&path, Layer::Managed)?;
+    }
     if let Some(raw) = read_layer(&binding.root.join("config.toml"), Layer::User)? {
         let doc = raw
             .parse::<toml_edit::DocumentMut>()

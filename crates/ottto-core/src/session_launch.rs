@@ -120,6 +120,7 @@ pub fn execute_launch_plan(_: &SessionLaunchExecPlanV1) -> Reason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     #[test]
     fn executable_quote_rejects_lines_and_keeps_metacharacters_literal() {
         assert_eq!(
@@ -135,5 +136,57 @@ mod tests {
             execute_launch_plan(&SessionLaunchExecPlanV1::default()),
             Reason::Unknown
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executor_uses_passwd_identity_scrubs_secrets_and_rejects_changed_folder() {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(raw) = std::env::var("OTTTO_SYNTHETIC_LAUNCH_PLAN") {
+            let plan = serde_json::from_str(&raw).unwrap();
+            let reason = execute_launch_plan(&plan);
+            std::process::exit(if reason == Reason::FolderChanged {
+                23
+            } else {
+                24
+            });
+        }
+        let root = std::env::temp_dir().join(format!(
+            "exec-plan-{}",
+            crate::generate_control_token().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let metadata = std::fs::metadata(&root).unwrap();
+        let user = launch_user().unwrap();
+        let plan = SessionLaunchExecPlanV1 {
+            program: Some("/bin/sh".into()),
+            argv: Some(vec!["-c".into(), "test \"$HOME\" = \"$EXPECTED_HOME\" && test \"$USER\" = \"$EXPECTED_USER\" && test \"$LOGNAME\" = \"$EXPECTED_USER\" && test -z \"${ANTHROPIC_API_KEY+x}\" && test -z \"${OTTTO_CONTROL_TOKEN+x}\" && test \"$(pwd -P)\" = \"$EXPECTED_CWD\"".into()]),
+            cwd: Some(root.to_string_lossy().into_owned()), cwd_dev: Some(metadata.dev()), cwd_ino: Some(metadata.ino()),
+            env_unset: Some(vec!["ANTHROPIC_API_KEY".into(), "OTTTO_CONTROL_TOKEN".into()]),
+            env_set: Some(BTreeMap::from([
+                ("HOME".into(), "/wrong-home".into()), ("USER".into(), "wrong-user".into()), ("LOGNAME".into(), "wrong-user".into()),
+                ("EXPECTED_HOME".into(), user.home.to_string_lossy().into_owned()), ("EXPECTED_USER".into(), user.name),
+                ("EXPECTED_CWD".into(), root.canonicalize().unwrap().to_string_lossy().into_owned()),
+            ])),
+        };
+        let run = || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["session_launch::tests::executor_uses_passwd_identity_scrubs_secrets_and_rejects_changed_folder", "--exact"])
+            .env("OTTTO_SYNTHETIC_LAUNCH_PLAN", serde_json::to_string(&plan).unwrap())
+            .env("ANTHROPIC_API_KEY", "synthetic-key").env("OTTTO_CONTROL_TOKEN", "synthetic-token")
+            .output().unwrap()
+        };
+        let result = run();
+        assert!(
+            result.status.success(),
+            "synthetic executor failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let moved = root.with_extension("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(run().status.code(), Some(23));
+        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir(moved).unwrap();
     }
 }

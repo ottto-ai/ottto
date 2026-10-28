@@ -27,13 +27,14 @@ fn fixture_entry(root: &Path) -> Entry {
         dev: metadata.dev(),
         ino: metadata.ino(),
         program: PathBuf::from("/bin/false"),
+        program_identity: program_identity(Path::new("/bin/false")).unwrap(),
         secret: Sha256::digest(b"secret").into(),
         created: Instant::now(),
         state: State::Pending,
         block: None,
         attempt: None,
         launcher: root.join("old.command"),
-        generation: None,
+        generation: (0, None),
     }
 }
 
@@ -284,4 +285,143 @@ fn fresh_identity_switch_and_needs_login_are_refused_without_spawning() {
         Reason::SlotNeedsLogin
     );
     std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
+}
+
+#[test]
+fn prepare_consume_rechecks_settings_binding_folder_and_retry() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("launch-roundtrip");
+    let root = scratch.as_ref();
+    let support = root.join("support");
+    let home = root.join("home");
+    let project = root.join("project");
+    let bin = root.join("bin");
+    for path in [&support, &home, &project, &bin] {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::create_dir(home.join(".claude")).unwrap();
+    std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin);
+    let cli = bin.join("claude");
+    fs::write(
+        &cli,
+        "#!/bin/sh\n[ \"$1\" = --version ] || exit 99\nprintf '2.1.310 (Claude Code)\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        home.join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"account-one","organizationUuid":"org-one"}}"#,
+    )
+    .unwrap();
+    let account = billing_identity_hash("anthropic", "account", "account-one").unwrap();
+    let organization = billing_identity_hash("anthropic", "organization", "org-one").unwrap();
+    fs::write(support.join("claude-config-slot-collection-state.json"), serde_json::to_vec(&serde_json::json!({
+        "schema_version":1,"slots":{"default":{"state":"fresh","account_identifier_hash":account,"organization_identifier_hash":organization}}
+    })).unwrap()).unwrap();
+    let user = LaunchUser {
+        home: home.clone(),
+        name: "synthetic".into(),
+    };
+    let prepare = |registry: &mut Registry| {
+        registry
+            .prepare_for_user(
+                Provider::ClaudeCode,
+                "default",
+                &account,
+                &organization,
+                SessionLaunchFolderV1 {
+                    path: Some(project.to_string_lossy().into_owned()),
+                    recent_id: None,
+                },
+                Some(PathBuf::from("/bin/true")),
+                &support,
+                user.clone(),
+            )
+            .unwrap()
+    };
+    let mut registry = Registry::default();
+    let one = prepare(&mut registry);
+    let old = one.launch_id.unwrap();
+    let old_path = one.launcher_path.unwrap();
+    let two = prepare(&mut registry);
+    let id = two.launch_id.unwrap();
+    assert_eq!(
+        registry.status(&old, false).block.unwrap().reason,
+        Reason::LaunchCancelled
+    );
+    assert!(!Path::new(&old_path).exists());
+    let secret = fs::read_to_string(two.launcher_path.unwrap())
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_owned();
+    let result = registry.consume(&id, &secret);
+    assert_eq!(result.state, Some(State::Starting));
+    assert!(result
+        .plan
+        .unwrap()
+        .env_set
+        .unwrap()
+        .get("CLAUDE_CONFIG_DIR")
+        .is_none());
+    assert_eq!(
+        registry.consume(&id, &secret).block.unwrap().reason,
+        Reason::LaunchAlreadyUsed
+    );
+    assert_eq!(
+        registry
+            .report(
+                &id,
+                result.attempt_id.unwrap().expose_secret(),
+                Reason::ExecFailed
+            )
+            .block
+            .unwrap()
+            .reason,
+        Reason::ExecFailed
+    );
+    for reason in [
+        Reason::SettingsEnvOverride,
+        Reason::AccountMismatch,
+        Reason::FolderChanged,
+    ] {
+        let result = prepare(&mut registry);
+        let id = result.launch_id.unwrap();
+        let secret = fs::read_to_string(result.launcher_path.unwrap())
+            .unwrap()
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .to_owned();
+        match reason {
+            Reason::SettingsEnvOverride => fs::write(
+                home.join(".claude/settings.json"),
+                r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid"}}"#,
+            )
+            .unwrap(),
+            Reason::AccountMismatch => fs::write(
+                home.join(".claude.json"),
+                r#"{"oauthAccount":{"accountUuid":"account-two","organizationUuid":"org-one"}}"#,
+            )
+            .unwrap(),
+            _ => {
+                fs::rename(&project, root.join("old-project")).unwrap();
+                fs::create_dir(&project).unwrap();
+            }
+        }
+        assert_eq!(registry.consume(&id, &secret).block.unwrap().reason, reason);
+        let _ = fs::remove_file(home.join(".claude/settings.json"));
+        fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"account-one","organizationUuid":"org-one"}}"#,
+        )
+        .unwrap();
+    }
+    std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
+    std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH");
 }

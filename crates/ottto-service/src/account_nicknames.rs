@@ -83,6 +83,11 @@ pub(crate) fn generation() -> Option<Generation> {
     generation_locked()
 }
 
+pub(crate) fn launch_generation() -> (u64, Option<Generation>) {
+    let _lock = crate::control::lock_setup_run_binding();
+    (EPOCH.load(Ordering::Acquire), generation_locked())
+}
+
 pub(crate) fn generation_for_device(device: &LocalDeviceBinding) -> Option<Generation> {
     let _lock = crate::control::try_lock_setup_run_binding()?;
     if FileDeviceStore::default().load().ok().flatten().as_ref() != Some(device) {

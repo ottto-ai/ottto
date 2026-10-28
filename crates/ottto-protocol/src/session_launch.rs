@@ -244,4 +244,20 @@ mod tests {
             SessionLaunchProviderV1::Unknown
         );
     }
+
+    #[test]
+    fn terminal_handoff_fixture_keeps_its_exact_version() {
+        let request: LocalControlRequest = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/session-launch-consume-request.json"
+        ))
+        .unwrap();
+        assert_eq!(request.protocol_version, 28);
+        assert!(matches!(
+            request.command,
+            LocalControlCommand::SessionLaunchConsume {
+                schema_version: 1,
+                ..
+            }
+        ));
+    }
 }

@@ -86,7 +86,7 @@ impl Cache {
                 worker_slot.as_deref(),
                 &support,
                 &key,
-                deadline,
+                deadline - Duration::from_millis(50),
             ));
         });
         let response = receive
@@ -177,11 +177,12 @@ fn collect(
     key: &str,
     deadline: Instant,
 ) -> Response {
+    let read_deadline = deadline - Duration::from_millis(100);
     let roots = roots();
     let mut candidates = Vec::new();
     let mut partial_reason = None;
     for (index, root) in roots.iter().enumerate() {
-        if Instant::now() >= deadline {
+        if Instant::now() >= read_deadline {
             partial_reason = Some("recent_timeout");
             break;
         }
@@ -199,26 +200,28 @@ fn collect(
                     });
                 }
             }
-            Provider::Codex => match codex_folders(&root.path.join("state_5.sqlite"), deadline) {
-                Ok(rows) => {
-                    for (path, seconds) in rows {
-                        candidates.push(Candidate {
-                            path: path.into(),
-                            seconds,
-                            root: Some(index),
-                            live: false,
-                            repository: None,
-                        });
+            Provider::Codex => {
+                match codex_folders(&root.path.join("state_5.sqlite"), read_deadline) {
+                    Ok(rows) => {
+                        for (path, seconds) in rows {
+                            candidates.push(Candidate {
+                                path: path.into(),
+                                seconds,
+                                root: Some(index),
+                                live: false,
+                                repository: None,
+                            });
+                        }
+                    }
+                    Err(reason) => {
+                        partial_reason = Some(reason);
                     }
                 }
-                Err(reason) => {
-                    partial_reason = Some(reason);
-                }
-            },
+            }
             Provider::Unknown => {}
         }
     }
-    let (scopes, incomplete) = crate::context_composition::recent_scopes(support, deadline);
+    let (scopes, incomplete) = crate::context_composition::recent_scopes(support, read_deadline);
     if incomplete {
         partial_reason = Some("composition_unavailable");
     }
