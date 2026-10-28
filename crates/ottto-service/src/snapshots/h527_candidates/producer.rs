@@ -2469,10 +2469,11 @@ fn scan_peer_file(
                                     &scan.target_ranks[i].1,
                                 )
                             };
-                            if !scan.target_native_tuples[other].contains(&tuple)
-                                && !(rank(other) < rank(index)
-                                    && scan.target_missing_tuples[other].contains_key(&tuple))
-                            {
+                            let canonical_keeper = scan.target_native_tuples[other]
+                                .contains(&tuple)
+                                || (rank(other) < rank(index)
+                                    && scan.target_missing_tuples[other].contains_key(&tuple));
+                            if !canonical_keeper {
                                 continue;
                             }
                         }
