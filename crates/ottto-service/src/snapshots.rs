@@ -44847,8 +44847,10 @@ impl ScanIndex {
                     .blocked_session_ids
                     .iter()
                     .filter(|session_id| {
-                        self.codex_state_only_blocked_session_ids
-                            .contains(session_id.as_str())
+                        archive_residue
+                            || self
+                                .codex_state_only_blocked_session_ids
+                                .contains(session_id.as_str())
                     })
                     .cloned()
                     .collect(),
