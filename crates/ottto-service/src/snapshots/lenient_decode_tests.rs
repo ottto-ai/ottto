@@ -1276,9 +1276,15 @@ fn optional_raw_cap_counts_object_field_leading_whitespace() {
     file.flush().unwrap();
     drop(file);
     let native = claude_request_census::decode_index(File::open(&path).unwrap()).unwrap();
-    assert!(serde_json::to_value(&native).unwrap().get("claude_request_census_shadow").is_none());
+    assert!(serde_json::to_value(&native)
+        .unwrap()
+        .get("claude_request_census_shadow")
+        .is_none());
     let loaded = ScanIndex::load(&path).unwrap();
-    assert!(serde_json::to_value(&loaded).unwrap().get("claude_request_census_shadow").is_none());
+    assert!(serde_json::to_value(&loaded)
+        .unwrap()
+        .get("claude_request_census_shadow")
+        .is_none());
     assert_sibling(&loaded);
     assert_eq!(corrupt_count(scratch.as_ref()), 0);
 }
@@ -4564,6 +4570,7 @@ fn retired_reread_guard_keeps_legacy_map_and_full_array_custody() {
         "reread_budget_refused",
     ];
     let mut old = serde_json::to_value(&seed).unwrap();
+    old["claude_request_census_shadow"] = serde_json::json!({"o":true,"f":7,"d":9});
     old["reread_guard"] = serde_json::json!({
         "closed":true, "observed_reads":999, "wall_high_water":u64::MAX,
         "tripwire":{"indexed":1,"planned":999,"cause_counts":[1,2,3]},
@@ -4814,7 +4821,10 @@ pub(super) fn old_census_shadow_array(index: &ScanIndex) -> Value {
         held_audit_progress,
         claude_money_birth_store,
     );
-    fields.insert("reread_guard".into(), serde_json::json!({"closed":true,"observed_reads":41}));
+    fields.insert(
+        "reread_guard".into(),
+        serde_json::json!({"closed":true,"observed_reads":41}),
+    );
     fields.insert(
         "claude_request_census_shadow".into(),
         serde_json::json!({"o":true,"f":7,"d":9}),
@@ -4887,6 +4897,7 @@ fn retired_census_shadow_keeps_old_map_and_array_custody() {
     let expected_bytes = serde_json::to_vec(&seed).unwrap();
     let census = serde_json::to_vec(&seed.claude_request_census).unwrap();
     let mut old = expected.clone();
+    old["reread_guard"] = serde_json::json!({"closed":true,"observed_reads":41});
     old["claude_request_census_shadow"] = serde_json::json!({"o":true,"f":7,"d":9});
     let array = old_census_shadow_array(&seed);
     let escaped = "claude_request_census_shadow"

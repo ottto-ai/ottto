@@ -781,7 +781,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
     reader.consume(1);
     let close = if array { b']' } else { b'}' };
     let mut position = 0;
-    let mut census_resources = [false; 2];
+    let mut resources = [false; 2];
     if whitespace(reader)? != Some(close) {
         loop {
             let name = if array {
@@ -815,8 +815,12 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
             }
             let value = lexical_span(reader, optional, 1)?;
             if optional {
-                if matches!(name, Some("claude_request_census" | "claude_request_census_shadow")) {
-                    census_resources[usize::from(name == Some("claude_request_census_shadow"))] |= value.resource;
+                if matches!(
+                    name,
+                    Some("claude_request_census" | "claude_request_census_shadow")
+                ) {
+                    resources[usize::from(name == Some("claude_request_census_shadow"))] |=
+                        value.resource;
                 }
                 if !value.resource {
                     checked_grammar(reader, value)?;
@@ -848,7 +852,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[
         }
     })?;
     reader.seek(SeekFrom::Start(0))?;
-    Ok(census_resources)
+    Ok(resources)
 }
 fn optional_census(name: Option<&str>) -> bool {
     matches!(
