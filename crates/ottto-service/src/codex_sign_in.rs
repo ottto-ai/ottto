@@ -1047,10 +1047,20 @@ mod tests {
         assert!(!signed_in(true, false, ok, true));
     }
 
+    /// The port is a fixed one that nothing holds at the start, below every
+    /// default ephemeral range (Linux 32768-60999, macOS 49152-65535) as the
+    /// real sign-in port is. A port that a bind to port 0 hands out is free
+    /// only for IPv4: another process's listener on `[::1]` can hold the
+    /// same number, and the kernel hands the number out again once it is
+    /// released, so it could be busy after the drop for others' reasons.
     #[test]
     fn a_held_port_is_busy() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener");
-        let port = listener.local_addr().expect("address").port();
+        let first = 20_000 + u16::try_from(std::process::id() % 10_000).expect("below 10000");
+        let (port, listener) = (first..30_000)
+            .chain(20_000..first)
+            .filter(|port| !port_in_use(*port))
+            .find_map(|port| Some((port, TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok()?)))
+            .expect("a port that nothing holds");
         assert!(port_in_use(port));
         drop(listener);
         assert!(!port_in_use(port));
