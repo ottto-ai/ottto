@@ -45,12 +45,29 @@ This compatibility repair does not yet provide incremental detector execution.
 
 Preparation validates both the patch and its actual completion against accepted
 state. If either exceeds a budget, it removes suffix upserts and checks the merge
-again. Partial patches never retract accepted rows. A dropped replacement whose
-ID is still accepted is not counted as omitted. Accepted IDs outside the selected
+again. Codex trims in owned session order, including under-cap byte trimming;
+fitting complete patches keep the existing event-ID wire order. Partial patches
+never retract accepted rows. An accepted row that cannot be parsed refuses the
+cache update rather than disappearing from the cumulative bound. A dropped
+replacement whose ID is still accepted is not counted as omitted. Accepted IDs
+outside the selected
 prefix make omission coverage unknown (partial with a null count). If even a
 metadata-only update cannot fit, the cache member is withheld and accepted
-evidence remains intact. Existing finished sessions change only on their next
-natural upload; no new collection, history read, replay, or version bump is added.
+evidence remains intact. Withholding sends no cache metadata, so the server can
+retain stale `coverage: "complete"` and its old omitted count until a later
+natural upload can send a fitting cache patch. The existing Claude reread
+diagnostic carrier does not count these cache-upload refusals. Existing finished
+sessions change only on their next natural upload; no new collection, history
+read, replay, or version bump is added.
+
+The omitted count is null (unknown) when the retained Codex request book exceeds
+65,536 records, the physical read report is incomplete, duplicate request IDs
+have conflicting slots, or a request timestamp cannot be parsed. These cases
+send an empty partial patch, preserving accepted observations. Preparation also
+uses null when accepted IDs lie outside the selected prefix, or when adding
+trimmed missing IDs to a known overflow count would overflow `u64`. Byte trimming
+alone keeps the count exact when the accepted IDs remain within the prefix and
+the addition fits. A refused cache member sends no count at all.
 
 Every cache patch declares `snapshot_head_etag:v1` and uses the accepted
 predecessor etag for existing entities. A collector without that token first
