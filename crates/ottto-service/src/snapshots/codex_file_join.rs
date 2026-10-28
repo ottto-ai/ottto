@@ -544,15 +544,17 @@ impl HeaderInventory {
     }
     /// Build the ordinary read queue AFTER full-roster family registration.
     pub(super) fn retain_cached_archives(&mut self, index: &ScanIndex, paths: &BTreeSet<String>) {
-        self.pending = paths
-            .iter()
-            .filter(|path| {
-                !codex_archive_path(Path::new(path))
-                    || index.archive_header(Path::new(path)).is_some()
-            })
-            .take(MAX_HEADER_FILES + 1)
-            .map(PathBuf::from)
-            .collect();
+        self.pending.clear();
+        self.pending.extend(
+            paths
+                .iter()
+                .filter(|path| {
+                    !codex_archive_path(Path::new(path))
+                        || index.archive_header(Path::new(path)).is_some()
+                })
+                .take(MAX_HEADER_FILES + 1)
+                .map(PathBuf::from),
+        );
         self.complete = self.pending.len() <= MAX_HEADER_FILES && self.directories.stable;
         self.bounded_out = !self.complete;
     }

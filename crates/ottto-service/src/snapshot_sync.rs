@@ -4619,6 +4619,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             .and_then(continuation_finish_inputs(
                 &mut completed.0,
                 &mut completed.2,
+                &completed.1,
                 remaining,
                 &self.daemon.codex_preludes,
                 self.daemon.codex_versions.clone(),
@@ -6367,6 +6368,7 @@ fn prepare_sync_source_inner(
 struct ContinuationInputs {
     codex_preludes: std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
+    archive_pass: crate::snapshots::codex_archive_catchup::Pass,
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
@@ -6383,7 +6385,7 @@ struct ContinuationInputs {
     runtime_context: continuation::RuntimeContext,
 }
 
-crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
+crate::heap_layout_bound::fields!(ContinuationInputs; archive_pass, codex_preludes, account_witness, activity_hint,
     receipt_window_days, context_curve_enabled, cache_observations_enabled,
     scan_agent_status_collection, attribution_context, upload_policy,
     upload_destination_namespace, receipt_client, index_path, upload_progress_path, evidence, runtime_context; shared codex_versions);
@@ -6400,6 +6402,7 @@ impl ContinuationInputs {
 fn continuation_finish_inputs<'a>(
     preparation: &'a mut SourcePreparation,
     scan: &'a mut SourceScanResult,
+    index: &'a ScanIndex,
     remaining: Option<usize>,
     codex_preludes: &'a std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
@@ -6407,7 +6410,7 @@ fn continuation_finish_inputs<'a>(
 {
     move |ticket| {
         let evidence = scan.take_continuation_evidence()?;
-        let mut inputs = take_continuation_inputs(preparation, codex_preludes, codex_versions);
+        let mut inputs = take_continuation_inputs(preparation, index, codex_preludes, codex_versions);
         inputs.evidence = Some(evidence);
         let refusal = remaining.map_or("no_remaining", |_| "over_bound");
         let ticket = remaining.and_then(|limit| ticket.with_inputs(inputs, limit));
@@ -6423,6 +6426,7 @@ fn continuation_finish_inputs<'a>(
 /// Called only while continuation pages are enabled and a ticket was minted.
 fn take_continuation_inputs(
     preparation: &mut SourcePreparation,
+    index: &ScanIndex,
     codex_preludes: &std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
     codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
 ) -> ContinuationInputs {
@@ -6436,6 +6440,7 @@ fn take_continuation_inputs(
         codex_versions,
         evidence: None,
         runtime_context: continuation::runtime_context(),
+        archive_pass: index.archive_pass.clone(),
         account_witness: preparation.account_witness,
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
@@ -6566,14 +6571,16 @@ fn run_continuation_scan(
             SourcePreparationStep::Pending(next) => preparation = next,
             SourcePreparationStep::Refused(mut refused, _) => {
                 crate::local_resource_diagnostics::codex_continuation(Some("other"));
+                inputs.archive_pass.cpu = u64::MAX; // Lost step accounting cannot grant a new budget.
                 inputs.attribution_context = refused.attribution_context.take();
                 return Ok(ContinuationScan::StepRefused);
             }
             SourcePreparationStep::Complete {
                 mut preparation,
-                index: _,
+                index,
                 mut scan,
             } => {
+                inputs.archive_pass = index.archive_pass.clone();
                 inputs.evidence = scan.take_continuation_evidence();
                 inputs.attribution_context = preparation.attribution_context.take();
                 return Ok(ContinuationScan::Uncommitted {
@@ -6614,6 +6621,7 @@ fn prepare_continuation_source(
     )?;
     let (mut index, _) =
         ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
+    index.archive_pass = inputs.archive_pass.clone();
     upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(

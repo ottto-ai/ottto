@@ -1,5 +1,5 @@
 #[derive(Clone, Debug, Default)]
-pub(super) struct Pass {
+pub(crate) struct Pass {
     pub started: bool,
     pub cpu: u64,
     pub work: u64,

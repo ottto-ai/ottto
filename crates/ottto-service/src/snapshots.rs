@@ -85,7 +85,7 @@ pub(crate) use tests::output as claude_request_account_output;
 #[cfg(test)]
 mod codex_compressed_hold_tests;
 mod codex_compressed_holds;
-mod codex_archive_catchup;
+pub(crate) mod codex_archive_catchup;
 mod codex_compressed_input;
 #[cfg(test)]
 mod codex_zst_refusal_tests;
@@ -3388,7 +3388,7 @@ pub struct ScanIndex {
     claude_account_window_retention: account_pending_retention::Counts,
     /// RAM-only pacing spans ordinary + continuation pages, never durable authority.
     #[serde(skip)]
-    archive_pass: codex_archive_catchup::Pass,
+    pub(crate) archive_pass: codex_archive_catchup::Pass,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]

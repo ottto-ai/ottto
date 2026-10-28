@@ -295,6 +295,7 @@ impl ContinuationFixture {
         let mut minted = self.preparation(true);
         let mut inputs = take_continuation_inputs(
             &mut minted,
+        &ScanIndex::default(),
             &std::sync::Arc::default(),
             std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
         );
@@ -321,6 +322,7 @@ pub(super) fn continuation_inputs_for_test(
     let mut preparation = fixture.preparation(attribution);
     let inputs = take_continuation_inputs(
         &mut preparation,
+        &ScanIndex::default(),
         &std::sync::Arc::default(),
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
@@ -340,6 +342,7 @@ fn continuation_inputs_move_the_context_and_cache_no_raw_key() {
         .is_some());
     let inputs = take_continuation_inputs(
         &mut preparation,
+        &ScanIndex::default(),
         &std::sync::Arc::default(),
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
@@ -372,6 +375,7 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     let mut minted = fixture.preparation(true);
     let mut inputs = take_continuation_inputs(
         &mut minted,
+        &ScanIndex::default(),
         &std::sync::Arc::default(),
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
@@ -494,6 +498,7 @@ fn a_pending_historical_replay_refuses_the_continuation_prepare() {
     let mut minted = fixture.preparation(true);
     let mut inputs = take_continuation_inputs(
         &mut minted,
+        &ScanIndex::default(),
         &std::sync::Arc::default(),
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
@@ -612,6 +617,7 @@ fn no_continuation_output_serializes_the_attribution_key() {
     let mut minted = fixture.preparation(true);
     let mut inputs = take_continuation_inputs(
         &mut minted,
+        &ScanIndex::default(),
         &std::sync::Arc::default(),
         std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
     );
@@ -798,6 +804,7 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
         let mut minted = fixture.preparation(true);
         let mut inputs = take_continuation_inputs(
             &mut minted,
+        &ScanIndex::default(),
             &std::sync::Arc::default(),
             std::sync::Arc::new(crate::snapshots::codex_version::CodexVersionFeed::new(None)),
         );
@@ -813,4 +820,50 @@ fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
             "the next ordinary pass"
         );
     }
+}
+
+#[test]
+fn continuation_archive_cpu_survives_the_production_disk_reload() {
+    let fixture = ContinuationFixture::quiescent("continuation-archive-cpu");
+    let mut minted = fixture.preparation(false);
+    let (_, mut index) = fixture.load();
+    index.archive_pass.power = true;
+    index.archive_pass.started = true;
+    index.archive_pass.observe(Some(30_000_001), 1);
+    index.save(&fixture.index_path).unwrap();
+    assert_eq!(
+        fixture.load().1.archive_pass.cpu,
+        0,
+        "disk has no scheduling authority"
+    );
+    let mut inputs = take_continuation_inputs(&mut minted, &index);
+    let before = fixture.disk();
+    let prepared = fixture.prepare(&mut inputs).unwrap();
+    let restored = prepared.scan.as_ref().unwrap().native_comparison_inputs().0;
+    assert_eq!(restored.archive_pass.cpu, 30_000_001);
+    assert!(!restored.archive_pass.ready(u64::MAX));
+    assert_eq!(prepared.committed_index.archive_pass.cpu, 30_000_001);
+    drop(prepared);
+    let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
+    let outcome = run_continuation_scan(
+        &fixture.home,
+        &fixture.support_dir,
+        &cache,
+        &mut inputs,
+        &BTreeSet::new(),
+        Some(Duration::from_secs(300)),
+        Instant::now() + Duration::from_secs(20),
+    )
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        ContinuationScan::Uncommitted { .. } | ContinuationScan::Committed(_)
+    ));
+    assert!(inputs.archive_pass.cpu >= 30_000_001);
+    assert!(!inputs.archive_pass.ready(u64::MAX));
+    assert_eq!(
+        fixture.disk(),
+        before,
+        "pacing carry does not save a new record"
+    );
 }
