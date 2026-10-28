@@ -3040,9 +3040,9 @@ fn completed_joined_members_are_not_missing_upgrade_state() {
             10,
             &cold,
             if n == 0 {
-                "2026-10-07T23:00:00Z"
+                "2026-10-06T23:01:00Z"
             } else {
-                "2026-10-08T23:00:00Z"
+                "2026-10-06T23:02:00Z"
             },
         );
         assert!(scan.scanned_file_count >= 2, "joined updates must progress");
