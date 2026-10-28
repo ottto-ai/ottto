@@ -1034,8 +1034,14 @@ fn retained_endpoint_change_refuses_before_relay_token_or_post() {
     let mut owner = f.capture(Duration::ZERO);
     let before = std::fs::read(&f.index_path).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let changed = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()))
+    // Match the fresh client to the changed persisted endpoint: only the
+    // retained endpoint fence can distinguish this from a valid new turn.
+    let mut connection = FileConnectionStore::default().load().unwrap().unwrap();
+    connection.api_base_url = format!("http://{}", listener.local_addr().unwrap());
+    FileConnectionStore::default().save(&connection).unwrap();
+    let changed = SnapshotApiClient::new(&connection.api_base_url)
         .with_bounded_retry_loopback_http_for_test();
+    assert!(changed.matches_api_base(&snapshot_api_base_url().unwrap()));
     let mut attempted = 0;
     owner.isolated_boundary(|page| {
         attempted += 1;
