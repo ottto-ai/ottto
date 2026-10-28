@@ -1,7 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
-
 int ottto_power_state(void) {
     @autoreleasepool {
         CFTypeRef info = IOPSCopyPowerSourcesInfo();

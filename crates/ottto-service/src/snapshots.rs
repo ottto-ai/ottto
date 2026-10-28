@@ -173,8 +173,6 @@ use claude_response_records::{
 };
 use codex_compressed_input::{refuse_compressed_codex, OpenedInput};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
-// Stage 1 (N2): the cursor side of a continuation page, for StateMissing's
-// adapter in `snapshot_sync`.
 #[cfg(test)]
 pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
 #[allow(unused_imports)]
@@ -3224,16 +3222,13 @@ pub(crate) fn take_continuation_read_ranges_for_test() -> Vec<std::ops::Range<u6
     sampled_scan::codex_cursor::tests::NATIVE_RANGES
         .with(|v| v.borrow_mut().take().unwrap_or_default())
 }
-
 #[cfg(test)]
 pub(crate) fn begin_continuation_read_ranges_for_test() {
     sampled_scan::codex_cursor::tests::NATIVE_RANGES.with(|v| *v.borrow_mut() = Some(Vec::new()));
 }
-
-/// Moved ordinary-page evidence; this complete inventory includes every ledger path.
 #[derive(Debug)]
 pub(crate) struct CodexContinuationEvidence {
-    inventory: codex_file_join::HeaderInventory,
+    inventory: codex_file_join::HeaderInventory, // Complete roster, including ledger paths.
     ledgers: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     codex: CodexTitleMetadata,
     traces: Option<Arc<CodexTurnTraceMap>>,
@@ -3244,12 +3239,6 @@ impl CodexContinuationEvidence {
         self.inventory.content_unchanged()
     }
 }
-
-/// Stage 1 (§7 exclusions): the pass of a continuation page. C14 prunes and
-/// hydrates as on an ordinary page, but reads the gate without resetting it
-/// (C-1: the page charges and saves nothing), and the kind
-/// excludes G7, side due, the proof hook (row 31, so no leftover is spent)
-/// and the sweep (row 32) through the `CodexSidePass` predicates.
 pub(crate) fn begin_codex_continuation_side_pass(
     cache: &sampled_scan::SharedCache,
     index_path: &Path,
@@ -7424,7 +7413,6 @@ pub struct SourceScanResult {
     continuation_evidence: Option<Arc<Mutex<Option<CodexContinuationEvidence>>>>,
 }
 }
-
 #[derive(Clone, Debug)]
 pub(crate) struct CodexJoinValidator(codex_file_join::Validation);
 impl CodexJoinValidator {
@@ -7440,14 +7428,12 @@ impl SourceScanResult {
     pub(crate) fn take_continuation_evidence(&mut self) -> Option<CodexContinuationEvidence> {
         self.continuation_evidence.take()?.lock().ok()?.take()
     }
-
     /// Stage 1 hunk A: the ticket `CodexCursorPort::ticket_for` reads.
     pub(crate) fn continuation_ticket(
         &self,
     ) -> Option<&sampled_scan::codex_cursor::CodexCursorTicket> {
         self.continuation_ticket.as_ref()
     }
-
     pub(crate) fn validate_codex_checkpoint(&self) -> Result<()> {
         if let Some(validation) = &self.codex_join_validation {
             validation.validate_all()?;
@@ -26012,8 +25998,6 @@ impl OwnedSourceScan {
         )
     }
 
-    /// Resume the held job with moved, certified ordinary-page evidence.
-    /// This frame performs no selection, inventory read or traversal update.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_continuation(
         roots: &[PathBuf],
@@ -26023,7 +26007,6 @@ impl OwnedSourceScan {
         file_limit: usize,
         artifacts_enabled: bool,
         context_curve_enabled: bool,
-        _members: &BTreeSet<String>,
         ordinary_equivalent: Option<std::time::Duration>,
         mut evidence: Option<CodexContinuationEvidence>,
     ) -> Self {
@@ -28123,11 +28106,11 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Ok(true) if codex_page.continuation() => {
-                        // Park at sealed X, exactly like a byte-budget pause. Only
-                        // an ordinary page may apply EOF, certify and emit.
                         continuation_ticket = None;
                         if let Some(lease) = codex_cursor_lease.take() {
-                            drop(lease.pause(active));
+                            #[cfg(test)]
+                            sampled_scan::codex_cursor::tests::constrain_eof_park(&mut active);
+                            drop(lease.pause(active)); // StateBound: ordinary disclosure only.
                         }
                         pending!();
                     }
@@ -29079,8 +29062,6 @@ impl OwnedSourceScan {
                     context
                         .cache
                         .cursor_published(publication, parsed_file.is_ok());
-                    // Stage 1 (EOF seam): the attempt committed and finished.
-                    if parsed_file.is_ok() {}
                 }
                 if let Ok(parsed) = &parsed_file {
                     if source == SnapshotSource::ClaudeCode && !comparison_target {
@@ -30237,7 +30218,6 @@ impl OwnedSourceScan {
                         },
                     });
                 }
-
                 // U1a-2a (row 31): the proof hook, once per page, after the
                 // page's candidates, on the singleton budget main left.
                 if codex_parent_proofs_enabled(source, sampling.as_ref())
@@ -30896,20 +30876,17 @@ impl OwnedSourceScan {
                     );
                 }
                 let local_diagnostics = codex_title_metadata.local_diagnostics;
-                let continuation_evidence =
-                    if codex_join_completed.is_empty() && continuation_ticket.is_some() {
-                        codex_join_inventory
-                            .take()
-                            .filter(|inventory| inventory.complete)
-                            .map(|inventory| CodexContinuationEvidence {
-                                inventory,
-                                ledgers: codex_parent_ownership_ledgers,
-                                codex: codex_title_metadata,
-                                traces: codex_turn_traces,
-                            })
-                    } else {
-                        None
-                    };
+                let continuation_evidence = (codex_join_completed.is_empty()
+                    && continuation_ticket.is_some())
+                .then(|| codex_join_inventory.take())
+                .flatten()
+                .filter(|inventory| inventory.complete)
+                .map(|inventory| CodexContinuationEvidence {
+                    inventory,
+                    ledgers: codex_parent_ownership_ledgers,
+                    codex: codex_title_metadata,
+                    traces: codex_turn_traces,
+                });
                 let scan = SourceScanResult {
                     source,
                     backfill_window_days,

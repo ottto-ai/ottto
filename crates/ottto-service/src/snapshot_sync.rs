@@ -4474,9 +4474,6 @@ struct SnapshotCycleOwner<'a> {
     codex_started: Option<Instant>,
 }
 impl SnapshotCycleOwner<'_> {
-    /// One completed source scan: the census fence over the authority and
-    /// destination rechecks, then the unchanged `finish_sync_source`. An
-    /// ordinary finish runs this.
     fn finish_completed(
         &mut self,
         (preparation, index, scan): (SourcePreparation, ScanIndex, SourceScanResult),
@@ -4601,7 +4598,6 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                 authority,
                 continuation::ticket_lifetime(self.codex_started),
             )
-            // K2: moved out only when a ticket was minted.
             .and_then(|ticket| {
                 let evidence = completed.2.take_continuation_evidence()?;
                 let mut inputs = take_continuation_inputs(
@@ -4656,7 +4652,6 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             0
         };
         let owned = versions.checked_add(native)?;
-        // A held continuation ticket's process-retained inputs.
         let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
         owned.checked_add(continuation)
     }
@@ -6416,25 +6411,32 @@ enum ContinuationScan {
     },
 }
 
-/// Stage 1 (K1 a″): one Codex continuation page on the worker: the
-/// continuation-local prepare, then the scan to its end. The working index
-/// and its committed copy are always dropped. Moved inputs return to the
-/// ticket only for another byte-budget pause; no continuation end saves.
 fn run_continuation_scan(
     home: &Path,
     support_dir: &Path,
     cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
     inputs: &mut ContinuationInputs,
-    members: &BTreeSet<String>,
     ordinary_equivalent: Option<Duration>,
     deadline: Instant,
 ) -> Result<ContinuationScan> {
-    if inputs.runtime_context != continuation::runtime_context()
+    let current = continuation::runtime_context();
+    let contexts = |value: continuation::RuntimeContext| value.map(|slot| slot.map(|v| v.0));
+    let held = if contexts(inputs.runtime_context) != contexts(current) {
+        "context_changed"
+    } else if inputs.runtime_context != current {
+        "policy_changed"
+    } else if inputs.evidence.is_none() {
+        "other"
+    } else {
+        "roster_changed"
+    };
+    if inputs.runtime_context != current
         || !inputs
             .evidence
             .as_ref()
             .is_some_and(|evidence| evidence.content_unchanged())
     {
+        crate::local_resource_diagnostics::codex_continuation(Some(held));
         return Ok(ContinuationScan::Refused(
             ContinuationRefusal::EvidenceChanged,
         ));
@@ -6444,17 +6446,23 @@ fn run_continuation_scan(
         support_dir,
         cache,
         inputs,
-        members,
         ordinary_equivalent,
         deadline,
-    )? {
+    )
+    .inspect_err(|_| crate::local_resource_diagnostics::codex_continuation(Some("other")))?
+    {
         Ok(preparation) => preparation,
-        Err(reason) => return Ok(ContinuationScan::Refused(reason)),
+        Err(reason) => {
+            crate::local_resource_diagnostics::codex_continuation(Some("other"));
+            return Ok(ContinuationScan::Refused(reason));
+        }
     };
+    crate::local_resource_diagnostics::codex_continuation(None);
     loop {
         match preparation.step() {
             SourcePreparationStep::Pending(next) => preparation = next,
             SourcePreparationStep::Refused(mut refused, _) => {
+                crate::local_resource_diagnostics::codex_continuation(Some("other"));
                 inputs.attribution_context = refused.attribution_context.take();
                 return Ok(ContinuationScan::StepRefused);
             }
@@ -6488,7 +6496,6 @@ fn prepare_continuation_source(
     support_dir: &Path,
     cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
     inputs: &mut ContinuationInputs,
-    members: &BTreeSet<String>,
     ordinary_equivalent: Option<Duration>,
     deadline: Instant,
 ) -> Result<std::result::Result<SourcePreparation, ContinuationRefusal>> {
@@ -6600,7 +6607,6 @@ fn prepare_continuation_source(
         MAX_BACKFILL_FILES_PER_SOURCE,
         inputs.upload_policy.session_artifacts_enabled,
         inputs.context_curve_enabled,
-        members,
         ordinary_equivalent,
         inputs.evidence.take(),
     )

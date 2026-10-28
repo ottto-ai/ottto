@@ -1956,6 +1956,23 @@ fn eof_park_and_middle_pages_never_upload_or_move_the_ordinary_clock() {
     assert_eq!(world.due(), None);
 }
 
+thread_local! {
+    static TEST_CONTEXT: std::cell::Cell<Option<RuntimeContext>> = const { std::cell::Cell::new(None) };
+}
+pub(super) fn runtime_context_override() -> Option<RuntimeContext> {
+    TEST_CONTEXT.with(std::cell::Cell::get)
+}
+pub(super) fn observe_context(slot: usize, value: ([u8; 32], [u8; 32])) -> bool {
+    TEST_CONTEXT.with(|state| {
+        let Some(mut context) = state.get() else {
+            return false;
+        };
+        context[slot] = Some(value);
+        state.set(Some(context));
+        true
+    })
+}
+
 fn inventory_inputs() -> (PathBuf, ContinuationInputs) {
     let root = crate::test_scratch::unique_path("continuation-carried-inventory");
     std::fs::create_dir_all(&root).unwrap();
@@ -1975,9 +1992,22 @@ fn inventory_inputs() -> (PathBuf, ContinuationInputs) {
 
 #[test]
 fn changed_context_policy_or_inventory_holds_before_any_read() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_CONTEXT.with(|v| v.set(None));
+        }
+    }
+    let _reset = Reset;
+    TEST_CONTEXT.with(|v| v.set(Some([None; 2])));
     for change in ["context", "policy", "content"] {
         let (root, mut inputs) = inventory_inputs();
         observe(SnapshotSource::Codex, "mint-context", inputs.upload_policy);
+        observe(
+            SnapshotSource::ClaudeCode,
+            "mint-context",
+            inputs.upload_policy,
+        );
         inputs.runtime_context = runtime_context();
         match change {
             "context" => observe(
@@ -1990,7 +2020,7 @@ fn changed_context_policy_or_inventory_holds_before_any_read() {
                     session_titles_enabled: !inputs.upload_policy.session_titles_enabled,
                     ..inputs.upload_policy
                 };
-                observe(SnapshotSource::ClaudeCode, "changed-policy", policy);
+                observe(SnapshotSource::ClaudeCode, "mint-context", policy);
             }
             _ => {
                 let file = std::fs::read_dir(&root)
@@ -2011,16 +2041,26 @@ fn changed_context_policy_or_inventory_holds_before_any_read() {
         }
         crate::snapshots::begin_continuation_read_ranges_for_test();
         let cache = Arc::new(SharedCache::default());
-        let result = run_continuation_scan(
-            &root,
-            &root,
-            &cache,
-            &mut inputs,
-            &std::collections::BTreeSet::new(),
-            Some(Duration::from_secs(300)),
-            Instant::now() + Duration::from_secs(20),
-        )
-        .unwrap();
+        let (result, records) = crate::local_resource_diagnostics::capture(|| {
+            run_continuation_scan(
+                &root,
+                &root,
+                &cache,
+                &mut inputs,
+                Some(Duration::from_secs(300)),
+                Instant::now() + Duration::from_secs(20),
+            )
+            .unwrap()
+        });
+        let reason = match change {
+            "context" => "context_changed",
+            "policy" => "policy_changed",
+            _ => "roster_changed",
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["stage"], "codex_continuation");
+        assert_eq!(records[0]["counts"]["continuation_pages_run"], 0);
+        assert_eq!(records[0]["counts"]["continuation_held"][reason], 1);
         assert!(
             matches!(
                 result,

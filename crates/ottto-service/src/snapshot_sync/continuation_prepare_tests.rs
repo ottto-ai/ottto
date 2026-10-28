@@ -264,7 +264,6 @@ impl ContinuationFixture {
             &self.support_dir,
             cache,
             inputs,
-            &BTreeSet::new(),
             Some(Duration::from_secs(300)),
             Instant::now() + Duration::from_secs(20),
         )

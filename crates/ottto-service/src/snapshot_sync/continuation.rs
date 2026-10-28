@@ -1,5 +1,4 @@
 //! Enabled Codex cursor pages: AC only, background QoS, EOF parked for ordinary cadence.
-
 use super::{
     enabled_snapshot_sources, load_snapshot_device_credentials, run_continuation_scan, safe_error,
     snapshot_api_base_url, snapshot_upload_destination_namespace, source_upload_backoff_remaining,
@@ -24,6 +23,10 @@ use zeroize::Zeroize;
 pub(super) type RuntimeContext = [Option<([u8; 32], [u8; 32])>; 2];
 static UPLOAD_CONTEXT: Mutex<RuntimeContext> = Mutex::new([None; 2]);
 pub(super) fn runtime_context() -> RuntimeContext {
+    #[cfg(test)]
+    if let Some(context) = tests::runtime_context_override() {
+        return context;
+    }
     *UPLOAD_CONTEXT.lock().unwrap_or_else(|p| p.into_inner())
 }
 pub(super) fn observe(source: SnapshotSource, context: &str, policy: SnapshotUploadPolicy) {
@@ -32,10 +35,15 @@ pub(super) fn observe(source: SnapshotSource, context: &str, policy: SnapshotUpl
         SnapshotSource::Codex => 1,
         SnapshotSource::Pi => return,
     };
-    UPLOAD_CONTEXT.lock().unwrap_or_else(|p| p.into_inner())[slot] = Some((
+    let value = (
         Sha256::digest(context.as_bytes()).into(),
         Sha256::digest(serde_json::to_vec(&policy).expect("upload policy is serializable")).into(),
-    ));
+    );
+    #[cfg(test)]
+    if tests::observe_context(slot, value) {
+        return;
+    }
+    UPLOAD_CONTEXT.lock().unwrap_or_else(|p| p.into_inner())[slot] = Some(value);
 }
 
 /// At least 30 s and nine idle seconds per working second between pages.
@@ -106,8 +114,6 @@ pub(super) struct ContinuationTicket {
     /// The scan authority the asking page ran under ([`current_authority`]).
     authority: [u8; 32],
     cursor: CursorTicket,
-    /// The fixed lifetime of the cached inputs (K2/P-1, [`ticket_lifetime`]):
-    /// valid from `issued` until before `expires`. Nothing renews it.
     issued: Instant,
     expires: Instant,
 }
@@ -135,7 +141,6 @@ fn lifetime_holds(issued: Instant, expires: Instant, now: Instant) -> bool {
     issued <= now && now < expires
 }
 
-/// How one continuation page ended. Progress lives only in the cursor slot.
 pub(super) enum PageEnd {
     /// The job paused again at its byte budget: the only end that may ask for
     /// another page.
@@ -156,23 +161,13 @@ pub(super) enum PageEnd {
     Failed(anyhow::Error),
 }
 
-/// The cursor side of a continuation page ([`CodexContinuation`] over c22's
-/// `CodexCursorPort`). None of its methods may make a network call; EOF
-/// finalization belongs to the ordinary pass.
+/// Resume only: no network calls or EOF completion.
 pub(super) trait CursorContinuation {
     /// Hunk A: the ticket of a just-finished ordinary Codex page, only for a
     /// valid, budget-exhausted, accelerated pause.
     fn ticket_for(&self, scan: &SourceScanResult) -> Option<CursorTicket>;
     /// `cursor_continuation_ready`: under the cursor lock, with no IO.
     fn ready(&mut self, ticket: &CursorTicket) -> bool;
-    /// One resume-only page: `ScanIndex::load`, the continuation-local
-    /// prepare (K1), `begin_codex_continuation_side_pass`, the scan. Pages
-    /// never save; EOF parks for the ordinary pass. Once `deadline` passes,
-    /// the job pauses at the next
-    /// `step()` return without a ticket (`PausedContended`, K6). The deadline
-    /// is cooperative: the in-progress record, C14, local finalization and
-    /// scheduling may overrun it; it is not a hard lock-hold bound.
-    /// `ordinary_equivalent` is the interval this page stands for (K4).
     fn page(
         &mut self,
         ticket: CursorTicket,
@@ -206,7 +201,6 @@ pub(super) struct MacPlatformSignals {
     #[cfg(test)]
     setter: Option<fn(u32, i32) -> bool>,
 }
-
 fn power_state(answer: i32) -> PlatformState {
     match answer {
         1 => PlatformState::Allowed,
@@ -241,14 +235,12 @@ fn set_qos(_class: u32, _rel: i32) -> bool {
 }
 impl MacPlatformSignals {
     fn enter(&mut self, saved: Option<(u32, i32)>, set: fn(u32, i32) -> bool) -> PlatformState {
-        let Some(saved) = saved else {
-            return PlatformState::Unknown;
-        };
-        if !set(0x09, 0) {
-            return PlatformState::Unknown;
+        if let Some(saved) = saved.filter(|_| set(0x09, 0)) {
+            self.saved = Some(saved);
+            PlatformState::Allowed
+        } else {
+            PlatformState::Unknown
         }
-        self.saved = Some(saved);
-        PlatformState::Allowed
     }
     fn background() -> Option<Self> {
         let mut signals = Self::default();
@@ -292,7 +284,6 @@ pub(super) trait CadenceAccess {
     fn cadence<T>(&mut self, apply: impl FnOnce(&mut SourceCadence) -> T) -> Option<T>;
 }
 
-/// Local authority and cadence inputs; none of these methods uses the network.
 pub(super) trait Host: CadenceAccess {
     fn now(&mut self) -> Instant;
     /// Whether the server's upload backoff for Codex is still running.
@@ -372,9 +363,6 @@ impl Outcome {
 /// newer ordinary decision with an older ticket. Clearing needs no lock: it
 /// can only lose a continuation.
 ///
-/// The page receives the earlier of `ordinary_deadline` and
-/// [`CONTENTION_WORK`] after entry as a cooperative deadline. Measured work
-/// runs from entry to just before the lock is released, including preparation.
 pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
     host: &mut H,
     port: &mut P,
@@ -462,7 +450,6 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
     } else {
         None
     };
-    // Restore before returning to the ordinary loop, which may use the network.
     drop(qos);
     let (outcome, next) = match ended {
         None => (Outcome::Skipped(Skip::NotReady), None),
@@ -594,12 +581,6 @@ pub(super) trait LoopHost {
     fn page(&mut self, deadline: Instant) -> Outcome;
 }
 
-/// Wait out one ordinary interval, running due continuation pages inside it.
-/// The ordinary deadline is fixed when the wait starts, and each page is given
-/// it as its own deadline. A page can still push the ordinary cycle out by
-/// the record it was reading when the deadline passed, required local
-/// finalization and scheduling. There is no
-/// hard elapsed-time guarantee.
 pub(super) fn wait_for_ordinary_cycle(host: &mut impl LoopHost, interval: Duration) {
     let start = host.now();
     let Some(deadline) = start.checked_add(interval) else {
@@ -730,9 +711,6 @@ pub(super) fn ticket_lifetime(prepared_at: Option<Instant>) -> Option<(Instant, 
     .flatten()
 }
 
-/// An ordinary Codex prepare is starting: whatever it learns (a disable, a
-/// new key epoch, another destination) replaces the cached inputs, so the
-/// older ticket and its context are dropped now.
 pub(super) fn invalidate_on_ordinary_prepare() {
     clear(&mut CodexCadence, &TICKET);
 }
@@ -818,7 +796,6 @@ impl Drop for CycleSettlement {
     }
 }
 
-/// The pending page for the loop planner.
 pub(super) fn production_pending() -> Option<(Instant, Duration)> {
     if lock_slot(&TICKET).is_none() {
         return None;
@@ -831,7 +808,6 @@ pub(super) fn production_pending() -> Option<(Instant, Duration)> {
     .flatten()
 }
 
-/// The production host: local authority and pacing checks.
 struct ProductionHost<'a> {
     daemon: &'a LocalDaemon,
 }
@@ -865,7 +841,6 @@ impl Host for ProductionHost<'_> {
     }
 }
 
-/// One production continuation page.
 pub(super) fn run_production_page(
     home: &Path,
     support_dir: &Path,
@@ -979,7 +954,6 @@ pub(super) struct CodexContinuation<'a> {
     cache: &'a Arc<SharedCache>,
     home: &'a Path,
     support_dir: &'a Path,
-    /// Entered and restored on the worker thread.
     worker_qos: fn() -> Option<MacPlatformSignals>,
     /// The process latch (W8): [`WORKER_LATCHED`] in production.
     latch: &'static AtomicBool,
@@ -1082,9 +1056,6 @@ fn page_end(
     }
 }
 
-/// The whole page on one thread (W4): the worker's QoS, the members, then
-/// the continuation-local prepare and scan. Nothing is saved,
-/// and no cursor credit, lease or active file outlives this call (W3).
 #[allow(clippy::too_many_arguments)]
 fn page_on_worker(
     cache: &Arc<SharedCache>,
@@ -1098,9 +1069,9 @@ fn page_on_worker(
     let Some(_qos) = qos() else {
         return WorkerEnd::Deferred;
     };
-    let Some(members) = CodexCursorPort::new(Arc::clone(cache)).members(&page.cursor) else {
+    if !CodexCursorPort::new(Arc::clone(cache)).ready(&page.cursor) {
         return WorkerEnd::Deferred;
-    };
+    }
     let Some(inputs) = page.inputs.as_mut() else {
         return WorkerEnd::Deferred;
     };
@@ -1109,7 +1080,6 @@ fn page_on_worker(
         support_dir,
         cache,
         inputs,
-        &members,
         ordinary_equivalent,
         deadline,
     ) {

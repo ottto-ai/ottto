@@ -210,9 +210,6 @@ pub(in crate::snapshots) struct PageBudget {
     /// diagnostics window (`SharedCache::cursor_diagnostics`). Boxed so the
     /// by-value scan object stays small.
     window_start: Option<Box<Counters>>,
-    /// Stage 1 (E): a continuation page (`OwnedSourceScan::new_continuation`).
-    /// It only resumes, never ticks the cursor page clock and never counts
-    /// toward E2.
     continuation: bool,
     /// Stage 1 (§6): a continuation page's ordinary interval
     /// (StateMissing's input); `None` is unknown coverage.
@@ -2694,7 +2691,6 @@ fn accrue_equivalent(
 
 /// Why `cursor_continuation_ready` refused a ticket. Every refusal sends the
 /// next page to the ordinary cadence.
-#[cfg_attr(not(test), allow(dead_code))] // Read by StateMissing's adapter (inert).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum ReadyRefusal {
     /// The cursor state is poisoned.
@@ -2758,6 +2754,10 @@ impl SharedCache {
         job: &OwnedActiveFile,
         page: &PageBudget,
     ) -> Option<CodexCursorTicket> {
+        if job.group.is_some() {
+            crate::local_resource_diagnostics::codex_continuation(Some("group_job"));
+            return None;
+        }
         let meta = job.cursor.as_ref()?;
         if !page.cursor_exhausted(Limits::current()) || !accelerated(meta) {
             return None;
@@ -2769,7 +2769,6 @@ impl SharedCache {
     /// `cursor_continuation_ready`: whether `ticket`'s attempt is still the
     /// paused job, for its namespace, in this cursor state, and accelerated.
     /// Under the cursor lock, with no IO.
-    #[cfg_attr(not(test), allow(dead_code))] // StateMissing's entry (inert).
     pub(in crate::snapshots) fn cursor_continuation_ready(
         &self,
         ticket: &CodexCursorTicket,
@@ -2780,7 +2779,7 @@ impl SharedCache {
 
     /// Stage 1 (D): the index keys of a ready ticket's job members: the only
     /// paths a continuation page selects. None unless the ticket is ready.
-    #[cfg_attr(not(test), allow(dead_code))] // StateMissing's entry (inert).
+    #[cfg(test)]
     pub(in crate::snapshots) fn continuation_members(
         &self,
         ticket: &CodexCursorTicket,
@@ -2823,16 +2822,10 @@ impl SharedCache {
     }
 }
 
-/// Stage 1 (N2): the cursor side of a continuation page, as inherent
-/// methods. StateMissing's `CursorContinuation` adapter wraps it in its own
-/// file; nothing in production builds one while continuation pages are
-/// disabled.
-#[cfg_attr(not(test), allow(dead_code))] // StateMissing's adapter (inert).
 pub(crate) struct CodexCursorPort {
     cache: Arc<SharedCache>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // StateMissing's adapter (inert).
 impl CodexCursorPort {
     pub(crate) fn new(cache: Arc<SharedCache>) -> Self {
         Self { cache }
@@ -2850,6 +2843,7 @@ impl CodexCursorPort {
 
     /// Hunk D: the member index keys the continuation page selects
     /// (`OwnedSourceScan::new_continuation`); None unless `ready`.
+    #[cfg(test)]
     pub(crate) fn members(&self, ticket: &CodexCursorTicket) -> Option<BTreeSet<String>> {
         self.cache.continuation_members(ticket)
     }
@@ -5368,10 +5362,15 @@ impl SharedCache {
         namespace: &Scope,
         continuation: bool,
     ) -> Option<(Box<OwnedActiveFile>, CursorLease)> {
-        let (job, token) = self.with_cursor(|cursor| {
+        let mut group_held = false;
+        let claimed = self.with_cursor(|cursor| {
             let Slot::Paused(job) = &cursor.slot else {
                 return None;
             };
+            if continuation && job.group.is_some() {
+                group_held = true;
+                return None;
+            }
             let foreign = job
                 .cursor
                 .as_ref()
@@ -5408,7 +5407,11 @@ impl SharedCache {
             cursor.slot_touched = cursor.rotation.page;
             cursor.counters.jobs_resumed += 1;
             Some((job, token))
-        })??;
+        });
+        if group_held {
+            crate::local_resource_diagnostics::codex_continuation(Some("group_job"));
+        }
+        let (job, token) = claimed??;
         Some((
             job,
             CursorLease {

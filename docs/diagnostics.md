@@ -114,6 +114,30 @@ count. Codex/Pi, watcher hints and nonmember candidate losses add none. No new
 filesystem probe, event stream, path/key/name output or authority decision is
 introduced; diagnostics only, no behaviour change.
 
+The `codex_continuation` stage uses the same version 2 `local_resources`
+point carrier, with source `codex` and no CPU/RSS measurement. Each admission
+record has `continuation_pages_run` (1 when a prepared page enters the scan
+step loop, otherwise 0) and a sparse `continuation_held` object whose single
+nonzero count is 1. Its closed reason keys are `roster_changed`,
+`context_changed`, `policy_changed`, `group_job`, and `other`. Sum these point
+counts over the desired window; they are not persisted process totals.
+
+Roster/context/policy holds occur before prepare or transcript reads. Context
+wins if both context and policy changed; missing carried evidence, prepare
+errors/refusals and step-admission refusals use `other`. Group refusals are
+counted at ticket mint or resume, before taking the job. A stepped page can
+later produce an additional hold record; the two counters are not exclusive.
+Timer wakes without a ready page and platform/QoS skips are outside these scan
+admission counts. No path, session id, digest, error text or transcript content
+is included, and the counts grant no authority.
+
+The inventory check performs at most one `lstat` per carried rollout path
+(up to 32,768), stopping on the first mismatch. It includes ledger parents and
+the held file. Any changed rollout holds continuation, so active Codex sessions
+usually leave it idle. Additions wait for the ordinary census; an EOF park that
+cannot fit becomes strict StateBound debt for the ordinary pass to disclose,
+keeping the prior body rather than emitting a zero replacement.
+
 A `source_finish` record wraps rotation finish, including its validation,
 post-policy finalization and upload work. It exists exactly when finish was
 called and returned normally, including an error return. It has `counts: {}`
