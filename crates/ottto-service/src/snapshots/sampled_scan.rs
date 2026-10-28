@@ -2012,7 +2012,7 @@ pub(super) fn new_source_parser(
             anyhow::bail!(codex_compressed_input::ArchiveAdmissionYield);
         };
         codex_compressed_input::admission_streak(&key, false);
-        let evidence = match codex_compressed_input::ArchiveEvidence::begin(
+        let mut evidence = match codex_compressed_input::ArchiveEvidence::begin(
             input.get_ref(),
             &candidate.path,
             index.files.get(&key).and_then(|e| e.archive.as_deref()),
@@ -2023,6 +2023,10 @@ pub(super) fn new_source_parser(
                 return Err(e.into());
             }
         };
+        evidence.user_context = index
+            .active_archive_user_context
+            .clone()
+            .or(evidence.user_context);
         index.files.entry(key).or_default().archive = Some(Box::new(evidence));
         input
     } else {
