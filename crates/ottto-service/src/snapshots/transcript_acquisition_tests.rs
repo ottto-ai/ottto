@@ -4103,6 +4103,41 @@ fn pi_ram_tail_ignores_age_clock_and_audit_slot_pressure() {
 
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
+fn pi_new_file_reads_once_without_transitional_full_count() {
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    let source = SnapshotSource::Pi;
+    let fixture = ScanFixture::new(source);
+    fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let index = ScanIndex::default();
+    let key = local_index_key(&fixture.file.0);
+    assert!(!index.files.contains_key(&key));
+    let (((index, scan, modes), counts), reads) =
+        terminal_contract_retry::source_acquisitions(|| {
+            observe(|| production_scan(&fixture, source, index, Some(cache.clone()), "pi-new-file"))
+        });
+    assert_eq!(modes, (1, 0, 0));
+    assert!(!scan.snapshots.is_empty());
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads.get(&fixture.file.0), Some(&1));
+    assert!(index.files.contains_key(&key));
+    assert_eq!(
+        counts.pi, 0,
+        "a new object's first read is not transitional"
+    );
+    let (((_, _, modes), counts), reads) = terminal_contract_retry::source_acquisitions(|| {
+        observe(|| production_scan(&fixture, source, index, Some(cache), "pi-new-file"))
+    });
+    assert_eq!(modes, (0, 0, 0));
+    assert!(
+        reads.is_empty(),
+        "the new Pi file is settled after one read"
+    );
+    assert_eq!(counts.pi, 0);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pi_recordless_restart_and_eviction_full_only_on_change() {
     use crate::local_resource_diagnostics::cache_lifecycle::observe;
     let source = SnapshotSource::Pi;

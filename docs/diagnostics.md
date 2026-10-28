@@ -753,11 +753,13 @@ explicit release, including real durable I/O paths.
 Pi joins the shared sampled RAM reader. Its `native_collection_page` acquisition
 counts report Full, Tail and Unchanged decisions with the actual planner reasons.
 Audit age, clock changes and audit-slot pressure do not gate checkpoint reuse.
-Until Pi durable records are enabled, a changed file without a RAM reduction
-still reads Full: the transitional `pi` leaf in `retained_cache_page_events`
-counts that attempt once at read start, alongside `state_missing`. Restart or
-RAM eviction never triggers a read of an idle file. This is a staged exception;
-it does not turn a cache miss into a first-read authorization.
+Until Pi durable records are enabled, an already-indexed file that changes
+without a RAM reduction still reads Full: the transitional `pi` leaf in
+`retained_cache_page_events` counts that attempt once at read start, alongside
+`state_missing`. A newly discovered file's first Full read does not increment
+that leaf. Restart or RAM eviction never triggers a read of an idle file.
+This is a staged exception; it does not turn a cache miss into a first-read
+authorization.
 
 The same #799 page line (source `pi`) reports cache-only
 `retention_bound_refused_pi` events and `retention_bound_refused_pi_bytes`:

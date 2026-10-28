@@ -31621,6 +31621,7 @@ impl OwnedSourceScan {
             // Counted once the page actually reads the file (R2-M3): a fence
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
+            let mut indexed_pi_entry = false;
             // U1a-2a G7: a side read's acquisition is a fresh `Full` read
             // under the side scope: no retained take, no admission observes
             // or counters, no debt. Failures are its charged attempt.
@@ -31657,6 +31658,7 @@ impl OwnedSourceScan {
                 }
             } else if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
+                indexed_pi_entry = source == SnapshotSource::Pi && index.files.contains_key(&key);
                 let taken = context.cache.take(&key);
                 // Kept beside the moved copy for R0's completion decision.
                 let taken_admission = taken.as_ref().map(|taken| {
@@ -32155,7 +32157,7 @@ impl OwnedSourceScan {
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
-                if source == SnapshotSource::Pi
+                if indexed_pi_entry
                     && mode
                         == crate::transcript_acquisition::ReadMode::Full(
                             crate::transcript_acquisition::FullReason::StateMissing,
