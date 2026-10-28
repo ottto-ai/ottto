@@ -1546,10 +1546,10 @@ fn a_tagged_permitted_body_keeps_census_identity_and_the_suppression() {
 /// tags only from D1's account-checked login, and a family whose one
 /// checked row covers one of the parent's four requests also withholds the
 /// session account for incomplete request evidence (legacy account path,
-/// `apply_claude_account_evidence`). `observe_page` counts that withheld
-/// member as non-structural, so every due terminal re-arms. The veto does
-/// not depend on the contract: the always-on build (tagged contract-5 body)
-/// and a pre-cutover build without evidence re-arm the same terminals.
+/// `apply_claude_account_evidence`). That explanation is not duplicate-census
+/// input: the first terminal pays for the structural baseline, then both later
+/// due terminals suppress with zero clears. The always-on build still tags the
+/// contract-5 body, and the pre-cutover arm has identical re-arm behavior.
 #[test]
 fn a_withheld_account_rearms_the_same_before_and_after_the_cutover() {
     claude_request_identity::with_cycle_contract_for_test(
@@ -1604,8 +1604,8 @@ fn a_withheld_account_rearms_the_same_before_and_after_the_cutover() {
             assert_eq!(runs[0], runs[1], "the cutover adds no re-arm");
             assert_eq!(
                 runs[1],
-                vec![(true, false, 2); 3],
-                "a liveness re-arm at each due terminal"
+                vec![(true, false, 2), (false, true, 0), (false, true, 0)],
+                "pay once for the baseline; attribution explanations never re-arm it"
             );
         },
     );
