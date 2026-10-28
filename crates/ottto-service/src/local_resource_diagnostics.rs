@@ -39,7 +39,9 @@ pub(crate) enum CodexZstCause {
     #[serde(rename = "CompressedCompatibilityUnfunded")]
     CompatibilityUnfunded,
 }
-static CODEX_ZST_REFUSED: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+const CODEX_ZST_CAUSES: usize = CodexZstCause::CompatibilityUnfunded as usize + 1;
+static CODEX_ZST_REFUSED: [AtomicU64; CODEX_ZST_CAUSES] =
+    [const { AtomicU64::new(0) }; CODEX_ZST_CAUSES];
 
 pub(crate) fn codex_zst_refused(cause: CodexZstCause) {
     let counter = &CODEX_ZST_REFUSED[cause as usize];
