@@ -1053,6 +1053,8 @@ fn pi_seed() -> String {
 
 struct PiProof {
     durable: bool,
+    /// Records this build's restart owners actually restored after a commit.
+    restored: u64,
     bodies: Vec<ReceiptBody>,
 }
 
@@ -1069,19 +1071,22 @@ impl PiProof {
         });
     }
 
-    fn finish(self, c: &Corpus) {
+    fn finish(self, c: &Corpus, disk: &Disk) {
         let name = c.base.file_name().unwrap().to_str().unwrap();
         receipt(name, &self.bodies);
-        let status = if self.durable {
-            "VERIFIED"
-        } else {
-            "UNSUPPORTED"
+        // The declaration is what this build did with the committed record:
+        // a restore proves support, and UNSUPPORTED also needs an empty store.
+        // A kept record that never restored fails, so head cannot declare it.
+        let (capability, status) = match (self.restored, disk.records()) {
+            (0, 0) => ("UNSUPPORTED", "UNSUPPORTED"),
+            (0, records) => panic!("{name}: {records} Pi record(s) stored, none restored"),
+            _ => ("SUPPORTED", "VERIFIED"),
         };
-        let capability = if self.durable {
-            "SUPPORTED"
-        } else {
-            "UNSUPPORTED"
-        };
+        assert_eq!(
+            capability == "SUPPORTED",
+            self.durable,
+            "{name}: Pi restore disagrees with the store"
+        );
         println!("MONEY_EQUIVALENCE_PI_CAPABILITY {name} {capability}");
         println!("MONEY_EQUIVALENCE_DISK {name} {status}");
     }
@@ -1109,6 +1114,7 @@ fn pi_disk_corpus(
     assert_eq!(disk.records(), usize::from(durable), "Pi store capability");
     let mut proof = PiProof {
         durable,
+        restored: 0,
         bodies: Vec::new(),
     };
     proof.capture(&scan);
@@ -1151,6 +1157,11 @@ fn pi_pages(
         if proof.durable { disk_mode } else { (0, 0, 0) },
         "Pi disk acquisition"
     );
+    // Same counter API on both builds; a build without a Pi store has none.
+    proof.restored += restart
+        .cache
+        .durable_counters(SnapshotSource::Pi)
+        .map_or(0, |(counters, _)| counters.restored);
     if proof.durable {
         assert_eq!(
             durable_restores(&restart.cache, SnapshotSource::Pi).1,
@@ -1220,7 +1231,7 @@ fn pi_splits(name: &str, prefix: &str, suffix: Vec<Value>, requests: u64) -> Sou
         requests,
         "{name}"
     );
-    proof.finish(&c);
+    proof.finish(&c, &disk);
     scan
 }
 
@@ -1578,7 +1589,7 @@ fn pi_cli_fork_preserves_double_count() {
         ),
         EXPECTED_FORK_TOTALS
     );
-    proof.finish(&c);
+    proof.finish(&c, &disk);
 }
 
 #[test]
@@ -1641,7 +1652,7 @@ fn pi_version_rewrite_after_tail() {
         0,
     );
     assert_eq!(scan.snapshots[0].request_count, 3);
-    proof.finish(&c);
+    proof.finish(&c, &disk);
 }
 
 #[test]
@@ -1700,7 +1711,7 @@ fn pi_upgrade_without_semantic_revision() {
         (0, 1, 0),
         1,
     );
-    proof.finish(&c);
+    proof.finish(&c, &disk);
 }
 
 #[test]
@@ -1768,7 +1779,7 @@ fn pi_downgrade_then_reupgrade() {
         (0, 1, 0),
         1,
     );
-    proof.finish(&c);
+    proof.finish(&c, &disk);
 }
 
 #[cfg(unix)]
@@ -1837,5 +1848,5 @@ fn pi_acquisition_metadata_changes() {
         (0, 1, 0),
         1,
     );
-    proof.finish(&c);
+    proof.finish(&c, &disk);
 }

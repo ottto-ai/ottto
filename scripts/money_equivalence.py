@@ -169,6 +169,11 @@ def main():
                     f"{manifest['runtime_seconds']:.1f}s. "
                     f"Base Pi disk UNSUPPORTED: {', '.join(sorted(unsupported)) or 'none'}; "
                     f"head Pi disk VERIFIED: {len(PI_FIXTURES)}. Family vector remains ignored.\n")
+            counts = {kind: ", ".join(f"{arm} " + "/".join(str(manifest["receipt_counts"][arm][kind][k])
+                                                            for k in ("existing", "pi", "total"))
+                                      for arm in ("base", "head"))
+                      for kind in ("cross_build", "disk")}
+            f.write(f"Receipts existing/pi/total: {counts['cross_build']}; disk {counts['disk']}.\n")
     finally:
         command(["git", "worktree", "remove", "--force", str(base)])
 
