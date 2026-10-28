@@ -30,6 +30,8 @@ use toml_edit::{DocumentMut, Item};
 
 pub(crate) mod cache_observations;
 #[cfg(test)]
+pub(crate) mod cache_overcap_tests;
+#[cfg(test)]
 mod cache_policy_tests;
 mod claude_context_file_birth;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
@@ -20331,7 +20333,7 @@ impl SnapshotAccumulator {
         };
         if self.source == SnapshotSource::Codex && codex_usage_accounting_proven {
             self.cache_observations =
-                cache_wire_for_requests(&source_session_id, &self.cache_requests);
+                codex_cache_wire_for_requests(&source_session_id, &self.cache_requests);
             if !self.cache_requests_complete {
                 self.cache_observations = Some(CacheObservations {
                     schema_version: 1,
@@ -35414,7 +35416,11 @@ pub(crate) fn cache_state_from_patch(previous: Option<&Value>, patch: &CacheObse
     for operation in &patch.operations {
         match operation {
             cache_observations::Operation::Upsert { observation } => {
-                observations.insert(observation.event_id.clone(), observation.as_ref().clone());
+                if observation.status == "retracted" {
+                    observations.remove(&observation.event_id);
+                } else {
+                    observations.insert(observation.event_id.clone(), observation.as_ref().clone());
+                }
             }
             cache_observations::Operation::Retract { event_id } => {
                 observations.remove(event_id);
@@ -35424,17 +35430,14 @@ pub(crate) fn cache_state_from_patch(previous: Option<&Value>, patch: &CacheObse
     json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count})
 }
 
+/// Preflight the exact wire and its completion against the ACKed predecessor.
+/// Partial coverage never authorizes deletion, including after budget trimming.
 pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<&Value>) {
     let Some(patch) = item.cache_observations.as_ref() else {
         return;
     };
-    // A lossy parse never retracts previously accepted observations.
-    let current = if patch.coverage == "complete" {
-        cache_state_from_patch(None, patch)
-    } else {
-        cache_state_from_patch(prior, patch)
-    };
-    let ids = current["observations"]
+    let desired = cache_state_from_patch(None, patch);
+    let ids = desired["observations"]
         .as_array()
         .into_iter()
         .flatten()
@@ -35456,17 +35459,90 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
                 }
             }
         }
+        let state = cache_state_from_patch(prior, &wire);
+        if wire.validate() && cache_state_within_limits(&state) {
+            item.cache_observations_state = Some(state);
+            item.cache_observations = Some(wire);
+            return;
+        }
     }
-    if !wire.validate() {
-        wire.operations.clear();
-        wire.coverage = "partial".into();
-        wire.omitted_observation_count = Some(ids.len() as u64);
+
+    // Preserve all accepted evidence on partial/refused corrections. A prior ID
+    // outside the selected prefix prevents an exact missing-observation count.
+    let prior_is_prefix = prior
+        .and_then(|p| p["observations"].as_array())
+        .into_iter()
+        .flatten()
+        .all(|row| row["event_id"].as_str().is_some_and(|id| ids.contains(id)));
+    let overflow = if prior_is_prefix {
+        if patch.coverage == "complete" {
+            Some(0)
+        } else {
+            patch.omitted_observation_count
+        }
+    } else {
+        None
+    };
+    wire.coverage = "partial".into();
+    wire.operations.retain(|operation| {
+        matches!(operation,
+        cache_observations::Operation::Upsert { observation } if observation.status != "retracted")
+    });
+    loop {
+        let mut state = cache_state_from_patch(prior, &wire);
+        let missing = ids
+            .iter()
+            .filter(|id| {
+                !state["observations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["event_id"].as_str() == Some(**id))
+            })
+            .count() as u64;
+        wire.omitted_observation_count = overflow.and_then(|count| count.checked_add(missing));
+        state["omitted_observation_count"] = json!(wire.omitted_observation_count);
+        if wire.validate() && cache_state_within_limits(&state) {
+            item.cache_observations_state = Some(state);
+            item.cache_observations = Some(wire);
+            return;
+        }
+        // Removing a shrinking replacement can INCREASE completed bytes. Always
+        // recompute the actual merge; do not assume monotonic sizes.
+        if wire.operations.pop().is_none() {
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            return;
+        }
     }
-    item.cache_observations_state = Some(cache_state_from_patch(prior, &wire));
-    item.cache_observations = Some(wire);
+}
+
+fn cache_state_within_limits(state: &Value) -> bool {
+    state["observations"].as_array().is_some_and(|rows| {
+        rows.len() <= cache_observations::MAX_ROWS
+            && rows.iter().all(|row| row["status"] != "retracted")
+    }) && crate::canonical_json::canonicalize(state)
+        .is_ok_and(|bytes| bytes.len() <= cache_observations::MAX_WIRE_BYTES)
+}
+
+fn codex_cache_wire_for_requests(
+    session: &str,
+    requests: &[OwnedRequest],
+) -> Option<CacheObservations> {
+    cache_wire_for_requests_inner(session, requests, true)
 }
 
 fn cache_wire_for_requests(session: &str, requests: &[OwnedRequest]) -> Option<CacheObservations> {
+    cache_wire_for_requests_inner(session, requests, false)
+}
+
+fn cache_wire_for_requests_inner(
+    session: &str,
+    requests: &[OwnedRequest],
+    codex_prefix: bool,
+) -> Option<CacheObservations> {
+    // Existing replay/dedup scratch remains unchanged. The Codex selection below
+    // adds only a fixed prefix; this is not yet an incremental semantic stream.
     let mut seen = BTreeMap::new();
     let mut conflict = false;
     let mut unique = Vec::new();
@@ -35489,6 +35565,24 @@ fn cache_wire_for_requests(session: &str, requests: &[OwnedRequest]) -> Option<C
             operations: Vec::new(),
             coverage: "partial".into(),
             omitted_observation_count: None,
+        });
+    }
+    if codex_prefix {
+        let (mut rows, overflow) = cache_observations::detect_unique_prefix(session, &unique);
+        if overflow == 0 {
+            // Preserve existing under-cap wire order and canonical body bytes.
+            rows.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+        }
+        return Some(CacheObservations {
+            schema_version: 1,
+            operations: rows
+                .into_iter()
+                .map(|observation| cache_observations::Operation::Upsert {
+                    observation: Box::new(observation),
+                })
+                .collect(),
+            coverage: if overflow == 0 { "complete" } else { "partial" }.into(),
+            omitted_observation_count: (overflow != 0).then_some(overflow),
         });
     }
     let (rows, overflow) =

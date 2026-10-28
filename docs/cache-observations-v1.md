@@ -36,6 +36,22 @@ produce self-contained downstream evidence. V1 permits 64 operations and
 reports partial coverage and omitted counts while preserving accepted evidence;
 it does not silently evict rows or introduce another uploader.
 
+Codex sessions exceeding 64 observations send the earliest 64 in owned session
+order plus the exact number of later observations. Appends can complete the last
+row's next-request witness without rotating prefix membership. Claude's existing
+overflow gate is unchanged. Selection retains at most 64 rows; the existing
+request replay and duplicate checks still scale with the retained request book.
+This compatibility repair does not yet provide incremental detector execution.
+
+Preparation validates both the patch and its actual completion against accepted
+state. If either exceeds a budget, it removes suffix upserts and checks the merge
+again. Partial patches never retract accepted rows. A dropped replacement whose
+ID is still accepted is not counted as omitted. Accepted IDs outside the selected
+prefix make omission coverage unknown (partial with a null count). If even a
+metadata-only update cannot fit, the cache member is withheld and accepted
+evidence remains intact. Existing finished sessions change only on their next
+natural upload; no new collection, history read, replay, or version bump is added.
+
 Every cache patch declares `snapshot_head_etag:v1` and uses the accepted
 predecessor etag for existing entities. A collector without that token first
 settles grown ordinary usage with cache omitted through the existing optional
