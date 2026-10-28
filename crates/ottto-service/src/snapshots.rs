@@ -7978,6 +7978,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
         if let Some(entry) = index.files.get_mut(&pending.index_key) {
             entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
             entry.last_upload_body_witness = final_upload_body_witness.clone();
+            if let Some(archive) = entry.archive.as_mut() {
+                archive.body_witness = final_upload_body_witness.clone();
+            }
         }
         let stamped = index.stamp_effective_upload_body_witness_revision(
             &pending.index_key,
@@ -27697,6 +27700,15 @@ impl OwnedSourceScan {
                 }
             }
             if let Some(mut active) = active_file.take() {
+                if index
+                    .files
+                    .get(&local_index_key(&active.candidate.path))
+                    .and_then(|entry| entry.archive.as_ref())
+                    .is_some_and(|a| !a.reservation_saved)
+                {
+                    active_file = Some(active);
+                    pending!();
+                }
                 if let Some(delivery) = line_delivery.as_mut() {
                     delivery.begin_armed(&active);
                 }
@@ -32432,14 +32444,17 @@ fn append_codex_state_only_snapshots(
     //     scanned file, including a rollout that parsed to zero usage rows; such
     //     a session has no split snapshot, so it MUST still fall through to a
     //     state-only total or its tokens would be dropped entirely.
-    //   * Session ids are derived from the rollout filename, so coverage does
-    //     not depend on the state DB `rollout_path` matching the scan path
+    //   * Archive coverage uses the last validated logical id; plain coverage
+    //     uses filename evidence. Neither depends on the state DB `rollout_path`
     //     byte-for-byte (home symlinks, relative paths, case differences).
     let covered_in_prior_runs: BTreeSet<String> = index
         .files
         .iter()
         .filter(|(_, entry)| entry.last_snapshot_fingerprint.is_some())
-        .filter_map(|(path, _)| metadata.identity_from_path_evidence(Path::new(path)))
+        .filter_map(|(path, entry)| match entry.archive.as_ref() {
+            Some(archive) => Some(archive.logical_id.clone()),
+            None => metadata.identity_from_path_evidence(Path::new(path)),
+        })
         .collect();
     let mut scanned_session_count = 0;
     let protected = index

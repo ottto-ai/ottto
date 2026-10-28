@@ -757,6 +757,15 @@ cancellation/unwind safety net. Stores-held debug assertions guard admission and
 explicit release, including real durable I/O paths.
 
 Archive disposition stays `pending` until the final body is ACK-settled.
+Each admitted attempt clears its own body witness; only successful output
+finalization binds a new witness. Carried body facts and old ACKs cannot settle
+a failed current attempt. Prior native archive coverage uses its validated
+logical id, including while a later attempt is pending, so quiet scans preserve
+the exclusive token/model breakdown instead of replacing it with a state total.
+The pending attempt count and deadline are checkpointed through the existing
+scan/sync checkpoint hook before any decoder read. Save failure releases the decoder and
+restores committed evidence; restart retains the six-hour/three-attempt bound.
+The in-process permission to read is never serialized and grants no ACK authority.
 Pending evidence carries a retry deadline: at most one first-read re-decode per
 six hours. Each retry increments `codex_zst_first_read_retry` on the same carrier;
 its decoded bytes are included above. Three failed settlements hold the archive
