@@ -2909,7 +2909,12 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         let dir = store::store_dir_for_index(&index_path);
         let hex = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let record = dir.join(format!("{hex}.rec"));
-        let bytes = [b"ottto-dt".as_slice(), &2_u16.to_le_bytes(), &[7_u8; 64]].concat();
+        let bytes = [
+            b"ottto-dt".as_slice(),
+            &(crate::durable_tail_store::FORMAT_VERSION + 1).to_le_bytes(),
+            &[7_u8; 64],
+        ]
+        .concat();
         if held {
             fs::create_dir_all(&dir).unwrap();
             fs::write(&record, &bytes).unwrap();
@@ -2921,7 +2926,7 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
             assert_eq!(fs::read(&record).unwrap(), bytes);
             assert!(durable.durable_held[store::Refusal::NewerFormat as usize] >= 1);
         } else {
-            assert_eq!(durable.durable_held, [0; 5]);
+            assert_eq!(durable.durable_held, [0; 6]);
         }
         scanned.push(result.scanned_file_count);
         fs::remove_dir_all(root).unwrap();
@@ -2930,4 +2935,61 @@ fn durable_hold_on_one_member_holds_the_joined_group() {
         scanned[1] + 2 <= scanned[0],
         "control acquires both members; the held group acquires neither: {scanned:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn two_missing_group_members_keep_both_tickets_until_the_group_can_acquire() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (root, _) = fixture();
+    fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let _lock = crate::locked_state_dir::test_locks::hold(&root);
+    let index_path = root.join("index.json");
+    let source = SnapshotSource::Codex;
+    let mut committed = ScanIndex::default();
+    for name in ["a", "b"] {
+        committed.files.insert(local_index_key(&root.join(format!("sessions/{name}.jsonl"))),serde_json::from_value(json!({"size_bytes":0,"modified_unix_seconds":0,"source_file_fingerprint":"prior-native","last_snapshot_fingerprint":"prior-accepted"})).unwrap());
+    }
+    committed.save(&index_path).unwrap();
+    let cache = Arc::new(SharedCache::default());
+    let namespace = Scope("group-missing-upgrade".into());
+    cache.durable_begin_pass(source, &index_path, &namespace, false);
+    let mut owned = OwnedSourceScan::new(
+        source,
+        &[root.join("sessions")],
+        committed.clone(),
+        "2026-10-06T23:00:00Z",
+        7,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        false,
+    )
+    .with_sampled_acquisition(cache.clone(), namespace);
+    let mut saves = 0;
+    let result = loop {
+        match owned.step(None) {
+            OwnedSourceScanStep::Pending(mut next) => {
+                if next.index.reread_guard.needs_save() {
+                    saves += 1;
+                }
+                next.persist_reread_reservations(&mut committed, &index_path)
+                    .unwrap();
+                assert!(saves <= 2, "no additional per-release grant");
+                owned = next;
+            }
+            OwnedSourceScanStep::Complete { scan, .. } => break scan,
+        }
+    };
+    assert_eq!(saves, 2, "one receipt for each member");
+    assert!(result.scanned_file_count >= 2);
+    assert!(!result.snapshots.is_empty());
+    let (counts, _) = cache.durable_counters(source).unwrap();
+    assert_eq!(counts.upgrade_state_missing, 2);
+    assert_eq!(counts.durable_held.iter().sum::<u64>(), 0);
+    fs::remove_dir_all(root).unwrap();
 }

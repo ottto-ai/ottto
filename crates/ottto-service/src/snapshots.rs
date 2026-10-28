@@ -27619,13 +27619,28 @@ impl OwnedSourceScan {
                     // Grouped members bypass the per-candidate guard: one held member holds the group.
                     #[cfg(unix)]
                     if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                        if let Some((member, reason)) = group.members.iter().find_map(|member| {
-                            Some((
-                                member,
-                                cache.durable_hold(source, &local_index_key(&member.path))?,
-                            ))
-                        }) {
-                            cache.durable_hold_exit(source, reason, index, member, &mut census);
+                        if let Some((member, reason)) = group
+                            .members
+                            .iter()
+                            .find_map(|member| {
+                                Some((member, cache.durable_guard(source, member, index, false)?))
+                            })
+                            .or_else(|| {
+                                group.members.iter().find_map(|member| {
+                                    cache
+                                        .durable_upgrade_missing(source, member, index, true)
+                                        .then_some((
+                                            member,
+                                            crate::durable_tail_store::Refusal::UpgradeMissing,
+                                        ))
+                                })
+                            })
+                        {
+                            if index.reread_guard.needs_save() {
+                                codex_join_groups.push_front(group);
+                            } else {
+                                cache.durable_hold_exit(source, reason, index, member, &mut census);
+                            }
                             pending!();
                         }
                     }
@@ -31210,10 +31225,12 @@ impl OwnedSourceScan {
             #[cfg(unix)]
             if side_plan.is_none() {
                 if let Some(cache) = durable_guard.as_ref().and_then(std::sync::Weak::upgrade) {
-                    if let Some(reason) =
-                        cache.durable_hold(source, &local_index_key(&candidate.path))
-                    {
-                        cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
+                    if let Some(reason) = cache.durable_guard(source, &candidate, index, true) {
+                        if index.reread_guard.needs_save() {
+                            identified_candidates.push_front(candidate);
+                        } else {
+                            cache.durable_hold_exit(source, reason, index, &candidate, &mut census);
+                        }
                         pending!();
                     }
                 }

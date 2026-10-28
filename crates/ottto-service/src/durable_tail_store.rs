@@ -155,7 +155,24 @@ pub(crate) fn key_digest(source: DurableSource, index_key: &str) -> Digest32 {
 /// plus this store's format version, the codec's allowlist digest, the
 /// identity contract in force and the Codex counting view. A change to any of
 /// them refuses the record even when the file scope does not move.
+#[cfg(test)]
 pub(crate) fn scope_digest(
+    file_scope: &str,
+    allowlist: &Digest32,
+    identity_contract: &str,
+    counting_view: &str,
+) -> Digest32 {
+    scope_digest_for(
+        FORMAT_VERSION,
+        file_scope,
+        allowlist,
+        identity_contract,
+        counting_view,
+    )
+}
+
+pub(crate) fn scope_digest_for(
+    format: u16,
     file_scope: &str,
     allowlist: &Digest32,
     identity_contract: &str,
@@ -165,7 +182,7 @@ pub(crate) fn scope_digest(
         "ottto-dt-scope:v1",
         &[
             file_scope.as_bytes(),
-            FORMAT_VERSION.to_le_bytes().as_slice(),
+            format.to_le_bytes().as_slice(),
             allowlist.as_slice(),
             identity_contract.as_bytes(),
             counting_view.as_bytes(),
@@ -269,6 +286,7 @@ pub(crate) struct PendingRecord {
 pub(crate) struct DurableRecord {
     pub(crate) record: PendingRecord,
     pub(crate) index_generation: u64,
+    pub(crate) format: u16,
 }
 
 /// Preservation classes: unknown representations (U) precede known corruption (T14).
@@ -279,6 +297,7 @@ pub(crate) enum Refusal {
     Undecodable,
     Unbindable,
     Corrupt,
+    UpgradeMissing,
 }
 
 /// The outcome of reading one key.
@@ -362,7 +381,7 @@ pub(crate) struct StoreCounters {
     pub(crate) bytes_read: u64,
     pub(crate) records_read: u64,
     pub(crate) missing: u64,
-    pub(crate) format_hold: [u64; 5],
+    pub(crate) format_hold: [u64; 6],
     /// Writes skipped: predecessor unknown, or a new key while record files
     /// exceed `INVENTORY_BOUND` (offered again after the next save).
     pub(crate) store_write_skipped: [u64; 2],
@@ -493,6 +512,19 @@ impl DurableTailStore {
         &self.dir
     }
 
+    pub(crate) fn representation(&mut self, key: &Digest32) -> Option<(u16, Digest32)> {
+        self.classify(key, "guard")
+            .ok()
+            .flatten()
+            .map(|h| (h.format, h.record.allowlist))
+    }
+
+    pub(crate) fn absent(&self, key: &Digest32) -> bool {
+        self.disabled.is_none()
+            && fs::symlink_metadata(self.record_path(key))
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+    }
+
     pub(crate) fn counters(&self) -> StoreCounters {
         self.counters
     }
@@ -516,7 +548,7 @@ impl DurableTailStore {
     /// Owner/mode (store-level) precede header dispatch, which precedes the
     /// size check. Only a verified known record licenses mutation. `Ok(None)`
     /// also when the store is disabled.
-    fn classify(&mut self, key: &Digest32, work: &str) -> Result<Option<Binding>, Refusal> {
+    fn classify(&mut self, key: &Digest32, work: &str) -> Result<Option<Header>, Refusal> {
         if !self.usable() {
             return Ok(None);
         }
@@ -666,13 +698,16 @@ impl DurableTailStore {
             .sum::<usize>();
         for record in pending {
             // A T14 predecessor is the rebuild's to replace.
-            let corrupt = match self.classify(&record.binding.key, "overwrite") {
+            let keep_prior = match self.classify(&record.binding.key, "overwrite") {
                 Err(Refusal::Corrupt) => true,
                 Err(_) => {
                     self.counters.store_write_skipped[0] += 1;
                     continue;
                 }
-                Ok(_) => false,
+                // Preserve the v1 authority if the ordinary replacement fails
+                // or is refused by the record/store budget.
+                Ok(Some(old)) => old.format == 1,
+                Ok(None) => false,
             };
             let content = content_digest(&record);
             if self
@@ -682,7 +717,7 @@ impl DurableTailStore {
             {
                 receipt.clean += 1;
             } else {
-                dirty.push((record, content, corrupt));
+                dirty.push((record, content, keep_prior));
             }
         }
         if !self.usable() {
@@ -695,7 +730,7 @@ impl DurableTailStore {
         ensure_private_dir(&self.dir)?;
         let (mut on_disk, mut unlisted) = self.scan_disk()?;
         let mut changed = false;
-        for (record, content, corrupt) in dirty {
+        for (record, content, keep_prior) in dirty {
             if receipt.written + receipt.budget_refused >= MAX_BATCH {
                 receipt.deferred += 1;
                 receipt.deferred_keys.push(record.binding.key);
@@ -725,6 +760,7 @@ impl DurableTailStore {
             let stored = DurableRecord {
                 record,
                 index_generation: committed_generation,
+                format: FORMAT_VERSION,
             };
             let bytes = encode(&stored);
             self.note_codec(pending_bytes + bytes.capacity());
@@ -741,8 +777,8 @@ impl DurableTailStore {
             {
                 // A stale record for this key would bind to an older entry
                 // only; drop it so the refusal costs no disk. A T14 record
-                // stays until a rebuild replaces it.
-                if previous != 0 && !corrupt {
+                // and a bootstrappable v1 record stay until replacement.
+                if previous != 0 && !keep_prior {
                     remove_if_present(&path)?;
                     on_disk.remove(&key);
                     changed = true;
@@ -834,6 +870,7 @@ impl DurableTailStore {
             self.counters.gc_bytes_read += HEADER_BYTES as u64;
             let verdict = match self.classify(&key, "delete") {
                 Ok(Some(binding)) => {
+                    let binding = binding.record.binding;
                     let live = binding.context == *live_context
                         && match keep.get(&key) {
                             Some(Some(scope)) => *scope == binding.scope,
@@ -1088,27 +1125,30 @@ fn dead_temp(name: &str) -> bool {
                 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
 }
 
-fn decode_header(header: &[u8], key: &Digest32, source: DurableSource) -> Result<Binding, Refusal> {
-    let mut c = Cursor(header);
+struct Header {
+    record: PendingRecord,
+    generation: u64,
+    format: u16,
+    body_len: usize,
+}
+fn decode_header(bytes: &[u8], key: &Digest32, source: DurableSource) -> Result<Header, Refusal> {
+    let mut c = Cursor(bytes);
     if c.array::<8>() != Some(MAGIC) {
         return Err(Refusal::Undecodable);
     }
-    let version = c.u16().ok_or(Refusal::Undecodable)?;
-    if version > FORMAT_VERSION {
+    let format = c.u16().ok_or(Refusal::Undecodable)?;
+    if format > FORMAT_VERSION {
         return Err(Refusal::NewerFormat);
-    }
-    if version != FORMAT_VERSION {
-        return Err(Refusal::Unknown);
     }
     let allowlist = c.array::<32>().ok_or(Refusal::Undecodable)?;
     let tag = c.u8().ok_or(Refusal::Undecodable)?;
-    // Both pinned v1 writers (72205c6c and 4f143c16/ffc6c846) have these same lists.
+    // Both pinned v1 writers (72205c6c and ffc6c846) use these lists.
     let pin = match tag {
         1 => "8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c",
         2 => "02206079405b58944e1d6d4d0ed3768c2acb39444d5278f1ba86725a723534a1",
         _ => return Err(Refusal::Unknown),
     };
-    if Some(allowlist) != parse_hex_digest(pin) {
+    if format != 1 || Some(allowlist) != parse_hex_digest(pin) {
         return Err(Refusal::Unknown);
     }
     let binding = (|| {
@@ -1124,28 +1164,60 @@ fn decode_header(header: &[u8], key: &Digest32, source: DurableSource) -> Result
     if binding.key != *key || binding.source != source {
         return Err(Refusal::Unbindable);
     }
-    Ok(binding)
+    let parsed = (|| {
+        let generation = c.u64()?;
+        let certificate = DurableCertificate {
+            device: c.u64()?,
+            inode: c.u64()?,
+            length: c.u64()?,
+            modified: (c.i64()?, c.i64()?),
+            birth_nanos: c.u64()?,
+            sealed_offset: c.u64()?,
+            sample_len: c.u32()?,
+            head_sha256: c.array()?,
+            boundary_sha256: c.array()?,
+            verified_unix_seconds: c.u64()?,
+            // The old debt bytes are consumed, structurally checked and dropped.
+            audit_debt_unix_seconds: {
+                let tag = c.u8()?;
+                let due = c.u64()?;
+                if tag > 1 || tag == 0 && due != 0 {
+                    return None;
+                }
+                None
+            },
+        };
+        Some(Header {
+            record: PendingRecord {
+                binding,
+                certificate,
+                body: Vec::new(),
+                allowlist,
+            },
+            generation,
+            format,
+            body_len: c.u32()? as usize,
+        })
+    })();
+    parsed.ok_or(Refusal::Corrupt)
 }
 
 fn verify(bytes: &[u8], source: DurableSource) -> Result<(), Refusal> {
     let bad = Refusal::Corrupt;
-    if bytes.len() < HEADER_BYTES + TRAILER_BYTES {
-        return Err(bad);
-    }
-    let end = bytes.len() - TRAILER_BYTES;
-    // Trailer FIRST: structural duplicate checks on unsorted maps/sets can be quadratic.
+    let end = bytes.len().checked_sub(TRAILER_BYTES).ok_or(bad)?;
     if bytes[end..] != Sha256::digest(&bytes[..end])[..] {
         return Err(bad);
     }
-    let mut c = Cursor(&bytes[HEADER_BYTES - 4..HEADER_BYTES]);
-    if c.u32().map(|n| n as usize) != Some(end - HEADER_BYTES) {
+    let key = bytes
+        .get(43..75)
+        .and_then(|b| b.try_into().ok())
+        .ok_or(bad)?;
+    let h = decode_header(bytes, &key, source)?;
+    let start = HEADER_BYTES;
+    if end.checked_sub(start) != Some(h.body_len) {
         return Err(bad);
     }
-    let debt = HEADER_BYTES - 4 - 9;
-    if !matches!(bytes[debt], 0 | 1) || (bytes[debt] == 0 && bytes[debt + 1..debt + 9] != [0; 8]) {
-        return Err(bad);
-    }
-    crate::snapshots::verify_durable_body(&bytes[HEADER_BYTES..end], source)
+    crate::snapshots::verify_durable_body(&bytes[start..end], source)
         .then_some(())
         .ok_or(bad)
 }
@@ -1280,68 +1352,23 @@ impl<'a> Cursor<'a> {
 
 /// The version is checked before the trailer: a newer layout is not ours to
 /// judge. Everything else must pass the trailer and decode exactly.
-fn decode(bytes: &[u8], allowlist: &Digest32) -> Result<DurableRecord, Refusal> {
+fn decode(bytes: &[u8], _allowlist: &Digest32) -> Result<DurableRecord, Refusal> {
     let source = bytes
         .get(42)
         .and_then(|tag| DurableSource::from_tag(*tag))
         .ok_or(Refusal::Undecodable)?;
-    let key: Digest32 = bytes
+    let key = bytes
         .get(43..75)
         .and_then(|b| b.try_into().ok())
         .ok_or(Refusal::Undecodable)?;
-    decode_header(bytes, &key, source)?;
+    let mut h = decode_header(bytes, &key, source)?;
     verify(bytes, source)?;
-    let body_end = bytes.len() - TRAILER_BYTES;
-    let mut cursor = Cursor(&bytes[10..body_end]);
-    let record_allowlist = cursor.array::<32>().ok_or(Refusal::Corrupt)?;
-    let decoded = (|| {
-        let source = DurableSource::from_tag(cursor.u8()?)?;
-        let binding = Binding {
-            source,
-            key: cursor.array()?,
-            context: cursor.array()?,
-            scope: cursor.array()?,
-            entry: cursor.array()?,
-        };
-        let index_generation = cursor.u64()?;
-        let certificate = DurableCertificate {
-            device: cursor.u64()?,
-            inode: cursor.u64()?,
-            length: cursor.u64()?,
-            modified: (cursor.i64()?, cursor.i64()?),
-            birth_nanos: cursor.u64()?,
-            sealed_offset: cursor.u64()?,
-            sample_len: cursor.u32()?,
-            head_sha256: cursor.array()?,
-            boundary_sha256: cursor.array()?,
-            verified_unix_seconds: cursor.u64()?,
-            audit_debt_unix_seconds: {
-                let present = cursor.u8()?;
-                let due = cursor.u64()?;
-                match present {
-                    0 if due == 0 => None,
-                    1 => Some(due),
-                    _ => return None,
-                }
-            },
-        };
-        let body_len = cursor.u32()? as usize;
-        let body = cursor.take(body_len)?.to_vec();
-        cursor.0.is_empty().then_some(DurableRecord {
-            record: PendingRecord {
-                binding,
-                certificate,
-                body,
-                allowlist: record_allowlist,
-            },
-            index_generation,
-        })
-    })();
-    let record = decoded.ok_or(Refusal::Corrupt)?;
-    if record_allowlist != *allowlist {
-        return Err(Refusal::Unknown);
-    }
-    Ok(record)
+    h.record.body = bytes[HEADER_BYTES..bytes.len() - TRAILER_BYTES].to_vec();
+    Ok(DurableRecord {
+        record: h.record,
+        index_generation: h.generation,
+        format: h.format,
+    })
 }
 
 /// Test-only fault points inside the atomic write.
@@ -1390,4 +1417,4 @@ pub(crate) mod test_hooks {
 
 #[cfg(test)]
 #[path = "durable_tail_store_tests.rs"]
-mod tests;
+pub(crate) mod tests;

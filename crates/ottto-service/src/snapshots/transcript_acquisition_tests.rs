@@ -1778,7 +1778,7 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     // The known key is replaced; the new key is deferred, counted.
     assert_eq!(store.records_written, u64::from(supported));
     assert_eq!(store.budget_refused, 0);
-    assert_eq!(store.store_write_skipped, [0, u64::from(supported)]);
+    assert_eq!(store.store_write_skipped, [0, u64::from(supported), 0]);
     if supported {
         assert_eq!(store.disk_records, bound as u64 + 2);
     }
@@ -3593,5 +3593,132 @@ fn codex_compaction_events_and_points_match_full_read_at_every_tail_split() {
             local_points(&expected[0]),
             "split {split}"
         );
+    }
+}
+
+/// Format-only upgrade uses the actual old-writer serializer and production
+/// expected/scope/restore/write seams. Every upgraded restart has zero Fulls.
+#[cfg(unix)]
+#[test]
+fn pinned_v1_upgrade_rewrites_v2_then_second_restart_tails_without_a_full() {
+    use crate::durable_tail_store as store;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for pin in ["72205c6c", "ffc6c846"] {
+            let fixture = ScanFixture::new(source);
+            fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+            let namespace = Scope("v1-upgrade-production".into());
+            let state = fixture.dir.join("state");
+            fs::create_dir_all(&state).unwrap();
+            let lock = crate::locked_state_dir::test_locks::hold(&state);
+            let index_path = state.join("index.json");
+            let first = Arc::new(sampled_scan::SharedCache::default());
+            first.durable_begin_pass(
+                source,
+                &index_path,
+                &namespace,
+                claude_request_identity::capture_by_default(),
+            );
+            let (mut index, _, modes) = production_scan(
+                &fixture,
+                source,
+                ScanIndex::default(),
+                Some(first.clone()),
+                &namespace.0,
+            );
+            assert_eq!(modes.0, 1);
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                first
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            let key = local_index_key(&fixture.file.0);
+            let old = sampled_scan::durable_tail::seed_pinned_v1(&first, source, &key, &index, pin);
+            let record_path = fs::read_dir(store::store_dir_for_index(&index_path))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            assert_eq!(u16::from_le_bytes(old[8..10].try_into().unwrap()), 1);
+            drop(first);
+            fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+            let second = Arc::new(sampled_scan::SharedCache::default());
+            second.durable_begin_pass(
+                source,
+                &index_path,
+                &namespace,
+                claude_request_identity::capture_by_default(),
+            );
+            let loaded = ScanIndex::load(&index_path).unwrap();
+            let (mut warm, scan, modes) = production_scan(
+                &fixture,
+                source,
+                loaded.clone(),
+                Some(second.clone()),
+                &namespace.0,
+            );
+            let (cold, full, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+            assert_eq!(modes, (0, 1, 0), "{source:?} {pin}");
+            assert_eq!(second.durable_counters(source).unwrap().0.restored, 1);
+            assert_eq!(
+                second
+                    .durable_counters(source)
+                    .unwrap()
+                    .0
+                    .upgrade_state_missing,
+                0
+            );
+            assert_eq!(production_body(source, scan), production_body(source, full));
+            assert_eq!(
+                warm.files[&key].codex_counting_v2,
+                cold.files[&key].codex_counting_v2
+            );
+            assert_eq!(fs::read(&record_path).unwrap(), old, "no eager migration");
+            warm.save(&index_path).unwrap();
+            assert_eq!(
+                second
+                    .durable_write_after_save(lock, source, &warm)
+                    .unwrap()
+                    .written,
+                1
+            );
+            second.durable_gc(lock, source, &warm).unwrap();
+            let mut disk = store::DurableTailStore::new(
+                store::store_dir_for_index(&index_path),
+                sampled_scan::durable_tail::durable_source(source).unwrap(),
+            );
+            let record = match disk.read(
+                &store::key_digest(
+                    sampled_scan::durable_tail::durable_source(source).unwrap(),
+                    &key,
+                ),
+                &sampled_jsonl::durable::allowlist_digest(source),
+            ) {
+                store::ReadOutcome::Found(r) => r,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(record.format, crate::durable_tail_store::FORMAT_VERSION);
+            drop(second);
+            fixture.file.append(&usage(source, 160, 2, "fixture-model"));
+            let third = Arc::new(sampled_scan::SharedCache::default());
+            third.durable_begin_pass(
+                source,
+                &index_path,
+                &namespace,
+                claude_request_identity::capture_by_default(),
+            );
+            let loaded = ScanIndex::load(&index_path).unwrap();
+            let (_, scan, modes) =
+                production_scan(&fixture, source, loaded.clone(), Some(third), &namespace.0);
+            let (_, full, _) = production_scan(&fixture, source, loaded, None, &namespace.0);
+            assert_eq!(modes, (0, 1, 0), "second restart {source:?} {pin}");
+            assert_eq!(production_body(source, scan), production_body(source, full));
+        }
     }
 }

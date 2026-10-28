@@ -110,8 +110,9 @@ struct Reservation {
     saved: bool,
     claimed: bool,
     replay: bool,
+    upgrade: bool,
 }
-crate::heap_layout_bound::fields!(Reservation; wall, born, saved, claimed, replay);
+crate::heap_layout_bound::fields!(Reservation; wall, born, saved, claimed, replay, upgrade);
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct State {
@@ -286,6 +287,44 @@ impl State {
     }
     pub(super) fn begin_selection(&mut self) {
         self.require_save = false;
+    }
+    /// O3: use the existing durable replay ledger and pre-read reservation
+    /// receipt. Restart loses the unused ticket, never the spent release/key.
+    pub(super) fn upgrade_missing(&mut self, key: &str, consume: bool) -> bool {
+        if self.closed {
+            return false;
+        }
+        let id = KeyHash::of(key);
+        if let Some(r) = self
+            .reservations
+            .get_mut(&id)
+            .filter(|r| r.upgrade && r.saved && !r.claimed)
+        {
+            r.claimed = consume;
+            return true;
+        }
+        let keys = self
+            .replayed
+            .entry(format!(
+                "upgrade_state_missing:{}",
+                ottto_core::compiled_release_version()
+            ))
+            .or_default();
+        if keys.len() >= MAX_TRACKED_KEYS || !keys.insert(id) {
+            return false;
+        }
+        self.reservations.insert(
+            id,
+            Reservation {
+                wall: now(),
+                born: monotonic_millis(),
+                saved: false,
+                claimed: false,
+                replay: true,
+                upgrade: true,
+            },
+        );
+        false
     }
     pub(super) fn needs_save(&self) -> bool {
         self.reservations.values().any(|r| !r.saved)
@@ -502,6 +541,7 @@ impl State {
                 saved: durable,
                 claimed: durable,
                 replay,
+                upgrade: false,
             },
         );
         Admission::Admit(Ticket {

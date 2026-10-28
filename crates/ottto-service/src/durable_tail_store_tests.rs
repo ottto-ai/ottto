@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 
 /// Real compiled v1 body/allowlist; arbitrary test-only representations are U.
-fn placeholder_allowlist() -> Digest32 {
+pub(super) fn placeholder_allowlist() -> Digest32 {
     parse_hex_digest("8d141d534b95e2c5ac6a2e6d8e5ca45f3a852038fa456f5f3216c14bf84e943c").unwrap()
 }
-fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
+pub(super) fn placeholder_body(count: u64, sum: u64) -> Vec<u8> {
     crate::snapshots::durable_store_fixture_body(
         crate::snapshots::SnapshotSource::ClaudeCode,
         count,
@@ -40,11 +40,11 @@ fn acquire_released(dir: &Path) -> LockedStateDir {
     }
 }
 
-struct Scratch {
-    root: PathBuf,
+pub(super) struct Scratch {
+    pub(super) root: PathBuf,
 }
 impl Scratch {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             root: crate::test_scratch::private_dir("ottto-durable-tail"),
         }
@@ -52,13 +52,13 @@ impl Scratch {
     fn index_path(&self) -> PathBuf {
         self.root.join("index.json")
     }
-    fn store(&self) -> DurableTailStore {
+    pub(super) fn store(&self) -> DurableTailStore {
         DurableTailStore::new(
             store_dir_for_index(&self.index_path()),
             DurableSource::ClaudeCode,
         )
     }
-    fn transcript(&self, name: &str, bytes: &[u8]) -> PathBuf {
+    pub(super) fn transcript(&self, name: &str, bytes: &[u8]) -> PathBuf {
         let path = self.root.join(name);
         fs::write(&path, bytes).unwrap();
         path
@@ -89,14 +89,14 @@ fn checkpoint(path: &Path) -> crate::transcript_acquisition::Checkpoint {
         .unwrap()
 }
 
-fn certificate(path: &Path) -> DurableCertificate {
+pub(super) fn certificate(path: &Path) -> DurableCertificate {
     let birth = crate::transcript_acquisition::birth_unix_nanos(&fs::metadata(path).unwrap());
     checkpoint(path).durable_certificate(birth).unwrap()
 }
 
 const INDEX_KEY: &str = "/Users/canary-user/.claude/projects/canary-workspace/session.jsonl";
 
-fn binding(context: &str, file_scope: &str, entry: (&str, Option<&str>)) -> Binding {
+pub(super) fn binding(context: &str, file_scope: &str, entry: (&str, Option<&str>)) -> Binding {
     Binding {
         source: DurableSource::ClaudeCode,
         key: key_digest(DurableSource::ClaudeCode, INDEX_KEY),
@@ -111,7 +111,11 @@ fn binding(context: &str, file_scope: &str, entry: (&str, Option<&str>)) -> Bind
     }
 }
 
-fn pending(binding: Binding, certificate: DurableCertificate, count: u64) -> PendingRecord {
+pub(super) fn pending(
+    binding: Binding,
+    certificate: DurableCertificate,
+    count: u64,
+) -> PendingRecord {
     PendingRecord {
         binding,
         certificate,
@@ -120,7 +124,7 @@ fn pending(binding: Binding, certificate: DurableCertificate, count: u64) -> Pen
     }
 }
 
-fn found(outcome: ReadOutcome) -> DurableRecord {
+pub(super) fn found(outcome: ReadOutcome) -> DurableRecord {
     match outcome {
         ReadOutcome::Found(record) => *record,
         other => panic!("expected a record, got {other:?}"),
@@ -133,13 +137,13 @@ fn save_index(index: &mut ScanIndex, path: &Path) -> u64 {
     index.generation
 }
 
-fn record_file(store: &DurableTailStore, key: &Digest32) -> PathBuf {
+pub(super) fn record_file(store: &DurableTailStore, key: &Digest32) -> PathBuf {
     store.dir().join(format!("{}{RECORD_SUFFIX}", hex(key)))
 }
 
 /// Put record bytes back as an owner-only file, as the store writes them; a
 /// recreated file would otherwise take the umask's 0644 and be refused.
-fn put_record(path: &Path, bytes: &[u8]) {
+pub(super) fn put_record(path: &Path, bytes: &[u8]) {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -516,7 +520,7 @@ fn schema_both_ways_and_downgrade() {
             ],
         )
         .unwrap();
-    for (binding, version) in [(&newer, FORMAT_VERSION + 1), (&other, FORMAT_VERSION - 1)] {
+    for (binding, version) in [(&newer, FORMAT_VERSION + 1), (&other, 0)] {
         let path = record_file(&store, &binding.key);
         let mut bytes = fs::read(&path).unwrap();
         set_version(&mut bytes, version);
@@ -906,7 +910,7 @@ fn store_mode_faults_are_repaired_without_rebuilds() {
     let counters = cold.counters();
     assert_eq!(counters.mode_repaired, 3);
     assert_eq!(counters.t14_rebuild, 0);
-    assert_eq!(counters.format_hold, [0; 5]);
+    assert_eq!(counters.format_hold, [0; 6]);
     assert_eq!(cold.disabled(), None);
 }
 
@@ -955,7 +959,7 @@ fn foreign_owner_disables_the_store_without_rebuilds() {
     corrupt[end] ^= 1;
     put_record(&paths[1], &corrupt);
     let mut newer = fs::read(&paths[2]).unwrap();
-    set_version(&mut newer, 2);
+    set_version(&mut newer, FORMAT_VERSION + 1);
     put_record(&paths[2], &newer);
     let before = paths.each_ref().map(|path| fs::read(path).unwrap());
     // The directory passes its check; then a foreign-owned record with a
@@ -1267,6 +1271,7 @@ fn certificate_survives_the_envelope() {
         .write_after_save(&lock, 1, vec![pending(b.clone(), cert.clone(), 1)])
         .unwrap();
     let read = found(store.read(&b.key, &placeholder_allowlist()));
+    cert.audit_debt_unix_seconds = None;
     assert_eq!(read.record.certificate, cert);
     assert!(admits(&path, &read.record.certificate).unwrap().unchanged);
 }
@@ -1404,7 +1409,7 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                     Refusal::Unknown
                 }
                 "newer" | "reserved_v2" | "spent_v2" | "oversized_newer" => {
-                    set_version(&mut bytes, 2);
+                    set_version(&mut bytes, FORMAT_VERSION + 1);
                     // Future fields are opaque here; 5a1 must not interpret a mark.
                     if kind == "oversized_newer" {
                         bytes.resize(RECORD_BYTES + HEADER_BYTES + TRAILER_BYTES + 1, 0);
@@ -1421,24 +1426,24 @@ fn every_mutation_preserves_unknown_and_known_corrupt_predecessors_unprimed() {
                 }
                 "bad_body" => {
                     bytes[HEADER_BYTES] = 255; // invalid nested source enum, but valid trailer
-                    set_version(&mut bytes, 1);
+                    set_version(&mut bytes, FORMAT_VERSION);
                     Refusal::Corrupt
                 }
                 "foreign_source" => {
                     // Structurally valid Codex body under a Claude envelope: `decode` refuses it.
                     assert_eq!(bytes[HEADER_BYTES], 1);
                     bytes[HEADER_BYTES] = 0;
-                    set_version(&mut bytes, 1);
+                    set_version(&mut bytes, FORMAT_VERSION);
                     Refusal::Corrupt
                 }
                 "bad_length" => {
                     bytes[HEADER_BYTES - 4] ^= 1;
-                    set_version(&mut bytes, 1);
+                    set_version(&mut bytes, FORMAT_VERSION);
                     Refusal::Corrupt
                 }
                 "debt_tag" => {
                     bytes[HEADER_BYTES - 13] = 2;
-                    set_version(&mut bytes, 1);
+                    set_version(&mut bytes, FORMAT_VERSION);
                     Refusal::Corrupt
                 }
                 _ => {
@@ -1549,10 +1554,11 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
         let mut record = base.clone();
         record.binding.key = key_digest(DurableSource::ClaudeCode, &format!("unknown-{n}"));
         let mut bytes = encode(&DurableRecord {
+            format: FORMAT_VERSION,
             record: record.clone(),
             index_generation: 1,
         });
-        set_version(&mut bytes, 2);
+        set_version(&mut bytes, FORMAT_VERSION + 1);
         put_record(&record_file(&store, &record.binding.key), &bytes);
     }
     let link = store.dir().join(format!("{}.rec", hex(&[1; 32])));
@@ -1562,10 +1568,11 @@ fn fresh_cleanup_is_bounded_preserves_unsafe_entries_and_only_reaps_dead_writer_
     // A group-readable U record: header dispatch precedes the mode repair.
     let unsafe_path = store.dir().join(format!("{}.rec", hex(&[3; 32])));
     let mut unsafe_bytes = encode(&DurableRecord {
+        format: FORMAT_VERSION,
         record: base,
         index_generation: 1,
     });
-    set_version(&mut unsafe_bytes, 2);
+    set_version(&mut unsafe_bytes, FORMAT_VERSION + 1);
     put_record(&unsafe_path, &unsafe_bytes);
     fs::set_permissions(&unsafe_path, fs::Permissions::from_mode(0o644)).unwrap();
     // pid 1 is always alive and never this writer.
@@ -1623,10 +1630,11 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
         let mut record = pending(b.clone(), certificate(&transcript), 1);
         record.binding.key = key_digest(DurableSource::ClaudeCode, &format!("kept-{n}"));
         let mut bytes = encode(&DurableRecord {
+            format: FORMAT_VERSION,
             record: record.clone(),
             index_generation: 1,
         });
-        set_version(&mut bytes, 2);
+        set_version(&mut bytes, FORMAT_VERSION + 1);
         let path = record_file(&store, &record.binding.key);
         put_record(&path, &bytes);
         kept.push((path, bytes));
@@ -1661,4 +1669,52 @@ fn inventory_overflow_replaces_existing_records_and_defers_new_keys() {
     for (path, bytes) in kept {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
+}
+
+// Exact serializer shared by 72205c6c and ffc6c846 (compared at implementation).
+fn pinned_v1_header(out: &mut Vec<u8>, record: &PendingRecord, generation: u64) {
+    let binding = &record.binding;
+    let certificate = &record.certificate;
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&1_u16.to_le_bytes());
+    out.extend_from_slice(&record.allowlist);
+    out.push(binding.source.tag());
+    for part in [
+        &binding.key,
+        &binding.context,
+        &binding.scope,
+        &binding.entry,
+    ] {
+        out.extend_from_slice(part);
+    }
+    out.extend_from_slice(&generation.to_le_bytes());
+    for value in [certificate.device, certificate.inode, certificate.length] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&certificate.modified.0.to_le_bytes());
+    out.extend_from_slice(&certificate.modified.1.to_le_bytes());
+    out.extend_from_slice(&certificate.birth_nanos.to_le_bytes());
+    out.extend_from_slice(&certificate.sealed_offset.to_le_bytes());
+    out.extend_from_slice(&certificate.sample_len.to_le_bytes());
+    out.extend_from_slice(&certificate.head_sha256);
+    out.extend_from_slice(&certificate.boundary_sha256);
+    out.extend_from_slice(&certificate.verified_unix_seconds.to_le_bytes());
+    out.push(u8::from(certificate.audit_debt_unix_seconds.is_some()));
+    out.extend_from_slice(
+        &certificate
+            .audit_debt_unix_seconds
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&(record.body.len() as u32).to_le_bytes());
+}
+
+pub(crate) fn pinned_v1_bytes(record: &PendingRecord, generation: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    pinned_v1_header(&mut bytes, record, generation);
+    assert_eq!(bytes.len(), HEADER_BYTES);
+    bytes.extend_from_slice(&record.body);
+    let trailer = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&trailer);
+    bytes
 }

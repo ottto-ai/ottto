@@ -136,6 +136,7 @@ fn replay_revisions_and_applied_markers_bind_without_changing_the_allowlist() {
             &scope,
             index,
             &interpretation,
+            None,
         )
         .unwrap()
         .binding
@@ -281,6 +282,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             &scope,
             &index,
             &interpretation,
+            None,
         )
         .unwrap()
         .binding;
@@ -432,6 +434,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             &scope,
             &index,
             &interpretation,
+            None,
         )
         .unwrap()
         .binding;
@@ -465,6 +468,7 @@ fn attribution_capture_toggle_refuses_the_previous_claude_record() {
             &scope,
             &index,
             &after,
+            None,
         )
         .unwrap()
         .binding;
@@ -873,7 +877,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 let record_path = disk.dir().join(format!("{}.rec", hex(store_key)));
                 let mut bytes = std::fs::read(&record_path).unwrap();
                 if kind == "none" {
-                    std::fs::remove_file(&record_path).unwrap();
+                    // Known unmarked R29 control: acquisition still runs.
                 } else if kind == "unknown" {
                     bytes[10] ^= 1;
                 } else if kind == "undecodable" {
@@ -884,7 +888,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     let end = bytes.len() - 1;
                     bytes[end] ^= 1;
                 } else {
-                    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+                    bytes[8..10].copy_from_slice(&(store::FORMAT_VERSION + 1).to_le_bytes());
                     let end = bytes.len() - 32;
                     let trailer = Sha256::digest(&bytes[..end]);
                     bytes[end..].copy_from_slice(&trailer);
@@ -1105,7 +1109,7 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                     );
                     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
                 } else {
-                    assert_eq!(counts.durable_held, [0; 5]);
+                    assert_eq!(counts.durable_held, [0; 6]);
                 }
                 assert_eq!(counts.restored, 0);
                 let _ = std::fs::remove_dir_all(root);
@@ -1155,7 +1159,7 @@ fn foreign_owned_store_alarms_once_and_holds_nothing() {
         .unwrap()
         .path();
     let mut bytes = std::fs::read(&record_path).unwrap();
-    bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[8..10].copy_from_slice(&(store::FORMAT_VERSION + 1).to_le_bytes());
     std::fs::write(&record_path, &bytes).unwrap();
     let cache = SharedCache::default();
     cache.durable_begin_pass(source, &index_path, &namespace, false);
@@ -1253,4 +1257,383 @@ fn save_without_per_pass_setup_keeps_valid_records() {
     let (_, disk_counters) = cache.durable_counters(source).unwrap();
     assert_eq!(disk_counters.gc_records_deleted, 1);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn v1_bootstrap_validates_each_original_binding_input_and_keeps_failed_rewrites() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for arm in [
+            "equal",
+            "file_scope",
+            "namespace",
+            "account",
+            "identity",
+            "entry",
+            "generation",
+            "counting",
+        ] {
+            if arm == "counting" && source != SnapshotSource::Codex {
+                continue;
+            }
+            let root = crate::test_scratch::private_dir("ottto-dt-v1-bindings");
+            let lock = test_locks::hold(&root);
+            let path = root.join("session.jsonl");
+            if source == SnapshotSource::ClaudeCode {
+                native_fixture(&path);
+            } else {
+                codex_budget_fixture(&path, "019fa111-2222-7333-8444-555555555555", None);
+            }
+            let key = local_index_key(&path);
+            let index_path = root.join("index.json");
+            let namespace = Scope("v1-bindings".into());
+            let scope = Scope("v1-file-scope".into());
+            let mut index = ScanIndex::default();
+            index.files.insert(key.clone(),serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"real-native"})).unwrap());
+            index.save(&index_path).unwrap();
+            let interp = Interpretation::of(source, &key, &index, false, &namespace);
+            let ds = durable_source(source).unwrap();
+            let mut binding = expected(ds, source, &key, &scope, &index, &interp, None)
+                .unwrap()
+                .binding;
+            binding.scope = scope_for(
+                ds,
+                source,
+                &scope,
+                &index,
+                &interp,
+                1,
+                &codec::allowlist_digest(source),
+            );
+            let (reduction, _) = native_record_of(&path, &scope, source);
+            let pending = PendingRecord {
+                binding,
+                certificate: certificate(&path, &scope),
+                body: codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64)
+                    .unwrap(),
+                allowlist: codec::allowlist_digest(source),
+            };
+            let bytes = store::tests::pinned_v1_bytes(&pending, index.generation);
+            let dir = store::store_dir_for_index(&index_path);
+            std::fs::create_dir_all(&dir).unwrap();
+            let disk = dir.join(format!(
+                "{}.rec",
+                pending
+                    .binding
+                    .key
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ));
+            std::fs::write(&disk, &bytes).unwrap();
+            std::fs::set_permissions(&disk, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .unwrap();
+            let mut changed_namespace = namespace.clone();
+            let mut changed_scope = scope.clone();
+            match arm {
+                "file_scope" => changed_scope.0.push_str("changed"),
+                "namespace" => changed_namespace.0.push_str("changed"),
+                "account" => index.active_upload_context_fingerprint = Some("changed".into()),
+                "identity" => index.claude_request_identity_contract = Some("changed".into()),
+                "entry" => index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .source_file_fingerprint
+                    .push_str("changed"),
+                "generation" => index.generation = 0,
+                _ => {}
+            }
+            let mut changed = Interpretation::of(source, &key, &index, false, &changed_namespace);
+            if arm == "counting" {
+                changed.counting_view = "changed".into();
+            }
+            let cache = SharedCache::default();
+            cache.durable_begin_pass(source, &index_path, &changed_namespace, false);
+            let result = cache
+                .durable_restore(
+                    source,
+                    &key,
+                    &path,
+                    &changed_scope,
+                    &mut File::open(&path).unwrap(),
+                    &index,
+                    &changed,
+                )
+                .into_test_option();
+            assert_eq!(result.is_some(), arm == "equal", "{source:?} {arm}");
+            assert_eq!(
+                std::fs::read(&disk).unwrap(),
+                bytes,
+                "bootstrap never eagerly replaces"
+            );
+            if let Some(taken) = result {
+                assert_eq!(
+                    codec::encode(
+                        &taken.retained.state,
+                        store::RECORD_BYTES,
+                        jsonl_line_cap() as u64
+                    )
+                    .unwrap(),
+                    pending.body
+                );
+                // A failed format-only write leaves v1 authoritative even after GC.
+                store::test_hooks::set_before_rename(Some(Box::new(|_, _| {
+                    Err(std::io::Error::other("injected"))
+                })));
+                let mut v2 = pending.clone();
+                v2.binding = expected(ds, source, &key, &scope, &index, &interp, None)
+                    .unwrap()
+                    .binding;
+                let mut disk_store = DurableTailStore::new(dir.clone(), ds);
+                assert!(disk_store
+                    .write_after_save(lock, index.generation, vec![v2])
+                    .is_err());
+                store::test_hooks::set_before_rename(None);
+                cache.durable_note_scope(source, &key, &scope);
+                cache.durable_gc(lock, source, &index).unwrap();
+                assert_eq!(std::fs::read(&disk).unwrap(), bytes);
+                // An ordinary replacement may exceed an unchanged record/store
+                // budget. It must not delete the still-authoritative v1 image.
+                let mut over_budget = pending.clone();
+                over_budget.binding = expected(ds, source, &key, &scope, &index, &interp, None)
+                    .unwrap()
+                    .binding;
+                over_budget.body.resize(store::RECORD_BYTES, 0);
+                let receipt = disk_store
+                    .write_after_save(lock, index.generation, vec![over_budget])
+                    .unwrap();
+                assert_eq!(receipt.budget_refused, 1);
+                assert_eq!(receipt.written, 0);
+                cache.durable_gc(lock, source, &index).unwrap();
+                assert_eq!(std::fs::read(&disk).unwrap(), bytes);
+                let restart = SharedCache::default();
+                restart.durable_begin_pass(source, &index_path, &namespace, false);
+                assert!(restart
+                    .durable_restore(
+                        source,
+                        &key,
+                        &path,
+                        &scope,
+                        &mut File::open(&path).unwrap(),
+                        &index,
+                        &interp
+                    )
+                    .into_test_option()
+                    .is_some());
+            } else {
+                let (counts, _) = cache.durable_counters(source).unwrap();
+                assert_eq!(
+                    counts.ineligible.values().sum::<u64>(),
+                    1,
+                    "{source:?} {arm}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
+/// The same configured counting view can acquire different decisions: the
+/// immutable header, not the current view, decides Legacy versus V2.
+#[test]
+fn v1_counting_provenance_comes_from_each_decoded_reduction() {
+    use codex_counting_version::{AckEvidence, TestCutover};
+    for (timestamp, evidence, version) in [
+        ("1969-01-01T00:00:00Z", AckEvidence::None, 1),
+        ("2026-10-07T00:00:00Z", AckEvidence::None, 2),
+        ("2026-10-07T00:00:00Z", AckEvidence::LegacyAcked, 1),
+    ] {
+        let _cutover = TestCutover::set(0);
+        let root = crate::test_scratch::private_dir("ottto-dt-v1-counting");
+        let path = root.join("rollout.jsonl");
+        std::fs::write(&path,serde_json::json!({"type":"session_meta","payload":{"id":"019fa111-2222-7333-8444-555555555555","timestamp":timestamp}}).to_string()+"\n").unwrap();
+        let source = SnapshotSource::Codex;
+        let scope = Scope("counting".into());
+        let mut parser = OwnedJsonlParser::new(
+            File::open(&path).unwrap(),
+            &path,
+            source,
+            apply_codex_line,
+            None,
+            None,
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        codex_counting_version::configure(&mut parser.accumulator, evidence, Some(0));
+        parser
+            .prepare_acquisition(None, &scope, None, 1_800_000_000)
+            .unwrap();
+        while !parser.step().unwrap() {}
+        let reduction = parser.durable_test_reduction_copy();
+        let body = codec::encode(&reduction, store::RECORD_BYTES, jsonl_line_cap() as u64).unwrap();
+        let key = local_index_key(&path);
+        let namespace = Scope("counting-namespace".into());
+        let index_path = root.join("index.json");
+        let mut index = ScanIndex::default();
+        let mut entry: ScanIndexEntry=serde_json::from_value(serde_json::json!({"size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"native-owned"})).unwrap();
+        if evidence == AckEvidence::LegacyAcked {
+            entry.last_snapshot_fingerprint = Some("prior-Legacy-ACK".into());
+        }
+        index.files.insert(key.clone(), entry);
+        index.save(&index_path).unwrap();
+        let interpretation = Interpretation::of(source, &key, &index, false, &namespace);
+        assert_eq!(
+            interpretation.counting_view,
+            if evidence == AckEvidence::None {
+                "0:none"
+            } else {
+                "0:legacy_acked"
+            }
+        );
+        let pending = PendingRecord {
+            binding: expected(
+                DurableSource::Codex,
+                source,
+                &key,
+                &scope,
+                &index,
+                &interpretation,
+                Some((1, codec::allowlist_digest(source))),
+            )
+            .unwrap()
+            .binding,
+            certificate: certificate(&path, &scope),
+            body,
+            allowlist: codec::allowlist_digest(source),
+        };
+        let bytes = store::tests::pinned_v1_bytes(&pending, 1);
+        let lock = test_locks::hold(&root);
+        let dir = store::store_dir_for_index(&index_path);
+        std::fs::create_dir_all(&dir).unwrap();
+        let disk = dir.join(format!(
+            "{}.rec",
+            pending
+                .binding
+                .key
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        std::fs::write(&disk, &bytes).unwrap();
+        std::fs::set_permissions(&disk, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let mut store = DurableTailStore::new(dir.clone(), DurableSource::Codex);
+        let old = match store.read(&pending.binding.key, &pending.allowlist) {
+            ReadOutcome::Found(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(old.format, 1);
+        let fact = codec::decode(&old.record.body, source)
+            .unwrap()
+            .counting()
+            .unwrap();
+        assert_eq!(fact.0, Some(0));
+        assert_eq!(fact.1, version);
+        if crate::heap_layout_bound::layout_supported() {
+            let cache = SharedCache::default();
+            cache.durable_begin_pass(source, &index_path, &namespace, false);
+            let restored = cache
+                .durable_restore(
+                    source,
+                    &key,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &index,
+                    &interpretation,
+                )
+                .into_test_option()
+                .expect("v1 maps without content acquisition");
+            assert_eq!(restored.retained.state.durable_counting(), Some(fact));
+            cache.insert(
+                key.clone(),
+                sampled_jsonl::CompletedNativeAcquisition {
+                    checkpoint: restored.retained.checkpoint,
+                    reduction: Some(restored.retained.state),
+                    released: None,
+                    unsealed: false,
+                },
+                0,
+            );
+            cache.durable_note_selection(&key, &index.files[&key].source_file_fingerprint);
+            index.save(&index_path).unwrap();
+            assert_eq!(
+                cache
+                    .durable_write_after_save(lock, source, &index)
+                    .unwrap()
+                    .written,
+                1
+            );
+            let next = match store.read(&pending.binding.key, &pending.allowlist) {
+                ReadOutcome::Found(r) => r,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(next.format, store::FORMAT_VERSION);
+            let restart = SharedCache::default();
+            restart.durable_begin_pass(source, &index_path, &namespace, false);
+            let second = restart
+                .durable_restore(
+                    source,
+                    &key,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &index,
+                    &interpretation,
+                )
+                .into_test_option()
+                .expect("second restart");
+            assert_eq!(second.retained.state.durable_counting(), Some(fact));
+            // A record whose old pinned binding proves the configured cutover
+            // but whose own decoded cutover disagrees is R29, never mapped.
+            let _new_cutover = TestCutover::set(1);
+            let changed = Interpretation::of(source, &key, &index, false, &namespace);
+            let mut disagreement = pending.clone();
+            disagreement.binding = expected(
+                DurableSource::Codex,
+                source,
+                &key,
+                &scope,
+                &index,
+                &changed,
+                Some((1, pending.allowlist)),
+            )
+            .unwrap()
+            .binding;
+            std::fs::write(
+                &disk,
+                store::tests::pinned_v1_bytes(&disagreement, index.generation),
+            )
+            .unwrap();
+            let refused = SharedCache::default();
+            refused.durable_begin_pass(source, &index_path, &namespace, false);
+            assert!(refused
+                .durable_restore(
+                    source,
+                    &key,
+                    &path,
+                    &scope,
+                    &mut File::open(&path).unwrap(),
+                    &index,
+                    &changed
+                )
+                .into_test_option()
+                .is_none());
+            assert_eq!(
+                refused
+                    .durable_counters(source)
+                    .unwrap()
+                    .0
+                    .ineligible
+                    .get("scope"),
+                Some(&1)
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

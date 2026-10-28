@@ -777,3 +777,39 @@ fn scoped_clock_restores_after_nested_fixture_panic() {
     }
     assert_eq!(TEST_CLOCK.with(|clock| clock.get()), previous);
 }
+
+#[test]
+fn upgrade_missing_requires_a_saved_once_per_release_ticket() {
+    let mut state = State::default();
+    assert!(!state.upgrade_missing("fixture", true));
+    assert!(state.needs_save());
+    // A crash before OR after receipt cannot mint another ticket.
+    let bytes = serde_json::to_vec(&state).unwrap();
+    let mut restart: State = serde_json::from_slice(&bytes).unwrap();
+    assert!(!restart.upgrade_missing("fixture", true));
+    state.saved();
+    assert!(state.upgrade_missing("fixture", true));
+    assert!(!state.upgrade_missing("fixture", true));
+    let bytes = serde_json::to_vec(&state).unwrap();
+    let mut restart: State = serde_json::from_slice(&bytes).unwrap();
+    assert!(!restart.upgrade_missing("fixture", true));
+    assert!(!restart.upgrade_missing("another", true));
+    restart.saved();
+    assert!(restart.upgrade_missing("another", true));
+}
+
+#[test]
+fn group_upgrade_preflight_does_not_consume_ready_siblings() {
+    let mut state = State::default();
+    assert!(!state.upgrade_missing("a", false));
+    state.saved();
+    assert!(state.upgrade_missing("a", false));
+    assert!(!state.upgrade_missing("b", false));
+    state.saved();
+    assert!(state.upgrade_missing("a", false));
+    assert!(state.upgrade_missing("b", false));
+    assert!(state.upgrade_missing("a", true));
+    assert!(state.upgrade_missing("b", true));
+    assert!(!state.upgrade_missing("a", false));
+    assert!(!state.upgrade_missing("b", false));
+}
