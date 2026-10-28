@@ -989,10 +989,11 @@ fn common_hold_precedes_outer_gates_and_full_acquisition() {
                 .iter()
                 .position(|class| *class == kind)
                 .unwrap();
-                // An incomplete Codex join inventory withholds every candidate as
-                // residue before selection: nothing is acquired, so nothing is held.
-                let selected =
-                    !(source == SnapshotSource::Codex && bypass == "owning_header_false");
+                // An incomplete Codex join inventory, or a compressed rollout whose
+                // owning header it cannot read, withholds the candidate before
+                // selection: nothing is acquired, so nothing is held.
+                let selected = !(source == SnapshotSource::Codex
+                    && matches!(bypass, "owning_header_false" | "compressed"));
                 assert_eq!(
                     counts.durable_held[class],
                     u64::from(selected),

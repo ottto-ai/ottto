@@ -646,7 +646,12 @@ fn only_dirty_records_are_written_in_bounded_batches() {
     );
     let counters = store.counters();
     assert_eq!(counters.disk_records, 40);
-    assert_eq!(counters.disk_bytes, 40 * per_record);
+    // Real varint bodies: each record's size follows its own counts.
+    let disk_bytes = (0..40u64)
+        .map(|n| if n == 7 { 99 } else { n })
+        .map(|count| HEADER_BYTES + placeholder_body(count, count * 7).len() + TRAILER_BYTES)
+        .sum::<usize>();
+    assert_eq!(counters.disk_bytes, disk_bytes as u64);
     // Restart: a fresh store adopts what it reads, so the next save of the
     // same entries rewrites nothing.
     let mut restarted = scratch.store();
