@@ -585,7 +585,6 @@ mod tests {
             SnapshotSource::Pi,
             &mut scan,
             &mut index,
-            true,
             |_| String::new(),
         );
         assert!(!index.bounded_sweep_had_unsettled_upload);
@@ -749,7 +748,6 @@ mod tests {
                     SnapshotSource::Pi,
                     &mut scan,
                     index,
-                    true,
                     |_| String::new(),
                 );
             }

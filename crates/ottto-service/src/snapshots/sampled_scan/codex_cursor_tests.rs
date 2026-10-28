@@ -6340,7 +6340,7 @@ fn durable_restore_then_tail_beside_a_held_fork_memo_and_parent_ledger_matches_c
     const SINGLE: &str = "019fa111-2222-7333-8444-cccccccccccc";
     let source = SnapshotSource::Codex;
     let namespace = Scope("cursor-fixture".into());
-    let capture = crate::snapshots::claude_request_identity::capture_by_default();
+    let capture = true; // Outside a sync cycle every scan captures.
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::write(
         home.fixture.file(SINGLE),
@@ -13111,26 +13111,14 @@ fn continuation_page_past_its_deadline_pauses_without_a_ticket() {
     });
 }
 
-/// K5.2/K5.3: Codex holds no request-identity permit (`OtherSource`), so
-/// the ordinary Codex page never captures; neither does its continuation,
-/// in tests too, where capture would otherwise be the default.
+/// K5.2/K5.3: the ordinary Codex page never captures
+/// (`claude_request_identity::captures`); neither does its continuation, in
+/// tests too, where a scan outside a sync cycle captures.
 #[test]
 fn continuation_capture_mode_is_the_ordinary_codex_mode() {
-    use crate::snapshots::claude_request_identity::{
-        capture_by_default, permit_when, CohortDenial, COHORT_HINT_TOKEN,
-    };
-    for token in [None, Some(COHORT_HINT_TOKEN)] {
-        assert!(matches!(
-            permit_when(true, SnapshotSource::Codex, token),
-            Err(CohortDenial::OtherSource)
-        ));
-    }
     let ordinary_capture =
-        permit_when(true, SnapshotSource::Codex, Some(COHORT_HINT_TOKEN)).is_ok();
-    assert!(
-        capture_by_default(),
-        "the default the continuation must not use"
-    );
+        crate::snapshots::claude_request_identity::captures(SnapshotSource::Codex);
+    assert!(!ordinary_capture);
     let fixture = ScanRoot::new(4);
     let scan = OwnedSourceScan::new_continuation(
         std::slice::from_ref(&fixture.root),

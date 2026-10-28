@@ -145,7 +145,7 @@ fn compressed_reader_families_refuse_without_parsing_or_emitting_a_body() {
                 &index,
                 &interpretation
             ),
-            sampled_scan::durable_tail::RestoreOutcome::Miss
+            sampled_scan::durable_tail::RestoreOutcome::Miss(_)
         ));
     });
     fs::remove_dir_all(root).unwrap();

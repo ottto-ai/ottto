@@ -4302,11 +4302,6 @@ fn contract_observation_counts_empty_transitions_without_prepare_scan_duplicates
     index.observe_claude_request_identity_contract(false);
     index.observe_claude_request_identity_contract(false);
     let counts = scope.finish().contract;
-    assert_eq!(
-        counts.request_identity_permit,
-        Default::default(),
-        "permit is prepare-only"
-    );
     assert_eq!(counts.identity_contract_transition.from_empty, 1);
     assert_eq!(counts.identity_contract_transition.to_empty, 1);
     assert_eq!(counts.identity_contract_latch.set, 1);

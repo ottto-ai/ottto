@@ -1337,7 +1337,7 @@ fn durable_codex_restart_restores_then_tails_and_matches_cold_full() {
     let source = SnapshotSource::Codex;
     let supported = crate::heap_layout_bound::layout_supported();
     let _cutover = codex_counting_version::TestCutover::set(0);
-    let capture = claude_request_identity::capture_by_default();
+    let capture = true; // Outside a sync cycle every scan captures.
     let namespace = Scope("durable-codex".into());
     let arms = [
         "restore",
@@ -1662,7 +1662,7 @@ fn durable_inventory_overflow_keeps_tail_reuse_and_defers_new_keys() {
     let source = SnapshotSource::Codex;
     let supported = crate::heap_layout_bound::layout_supported();
     let _cutover = codex_counting_version::TestCutover::set(0);
-    let capture = claude_request_identity::capture_by_default();
+    let capture = true; // Preserve this test's pre-cutover parser binding.
     let namespace = Scope("durable-overflow".into());
     let fixture = ScanFixture::new(source);
     fixture.file.append(

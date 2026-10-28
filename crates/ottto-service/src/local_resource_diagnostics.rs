@@ -295,6 +295,7 @@ pub(crate) struct Probe {
     started: Instant,
     process: Option<ProcessSample>,
     pub(crate) page_events: claude_reread::Counts,
+    pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
 }
 impl Probe {
@@ -303,6 +304,7 @@ impl Probe {
             started: Instant::now(),
             process: process_sample(),
             page_events: Default::default(),
+            full_causes: Default::default(),
             line_delivery: None,
         }
     }
@@ -396,9 +398,11 @@ pub(crate) struct ClaudeAccountRetainedPending {
     pub(crate) claude_account_retained_pending_bytes: u64,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
-    const INLINE_ONLY: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(0)
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(
+            &self.full_causes.restore_outcome.miss,
+            c,
+        )
     }
 }
 
@@ -760,6 +764,40 @@ impl crate::heap_layout_bound::HeapLayoutBound for NativeDecision {
     }
 }
 
+/// Per-page restore attempts. A miss class never authorizes a body read.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct FullCauses {
+    pub(crate) restore_outcome: RestoreCounts,
+}
+impl FullCauses {
+    fn is_empty(&self) -> bool {
+        self.restore_outcome.restored == 0
+            && self.restore_outcome.held == 0
+            && self.restore_outcome.miss.is_empty()
+    }
+}
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct RestoreCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    restored: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    held: u64,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    miss: BTreeMap<&'static str, u64>,
+}
+impl RestoreCounts {
+    #[cfg(unix)]
+    pub(crate) fn record(&mut self, outcome: &crate::snapshots::sampled_scan::RestoreOutcome) {
+        use crate::snapshots::sampled_scan::RestoreOutcome;
+        let count = match outcome {
+            RestoreOutcome::Restored(_) => &mut self.restored,
+            RestoreOutcome::Held(_) => &mut self.held,
+            RestoreOutcome::Miss(class) => self.miss.entry(class.label()).or_default(),
+        };
+        *count = count.saturating_add(1);
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct CollectionCounts {
     pub(crate) scanned_files: usize,
@@ -768,6 +806,8 @@ pub(crate) struct CollectionCounts {
     /// total filesystem reads: byte counts exclude failed plans, joins,
     /// discovery and sidecars. Selection counts can include failed/repeated plans.
     pub(crate) sampled_acquisition: Option<ReadCounts>,
+    #[serde(skip_serializing_if = "FullCauses::is_empty")]
+    pub(crate) full_causes: FullCauses,
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadCounts {
@@ -1180,6 +1220,57 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_counts_are_sparse_saturating_and_page_scoped() {
+        use crate::snapshots::sampled_scan::{MissClass, RestoreOutcome};
+        let mut probe = Probe::start();
+        let collection = |full_causes| CollectionCounts {
+            scanned_files: 0,
+            semantic_noops: 0,
+            sampled_acquisition: None,
+            full_causes,
+        };
+        let (_, rows) = capture(|| {
+            probe.collection("codex", collection(Default::default()));
+            probe
+                .full_causes
+                .restore_outcome
+                .record(&RestoreOutcome::Miss(MissClass::Missing));
+            probe
+                .full_causes
+                .restore_outcome
+                .record(&RestoreOutcome::Miss(MissClass::Missing));
+            probe
+                .full_causes
+                .restore_outcome
+                .record(&RestoreOutcome::Held(
+                    crate::durable_tail_store::Refusal::Unknown,
+                ));
+            let counts = std::mem::take(&mut probe.full_causes);
+            probe.collection("codex", collection(counts));
+            let counts = std::mem::take(&mut probe.full_causes);
+            probe.collection("codex", collection(counts));
+        });
+        assert!(rows[0]["counts"].get("full_causes").is_none());
+        let counts = &rows[1]["counts"]["full_causes"]["restore_outcome"];
+        assert_eq!(counts["miss"]["missing"], 2);
+        assert_eq!(counts["held"], 1);
+        assert!(counts.get("restored").is_none());
+        assert_eq!(rows[1]["schema_version"], 2);
+        assert!(rows[1]["counts"]["sampled_acquisition"].is_null());
+        assert!(rows[2]["counts"].get("full_causes").is_none());
+        let counts = &mut probe.full_causes.restore_outcome;
+        counts.held = u64::MAX;
+        counts.record(&RestoreOutcome::Held(
+            crate::durable_tail_store::Refusal::Unknown,
+        ));
+        assert_eq!(counts.held, u64::MAX);
+        counts.restored = 1;
+        let json = serde_json::to_value(&probe.full_causes).unwrap();
+        assert_eq!(json["restore_outcome"]["restored"], 1);
+    }
 
     #[test]
     fn history_proof_correction_deferral_is_counted() {
@@ -1632,6 +1723,7 @@ mod tests {
                     scanned_files: 1,
                     semantic_noops: 0,
                     sampled_acquisition: None,
+                    full_causes: Default::default(),
                 },
             );
             probe.collection(
@@ -1640,6 +1732,7 @@ mod tests {
                     scanned_files: 0,
                     semantic_noops: 0,
                     sampled_acquisition: None,
+                    full_causes: Default::default(),
                 },
             );
             let scope = claude_reread::Scope::begin(true);
@@ -1848,6 +1941,7 @@ mod tests {
                                 scanned_files: usize::MAX,
                                 semantic_noops: usize::MAX,
                                 sampled_acquisition: Some(max_read_counts()),
+                                full_causes: Default::default(),
                             },
                         );
                     }
@@ -1929,6 +2023,7 @@ mod tests {
                     scanned_files: usize::MAX,
                     semantic_noops: usize::MAX,
                     sampled_acquisition: Some(max_read_counts()),
+                    full_causes: Default::default(),
                 },
             );
             source_finish("secret/path/provider", || Ok(())).unwrap();
