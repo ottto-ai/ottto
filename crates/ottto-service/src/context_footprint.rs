@@ -1263,7 +1263,7 @@ const OBSERVED_CWDS_PER_FILE: usize = 8;
 const OBSERVED_CWD_MAX_BYTES: usize = 4 * 1024;
 const PROJECTION_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Charged per projected file for its map slots, on top of its cwd
-/// allocations: `merge` keeps the map's capacity within twice its files plus
+/// allocations: `merge` keeps the table's slots within twice its files plus
 /// eight, and one slot (entry and control byte at 7/8 load) is under 128 bytes.
 const PROJECTED_FILE_BYTES: usize = 256;
 
@@ -1280,6 +1280,10 @@ pub(crate) struct CwdProjection(Mutex<Projection>);
 #[derive(Debug, Default)]
 struct Projection {
     files: HashMap<FileObject, ProjectedFile>,
+    /// The most `files` has reported it can hold since it was last rebuilt.
+    /// Removal frees no slot and its tombstones lower `capacity()`, so only
+    /// this bounds the table's allocation.
+    table_slots: usize,
     bytes: usize,
     passes: u64,
     evicted_files: u64,
@@ -1309,6 +1313,14 @@ fn remember_cwd(cwds: &mut Vec<String>, cwd: &str) {
         cwds.remove(0);
     }
     cwds.push(cwd.to_string());
+}
+
+impl Projection {
+    /// Moves the files into a table sized for them, free of tombstones.
+    fn rebuild(&mut self) {
+        self.files = std::mem::take(&mut self.files).into_iter().collect();
+        self.table_slots = self.files.capacity();
+    }
 }
 
 impl CwdProjection {
@@ -1349,6 +1361,7 @@ impl CwdProjection {
             let entry = ProjectedFile { mtime, cwds: known };
             projection.bytes += projected_bytes(&entry);
             projection.files.insert(file.object, entry);
+            projection.table_slots = projection.table_slots.max(projection.files.capacity());
         }
         while projection.bytes > PROJECTION_MAX_BYTES {
             let oldest = projection.files.iter().min_by_key(|(_, file)| file.mtime);
@@ -1362,10 +1375,8 @@ impl CwdProjection {
             projection.bytes -= evicted;
             projection.evicted_files += 1;
         }
-        // Removal keeps the table's allocation; shrink it before it outgrows
-        // the per-file charge.
-        if projection.files.capacity() > 2 * projection.files.len() + 8 {
-            projection.files.shrink_to_fit();
+        if projection.table_slots > 2 * projection.files.len() + 8 {
+            projection.rebuild();
         }
     }
 
@@ -1376,7 +1387,7 @@ impl CwdProjection {
         projection.files.retain(|_, file| {
             now.duration_since(file.mtime).unwrap_or(Duration::ZERO) <= RECENT_WORKSPACE_WINDOW
         });
-        projection.files.shrink_to_fit();
+        projection.rebuild();
         projection.bytes = projection.files.values().map(projected_bytes).sum();
         let mut out: BTreeMap<String, SystemTime> = BTreeMap::new();
         for file in projection.files.values() {
@@ -3439,13 +3450,14 @@ mod tests {
     }
 
     #[test]
-    fn projection_shrinks_its_map_after_evictions_and_empty_full_reads() {
+    fn projection_rebuilds_its_map_after_turnover_evictions_and_empty_full_reads() {
         // The per-file charge covers a map of twice its files plus eight only
         // while one slot (entry and control byte at 7/8 load) is under 128 bytes.
         const _: () =
             assert!((std::mem::size_of::<(FileObject, ProjectedFile)>() + 1) * 8 / 7 < 128);
         let within_charge = |state: &Projection| {
-            state.files.capacity() <= 2 * state.files.len() + 8
+            state.files.capacity() <= state.table_slots
+                && state.table_slots <= 2 * state.files.len() + 8
                 && state.bytes <= PROJECTION_MAX_BYTES
         };
         let root = temp_dir("cwd-projection-churn");
@@ -3463,9 +3475,23 @@ mod tests {
         }
         assert_eq!(projection.lock().files.len(), 2_000);
 
-        // Full reads that name no cwd forget every file and release the map.
-        for view in &shorts {
+        // Turnover leaves tombstones that lower the reported capacity; the
+        // table's slots stay bounded by its files throughout.
+        let mut turned = Vec::new();
+        for (index, view) in shorts.iter().take(1_500).enumerate() {
             deliver(&mut observer, view, &[json!({})], DeliveryEnd::Complete);
+            let path = root.join(format!("turned-{index:04}.jsonl"));
+            fs::write(&path, "").unwrap();
+            let fresh = claude_view(&path, start, DeliveryMode::Full);
+            deliver(&mut observer, &fresh, &short, DeliveryEnd::Complete);
+            assert!(within_charge(&projection.lock()));
+            turned.push(fresh);
+        }
+
+        // Full reads that name no cwd forget every file and release the map.
+        for view in shorts.iter().chain(&turned) {
+            deliver(&mut observer, view, &[json!({})], DeliveryEnd::Complete);
+            assert!(within_charge(&projection.lock()));
         }
         let state = projection.lock();
         assert!(state.files.is_empty() && state.bytes == 0 && within_charge(&state));
