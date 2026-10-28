@@ -3,6 +3,7 @@
 use serde::{ser::SerializeMap, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod cache_lifecycle;
