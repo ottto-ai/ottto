@@ -3,6 +3,7 @@ pub mod claude_account;
 pub mod claude_config_slots;
 pub mod claude_statusline;
 pub mod codex_account_slots;
+mod credential_file;
 pub mod lifecycle;
 pub mod local_client;
 pub mod local_service;

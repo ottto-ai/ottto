@@ -2,7 +2,6 @@ use crate::account_store::default_support_dir;
 use crate::{OTTTO_CONTROL_TOKEN_ENV, OTTTO_SECRET_FALLBACK_DIR_ENV};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
@@ -739,24 +738,11 @@ fn set_user_only_directory_permissions(path: &Path) -> Result<(), TokenStoreErro
 }
 
 fn load_file_secret(account: &str) -> Result<String, TokenStoreError> {
-    let read = || -> std::io::Result<String> {
-        const LIMIT: u64 = 64 * 1024;
-        let too_large = || {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "file-backed secret exceeds 64 KiB",
-            )
-        };
-        let file = fs::File::open(file_secret_path(account))?;
-        if file.metadata()?.len() > LIMIT {
-            return Err(too_large());
-        }
-        let mut value = String::with_capacity((LIMIT + 1) as usize);
-        file.take(LIMIT + 1).read_to_string(&mut value)?;
-        if value.len() > LIMIT as usize {
-            return Err(too_large());
-        }
-        Ok(value)
+    let read = || {
+        crate::credential_file::read(
+            fs::File::open(file_secret_path(account))?,
+            crate::credential_file::Kind::FileSecret,
+        )
     };
     match read() {
         Ok(value) => {

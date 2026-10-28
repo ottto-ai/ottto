@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use ottto_protocol::{LocalAccountBinding, SourceHealth};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const ACCOUNT_FILE_NAME: &str = "account.json";
@@ -362,19 +361,11 @@ impl FileDeviceStore {
     }
 
     fn read_bounded(&self) -> Result<String> {
-        const LIMIT: u64 = 64 * 1024;
-        let file = fs::File::open(&self.path)?;
-        anyhow::ensure!(
-            file.metadata()?.len() <= LIMIT,
-            "device binding exceeds 64 KiB"
-        );
-        let mut body = String::with_capacity((LIMIT + 1) as usize);
-        file.take(LIMIT + 1).read_to_string(&mut body)?;
-        anyhow::ensure!(
-            body.len() <= LIMIT as usize,
-            "device binding exceeds 64 KiB"
-        );
-        Ok(body)
+        crate::credential_file::read(
+            fs::File::open(&self.path)?,
+            crate::credential_file::Kind::DeviceBinding,
+        )
+        .map_err(Into::into)
     }
 
     pub fn load(&self) -> Result<Option<LocalDeviceBinding>> {
