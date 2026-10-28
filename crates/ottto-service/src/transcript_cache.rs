@@ -40,6 +40,7 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Retained<S> {
     }
 }
 struct Entry<S> {
+    durable: crate::snapshots::DurableCustody,
     retained: Retained<S>,
     used: u64,
     // Validated once at admission; private retained state is immutable until
@@ -57,6 +58,7 @@ struct Entry<S> {
 impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         let Self {
+            durable,
             retained: _,
             used: _,
             heap_bytes,
@@ -64,6 +66,7 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
             finalization_charge: _,
             e2_held_new_file: _,
         } = self;
+        durable.heap_bound(c)?;
         c.add(*heap_bytes)
     }
 }
@@ -87,6 +90,7 @@ pub(crate) enum Release {
 /// A retained copy moved out of the cache, with the admission facts the
 /// caller's completion needs (P1-RETAIN R0).
 pub(crate) struct Taken<S> {
+    pub(crate) durable: crate::snapshots::DurableCustody,
     pub(crate) retained: Retained<S>,
     /// The entry's victim-order hint as admitted: the source mtime, clipped
     /// to admission time.
@@ -180,6 +184,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// through its own existing HeapLayoutBound admission.
     pub(crate) fn take(&mut self, key: &str) -> Option<Taken<S>> {
         let taken = self.entries.remove(key).map(|entry| Taken {
+            durable: entry.durable,
             retained: entry.retained,
             modified_hint: entry.modified_hint,
             finalization_charge: entry.finalization_charge,
@@ -191,6 +196,18 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             Event::TakeAbsent
         });
         taken
+    }
+    /// Current custody is fixed inline metadata, already charged in Entry's slot.
+    pub(crate) fn restore_custody(
+        &mut self,
+        key: &str,
+        durable: crate::snapshots::DurableCustody,
+        held_new: bool,
+    ) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.durable = durable;
+            entry.e2_held_new_file = held_new;
+        }
     }
     /// Allocation-free update of inline eligibility on existing residents.
     /// `None` leaves an unvisited resident alone; no new registry or entry.
@@ -484,6 +501,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         // to newer resident state. Neither decision suppresses a native full
         // read or audit.
         let entry = Entry {
+            durable: Default::default(),
             modified_hint: rank,
             retained,
             used: next,

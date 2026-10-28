@@ -188,8 +188,7 @@ pub(super) enum OpenedInput {
 
 pub(super) struct NativeFile {
     file: File,
-    #[cfg(unix)]
-    custody: super::sampled_scan::durable_tail::DurableCustody,
+    custody: super::DurableCustody,
 }
 impl Read for NativeFile {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -210,9 +209,26 @@ impl OpenedInput {
     pub(super) fn plain(file: File) -> Self {
         Self::Plain(BufReader::new(NativeFile {
             file,
-            #[cfg(unix)]
             custody: Default::default(),
         }))
+    }
+
+    pub(super) fn take_durable(&mut self) -> super::DurableCustody {
+        match self {
+            Self::Plain(reader) => std::mem::take(&mut reader.get_mut().custody),
+            Self::Compressed(_) => Default::default(),
+        }
+    }
+    pub(super) fn accepts_durable(&self) -> bool {
+        matches!(self, Self::Plain(reader) if reader.get_ref().custody.is_empty())
+    }
+    pub(super) fn put_durable(&mut self, durable: super::DurableCustody) {
+        match self {
+            Self::Plain(reader) if reader.get_ref().custody.is_empty() => {
+                reader.get_mut().custody = durable
+            }
+            _ => unreachable!("validated empty Plain owner"),
+        }
     }
 
     #[cfg(unix)]

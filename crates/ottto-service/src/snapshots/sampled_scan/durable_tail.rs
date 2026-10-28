@@ -421,6 +421,19 @@ pub(crate) struct RetailAttempt {
     end: u64,
     old_end: u64,
 }
+impl crate::heap_layout_bound::HeapLayoutBound for RetailAttempt {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            source: _,
+            object: _,
+            next: _,
+            end: _,
+            old_end: _,
+        } = self;
+        c.add(0)
+    }
+}
+
 // Process totals by source: native physical Tail bytes and old-suffix overlap.
 static RETAIL_BYTES: [[AtomicU64; 2]; 2] = [
     [AtomicU64::new(0), AtomicU64::new(0)],
@@ -432,11 +445,7 @@ fn retail_bytes(source: SnapshotSource, metric: usize) -> u64 {
     })
 }
 
-/// Inline ownership; later active custody extends this same owner.
-#[derive(Default)]
-pub(crate) struct DurableCustody {
-    retail: Option<RetailAttempt>,
-}
+pub(crate) use crate::snapshots::DurableCustody;
 impl DurableCustody {
     pub(crate) fn take_retail(&mut self) -> Option<RetailAttempt> {
         self.retail.take()
@@ -981,6 +990,7 @@ impl SharedCache {
         let admitted = self.insert_admitted(
             key.to_string(),
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint,
                 reduction: Some(reduction),
                 released: None,

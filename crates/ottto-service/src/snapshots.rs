@@ -28,6 +28,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
+/// Unique acquisition metadata; the Plain native input owns it while reading.
+#[derive(Default)]
+pub(crate) struct DurableCustody {
+    #[cfg(unix)]
+    retail: Option<sampled_scan::durable_tail::RetailAttempt>,
+}
+crate::heap_layout_bound::fields!(DurableCustody; #[cfg(unix)] retail);
+impl DurableCustody {
+    pub(crate) fn is_empty(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.retail.is_none()
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+}
+
 pub(crate) mod cache_observations;
 #[cfg(test)]
 pub(crate) mod cache_overcap_tests;
@@ -31640,7 +31660,7 @@ impl OwnedSourceScan {
                 });
                 let e2_held_new_file = source == SnapshotSource::ClaudeCode
                     && taken.as_ref().is_some_and(|taken| taken.e2_held_new_file);
-                let retained = taken.map(|taken| taken.retained);
+                let mut retained = taken.map(Box::new);
                 let retained_present = retained.is_some();
                 let reinsertion =
                     crate::local_resource_diagnostics::claude_reread::Reinsertion::new(
@@ -31658,7 +31678,7 @@ impl OwnedSourceScan {
                 }
                 retained_offset = retained
                     .as_ref()
-                    .map(|retained| retained.checkpoint.sealed_offset());
+                    .map(|taken| taken.retained.checkpoint.sealed_offset());
                 let owning_header_is_current = source != SnapshotSource::Codex
                     || codex_join_inventory.as_ref().is_some_and(|inventory| {
                         inventory.complete
@@ -31679,6 +31699,15 @@ impl OwnedSourceScan {
                     .admission
                     .sidecar_census_complete
                     .observe(sidecar_census_complete);
+                if !(owning_header_is_current && state_census_complete && sidecar_census_complete) {
+                    if let Some(taken) = retained.take() {
+                        if source == SnapshotSource::ClaudeCode {
+                            claude_request_census::retain_held(index, &candidate);
+                        }
+                        context.cache.return_prepared_taken(key, taken);
+                        pending!();
+                    }
+                }
                 if owning_header_is_current && state_census_complete && sidecar_census_complete {
                     let reduction_sidecar = sampled_scan::reduction_dependencies(
                         source,
@@ -31691,6 +31720,15 @@ impl OwnedSourceScan {
                         .admission
                         .reduction_dependencies_available
                         .observe(reduction_sidecar.is_some());
+                    if reduction_sidecar.is_none() && retained.is_some() {
+                        if source == SnapshotSource::ClaudeCode {
+                            claude_request_census::retain_held(index, &candidate);
+                        }
+                        context
+                            .cache
+                            .return_prepared_taken(key, retained.take().expect("present"));
+                        pending!();
+                    }
                     if let Some(reduction_sidecar) = reduction_sidecar {
                         let debt =
                             sampled_audit::debt_for_key(index, &key, sampled_scan::now_seconds());
@@ -31765,7 +31803,7 @@ impl OwnedSourceScan {
                         #[cfg(unix)]
                         let mut retail_attempt = None;
                         #[cfg(unix)]
-                        let (retained, taken_admission) = match retained {
+                        let (mut retained, taken_admission) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
                                 let interpretation = sampled_scan::durable_tail::Interpretation::of(
                                     source,
@@ -31811,7 +31849,7 @@ impl OwnedSourceScan {
                                             taken.finalization_charge,
                                             taken.retained.state.usage_witness(),
                                         );
-                                        (Some(taken.retained), Some(admission))
+                                        (Some(taken), Some(admission))
                                     }
                                     sampled_scan::durable_tail::RestoreOutcome::Miss => {
                                         (None, taken_admission)
@@ -31830,24 +31868,44 @@ impl OwnedSourceScan {
                             }
                             retained => (retained, taken_admission),
                         };
-                        let old = retained.filter(|_| allow_sample);
+                        if !allow_sample {
+                            if let Some(taken) = retained.take() {
+                                if source == SnapshotSource::ClaudeCode {
+                                    claude_request_census::retain_held(index, &candidate);
+                                }
+                                context.cache.return_prepared_taken(key, taken);
+                                pending!();
+                            }
+                        }
+                        let old = retained;
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
-                        let mode = match parser.prepare_acquisition(
+                        let mode = match parser.prepare_acquisition_owned(
                             old,
                             &scope,
                             debt,
                             sampled_scan::now_seconds(),
                         ) {
                             Ok(mode) => mode,
-                            Err(_) => {
+                            Err(rejected) => {
+                                let had_taken = rejected.taken.is_some();
+                                if let Some(taken) = rejected.taken {
+                                    context.cache.return_prepared_taken(key, taken);
+                                }
                                 context.admission.prepare_failed =
                                     context.admission.prepare_failed.saturating_add(1);
                                 if source == SnapshotSource::ClaudeCode {
-                                    claude_request_census::invalidate_claude_request_census(
-                                        index,
-                                        &candidate.path,
-                                    );
+                                    if had_taken {
+                                        claude_request_census::retain_held(index, &candidate);
+                                    } else {
+                                        claude_request_census::invalidate_claude_request_census(
+                                            index,
+                                            &candidate.path,
+                                        );
+                                    }
+                                }
+                                if had_taken {
+                                    pending!();
                                 }
                                 census.record_unreadable(UnreadableCause::Reduction, 1);
                                 pending!();

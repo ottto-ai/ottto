@@ -343,6 +343,49 @@ impl SharedCache {
         completed: sampled_jsonl::CompletedNativeAcquisition,
         live_bytes: usize,
     ) -> bool {
+        self.insert_with_custody(key, completed, live_bytes, false)
+    }
+    pub(super) fn return_prepared_taken(
+        &self,
+        key: String,
+        taken: Box<crate::transcript_cache::Taken<CachedJsonlReduction>>,
+    ) -> bool {
+        let crate::transcript_cache::Taken {
+            retained,
+            durable,
+            modified_hint,
+            finalization_charge,
+            e2_held_new_file,
+        } = *taken;
+        self.insert_with_custody(
+            key,
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: retained.checkpoint,
+                reduction: Some(retained.state),
+                durable,
+                released: Some(modified_hint),
+                unsealed: false,
+            },
+            finalization_charge,
+            e2_held_new_file,
+        )
+    }
+    fn insert_with_custody(
+        &self,
+        key: String,
+        completed: sampled_jsonl::CompletedNativeAcquisition,
+        live_bytes: usize,
+        held_new: bool,
+    ) -> bool {
+        // This ordinary path accepts only fixed inline custody; dynamic debt uses b2.
+        if crate::heap_layout_bound::bound(
+            &completed.durable,
+            std::mem::size_of_val(&completed.durable),
+        )
+        .is_none()
+        {
+            return false;
+        }
         if let Some(state) = completed.reduction {
             if let Ok(mut cache) = self.retained() {
                 // The whole cursor state (paused job, memo, parked and rotation
@@ -363,7 +406,6 @@ impl SharedCache {
                 // release ran is admitted at exactly the rank that release
                 // ranked residents against.
                 let live_bytes_in = live_bytes;
-                #[cfg(unix)]
                 let touched = key.clone();
                 let reserved = live_bytes
                     .saturating_add(self.cursor_resident_for_main())
@@ -378,6 +420,9 @@ impl SharedCache {
                     live_bytes,
                     completed.released,
                 );
+                if admitted {
+                    cache.restore_custody(&touched, completed.durable, held_new);
+                }
                 self.drop_suspended_proof_if_over(&cache, live_bytes_in);
                 // M1: an admitted copy is a durable write candidate after the
                 // next successful index save (the durable lock is a leaf).

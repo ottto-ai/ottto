@@ -6,6 +6,319 @@ use std::io::Read;
 
 const INDEX_KEYS: usize = 20_000;
 
+fn owned_fixture(
+    source: SnapshotSource,
+    path: &Path,
+    scope: &Scope,
+) -> Box<Taken<CachedJsonlReduction>> {
+    if source == SnapshotSource::Codex {
+        codex_budget_fixture(path, "019fa111-2222-7333-8444-555555555555", None);
+    } else {
+        native_fixture(path);
+    }
+    let (state, checkpoint) = native_record_of(path, scope, source);
+    Box::new(Taken {
+        retained: crate::transcript_cache::Retained { checkpoint, state },
+        durable: Default::default(),
+        modified_hint: (17, 19),
+        finalization_charge: 23,
+        e2_held_new_file: true,
+    })
+}
+fn owned_parser(source: SnapshotSource, path: &Path, file: File) -> OwnedJsonlParser {
+    let apply = if source == SnapshotSource::Codex {
+        apply_codex_line
+    } else {
+        apply_claude_code_line
+    };
+    OwnedJsonlParser::new(file, path, source, apply, None, None, None, false, true).unwrap()
+}
+
+#[test]
+fn owned_prepare_rejects_with_original_box_graph_flags_and_unique_guard() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for arm in [
+            "capture",
+            "scope",
+            "read_error",
+            "buffered",
+            "occupied",
+            "source",
+            "priority",
+        ] {
+            if arm == "priority" && source != SnapshotSource::Codex {
+                continue;
+            }
+            let root = crate::test_scratch::ScratchDir::new("owned-prepare-reject");
+            let path = root.join("source.jsonl");
+            let scope = Scope("owned-file".into());
+            let mut taken = owned_fixture(source, &path, &scope);
+            let cache = SharedCache::default();
+            let attempt = cache
+                .begin_retail(
+                    source,
+                    &local_index_key(&path),
+                    &taken.retained.checkpoint,
+                    &File::open(&path).unwrap(),
+                    taken.retained.checkpoint.sealed_offset(),
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            let expected_guard = (attempt.object, attempt.next, attempt.end);
+            taken.durable.put_retail(attempt);
+            if arm == "capture" {
+                taken
+                    .retained
+                    .state
+                    .accumulator
+                    .claude_request_identity_capture = true;
+            }
+            if arm == "priority" {
+                taken
+                    .retained
+                    .state
+                    .accumulator
+                    .codex_observed_priority_turns =
+                    Some(BTreeMap::from([("turn-1".into(), true)]));
+            }
+            let body = codec::encode(
+                &taken.retained.state,
+                store::BODY_BYTES,
+                jsonl_line_cap() as u64,
+            )
+            .unwrap();
+            let address = (&*taken) as *const Taken<CachedJsonlReduction> as usize;
+            let file = if arm == "read_error" {
+                std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+            } else {
+                File::open(&path).unwrap()
+            };
+            let mut parser = owned_parser(source, &path, file);
+            if arm == "source" {
+                parser.source = SnapshotSource::Pi;
+            }
+            if arm == "buffered" {
+                assert!(!parser.reader.reader.fill_buf().unwrap().is_empty());
+            }
+            if arm == "occupied" {
+                parser
+                    .reader
+                    .reader
+                    .put_durable(std::mem::take(&mut taken.durable));
+            }
+            let passed_scope = if arm == "scope" {
+                Scope("other-file".into())
+            } else {
+                scope
+            };
+            let rejected = match parser.prepare_acquisition_owned(
+                Some(taken),
+                &passed_scope,
+                None,
+                1_800_000_000,
+            ) {
+                Ok(_) => panic!("{source:?}/{arm} unexpectedly accepted"),
+                Err(rejected) => rejected,
+            };
+            let mut returned = rejected.taken.expect("every rejection returns Taken");
+            assert_eq!(
+                (&*returned) as *const Taken<CachedJsonlReduction> as usize,
+                address,
+                "{arm}"
+            );
+            assert_eq!(returned.modified_hint, (17, 19));
+            assert_eq!(returned.finalization_charge, 23);
+            assert!(returned.e2_held_new_file);
+            assert_eq!(
+                codec::encode(
+                    &returned.retained.state,
+                    store::BODY_BYTES,
+                    jsonl_line_cap() as u64
+                )
+                .unwrap(),
+                body
+            );
+            let owner = if arm == "occupied" {
+                parser.reader.reader.take_durable()
+            } else {
+                std::mem::take(&mut returned.durable)
+            };
+            let mut owner = owner;
+            let attempt = owner.take_retail().expect("unique guard survived");
+            assert_eq!((attempt.object, attempt.next, attempt.end), expected_guard);
+            attempt.finish();
+            assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn owned_prepare_moves_guard_to_actual_native_owner_and_ends_it_at_completion() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let root = crate::test_scratch::ScratchDir::new("owned-prepare-success");
+        let path = root.join("source.jsonl");
+        let scope = Scope("owned-file".into());
+        let mut taken = owned_fixture(source, &path, &scope);
+        let cache = SharedCache::default();
+        let attempt = cache
+            .begin_retail(
+                source,
+                &local_index_key(&path),
+                &taken.retained.checkpoint,
+                &File::open(&path).unwrap(),
+                taken.retained.checkpoint.sealed_offset(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        taken.durable.put_retail(attempt);
+        let body = codec::encode(
+            &taken.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64,
+        )
+        .unwrap();
+        let mut parser = owned_parser(source, &path, File::open(&path).unwrap());
+        let mode = match parser.prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_000)
+        {
+            Ok(mode) => mode,
+            Err(rejected) => panic!("{}", rejected.error),
+        };
+        assert_eq!(mode, crate::transcript_acquisition::ReadMode::Unchanged);
+        assert!(
+            !parser.reader.reader.accepts_durable(),
+            "actual NativeFile owns the guard"
+        );
+        assert_eq!(
+            codec::encode(
+                &parser.durable_test_reduction_copy(),
+                store::BODY_BYTES,
+                jsonl_line_cap() as u64
+            )
+            .unwrap(),
+            body
+        );
+        let sampled_jsonl::SideCertificate::Certified { completed, .. } = parser
+            .certify_without_retention(&scope, 1_800_000_000)
+            .unwrap()
+        else {
+            panic!("certified native completion required")
+        };
+        assert!(
+            completed.durable.is_empty(),
+            "finished retail cannot grant future growth reads"
+        );
+        assert!(parser.reader.reader.accepts_durable());
+        assert_eq!(
+            cache.durable().unwrap().retail_spent.len(),
+            1,
+            "finish never renews allowance"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs native retained admission layout"
+)]
+fn rejected_ordinary_taken_returns_custody_rank_charge_and_held_flag_under_one_lock() {
+    assert!(crate::heap_layout_bound::layout_supported());
+    let root = crate::test_scratch::ScratchDir::new("owned-return");
+    let path = root.join("source.jsonl");
+    let scope = Scope("owned-file".into());
+    let mut taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &scope);
+    let cache = SharedCache::default();
+    let key = local_index_key(&path);
+    let attempt = cache
+        .begin_retail(
+            SnapshotSource::ClaudeCode,
+            &key,
+            &taken.retained.checkpoint,
+            &File::open(&path).unwrap(),
+            taken.retained.checkpoint.sealed_offset(),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+    taken.durable.put_retail(attempt);
+    let body = codec::encode(
+        &taken.retained.state,
+        store::BODY_BYTES,
+        jsonl_line_cap() as u64,
+    )
+    .unwrap();
+    assert!(cache.return_prepared_taken(key.clone(), taken));
+    let mut returned = cache.take(&key).expect("real cache admission");
+    assert_eq!(returned.modified_hint, (17, 19));
+    assert_eq!(returned.finalization_charge, 23);
+    assert!(returned.e2_held_new_file);
+    returned
+        .durable
+        .take_retail()
+        .expect("guard retained through admission")
+        .finish();
+    assert_eq!(
+        codec::encode(
+            &returned.retained.state,
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64
+        )
+        .unwrap(),
+        body
+    );
+    *cache.retained().unwrap() = crate::transcript_cache::TranscriptCache::with_byte_limit(0);
+    assert!(!cache.return_prepared_taken(key.clone(), Box::new(returned)));
+    assert!(cache.take(&key).is_none());
+    assert_eq!(cache.durable().unwrap().retail_spent.len(), 1);
+}
+
+#[test]
+fn owned_fresh_none_and_unowned_real_edit_keep_native_full_semantics() {
+    let root = crate::test_scratch::ScratchDir::new("owned-full");
+    let path = root.join("source.jsonl");
+    let scope = Scope("owned-file".into());
+    let taken = owned_fixture(SnapshotSource::ClaudeCode, &path, &scope);
+    assert!(taken.durable.is_empty());
+    let changed = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("100", "101");
+    std::fs::write(&path, changed).unwrap();
+    let mut parser = owned_parser(
+        SnapshotSource::ClaudeCode,
+        &path,
+        File::open(&path).unwrap(),
+    );
+    let mode = match parser.prepare_acquisition_owned(Some(taken), &scope, None, 1_800_000_000) {
+        Ok(mode) => mode,
+        Err(rejected) => panic!("{}", rejected.error),
+    };
+    assert!(
+        matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)),
+        "actual source edit"
+    );
+    while !parser.step().unwrap() {}
+    let (cold, _) = native_record_of(&path, &scope, SnapshotSource::ClaudeCode);
+    assert_eq!(
+        codec::encode(
+            &parser.durable_test_reduction_copy(),
+            store::BODY_BYTES,
+            jsonl_line_cap() as u64
+        )
+        .unwrap(),
+        codec::encode(&cold, store::BODY_BYTES, jsonl_line_cap() as u64).unwrap()
+    );
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut parser = owned_parser(source, &path, File::open(&path).unwrap());
+        let mode = match parser.prepare_acquisition_owned(None, &scope, None, 1_800_000_000) {
+            Ok(mode) => mode,
+            Err(rejected) => panic!("{}", rejected.error),
+        };
+        assert!(matches!(
+            mode,
+            crate::transcript_acquisition::ReadMode::Full(_)
+        ));
+    }
+}
+
 #[test]
 fn admissible_codex_records_survive_above_the_retired_aggregate_disk_cap() {
     let root = crate::test_scratch::ScratchDir::new("dt-aggregate-disk");
@@ -219,6 +532,7 @@ fn existing_m1_writer_uses_and_releases_active_credit_on_success_and_io_error() 
             assert!(cache.insert_admitted(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
+                    durable: Default::default(),
                     checkpoint,
                     reduction: Some(reduction),
                     released: None,
@@ -659,6 +973,7 @@ fn owed_history_refuses_restore_before_disk_for_revision_and_money_replay() {
             assert!(cache.insert_admitted(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
+                    durable: Default::default(),
                     checkpoint,
                     reduction: Some(reduction),
                     released: None,
@@ -871,6 +1186,7 @@ fn byte_budget_deferral_keeps_selection_provenance_for_the_next_save() {
         assert!(cache.insert_admitted(
             key.clone(),
             sampled_jsonl::CompletedNativeAcquisition {
+                durable: Default::default(),
                 checkpoint,
                 reduction: Some(reduction),
                 released: None,
@@ -1873,6 +2189,7 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
             cache.insert(
                 key.clone(),
                 sampled_jsonl::CompletedNativeAcquisition {
+                    durable: Default::default(),
                     checkpoint: restored.retained.checkpoint,
                     reduction: Some(restored.retained.state),
                     released: None,
@@ -2379,7 +2696,7 @@ fn q11_complete_map_is_paid_before_the_first_key() {
     assert!((2 * store::MAX_RECORDS + 1) * nodes <= reserve);
     assert_eq!(
         STORES_RESIDENT_BOUND,
-        2 * store::MAX_RECORDS * 128 + reserve
+        2 * store::MAX_RECORDS * 256 + 2 * (store::MAX_BATCH + 1) * 4096 + reserve
     );
     assert_eq!(
         super::super::STATE_BYTES

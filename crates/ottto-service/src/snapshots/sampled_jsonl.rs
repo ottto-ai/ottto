@@ -64,6 +64,7 @@ impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
 }
 
 pub(super) struct CompletedNativeAcquisition {
+    pub(super) durable: super::DurableCustody,
     pub(super) checkpoint: Checkpoint,
     pub(super) reduction: Option<CachedJsonlReduction>,
     /// `Some(rank)`: this completion's deferred release ran (P1-RETAIN R0)
@@ -78,7 +79,7 @@ pub(super) struct CompletedNativeAcquisition {
     /// its own bit is the job's `eof_applied` or `fragment`.
     pub(super) unsealed: bool,
 }
-crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction, released, unsealed);
+crate::heap_layout_bound::fields!(CompletedNativeAcquisition; durable, checkpoint, reduction, released, unsealed);
 
 /// A side read's certificate (U1a-2a): no retained copy and no cache event.
 #[allow(clippy::large_enum_variant)] // Moved once to the side exit; never stored.
@@ -101,7 +102,23 @@ pub(super) struct LiveReductionInputs {
     parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
 }
 
+pub(in crate::snapshots) struct PrepareRejected {
+    pub(in crate::snapshots) error: anyhow::Error,
+    pub(in crate::snapshots) taken:
+        Option<Box<crate::transcript_cache::Taken<CachedJsonlReduction>>>,
+}
+
 impl OwnedJsonlParser {
+    fn completed_durable(&mut self) -> super::DurableCustody {
+        let durable = self.reader.reader.take_durable();
+        #[cfg(unix)]
+        let mut durable = durable;
+        #[cfg(unix)]
+        if let Some(attempt) = durable.take_retail() {
+            attempt.finish();
+        }
+        durable
+    }
     /// The source mtime this read's checkpoint will carry
     /// (`ReadPlan::modified_hint`); `None` without a plan.
     pub(super) fn planned_modified_hint(&self) -> Option<(i64, i64)> {
@@ -131,23 +148,66 @@ impl OwnedJsonlParser {
         debt: Option<AuditDebt>,
         now: u64,
     ) -> Result<ReadMode> {
-        // Checkpoints, samples and resume offsets are physical-file bytes. A
-        // compressed stream has none, so it is never sampled or resumed.
-        refuse_compressed_codex(
-            None,
-            Some(&self.reader.reader),
-            CodexZstCause::PhysicalOffsetUnsupported,
-        )?;
-        anyhow::ensure!(
-            !self.reader.reader.is_compressed(),
-            "compressed input has no physical acquisition offsets"
-        );
-        anyhow::ensure!(
-            self.reader.reader.buffer().is_empty() && !self.reader.finished,
-            "acquisition must begin before native parsing"
-        );
-        let old = old.filter(|old| {
-            old.state.accumulator.source == self.source
+        let taken = old.map(|retained| {
+            Box::new(crate::transcript_cache::Taken {
+                retained,
+                durable: Default::default(),
+                modified_hint: (0, 0),
+                finalization_charge: 0,
+                e2_held_new_file: false,
+            })
+        });
+        self.prepare_acquisition_inner(taken, scope, debt, now, false)
+            .map_err(|rejected| rejected.error)
+    }
+
+    pub(in crate::snapshots) fn prepare_acquisition_owned(
+        &mut self,
+        taken: Option<Box<crate::transcript_cache::Taken<CachedJsonlReduction>>>,
+        scope: &Scope,
+        debt: Option<AuditDebt>,
+        now: u64,
+    ) -> std::result::Result<ReadMode, PrepareRejected> {
+        self.prepare_acquisition_inner(taken, scope, debt, now, true)
+    }
+    fn prepare_acquisition_inner(
+        &mut self,
+        mut taken: Option<Box<crate::transcript_cache::Taken<CachedJsonlReduction>>>,
+        scope: &Scope,
+        debt: Option<AuditDebt>,
+        now: u64,
+        preserve: bool,
+    ) -> std::result::Result<ReadMode, PrepareRejected> {
+        let checked = (|| -> Result<()> {
+            // Checkpoints, samples and resume offsets are physical-file bytes. A
+            // compressed stream has none, so it is never sampled or resumed.
+            refuse_compressed_codex(
+                None,
+                Some(&self.reader.reader),
+                CodexZstCause::PhysicalOffsetUnsupported,
+            )?;
+            anyhow::ensure!(
+                !self.reader.reader.is_compressed(),
+                "compressed input has no physical acquisition offsets"
+            );
+            anyhow::ensure!(
+                self.reader.reader.buffer().is_empty() && !self.reader.finished,
+                "acquisition must begin before native parsing"
+            );
+            anyhow::ensure!(
+                self.reader.reader.accepts_durable(),
+                "native custody occupied"
+            );
+            Ok(())
+        })();
+        if let Err(error) = checked {
+            return Err(PrepareRejected { error, taken });
+        }
+        let reusable = taken
+            .as_ref()
+            .map(|taken| &taken.retained)
+            .is_none_or(|old| {
+                old.state.accumulator.source == self.source
                 // Marker state covers the whole file only in the capture mode
                 // it was built in: a non-capture prefix holds no markers, which
                 // is not the same as a prefix without markers.
@@ -175,15 +235,44 @@ impl OwnedJsonlParser {
                                         .is_some_and(|traces| traces.is_priority_turn(turn))
                             })
                         }))
-        });
-        let plan = ReadPlan::prepare(
+            });
+        if !reusable {
+            if preserve {
+                return Err(PrepareRejected {
+                    error: anyhow::anyhow!("incompatible acquisition"),
+                    taken,
+                });
+            }
+            taken = None;
+        }
+        let old = taken.as_ref().map(|taken| &taken.retained);
+        let plan = match ReadPlan::prepare(
             self.reader.reader.get_mut(),
             old.as_ref().map(|old| &old.checkpoint),
             scope,
             debt,
             now,
-        )?;
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(PrepareRejected {
+                    error: error.into(),
+                    taken,
+                })
+            }
+        };
         let mode = plan.mode();
+        if preserve
+            && matches!(mode, ReadMode::Full(_))
+            && taken
+                .as_ref()
+                .is_some_and(|taken| !taken.durable.is_empty())
+        {
+            return Err(PrepareRejected {
+                error: anyhow::anyhow!("retained acquisition refused"),
+                taken,
+            });
+        }
         if matches!(mode, ReadMode::Full(_)) && self.source == SnapshotSource::Codex {
             self.accumulator.codex_observed_priority_turns = Some(BTreeMap::new());
         }
@@ -194,9 +283,11 @@ impl OwnedJsonlParser {
                 recognized_usage_drop_count,
                 positive_recognized_usage_count,
                 positive_usage_evidence,
-            } = old
-                .expect("reusable acquisition requires native reduction")
-                .state;
+            } = {
+                let taken = taken.take().expect("continued acquisition");
+                self.reader.reader.put_durable(taken.durable);
+                taken.retained.state
+            };
             // These are live native inputs, not immutable retained history.
             // Known prior trace decisions were compared above; fresh suffixes
             // use this cycle's traces. Projected EOF advances with appends.
@@ -319,6 +410,7 @@ impl OwnedJsonlParser {
         }
         if unsealed || !admitted_copy {
             return Ok(Some(CompletedNativeAcquisition {
+                durable: self.completed_durable(),
                 checkpoint,
                 reduction: None,
                 released: None,
@@ -344,6 +436,7 @@ impl OwnedJsonlParser {
             Event::RetentionCloneBoundRefused
         });
         Ok(Some(CompletedNativeAcquisition {
+            durable: self.completed_durable(),
             checkpoint,
             reduction,
             released: None,
@@ -417,8 +510,11 @@ impl OwnedJsonlParser {
         if unsealed {
             record(Event::RetentionUnsealedEof);
         }
-        let declined = |checkpoint: Checkpoint| -> Result<Option<CompletedNativeAcquisition>> {
+        let declined = |checkpoint: Checkpoint,
+                        durable: super::DurableCustody|
+         -> Result<Option<CompletedNativeAcquisition>> {
             Ok(Some(CompletedNativeAcquisition {
+                durable,
                 checkpoint,
                 reduction: None,
                 released: None,
@@ -426,7 +522,7 @@ impl OwnedJsonlParser {
             }))
         };
         if unsealed || !compatible {
-            return declined(checkpoint);
+            return declined(checkpoint, self.completed_durable());
         }
         let limit = budget_after.min(release.entry_limit);
         if self.certified_charge(&checkpoint, limit).is_none() {
@@ -439,7 +535,7 @@ impl OwnedJsonlParser {
                     Refusal::Admission { charge },
                 ));
             }
-            return declined(checkpoint);
+            return declined(checkpoint, self.completed_durable());
         }
         #[cfg(test)]
         sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeStampGate);
@@ -450,7 +546,7 @@ impl OwnedJsonlParser {
             || checkpoint.modified_hint() != release.modified
         {
             record(Event::RetentionUnsealedEof);
-            return declined(checkpoint);
+            return declined(checkpoint, self.completed_durable());
         }
         #[cfg(test)]
         let entry_limit = release.entry_limit;
@@ -463,7 +559,7 @@ impl OwnedJsonlParser {
                 RefusalView::deferred(budget_after, entry_limit),
                 Refusal::Release(outcome),
             ));
-            return declined(checkpoint);
+            return declined(checkpoint, self.completed_durable());
         }
         let reduction = self.reduction_copy();
         let charge = crate::heap_layout_bound::bound(&reduction, limit);
@@ -485,6 +581,7 @@ impl OwnedJsonlParser {
             Event::RetentionCloneBoundRefused
         });
         Ok(Some(CompletedNativeAcquisition {
+            durable: self.completed_durable(),
             checkpoint,
             reduction,
             released: Some(rank),
@@ -520,6 +617,7 @@ impl OwnedJsonlParser {
         let len = self.reader.reader.get_ref().metadata()?.len();
         Ok(SideCertificate::Certified {
             completed: CompletedNativeAcquisition {
+                durable: self.completed_durable(),
                 unsealed: checkpoint.sealed_offset() != len,
                 checkpoint,
                 reduction: None,
@@ -565,6 +663,7 @@ impl OwnedJsonlParser {
             || !sampled_scan::compatible_reduction(&self.accumulator)
         {
             return CompletedNativeAcquisition {
+                durable: self.completed_durable(),
                 checkpoint,
                 reduction: None,
                 released: None,
@@ -591,6 +690,7 @@ impl OwnedJsonlParser {
         self.restore_live_reduction_inputs(inputs);
         let Some(accumulator) = accumulator else {
             return CompletedNativeAcquisition {
+                durable: self.completed_durable(),
                 checkpoint,
                 reduction: None,
                 released: None,
@@ -606,6 +706,7 @@ impl OwnedJsonlParser {
         };
         let reduction = crate::heap_layout_bound::bound(&reduction, budget).map(|_| reduction);
         CompletedNativeAcquisition {
+            durable: self.completed_durable(),
             checkpoint,
             reduction,
             released: None,
