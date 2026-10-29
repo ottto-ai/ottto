@@ -2756,6 +2756,14 @@ impl CodexInventoryHold {
             ..Self::default()
         }
     }
+    /// Round 8: a carried key keeps its wake evidence, so a new walk leaves
+    /// an idle key unread (its stamp gate); only the walk's own wait goes.
+    fn carried(self) -> Self {
+        Self {
+            awaiting_directories: false,
+            ..self
+        }
+    }
 }
 
 /// Durable record of the residue disclosed by the last census that completed
@@ -26116,7 +26124,7 @@ impl OwnedSourceScan {
             index.record_started_claude_request_identity_contract(claude_request_identity_capture);
         }
         let next_generation_hints;
-        let codex_owed_woken;
+        let codex_owed_moved;
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
             // The walk borrows the owed Codex keys beside its traversal.
@@ -26134,12 +26142,23 @@ impl OwnedSourceScan {
                 );
             }
             traversal.residue.codex_inventory_hold = codex_hold;
-            codex_owed_woken =
-                release_codex_inventory_hold(source, traversal, &index.files, collected_at) > 0;
+            codex_owed_moved =
+                release_codex_inventory_hold(source, traversal, &index.files, collected_at);
             if source == SnapshotSource::Codex {
                 let hold = traversal.residue.codex_inventory_hold.as_ref();
                 let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
-                codex_owed_gauge(hold.map_or(0, |hold| hold.owed.len() as u64), now);
+                // Round 8: by owed age (<=30 d, 31-90 d, >90 d), and those
+                // that grew more than 7 days after this process saw them owed.
+                let (mut pace, mut ages) = (codex_owed_pace(), [0; 4]);
+                for key in hold.into_iter().flat_map(|hold| &hold.owed) {
+                    let (_, _, stamp, ages_seen) = pace.entry(key.clone()).or_default();
+                    let size = stamp.as_ref().map_or(u64::MAX, |((size, _), _)| *size);
+                    let [seen, _, grown] = *ages_seen.get_or_insert([now, size, now]);
+                    let days = now.saturating_sub(seen) / 86_400;
+                    ages[usize::from(days > 30) + usize::from(days > 90)] += 1;
+                    ages[3] += u64::from(grown.saturating_sub(seen) > 7 * 86_400);
+                }
+                codex_owed_gauge(hold.map_or(0, |hold| hold.owed.len() as u64), now, ages);
             }
         }
         if source == SnapshotSource::Codex {
@@ -26417,7 +26436,6 @@ impl OwnedSourceScan {
         index.resume_census_window_end = Some(census_window_end.clone());
         let mut census = ScanCensus {
             causes,
-            codex_owed_woken,
             ..ScanCensus::default()
         };
         let codex_selected_flags = if source == SnapshotSource::Codex {
@@ -26447,16 +26465,50 @@ impl OwnedSourceScan {
             })
             .collect::<Vec<_>>();
         // Round 7: a paced owed key stays observed and owed, unattempted.
+        // Round 8: so does an idle one, stat-only: its size, mtime and inputs
+        // (N1's, or the hold's witnesses) are as at its last refusal.
         let traversal = index.traversal.as_ref();
         if let Some(hold) = traversal.and_then(|t| t.residue.codex_inventory_hold.as_ref()) {
-            let (now, pace) = (rfc3339_unix_seconds(collected_at), codex_owed_pace());
+            let (now, mut pace) = (rfc3339_unix_seconds(collected_at), codex_owed_pace());
+            let (mut woken, mut evidence) = (0, None);
+            let witnesses = || {
+                let mut witnesses = hold.refused_headers.iter().chain(&hold.outside_roster);
+                codex_owed_moved
+                    || (hold.refused_headers.is_empty() && hold.outside_roster.is_empty())
+                    || witnesses.any(|(key, witness)| {
+                        codex_file_join::path_witness(Path::new(key)) != *witness
+                    })
+            };
             files.retain(|candidate| {
                 let key = local_index_key(&candidate.path);
-                let due = pace.get(&key).filter(|_| hold.owed.contains(&key));
-                let paced = due.zip(now).is_some_and(|(&(_, due), now)| now < due);
+                if !hold.owed.contains(&key) {
+                    return true;
+                }
+                let (_, due, stamp, seen) = pace.entry(key).or_default();
+                if let (Some(now), Some([_, size, grown])) = (now, seen.as_mut()) {
+                    if std::mem::replace(size, candidate.size_bytes) < candidate.size_bytes {
+                        *grown = now;
+                    }
+                }
+                let paced = now.is_some_and(|now| now < *due);
+                let idle = stamp.as_ref().is_some_and(|(own, inputs)| {
+                    *own == (candidate.size_bytes, candidate.modified_unix_nanos)
+                        && match inputs {
+                            Some(inputs) => {
+                                *inputs == codex_owed_inputs(&codex_title_metadata, &candidate.path)
+                            }
+                            None => !*evidence.get_or_insert_with(|| witnesses()),
+                        }
+                });
                 codex_owed_event(CodexOwedEvent::Paced, u64::from(paced));
-                !paced
+                codex_owed_event(CodexOwedEvent::Idle, u64::from(idle && !paced));
+                if !(paced || idle) {
+                    (*stamp, woken) = (None, woken + 1);
+                }
+                !(paced || idle)
             });
+            codex_owed_event(CodexOwedEvent::WakeEvents, woken);
+            census.codex_owed_woken = woken > 0;
         }
 
         let prepare_candidate_context = |candidate: &mut CandidateFile| {
@@ -32355,9 +32407,14 @@ impl OwnedSourceScan {
                             // main holds the file too). Never requeued; not
                             // unreadable: owed, paced, carried by the census.
                             Err(sampled_scan::codex_cursor::StartRefusal::InputsUnavailable) => {
+                                let candidate = &active.candidate;
+                                let stamp = (
+                                    (candidate.size_bytes, candidate.modified_unix_nanos),
+                                    Some(codex_owed_inputs(&codex_title_metadata, &candidate.path)),
+                                );
                                 if let Some(traversal) = index.traversal.as_mut() {
                                     let now = rfc3339_unix_seconds(&collected_at).unwrap_or(0);
-                                    record_codex_owed_input(traversal, &active.candidate.path, now);
+                                    record_codex_owed_input(traversal, &candidate.path, now, stamp);
                                 }
                                 pending!();
                             }
@@ -41293,12 +41350,12 @@ fn ensure_bounded_traversal(
     if let Some(parts) = context_observation {
         claude_contract::started_context(&context_fingerprint, parts, roots);
     }
-    // Owed Codex keys outlive their walk; their old wake evidence goes.
+    // Owed Codex keys outlive their walk, with their wake evidence.
     let codex_owed = index
         .traversal
         .as_mut()
         .and_then(|traversal| traversal.residue.codex_inventory_hold.take())
-        .map(CodexInventoryHold::owed_only);
+        .map(CodexInventoryHold::carried);
     index.traversal = Some(ScanTraversalCheckpoint {
         context_fingerprint,
         census_window_end: collected_at.to_string(),
@@ -41677,12 +41734,25 @@ fn record_codex_inventory_hold(
         hold.refused_headers.clear();
         hold.outside_roster.clear();
         hold.awaiting_directories = false;
+        return;
+    }
+    // Round 8: until this evidence or the file moves, a retry reads nothing.
+    let mut pace = codex_owed_pace();
+    for key in held.iter().filter(|key| hold.owed.contains(*key)) {
+        let stat = fs::symlink_metadata(key).ok();
+        let own = stat.and_then(|stat| Some((stat.len(), unix_nanos(stat.modified().ok()?)?)));
+        pace.entry(key.clone()).or_default().2 = own.map(|own| (own, None));
     }
 }
 
 /// N1: a large candidate refused at its cursor start for want of reduction
 /// inputs is owed and paced; its first record is the evidence that must move.
-fn record_codex_owed_input(traversal: &mut ScanTraversalCheckpoint, path: &Path, now: u64) {
+fn record_codex_owed_input(
+    traversal: &mut ScanTraversalCheckpoint,
+    path: &Path,
+    now: u64,
+    stamp: CodexOwedStamp,
+) {
     let key = local_index_key(path);
     let hold = traversal
         .residue
@@ -41693,8 +41763,8 @@ fn record_codex_owed_input(traversal: &mut ScanTraversalCheckpoint, path: &Path,
         return;
     }
     let mut pace = codex_owed_pace();
-    let (n, due) = pace.entry(key.clone()).or_default();
-    *n = n.saturating_add(1);
+    let (n, due, last, _) = pace.entry(key.clone()).or_default();
+    (*n, *last) = (n.saturating_add(1), Some(stamp));
     *due = now.saturating_add(3_600 * if *n < CODEX_OWED_ATTEMPTS { 1 } else { 6 });
     codex_owed_event(
         CodexOwedEvent::Disabled,
@@ -41706,14 +41776,36 @@ fn record_codex_owed_input(traversal: &mut ScanTraversalCheckpoint, path: &Path,
     }
 }
 
-/// Owed key -> (input refusals, not before): hourly, then every 6 h after a
-/// day of refusals (hold rule 5). RAM only (a restart retries once early);
-/// only owed keys enter and release removes them.
+/// Owed key -> (input refusals, not before, last refused stamp): hourly, then
+/// every 6 h after a day of refusals (hold rule 5). RAM only (a restart
+/// retries once early); only owed keys enter and release removes them.
 const CODEX_OWED_ATTEMPTS: u32 = 24;
-static CODEX_OWED_PACE: Mutex<BTreeMap<String, (u32, u64)>> = Mutex::new(BTreeMap::new());
-fn codex_owed_pace() -> std::sync::MutexGuard<'static, BTreeMap<String, (u32, u64)>> {
+/// Round 8: own (size, mtime nanos) at a refusal, and N1's stat-free inputs
+/// (`None`: the hold's witnesses are its inputs).
+type CodexOwedStamp = ((u64, u64), Option<String>);
+/// Round 8 gauge (process-observed): first seen owed, size, last growth.
+type CodexOwedPace = BTreeMap<String, (u32, u64, Option<CodexOwedStamp>, Option<[u64; 3]>)>;
+static CODEX_OWED_PACE: Mutex<CodexOwedPace> = Mutex::new(BTreeMap::new());
+fn codex_owed_pace() -> std::sync::MutexGuard<'static, CodexOwedPace> {
     let pace = CODEX_OWED_PACE.lock();
     pace.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+/// N1's inputs a stat can see: the census flags and the reduction
+/// fingerprint. The owning header and its witness are reads, so for them
+/// only the file's own change wakes it (a counted delay, never a drop).
+fn codex_owed_inputs(codex: &CodexTitleMetadata, path: &Path) -> String {
+    #[cfg(test)]
+    let refused = sampled_scan::test_refuses_reduction_dependencies();
+    #[cfg(not(test))]
+    let refused = false;
+    let flags = (
+        codex.state_census_incomplete,
+        codex.sidecar_census_incomplete,
+    );
+    format!(
+        "{flags:?}{refused}{}",
+        codex.path_reduction_fingerprint(path)
+    )
 }
 /// Owe `keys` until each catches up or is proved removed, discoverable at any
 /// age (`DiscoveryRetention`), so a held file that grows then idles is never
@@ -41761,7 +41853,7 @@ fn release_removed_codex_owed(traversal: &mut ScanTraversalCheckpoint, removed: 
 fn close_codex_owed(traversal: Option<&mut ScanTraversalCheckpoint>) -> Option<CodexInventoryHold> {
     let hold = traversal?.residue.codex_inventory_hold.take()?;
     codex_owed_event(CodexOwedEvent::Carried, hold.owed.len() as u64);
-    Some(hold.owed_only())
+    Some(hold.carried())
 }
 
 /// Queue owed roster members again, through every gate, once evidence moved
@@ -41770,17 +41862,18 @@ fn close_codex_owed(traversal: Option<&mut ScanTraversalCheckpoint>) -> Option<C
 /// refused input (a failed upload's retry). Released when the committed
 /// size and mtime nanos match the file (after ACK, never a same-size rewrite);
 /// an unlisted ENOENT key is removed, other stat errors keep it owed.
+/// Round 8: true when evidence moved (never for the timer alone).
 fn release_codex_inventory_hold(
     source: SnapshotSource,
     traversal: &mut ScanTraversalCheckpoint,
     files: &BTreeMap<String, ScanIndexEntry>,
     collected_at: &str,
-) -> u64 {
+) -> bool {
     if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
-        return 0;
+        return false;
     }
     let Some(mut hold) = traversal.residue.codex_inventory_hold.take() else {
-        return 0;
+        return false;
     };
     let moved = |key: &String, witness: &Option<String>| {
         codex_file_join::path_witness(Path::new(key)) != *witness
@@ -41791,8 +41884,7 @@ fn release_codex_inventory_hold(
             .unhealthy_retry_not_before_unix_seconds
             .is_some_and(|deadline| now >= deadline)
     });
-    let released = retry_due
-        || hold.awaiting_directories
+    let evidence = hold.awaiting_directories
         || hold.refused_headers.iter().any(|(key, witness)| {
             // A record that vanished before its read has no witness to move;
             // leaving the roster is its evidence.
@@ -41802,6 +41894,7 @@ fn release_codex_inventory_hold(
             .outside_roster
             .iter()
             .any(|(key, witness)| roster.contains(key) || moved(key, witness));
+    let released = retry_due || evidence;
     let mut counts = [0; 3];
     let mut pace = codex_owed_pace();
     hold.owed.retain(|key| {
@@ -41823,7 +41916,6 @@ fn release_codex_inventory_hold(
     codex_owed_event(CodexOwedEvent::Removed, counts[0]);
     codex_owed_event(CodexOwedEvent::CaughtUp, counts[1]);
     codex_owed_event(CodexOwedEvent::AccessError, counts[2]);
-    let mut woken = 0;
     if released || (!traversal.counts.has_errors() && hold.refused_headers.is_empty()) {
         if retry_due {
             // The page re-arms the next, longer, retry deadline.
@@ -41854,9 +41946,7 @@ fn release_codex_inventory_hold(
                 census_member: true,
                 watcher_hint: false,
             });
-            woken += u64::from(retry_due);
         }
-        codex_owed_event(CodexOwedEvent::WakeEvents, woken);
         hold = CodexInventoryHold {
             outside_roster: unlisted,
             ..hold.owed_only()
@@ -41865,7 +41955,7 @@ fn release_codex_inventory_hold(
     if !hold.owed.is_empty() {
         traversal.residue.codex_inventory_hold = Some(hold);
     }
-    woken
+    evidence
 }
 
 fn advance_bounded_directory_traversal(

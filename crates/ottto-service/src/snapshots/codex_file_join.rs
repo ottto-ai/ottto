@@ -3160,6 +3160,64 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn idle_inventory_held_key_wakes_stat_only_and_is_counted_by_age() {
+        // Round 8 (SOURCE 1): nothing the held key was refused on moved, so
+        // the walks past the retry deadline leave it unread (`idle`): no
+        // attempt, 0 inventory bytes, still owed. Before round 8 each such
+        // walk re-attempted it and re-read the header inventory. SOURCE 2, 6:
+        // the gauge counts it by owed age and, once it grows more than 7
+        // days after it was first seen owed, as `growing_7d`.
+        let (root, held_index, _, new, witness) = held_behind_unreadable_header();
+        let key = local_index_key(&new);
+        let owes =
+            |index: &ScanIndex| inventory_hold(index).is_some_and(|hold| hold.owed.contains(&key));
+        let wake = crate::local_resource_diagnostics::take_codex_owed_wake_for_test;
+        let gauge = crate::local_resource_diagnostics::take_codex_owed_gauge_for_test;
+        wake();
+        let mut index = held_index;
+        let mut idle = 0;
+        for at in [
+            RETAINED_AT,
+            "2026-10-07T01:00:00Z",
+            "2026-11-15T23:00:00Z",
+            "2026-11-15T23:00:30Z",
+        ] {
+            let (next, page) = retained_page_at(&root, index, &[], at);
+            index = next;
+            assert!(owes(&index), "{at}: still owed");
+            assert!(page
+                .snapshots
+                .iter()
+                .all(|s| s.source_session_id != UNRELATED));
+            let woken = wake();
+            assert_eq!(woken.get("events"), None, "{at}: {woken:?}");
+            assert_eq!(woken.get("inventory_bytes"), None, "{at}: 0 bytes");
+            idle += woken.get("idle").copied().unwrap_or_default();
+        }
+        assert!(idle >= 1, "the idle key was seen and left unread");
+        assert_eq!(path_witness(&new).unwrap(), witness, "not rewritten");
+        let aged = gauge();
+        assert!(aged.get("d31_90").is_some_and(|n| *n >= 1), "{aged:?}");
+        // It grows 40 days owed: woken once (held again), then counted.
+        let mut text = fs::read_to_string(&new).unwrap();
+        for row in &member(UNRELATED, "n-2", 90, 160)[1..] {
+            text.push_str(&(serde_json::to_string(row).unwrap() + "\n"));
+        }
+        fs::write(&new, text).unwrap();
+        let hint = std::slice::from_ref(&new);
+        let (index, _) = retained_page_at(&root, index, hint, "2026-11-15T23:01:00Z");
+        let woken = wake();
+        assert!(woken.get("events").is_some_and(|n| *n >= 1), "{woken:?}");
+        let (index, _) = retained_page_at(&root, index, &[], "2026-11-15T23:01:30Z");
+        assert!(owes(&index), "held again, never dropped");
+        let grown = gauge();
+        assert!(
+            grown.get("growing_7d").is_some_and(|n| *n >= 1),
+            "{grown:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn same_size_rewrite_is_not_a_caught_up_release() {
         // C1: the release proof is the committed size and mtime nanos.
         let (root, held_index, unreadable, new, _) = held_behind_unreadable_header();

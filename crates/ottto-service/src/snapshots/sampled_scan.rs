@@ -2020,6 +2020,10 @@ pub(super) fn configure_tier_replay(
 
 #[cfg(test)]
 thread_local! { static TEST_REFUSE_REDUCTION_DEPENDENCIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(super) fn test_refuses_reduction_dependencies() -> bool {
+    TEST_REFUSE_REDUCTION_DEPENDENCIES.with(std::cell::Cell::get)
+}
 
 /// Actual path-scoped interpretation dependencies. Decode no provider row here;
 /// reuse existing sidecar inventory and bounded owning-header authority.

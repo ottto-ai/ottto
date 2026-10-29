@@ -13985,8 +13985,8 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
         assert!(held.snapshots.is_empty());
         assert!(owed(&index));
         assert!(index.files.contains_key(&key), "its entry is kept");
-        // D2: a healthy walk arms no retry deadline, so no deadline wake;
-        // past its hourly pace the walk retries it, no body read.
+        // D2: a healthy walk arms no retry deadline; past its hourly pace
+        // the walk retries it (it grew), no body read.
         crate::local_resource_diagnostics::take_codex_owed_wake_for_test();
         fixture.append(SESSION, &token_line(83));
         let (index, woken, modes) = page(index, 9, 8 * day + 7_200);
@@ -13994,7 +13994,8 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
         assert_eq!((modes, woken.snapshots.len()), ((0, 0), 0), "no body read");
         assert!(owed(&index));
         let wake = crate::local_resource_diagnostics::take_codex_owed_wake_for_test();
-        assert_eq!(wake, BTreeMap::new(), "no deadline wake");
+        // Round 8: a wake is an attempt after a move (here its growth).
+        assert_eq!(wake.get("events"), Some(&1), "{wake:?}");
         // The inputs return while the file idles: the bounded retry queues it
         // once and it is caught up by one Tail.
         refuse.set(false);
@@ -14330,6 +14331,92 @@ fn inputs_unavailable_refusal_completes_the_census_and_carries_the_key() {
             .snapshots
             .iter()
             .all(|s| s.source_session_id != SESSION));
+    });
+}
+
+/// Round 8 (SOURCE 1): an owed key whose file and N1 inputs are as at its
+/// refusal is not attempted at its hourly wake: no start, no header or
+/// inventory read (`codex_owed_wake` has no `inventory_bytes`), counted
+/// `idle`, still owed. Its inputs returning (the file unchanged) wake it
+/// once: one Tail, then the release. Zero Full, nothing dropped.
+#[test]
+fn idle_owed_input_key_is_not_reattempted_until_its_inputs_move() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let refuse = |on: bool| super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(on));
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let at = |secs: u64| {
+        time::OffsetDateTime::from_unix_timestamp((start + secs) as i64)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let t0 = std::time::Instant::now();
+    let fixture = ScanRoot::new(80);
+    let key = local_index_key(&fixture.file(SESSION));
+    let owed = |index: &ScanIndex| {
+        let hold = index.traversal.as_ref();
+        let hold = hold.and_then(|traversal| traversal.residue.codex_inventory_hold.as_ref());
+        hold.is_some_and(|hold| hold.owed.contains(&key))
+    };
+    let cache = Arc::new(SharedCache::default());
+    let pages = std::cell::Cell::new(0);
+    let page = |index: ScanIndex, secs: u64| {
+        pages.set(pages.get() + 1);
+        let ahead = std::time::Duration::from_secs(pages.get() * 86_400);
+        with_pace_clock(Some(t0 + ahead), false, || {
+            owed_page(&fixture, index, &cache, &at(secs))
+        })
+    };
+    let deferred = || counter(&cache, |c| c.jobs_deferred_inputs);
+    let wake = crate::local_resource_diagnostics::take_codex_owed_wake_for_test;
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for step in 0..64 {
+            index = page(index, step).0;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        refuse(true);
+        fixture.append(SESSION, &token_line(81));
+        let (mut index, _, _) = page(index, 100);
+        assert_eq!(deferred(), 1, "premise: N1 refused the start");
+        wake();
+        // Past the hourly pace, nothing moved: each walk leaves it unread.
+        for secs in [3_800, 7_400] {
+            let (next, scan, modes) = page(index, secs);
+            index = next;
+            assert_eq!((modes, scan.snapshots.len()), ((0, 0), 0));
+            assert!(owed(&index), "still owed, never dropped");
+        }
+        // Before round 8 each walk past the pace re-attempted it.
+        assert_eq!(deferred(), 1, "no attempt while idle");
+        let idle = wake();
+        assert_eq!(idle.get("events"), None, "{idle:?}");
+        assert_eq!(idle.get("inventory_bytes"), None, "0 inventory bytes");
+        assert!(idle.get("idle").is_some_and(|n| *n >= 1), "{idle:?}");
+        // The inputs return, the file unchanged: woken once, one Tail.
+        refuse(false);
+        let (index, tail, modes) = page(index, 11_000);
+        assert_eq!(modes, (0, 1), "one Tail, zero Full");
+        let emitted = tail.snapshots.iter();
+        assert_eq!(
+            emitted.filter(|s| s.source_session_id == SESSION).count(),
+            1
+        );
+        assert_eq!(wake().get("events"), Some(&1));
+        let (index, _, modes) = page(index, 11_060);
+        assert_eq!(modes, (0, 0));
+        assert!(!owed(&index), "released once accepted");
+        let (counts, released) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(counts.get("dropped"), None);
+        assert_eq!(released, BTreeMap::from([("caught_up", 1)]));
     });
 }
 

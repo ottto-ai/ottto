@@ -283,12 +283,18 @@ ENOENT is removed; any other stat error keeps it owed, counted as
 historical replay that resets the traversal, while a key is still owed (a file
 still being written, an upload not yet acknowledged) hands it to the next one,
 counted as `carried`. A healthy traversal with no refused input queues an
-unmatched key again, so a failed upload is retried. While owed,
-unmoved evidence re-reads nothing until the traversal's bounded retry
-deadline, when they are queued once and the deadline re-arms;
-`counts.codex_owed_wake` counts those wakes' cheap checks: `events` (keys a
-passed deadline queued) and `inventory_bytes` (header inventory bytes read on
-those pages). On Codex pages, `counts.codex_owed` counts `held` (keys that
+unmatched key again, so a failed upload is retried. While owed, a key is
+read again only after something it was refused on moved: its own size or
+mtime nanos, its reduction inputs a stat can see (census flags and reduction
+fingerprint) for an input refusal, or the hold's refused-header and
+outside-roster witnesses (carried across generations) for an inventory hold.
+A walk, a new generation or a passed retry deadline that finds none moved
+leaves it unread, stat-only. Owning headers are reads, so for them only the
+file's own change wakes it (a delay, never a drop); the stamps are
+process-local, so a restart allows one early attempt.
+`counts.codex_owed_wake` counts `events` (owed keys attempted again),
+`inventory_bytes` (header inventory bytes read on those pages) and `idle`
+(owed keys left unread because nothing moved). On Codex pages, `counts.codex_owed` counts `held` (keys that
 became owed), `overflow` (past the 10,000-key bound a new key keeps only the
 window), `oversized` (an owed key over the size cap, kept observed and unread)
 `carried` (owed keys a closing generation handed on), `access_error` (an
@@ -306,9 +312,12 @@ keys only; #867's generation marker then moves once.
 drained like `line_delivery_unselected`. The gauge `counts.codex_owed_gauge`
 reports `count` (keys owed at the last Codex walk) and `oldest_age_s` (seconds
 this process has continuously seen a non-empty owed set: a process-local lower
-bound, since no owe time is persisted). Past 24 hours it raises its own local
-alarm, `codex_owed_age_alarm` with `count` and `oldest_age_s`, at most
-hourly.
+bound, since no owe time is persisted), owed keys by owed age (`le_30d`,
+`d31_90`, `gt_90d`) and `growing_7d` (owed keys that grew more than 7 days
+after first seen owed). Ages are as this process observed them (no owe time
+is persisted), so a restart counts every key from zero. Past 24 hours it
+raises its own local alarm, `codex_owed_age_alarm` with `count` and
+`oldest_age_s`, at most hourly.
 
 `counts.line_delivery_unselected` counts discovery skip decisions for the
 page's source: `age` (outside the backfill window, not held for verification

@@ -137,8 +137,9 @@ pub(crate) enum UnselectedReason {
     WithheldOversized,
 }
 /// The three reasons, the four `WithheldEvent` slots, the twelve
-/// `CodexOwedEvent` slots, then the owed gauge and its two clock slots.
-const UNSELECTED_REASONS: usize = 23;
+/// `CodexOwedEvent` slots, then the owed gauge and its two clock slots,
+/// `Idle`, and the gauge's age buckets.
+const UNSELECTED_REASONS: usize = 28;
 /// Claude, Codex, Pi x reason, drained by that source's page line.
 #[cfg(not(test))]
 static LINE_UNSELECTED: [AtomicU64; 3 * UNSELECTED_REASONS] =
@@ -206,8 +207,8 @@ pub(crate) enum CodexOwedEvent {
     Removed,
     /// Lost by a red restart of a partially settled sweep (an open gap).
     Dropped,
-    /// Owed keys a passed retry deadline queued (a cheap header check each),
-    /// and the header inventory bytes read on the pages that did it.
+    /// Owed keys attempted again (round 8: only after their stamp, inputs or
+    /// evidence moved), and the header inventory bytes of those pages.
     WakeEvents,
     WakeInventoryBytes,
     /// Still owed when its generation closed: handed to the next one.
@@ -218,6 +219,9 @@ pub(crate) enum CodexOwedEvent {
     Disabled,
     /// An owed key's retry deferred by its pace (a counted delay).
     Paced,
+    /// Round 8: an owed key left unread, stat-only: nothing it was refused
+    /// on moved.
+    Idle = 23,
 }
 /// Recorded after the decision; never a gate input.
 pub(crate) fn codex_owed_event(event: CodexOwedEvent, count: u64) {
@@ -248,13 +252,22 @@ pub(crate) fn codex_owed_overflow_alarm(keys: u64) {
     let counts = serde_json::json!({ "overflow": [keys, total] });
     traversal_point("codex_owed_overflow_alarm", "codex", &counts);
 }
-const CODEX_OWED_WAKE: [(&str, usize); 2] = [("events", 13), ("inventory_bytes", 14)];
-const CODEX_OWED_GAUGE: [(&str, usize); 2] = [("count", 19), ("oldest_age_s", 20)];
+const CODEX_OWED_WAKE: [(&str, usize); 3] = [("events", 13), ("inventory_bytes", 14), ("idle", 23)];
+const CODEX_OWED_GAUGE: [(&str, usize); 6] = [
+    ("count", 19),
+    ("oldest_age_s", 20),
+    ("le_30d", 24),
+    ("d31_90", 25),
+    ("gt_90d", 26),
+    ("growing_7d", 27),
+];
 /// Gauge on #799: the owed Codex keys and how long, at least, this process
 /// has seen some owed (the hold persists no owe time; slot 21 keeps that
 /// start, slot 22 the last alarm). Past 24 h it raises its own alarm, at
-/// most hourly. Counts only; no path or id.
-pub(crate) fn codex_owed_gauge(count: u64, now: u64) {
+/// most hourly. Round 8 (SOURCE 2, Q2): `ages` = owed keys by owed age
+/// (<=30 d, 31-90 d, >90 d) and those still growing past 7 days owed, as
+/// this process observed them. Counts only; no path or id.
+pub(crate) fn codex_owed_gauge(count: u64, now: u64, ages: [u64; 4]) {
     let since = line_unselected("codex", 21, |since| match count {
         0 => since.swap(0, Relaxed),
         _ => since
@@ -265,7 +278,9 @@ pub(crate) fn codex_owed_gauge(count: u64, now: u64) {
     if count == 0 {
         return;
     }
-    for ((_, slot), value) in CODEX_OWED_GAUGE.into_iter().zip([count, oldest_age_s]) {
+    let [le_30d, d31_90, gt_90d, growing_7d] = ages;
+    let values = [count, oldest_age_s, le_30d, d31_90, gt_90d, growing_7d];
+    for ((_, slot), value) in CODEX_OWED_GAUGE.into_iter().zip(values) {
         line_unselected("codex", slot, |gauge| gauge.swap(value, Relaxed));
     }
     let last = line_unselected("codex", 22, |alarmed| alarmed.load(Relaxed));

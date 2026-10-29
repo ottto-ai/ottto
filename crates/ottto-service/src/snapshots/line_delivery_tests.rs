@@ -2247,9 +2247,10 @@ fn codex_owed_gauge_reports_age_and_alarms_past_a_day() {
     use crate::local_resource_diagnostics::{codex_owed_gauge, take_codex_owed_gauge_for_test};
     let t = 1_000_000;
     let ((), records) = capture(|| {
-        codex_owed_gauge(3, t);
-        codex_owed_gauge(3, t + 86_401);
-        codex_owed_gauge(2, t + 86_402);
+        codex_owed_gauge(3, t, [3, 0, 0, 0]);
+        codex_owed_gauge(3, t + 86_401, [3, 0, 0, 0]);
+        // Round 8: by owed age, and growing past 7 days owed.
+        codex_owed_gauge(2, t + 86_402, [0, 1, 1, 1]);
     });
     let alarms = records
         .iter()
@@ -2260,13 +2261,19 @@ fn codex_owed_gauge_reports_age_and_alarms_past_a_day() {
     let gauge = take_codex_owed_gauge_for_test();
     assert_eq!(
         gauge,
-        BTreeMap::from([("count", 2), ("oldest_age_s", 86_402)])
+        BTreeMap::from([
+            ("count", 2),
+            ("oldest_age_s", 86_402),
+            ("d31_90", 1),
+            ("gt_90d", 1),
+            ("growing_7d", 1)
+        ])
     );
-    codex_owed_gauge(0, t + 90_000);
-    codex_owed_gauge(1, t + 90_001);
+    codex_owed_gauge(0, t + 90_000, [0; 4]);
+    codex_owed_gauge(1, t + 90_001, [1, 0, 0, 0]);
     assert_eq!(
         take_codex_owed_gauge_for_test(),
-        BTreeMap::from([("count", 1)])
+        BTreeMap::from([("count", 1), ("le_30d", 1)])
     );
 }
 
