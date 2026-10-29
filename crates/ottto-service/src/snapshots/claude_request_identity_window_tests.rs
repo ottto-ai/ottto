@@ -622,14 +622,37 @@ fn sticky_individually_over_parts_bucket_preserves_joint_accepted_money_proof() 
     sticky_assert_joint_pair_survives(true);
 }
 
-
-#[test]
-fn sticky_byte_cap_keeps_collectively_fitting_accepted_pair_when_another_cannot_fit() {
+fn sticky_assert_collective_byte_pair(newer_bad: bool) {
+    let bad_hour = if newer_bad {
+        "2026-09-01T12:00:00Z"
+    } else {
+        "2026-09-01T09:00:00Z"
+    };
     let requests = [
         display_request(Some("max"), HOUR_10, 1, login_key(OWNER_A), Some(HOUR_10)),
         display_request(Some("max"), HOUR_11, 1, login_key(OWNER_A), Some(HOUR_11)),
-        display_request(Some("pro"), "2026-09-01T09:00:00Z", 1, login_key(OWNER_A), Some("2026-09-01T09:00:00Z")),
-        display_request(Some("pro"), "2026-09-01T09:00:00Z", 1, login_key(D64), Some("2026-09-01T09:00:00Z")),
+        display_request(
+            Some("pro"),
+            bad_hour,
+            1,
+            if newer_bad {
+                login_org('a', Some('c'), identity::TELEMETRY)
+            } else {
+                login_key(OWNER_A)
+            },
+            Some(bad_hour),
+        ),
+        display_request(
+            Some(if newer_bad { "team" } else { "pro" }),
+            bad_hour,
+            1,
+            if newer_bad {
+                login_org('d', Some('e'), identity::TELEMETRY)
+            } else {
+                login_key(D64)
+            },
+            Some(bad_hour),
+        ),
     ];
     let (mut item, timed) = display_item(&requests);
     item.collected_at = "2026-09-01T12:05:00Z".into();
@@ -658,13 +681,21 @@ fn sticky_byte_cap_keeps_collectively_fitting_accepted_pair_when_another_cannot_
         for share in shares.iter_mut().skip(kept) {
             share.identity = RequestIdentity::Missing;
         }
-        identity::apply_with_accepted_for_test(&mut candidate, &shares, &identity::AcceptedBuckets::default()).unwrap();
-        candidate.request_identity_refusals = if kept == 2 { 1 } else { 2 };
+        identity::apply_with_accepted_for_test(
+            &mut candidate,
+            &shares,
+            &identity::AcceptedBuckets::default(),
+        )
+        .unwrap();
+        candidate.request_identity_refusals = u64::from(newer_bad) + if kept == 2 { 1 } else { 2 };
         identity::item_bytes(&candidate) - base
     };
     let pair_extra = extra(2);
     let single_extra = extra(1);
-    assert!(pair_extra < single_extra, "the complete top row collapses to Single");
+    assert!(
+        pair_extra < single_extra,
+        "the complete top row collapses to Single"
+    );
     let headroom = (pair_extra + single_extra) / 2;
     let target = identity::MAX_ITEM_BYTES - headroom;
     let mut filler = clean.usage_buckets[0].model_usage[0].clone();
@@ -682,7 +713,9 @@ fn sticky_byte_cap_keeps_collectively_fitting_accepted_pair_when_another_cannot_
         candidate.request_count += count as u64;
         for hour in 0..count {
             candidate.usage_buckets.push(SnapshotUsageBucket {
-                bucket_start: (start + time::Duration::hours(hour as i64)).format(&Rfc3339).unwrap(),
+                bucket_start: (start + time::Duration::hours(hour as i64))
+                    .format(&Rfc3339)
+                    .unwrap(),
                 model_usage: vec![filler.clone()],
                 first_activity_at: None,
                 last_activity_at: None,
@@ -703,7 +736,11 @@ fn sticky_byte_cap_keeps_collectively_fitting_accepted_pair_when_another_cannot_
     }
     let mut padded = with_fillers(low);
     let mut gap = target - identity::item_bytes(&padded);
-    for label in [&mut padded.session_display_name, &mut padded.workspace_display_label, &mut padded.repository_label] {
+    for label in [
+        &mut padded.session_display_name,
+        &mut padded.workspace_display_label,
+        &mut padded.repository_label,
+    ] {
         let take = gap.min(254);
         label.as_mut().unwrap().push_str(&"x".repeat(take));
         gap -= take;
@@ -721,10 +758,25 @@ fn sticky_byte_cap_keeps_collectively_fitting_accepted_pair_when_another_cannot_
         });
     }
     identity::apply_with_accepted_for_test(&mut padded, &proof, &accepted).unwrap();
-    // The item orders buckets by start, so the independent 09:00 bucket is first.
-    assert!(!sticky_tagged(&padded.usage_buckets[0].model_usage[0]));
-    assert!(sticky_tagged(&padded.usage_buckets[1].model_usage[0]));
-    assert!(sticky_tagged(&padded.usage_buckets[2].model_usage[0]));
-    assert_eq!(padded.request_identity_refusals, 1);
+    let bad_index = if newer_bad { 2 } else { 0 };
+    for (index, bucket) in padded.usage_buckets.iter().take(3).enumerate() {
+        assert!(bucket
+            .model_usage
+            .iter()
+            .all(|row| sticky_tagged(row) == (index != bad_index)));
+    }
+    assert_eq!(
+        padded.request_identity_refusals,
+        if newer_bad { 2 } else { 1 }
+    );
     sticky_assert_reconciled(&padded);
+}
+
+#[test]
+fn sticky_byte_cap_keeps_joint_accepted_pair_when_an_older_bucket_cannot_fit() {
+    sticky_assert_collective_byte_pair(false);
+}
+#[test]
+fn sticky_byte_cap_keeps_joint_accepted_pair_when_open_bucket_metadata_cannot_fit() {
+    sticky_assert_collective_byte_pair(true);
 }

@@ -282,6 +282,14 @@ fn intrinsically_fits(item: &SnapshotItem, grouping: &Grouping, index: usize, ba
             .iter()
             .map(AuthorityKey::evidence)
             .collect::<BTreeSet<_>>();
+        total.bytes += evidence_bytes(&evidence, 0)?;
+        total.bytes += evidence
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                total.references.get(key).copied().unwrap_or(0) * (index.to_string().len() - 1)
+            })
+            .sum::<usize>();
         (keys.len() <= MAX_AUTHORITY_KEYS && evidence.len() <= MAX_EVIDENCE_ENTRIES)
             .then_some(total)
     };
