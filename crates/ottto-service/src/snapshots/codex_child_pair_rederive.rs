@@ -1,5 +1,5 @@
 //! One-time, bounded validation of pre-#896 cached child creator evidence.
-//! This metadata selects an existing audit; it never supplies account evidence.
+//! This metadata selects a counted native Full; it never supplies account evidence.
 use super::*;
 
 #[cfg(unix)]
@@ -85,8 +85,8 @@ pub(super) fn eligible(acc: &SnapshotAccumulator, metadata: &CodexTitleMetadata)
             || (depth_two && acc.codex_creator_evidence.is_none()))
 }
 
-/// Collect metadata first, sum INDEX sizes, then stage the existing per-key
-/// audits. No transcript is opened by the selector. Over-budget stages none.
+/// Collect metadata first, sum INDEX sizes, then mark the approved per-key
+/// repair cause. This never stages AuditDebt or opens a transcript.
 #[cfg(unix)]
 pub(super) fn stage(
     index: &mut ScanIndex,
@@ -137,28 +137,22 @@ pub(super) fn stage(
     }
     let now = sampled_scan::now_seconds();
     for key in keys {
-        let entry = &index.files[&key];
-        let previous_due = entry.unverified_deadline();
-        let fingerprint = entry.source_file_fingerprint.clone();
-        if index.stage_sampled_audit(
-            &key,
-            &fingerprint,
-            crate::transcript_acquisition::AuditDebt {
-                due_unix_seconds: now,
-            },
-        ) {
-            index
-                .files
-                .get_mut(&key)
-                .expect("staged entry")
-                .codex_child_pair_rederive = Some(Stamp::Pending {
-                attempts: 0,
-                retry_after: now,
-                running: false,
-                previous_due,
-            });
-        }
+        let entry = index.files.get_mut(&key).expect("selected entry");
+        entry.codex_child_pair_rederive = Some(Stamp::Pending {
+            attempts: 0,
+            retry_after: now,
+            running: false,
+            previous_due: entry.unverified_deadline(),
+        });
     }
+}
+
+pub(super) fn pending(index: &ScanIndex, key: &str) -> bool {
+    index.files.get(key).is_some_and(pending_entry)
+}
+
+pub(super) fn pending_entry(entry: &ScanIndexEntry) -> bool {
+    matches!(entry.codex_child_pair_rederive, Some(Stamp::Pending { .. }))
 }
 
 pub(super) fn waiting(entry: &ScanIndexEntry, now: u64) -> bool {
@@ -194,14 +188,11 @@ fn retire(index: &mut ScanIndex, key: &str, stamp: Stamp) -> bool {
     let Some(entry) = index.files.get_mut(key) else {
         return false;
     };
-    let Some(Stamp::Pending { previous_due, .. }) = entry.codex_child_pair_rederive else {
+    if !matches!(entry.codex_child_pair_rederive, Some(Stamp::Pending { .. })) {
         return false;
-    };
-    if let Some(due) = previous_due {
-        entry.set_unverified_deadline(due);
-    } else {
-        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
     }
+    // The repair owns no audit debt. Failure must not clear or reschedule
+    // the independent marker, including debt staged while this read ran.
     entry.codex_child_pair_rederive = Some(stamp);
     true
 }
@@ -290,15 +281,8 @@ pub(super) fn outcome_slot(stamp: Stamp) -> Option<usize> {
     }
 }
 
-/// Called only when native code stages a separate audit while repair is owed.
-pub(super) fn independent_debt(entry: &mut ScanIndexEntry, due: u64) {
-    if let Some(Stamp::Pending { previous_due, .. }) = entry.codex_child_pair_rederive.as_mut() {
-        *previous_due = Some(previous_due.map_or(due, |old| old.min(due)));
-    }
-}
-
 /// A retry delay belongs only to this repair. Compare the ordinary selector
-/// with its marker temporarily removed; every other cause keeps its priority.
+/// ignoring only its Pending marker; every other cause keeps its priority.
 fn ordinary_decision(index: &ScanIndex, candidate: &CandidateFile) -> CandidateDecision {
     index
         .candidate_decision_with_repair_gate(candidate, sampled_scan::now_seconds(), true, true)

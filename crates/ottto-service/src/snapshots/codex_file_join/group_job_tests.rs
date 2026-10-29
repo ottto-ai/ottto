@@ -3571,14 +3571,6 @@ fn child_pair_repair_group_checks_identified_members_and_honors_backoff_and_grow
         assert_eq!(initial.snapshots.len(), 2, "settled native group premise");
         for path in std::iter::once(&a).chain(both_pending.then_some(&b)) {
             let key = local_index_key(path);
-            let fp = index.files[&key].source_file_fingerprint.clone();
-            assert!(index.stage_sampled_audit(
-                &key,
-                &fp,
-                crate::transcript_acquisition::AuditDebt {
-                    due_unix_seconds: 100
-                }
-            ));
             index.files.get_mut(&key).unwrap().codex_child_pair_rederive = Some(Stamp::Pending {
                 attempts: 1,
                 retry_after: 108,

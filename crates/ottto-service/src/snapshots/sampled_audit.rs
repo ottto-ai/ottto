@@ -146,7 +146,6 @@ impl ScanIndex {
         else {
             return false;
         };
-        codex_child_pair_rederive::independent_debt(entry, debt.due_unix_seconds);
         let due = entry
             .unverified_deadline()
             .map_or(debt.due_unix_seconds, |old| old.min(debt.due_unix_seconds));
@@ -215,9 +214,9 @@ pub(super) fn path_requires_verification(
     files: &BTreeMap<String, ScanIndexEntry>,
     path: &Path,
 ) -> bool {
-    files
-        .get(&local_index_key(path))
-        .is_some_and(ScanIndexEntry::has_unverified_source)
+    files.get(&local_index_key(path)).is_some_and(|entry| {
+        entry.has_unverified_source() || codex_child_pair_rederive::pending_entry(entry)
+    })
 }
 
 pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {

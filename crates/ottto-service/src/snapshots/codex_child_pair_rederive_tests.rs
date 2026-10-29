@@ -156,7 +156,34 @@ impl Fixture {
         );
         scan.codex_title_metadata.spawn_parents = metadata.spawn_parents.clone();
         if let Some(cache) = cache {
+            let audit_versions = scan
+                .index
+                .files
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.scan_identity_version.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let pending_audits = scan
+                .index
+                .files
+                .values()
+                .filter(|entry| entry.has_unverified_source())
+                .count();
             scan = scan.with_sampled_acquisition(cache, Scope(NAMESPACE.into()));
+            let context = scan.sampling.as_ref().unwrap();
+            assert_eq!(
+                context.audit_slots,
+                crate::transcript_cache::CACHE_ENTRIES.saturating_sub(pending_audits)
+            );
+            assert_eq!(
+                context.audit_metadata_supported,
+                pending_audits <= crate::transcript_cache::CACHE_ENTRIES
+            );
+            for (key, version) in audit_versions {
+                assert_eq!(
+                    scan.index.files[&key].scan_identity_version, version,
+                    "repair cannot create or reschedule audit debt"
+                );
+            }
         }
         let ((index, result), reads) = terminal_contract_retry::source_acquisitions(|| loop {
             if let Some(active) = scan.active_file.as_deref() {
@@ -172,9 +199,9 @@ impl Fixture {
                         active
                             .sampling
                             .as_ref()
-                            .expect("repair uses acquisition plan")
+                            .expect("repair uses cold native acquisition plan")
                             .mode,
-                        ReadMode::Full(FullReason::AuditDue)
+                        ReadMode::Full(FullReason::StateMissing)
                     );
                 }
             }
@@ -303,7 +330,16 @@ fn codex_child_pair_named_conflict_incomplete_read_once_then_two_restarts() {
         fixture.seed(&index, kind != "depth2", kind == "depth2");
         let cache = fixture.cache();
         assert!(cache.durable_child_pair_candidate(&key, &index, &metadata));
-        let (mut index, repaired, reads) = fixture.run(index, Some(cache.clone()), &metadata);
+        let ((mut index, repaired, reads), diagnostics) =
+            crate::local_resource_diagnostics::capture(|| {
+                fixture.run(index, Some(cache.clone()), &metadata)
+            });
+        assert_audit_counts(&diagnostics, [0, 0, 0]);
+        let reason_lines = take_codex_parse_reason_lines_for_test();
+        assert!(!reason_lines.is_empty());
+        assert!(reason_lines
+            .iter()
+            .all(|line| line.contains("comparison_target=0")));
         assert_eq!(reads, 1, "{kind}");
         assert_eq!(
             index.files[&key].codex_child_pair_rederive,
@@ -414,13 +450,13 @@ fn codex_child_pair_three_retries_then_unreadable_preserve_independent_debt() {
         let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
         let key = local_index_key(&fixture.path);
         let fp = index.files[&key].source_file_fingerprint.clone();
-        assert!(index.stage_sampled_audit(
-            &key,
-            &fp,
-            crate::transcript_acquisition::AuditDebt {
-                due_unix_seconds: 100
-            }
-        ));
+        if let Some(due_unix_seconds) = previous_due {
+            assert!(index.stage_sampled_audit(
+                &key,
+                &fp,
+                crate::transcript_acquisition::AuditDebt { due_unix_seconds },
+            ));
+        }
         index.files.get_mut(&key).unwrap().codex_child_pair_rederive = Some(Stamp::Pending {
             attempts: 0,
             retry_after: 100,
@@ -515,11 +551,6 @@ fn codex_child_pair_unknown_marker_is_fail_closed_and_partial_save_carries_credi
         running: true,
         previous_due: None,
     });
-    previous
-        .files
-        .get_mut(&key)
-        .unwrap()
-        .set_unverified_deadline(100);
     let mut working = previous.clone();
     assert!(retire(&mut working, &key, Stamp::Incomplete));
     let subset = working.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
@@ -856,4 +887,184 @@ fn codex_child_pair_old_positional_entry_keeps_nondefault_tail_neighbors() {
     assert_eq!(current.opened_changed_nanos, 111);
     assert_eq!(current.opened_birth_nanos, 222);
     assert!(current.codex_child_pair_rederive.is_none());
+}
+
+fn assert_audit_counts(rows: &[Value], expected: [u64; 3]) {
+    let pages = rows
+        .iter()
+        .filter(|row| row["stage"] == "native_collection_page")
+        .collect::<Vec<_>>();
+    assert!(!pages.is_empty(), "actual diagnostic emission required");
+    let mut totals = [0; 3];
+    for row in pages {
+        let events = &row["counts"]["sampled_acquisition"]["page_events"];
+        totals[0] += events["full_reasons"]["audit_due"].as_u64().unwrap_or(0);
+        totals[1] += events["audits_started"].as_u64().unwrap();
+        totals[2] += events["audits_completed"].as_u64().unwrap();
+        if expected == [0; 3] {
+            assert_eq!(
+                events["full_reasons"],
+                json!({}),
+                "repair has only the codex_child_pair_rederive cause tally"
+            );
+        }
+    }
+    assert_eq!(totals, expected);
+}
+
+#[test]
+fn codex_child_pair_verified_full_discharges_existing_debt_without_audit_tally() {
+    for due in [7, u64::MAX] {
+        let fixture = Fixture::new("named");
+        let metadata = CodexTitleMetadata::default();
+        let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+        let key = local_index_key(&fixture.path);
+        let fp = index.files[&key].source_file_fingerprint.clone();
+        assert!(index.stage_sampled_audit(
+            &key,
+            &fp,
+            crate::transcript_acquisition::AuditDebt {
+                due_unix_seconds: due
+            }
+        ));
+        fixture.seed(&index, true, false);
+        let cache = fixture.cache();
+        let ((index, _, reads), rows) = crate::local_resource_diagnostics::capture(|| {
+            fixture.run(index, Some(cache.clone()), &metadata)
+        });
+        assert_eq!(reads, 1);
+        assert_eq!(
+            index.files[&key].codex_child_pair_rederive,
+            Some(Stamp::Named)
+        );
+        assert!(
+            !index.files[&key].has_unverified_source(),
+            "real verified Full discharges existing debt"
+        );
+        assert_audit_counts(&rows, [0; 3]);
+        assert_eq!(
+            cache
+                .durable_counters(SnapshotSource::Codex)
+                .unwrap()
+                .0
+                .codex_child_pair_rederive[2],
+            1
+        );
+    }
+}
+
+#[test]
+fn codex_child_pair_failed_full_keeps_existing_debt_without_audit_tally() {
+    let fixture = Fixture::new("named");
+    let metadata = CodexTitleMetadata::default();
+    let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+    let key = local_index_key(&fixture.path);
+    let fp = index.files[&key].source_file_fingerprint.clone();
+    assert!(index.stage_sampled_audit(
+        &key,
+        &fp,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: 7
+        }
+    ));
+    fixture.seed(&index, true, false);
+    let faults = std::cell::Cell::new(0);
+    let ((index, _, _), rows) = crate::local_resource_diagnostics::capture(|| {
+        fixture.run_inner(index, Some(fixture.cache()), &metadata, Some(&faults))
+    });
+    assert_eq!(faults.get(), 1);
+    assert_eq!(index.files[&key].unverified_deadline(), Some(7));
+    assert_audit_counts(&rows, [0; 3]);
+}
+
+#[test]
+fn codex_child_pair_other_due_audit_starts_same_pass_with_all_audit_slots_reserved() {
+    let fixture = Fixture::new("named");
+    let other = fixture
+        .root
+        .join(format!("rollout-2026-10-07T10-00-00-{PARENT}.jsonl"));
+    let mut rows = fs::read_to_string(&fixture.path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    rows[0]["payload"]["id"] = json!(PARENT);
+    rows[0]["payload"]["session_id"] = json!(PARENT);
+    rows[0]["payload"]["source"] = json!("cli");
+    rows[0]["payload"]["thread_source"] = json!("cli");
+    for field in [
+        "forked_from_id",
+        "history_mode",
+        "subagent_history_start_ordinal",
+    ] {
+        rows[0]["payload"].as_object_mut().unwrap().remove(field);
+    }
+    fs::write(
+        &other,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let metadata = CodexTitleMetadata::default();
+    let (mut index, _, _) = fixture.run(ScanIndex::default(), None, &metadata);
+    let key = local_index_key(&fixture.path);
+    let other_key = local_index_key(&other);
+    let other_fp = index.files[&other_key].source_file_fingerprint.clone();
+    assert!(index.stage_sampled_audit(
+        &other_key,
+        &other_fp,
+        crate::transcript_acquisition::AuditDebt {
+            due_unix_seconds: 7
+        }
+    ));
+    // Fill the existing audit metadata capacity. A repair-created debt would
+    // exceed it and disable audit metadata; marker-only repair consumes none.
+    for n in 1..crate::transcript_cache::CACHE_ENTRIES {
+        let mut future = index.files[&key].clone();
+        future.set_unverified_deadline(sampled_scan::now_seconds() + 3600);
+        index
+            .files
+            .insert(format!("synthetic-absent-audit-{n}"), future);
+    }
+    fixture.seed(&index, true, false);
+    let cache = fixture.cache();
+    let ((index, result, reads), diagnostics) = crate::local_resource_diagnostics::capture(|| {
+        fixture.run(index, Some(cache.clone()), &metadata)
+    });
+    assert_eq!(reads, 1);
+    assert_eq!(
+        index.files[&key].codex_child_pair_rederive,
+        Some(Stamp::Named)
+    );
+    assert!(
+        !index.files[&other_key].has_unverified_source(),
+        "other due file completed on schedule"
+    );
+    assert_eq!(
+        result.scanned_file_count, 2,
+        "both physical files read in this pass"
+    );
+    assert_audit_counts(&diagnostics, [1, 1, 1]);
+    let page = diagnostics
+        .iter()
+        .find(|row| row["stage"] == "native_collection_page")
+        .unwrap();
+    let admission = &page["counts"]["sampled_acquisition"]["acquisition_admission"];
+    assert_eq!(
+        admission["audit_slot_available"],
+        json!({"assessed":1,"matched":0})
+    );
+    assert_eq!(
+        admission["audit_metadata_supported"],
+        json!({"assessed":1,"matched":1})
+    );
+    assert_eq!(
+        cache
+            .durable_counters(SnapshotSource::Codex)
+            .unwrap()
+            .0
+            .codex_child_pair_rederive[0],
+        1
+    );
 }

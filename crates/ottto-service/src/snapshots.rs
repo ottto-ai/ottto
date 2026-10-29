@@ -28341,11 +28341,16 @@ impl OwnedSourceScan {
                         }
                     }
                     let acquisition = active.sampling.as_mut().expect("sampled acquisition");
-                    let debt = sampled_audit::debt_for_key(
-                        index,
-                        &acquisition.key,
-                        sampled_scan::now_seconds(),
-                    );
+                    let repair = codex_child_pair_rederive::pending(index, &acquisition.key);
+                    let debt = (!repair)
+                        .then(|| {
+                            sampled_audit::debt_for_key(
+                                index,
+                                &acquisition.key,
+                                sampled_scan::now_seconds(),
+                            )
+                        })
+                        .flatten();
                     let Ok(mode) = parser.prepare_acquisition(
                         None,
                         &acquisition.scope,
@@ -28358,7 +28363,11 @@ impl OwnedSourceScan {
                     acquisition.mode = mode;
                     if let Some(context) = sampling.as_mut() {
                         context.priority_replays += 1;
-                        context.record_mode(mode, acquisition.audit_due);
+                        if repair {
+                            context.full_files += 1;
+                        } else {
+                            context.record_mode(mode, acquisition.audit_due);
+                        }
                     }
                     active.parser = parser;
                     active.charged_bytes = 0;
@@ -30139,7 +30148,7 @@ impl OwnedSourceScan {
                     && file_sampling
                         .as_ref()
                         .is_some_and(|active| active.audit_due.is_some());
-                if sampled_audit_verified {
+                if sampled_audit_verified && repair_stamp.is_none() {
                     if let Some(context) = sampling.as_mut() {
                         context.complete_audit(
                             file_sampling
@@ -30247,7 +30256,9 @@ impl OwnedSourceScan {
                             .files
                             .get(&key)
                             .and_then(ScanIndexEntry::unverified_deadline);
+                        let repair_member = codex_child_pair_rederive::pending(index, &key);
                         let staged = !source_verified
+                            && !repair_member
                             && due.is_some_and(|due_unix_seconds| {
                                 index.stage_sampled_audit(
                                     &key,
@@ -30255,9 +30266,11 @@ impl OwnedSourceScan {
                                     crate::transcript_acquisition::AuditDebt { due_unix_seconds },
                                 )
                             });
-                        debug_assert!(staged || source_verified || due.is_none());
+                        debug_assert!(staged || source_verified || due.is_none() || repair_member);
                         if let Some(context) = sampling.as_mut() {
-                            if let Some(owed) = marked.or(due).filter(|_| source_verified) {
+                            if let Some(owed) = marked.or(due).filter(|_| {
+                                source_verified && !codex_child_pair_rederive::pending(index, &key)
+                            }) {
                                 context.complete_audit(owed);
                             }
                             #[cfg(unix)]
@@ -30321,10 +30334,10 @@ impl OwnedSourceScan {
                     } else if source_verified {
                         index.complete_full_audit(&index_key, &source_file_fingerprint);
                         // A re-probed singleton due retires like a captured one, once.
-                        if let Some((context, due)) = sampling
-                            .as_mut()
-                            .zip(reprobed_due.filter(|_| !sampled_audit_verified))
-                        {
+                        if let Some((context, due)) = sampling.as_mut().zip(
+                            reprobed_due
+                                .filter(|_| !sampled_audit_verified && repair_stamp.is_none()),
+                        ) {
                             context.complete_audit(due);
                         }
                     }
@@ -30353,14 +30366,19 @@ impl OwnedSourceScan {
                             );
                         }
                     }
-                    if let Some(fragment) = cursor_fragment {
+                    if let Some(fragment) = cursor_fragment.filter(|_| repair_stamp.is_none()) {
                         index.stage_sampled_audit(
                             &index_key,
                             &source_file_fingerprint,
                             fragment.debt,
                         );
                     }
-                    if let Some(completed) = completed_acquisition {
+                    // A long/grown repair may produce an unverified prefix
+                    // certificate. It cannot introduce future audit debt via
+                    // a retained checkpoint after the index gate above.
+                    if let Some(completed) = completed_acquisition.filter(|completed| {
+                        repair_stamp.is_none() || completed.checkpoint.audit_debt().is_none()
+                    }) {
                         if let Some(context) = sampling.as_ref() {
                             // A clone allocates exactly its length, and is the
                             // sampled key: R0's insert term assumes both.
@@ -31748,7 +31766,9 @@ impl OwnedSourceScan {
                     }
                 }
             }
-            if source == SnapshotSource::Codex {
+            if source == SnapshotSource::Codex
+                && !codex_child_pair_rederive::pending(index, &repair_key)
+            {
                 census.note_codex_selection(decision, parse_reason, codex_selected_by);
             }
             // A parse of a carried family's member cancels that family's
@@ -32043,7 +32063,9 @@ impl OwnedSourceScan {
                 let extent = opened_file.metadata().map_or(0, |metadata| metadata.len());
                 // U1a-2a G4a: a side read is a full read with no retained
                 // state, and 2a reads only a singleton (otherwise main's Skip).
-                let expected = if side_plan.is_some() {
+                let expected = if side_plan.is_some()
+                    || codex_child_pair_rederive::pending(index, &key)
+                {
                     extent
                 } else {
                     extent.saturating_sub(context.cache.retained_sealed_offset(&key).unwrap_or(0))
@@ -32274,6 +32296,72 @@ impl OwnedSourceScan {
                         }
                         pending!();
                     }
+                }
+            } else if source == SnapshotSource::Codex
+                && codex_child_pair_rederive::pending(index, &repair_key)
+            {
+                if let Some(context) = sampling.as_mut() {
+                    let dependency = sampled_scan::reduction_dependencies(
+                        source,
+                        &candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                    );
+                    let Some(dependency) = dependency else {
+                        census.record_unreadable(UnreadableCause::Reduction, 1);
+                        pending!();
+                    };
+                    let scope = context.file_scope(
+                        source,
+                        &candidate,
+                        &dependency,
+                        true,
+                        context_curve_enabled,
+                        index,
+                    );
+                    // Pending is the cause tag. A cold native Full owns no
+                    // AuditDebt and bypasses cache restore/rearm/audit slots.
+                    #[cfg(unix)]
+                    context
+                        .cache
+                        .durable_note_scope(source, &repair_key, &scope);
+                    let mode = match parser.prepare_acquisition(
+                        None,
+                        &scope,
+                        None,
+                        sampled_scan::now_seconds(),
+                    ) {
+                        Ok(mode) => mode,
+                        Err(_) => {
+                            if codex_child_pair_rederive::begin(
+                                index,
+                                &repair_key,
+                                sampled_scan::now_seconds(),
+                            ) && codex_child_pair_rederive::failed(
+                                index,
+                                &repair_key,
+                                sampled_scan::now_seconds(),
+                            ) {
+                                #[cfg(unix)]
+                                context.cache.durable_child_pair_count(5, 1);
+                            }
+                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                            pending!();
+                        }
+                    };
+                    sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
+                    planned_mode = Some((mode, None));
+                    file_sampling = Some(sampled_scan::Active {
+                        key: repair_key.clone(),
+                        scope,
+                        mode,
+                        audit_due: None,
+                        retained_hint: None,
+                        retained_finalization_charge: 0,
+                        retained_usage: None,
+                        reinsertion: Default::default(),
+                    });
                 }
             } else if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
@@ -32836,7 +32924,13 @@ impl OwnedSourceScan {
                 }
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
-                context.record_mode(mode, audit_due);
+                if codex_child_pair_rederive::pending(index, &repair_key) {
+                    // Physical Full totals remain truthful. Its cause is counted
+                    // ONLY by codex_child_pair_rederive, not the audit tally.
+                    context.full_files += 1;
+                } else {
+                    context.record_mode(mode, audit_due);
+                }
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
@@ -49102,16 +49196,11 @@ impl ScanIndex {
                 return (CandidateDecision::Skip, None);
             }
         }
-        let repair_only = ignore_child_repair
-            && matches!(
-                entry.codex_child_pair_rederive,
-                Some(codex_child_pair_rederive::Stamp::Pending {
-                    previous_due: None,
-                    ..
-                })
-            );
-        if (!repair_only && entry.audit_requires_full(now))
-            || sampled_audit::progress_debt(self, &key, now).is_some()
+        if !ignore_child_repair && codex_child_pair_rederive::pending_entry(entry) {
+            // The persisted repair marker is its selection cause, never Audit.
+            return (CandidateDecision::Parse, None);
+        }
+        if entry.audit_requires_full(now) || sampled_audit::progress_debt(self, &key, now).is_some()
         {
             return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }

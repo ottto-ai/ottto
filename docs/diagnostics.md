@@ -1108,9 +1108,13 @@ their summed **index-recorded source size in bytes**, measured before staging
 any reads. They are process-lifetime totals; persisted pending/terminal markers
 prevent recounting admitted entries. They are not actual I/O bytes. If the
 population or its accumulated budget exceeds 5,000,000,000 bytes, that cohort
-stages no repair audits and repair admission stops for the process, requiring
-an operator decision. Actual transcript bytes and Full(AuditDue)
-attempts remain in the existing acquisition counters. The four outcome columns
+stages no repairs and repair admission stops for the process, requiring
+an operator decision. Repair causes count only here, never as `audit_due`,
+`audits_started` or `audits_completed`. The approved per-entry marker selects
+an existing cold native Full directly, without creating AuditDebt, changing
+independent audit deadlines or reserving audit slots. General physical Full
+and byte totals still include the real work. A verified Full may discharge
+existing independent debt; an unsuccessful repair leaves that debt intact. The four outcome columns
 are process-lifetime terminal-entry counts. Retries do not increment outcomes;
 I/O failures get at most three delayed retries after the initial attempt.
 
