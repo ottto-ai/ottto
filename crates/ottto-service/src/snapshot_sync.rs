@@ -15318,7 +15318,7 @@ mod tests {
     }
 
     #[test]
-    fn account_change_counter_updates_only_for_stored_body_acks() {
+    fn account_change_baseline_updates_only_for_stored_body_acks() {
         use crate::local_resource_diagnostics::{capture, source_finish};
         use serde_json::{json, Value};
         let mut progress = test_upload_progress();
