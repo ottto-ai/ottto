@@ -813,7 +813,7 @@ impl TransitionDriver for Codex24b {
             result.io.rederive_named = counters.rederive_line_bytes;
         }
         result.codex_evidence = json!({
-            "receipts": index.files.iter().map(|(k,e)| (k.clone(), json!({
+            "TierReplay": index.files.iter().map(|(k,e)| (k.clone(), json!({
                 "applied":e.codex_applied_tier_receipt,
                 "required":e.codex_applied_tier_receipt_required,
                 "captured":e.codex_captured_tier_receipt,
