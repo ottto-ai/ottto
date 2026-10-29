@@ -15154,13 +15154,20 @@ fn deferred_custody_saves_decision_before_frozen_continuation_and_restart() {
 }
 
 fn deferred_group_fixture(prior: bool) -> (ScanRoot, ScanIndex, Arc<SharedCache>, PathBuf) {
-    deferred_group_fixture_with_loss(prior, false)
+    let (f, i, c, h, _) = deferred_group_fixture_with_loss(prior, false);
+    (f, i, c, h)
 }
 
 fn deferred_group_fixture_with_loss(
     prior: bool,
     loss: bool,
-) -> (ScanRoot, ScanIndex, Arc<SharedCache>, PathBuf) {
+) -> (
+    ScanRoot,
+    ScanIndex,
+    Arc<SharedCache>,
+    PathBuf,
+    Option<SnapshotItem>,
+) {
     use crate::snapshots::codex_file_join::tests::usage;
     fn chain(created: &str, start: u64, count: u64) -> Vec<u8> {
         let mut bytes = codex_line(json!({"type":"session_meta", "timestamp":created,
@@ -15182,6 +15189,7 @@ fn deferred_group_fixture_with_loss(
     let key = local_index_key(&path);
     let cache = Arc::new(SharedCache::default());
     let mut index = ScanIndex::default();
+    let mut prior_body = None;
     if prior {
         fs::write(&path, chain("2026-10-07T10:00:00Z", 0, 1)).unwrap();
         let (next, seed, _) = page_selections(
@@ -15194,6 +15202,7 @@ fn deferred_group_fixture_with_loss(
             usize::MAX,
         );
         index = next;
+        prior_body = seed.snapshots.first().cloned();
         assert!(!seed.snapshots.is_empty());
         assert!(index.files[&key].last_snapshot_fingerprint.is_some());
         assert!(cache.retained_checkpoint(&key).is_some());
@@ -15247,7 +15256,7 @@ fn deferred_group_fixture_with_loss(
     } else {
         assert!(!index.files.contains_key(&key));
     }
-    (fixture, index, cache, held)
+    (fixture, index, cache, held, prior_body)
 }
 
 #[test]
@@ -16228,7 +16237,7 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
     }
     for loss in [false, true] {
         with_test_limits(2048, 1024, 64, || {
-            let (fixture, mut index, cache, held) = deferred_group_fixture_with_loss(true, loss);
+            let (fixture, mut index, cache, held, _) = deferred_group_fixture_with_loss(true, loss);
             let key = local_index_key(&held);
             let plain = local_index_key(&fixture.file(SESSION));
             // Independent main-equivalent, unheld native union over the SAME files.
@@ -16374,4 +16383,297 @@ fn deferred_custody_group_money_main_pass_and_withhold_then_quiet_restart() {
             assert!(index.files[&key].codex_compressed_hold.is_some());
         });
     }
+
+    // A same-owner newcomer is membership evidence even while excluded from reads.
+    for persisted_header_skip in [false, true] {
+        with_test_limits(2048, 1024, 64, || {
+            let (fixture, mut index, cache, held, prior_body) =
+                deferred_group_fixture_with_loss(true, false);
+            let plain_path = fixture.file(SESSION);
+            let plain = local_index_key(&plain_path);
+            let prior = index.files[&plain].clone();
+            let prior_body = prior_body.expect("native accepted seed money");
+            let accepted = Accepted {
+                body: serde_json::to_value(&prior_body).unwrap(),
+                witness: format!("{:?}", prior.last_upload_body_witness.as_ref().unwrap()),
+            };
+            let mut prior_money = route(&[prior_body], &index, Mode::Ram);
+            prior_money
+                .accepted
+                .insert(SESSION.into(), accepted.clone());
+            let prior_incidence = index.file_snapshot_fingerprints.get(&plain).cloned();
+            let newcomer = fixture.root.join("newcomer.jsonl");
+            let mut rows = codex_file_join::tests::member(SESSION, "new-response", 100, 700);
+            rows[0]["payload"]["timestamp"] = json!("2026-10-07T11:00:00Z");
+            fs::write(
+                &newcomer,
+                rows.iter()
+                    .map(|r| r.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let healthy = "ffffffff-1111-4111-8111-ffffffffffff";
+            let other = fixture.file(healthy);
+            let rows = codex_file_join::tests::member(healthy, "independent", 100, 100);
+            fs::write(
+                &other,
+                rows.iter()
+                    .map(|r| r.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let new_key = local_index_key(&newcomer);
+            let mut roster = cache.paused_members_for_test().unwrap();
+            roster.extend([new_key.clone(), local_index_key(&other)]);
+            index.traversal.as_mut().unwrap().codex_rollout_paths = roster.clone();
+            let mut dirs = codex_file_join::DirectoryCensus::new();
+            dirs.observe(&fixture.root, &fs::metadata(&fixture.root).unwrap());
+            let mut inventory = codex_file_join::HeaderInventory::new(
+                std::slice::from_ref(&fixture.root),
+                &roster,
+                Some(&dirs),
+            );
+            while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None) {}
+            let mut committed = index.clone();
+            index.hold_compressed(
+                &held,
+                BTreeSet::from([SESSION.into()]),
+                CodexZstCause::ParentLedgerUnbound,
+            );
+            while !inventory.prepare_custody(&index) {}
+            assert!(inventory
+                .headers
+                .iter()
+                .any(|h| h.candidate.path == newcomer && h.custody_cause.is_some()));
+            while !inventory.hold_custodied_siblings(&mut index) {}
+            assert!(index.codex_state_only_blocked_by_file[&new_key].contains(SESSION));
+            if persisted_header_skip {
+                // A later pass has no header at all for N; the roster still owes it.
+                inventory = codex_file_join::HeaderInventory::new(
+                    std::slice::from_ref(&fixture.root),
+                    &roster,
+                    Some(&dirs),
+                );
+                while !inventory.step_with_archive(&CodexTitleMetadata::default(), &mut index, None)
+                {
+                }
+                while !inventory.prepare_custody(&index) {}
+                assert!(inventory
+                    .headers
+                    .iter()
+                    .all(|h| h.candidate.path != newcomer));
+            }
+            let saved = fixture._dir.0.join("new-member-custody.json");
+            let mut holder = codex_scan(&fixture, index, NOW)
+                .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()));
+            holder
+                .persist_custody_decisions(&mut committed, &saved)
+                .unwrap();
+            let mut index = holder.index.clone();
+            let mut control = index.clone();
+            control
+                .traversal
+                .as_mut()
+                .unwrap()
+                .codex_rollout_paths
+                .remove(&new_key);
+            let mut old_inventory = inventory.clone();
+            old_inventory
+                .headers
+                .retain(|h| h.candidate.path != newcomer);
+            let check = |state: &ScanIndex, inv: &codex_file_join::HeaderInventory| {
+                cache
+                    .with_cursor(|cursor| {
+                        let Slot::Paused(job) = &mut cursor.slot else {
+                            panic!("same paused job");
+                        };
+                        assert!(job.cursor.as_ref().unwrap().custody_deferred.is_some());
+                        assert_eq!(job.group.as_ref().unwrap().scope, group_scope(state));
+                        let counting = job_counting_view(job, state);
+                        revalidate(
+                            job,
+                            ResumeInputs {
+                                codex: &CodexTitleMetadata::default(),
+                                claude: &ClaudeTitleMetadata::default(),
+                                support: None,
+                                traces: None,
+                                parents: None,
+                                inventory: Some(inv),
+                                scope: None,
+                                counting,
+                                group_scope: group_scope(state),
+                                census_complete: true,
+                                custody: Some(state),
+                            },
+                        )
+                    })
+                    .unwrap()
+            };
+            assert!(
+                matches!(check(&control, &old_inventory), Resume::Valid),
+                "no-new-member control"
+            );
+            assert!(
+                matches!(check(&index, &inventory), Resume::Changed),
+                "held N is extra membership"
+            );
+            let (cold_index, cold_output) = page(&fixture, ScanIndex::default(), None);
+            let cold = route(&cold_output.snapshots, &cold_index, Mode::ColdFull);
+            let started = counter(&cache, |c| c.jobs_started);
+            let mut emitted = Vec::new();
+            for pass in 0..32 {
+                let (next, output, _) = codex_compressed_hold_tests::no_open(&plain_path, || {
+                    page_with(
+                        &fixture,
+                        index,
+                        Some(Arc::clone(&cache)),
+                        "cursor-fixture",
+                        NOW,
+                        |scan| {
+                            if pass == 0 {
+                                scan.codex_join_inventory = Some(inventory.clone());
+                                scan.codex_join_prepared = true;
+                            }
+                        },
+                    )
+                });
+                index = next;
+                assert!(output
+                    .snapshots
+                    .iter()
+                    .all(|i| i.source_session_id != SESSION));
+                emitted.extend(output.snapshots);
+                assert_eq!(index.files[&plain].size_bytes, prior.size_bytes);
+                assert_eq!(
+                    index.files[&plain].last_snapshot_fingerprint,
+                    prior.last_snapshot_fingerprint
+                );
+                assert_eq!(
+                    index.files[&plain].last_upload_body_witness,
+                    prior.last_upload_body_witness
+                );
+                assert_eq!(
+                    index.file_snapshot_fingerprints.get(&plain),
+                    prior_incidence.as_ref()
+                );
+                assert!(index.files[&new_key].codex_compressed_hold.is_some());
+                index.save(&saved).unwrap();
+                index = ScanIndex::load(&saved).unwrap();
+                index.traversal = None;
+            }
+            assert!(cache.cursor_slot_free());
+            assert!(
+                counter(&cache, |c| c.jobs_started) <= started + 1,
+                "only unrelated first acquisition may start"
+            );
+            assert_eq!(
+                emitted
+                    .iter()
+                    .filter(|i| i.source_session_id == healthy)
+                    .count(),
+                1
+            );
+            let mut actual = route(&emitted, &index, Mode::Restart);
+            actual.accepted.insert(SESSION.into(), accepted);
+            money_oracle::assert_no_smaller_reemit(SESSION, &prior_money, &actual, &cold, true);
+        });
+    }
+}
+
+#[test]
+fn custody_hold_counts_survive_worker_save_failure_once_across_threads() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    fn count(rows: &[Value]) -> u64 {
+        rows.iter()
+            .filter(|r| r["stage"] == "codex_zst_held")
+            .map(|r| {
+                r["counts"]["codex_zst_held"]["CompressedParentLedgerUnbound"]
+                    .as_u64()
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+    let (fixture, cache, mut committed, saved, rows) = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            with_test_limits(2048, 1024, 64, || {
+                let fixture = ScanRoot::new(80);
+                let path = fixture.file(SESSION);
+                let cache = Arc::new(SharedCache::default());
+                let (mut index, _) = paused_singleton(&fixture, &cache);
+                let saved = fixture._dir.0.join("thread-save.json");
+                index.save(&saved).unwrap();
+                let committed = index.clone();
+                let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                    index.hold_compressed(
+                        &path,
+                        BTreeSet::from([SESSION.into()]),
+                        CodexZstCause::ParentLedgerUnbound,
+                    );
+                    let mut stale = committed.clone();
+                    stale.generation += 1;
+                    let mut scan = codex_scan(&fixture, index, NOW).with_sampled_acquisition(
+                        Arc::clone(&cache),
+                        Scope("cursor-fixture".into()),
+                    );
+                    assert!(scan.persist_custody_decisions(&mut stale, &saved).is_err());
+                    drop(scan); // Refused source preparation exits this one-shot worker.
+                    assert!(cache.replay_custody_decision());
+                });
+                (fixture, cache, committed, saved, rows)
+            })
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(
+        count(&rows),
+        1,
+        "mint survives Pending/save refusal and worker exit exactly once"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["counts"]["codex_zst_held"]["CompressedParentLedgerUnbound"] == 1)
+            .count(),
+        1
+    );
+    let rows = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            with_test_limits(2048, 1024, 64, || {
+                let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                    let retry = codex_scan(&fixture, ScanIndex::load(&saved).unwrap(), NOW)
+                        .with_sampled_acquisition(
+                            Arc::clone(&cache),
+                            Scope("cursor-fixture".into()),
+                        );
+                    let OwnedSourceScanStep::Pending(mut retry) =
+                        codex_compressed_hold_tests::no_open(&fixture.file(SESSION), || {
+                            retry.step(None)
+                        })
+                    else {
+                        panic!("replay before any read");
+                    };
+                    retry
+                        .persist_custody_decisions(&mut committed, &saved)
+                        .unwrap();
+                    assert!(ScanIndex::load(&saved).unwrap().files
+                        [&local_index_key(&fixture.file(SESSION))]
+                        .codex_compressed_hold
+                        .is_some());
+                    drop(retry);
+                });
+                rows
+            })
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(
+        count(&rows),
+        0,
+        "a new worker retries durable debt without minting/counting it again"
+    );
 }

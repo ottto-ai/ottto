@@ -1338,6 +1338,11 @@ overwrite; backend authority rules independently govern successor acceptance.
 
 ### Deferred custody on a running Codex job
 
+`codex_zst_held` counts newly recorded causes and refusals per source attempt,
+including preparation/decoding, Pending, Refused, abandoned and Complete exits.
+Each drain clears the thread-local batch before emission; nested closeouts emit
+an event once. No count depends on a later successful scan or the worker's lifetime.
+
 `custody_latch_deferred` uses the existing counts-only `local_resources` carrier.
 `count` (also exposed as the compatibility alias `events`) is one per
 already-acquired job that first observes a new correctness custody decision.

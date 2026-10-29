@@ -166,6 +166,9 @@ impl HeaderWitness {
 }
 
 pub(super) fn member_home(root: &Path) -> PathBuf {
+    member_home_ref(root).to_path_buf()
+}
+pub(super) fn member_home_ref(root: &Path) -> &Path {
     root.ancestors()
         .find(|path| {
             matches!(
@@ -175,7 +178,6 @@ pub(super) fn member_home(root: &Path) -> PathBuf {
         })
         .and_then(Path::parent)
         .unwrap_or(root)
-        .to_path_buf()
 }
 // One bounded secure acquisition path; semantic inventory and sampled-scope
 // witnesses both use it. Only inventory performs native header decoding.

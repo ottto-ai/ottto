@@ -456,6 +456,7 @@ impl OwnedSourceScan {
         committed: &mut ScanIndex,
         path: &Path,
     ) -> Result<()> {
+        let _held_counts = crate::local_resource_diagnostics::CodexHeldScope;
         if self.source != SnapshotSource::Codex {
             return Ok(());
         }

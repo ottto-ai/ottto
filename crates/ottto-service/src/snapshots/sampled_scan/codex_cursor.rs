@@ -6400,19 +6400,57 @@ pub(in crate::snapshots) fn revalidate(
     }) else {
         return Resume::Unavailable;
     };
-    let members = inventory
-        .headers
-        .iter()
-        .filter(|header| {
-            Some(&header.owner) == meta.owner.as_ref()
-                && !inventory.member_held(&header.candidate.path)
-        })
-        .count();
-    if meta.owner.is_some() && members > 1 {
-        // A continuation appeared: the owner is now a group, never a singleton.
-        return Resume::Changed;
+    if let Some(owner) = meta.owner.as_ref() {
+        if inventory
+            .headers
+            .iter()
+            .any(|header| &header.owner == owner && header.candidate.path != job.candidate.path)
+        {
+            return Resume::Changed;
+        }
+        match held_roster_has_extra(inputs.custody, owner, None, |key| key == meta.key) {
+            Some(true) => return Resume::Changed,
+            None => return Resume::Unavailable,
+            Some(false) => {}
+        }
     }
     revalidate_decisions(job, inputs.traces, inputs.parents)
+}
+
+/// Negative membership evidence, independent of read/selection eligibility.
+/// One capped roster pass, borrowed keys/owners only; exhaustion grants no resume.
+fn held_roster_has_extra(
+    index: Option<&ScanIndex>,
+    owner: &str,
+    home: Option<&Path>,
+    is_boot: impl Fn(&str) -> bool,
+) -> Option<bool> {
+    let Some((index, traversal)) = index.and_then(|i| i.traversal.as_ref().map(|t| (i, t))) else {
+        return Some(false);
+    };
+    for (at, key) in traversal.codex_rollout_paths.iter().enumerate() {
+        if at == codex_file_join::MAX_HEADER_FILES {
+            return None;
+        }
+        if !is_boot(key)
+            && index
+                .files
+                .get(key)
+                .is_some_and(|e| e.codex_compressed_hold.is_some())
+            && index
+                .codex_state_only_blocked_by_file
+                .get(key)
+                .is_some_and(|owners| owners.contains(owner))
+            && home.is_none_or(|home| {
+                traversal
+                    .owning_scan_root(Path::new(key))
+                    .is_some_and(|root| codex_file_join::member_home_ref(root) == home)
+            })
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// The group subset of the revalidation checklist (P2): the member being
@@ -6476,15 +6514,25 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
     let mut current = inventory
         .headers
         .iter()
-        .filter(|header| {
-            header.owner == group.owner
-                && header.home == group.home
-                && !inventory.member_held(&header.candidate.path)
-        })
+        .filter(|header| header.owner == group.owner && header.home == group.home)
         .map(|header| local_index_key(&header.candidate.path))
         .collect::<BTreeSet<_>>();
-    // A held member is omitted by the new inventory. Only this existing job
-    // owns its boot header and frozen extent; new groups never use it.
+    let members = group
+        .members
+        .iter()
+        .map(|m| local_index_key(&m.path))
+        .collect::<BTreeSet<_>>();
+    if current.iter().any(|key| !members.contains(key)) {
+        return Resume::Changed;
+    }
+    match held_roster_has_extra(inputs.custody, &group.owner, Some(&group.home), |key| {
+        members.contains(key)
+    }) {
+        Some(true) => return Resume::Changed,
+        None => return Resume::Unavailable,
+        Some(false) => {}
+    }
+    // Restore omitted boot headers only after ruling out held newcomers.
     if let Some(index) = inputs.custody {
         current.extend(group.members.iter().filter_map(|member| {
             let key = local_index_key(&member.path);
@@ -6495,11 +6543,6 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
                 .then_some(key)
         }));
     }
-    let members = group
-        .members
-        .iter()
-        .map(|member| local_index_key(&member.path))
-        .collect::<BTreeSet<_>>();
     if current != members {
         // A member appeared or vanished: another job.
         return Resume::Changed;

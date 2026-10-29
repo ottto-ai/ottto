@@ -26535,6 +26535,7 @@ impl OwnedSourceScan {
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
+        let _held_counts = crate::local_resource_diagnostics::CodexHeldScope;
         let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
             source == SnapshotSource::ClaudeCode,
         );
@@ -27340,6 +27341,7 @@ impl OwnedSourceScan {
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
         capture_credit: Option<&mut Option<crate::source_rotation::PaidReservation>>,
     ) -> Result<OwnedSourceScanStep, crate::source_rotation::LocalRefusal> {
+        let _held_counts = crate::local_resource_diagnostics::CodexHeldScope;
         if self.source == SnapshotSource::Codex {
             if let Some(context) = self.sampling.as_ref() {
                 if context.cache.replay_custody_decision() {
@@ -31810,9 +31812,6 @@ impl OwnedSourceScan {
                             "groups_completed"
                         },
                     );
-                }
-                if source == SnapshotSource::Codex {
-                    crate::local_resource_diagnostics::flush_codex_zst_held();
                 }
                 let scan = SourceScanResult {
                     source,

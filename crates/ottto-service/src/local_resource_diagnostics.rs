@@ -189,6 +189,15 @@ pub(crate) fn flush_codex_zst_held() {
     });
 }
 
+/// Flush on every attempt exit, including refusal/unwind and a one-shot thread.
+/// Nested scopes are safe: draining replaces the batch before emitting it.
+pub(crate) struct CodexHeldScope;
+impl Drop for CodexHeldScope {
+    fn drop(&mut self) {
+        flush_codex_zst_held();
+    }
+}
+
 /// Nonzero-only counters on the existing native_collection_page line.
 #[derive(Default, Serialize)]
 struct ClaudeRecordCaps {
