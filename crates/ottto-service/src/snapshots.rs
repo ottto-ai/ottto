@@ -27678,26 +27678,6 @@ impl OwnedSourceScan {
                             codex_state_only_blocked_session_ids.insert(group.owner.clone());
                             continue;
                         }
-                        // A settled receipt removes only context read debt. Keep
-                        // every ordinary/recovery gate and let skipped members
-                        // follow the ordinary census accounting below.
-                        let member_set = codex_file_join::member_set_witness(&group.members);
-                        if index.file_upload_context_enabled
-                            && group.members.iter().all(|member| {
-                                let key = local_index_key(&member.path);
-                                index.files.get(&key).is_some_and(|entry| {
-                                    entry.upload_context_receipt.is_some()
-                                        && entry.codex_joined_member_set.as_deref()
-                                            == Some(member_set.as_str())
-                                }) && !index.file_upload_context_requires_adoption(&key)
-                                    && index.candidate_decision(member) == CandidateDecision::Skip
-                            })
-                        {
-                            for member in &group.members {
-                                grouped_paths.remove(&local_index_key(&member.path));
-                            }
-                            continue;
-                        }
                         // G1: a group whose attempt already ended in this
                         // generation is fenced at its pop (M-5 b) and reads
                         // nothing. Decide it here, so it takes no file

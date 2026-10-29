@@ -239,12 +239,18 @@ wire remainder and native read allowance. The alias fixture's previous expected
 sum counted both scanner aliases; transport deduplicates the fingerprint before
 POSTing one representative. Its counter assertion now uses bytes received by
 the fake transport. Resend entity classification remains once per cycle while
-wire bytes charge each actual POST attempt. Settled receipt groups take the normal
-candidate skip path so unchanged aliases stop reparsing on subsequent relists;
-ordinary recovery gates and protected census assertions remain intact. No local
+wire bytes charge each actual POST attempt. Quietness fixtures count actual parser acquisitions and actual POSTs rather than
+`scanned_file_count`: the existing `GroupBoot::Unchanged` branch counts identified
+alias members as scanned/semantic no-ops without constructing a body parser.
+The joined tier job constructs one canonical parser for its physical aliases;
+its parser-acquisition map is not a per-alias open counter. Production group
+ownership/census dispatch is retained, and protected assertions remain intact. No local
 Cargo tests; all-target wrapper clippy and Linux CI provide validation.
 
-Focused review also caught a settled-skip alias displacing an ordinary singleton
-beside an ordinary group. Disposable context/skip entries now leave first whenever
-receipt mode is active, preserving existing census preference within each class.
-A portable three-slot fixture covers that exact group/skip/singleton combination.
+Disposable context/skip entries leave first whenever receipt mode is active,
+preserving existing census preference within each class. A portable three-slot
+fixture also checks that a new singleton is read/POSTed when ordinary groups
+compete for slots; unchanged groups retain baseline metadata-witness admission.
+An attempted early receipt-group shortcut was removed after CI demonstrated its
+header candidates lack final opened-object identity. Existing GroupBoot owns
+that validation, and quietness is checked through the actual parser/transport.

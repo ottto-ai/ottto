@@ -153,8 +153,30 @@ impl Fixture {
 
     fn assert_quiet(&mut self) {
         for _ in 0..3 {
-            let (scan, bytes) = self.walk(true);
-            assert_eq!((scan.scanned_file_count, bytes), (0, 0));
+            let previous = self.index.clone();
+            let ((scan, bytes), parses) =
+                terminal_contract_retry::source_acquisitions(|| self.walk(true));
+            // GroupBoot::Unchanged counts identified alias members as scanned
+            // and semantic no-ops, but constructs no body parser. Count real
+            // parser acquisitions rather than mistaking metadata checks for parses.
+            assert!(
+                parses.is_empty(),
+                "no body parser is constructed after adoption"
+            );
+            assert_eq!(bytes, 0);
+            self.uploader.activate(
+                self.source,
+                self.index
+                    .active_upload_context_fingerprint
+                    .clone()
+                    .unwrap(),
+                &mut self.index,
+            );
+            let before = self.uploader.posts.len();
+            self.uploader
+                .send(self.source, &mut self.index, &previous, &scan.snapshots)
+                .unwrap();
+            assert_eq!(self.uploader.posts.len(), before, "no POST after adoption");
             assert!(!scan.census_complete);
             assert_eq!(
                 self.index.upload_context_fingerprint.as_deref(),
@@ -1537,8 +1559,13 @@ fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
             scan.scanned_file_count as u64, members,
             "context group runs on its later page"
         );
-        assert_eq!(reads.len() as u64, members);
-        assert!(reads.values().all(|count| *count == 1));
+        // A joined job constructs one SourceFileParser at its canonical live
+        // member; the job's tier reader covers the physical aliases.
+        assert_eq!(reads.len(), 1);
+        assert!(reads.iter().all(|(path, count)| *count == 1
+            && names
+                .iter()
+                .any(|name| *path == f.root.join(format!("{name}.jsonl")))));
         f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
         assert_eq!(
             f.uploader
@@ -1629,10 +1656,9 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
     assert_eq!(scan.scanned_file_count, 3);
     assert_eq!(
         reads,
-        ["c", "d", "z"]
-            .into_iter()
-            .map(|name| (f.root.join(format!("{name}.jsonl")), 1))
-            .collect()
+        // The settled group keeps its baseline metadata-witness slots; the
+        // other ordinary group waits. Those slots still cannot evict z.
+        BTreeMap::from([(singleton.clone(), 1)])
     );
     f.uploader.activate(f.source, "d".repeat(64), &mut f.index);
     let first = f.uploader.posts.len();
