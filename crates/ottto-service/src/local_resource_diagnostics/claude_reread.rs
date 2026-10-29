@@ -199,6 +199,8 @@ impl Rearm {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Counts {
+    #[serde(skip_serializing_if = "LineageParentless::is_empty")]
+    pub(crate) lineage_parentless_while_incomplete: LineageParentless,
     #[serde(skip_serializing_if = "DesktopDiscoveryIncomplete::is_empty")]
     pub(crate) desktop_discovery_incomplete: DesktopDiscoveryIncomplete,
     #[serde(skip_serializing_if = "DesktopMetadata::is_empty")]
@@ -218,6 +220,28 @@ pub(crate) struct Counts {
     #[serde(skip_serializing_if = "CachePage::is_empty")]
     pub(crate) retained_cache_page_events: CachePage,
 }
+/// Finalized file offers, not parses or stored-body acknowledgements.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct LineageParentless {
+    #[serde(skip_serializing_if = "super::is_zero")]
+    files: u64,
+}
+impl LineageParentless {
+    fn is_empty(&self) -> bool {
+        self.files == 0
+    }
+    fn merge(&mut self, other: Self) {
+        self.files = self.files.saturating_add(other.files);
+    }
+}
+pub(crate) fn lineage_parentless_while_incomplete(files: u64) {
+    update(|counts| {
+        counts
+            .lineage_parentless_while_incomplete
+            .merge(LineageParentless { files })
+    });
+}
+
 /// Discovery coverage is separate from errors inside a returned metadata store.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct DesktopDiscoveryIncomplete {
@@ -399,6 +423,8 @@ pub(crate) fn cache_capacity_eviction(count_pressure: bool) {
 }
 impl Counts {
     pub(crate) fn merge(&mut self, other: Self) {
+        self.lineage_parentless_while_incomplete
+            .merge(other.lineage_parentless_while_incomplete);
         self.desktop_discovery_incomplete
             .merge(other.desktop_discovery_incomplete);
         self.desktop_metadata.merge(other.desktop_metadata);

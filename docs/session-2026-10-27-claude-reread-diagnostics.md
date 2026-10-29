@@ -86,6 +86,16 @@ census discovery emits `desktop_discovery_capped_persistent`; a noncapped
 discovery resets the streak. This diagnostic state is process-local, carries no
 paths or identifiers, and never increases a cap or changes retry timing.
 
+`lineage_parentless_while_incomplete{files}` counts distinct source files in
+finalized offers whose cached Desktop metadata identifies a child, whose lineage
+census is incomplete, and whose emitted facts/origin have no parent reference.
+It runs after held-body and semantic no-op removal, using resident metadata only;
+no read, persisted field, selector or attribution decision is added. Scratch is
+bounded by emitted page items. Unobserved children cannot be counted before their
+metadata is discovered. Retries can count the same file again; this is offered
+work, not distinct lifetime sessions or stored-body ACKs. Complete lineage
+censuses count zero. The counter uses the existing finish diagnostics scope.
+
 Inventory changes cool down even a successful small metadata sweep using the
 existing 60-second initial retry and one-hour ceiling. A changed inventory during
 backoff revokes the census witness immediately, retains the deadline, and does

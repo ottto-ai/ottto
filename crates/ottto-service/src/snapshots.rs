@@ -8157,6 +8157,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
                 .unwrap_or(true)
     });
 
+    record_lineage_parentless_while_incomplete(source, &result.snapshots, index);
+
     // State-only Codex entities do not have a source-file fingerprint, so they
     // cannot use the file finalization table above. Rebind their durable map to
     // the final post-enrichment/post-policy/post-cutoff fingerprint here. This
@@ -8206,6 +8208,52 @@ pub fn finalize_scan_after_policy_with_body_witness(
     index
         .snapshot_activity_at
         .retain(|fingerprint, _| current_fingerprints.contains(fingerprint));
+}
+
+/// Observe only offers that survived policy, holds and semantic no-op removal.
+/// Cached Desktop child metadata is already resident; no source reads or durable
+/// state are needed. Scratch is bounded by this page's emitted items.
+fn record_lineage_parentless_while_incomplete(
+    source: SnapshotSource,
+    snapshots: &[SnapshotItem],
+    index: &ScanIndex,
+) {
+    if source != SnapshotSource::ClaudeCode
+        || index.claude_desktop_lineage_census_complete
+        || snapshots.is_empty()
+    {
+        return;
+    }
+    let mut parentless: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for snapshot in snapshots {
+        if snapshot.origin.parent_session_ref.is_none()
+            && !snapshot
+                .attribution_facts
+                .iter()
+                .any(|fact| fact.field == "parent_session_ref")
+        {
+            if let Some(file) = snapshot.source_file_fingerprint.as_deref() {
+                parentless
+                    .entry(&snapshot.source_session_id)
+                    .or_default()
+                    .insert(file);
+            }
+        }
+    }
+    if parentless.is_empty() {
+        return;
+    }
+    let mut files = BTreeSet::new();
+    for entry in index.claude_desktop_title_files.values() {
+        if entry.spawned_from_desktop_session_id.is_some() || entry.spawned_from_unresolved {
+            if let Some(emitted) = parentless.remove(entry.cli_session_id.as_str()) {
+                files.extend(emitted);
+            }
+        }
+    }
+    crate::local_resource_diagnostics::claude_reread::lineage_parentless_while_incomplete(
+        files.len() as u64,
+    );
 }
 
 /// The producer-side event clock mirrored by the accepted-log append path.
@@ -77652,6 +77700,95 @@ mod tests {
             .claude_desktop_title_files
             .contains_key(&local_index_key(&bucket.join("local_session.json"))));
         claude_original_carrier_fixture(&metadata, "")
+    }
+
+    #[test]
+    fn finalized_parentless_desktop_child_counts_only_incomplete_emission() {
+        let _gate = claude_request_money::e2::GateForTest::off();
+        for complete in [false, true] {
+            let child = spawn_cli("parentless-count-child");
+            let parent = spawn_cli("parentless-count-parent");
+            let mut index = ScanIndex {
+                claude_desktop_lineage_census_complete: complete,
+                ..ScanIndex::default()
+            };
+            index.claude_desktop_title_files.insert(
+                "child".into(),
+                desktop_spawn_entry_raw(&child, "local_child", Some("local_parent")),
+            );
+            index.claude_desktop_title_files.insert(
+                "parent".into(),
+                desktop_spawn_entry_raw(&parent, "local_parent", None),
+            );
+            let metadata = ClaudeTitleMetadata::from_durable_index(&index, !complete);
+            let home = crate::test_scratch::ScratchDir::new("parentless-offer-count");
+            let path = home.join(format!("{child}.jsonl"));
+            fs::write(
+                &path,
+                json!({"timestamp":"2026-09-30T10:00:00Z",
+                "type":"assistant", "sessionId":child, "requestId":"child-request",
+                "message":{"id":"child-message", "model":"claude-opus-4-8",
+                    "usage":{"input_tokens":10,"output_tokens":2}}})
+                .to_string(),
+            )
+            .unwrap();
+            let item = parse_claude_code_jsonl_file_with_title_metadata(
+                &path,
+                "2026-09-30T10:05:00Z",
+                "f".repeat(64),
+                &metadata,
+                false,
+            )
+            .unwrap()
+            .remove(0);
+            assert_eq!(
+                item.attribution_facts
+                    .iter()
+                    .any(|fact| fact.field == "parent_session_ref"),
+                complete
+            );
+            let mut result = SourceScanResult::empty(SnapshotSource::ClaudeCode);
+            result.snapshots.push(item);
+            let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+            assert_eq!(result.snapshots.len(), 1, "the child is actually offered");
+            let counts = serde_json::to_value(scope.finish()).unwrap();
+            assert_eq!(
+                counts["lineage_parentless_while_incomplete"]["files"]
+                    .as_u64()
+                    .unwrap_or(0),
+                u64::from(!complete)
+            );
+            if !complete {
+                // Repeated entities for one physical file count once; ordinary
+                // sessions and files already carrying a parent count zero.
+                result.snapshots.push(result.snapshots[0].clone());
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+                assert_eq!(
+                    serde_json::to_value(scope.finish()).unwrap()
+                        ["lineage_parentless_while_incomplete"]["files"],
+                    1
+                );
+                result.snapshots.truncate(1);
+                result.snapshots[0].origin.parent_session_ref = Some(parent.clone());
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+                assert!(serde_json::to_value(scope.finish())
+                    .unwrap()
+                    .get("lineage_parentless_while_incomplete")
+                    .is_none());
+                result.snapshots[0].origin.parent_session_ref = None;
+                result.snapshots[0].source_session_id = "ordinary".into();
+                result.snapshots.truncate(1);
+                let scope = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
+                finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+                assert!(serde_json::to_value(scope.finish())
+                    .unwrap()
+                    .get("lineage_parentless_while_incomplete")
+                    .is_none());
+            }
+        }
     }
 
     #[test]
