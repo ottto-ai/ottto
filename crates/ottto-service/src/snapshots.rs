@@ -29052,19 +29052,7 @@ impl OwnedSourceScan {
                         })
                 {
                     let owners = parsed_file.state_only_blocked_session_ids.clone();
-                    index.hold_compressed(
-                        &candidate.path,
-                        owners.clone(),
-                        CodexZstCause::ParentLedgerUnbound,
-                    );
-                    for alias in &aliases {
-                        index.hold_compressed(
-                            &alias.path,
-                            owners.clone(),
-                            CodexZstCause::ParentLedgerUnbound,
-                        );
-                    }
-                    if let Some(inventory) = codex_join_inventory.as_mut() {
+                    let fanout_admitted = if let Some(inventory) = codex_join_inventory.as_mut() {
                         inventory
                             .headers
                             .sort_unstable_by(|a, b| a.owner.cmp(&b.owner));
@@ -29078,6 +29066,27 @@ impl OwnedSourceScan {
                                 .cmp(b.candidate.path.as_os_str())
                         });
                         inventory.hold_custodied_siblings(index);
+                        !inventory.custody_refused
+                            && !inventory.custody_unknown
+                            && aliases
+                                .iter()
+                                .all(|alias| inventory.member_held(&alias.path))
+                    } else {
+                        aliases.is_empty()
+                    };
+                    index.hold_compressed(
+                        &candidate.path,
+                        owners.clone(),
+                        CodexZstCause::ParentLedgerUnbound,
+                    );
+                    if fanout_admitted {
+                        for alias in &aliases {
+                            index.hold_compressed(
+                                &alias.path,
+                                owners.clone(),
+                                CodexZstCause::ParentLedgerUnbound,
+                            );
+                        }
                     }
                     codex_state_only_blocked_session_ids.extend(owners);
                     pending!();
