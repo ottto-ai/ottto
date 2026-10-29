@@ -123,6 +123,11 @@ impl codex_file_join::HeaderInventory {
                 let owners = index.codex_state_only_blocked_by_file.get(key);
                 if !owners.is_some_and(|owners| !owners.is_empty()) {
                     self.custody_unknown = true;
+                    // Path ids are negative scope only, never ownership proof.
+                    // Truly unlocated custody still cannot fence plain work.
+                    for owner in codex_session_id_candidates_from_path(Path::new(key)) {
+                        self.mark_custody_owner(&owner, cause);
+                    }
                 }
                 for owner in owners.into_iter().flatten() {
                     self.mark_custody_owner(owner, cause);

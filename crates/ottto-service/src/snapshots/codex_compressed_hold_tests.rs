@@ -1185,3 +1185,58 @@ fn selective_legacy_owner_barrier_keeps_smaller_sibling_quiet_and_unrelated_plai
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn unattributed_path_scoped_legacy_owner_keeps_smaller_sibling_quiet_and_unrelated_plain_publishes()
+{
+    for absent in [false, true] {
+        let root = crate::test_scratch::private_dir("custody-selective-legacy-owner");
+        let held = member(&root, "sessions", OWNER, false);
+        let unrelated = member(&root, "sessions", PARENT, false);
+        let mut index = accepted(&root, &held);
+        assert!(index.files[&local_index_key(&held)]
+            .codex_protected_owner
+            .is_none());
+        assert!(index.files[&local_index_key(&held)]
+            .codex_joined_member_set
+            .is_none());
+        latch(&mut index, &held);
+        index.codex_state_only_blocked_by_file.clear();
+        assert!(index.codex_state_only_blocked_by_file.is_empty());
+        let smaller = held.with_file_name(format!("rollout-2026-10-01T11-00-00-{OWNER}.jsonl"));
+        fs::write(
+            &smaller,
+            codex_file_join::tests::member(OWNER, "shorter", 1, 1)
+                .iter()
+                .map(|v| v.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let witness = index.files[&local_index_key(&held)]
+            .last_upload_body_witness
+            .clone();
+        assert!(witness.is_some());
+        if absent {
+            fs::remove_file(&held).unwrap();
+        }
+        let (index, result) = no_open(&held, || normal(&root, index, &[]));
+        assert_eq!(result.unreadable_path_count, 0);
+        assert!(!result.snapshots.is_empty());
+        assert!(result
+            .snapshots
+            .iter()
+            .all(|s| s.source_session_id == PARENT && s.input_tokens > 0));
+        assert!(index.files[&local_index_key(&unrelated)]
+            .last_snapshot_fingerprint
+            .is_some());
+        assert_eq!(
+            index.files[&local_index_key(&held)].last_upload_body_witness,
+            witness
+        );
+        assert_eq!(
+            index.files[&local_index_key(&smaller)].codex_compressed_hold,
+            Some(CodexZstCause::ParentLedgerUnbound)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
