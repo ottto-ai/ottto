@@ -353,6 +353,7 @@ adds no background subsystem or upload fallback.
 The safe diagnostic names the connection binding and asks to reconnect; it
 contains no path or endpoint URL. During owned-scan authority revalidation,
 an endpoint load failure remains a local-state rejection.
+
 Claude's supported old-binding migration reports `counts.migration` as four
 `[delta, process total]` pairs in this order: held classification, awaiting
 reservation save, claimed A5, durably replaced. These are events, not unique
@@ -369,10 +370,24 @@ a shorter current extent, obsolete certificate length, generation-ahead records,
 object changes and resource failures. Genuine idle and correctness barriers
 (future revision, owed replay, context/namespace or downgrade) stay held.
 Fallback counts and pacing are separate from A5 reads and durable replacements.
-Indexed Claude growth stays eligible past the activity window until its committed
-end catches up, using already-observed length; secure opens and file-size caps
-still apply. Idle migration files take no body/sample read. Restored records may
-perform existing bounded certificate samples, separately from body I/O.
+Generic growth eligibility past the activity window remains an integration
+dependency; this migration path does not add a Claude-only discovery exception.
+Idle migration files take no body read. A changed object or mtime can require
+existing bounded certificate samples before a stale/no-match hold; samples are
+counted separately from body I/O and mtime alone grants no real-edit acquisition.
+
+Only O3's negative release/key spends use the existing `reread_guard` wire slot,
+under `replayed[upgrade_state_missing:<release>]`. They survive production decode,
+partial checkpoints and restart; live grants never survive serialization or an
+index copy. Ambiguous or malformed spend evidence refuses migration authority.
+The retired generic reread budgets and selection holds remain absent.
+
+Unregistered replay rejected by a Claude binding is still Stale policy. The
+existing restore carrier includes its typed `stale_attribution`; this is neither
+a generic Miss nor an ACK. `pace_anomaly` reports implausible wall-clock stamps
+separately from capacity `pace_evicted`; both are delta/process-total pairs.
+Clock anomalies expire the Full pace toward reading without refunding Tail
+allowance already spent.
 
 ## Line Delivery Counters
 
