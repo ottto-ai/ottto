@@ -6,6 +6,7 @@ use crate::codex_scan_diagnostics::{
 use crate::local_resource_diagnostics::claude_absence::Parent;
 use crate::local_resource_diagnostics::claude_contract;
 use crate::local_resource_diagnostics::claude_reread::IgnoredVeto;
+use crate::local_resource_diagnostics::rearm_cause;
 use crate::local_resource_diagnostics::{line_delivery_unselected, UnselectedReason};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -6346,6 +6347,7 @@ pub(crate) fn claude_stale_family_carry_refund_uncarries_for_test() -> usize {
 /// its members. Returns false when the walk had passed one, so the caller
 /// starts the traversal again and the uncarry precedes every pass.
 fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
+    rearm_cause::retain(index);
     let carry = &index.claude_stale_family_carry;
     if carry.roots.is_empty() && carry.capped_roots.is_empty() {
         return true;
@@ -6391,7 +6393,7 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
             .is_some_and(|member| carry.contains(member.root))
             && !entry.source_file_fingerprint.is_empty()
         {
-            entry.source_file_fingerprint.clear();
+            rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
             rearmed += 1;
         }
     }
@@ -6646,6 +6648,7 @@ fn replay_and_rearm_claude_family(
     page: &VecDeque<CandidateFile>,
     rearm_parsed: bool,
 ) -> (usize, usize) {
+    rearm_cause::retain(index);
     let in_family = |index_key: &str| {
         claude_index_path_member_ref(Path::new(index_key))
             .is_some_and(|member| member.root == root_session_id)
@@ -6681,7 +6684,7 @@ fn replay_and_rearm_claude_family(
             && in_family(index_key)
             && !entry.source_file_fingerprint.is_empty()
         {
-            entry.source_file_fingerprint.clear();
+            rearm_cause::clear(index_key, entry, rearm_cause::Cause::CarryInvalidation);
             rearmed += 1;
         }
     }
@@ -28224,6 +28227,11 @@ impl OwnedSourceScan {
                 if let Some(context) = sampling.as_mut().filter(|_| active.side_origin.is_none()) {
                     if let Some(plan) = active.parser.reader.acquisition.as_ref() {
                         context.record_input(plan.metrics());
+                        resource_probe.rearm_full_completed(
+                            &local_index_key(&active.candidate.path),
+                            plan.mode(),
+                            plan.metrics().native_bytes,
+                        );
                     }
                 }
                 if active.sampling.as_ref().is_some_and(|acquisition| {
@@ -31107,6 +31115,9 @@ impl OwnedSourceScan {
                         },
                     ),
                 };
+                if source == SnapshotSource::ClaudeCode {
+                    rearm_cause::retain(index);
+                }
                 let sampled_acquisition = sampling.as_ref().map(|context| {
                     let audit_now = sampled_scan::now_seconds();
                     let pending = index
@@ -31134,6 +31145,7 @@ impl OwnedSourceScan {
                         completed_guard_bytes: context.sample_bytes,
                         acquisition_admission: context.admission,
                         page_events: crate::local_resource_diagnostics::PageEvents {
+                            full_cause: resource_probe.rearm_fulls(),
                             full_reasons: crate::local_resource_diagnostics::FullReasons(
                                 context.full_reasons,
                             ),
@@ -32611,6 +32623,7 @@ impl OwnedSourceScan {
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
                 context.record_mode(mode, audit_due);
+                resource_probe.rearm_full_selected(&local_index_key(&active.candidate.path), mode);
             }
             if let Some(delivery) = line_delivery.as_mut() {
                 delivery.arm();
@@ -40815,6 +40828,9 @@ fn ensure_bounded_traversal(
     collected_at: &str,
     backfill_window_days: u64,
 ) -> TraversalProgress {
+    if source == SnapshotSource::ClaudeCode {
+        rearm_cause::retain(index);
+    }
     let context_fingerprint =
         scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
     let context_observation = (source == SnapshotSource::ClaudeCode).then(|| {
@@ -40902,12 +40918,16 @@ fn ensure_bounded_traversal(
                     retained.roots.contains(member.root)
                         || retained.capped_roots.contains(member.root)
                 }) {
-                    entry.source_file_fingerprint.clear();
+                    rearm_cause::clear(key, entry, rearm_cause::Cause::CarryInvalidation);
                 }
             }
             for candidate in &retained.replay {
                 if let Some(entry) = index.files.get_mut(&local_index_key(&candidate.path)) {
-                    entry.source_file_fingerprint.clear();
+                    rearm_cause::clear(
+                        &local_index_key(&candidate.path),
+                        entry,
+                        rearm_cause::Cause::CarryInvalidation,
+                    );
                 }
             }
             index.traversal = None;
@@ -41323,7 +41343,7 @@ fn ensure_bounded_traversal(
             } else if capped_roots.contains(&root) {
                 capped_file_count += 1;
             } else {
-                entry.source_file_fingerprint.clear();
+                rearm_cause::clear(index_key, entry, transition.rearm_cause());
                 rearmed_file_count += 1;
                 if full_rearm_window_roots.contains(&root) {
                     window_rearmed_file_count += 1;
@@ -49070,6 +49090,7 @@ impl ScanIndex {
 
     fn migrate(&mut self, candidate: CandidateFile) {
         let key = local_index_key(&candidate.path);
+        rearm_cause::reproven(&key);
         let last_snapshot_fingerprint = self
             .files
             .get(&key)
@@ -49123,6 +49144,7 @@ impl ScanIndex {
         parse_outcome: ScanParseOutcome,
     ) {
         let key = local_index_key(&candidate.path);
+        rearm_cause::reproven(&key);
         let last_upload_body_witness = self
             .files
             .get(&key)
