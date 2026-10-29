@@ -18,6 +18,9 @@ pub(super) fn deserialize_hold<'de, D: serde::Deserializer<'de>>(
             Ok(None)
         }
         fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            if value.len() > 64 {
+                return Ok(unsupported());
+            }
             Ok(
                 CodexZstCause::deserialize(serde::de::value::StrDeserializer::<E>::new(value))
                     .ok()

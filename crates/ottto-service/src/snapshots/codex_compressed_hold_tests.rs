@@ -553,5 +553,11 @@ fn malformed_large_hold_streams_to_generic_custody() {
         loaded.files[&key].codex_compressed_hold,
         Some(CodexZstCause::OwnerUnproven)
     );
+    raw["files"][&key]["codex_compressed_hold"] = json!("x".repeat(100_000));
+    fs::write(&saved, serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_eq!(
+        ScanIndex::load(&saved).unwrap().files[&key].codex_compressed_hold,
+        Some(CodexZstCause::OwnerUnproven)
+    );
     fs::remove_dir_all(root).unwrap();
 }
