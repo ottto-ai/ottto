@@ -2371,3 +2371,42 @@ fn gc_representation_reads_only_bounded_store_headers_and_charges_gc() {
         "no transcript can supply bytes during GC"
     );
 }
+
+#[test]
+fn read_memo_keeps_stored_debt_until_a_clean_replacement_is_written() {
+    let scratch = Scratch::new();
+    let lock = LockedStateDir::acquire(&scratch.root).unwrap();
+    let transcript = scratch.transcript("memo-debt.jsonl", b"{}\n");
+    let b = binding("acct", "scope", ("fp", None));
+    let mut cert = certificate(&transcript);
+    cert.audit_debt_unix_seconds = Some(NOW + 60);
+    let mut store = scratch.store();
+    store
+        .write_after_save(&lock, 1, vec![pending(b.clone(), cert.clone(), 0)])
+        .unwrap();
+    assert_eq!(
+        found(store.read(&b.key))
+            .record
+            .certificate
+            .audit_debt_unix_seconds,
+        None
+    );
+    // A same-second completed Full may change only the current index's debt.
+    cert.audit_debt_unix_seconds = None;
+    let clean = pending(b.clone(), cert, 0);
+    let receipt = store
+        .write_after_save(&lock, 2, vec![clean.clone()])
+        .unwrap();
+    assert_eq!((receipt.written, receipt.clean), (1, 0));
+    assert_eq!(
+        found(scratch.store().read(&b.key)).envelope_audit_debt,
+        None
+    );
+    assert!(matches!(store.read(&b.key), ReadOutcome::Found(_)));
+    let receipt = store.write_after_save(&lock, 3, vec![clean]).unwrap();
+    assert_eq!(
+        (receipt.written, receipt.clean),
+        (0, 1),
+        "quiet clean records remain clean"
+    );
+}

@@ -742,7 +742,15 @@ impl DurableTailStore {
         match decode(&bytes) {
             Ok(record) => {
                 if let Some((content, _)) = self.durable.get_mut(key) {
-                    *content = Some(content_digest(&record.record));
+                    // Memo the verified STORED representation, not the decoded
+                    // certificate whose compatibility debt was dropped.
+                    let mut header = [0; HEADER_BYTES];
+                    header.copy_from_slice(&bytes[..HEADER_BYTES]);
+                    header[171..179].fill(0); // committed generation is not content
+                    *content = Some(content_digest_parts(
+                        &header,
+                        &bytes[HEADER_BYTES..bytes.len() - TRAILER_BYTES],
+                    ));
                 }
                 ReadOutcome::Found(Box::new(record))
             }
@@ -1114,10 +1122,11 @@ impl DurableTailStore {
 fn content_digest(record: &PendingRecord) -> Digest32 {
     let mut header = Vec::with_capacity(HEADER_BYTES);
     encode_header(&mut header, record, 0);
-    digest(
-        "ottto-dt-content:v2",
-        &[header.as_slice(), record.body.as_slice()],
-    )
+    content_digest_parts(&header, &record.body)
+}
+
+fn content_digest_parts(header: &[u8], body: &[u8]) -> Digest32 {
+    digest("ottto-dt-content:v2", &[header, body])
 }
 
 fn inspect_path(path: &Path) -> io::Result<fs::Metadata> {

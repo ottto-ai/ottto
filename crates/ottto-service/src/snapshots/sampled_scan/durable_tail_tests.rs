@@ -3000,8 +3000,13 @@ fn v1_dropped_envelope_debt_survives_in_index_without_postponement() {
             missing.save(&index_path).unwrap();
             let mut replacement = record.record;
             replacement.certificate = certificate_at(&key, &checkpoint, &missing, now).unwrap();
-            disk.write_after_save(lock, missing.generation, vec![replacement])
-                .unwrap();
+            assert_eq!(
+                disk.write_after_save(lock, missing.generation, vec![replacement])
+                    .unwrap()
+                    .written,
+                1,
+                "completed audit must replace the debt-bearing predecessor, not memo-skip it"
+            );
             let record = match DurableTailStore::new(dir.clone(), source).read(&record_key) {
                 ReadOutcome::Found(r) => r,
                 other => panic!("{other:?}"),

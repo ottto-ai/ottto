@@ -14,6 +14,8 @@ reads. An existing entry with a reset/postponed carrier re-arms an immediate
 index audit, recovering the normal completed-audit/index-saved/record-old crash
 window through Full(AuditDue). The envelope never restores checkpoint debt;
 the index remains deadline authority and later offers cannot postpone it.
+Dirty detection hashes validated stored header/body bytes, normalizing only
+the generation; dropping decoded debt cannot falsely skip its clean replacement.
 Ordinary replacement failure or budget refusal retains valid v1 authority.
 
 No migration occurs in this slice: tag 1 and its scope formula are unchanged.
