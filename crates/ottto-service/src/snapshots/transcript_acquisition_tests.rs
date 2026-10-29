@@ -4347,7 +4347,13 @@ fn missing_index_terminal_loss_carries_recovered_debt_until_verified_full_for_bo
             &index.files,
             &fixture.file.0
         ));
-        let (counts, _) = cache.durable_counters(source).unwrap();
+        let (counts, store) = cache.durable_counters(source).unwrap();
+        assert!(
+            counts
+                .summary(source, &store)
+                .contains("audit_carrier_staged_unverified:1"),
+            "the staged transition is visible on the production durable_tail line"
+        );
         assert_eq!(counts.ineligible.get("audit_carrier"), Some(&1));
         assert_eq!(
             counts.ineligible.get("audit_carrier_staged_unverified"),
@@ -4618,3 +4624,5 @@ fn missing_carrier_future_debt_clamps_only_in_live_context_for_both_sources() {
         }
     }
 }
+
+mod codex_mcp_version_tests;

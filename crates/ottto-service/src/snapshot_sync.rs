@@ -3319,6 +3319,7 @@ struct SyncCounts {
     over_line_cap_count: u64,
     recognized_usage_drop_count: u64,
     ownership_incomplete_file_count: u64,
+    causes: crate::snapshots::ownership_diagnostics::Summary,
     snapshot_unproven_terminal_count: u64,
     snapshot_superseded_terminal_count: u64,
     cooldown_conflict_deferred: usize,
@@ -3442,6 +3443,9 @@ impl SyncCounts {
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
             ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
+            causes: scan_result
+                .causes
+                .summary(scan_result.ownership_incomplete_file_count),
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
             cooldown_conflict_deferred: 0,
@@ -3469,7 +3473,7 @@ impl SyncCounts {
     }
 
     fn terminal_census_line(&self, source: &str) -> String {
-        format!(
+        let mut line = format!(
             "snapshot terminal_census source={source} census_complete={} scanned_files={} \
              uploaded={} unproven_terminal={} superseded_terminal={} \
              ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
@@ -3485,7 +3489,11 @@ impl SyncCounts {
             self.cooldown_conflict_deferred,
             crate::snapshots::terminal_contract_retry::local_count(),
             crate::snapshots::terminal_contract_retry::exhausted_count(),
-        )
+        );
+        if source == "codex" {
+            line.push_str(&crate::snapshots::ownership_diagnostics::line(self.causes));
+        }
+        line
     }
 
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
@@ -4658,7 +4666,13 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                     continuation::ticket_lifetime(self.codex_started),
                 )
                 // K2: moved out only when a ticket was minted.
-                .map(|ticket| ticket.with_inputs(take_continuation_inputs(&mut completed.0)))
+                .map(|ticket| {
+                    ticket.with_inputs(take_continuation_inputs(
+                        &mut completed.0,
+                        &self.daemon.codex_preludes,
+                        self.daemon.codex_versions.clone(),
+                    ))
+                })
             });
         let finished = crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
             self.finish_completed(completed)
@@ -4694,14 +4708,18 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         self.started.elapsed()
     }
     fn retained_bound(&self, limit: usize) -> Option<usize> {
+        let versions = crate::heap_layout_bound::bound(&self.daemon.codex_versions, limit)?;
         let native = if crate::snapshots::claude_native_comparison::enabled() {
-            self.daemon.native_comparison.retained_bound(limit)?
+            self.daemon
+                .native_comparison
+                .retained_bound(limit.checked_sub(versions)?)?
         } else {
             0
         };
+        let owned = versions.checked_add(native)?;
         // Stage 1 (K2): a held continuation ticket's inputs; zero while inert.
-        let continuation = continuation::retained_bound(limit.checked_sub(native)?)?;
-        native.checked_add(continuation)
+        let continuation = continuation::retained_bound(limit.checked_sub(owned)?)?;
+        owned.checked_add(continuation)
     }
     fn discard_retained(&mut self) {
         if crate::snapshots::claude_native_comparison::enabled() {
@@ -6268,9 +6286,12 @@ fn prepare_sync_source_inner(
         request_identity_capture,
     )
     .with_sampled_acquisition(daemon.transcript_cache.clone(), sampled_scope.clone())
-    .with_codex_side_pass(codex_side_pass);
+    .with_codex_side_pass(codex_side_pass)
+    .with_codex_versions(daemon.codex_versions.clone());
     if source == SnapshotSource::ClaudeCode {
         scan = scan.with_line_observer("footprint", daemon.footprint_cwds.observer());
+    } else if source == SnapshotSource::Codex {
+        scan = scan.with_line_observer("codex_prelude", daemon.codex_preludes.observer(&roots));
     }
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
@@ -6325,6 +6346,8 @@ fn prepare_sync_source_inner(
 /// every other end. Charged as process-retained memory
 /// (`continuation::retained_bound`).
 struct ContinuationInputs {
+    codex_preludes: std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
     account_witness: [u8; 32],
     activity_hint: crate::snapshot_client::ActivityHintResponse,
     receipt_window_days: u64,
@@ -6339,10 +6362,10 @@ struct ContinuationInputs {
     upload_progress_path: PathBuf,
 }
 
-crate::heap_layout_bound::fields!(ContinuationInputs; account_witness, activity_hint,
+crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
     receipt_window_days, context_curve_enabled, cache_observations_enabled,
     scan_agent_status_collection, attribution_context, upload_policy,
-    upload_destination_namespace, receipt_client, index_path, upload_progress_path);
+    upload_destination_namespace, receipt_client, index_path, upload_progress_path; shared codex_versions);
 
 impl ContinuationInputs {
     /// Whether the moved attribution context is present (tests read this
@@ -6357,13 +6380,19 @@ impl ContinuationInputs {
 /// page, taken before its finish. `finish_sync_source` never reads the
 /// attribution context, so moving it out changes nothing for the finish.
 /// Called only while continuation pages are enabled and a ticket was minted.
-fn take_continuation_inputs(preparation: &mut SourcePreparation) -> ContinuationInputs {
+fn take_continuation_inputs(
+    preparation: &mut SourcePreparation,
+    codex_preludes: &std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
+) -> ContinuationInputs {
     let mut activity_hint = preparation.activity_hint.clone();
     // The prepare took the raw key out of its hint already; never keep one.
     if let Some(mut key) = activity_hint.session_attribution_hmac_key.take() {
         key.zeroize();
     }
     ContinuationInputs {
+        codex_preludes: std::sync::Arc::clone(codex_preludes),
+        codex_versions,
         account_witness: preparation.account_witness,
         activity_hint,
         receipt_window_days: preparation.receipt_window_days,
@@ -6647,7 +6676,9 @@ fn prepare_continuation_source(
             false,
         ),
     )
-    .with_codex_side_pass(Some(codex_side_pass));
+    .with_codex_side_pass(Some(codex_side_pass))
+    .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
+    .with_codex_versions(inputs.codex_versions.clone());
     Ok(Ok(SourcePreparation {
         native_comparison_reservation: None,
         native_comparison_lease: None,
@@ -9039,7 +9070,6 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.exact_request_set_root_count += 1;
         } else {
             stats.request_set_mismatch_root_count += 1;
-            full_rearm_evidence_complete = false;
             stats.api_only_request_count += api_request_ids.difference(&trace_request_ids).count();
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
@@ -9052,6 +9082,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_evidence_row_count += rows.len();
             trace_report.evidence.insert(root_session_id, rows);
         }
+    }
+    if stats.request_set_mismatch_root_count > 0 {
+        index.note_claude_ignored_rearm_veto(
+            &scan_result.census_window_end,
+            crate::local_resource_diagnostics::claude_reread::IgnoredVeto::EvidenceGap.bit(),
+        );
     }
     // E2 side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
@@ -24086,3 +24122,38 @@ crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reas
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+
+#[cfg(test)]
+mod ownership_census_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_appends_scanner_partition_only_for_codex_and_keeps_unproven_separate() {
+        let mut contributions = [0; 8];
+        contributions[0] = 2;
+        let counts = SyncCounts {
+            ownership_incomplete_file_count: 5,
+            snapshot_unproven_terminal_count: 3,
+            causes: (contributions, [0, 77, 0]),
+            ..SyncCounts::default()
+        };
+        let line = counts.terminal_census_line("codex");
+        assert!(line.contains("unproven_terminal=3"));
+        assert!(line.contains("ownership_incomplete_files=5"));
+        assert!(line.contains("ownership_incomplete_contributions{bucket=\"inventory_hold\"}=2"));
+        assert!(line.contains("ownership_incomplete_generation_start=77"));
+        assert!(!line.contains("ownership_incomplete_distinct_paths{"));
+        assert!(!line.contains("bucket=\"unattributed\""));
+        assert!(
+            line.find("terminal_contract_retry_exhausted=").unwrap()
+                < line
+                    .find("ownership_incomplete_contributions{bucket=")
+                    .unwrap()
+        );
+        for source in ["claude_code", "pi"] {
+            assert!(!counts
+                .terminal_census_line(source)
+                .contains("ownership_incomplete_contributions{bucket="));
+        }
+    }
+}

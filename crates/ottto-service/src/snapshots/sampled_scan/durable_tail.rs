@@ -104,7 +104,7 @@ impl Counters {
         };
         format!(
             "ottto-service: durable_tail source={} rederive_head_bytes={} \
-             rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} \
+             rederive_named_lines={} rederive_line_bytes={} not_persisted={{{}}} ineligible={{{}}} \
              write_deferred={} write_unlocked={} peak_body_bytes={} disk_records={} disk_bytes={} \
              bytes_written={} records_written={} records_clean={} store_budget_refused={} \
              bytes_read={} format_hold[newer,unknown,undecodable,unbindable,known_corrupt]={:?} durable_held={:?} held_census[kept,invalidated]={:?} \
@@ -117,6 +117,7 @@ impl Counters {
             self.rederive_named_lines,
             self.rederive_line_bytes,
             classes(&self.not_persisted),
+            classes(&self.ineligible),
             self.write_deferred,
             self.write_unlocked,
             self.peak_body_bytes,
