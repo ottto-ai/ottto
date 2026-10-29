@@ -1375,6 +1375,7 @@ fn excluded_archive_inventory_hold_survives_restart_without_plain_header_reread(
 
 #[test]
 fn denied_only_inventory_hold_reoffers_owed_plain_at_bounded_retry_generation() {
+    let _discovery = archive_discovery_scope(false);
     use codex_file_join::{tests::header_reads, DirectoryCensus, HeaderInventory};
 
     fn page(
