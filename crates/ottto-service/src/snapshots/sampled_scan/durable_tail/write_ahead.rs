@@ -293,6 +293,17 @@ impl<'a> CommitFences<'a> {
 }
 
 impl SharedCache {
+    #[cfg(test)]
+    pub(crate) fn expire_resource_pause_for_test(&self, source: SnapshotSource) {
+        if let Some(ds) = durable_source(source) {
+            if let Some(mut stores) = self.durable() {
+                if let Some(slot) = stores.slot(ds).as_mut() {
+                    slot.store.expire_resource_pause_for_test();
+                }
+            }
+        }
+    }
+
     pub(crate) fn durable_store_faulted(&self, source: SnapshotSource) -> bool {
         let Some(ds) = durable_source(source) else {
             return false;
@@ -873,6 +884,15 @@ impl SharedCache {
                 slot.store.note_degraded_publish();
             }
         };
+        if source == DurableSource::ClaudeCode
+            && stores
+                .retail_spent
+                .get(&digest)
+                .is_some_and(|custody| custody.hold.is_some())
+            && !stores.hold_content_changed(digest)
+        {
+            return UnpreparedDisposition::Hold(HeldCause::StaleSurvivor);
+        }
         let disposition = match prior {
             PriorRecord::Protected(store::Refusal::ReceiptPending) => {
                 UnpreparedDisposition::Hold(HeldCause::ReceiptPending)

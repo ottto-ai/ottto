@@ -668,6 +668,11 @@ impl DurableTailStore {
         if self.check_writer(writer).is_err() || failure.attempt.dir != self.dir {
             failure.protected = Some(Refusal::Unbindable);
         }
+        self.counters.store_fault_reason = Some(if failure.is_enospc() {
+            "enospc"
+        } else {
+            failure.stage
+        });
         if failure.is_enospc() {
             self.pause_resources();
         }
@@ -873,6 +878,10 @@ impl DurableTailStore {
         self.resource_checked = true;
         self.resource_granted = enough;
         if !enough {
+            if self.resource_pause.is_none() {
+                self.counters.store_fault_reason = Some("resource_floor");
+                self.counters.budget_refused += 1;
+            }
             self.pause_resources();
             return false;
         }

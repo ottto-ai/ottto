@@ -16,7 +16,7 @@ use crate::locked_state_dir::test_locks;
 use crate::transcript_acquisition::{AuditDebt, Scope};
 use serde_json::{json, Value};
 use std::cell::Cell;
-use std::io::{self, Write as _};
+use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::rc::Rc;
 use std::sync::Arc;

@@ -562,6 +562,7 @@ pub(crate) struct StoreCounters {
     /// established absence. Separate from integrity and receipt mismatch.
     pub(crate) store_write_cleanup_failed: u64,
     pub(crate) store_faults: u64,
+    pub(crate) store_fault_reason: Option<&'static str>,
     pub(crate) stale_record_refused: u64,
     pub(crate) resource_paused_seconds: u64,
     pub(crate) resource_pause_checks: u64,

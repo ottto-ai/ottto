@@ -135,6 +135,8 @@ mod codex_parent_side_read_tests;
 mod codex_parent_side_tests;
 #[cfg(test)]
 mod file_set_digest_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod m3_d3_tests;
 #[cfg(all(test, unix))]
 mod m3_native_tests;
 #[cfg(test)]
@@ -35617,6 +35619,12 @@ fn unprepared_disposition(
     disposition: sampled_scan::durable_tail::UnpreparedDisposition,
 ) -> NativeDisposition {
     use sampled_scan::durable_tail::UnpreparedDisposition;
+    if !matches!(
+        disposition,
+        sampled_scan::durable_tail::UnpreparedDisposition::Hold(_)
+    ) {
+        acquisition.custody_mut().take_owed();
+    }
     match disposition {
         UnpreparedDisposition::PublishStrictRebind => NativeDisposition::PublishStrictRebind,
         UnpreparedDisposition::PublishRetainingPrior { format, cause } => {
@@ -43745,7 +43753,6 @@ fn advance_bounded_directory_traversal_with_budget<'a>(
     recovery: impl Into<DiscoveryRecovery<'a>>,
 ) {
     let recovery = recovery.into();
-    let files = recovery.files;
 
     let walk_issues = |counts: &ScanTraversalCounts| {
         (
@@ -43988,7 +43995,6 @@ fn candidate_from_traversal_path_at<'a>(
     recovery: impl Into<DiscoveryRecovery<'a>>,
 ) -> Option<CandidateFile> {
     let recovery = recovery.into();
-    let files = recovery.files;
 
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
