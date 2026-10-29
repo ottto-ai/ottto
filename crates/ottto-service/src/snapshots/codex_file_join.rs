@@ -3266,7 +3266,7 @@ pub(super) mod tests {
                 &mut index,
                 &BTreeSet::new()
             ),
-            (1, 0)
+            Some((1, 0))
         );
         assert_eq!(items[0].source_session_id, healthy);
         // Malformed/future owner metadata cannot reset the surrounding index
@@ -3285,7 +3285,7 @@ pub(super) mod tests {
                 &mut malformed,
                 &BTreeSet::new()
             ),
-            (0, 0)
+            Some((0, 0))
         );
         assert!(items.is_empty());
         fs::remove_dir_all(root).unwrap();
