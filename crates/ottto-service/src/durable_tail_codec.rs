@@ -573,10 +573,8 @@ fn verify_entries<'a, K: Ord>(
             sorted &= p < &current;
         }
         if !sorted {
-            let mut earlier = Dec {
-                bytes: d.bytes,
-                at: start,
-            };
+            let mut earlier = Dec::new(d.bytes);
+            earlier.at = start;
             for _ in 0..i {
                 if key(&mut earlier)? == current {
                     return Err(Corrupt);

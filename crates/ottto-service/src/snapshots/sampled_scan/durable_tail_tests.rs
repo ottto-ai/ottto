@@ -3426,6 +3426,8 @@ fn v1_counting_provenance_comes_from_each_decoded_reduction() {
                 .into_test_option()
                 .expect("second restart");
             assert_eq!(second.retained.state.durable_counting(), Some(fact));
+            // Release the process-wide lease before the next restore.
+            drop(second);
             // A record whose old pinned binding proves the configured cutover
             // but whose own decoded cutover disagrees is R29, never mapped.
             let _new_cutover = TestCutover::set(1);
