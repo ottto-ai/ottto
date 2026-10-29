@@ -398,7 +398,9 @@ fn progress_slot(key: String, due: u64, previous: Option<&HeldAuditProgress>) ->
 const OPEN_PARK_FAILURES: u8 = 8;
 const OPEN_BACKOFF_CAP_SECONDS: u64 = 6 * 60 * 60;
 /// Census keys are at most 4 KiB, so the map stays bounded (about 1 MiB at
-/// worst). Beyond it the longest-quiet key is forgotten and simply retried.
+/// worst). On overflow the longest-quiet entry is evicted (counted) and that
+/// key may retry (rule 7: fail toward reading); its owed due moves into the
+/// slot with it, so the debt is never dropped or moved later.
 const OPEN_BACKOFF_KEYS: usize = 256;
 
 type OpenStamp = Option<[i64; 7]>;
@@ -443,12 +445,23 @@ struct OpenFailure {
 struct OpenBackoff {
     page: u64,
     keys: BTreeMap<String, OpenFailure>,
+    /// Process total of overflow evictions.
+    evicted: u64,
 }
+
+/// One recorded failure: `parked` exactly when it parks the key, and the
+/// overflow-evicted key with its owed due.
+struct RecordedFailure {
+    parked: Option<OpenFailure>,
+    evicted: Option<(String, u64)>,
+}
+
 impl OpenBackoff {
     const fn new() -> Self {
         Self {
             page: 0,
             keys: BTreeMap::new(),
+            evicted: 0,
         }
     }
     fn blocked(&self, key: &str, now: u64) -> bool {
@@ -462,8 +475,8 @@ impl OpenBackoff {
     fn owed(&self, key: &str) -> Option<u64> {
         self.keys.get(key).map(|failure| failure.owed_due)
     }
-    /// Some(parked failure) exactly when this failure parks the key.
-    fn record_failure(&mut self, key: &str, due: u64, now: u64) -> Option<OpenFailure> {
+    fn record_failure(&mut self, key: &str, due: u64, now: u64) -> RecordedFailure {
+        let mut evicted = None;
         if !self.keys.contains_key(key) && self.keys.len() >= OPEN_BACKOFF_KEYS {
             let quiet = self
                 .keys
@@ -471,7 +484,11 @@ impl OpenBackoff {
                 .min_by_key(|(_, failure)| failure.last_failed)
                 .map(|(key, _)| key.clone());
             if let Some(quiet) = quiet {
-                self.keys.remove(&quiet);
+                evicted = self
+                    .keys
+                    .remove(&quiet)
+                    .map(|failure| (quiet, failure.owed_due));
+                self.evicted = self.evicted.saturating_add(1);
             }
         }
         let page = self.page;
@@ -488,7 +505,10 @@ impl OpenBackoff {
         failure.last_failed = now;
         failure.retry_page = page.saturating_add(1 << u32::from(failure.failures - 1).min(62));
         failure.stamp = open_stamp(key);
-        (failure.failures == OPEN_PARK_FAILURES).then(|| failure.clone())
+        RecordedFailure {
+            parked: (failure.failures == OPEN_PARK_FAILURES).then(|| failure.clone()),
+            evicted,
+        }
     }
 }
 
@@ -530,6 +550,11 @@ pub(super) fn held_audit_open_failed(now: u64) -> (usize, u64) {
                 .unwrap_or(0),
         )
     })
+}
+
+/// Census-line process total: overflow evictions from the backoff map.
+pub(super) fn held_audit_open_backoff_evicted() -> u64 {
+    with_open_backoff(|backoff| backoff.evicted)
 }
 
 #[cfg(test)]
@@ -574,9 +599,9 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
     else {
         return;
     };
-    let (parked, keys) =
+    let (recorded, keys) =
         with_open_backoff(|backoff| (backoff.record_failure(key, due, now), backoff.keys.len()));
-    if let Some(parked) = parked {
+    if let Some(parked) = recorded.parked {
         // Counts only; no path or id. Once per park.
         crate::local_resource_diagnostics::claude_held_audit_open_parked(&HeldAuditOpenParked {
             held_audit_open_failures: parked.failures,
@@ -585,8 +610,17 @@ pub(super) fn progress_open_failed(index: &mut ScanIndex, key: &str, now: u64) {
         });
     }
     let previous = index.held_audit_progress.take();
-    index.held_audit_progress = next_progress_key(index, Some(key), now)
-        .map(|next| progress_slot(next, due, previous.as_ref()));
+    // Rule 7: an overflow-evicted key may retry, so it takes the next turn,
+    // and its owed due moves into the slot: the debt is never dropped.
+    let (evicted, evicted_due) = recorded.evicted.unzip();
+    index.held_audit_progress = evicted
+        .filter(|evicted| progress_eligible(index, evicted))
+        .or_else(|| next_progress_key(index, Some(key), now))
+        .map(|next| {
+            let mut slot = progress_slot(next, due, previous.as_ref());
+            slot.due = evicted_due.map_or(slot.due, |owed| slot.due.min(owed));
+            slot
+        });
 }
 
 /// Select this page's progress slot: keep an unattempted, unblocked slot,

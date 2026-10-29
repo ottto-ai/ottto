@@ -260,3 +260,61 @@ fn held_open_backoff_due_carries_into_rotation_and_restoration() {
     assert_eq!(restore_held_audit_deadlines(&mut restored, D + 100), 1);
     assert_eq!(restored.files[&failing].unverified_deadline(), Some(D));
 }
+
+/// Rule 7 overflow: with 256 failing keys tracked, a 257th failure evicts
+/// the longest-quiet entry (counted). That key may retry: it takes the next
+/// turn with its owed due, never later, across a save/reload.
+#[test]
+fn held_open_backoff_overflow_evicts_oldest_and_keeps_its_due_owed() {
+    reset_open_backoff_for_test();
+    let root = Root::new("overflow");
+    let keys = (0..=OPEN_BACKOFF_KEYS)
+        .map(|n| root.key(&format!("k{n:04}.jsonl")))
+        .collect::<Vec<_>>();
+    let mut index = held_index(&root, &keys.iter().map(String::as_str).collect::<Vec<_>>());
+    // Fill the map: k0000 failed first and owes the earliest due.
+    let owed = D - 1_000;
+    with_open_backoff(|backoff| {
+        for (n, key) in keys[..OPEN_BACKOFF_KEYS].iter().enumerate() {
+            let recorded = backoff.record_failure(key, owed + n as u64, D + n as u64);
+            assert!(recorded.evicted.is_none() && recorded.parked.is_none());
+        }
+    });
+    assert_eq!(held_audit_open_failed(D).0, OPEN_BACKOFF_KEYS);
+    assert_eq!(held_audit_open_backoff_evicted(), 0);
+
+    let last = &keys[OPEN_BACKOFF_KEYS];
+    index.held_audit_progress = Some(HeldAuditProgress {
+        key: last.clone(),
+        due: D,
+        attempted: false,
+    });
+    let now = D + 10_000;
+    progress_open_failed(&mut index, last, now);
+    assert_eq!(held_audit_open_backoff_evicted(), 1, "counted");
+    assert_eq!(held_audit_open_failed(now).0, OPEN_BACKOFF_KEYS);
+    assert_eq!(with_open_backoff(|backoff| backoff.owed(&keys[0])), None);
+    assert_eq!(
+        with_open_backoff(|backoff| backoff.owed(last)),
+        Some(D),
+        "the new failure keeps its own due"
+    );
+    // The evicted key's owed due moved into the slot, with it.
+    assert_eq!(slot(&index), Some((keys[0].clone(), owed, false)));
+    assert!(awaits_hold_deadline_restoration(&index, &keys[0]));
+
+    let path = root.0.join("index.json");
+    index.save(&path).unwrap();
+    let mut index = ScanIndex::load(&path).unwrap();
+    assert_eq!(slot(&index), Some((keys[0].clone(), owed, false)));
+    // The next rotation queues it at that due: it may retry, never later.
+    assert_eq!(
+        schedule_held_audit_progress(&mut index, now).as_deref(),
+        Some(keys[0].as_str())
+    );
+    assert_eq!(
+        progress_debt(&index, &keys[0], now).map(|debt| debt.due_unix_seconds),
+        Some(owed)
+    );
+    assert_eq!(held_audit_open_backoff_evicted(), 1);
+}
