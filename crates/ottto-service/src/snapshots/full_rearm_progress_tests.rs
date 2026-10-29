@@ -2541,6 +2541,10 @@ fn late_account_telemetry_reselects_the_family_without_whole_index_rearm() {
             .unwrap()
         };
         let enrich = |scan: &mut SourceScanResult, index: &mut ScanIndex| {
+            // This account-only adapter must pay/commit the new terminal read
+            // boundary before finalizing or starting its next native walk.
+            let (overrun, _) = crate::snapshot_sync::bounded_terminal_read_for_test(&support, scan, index);
+            assert!(!overrun);
             let evidence = crate::claude_local_otel::load_claude_effort_evidence(
                 &support,
                 [OTHER_ROOT.to_string()],
