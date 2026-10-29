@@ -2269,3 +2269,42 @@ fn codex_owed_gauge_reports_age_and_alarms_past_a_day() {
         BTreeMap::from([("count", 1)])
     );
 }
+
+/// Round 6 (Lead B b): an owed key earns no inclusive state-only total before
+/// its ACKed release; the same thread falls back once it is no longer owed.
+#[test]
+fn owed_key_blocks_the_codex_state_only_fallback() {
+    let id = "019e253c-9999-7000-9000-cccccccccccc";
+    let root = crate::test_scratch::unique_path("owed-state-only");
+    fs::create_dir_all(&root).unwrap();
+    let mut metadata = CodexTitleMetadata::default();
+    let thread = CodexStateThread {
+        tokens_used: 59,
+        ..CodexStateThread::default()
+    };
+    metadata.state_threads.insert(id.to_string(), thread);
+    let state_only = |index: &mut ScanIndex| {
+        let mut snapshots = Vec::new();
+        let at = "2026-10-29T00:00:00Z";
+        append_codex_state_only_snapshots(&mut snapshots, &metadata, at, index, &BTreeSet::new());
+        snapshots.len()
+    };
+    let mut index = ScanIndex::default();
+    ensure_bounded_traversal(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&root),
+        &mut index,
+        "2026-10-29T00:00:00Z",
+        7,
+    );
+    assert_eq!(state_only(&mut index), 1, "premise: the thread falls back");
+    let key = local_index_key(&root.join(format!("rollout-2026-10-28T10-00-00-{id}.jsonl")));
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.residue.codex_inventory_hold = Some(CodexInventoryHold {
+        owed: BTreeSet::from([key]),
+        ..CodexInventoryHold::default()
+    });
+    // Before round 6 the owed key's thread fell back to its inclusive total.
+    assert_eq!(state_only(&mut index), 0, "owed: no state-only total");
+    fs::remove_dir_all(root).unwrap();
+}

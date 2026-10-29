@@ -267,8 +267,12 @@ hold) registers as one field plus its lines in `discovery_retention!`,
 `unverified` and `owes`; it adds no separate exemption.
 
 Codex owed keys are candidates held by an incomplete header inventory or
-refused at a cursor start for want of reduction inputs (`Reduction`
-unreadable). They stay owed across the bounded retry and restarts until the
+refused at a cursor start for want of reduction inputs. That refusal is
+transient, so it is not unreadable (only the inventory's unknown owner
+keeps `alias_parser`): the census completes healthy and carries the key, and
+each generation's walk retries it once, a cheap check counted by the cursor's
+`jobs_deferred_inputs`, with no body read. An owed key's thread gets no
+inclusive state-only total before its release. They stay owed across the bounded retry and restarts until the
 committed index entry's size and mtime nanos match the file (checked at page
 start, so after upload acceptance, never at parse completion or by a
 same-size rewrite) or their absence is proved: only an unlisted key gone with
@@ -276,7 +280,7 @@ ENOENT is removed; any other stat error keeps it owed, counted as
 `access_error`. They never hold a census open: a generation that closes, or a
 historical replay that resets the traversal, while a key is still owed (a file
 still being written, an upload not yet acknowledged) hands it to the next one,
-counted as `carried`. A healthy traversal queues an
+counted as `carried`. A healthy traversal with no refused input queues an
 unmatched key again, so a failed upload is retried. While owed,
 unmoved evidence re-reads nothing until the traversal's bounded retry
 deadline, when they are queued once and the deadline re-arms;

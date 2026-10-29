@@ -13881,12 +13881,13 @@ fn owed_page(
 
 /// Hold rule, N1 variant. A committed large rollout grows while its
 /// reduction inputs are unavailable: each cursor start is refused and the key
-/// is owed. Unmoved evidence before the retry deadline reads nothing. It
-/// idles past the 7-day window and the bounded retry walks it anyway. A
-/// passed deadline with the inputs still missing wakes one counted cheap
-/// check and reads no body. Once the inputs return it is caught up by exactly
-/// one Tail from the retained prefix (zero Full), emitted once and equal to a
-/// cold Full, and released by the next page that finds it accepted.
+/// is owed. Round 6: the refusal is not unreadable, so each generation (one
+/// page here) completes, carries the key and retries it once by its walk, a
+/// counted cheap check that reads no body; no retry deadline is armed. It
+/// idles past the 7-day window and is walked anyway. Once the inputs return
+/// it is caught up by exactly one Tail from the retained prefix (zero Full),
+/// emitted once and equal to a cold Full, and released by the next page that
+/// finds it accepted.
 #[test]
 fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -13965,30 +13966,31 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
         assert_eq!(deferred(), 2, "moved evidence retries once");
         assert_eq!((modes, held.snapshots.len()), ((0, 0), 0));
         assert!(owed(&index));
-        // Unmoved evidence before the re-armed retry deadline: no read.
-        let (index, quiet, _) = page(index, 3, 410);
-        assert_eq!(deferred(), 2, "unchanged owed key: no attempt");
-        assert_eq!(quiet.scanned_file_count, 0);
+        // Unmoved: the next generation's walk retries it once, no body read.
+        // Before round 6 the red (unreadable) census waited for its retry
+        // deadline and made no attempt here.
+        let (index, quiet, modes) = page(index, 3, 410);
+        assert_eq!(deferred(), 3, "one cheap retry per generation");
+        assert_eq!((modes, quiet.snapshots.len()), ((0, 0), 0));
         // Idle past the window; a partially settled sweep makes the bounded
         // retry walk at day 8 with the inputs still missing.
         let mut index = index;
         index.mark_bounded_sweep_unsettled();
         let (index, held, _) = page(index, 8, 8 * day);
         // Before this slice the retry's walk aged the key out: no attempt.
-        assert_eq!(deferred(), 3, "the aged owed key is still walked");
+        assert_eq!(deferred(), 4, "the aged owed key is still walked");
         assert!(held.snapshots.is_empty());
         assert!(owed(&index));
         assert!(index.files.contains_key(&key), "its entry is kept");
-        // D2: past the re-armed deadline, still missing: one cheap, counted
-        // check, no body read.
+        // D2: a healthy walk arms no retry deadline, so no deadline wake;
+        // the generation's walk retries it, one cheap check, no body read.
         crate::local_resource_diagnostics::take_codex_owed_wake_for_test();
         let (index, woken, modes) = page(index, 9, 8 * day + 7_200);
-        assert_eq!(deferred(), 4, "the deadline queued it once");
+        assert_eq!(deferred(), 5, "one cheap retry per generation");
         assert_eq!((modes, woken.snapshots.len()), ((0, 0), 0), "no body read");
         assert!(owed(&index));
         let wake = crate::local_resource_diagnostics::take_codex_owed_wake_for_test();
-        assert_eq!(wake.get("events"), Some(&1));
-        assert!(wake.get("inventory_bytes").copied().unwrap_or(0) <= 65_537);
+        assert_eq!(wake, BTreeMap::new(), "no deadline wake");
         // The inputs return while the file idles: the bounded retry queues it
         // once and it is caught up by one Tail.
         refuse.set(false);
@@ -14009,13 +14011,16 @@ fn reduction_refused_growth_stays_owed_and_catches_up_by_one_tail() {
         let (index, accepted, modes) = page(index, 11, 10 * day);
         assert_eq!((modes, accepted.snapshots.len()), ((0, 0), 0));
         assert!(!owed(&index), "released once accepted");
+        let (mut owed_counts, released) =
+            crate::local_resource_diagnostics::take_codex_owed_for_test();
+        // Round 6: each healthy close carried it.
+        assert!(owed_counts.remove("carried").is_some());
         assert_eq!(
-            crate::local_resource_diagnostics::take_codex_owed_for_test(),
-            (
-                BTreeMap::from([("held", 1)]),
-                BTreeMap::from([("caught_up", 1)])
-            )
+            owed_counts,
+            BTreeMap::from([("held", 1)]),
+            "nothing dropped"
         );
+        assert_eq!(released, BTreeMap::from([("caught_up", 1)]));
         (tail, index)
     });
     // Nothing is read again, and the catch-up equals a cold Full.
@@ -14081,13 +14086,13 @@ fn owed_key_on_a_growing_file_does_not_hold_the_census() {
         crate::local_resource_diagnostics::take_codex_owed_for_test();
         refuse(true);
         fixture.append(SESSION, &token_line(81));
-        let (mut index, _, _) = page(index, 1, 100);
+        let (mut index, refused, _) = page(index, 1, 100);
         refuse(false);
         assert!(owed(&index), "premise: the refused key is owed");
-        // Past the retry deadline the bounded retry walks; the file is
-        // written before every page (inside the window).
+        // Round 6: the refusal is not unreadable, so its census may close.
+        let mut completed = usize::from(refused.census_complete);
+        // The file is written before every page (inside the window).
         index.mark_bounded_sweep_unsettled();
-        let mut completed = 0;
         for n in 0..4 {
             fixture.append(SESSION, &token_line(82 + n));
             let (next, scan, modes) = page(index, 8 + n, 1_000 + n * 600);
@@ -14095,6 +14100,11 @@ fn owed_key_on_a_growing_file_does_not_hold_the_census() {
             assert_eq!(modes, (0, 1), "page {n}: its growth by one Tail");
             assert!(owed(&index), "page {n}: still owed, never dropped");
             completed += usize::from(scan.census_complete);
+            // Lead B: at each close Σ buckets + unattributed = S, no reset.
+            let (c, [unattributed, _, invalid]) =
+                scan.causes.summary(scan.ownership_incomplete_file_count);
+            let total = c[..6].iter().sum::<usize>() + unattributed;
+            assert_eq!((total, invalid), (scan.ownership_incomplete_file_count, 0));
         }
         // Before round 4 the owed key held every one of these censuses open.
         assert!(completed >= 3, "the census is not held open: {completed}");
@@ -14158,7 +14168,7 @@ fn owed_release_after(lose: impl Fn(ScanIndex, &mut Arc<SharedCache>) -> ScanInd
         assert!(owed(&index), "premise: owed");
         let index = lose(index, &mut cache);
         assert!(owed(&index), "the owed set survives");
-        // Past the retry deadline the wake queues it once.
+        // The next generation's walk queues it once.
         let (index, tail, modes) = page(index, &cache, 2, 1_000);
         let reasons = OWED_FULL_REASONS.with(std::cell::Cell::get);
         assert_eq!((modes, reasons), ((0, 1), [0; 11]), "one Tail, no Full");
@@ -14171,7 +14181,9 @@ fn owed_release_after(lose: impl Fn(ScanIndex, &mut Arc<SharedCache>) -> ScanInd
         let (index, _, modes) = page(index, &cache, 3, 1_060);
         assert_eq!(modes, (0, 0));
         assert!(!owed(&index));
-        let (owed_counts, released) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        let (mut owed_counts, released) =
+            crate::local_resource_diagnostics::take_codex_owed_for_test();
+        owed_counts.remove("carried"); // Round 6: healthy closes carry it.
         assert_eq!(
             owed_counts,
             BTreeMap::from([("held", 1)]),
@@ -14250,12 +14262,71 @@ fn reduction_refused_owed_key_is_released_when_removed() {
         let (index, gone, modes) = page(index, 2, 101);
         assert_eq!((modes, gone.scanned_file_count), ((0, 0), 0));
         assert!(hold(&index).map_or(true, |hold| !hold.owed.contains(&key)));
+        let (mut owed_counts, released) =
+            crate::local_resource_diagnostics::take_codex_owed_for_test();
+        owed_counts.remove("carried"); // Round 6: a healthy close carries it.
+        assert_eq!(owed_counts, BTreeMap::from([("held", 1)]));
+        assert_eq!(released, BTreeMap::from([("removed", 1)]));
+    });
+}
+
+/// Round 6 (E2 item 1; Lead A; Lead B a, b): an InputsUnavailable refusal
+/// mid-page is transient and owed, never unreadable. The census completes
+/// healthy (no restart, no retry deadline) and carries the key once, with
+/// nothing dropped. The key is never retired: its prior accepted entry and
+/// witness are unchanged, and the page emits nothing for it ($0 or state-only).
+#[test]
+fn inputs_unavailable_refusal_completes_the_census_and_carries_the_key() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let key = local_index_key(&fixture.file(SESSION));
+    let cache = Arc::new(SharedCache::default());
+    let refuse = |on: bool| super::super::TEST_REFUSE_REDUCTION_DEPENDENCIES.with(|v| v.set(on));
+    with_test_limits(2048, 1024, 64, || {
+        let mut index = ScanIndex::default();
+        for step in 0..64 {
+            index = owed_page(&fixture, index, &cache, &collected_at(step)).0;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let entry = |index: &ScanIndex| serde_json::to_value(index.files.get(&key)).unwrap();
+        let accepted = entry(&index);
+        assert!(index.files.contains_key(&key), "premise: an accepted entry");
+        crate::local_resource_diagnostics::take_codex_owed_for_test();
+        super::super::test_hooks::clear();
+        refuse(true);
+        fixture.append(SESSION, &token_line(81));
+        let (index, refused, _) = owed_page(&fixture, index, &cache, &collected_at(100));
+        refuse(false);
         assert_eq!(
-            crate::local_resource_diagnostics::take_codex_owed_for_test(),
-            (
-                BTreeMap::from([("held", 1)]),
-                BTreeMap::from([("removed", 1)])
-            )
+            counter(&cache, |c| c.jobs_deferred_inputs),
+            1,
+            "premise: N1"
         );
+        // Before round 6 the refusal was unreadable: a red census, no close.
+        let reduction = crate::codex_scan_diagnostics::UnreadableCause::Reduction as usize;
+        assert!(!super::super::test_hooks::unreadable().contains(&reduction));
+        assert_eq!(refused.unreadable_path_count, 0);
+        assert!(refused.census_complete, "the census completes");
+        let traversal = index.traversal.as_ref().expect("the next generation");
+        assert!(!traversal.counts.has_errors());
+        assert_eq!(traversal.unhealthy_retry_not_before_unix_seconds, None);
+        let hold = traversal.residue.codex_inventory_hold.as_ref();
+        assert!(hold.is_some_and(|hold| hold.owed.contains(&key)), "carried");
+        let (owed_counts, _) = crate::local_resource_diagnostics::take_codex_owed_for_test();
+        assert_eq!(
+            owed_counts,
+            BTreeMap::from([("carried", 1), ("held", 1)]),
+            "nothing dropped"
+        );
+        // Lead B (a, b): never absent, no credit before the ACKed release.
+        assert_eq!(entry(&index), accepted, "accepted entry and witness kept");
+        assert!(refused
+            .snapshots
+            .iter()
+            .all(|s| s.source_session_id != SESSION));
     });
 }

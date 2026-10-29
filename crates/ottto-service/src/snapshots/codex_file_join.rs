@@ -3128,6 +3128,12 @@ pub(super) mod tests {
         );
         let (owed, _) = crate::local_resource_diagnostics::take_codex_owed_for_test();
         assert_eq!(owed.get("dropped"), None);
+        // E2 pin: the kept traversal is the NEW generation (started at the
+        // close, the new #867 marker), so it carries none of the closed
+        // sweep's contributions.
+        let kept = index.traversal.as_ref().unwrap();
+        assert_eq!(kept.census_window_end, restarted_at);
+        assert!(kept.counts.causes.is_empty(), "{:?}", kept.counts.causes);
         // The old generation's contributions, on its last line.
         let (old, [_, old_marker, _]) = summary(&restart);
         assert!(old[INVENTORY] > 0, "{old:?}");
