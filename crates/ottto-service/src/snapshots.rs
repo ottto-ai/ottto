@@ -47732,61 +47732,66 @@ impl ScanIndex {
             ));
         }
         self.retire_committed_claude_account_pending_windows();
-        self.measure_claude_usage_pending_settlement();
-        let previous_generation = self.generation;
-        self.schema_version = SCAN_INDEX_SCHEMA_VERSION;
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("local snapshot scan index generation overflow"))?;
-        if let Err(error) = lenient_decode::check_held_output(self) {
-            self.generation = previous_generation;
-            return Err(error);
-        }
-        match scan_index_integration::publish_at(path, self) {
-            Ok(Some(state)) => {
-                self.persistence_root = Some(state);
-                self.persistence_legacy_recovery = None;
-                return Ok(());
-            }
-            Ok(None) => {} // Standalone legacy files retain their existing path.
-            Err(error) => {
-                if let Some(published) =
-                    error.downcast_ref::<scan_index_persistence::CommitPublished>()
-                {
-                    self.generation = published.generation;
-                    self.persistence_root = None;
-                    self.persistence_legacy_recovery = None;
-                } else {
-                    self.generation = previous_generation;
-                }
+        let usage_pending = self.prepare_claude_usage_pending_settlement();
+        let result = (|| -> Result<()> {
+            let previous_generation = self.generation;
+            self.schema_version = SCAN_INDEX_SCHEMA_VERSION;
+            self.generation = self
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("local snapshot scan index generation overflow"))?;
+            if let Err(error) = lenient_decode::check_held_output(self) {
+                self.generation = previous_generation;
                 return Err(error);
             }
-        }
-        // Never truncate the live index in place. The flock serializes new
-        // daemons; the v2-only path isolates this state from older daemons.
-        let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        let mut file = File::create(&temp_path)
-            .with_context(|| format!("create scan index temp {}", temp_path.display()))?;
-        let result = (|| -> Result<()> {
-            {
-                let mut writer = BufWriter::new(&mut file);
-                lenient_decode::write_index(&mut writer, self)
-                    .with_context(|| format!("write scan index temp {}", temp_path.display()))?;
-                writer
-                    .flush()
-                    .with_context(|| format!("flush scan index temp {}", temp_path.display()))?;
+            match scan_index_integration::publish_at(path, self) {
+                Ok(Some(state)) => {
+                    self.persistence_root = Some(state);
+                    self.persistence_legacy_recovery = None;
+                    return Ok(());
+                }
+                Ok(None) => {} // Standalone legacy files retain their existing path.
+                Err(error) => {
+                    if let Some(published) =
+                        error.downcast_ref::<scan_index_persistence::CommitPublished>()
+                    {
+                        self.generation = published.generation;
+                        self.persistence_root = None;
+                        self.persistence_legacy_recovery = None;
+                    } else {
+                        self.generation = previous_generation;
+                    }
+                    return Err(error);
+                }
             }
-            file.sync_all()
-                .with_context(|| format!("sync scan index temp {}", temp_path.display()))?;
-            fs::rename(&temp_path, path)
-                .with_context(|| format!("replace scan index {}", path.display()))?;
-            sync_checkpoint_parent(path)
+            // Never truncate the live index in place. The flock serializes new
+            // daemons; the v2-only path isolates this state from older daemons.
+            let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+            let mut file = File::create(&temp_path)
+                .with_context(|| format!("create scan index temp {}", temp_path.display()))?;
+            let result = (|| -> Result<()> {
+                {
+                    let mut writer = BufWriter::new(&mut file);
+                    lenient_decode::write_index(&mut writer, self).with_context(|| {
+                        format!("write scan index temp {}", temp_path.display())
+                    })?;
+                    writer.flush().with_context(|| {
+                        format!("flush scan index temp {}", temp_path.display())
+                    })?;
+                }
+                file.sync_all()
+                    .with_context(|| format!("sync scan index temp {}", temp_path.display()))?;
+                fs::rename(&temp_path, path)
+                    .with_context(|| format!("replace scan index {}", path.display()))?;
+                sync_checkpoint_parent(path)
+            })();
+            if result.is_err() {
+                self.generation = previous_generation;
+                let _ = fs::remove_file(&temp_path);
+            }
+            result
         })();
-        if result.is_err() {
-            self.generation = previous_generation;
-            let _ = fs::remove_file(&temp_path);
-        }
+        usage_pending.finish(self, result.is_ok());
         result
     }
 

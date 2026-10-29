@@ -265,6 +265,8 @@ pub(super) struct Counts {
     // hide the B3 backlog. They are never added to the disjoint totals above.
     pub(super) owner_gates: BTreeMap<Refusal, Weight>,
     pub(super) byte_measurement_failed: u64,
+    pub(super) compacted: Weight,
+    pub(super) compaction_scratch_refused: Weight,
 }
 
 fn pending_bytes(pending: &ClaudeUsageFamilyPending) -> Option<u64> {
@@ -286,46 +288,152 @@ fn pending_bytes(pending: &ClaudeUsageFamilyPending) -> Option<u64> {
     Some(counter.0)
 }
 
+// Per selected save attempt after CAS checks, before publication; not a
+// cumulative count, successful-save receipt or frozen-copy measurement.
+fn classify_index(
+    index: &ScanIndex,
+    mut settled: impl FnMut(&str, &ClaudeUsageFamilyWitness, u64),
+) -> Counts {
+    let mut counts = Counts::default();
+    if index.claude_usage_family_pending.is_empty() {
+        return counts;
+    }
+    let inventory = inventory(index);
+    for (root, pending) in &index.claude_usage_family_pending {
+        let bytes = pending_bytes(pending).unwrap_or_else(|| {
+            counts.byte_measurement_failed += 1;
+            0
+        });
+        counts.considered.add(bytes);
+        if let Err(reason) = accepted_usage_receipt(index, root) {
+            counts.owner_gates.entry(reason).or_default().add(bytes);
+        }
+        if let Err(reason) = retry_carry_replacement(index, root) {
+            counts.owner_gates.entry(reason).or_default().add(bytes);
+        }
+        let result = match &inventory {
+            Some(inventory) => settlement(index, root, pending, inventory.get(root.as_str())),
+            None => Settlement::Refused(Refusal::Scratch),
+        };
+        match result {
+            Settlement::Settled(commitment) => {
+                // H commitment exists only when the exact receipt gate earns it.
+                settled(root, commitment, bytes);
+                counts.settled.add(bytes);
+            }
+            Settlement::Refused(reason) => counts.refused.entry(reason).or_default().add(bytes),
+        }
+    }
+    counts
+}
+
+// Own predecessors until the existing atomic index publication succeeds. No
+// token graphs are cloned; a failed save restores the same pending records.
+pub(super) struct Prepared {
+    previous: Vec<(String, ClaudeUsageFamilyPending)>,
+}
+impl Prepared {
+    fn compact(&mut self, index: &mut ScanIndex, root: String) -> u64 {
+        let pending = index
+            .claude_usage_family_pending
+            .get_mut(&root)
+            .expect("classified root");
+        let bytes = pending_bytes(pending).unwrap_or(0);
+        let skeleton = compacted_skeleton(pending);
+        let previous = std::mem::replace(pending, skeleton);
+        self.previous.push((root, previous));
+        bytes
+    }
+    pub(super) fn finish(self, index: &mut ScanIndex, published: bool) {
+        if !published {
+            for (root, pending) in self.previous {
+                index.claude_usage_family_pending.insert(root, pending);
+            }
+        }
+    }
+}
+
+fn compacted_skeleton(pending: &ClaudeUsageFamilyPending) -> ClaudeUsageFamilyPending {
+    ClaudeUsageFamilyPending {
+        census_window_end: pending.census_window_end.clone(),
+        member_request_id_hashes: pending
+            .membership()
+            .iter()
+            .map(|(member, hashes)| (member.clone(), hashes.iter().cloned().collect()))
+            .collect(),
+        member_occurrences: BTreeMap::new(),
+        invalid: pending.invalid,
+        idless_revision: pending.idless_revision,
+        derived_request_members: BTreeSet::new(),
+    }
+}
+
+// Price the new exact keys and candidate/rollback slots before cloning. The
+// old occurrences move into Prepared until publication; no second token copy.
+fn price_compaction(
+    root: &str,
+    pending: &ClaudeUsageFamilyPending,
+    cost: &mut crate::heap_layout_bound::Counter,
+) -> Option<()> {
+    use crate::heap_layout_bound::tree_nodes;
+    cost.add(root.len().checked_mul(2)?)?;
+    cost.add(pending.census_window_end.len())?;
+    cost.add(std::mem::size_of::<(String, ClaudeUsageFamilyPending)>().checked_mul(4)?)?;
+    tree_nodes::<String, BTreeSet<String>>(pending.membership().keys().count(), cost)?;
+    for (member, hashes) in pending.membership().iter() {
+        cost.add(member.len())?;
+        tree_nodes::<String, ()>(hashes.len(), cost)?;
+        for hash in hashes.iter() {
+            cost.add(hash.len())?;
+        }
+    }
+    Some(())
+}
+
 impl ScanIndex {
-    // Per selected save attempt after CAS checks, before publication; not a
-    // cumulative count, successful-save receipt or frozen-copy measurement.
-    pub(super) fn measure_claude_usage_pending_settlement(&self) -> Counts {
-        let mut counts = Counts::default();
-        if self.claude_usage_family_pending.is_empty() {
-            return counts;
+    pub(super) fn prepare_claude_usage_pending_settlement(&mut self) -> Prepared {
+        let mut candidates = Vec::new();
+        let mut scratch_refused = Weight::default();
+        let mut cost =
+            crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+        let mut counts = classify_index(self, |root, _commitment, bytes| {
+            let pending = &self.claude_usage_family_pending[root];
+            if price_compaction(root, pending, &mut cost).is_none()
+                || candidates.try_reserve(1).is_err()
+            {
+                scratch_refused.add(bytes);
+            } else {
+                candidates.push(root.to_owned());
+            }
+        });
+        counts.compaction_scratch_refused = scratch_refused;
+        let mut prepared = Prepared {
+            previous: Vec::new(),
+        };
+        // Reserve before mutation; allocation refusal keeps every occurrence.
+        if prepared
+            .previous
+            .try_reserve_exact(candidates.len())
+            .is_ok()
+        {
+            for root in candidates {
+                counts.compacted.add(prepared.compact(self, root));
+            }
+        } else {
+            for root in candidates {
+                counts
+                    .compaction_scratch_refused
+                    .add(pending_bytes(&self.claude_usage_family_pending[&root]).unwrap_or(0));
+            }
         }
-        let inventory = inventory(self);
-        for (root, pending) in &self.claude_usage_family_pending {
-            let bytes = pending_bytes(pending).unwrap_or_else(|| {
-                counts.byte_measurement_failed += 1;
-                0
-            });
-            counts.considered.add(bytes);
-            if let Err(reason) = accepted_usage_receipt(self, root) {
-                counts.owner_gates.entry(reason).or_default().add(bytes);
-            }
-            if let Err(reason) = retry_carry_replacement(self, root) {
-                counts.owner_gates.entry(reason).or_default().add(bytes);
-            }
-            let result = match &inventory {
-                Some(inventory) => settlement(self, root, pending, inventory.get(root.as_str())),
-                None => Settlement::Refused(Refusal::Scratch),
-            };
-            match result {
-                Settlement::Settled(commitment) => {
-                    // H commitment exists only when the exact receipt gate earns it.
-                    let _ = commitment;
-                    counts.settled.add(bytes);
-                }
-                Settlement::Refused(reason) => counts.refused.entry(reason).or_default().add(bytes),
-            }
+        if counts.considered.families != 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "claude_usage_pending_settlement_attempt",
+                "claude",
+                &counts,
+            );
         }
-        crate::local_resource_diagnostics::traversal_point(
-            "claude_usage_pending_settlement_attempt",
-            "claude",
-            &counts,
-        );
-        counts
+        prepared
     }
 }
 
@@ -501,7 +609,7 @@ mod tests {
     #[test]
     fn byte_counter_uses_existing_wire_bytes_and_both_gates_are_visible() {
         let index = fixture();
-        let counts = index.measure_claude_usage_pending_settlement();
+        let counts = classify_index(&index, |_, _, _| {});
         let bytes = serde_json::to_vec(&index.claude_usage_family_pending[ROOT])
             .unwrap()
             .len() as u64;
@@ -525,5 +633,62 @@ mod tests {
             bytes
         );
         assert_eq!(counts.byte_measurement_failed, 0);
+    }
+    #[test]
+    fn compacted_keys_and_commitment_survive_two_wire_restarts_and_failure_restores_values() {
+        let mut index = fixture();
+        let original = index.claude_usage_family_pending[ROOT].clone();
+        let witness = index.claude_usage_family_witnesses[ROOT].clone();
+        let mut prepared = Prepared {
+            previous: Vec::with_capacity(1),
+        };
+        prepared.compact(&mut index, ROOT.into());
+        let compacted = &index.claude_usage_family_pending[ROOT];
+        assert!(compacted.member_occurrences.is_empty());
+        assert_eq!(
+            serde_json::to_value(compacted.membership()).unwrap(),
+            serde_json::to_value(original.membership()).unwrap()
+        );
+        assert_eq!(index.claude_usage_family_witnesses[ROOT], witness);
+        // Exercise the actual rollback used for any failed publication.
+        prepared.finish(&mut index, false);
+        assert_eq!(index.claude_usage_family_pending[ROOT], original);
+        let mut committed = Prepared {
+            previous: Vec::with_capacity(1),
+        };
+        committed.compact(&mut index, ROOT.into());
+        committed.finish(&mut index, true);
+        let mut skeleton = index.claude_usage_family_pending[ROOT].clone();
+        for _ in 0..2 {
+            skeleton = serde_json::from_slice(&serde_json::to_vec(&skeleton).unwrap()).unwrap();
+            assert!(skeleton.member_occurrences.is_empty());
+            assert_eq!(
+                serde_json::to_value(skeleton.membership()).unwrap(),
+                serde_json::to_value(original.membership()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn production_owner_gates_preserve_pending_and_accepted_state_across_two_restarts() {
+        let mut index = fixture();
+        let pending = index.claude_usage_family_pending[ROOT].clone();
+        let accepted = index.accepted_snapshot_fingerprints.clone();
+        let file_heads = serde_json::to_value(&index.files).unwrap();
+        for _ in 0..2 {
+            let prepared = index.prepare_claude_usage_pending_settlement();
+            assert!(prepared.previous.is_empty());
+            prepared.finish(&mut index, true);
+            assert_eq!(index.claude_usage_family_pending[ROOT], pending);
+            assert_eq!(index.accepted_snapshot_fingerprints, accepted);
+            assert_eq!(serde_json::to_value(&index.files).unwrap(), file_heads);
+            let restored = serde_json::from_slice(
+                &serde_json::to_vec(&index.claude_usage_family_pending[ROOT]).unwrap(),
+            )
+            .unwrap();
+            index
+                .claude_usage_family_pending
+                .insert(ROOT.into(), restored);
+        }
     }
 }
