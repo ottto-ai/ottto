@@ -2641,8 +2641,12 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
         // The old uniform-retry expectation would manufacture that identity.
         assert!(item.request_evidence.is_empty());
         assert!(rows_of(&item).all(|row| row.identity_parts.is_none()
-            && row.evidence_ref.is_none() && row.account_identifier_hash.is_none()));
-        assert_eq!(item.request_identity_refusals, 1, "the bucket row lost proof");
+            && row.evidence_ref.is_none()
+            && row.account_identifier_hash.is_none()));
+        assert_eq!(
+            item.request_identity_refusals, 1,
+            "the bucket row lost proof"
+        );
         assert_evidence_referenced(&item);
         cleanup(&[&a, &b]);
     });
