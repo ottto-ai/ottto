@@ -5088,7 +5088,7 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
         if source_snapshots.is_empty() {
             continue;
         }
-        let relay_token = match client.issue_relay_token(&device, &device_secret, source) {
+        let relay_token = match client.issue_status_relay_token(&device, &device_secret, source) {
             Ok(token) => token,
             Err(error) => {
                 transport_cycle.note_error(&error);
@@ -5818,7 +5818,7 @@ fn prepare_sync_source_inner(
         diagnostic.emit();
     }
     let scan_started_at = current_rfc3339();
-    let relay_token = client.issue_relay_token(device, device_secret, source)?;
+    let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
     // Treat the activity hint as the only authority for the semantic evidence
     // window. Missing/malformed hints already fail JSON decoding; future

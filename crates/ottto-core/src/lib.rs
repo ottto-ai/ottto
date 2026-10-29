@@ -9,6 +9,7 @@ pub mod local_client;
 pub mod local_service;
 pub mod provider_call_log;
 pub mod redaction;
+pub mod session_launch;
 #[cfg(unix)]
 pub mod state_dir_lock;
 pub mod status;

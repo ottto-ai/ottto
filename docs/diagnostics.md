@@ -22,6 +22,22 @@ owns the service, it is the version of the app in `~/Applications` or
 In every other case it is `unknown`. It is never taken from the service or CLI
 version, because the app and a Homebrew install can be at different versions.
 
+## Account-bound terminal launch
+
+Session launch blocks travel over authenticated local control. Reasons include
+`slot_not_found`, `slot_needs_login`, `slot_not_verified`, `account_mismatch`,
+`cli_not_found`, `cli_version_unsupported`, `cloud_provider_route`, `api_key_route`,
+`settings_env_override`, `settings_unreadable`, `settings_malformed`,
+`config_unsupported`, `forced_login_method`, `forced_org_mismatch`,
+`codex_provider_not_openai`, `codex_api_key_login`, `folder_missing`,
+`folder_not_directory`, `folder_not_local`, `folder_invalid`, `folder_changed`,
+`launcher_dir_unsafe`, `launch_expired`, `launch_already_used`, `launch_unknown`,
+`launch_cancelled`, `launch_limit`, `chdir_failed`, and `exec_failed`.
+The block can name a typed settings layer, never its values or paths. Launch
+status is `pending`, `starting`, `blocked` or `expired`; no successful exec or
+running agent is inferred. These features add no path or nickname diagnostics.
+See [the local handoff contract](session-launch.md).
+
 ## Claude Local Evidence Health
 
 Local collection includes a `claude_local_evidence` section with separate API

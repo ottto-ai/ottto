@@ -196,6 +196,21 @@ impl FileCodexAccountSlotSettingsStore {
         Ok(status_contract(&persisted))
     }
 
+    /// Read-only local launch/history projection. A pending deletion is
+    /// refused, never recovered by an unrelated user action.
+    pub fn load_for_session_launch(
+        &self,
+    ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
+        let persisted = self.read_persisted()?;
+        self.validate_persisted(&persisted)?;
+        if !persisted.deleting_managed_slot_ids.is_empty() {
+            return Err(CodexAccountSlotSettingsError::State(
+                "Codex slot removal is pending".into(),
+            ));
+        }
+        Ok(status_contract(&persisted))
+    }
+
     pub fn registered_bindings(
         &self,
     ) -> Result<Vec<CodexRegisteredSlotBinding>, CodexAccountSlotSettingsError> {

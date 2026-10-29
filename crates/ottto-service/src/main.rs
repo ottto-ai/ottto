@@ -609,6 +609,7 @@ fn run_startup_step(step: StartupStep) {
             }
         }
         StartupStep::RecoverClaudeBrowserAuth => {
+            ottto_service::session_launch::recover_at_startup();
             ottto_service::claude_browser_auth::recover_at_startup()
         }
         StartupStep::RecoverCodexSignIn => ottto_service::codex_sign_in::recover_at_startup(),
