@@ -5277,70 +5277,82 @@ fn o3_completion_replaces_no_match_idle_zero_restart_tail_and_money_equals_cold(
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
 fn o3_save_failure_cancelled_claim_restart_uses_paced_recovery_and_terminates() {
-    let _gate = claude_request_money::e2::GateForTest::set(true);
-    let f = O3Fixture::new();
-    f.append("growth", 200);
-    let owner = f.owner();
-    let mut prior = f.prior.clone();
-    let mut owned = b1g_owned(&owner, &f.roots, &f.root, &prior);
-    let reads = UPGRADE_OBSERVED.with(|v| v.get());
-    let mut refused = false;
-    for turn in 0..100_000 {
-        assert!(turn < 99_999, "must reach claim");
-        match owned.step(None) {
-            OwnedSourceScanStep::Pending(mut next) => {
-                if next.index.reread_guard.needs_save() && !refused {
-                    assert!(next
-                        .persist_reread_reservations(&mut prior, &f.path.join("bad-index"))
-                        .is_err());
-                    assert!(!next.index.reread_guard.upgrade_claimed(&f.key));
-                    assert_eq!(UPGRADE_OBSERVED.with(|v| v.get()), reads);
-                    refused = true;
+    for cleared in [false, true] {
+        let _gate = claude_request_money::e2::GateForTest::set(true);
+        let f = O3Fixture::new();
+        f.append("growth", 200);
+        let owner = f.owner();
+        let mut prior = f.prior.clone();
+        let mut owned = b1g_owned(&owner, &f.roots, &f.root, &prior);
+        let reads = UPGRADE_OBSERVED.with(|v| v.get());
+        let mut refused = false;
+        for turn in 0..100_000 {
+            assert!(turn < 99_999, "must reach claim");
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(mut next) => {
+                    if next.index.reread_guard.needs_save() && !refused {
+                        assert!(next
+                            .persist_reread_reservations(&mut prior, &f.path.join("bad-index"))
+                            .is_err());
+                        assert!(!next.index.reread_guard.upgrade_claimed(&f.key));
+                        assert_eq!(UPGRADE_OBSERVED.with(|v| v.get()), reads);
+                        refused = true;
+                    }
+                    next.persist_reread_reservations(&mut prior, &f.index_path)
+                        .unwrap();
+                    if next.index.reread_guard.upgrade_claimed(&f.key) && next.active_file.is_some()
+                    {
+                        assert!(refused);
+                        assert_eq!(
+                            next.active_file
+                                .as_ref()
+                                .unwrap()
+                                .parser
+                                .reader
+                                .consumed_bytes(),
+                            0
+                        );
+                        assert_eq!(UPGRADE_OBSERVED.with(|v| v.get()), reads);
+                        drop(next); // process death after saved claim, before first native I/O
+                        break;
+                    }
+                    owned = next;
                 }
-                next.persist_reread_reservations(&mut prior, &f.index_path)
-                    .unwrap();
-                if next.index.reread_guard.upgrade_claimed(&f.key) && next.active_file.is_some() {
-                    assert!(refused);
-                    assert_eq!(
-                        next.active_file
-                            .as_ref()
-                            .unwrap()
-                            .parser
-                            .reader
-                            .consumed_bytes(),
-                        0
-                    );
-                    assert_eq!(UPGRADE_OBSERVED.with(|v| v.get()), reads);
-                    drop(next); // process death after saved claim, before first native I/O
-                    break;
-                }
-                owned = next;
+                OwnedSourceScanStep::Complete { .. } => panic!("claim must precede completion"),
             }
-            OwnedSourceScanStep::Complete { .. } => panic!("claim must precede completion"),
         }
+        assert_eq!(std::fs::read(&f.record_path).unwrap(), f.survivor);
+        let restarted = f.owner();
+        let mut saved = ScanIndex::load(&f.index_path).unwrap();
+        if cleared {
+            saved
+                .files
+                .get_mut(&f.key)
+                .unwrap()
+                .source_file_fingerprint
+                .clear();
+        }
+        let before = saved.clone();
+        let ((mut index, mut scan, modes), bytes) =
+            observe_consumed(|| f.scan(&restarted, &mut saved));
+        assert_eq!(modes, (1, 0, 0));
+        assert_eq!(bytes, std::fs::metadata(&f.path).unwrap().len());
+        let counts = restarted
+            .cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .unwrap()
+            .0;
+        assert_eq!(
+            (counts.upgrade_claimed, counts.upgrade_state_missing),
+            (0, 0),
+            "durable A5 spend never refunded"
+        );
+        assert_eq!(counts.retail_full[0], 1, "existing resource recovery cause");
+        assert_eq!(scan.unreadable_path_count, 0);
+        f.assert_cold(before, &mut index, &mut scan);
+        assert_eq!(f.commit(&restarted, &mut index, &scan).written, 1);
+        assert_ne!(std::fs::read(&f.record_path).unwrap(), f.survivor);
     }
-    assert_eq!(std::fs::read(&f.record_path).unwrap(), f.survivor);
-    let restarted = f.owner();
-    let mut saved = ScanIndex::load(&f.index_path).unwrap();
-    let before = saved.clone();
-    let ((mut index, mut scan, modes), bytes) = observe_consumed(|| f.scan(&restarted, &mut saved));
-    assert_eq!(modes, (1, 0, 0));
-    assert_eq!(bytes, std::fs::metadata(&f.path).unwrap().len());
-    let counts = restarted
-        .cache
-        .durable_counters(SnapshotSource::ClaudeCode)
-        .unwrap()
-        .0;
-    assert_eq!(
-        (counts.upgrade_claimed, counts.upgrade_state_missing),
-        (0, 0),
-        "durable A5 spend never refunded"
-    );
-    assert_eq!(counts.retail_full[0], 1, "existing resource recovery cause");
-    assert_eq!(scan.unreadable_path_count, 0);
-    f.assert_cold(before, &mut index, &mut scan);
-    assert_eq!(f.commit(&restarted, &mut index, &scan).written, 1);
-    assert_ne!(std::fs::read(&f.record_path).unwrap(), f.survivor);
 }
 
 #[test]
@@ -5579,4 +5591,61 @@ fn o3_custody_capacity_fails_toward_counted_read_without_mutating_survivor() {
     assert_eq!(counts.upgrade_state_missing, 0);
     assert_eq!(f.commit(&owner, &mut index, &scan).written, 0);
     assert_eq!(std::fs::read(&f.record_path).unwrap(), f.survivor);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires native retained layout")]
+fn o3_changed_object_and_scope_memo_capacity_read_without_replacement_authority() {
+    let _gate = claude_request_money::e2::GateForTest::set(true);
+    for arm in ["object", "scope-capacity"] {
+        let f = O3Fixture::new();
+        let old = std::fs::metadata(&f.path).unwrap();
+        if arm == "object" {
+            let replacement = f.path.with_extension("replacement");
+            std::fs::write(&replacement, a1a_row("accepted", 100)).unwrap();
+            std::fs::rename(replacement, &f.path).unwrap();
+            assert_ne!(old.ino(), std::fs::metadata(&f.path).unwrap().ino());
+        }
+        f.append("growth", 200);
+        let owner = f.owner();
+        if arm == "scope-capacity" {
+            let mut stores = owner.cache.durable().unwrap();
+            let slot = stores.claude.as_mut().unwrap();
+            for n in 0..2 * store::MAX_RECORDS {
+                slot.decided
+                    .insert(format!("other-{n}"), Scope("bounded".into()));
+            }
+        }
+        let mut saved = f.prior.clone();
+        let before = saved.clone();
+        let ((mut index, mut scan, modes), bytes) = observe_consumed(|| f.scan(&owner, &mut saved));
+        assert_eq!(
+            modes,
+            (1, 0, 0),
+            "{arm}: growing source remains collectible"
+        );
+        assert_eq!(bytes, std::fs::metadata(&f.path).unwrap().len());
+        assert_eq!(scan.unreadable_path_count, 0);
+        f.assert_cold(before, &mut index, &mut scan);
+        let counts = owner
+            .cache
+            .durable_counters(SnapshotSource::ClaudeCode)
+            .unwrap()
+            .0;
+        assert_eq!(counts.retail_full[0], 1, "{arm}: resource read counted");
+        assert_eq!(counts.upgrade_state_missing, 0, "{arm}: no invented A5");
+        assert_eq!(f.commit(&owner, &mut index, &scan).written, 0);
+        assert_eq!(
+            std::fs::read(&f.record_path).unwrap(),
+            f.survivor,
+            "{arm}: no mutation grant"
+        );
+        // After publication, a quiet restart has no unpaid growth to age out.
+        let restarted = f.owner();
+        let mut saved = ScanIndex::load(&f.index_path).unwrap();
+        let ((_, scan, modes), bytes) = observe_consumed(|| f.scan(&restarted, &mut saved));
+        assert_eq!(modes.0, 0);
+        assert_eq!(bytes, 0);
+        assert_eq!(scan.unreadable_path_count, 0);
+    }
 }

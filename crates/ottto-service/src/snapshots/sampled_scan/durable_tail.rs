@@ -1213,7 +1213,14 @@ impl SharedCache {
         })();
         if matches!(
             result,
-            Err("o3.spent" | "o3.custody" | "o3.store" | "o3.record" | "o3.survivor" | "o3.ram")
+            Err("o3.spent"
+                | "o3.custody"
+                | "o3.store"
+                | "o3.record"
+                | "o3.survivor"
+                | "o3.ram"
+                | "o3.scope_missing"
+                | "o3.object")
         ) {
             if let Some(a) =
                 accepted.filter(|a| a.revision <= effective_revision(SnapshotSource::ClaudeCode))

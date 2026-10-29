@@ -31666,6 +31666,8 @@ impl OwnedSourceScan {
             // Counted once the page actually reads the file (R2-M3): a fence
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
+            #[cfg(unix)]
+            let mut migration_floor = None;
             // U1a-2a G7: a side read's acquisition is a fresh `Full` read
             // under the side scope: no retained take, no admission observes
             // or counters, no debt. Failures are its charged attempt.
@@ -31837,8 +31839,6 @@ impl OwnedSourceScan {
                         context.cache.durable_note_scope(source, &key, &scope);
                         #[cfg(unix)]
                         let mut retail_attempt = None;
-                        #[cfg(unix)]
-                        let mut migration_floor = None;
                         #[cfg(unix)]
                         let (retained, taken_admission) = match retained {
                             None if allow_sample && !parser.reader.reader.is_compressed() => {
@@ -32323,7 +32323,8 @@ impl OwnedSourceScan {
                     && planned_mode.map_or(true, |(mode, _)| {
                         matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
                     })
-                    && (index.reread_guard.upgrade_claimed(&local_index_key(&active.candidate.path))
+                    && (migration_floor.is_some()
+                        || index.reread_guard.upgrade_claimed(&local_index_key(&active.candidate.path))
                         || index.files.get(&local_index_key(&active.candidate.path))
                             .is_some_and(|e| !e.source_file_fingerprint.is_empty()
                                 && active.candidate.size_bytes > e.size_bytes))
