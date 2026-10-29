@@ -606,6 +606,17 @@ fn w0_r5_cap_fallbacks_match_bodies() {
         grow(target);
         grow(&mut built.model_usage[0]);
         let result = identity::apply(&mut built, &contributions).unwrap();
+        if tagged == "new-cap-evidence-16" {
+            // Revised cap policy: this two-hour body can retain the newest
+            // eight keys; W0's old whole-item fallback is no longer required.
+            assert!(matches!(result, Tagged::Sent { refusals: 1 }), "{result:?}");
+            assert!(built.usage_buckets[0].model_usage[0].identity_parts.is_none());
+            assert!(built.usage_buckets[1].model_usage[0].identity_parts.is_some());
+            assert_eq!(built.request_evidence.len(), 8);
+            assert_eq!(identity::semantic_leaf(&built)["refused"], true);
+            sticky_assert_reconciled(&built);
+            continue;
+        }
         let Tagged::Fallback { refusals, .. } = result else {
             panic!("{tagged}: {result:?}")
         };
@@ -866,7 +877,11 @@ fn builder_enforces_the_declared_parts_per_item_cap() {
                     bucket_start: bucket_start.clone(),
                     row_key: row_key_from_model_usage(&row),
                     usage: holder_usage(&one, None),
-                    identity: telemetry(char::from(b'a' + login), 'd'),
+                    // All eleven keys must be valid lowercase hex. The old
+                    // a..k spelling made g..k refusal shares instead of keys.
+                    identity: RequestIdentity::Tagged(AuthorityKey {
+                        login: Some(format!("{login:064x}")), org: Some("d".repeat(64)), basis: identity::TELEMETRY,
+                    }),
                 });
             }
             rows.push(row);
