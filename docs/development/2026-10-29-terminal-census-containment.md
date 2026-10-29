@@ -36,13 +36,17 @@ continue. Completion-only folds, retirement, ACK carry, upload-context adoption
 and source-wide manifests stay off. Unread pending/body/ACK/hold witnesses stay
 owed. The parked traversal re-offers its terminal without a restart/re-arm;
 ordinary watcher hints can keep supplying changed bodies. Partial saves retain
-unsettled changed-file demand in the existing traversal queue; no fresh walk or
-fingerprint clear is needed. Native-comparison selected fallback still withholds
+unsettled changed-file demand on EVERY partial page (including pages before a
+terminal refusal) in the existing traversal queue; no fresh walk or fingerprint
+clear is needed. Refused removals likewise retain exact path revalidation demand;
+all staged removals are re-probed before raw effects or a manifest can commit. Native-comparison selected fallback still withholds
 and queues dependent bodies; deferral revokes eligibility without dropping it.
 
 Local terminal_fold_deferred diagnostics report roots and estimated/stat bytes,
 label cause=preflight or cause=read_allowance, and alarm. A process-local terminal_fold_deferred_consecutive counter alarms at
-three consecutive deferred passes; process restart resets this diagnostic.
+three consecutive deferred TERMINAL OFFERS; ordinary pages neither increment nor
+reset it. It is process-global, including across multi-page metadata sweeps;
+process restart resets this diagnostic.
 
 On the measured M4 cohort (thousands of retained roots), 100% of terminal offers
 will defer against the 64-key cap until the separate PAGED terminal fold lands.
@@ -75,3 +79,34 @@ Fixtures cover ordinary upload/ACK/settlement across parked passes, root/stat
 refusal, growth after preflight and during trace reads, witness retention,
 admitted completion, disabled full replay and conservative latch clearing.
 Tests run in CI; local validation uses the serialized package Clippy wrapper.
+
+Parked discovery recovers on daemon restart, watcher overflow/loss and a
+60-second process-local cadence while parked. Each metadata pass visits at most
+512 directory entries and eight directories (including resumed readers). New or
+changed native files enter ordinary selection. Matching durable size/mtime/birth
+metadata queues no read of an unchanged transcript. `parked_rewalk{dirs,new_files,
+entries}` counts this work. Existing pending_directories is the durable worklist;
+its census_member=false marker identifies metadata work, and reconciliation_after
+holds a NUL-prefixed entry offset while that work is active. The prefix sorts
+before absolute file keys for conservative old-reader reconciliation. No new
+persisted field. Restart rehydrates an iterator offset in bounded chunks; inserts
+before an offset are revisited by the next periodic sweep. The metadata iterator
+cache holds at most 64 process-local contexts. Discovery adds no ownership proof.
+
+A same-context, exhausted non-window carry (or its metadata re-walk) may drop its
+obsolete process certificate across restart without clearing fingerprints or
+restarting the traversal. Existing missing/mismatched provenance, full-window,
+capped and replay safety conditions remain. The underlying traversal-start/carry
+clear loops remain pre-existing R2 paths; this narrow parked-restore guard is part
+of the hotfix and needs core/edge review.
+
+Frozen terminal evidence preserves the baseline permissive page-cohort error
+boundary on incomplete offers. Retained strict reads fail per family. Changed or
+unknown API/trace generations become incomplete before raw commit and stay
+incomplete through frozen consumption; healthy decoded rows cannot override a
+failed generation validation. The same actual-byte allowance covers all reads.
+
+AccountReproof's pre-existing nonterminal fingerprint-version repair is not a
+completion-only clear. The deferral early return bypasses it on refused M4 offers;
+row 6's legacy membership/newly proven family corrections also require the census
+completion gates. Scoped corrections remain uncapped.

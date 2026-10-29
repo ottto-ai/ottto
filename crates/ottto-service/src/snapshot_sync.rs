@@ -6966,7 +6966,11 @@ fn finish_sync_source(
         }
         // Deferral demotes only terminal authority. Healthy current-page
         // bodies still finalize, upload, settle and save the parked traversal.
-        index.note_claude_terminal_fold_offer(stats.terminal_fold_deferred.is_some());
+        // Only terminal offers participate: ordinary pages in between neither
+        // reset nor increment this process-global diagnostic streak.
+        if index.claude_terminal_fold_checked() {
+            index.note_claude_terminal_fold_offer(stats.terminal_fold_deferred.is_some());
+        }
         if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
             eprintln!("local snapshot sync: claude context basis counts={counts}");
         }

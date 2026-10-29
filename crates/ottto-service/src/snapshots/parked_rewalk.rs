@@ -61,8 +61,19 @@ fn recover_parked_claude_metadata(index: &mut ScanIndex, overflowed: bool) {
             let offset = traversal.reconciliation_after.as_deref()
                 .and_then(|value| value.strip_prefix(PARKED_REWALK_CURSOR))
                 .and_then(|value| value.parse().ok()).unwrap_or(0);
+            // A moved/removed directory is no longer discovery work. This
+            // grants no file absence: terminal reconciliation probes files.
+            let metadata = fs::symlink_metadata(&directory.path);
+            if metadata.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                || metadata.as_ref().is_ok_and(|metadata| !metadata.is_dir() || metadata.file_type().is_symlink()) {
+                traversal.pending_directories.pop_front();
+                traversal.reconciliation_after = Some(format!("{PARKED_REWALK_CURSOR}0"));
+                state.reader = None;
+                dirs += 1;
+                continue;
+            }
             // No-follow directory metadata first, exactly as ordinary discovery.
-            let opened = fs::symlink_metadata(&directory.path).ok()
+            let opened = metadata.ok()
                 .filter(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
                 .and_then(|_| fs::read_dir(&directory.path).ok());
             state.path = directory.path.clone();

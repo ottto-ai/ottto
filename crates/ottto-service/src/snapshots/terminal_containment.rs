@@ -116,26 +116,11 @@ impl ScanIndex {
 
     pub(crate) fn note_claude_terminal_fold_offer(&mut self, deferred: bool) {
         // Process-local diagnostic only: reload/downgrade adds no state field.
-        #[cfg(not(test))]
         static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        #[cfg(test)]
-        thread_local! {
-            static PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-        }
-        #[cfg(not(test))]
-        let passes = {
-            use std::sync::atomic::Ordering;
-            PASSES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(if deferred { value.saturating_add(1) } else { 0 })
-            }).unwrap_or_else(|value| value)
-                .saturating_add(u64::from(deferred))
-        };
-        #[cfg(test)]
-        let passes = PASSES.with(|counter| {
-            let passes = if deferred { counter.get().saturating_add(1) } else { 0 };
-            counter.set(passes);
-            passes
-        });
+        use std::sync::atomic::Ordering;
+        let passes = PASSES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(if deferred { value.saturating_add(1) } else { 0 })
+        }).unwrap_or_else(|value| value).saturating_add(u64::from(deferred));
         if deferred {
             crate::local_resource_diagnostics::traversal_point(
                 "terminal_fold_deferred_consecutive",
