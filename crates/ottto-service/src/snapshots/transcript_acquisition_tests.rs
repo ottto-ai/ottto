@@ -2100,7 +2100,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             let mut published = None;
             for page in 1..=32 {
                 let collected_at = format!("2026-10-07T12:00:{page:02}Z");
-                let (next, _, result, modes, _) = production_scan_page_at_with_setup(
+                let (next, raw_tail, result, modes, _) = production_scan_page_at_with_setup(
                     &fixture,
                     source,
                     index,
@@ -2117,11 +2117,11 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
                     "never Restart for audit age"
                 );
                 if !result.snapshots.is_empty() {
-                    published = Some((result, collected_at));
+                    published = Some((raw_tail, result, collected_at));
                     break;
                 }
             }
-            let (published, published_at) =
+            let (raw_tail, published, published_at) =
                 published.expect("overdue Tail completes and publishes");
             let counters = second.counters_for_test();
             if source == SnapshotSource::Codex {
@@ -2145,7 +2145,7 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
             assert_eq!(checkpoint.sealed_offset(), length);
             assert_eq!(checkpoint.last_full_verified(), START);
             assert_eq!(checkpoint.audit_debt().unwrap().due_unix_seconds, due);
-            let (_, _, cold, _, _) = production_scan_page_at_with_setup(
+            let (_, raw_cold, cold, _, _) = production_scan_page_at_with_setup(
                 &fixture,
                 source,
                 cold_index,
@@ -2159,6 +2159,10 @@ fn overdue_durable_cursor_tail_publishes_and_next_restart_reads_no_suffix() {
                 .iter()
                 .map(|snapshot| snapshot.snapshot_fingerprint.clone())
                 .collect::<BTreeSet<_>>();
+            assert_eq!(
+                production_body(source, raw_tail),
+                production_body(source, raw_cold)
+            );
             assert_eq!(
                 production_body(source, published),
                 production_body(source, cold)
