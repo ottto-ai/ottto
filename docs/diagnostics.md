@@ -1072,7 +1072,8 @@ without a RAM reduction still reads Full: the transitional `pi` leaf in
 `state_missing`. A newly discovered file's first Full read does not increment
 that leaf. A no-RAM-copy cap Full on a changed indexed file can increment both
 `pi` and `audit_cap_full` for one read. Audit, upload-context and other non-content
-reparse reasons do not increment `pi`. After a restart or eviction, an idle Pi
+reparse reasons do not increment `pi`; a change that an earlier gate (such as a
+due audit) selects first is counted under that reason, not `pi`. After a restart or eviction, an idle Pi
 file whose 1 h verification marker falls due is read once (audit); Pi-b2's durable
 record removes this. The verified Full retires the marker without re-staging it.
 This is a staged exception; it does not turn a cache miss into a first-read

@@ -2200,8 +2200,9 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         // Lose the verified copy too: retirement must survive without RAM,
         // and the later real change must exercise the transitional Full.
         cache.clear();
+        // Past where a marker re-staged by the verification Full would fall due.
         sampled_scan::set_test_now(Some(
-            due + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+            due + 2 * crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
         ));
         let (((index, _, modes), counts), reads) =
             terminal_contract_retry::source_acquisitions(|| {
