@@ -354,6 +354,18 @@ impl SharedCache {
         self.insert_with_custody(key, completed, live_bytes, false, true, false)
             .is_ok()
     }
+    /// A completion whose durable record the M3 native route already
+    /// settled: admitted like any copy, but never a post-save write offer.
+    #[cfg(unix)]
+    pub(super) fn insert_settled(
+        &self,
+        key: String,
+        completed: sampled_jsonl::CompletedNativeAcquisition,
+        live_bytes: usize,
+    ) -> bool {
+        self.insert_with_custody(key, completed, live_bytes, false, false, false)
+            .is_ok()
+    }
     pub(super) fn return_prepared_taken(
         &self,
         key: String,
@@ -1802,6 +1814,12 @@ pub(super) mod test_hooks {
         BeforeStampGate,
         /// After `retain_reduction` returns, before `finish`.
         AfterRetain,
+        /// M3 E5: the prepared native finish returned (any staged temp still
+        /// private), before the commit fences or any store decision.
+        BeforeNativeSettle,
+        /// M3 E12: the completion is settled (receipt, owed hold or degraded
+        /// disposition), before cursor publication, birth or any effect.
+        BeforeNativeEffects,
     }
 
     /// What `tail_completion_budget` measured on its last call.

@@ -86,6 +86,22 @@ impl CachedJsonlReduction {
     pub(super) fn source(&self) -> SnapshotSource {
         self.accumulator.source
     }
+    /// The borrowed PRE-finalization fields an M3 record stages from, in the
+    /// body's field order; the live finish seam passes the same five.
+    #[cfg(unix)]
+    pub(super) fn finish_view(
+        &self,
+    ) -> (&SnapshotAccumulator, &JsonlReadReport, (usize, usize, bool)) {
+        (
+            &self.accumulator,
+            &self.report,
+            (
+                self.recognized_usage_drop_count,
+                self.positive_recognized_usage_count,
+                self.positive_usage_evidence,
+            ),
+        )
+    }
 }
 impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
     fn supports_frozen_charge(&self) -> bool {
@@ -149,7 +165,8 @@ pub(in crate::snapshots) struct PrepareRejected {
 }
 
 impl OwnedJsonlParser {
-    fn completed_durable(&mut self) -> super::DurableCustody {
+    /// The read's custody, retail attempt ended; also the uncertified M3 owner.
+    pub(super) fn completed_durable(&mut self) -> super::DurableCustody {
         let durable = self.reader.reader.take_durable();
         #[cfg(unix)]
         let mut durable = durable;
