@@ -28992,7 +28992,8 @@ impl OwnedSourceScan {
                     None
                 };
                 // Retain the obligation until native finish and RAM admission.
-                // Only ordinary complete-c Unchanged acquisitions can retire it.
+                // Only due complete-c Unchanged acquisitions can retire it;
+                // incidental telemetry refreshes keep the original obligation.
                 let quiet_audit_checked = if let (Some(completed), Some(active), Some(context)) = (
                     completed_acquisition.as_ref(),
                     file_sampling.as_ref(),
@@ -29002,7 +29003,8 @@ impl OwnedSourceScan {
                         // Withheld bodies retain their obligation until release.
                         && !index.claude_account_deferred_holds.contains_key(&active.key)
                         && index.files.get(&active.key).is_some_and(|entry| {
-                            entry.has_unverified_source() && !entry.has_prefix_provenance()
+                            entry.audit_requires_full(sampled_scan::now_seconds())
+                                && !entry.has_prefix_provenance()
                         })
                         && !index.claude_request_census.get(&active.key).is_some_and(
                             claude_request_census::ClaudeRequestCensusRecord::identity_incomplete_hold,
@@ -32445,6 +32447,7 @@ impl OwnedSourceScan {
                         };
                         // The cap funds NEW obligations, never a global restore
                         // gate. Marked files Tail; quiet debt-free copies reuse.
+                        let mut cap_full = false;
                         if allow_sample
                             // Account-held reparses belong to withheld_reparse;
                             // central staging still bounds fresh audit markers.
@@ -32470,6 +32473,7 @@ impl OwnedSourceScan {
                                 census.record_unreadable(UnreadableCause::Reduction, 1);
                                 pending!();
                             }
+                            cap_full = true;
                             allow_sample = false;
                         }
                         context.admission.sampling_allowed.observe(allow_sample);
@@ -32505,7 +32509,7 @@ impl OwnedSourceScan {
                         // H1c: the plan uses absolute offsets; the reader's
                         // extent is relative to its Full/Tail start.
                         if source == SnapshotSource::ClaudeCode
-                            && allow_sample
+                            && (allow_sample || cap_full)
                             && matches!(
                                 mode,
                                 crate::transcript_acquisition::ReadMode::Full(_)

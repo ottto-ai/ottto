@@ -32,8 +32,9 @@ fn unavailable_codex_cohorts_cannot_grow_markers_past_cap_or_disable_marked_tail
     let mut cap_events = 0;
     let mut alarms = 0;
     let mut control = None;
+    let mut parked_control = None;
     // First two cohorts fill the cap; later cohorts would grow without bound
-    // before the fix. A missing parent is unavailable, never proven deletion.
+    // before the fix. ENOTDIR is unavailable, never proven deletion.
     for cohort in [cap / 2, cap - cap / 2, 4, 4] {
         for _ in 0..cohort {
             let id = format!("019fa111-2222-7333-8444-{:012}", ordinal + 1);
@@ -81,6 +82,13 @@ fn unavailable_codex_cohorts_cannot_grow_markers_past_cap_or_disable_marked_tail
             }
             if ordinal + 1 == cap {
                 control = Some(fixture.file.0.clone());
+                // Keep this marked control unavailable during later cohorts,
+                // just like their other owed members. Otherwise its due audit
+                // legitimately adds an Unchanged visit to each seed page.
+                let parked = fixture.dir.join("parked-control");
+                fs::rename(&unavailable_parent, &parked).unwrap();
+                fs::write(&unavailable_parent, b"unavailable mount placeholder").unwrap();
+                parked_control = Some((unavailable_parent.clone(), parked));
             } else {
                 fs::remove_file(&fixture.file.0).unwrap();
                 fs::remove_dir(&unavailable_parent).unwrap();
@@ -109,6 +117,9 @@ fn unavailable_codex_cohorts_cannot_grow_markers_past_cap_or_disable_marked_tail
             .count(),
         cap
     );
+    let (original_parent, parked) = parked_control.unwrap();
+    fs::remove_file(&original_parent).unwrap();
+    fs::rename(parked, original_parent).unwrap();
     fixture.file.0 = control.unwrap();
     let key = local_index_key(&fixture.file.0);
     assert!(
@@ -705,6 +716,16 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
             });
         assert_eq!(modes, (1, 0, 0), "counted catch-up after the age cutoff");
         assert_cap_counts(&diagnostics, 1, 0);
+        let page = diagnostics
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert_eq!(
+            page["counts"]["sampled_acquisition"]["page_events"]["full_cause"]
+                ["rearm_cleared{audit_cap_delay}"],
+            json!({"count": 1, "completed_native_bytes": actual_size}),
+            "the #897 wrapper retains the cap-delay cause across index reload"
+        );
         assert!(
             !raw.snapshots.is_empty(),
             "catch-up emits the unpaid append"
@@ -956,16 +977,9 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         Some(cache.clone()),
         "held-reservation",
     );
-    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
-    let (mut index, _, _) = production_scan(
-        &fixture,
-        source,
-        index,
-        Some(cache.clone()),
-        "held-reservation",
-    );
+    let quiet_path = fixture.file.0.clone();
     let quiet_key = local_index_key(&fixture.file.0);
-    let due = index.files[&quiet_key].unverified_deadline().unwrap();
+    assert!(!index.files[&quiet_key].has_unverified_source());
     fixture.file.0 = fixture.root.join("z-held-tail-fixture.jsonl");
     let held_row = |n, id| {
         let mut row = usage(source, n, id, "fixture-model");
@@ -983,7 +997,21 @@ fn held_retry_cannot_stage_against_a_quiet_slot_before_partial_save() {
         "held-reservation",
     );
     assert_eq!(modes, (1, 0, 0));
-    index = next;
+    // Seed B before creating A's audit. Once A is marked, selection may
+    // legitimately visit it even on an otherwise B-only seed page.
+    let held_path = fixture.file.0.clone();
+    fixture.file.0 = quiet_path;
+    fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+    let (mut index, _, modes) = production_scan(
+        &fixture,
+        source,
+        next,
+        Some(cache.clone()),
+        "held-reservation",
+    );
+    assert_eq!(modes, (0, 1, 0));
+    let due = index.files[&quiet_key].unverified_deadline().unwrap();
+    fixture.file.0 = held_path;
     let held_key = local_index_key(&fixture.file.0);
     assert!(!index.files[&held_key].has_unverified_source());
     let held = index.file_snapshot_fingerprints[&held_key].clone();

@@ -621,6 +621,19 @@ mod tests {
         assert!(path_requires_verification(&loaded.files, &candidate.path));
         assert!(!loaded.files[&key].has_unverified_source());
         assert_eq!(loaded.files[&key].size_bytes, 1);
+        // Same-process provenance survives the index round-trip until an
+        // actual Full completes; merely queuing the retry emits no Full.
+        let probe = crate::local_resource_diagnostics::Probe::start();
+        assert!(probe.rearm_fulls().is_empty());
+        let full = crate::transcript_acquisition::ReadMode::Full(
+            crate::transcript_acquisition::FullReason::StateMissing,
+        );
+        probe.rearm_full_selected(&key, full);
+        probe.rearm_full_completed(&key, full, 3);
+        assert_eq!(
+            serde_json::to_value(probe.rearm_fulls()).unwrap(),
+            json!({"rearm_cleared{audit_cap_delay}": {"count": 1, "completed_native_bytes": 3}})
+        );
         loaded.files.remove(&key);
         queue_cap_retry(&mut loaded, &candidate);
         assert!(!loaded.files.contains_key(&key), "no invented membership");
@@ -1119,8 +1132,13 @@ pub(super) fn queue_cap_retry(index: &mut ScanIndex, candidate: &CandidateFile) 
     // The queue can disappear on a context-changing traversal replacement.
     // Reuse the existing durable reparse witness at every age/open gate and
     // in partial saves; keep the committed size and marker population intact.
-    if let Some(entry) = index.files.get_mut(&local_index_key(&candidate.path)) {
-        entry.source_file_fingerprint.clear();
+    let key = local_index_key(&candidate.path);
+    if let Some(entry) = index.files.get_mut(&key) {
+        crate::local_resource_diagnostics::rearm_cause::clear(
+            &key,
+            entry,
+            crate::local_resource_diagnostics::rearm_cause::Cause::AuditCapDelay,
+        );
     }
     if let Some(traversal) = index.traversal.as_mut() {
         if !traversal

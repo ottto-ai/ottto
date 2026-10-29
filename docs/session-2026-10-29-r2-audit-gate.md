@@ -289,3 +289,20 @@ now uses the same events object as the integrated diagnostics. Deleted-hold
 tokens remain unreported until shared withheld-account bookkeeping lands.
 Whichever implementation integrates second must unify onto one emitter per
 count and retain the exactly-once fixture; both retirement paths stay present.
+
+Round17 composes with main's rearm attribution, optional Codex header facts and
+development replay harness. Incidental telemetry-only Unchanged reads before
+the audit deadline preserve index and checkpoint debt exactly; only a due,
+eligible sampled quiet validation can retire it. Cap Full fallback keeps the
+ordinary frozen acquisition extent while existing prefix/marker refusals stay.
+Cap-delay clears use the shared rearm wrapper with the audit_cap_delay cause,
+attributing the later Full and completed native bytes without changing its
+read permission or persisted retry witness.
+
+The multi-file fixtures now seed the held key before arming its quiet sibling,
+and temporarily park the cohort control beneath an uncertain non-directory
+ancestor while building other cohorts. Original mode, marker-population,
+pacing, partial-save and Tail assertions remain. The partial-save regression
+retains its original quiet-before-growing order check. Optional header and
+decoder admission rules are unchanged. Local Clippy compiles all targets;
+runtime tests remain CI-only.
